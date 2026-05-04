@@ -5,7 +5,7 @@
 <h1 align="center">AgentTrace</h1>
 
 <p align="center">
-  汇总多个 AI 编程 Agent 的历史成本、Token 和耗时，并定位任务为什么跑得慢。
+  找出哪个 AI 编程 Agent 最烧 Token、花了多少钱，以及任务为什么跑得慢。
 </p>
 
 <p align="center">
@@ -31,6 +31,8 @@
 
 **agenttrace** 是一个本地 TUI 和报告生成工具，用来分析 AI 编程 Agent 的历史会话。它会读取 Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cursor、Aider、OpenCode、OpenClaw、Hermes Agent、Kimi CLI 和 Copilot 风格日志，主要帮你做两件事：汇总多个 Agent 历史会话的成本、Token 和耗时；定位某次任务为什么跑得慢。
 
+可以把它理解成 AI 编程 Agent 的本地成本账单 + 慢任务调试器。
+
 ## 为什么需要 agenttrace？
 
 AI 编程 Agent 越来越像一套小型构建系统：会调用工具、重试、卡住、花 token，但你最后往往只看到一段总结。
@@ -43,6 +45,16 @@ AI 编程 Agent 越来越像一套小型构建系统：会调用工具、重试�
 - **任务为什么慢？** 发现长时间空档、挂起会话、重试循环、慢工具调用、大参数和上下文压力。
 - **先看哪一次？** 按成本、耗时、轮次、健康分、失败、异常、模型、来源或文本搜索排序。
 - **能不能本地看？** 所有分析都在本机完成，不需要上传 prompt、代码和日志。
+
+## 60 秒看价值
+
+```bash
+agenttrace --doctor
+agenttrace --overview -f json
+agenttrace
+```
+
+一次真实本机运行中，agenttrace 找到了 `1,707` 个可报告会话、`8.68B` Token、`$4,716.31` 估算成本和 `35` 个 Critical 会话，全程不上传 prompt 和代码。
 
 ## 真实本机运行
 
@@ -67,6 +79,7 @@ curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh
 其它安装方式：
 
 ```bash
+npm install -g agenttrace
 brew install luoyuctl/tap/agenttrace
 go install github.com/luoyuctl/agenttrace/cmd/agenttrace@latest
 ```
@@ -113,9 +126,11 @@ Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cline、Aider、Cursor export
 - 官网：https://luoyuctl.github.io/agenttrace/
 - AI Agent 可观测性指南：https://luoyuctl.github.io/agenttrace/ai-agent-observability.html
 - 示例 HTML 报告：https://luoyuctl.github.io/agenttrace/demo-report.html
+- 对比说明：[docs/comparison.md](docs/comparison.md)
 - CI 集成：[docs/ci-integration.md](docs/ci-integration.md)
 - Cursor 导入：[docs/cursor-import.md](docs/cursor-import.md)
 - Parser 指南：[docs/parser-guide.md](docs/parser-guide.md)
+- 路线图：[ROADMAP.md](ROADMAP.md)
 - 发布说明草案：[docs/launch-kit.md](docs/launch-kit.md)
 
 agenttrace 已被收录在 [Awesome Gemini CLI](https://github.com/Piebald-AI/awesome-gemini-cli)、[Charm in the Wild](https://github.com/charm-and-friends/charm-in-the-wild) 和 [Awesome Claude Code and Skills](https://github.com/GetBindu/awesome-claude-code-and-skills)。

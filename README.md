@@ -5,7 +5,7 @@
 <h1 align="center">AgentTrace</h1>
 
 <p align="center">
-  Review AI coding agent history across cost, tokens, and time, then find why a run was slow.
+  Find which AI coding agent burned your tokens, what it cost, and why the run got slow.
 </p>
 
 <p align="center">
@@ -31,6 +31,8 @@
 
 **agenttrace** is a local TUI and report generator for AI coding agent session history. It reads Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cursor, Aider, OpenCode, OpenClaw, Hermes Agent, Kimi CLI, and Copilot-style logs, then helps with two daily jobs: see what multiple agents spent across cost, tokens, and time; and diagnose why a task ran slowly.
 
+Think of it as a local cost explorer and slow-run debugger for coding agents.
+
 ## Why agenttrace?
 
 AI coding agents now behave like small build systems: they call tools, retry, stall, and spend tokens while you only see the final answer.
@@ -43,6 +45,16 @@ It helps you answer:
 - **Why was this task slow?** Catch long gaps, hanging sessions, retry loops, slow tool calls, large parameters, and context pressure.
 - **What should I inspect first?** Rank sessions by cost, duration, turns, health, failures, anomalies, model, source, or text search.
 - **Can I inspect this privately?** Everything runs locally; prompts, code, and logs do not need to leave your machine.
+
+## 60-second proof
+
+```bash
+agenttrace --doctor
+agenttrace --overview -f json
+agenttrace
+```
+
+On a real local machine, agenttrace found `1,707` reportable sessions, `8.68B` tokens, `$4,716.31` estimated cost, and `35` critical sessions without uploading prompts or code.
 
 ## Real local run
 
@@ -84,6 +96,7 @@ curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh
 Other install paths:
 
 ```bash
+npm install -g agenttrace
 brew install luoyuctl/tap/agenttrace
 go install github.com/luoyuctl/agenttrace/cmd/agenttrace@latest
 ```
@@ -93,8 +106,6 @@ Windows:
 ```powershell
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
-
-The npm wrapper is prepared in `npm/`, but the public package is not published yet.
 
 ## Common workflows
 
@@ -138,9 +149,11 @@ Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Her
 
 - Site: https://luoyuctl.github.io/agenttrace/
 - Sample HTML report: https://luoyuctl.github.io/agenttrace/demo-report.html
+- Comparison: [docs/comparison.md](docs/comparison.md)
 - CI setup: [docs/ci-integration.md](docs/ci-integration.md)
 - Cursor import: [docs/cursor-import.md](docs/cursor-import.md)
 - Parser guide: [docs/parser-guide.md](docs/parser-guide.md)
+- Roadmap: [ROADMAP.md](ROADMAP.md)
 - Launch notes: [docs/launch-kit.md](docs/launch-kit.md)
 
 Listed in [Awesome Gemini CLI](https://github.com/Piebald-AI/awesome-gemini-cli), [Charm in the Wild](https://github.com/charm-and-friends/charm-in-the-wild), and [Awesome Claude Code and Skills](https://github.com/GetBindu/awesome-claude-code-and-skills).

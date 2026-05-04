@@ -6,6 +6,8 @@ Repository: https://github.com/luoyuctl/agenttrace
 Website: https://luoyuctl.github.io/agenttrace/
 Sample report: https://luoyuctl.github.io/agenttrace/demo-report.html
 AI agent observability guide: https://luoyuctl.github.io/agenttrace/ai-agent-observability.html
+Comparison: https://github.com/luoyuctl/agenttrace/blob/master/docs/comparison.md
+Roadmap: https://github.com/luoyuctl/agenttrace/blob/master/ROADMAP.md
 Latest release: https://github.com/luoyuctl/agenttrace/releases/latest
 License: MIT
 

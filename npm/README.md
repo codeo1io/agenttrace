@@ -1,27 +1,28 @@
 # agenttrace
 
-TUI observability for AI coding agent sessions. It helps you inspect local agent runs across cost, token usage, latency, tool failures, anomalies, health score, and CI quality gates.
+Local-first AI coding agent session history for cost, tokens, time, and slow-run diagnosis.
 
-This directory contains the npm wrapper for agenttrace. The public npm package has not been published yet, so `npm install -g agenttrace` will return a registry 404 until the first publish.
+Use it to answer two questions:
+
+- Which coding agent sessions burned the most cost, tokens, and wall-clock time?
+- Why did a specific agent task run slowly?
 
 ## Install
 
-Use one of the supported install methods for now:
-
 ```bash
-brew install luoyuctl/tap/agenttrace
+npm install -g agenttrace
 agenttrace --version
 ```
+
+Other install methods:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
 agenttrace --version
 ```
 
-After the package is published, the npm install path will be:
-
 ```bash
-npm install -g agenttrace
+brew install luoyuctl/tap/agenttrace
 agenttrace --version
 ```
 
@@ -43,14 +44,14 @@ npm pack --dry-run
 # Open the TUI
 agenttrace
 
-# Try built-in sample sessions
-agenttrace --demo
-
 # Diagnose local session discovery and cache status
 agenttrace --doctor
 
 # JSON overview for automation
 agenttrace --overview -f json
+
+# Try built-in sample sessions if this machine has no local agent logs yet
+agenttrace --demo
 
 # CI health gate
 agenttrace --overview --fail-under-health 80 --fail-on-critical --max-tool-fail-rate 15
