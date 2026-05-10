@@ -107,6 +107,8 @@ Open PRs:
 - awesome-vibe-coding: https://github.com/ai-for-developers/awesome-vibe-coding/pull/56
 - awesome-ai-coding: https://github.com/wsxiaoys/awesome-ai-coding/pull/97
 - filipecalegario/awesome-vibe-coding: https://github.com/filipecalegario/awesome-vibe-coding/pull/171
+- jiji262/awesome-vibe-coding-tools: https://github.com/jiji262/awesome-vibe-coding-tools/pull/14
+- furudo-erika/awesome-vibe-coding-tools: https://github.com/furudo-erika/awesome-vibe-coding-tools/pull/2
 - awesome-coding-ai: https://github.com/ohong/awesome-coding-ai/pull/6
 - awesome-claude-code-toolkit: https://github.com/rohitg00/awesome-claude-code-toolkit/pull/361
 - ComposioHQ/awesome-claude-skills: https://github.com/ComposioHQ/awesome-claude-skills/pull/766
@@ -148,6 +150,7 @@ Open PRs:
 - tomrzv/Awesome-AI-Coding-Tools: https://github.com/tomrzv/Awesome-AI-Coding-Tools/pull/5
 - dingjiu1989-hue/awesome-ai-coding-tools: https://github.com/dingjiu1989-hue/awesome-ai-coding-tools/pull/1
 - yeaight7/awesome-ai-devtools: https://github.com/yeaight7/awesome-ai-devtools/pull/1
+- buainoai/awesome-ai-devtools-multilingual: https://github.com/buainoai/awesome-ai-devtools-multilingual/pull/11
 - Icloudeng/awesome-ai-coding-tools: https://github.com/Icloudeng/awesome-ai-coding-tools/pull/9
 - dremeika/awesome-coding-assistants: https://github.com/dremeika/awesome-coding-assistants/pull/11
 - tranhoangpich/awesome-agentic-coding: https://github.com/tranhoangpich/awesome-agentic-coding/pull/1
