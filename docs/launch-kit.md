@@ -169,6 +169,7 @@ Open PRs:
 - sam-blackfly/awesome-llm-tools: https://github.com/sam-blackfly/awesome-llm-tools/pull/2
 - llm-toolkit: https://github.com/sumanth-dhanya/llm-toolkit/pull/1
 - spinov001-art/awesome-llm-tools: https://github.com/spinov001-art/awesome-llm-tools/pull/1
+- dr-saad-la/awesome-llm-tools: https://github.com/dr-saad-la/awesome-llm-tools/pull/7
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
