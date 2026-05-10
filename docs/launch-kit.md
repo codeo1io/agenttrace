@@ -148,6 +148,7 @@ Open PRs:
 - shawnesquivel/awesome-agent-clis: https://github.com/shawnesquivel/awesome-agent-clis/pull/4
 - wdzhwsh4067/awesome-coding-agents: https://github.com/wdzhwsh4067/awesome-coding-agents/pull/1
 - tomrzv/Awesome-AI-Coding-Tools: https://github.com/tomrzv/Awesome-AI-Coding-Tools/pull/5
+- furudo-erika/awesome-ai-coding-tools: https://github.com/furudo-erika/awesome-ai-coding-tools/pull/5
 - dingjiu1989-hue/awesome-ai-coding-tools: https://github.com/dingjiu1989-hue/awesome-ai-coding-tools/pull/1
 - yeaight7/awesome-ai-devtools: https://github.com/yeaight7/awesome-ai-devtools/pull/1
 - buainoai/awesome-ai-devtools-multilingual: https://github.com/buainoai/awesome-ai-devtools-multilingual/pull/11
