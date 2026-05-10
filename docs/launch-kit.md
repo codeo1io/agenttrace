@@ -144,6 +144,10 @@ Open PRs:
 - agenmod/awesome-ai-cli: https://github.com/agenmod/awesome-ai-cli/pull/1
 - shawnesquivel/awesome-agent-clis: https://github.com/shawnesquivel/awesome-agent-clis/pull/4
 - wdzhwsh4067/awesome-coding-agents: https://github.com/wdzhwsh4067/awesome-coding-agents/pull/1
+- tomrzv/Awesome-AI-Coding-Tools: https://github.com/tomrzv/Awesome-AI-Coding-Tools/pull/5
+- dingjiu1989-hue/awesome-ai-coding-tools: https://github.com/dingjiu1989-hue/awesome-ai-coding-tools/pull/1
+- yeaight7/awesome-ai-devtools: https://github.com/yeaight7/awesome-ai-devtools/pull/1
+- Icloudeng/awesome-ai-coding-tools: https://github.com/Icloudeng/awesome-ai-coding-tools/pull/9
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
