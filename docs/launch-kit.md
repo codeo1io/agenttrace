@@ -273,6 +273,7 @@ Open PRs:
 - Siilwyn/awesome-cli-tools: https://github.com/Siilwyn/awesome-cli-tools/pull/19
 - CloudAI-X/claude-code-resources: https://github.com/CloudAI-X/claude-code-resources/pull/12
 - abordage/awesome-ai: https://github.com/abordage/awesome-ai/pull/4
+- qualisero/awesome-pi-agent: https://github.com/qualisero/awesome-pi-agent/pull/54
 
 Merged listings:
 
