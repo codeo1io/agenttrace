@@ -237,6 +237,9 @@ Open PRs:
 - kodustech/awesome-agent-skills: https://github.com/kodustech/awesome-agent-skills/pull/15
 - Chat2AnyLLM/awesome-repo-configs: https://github.com/Chat2AnyLLM/awesome-repo-configs/pull/14
 - philipbankier/awesome-agent-skills: https://github.com/philipbankier/awesome-agent-skills/pull/13
+- kenryu42/awesome-claude-skills: https://github.com/kenryu42/awesome-claude-skills/pull/11
+- sandipan1/awesome-claude-skills: https://github.com/sandipan1/awesome-claude-skills/pull/7
+- yibie/Awesome-Claude-Skills: https://github.com/yibie/Awesome-Claude-Skills/pull/7
 
 Merged listings:
 
