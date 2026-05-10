@@ -156,6 +156,8 @@ Open PRs:
 - antigravity-awesome-skills: https://github.com/sickn33/antigravity-awesome-skills/pull/583
 - VoltAgent/awesome-agent-skills: https://github.com/VoltAgent/awesome-agent-skills/pull/552
 - ComposioHQ/awesome-codex-skills: https://github.com/ComposioHQ/awesome-codex-skills/pull/58
+- JackyST0/awesome-agent-skills: https://github.com/JackyST0/awesome-agent-skills/pull/36
+- skillmatic-ai/awesome-agent-skills: https://github.com/skillmatic-ai/awesome-agent-skills/pull/78
 
 Merged listings:
 
