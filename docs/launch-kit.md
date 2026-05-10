@@ -234,6 +234,7 @@ Open PRs:
 - kenryu42/awesome-claude-skills: https://github.com/kenryu42/awesome-claude-skills/pull/11
 - sandipan1/awesome-claude-skills: https://github.com/sandipan1/awesome-claude-skills/pull/7
 - yibie/Awesome-Claude-Skills: https://github.com/yibie/Awesome-Claude-Skills/pull/7
+- coderPerseus/awesome-cli-tools-for-agents: https://github.com/coderPerseus/awesome-cli-tools-for-agents/pull/1
 
 Merged listings:
 
