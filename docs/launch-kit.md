@@ -155,6 +155,7 @@ Open PRs:
 - brandonhimpfen/awesome-ai-coding-agents: https://github.com/brandonhimpfen/awesome-ai-coding-agents/pull/11
 - ashishkaloge/awesome-agentic-engineering: https://github.com/ashishkaloge/awesome-agentic-engineering/pull/1
 - rogerchappel/awesome-agentic-engineering: https://github.com/rogerchappel/awesome-agentic-engineering/pull/1
+- AFunLS/awesome-ai-agent-tools: https://github.com/AFunLS/awesome-ai-agent-tools/pull/4
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
