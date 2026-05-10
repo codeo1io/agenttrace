@@ -20,7 +20,7 @@
   <a href="https://goreportcard.com/report/github.com/luoyuctl/agenttrace"><img src="https://goreportcard.com/badge/github.com/luoyuctl/agenttrace" alt="Go Report Card"></a>
   <img src="https://img.shields.io/badge/go-1.25+-00ADD8.svg" alt="Go">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/Homebrew-v0.4.0-2bbc8a.svg" alt="Homebrew">
+  <img src="https://img.shields.io/badge/Homebrew-v0.4.6-2bbc8a.svg" alt="Homebrew">
 </p>
 
 <p align="center">
@@ -110,7 +110,7 @@ agenttrace --overview -f html -o agenttrace-overview.html
 
 agenttrace 支持这些本地会话来源：
 
-Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Oh My Pi、Kimi CLI、Copilot-style logs，以及通用 JSON/JSONL traces。
+Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Pi、Oh My Pi、Kimi CLI、Copilot-style logs，以及通用 JSON/JSONL traces。
 
 ## 你会得到什么
 

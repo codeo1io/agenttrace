@@ -5,6 +5,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -88,6 +89,7 @@ type sessionDiscoveryMsg struct {
 	sessions     []loadedSession
 	cacheEntries int
 	cacheValid   int
+	sourceCounts map[string]int
 }
 
 // loadProgressMsg 承载一批渐进加载结果。
@@ -109,15 +111,16 @@ type Model struct {
 	lang     i18n.Lang
 
 	// Progressive loading state
-	loading         bool
-	loadProgress    int
-	loadTotal       int
-	loadedFromCache int
-	cacheEntries    int
-	cacheValid      int
-	loadQueue       []string
-	sessionCache    engine.SessionCache
-	unsavedNewCount int
+	loading          bool
+	loadProgress     int
+	loadTotal        int
+	loadedFromCache  int
+	cacheEntries     int
+	cacheValid       int
+	loadSourceCounts map[string]int
+	loadQueue        []string
+	sessionCache     engine.SessionCache
+	unsavedNewCount  int
 
 	// Overview data
 	overview engine.Overview
@@ -157,9 +160,10 @@ type Model struct {
 	tableReady bool
 
 	// Detail view
-	viewport    viewport.Model
-	detailReady bool
-	loopResult  engine.LoopResult // 循环检测结果
+	viewport         viewport.Model
+	detailReady      bool
+	diagnosticsReady bool
+	loopResult       engine.LoopResult // 循环检测结果
 
 	// Diff view
 	diffResult     engine.SessionDiff
@@ -236,12 +240,14 @@ func (m *Model) startReload() tea.Cmd {
 	m.sessions = nil
 	m.view = viewOverview
 	m.detailReady = false
+	m.diagnosticsReady = false
 	m.loadQueue = nil
 	m.loadProgress = 0
 	m.loadTotal = 0
 	m.loadedFromCache = 0
 	m.cacheEntries = 0
 	m.cacheValid = 0
+	m.loadSourceCounts = nil
 	m.unsavedNewCount = 0
 	m.loading = true
 
@@ -307,11 +313,13 @@ func discoverSessionFilesCmd(dir string, cache engine.SessionCache) tea.Cmd {
 			files:        files,
 			cacheEntries: cache.EntryCount(),
 			cacheValid:   cacheValid,
+			sourceCounts: loadingSourceCounts(files, nil, cache),
 		}
 		if dir == "" {
 			for _, s := range engine.LoadSQLiteBackedSessions() {
 				msg.sessions = append(msg.sessions, loadedSession{session: s})
 			}
+			msg.sourceCounts = loadingSourceCounts(files, msg.sessions, cache)
 		}
 		return msg
 	}
@@ -362,6 +370,58 @@ func loadNextCmd(files []string, cache engine.SessionCache, idx int) tea.Cmd {
 	}
 }
 
+func loadingSourceCounts(files []string, sessions []loadedSession, cache engine.SessionCache) map[string]int {
+	counts := make(map[string]int)
+	for _, loaded := range sessions {
+		source := loaded.session.Metrics.SourceTool
+		if source == "" {
+			source = "generic"
+		}
+		counts[source]++
+	}
+	for _, path := range files {
+		source := ""
+		if s, ok := engine.CachedSession(path, cache); ok {
+			source = s.Metrics.SourceTool
+		}
+		if source == "" {
+			source = loadingSourceFromPath(path)
+		}
+		counts[source]++
+	}
+	return counts
+}
+
+func loadingSourceFromPath(path string) string {
+	p := strings.ToLower(filepath.ToSlash(path))
+	switch {
+	case strings.Contains(p, "/.hermes/"):
+		return "hermes_jsonl"
+	case strings.Contains(p, "/.codex/"):
+		return "codex_cli"
+	case strings.Contains(p, "/.claude/"):
+		return "claude_code"
+	case strings.Contains(p, "/.gemini/"):
+		return "gemini_cli"
+	case strings.Contains(p, "/.qwen/"):
+		return "qwen_code"
+	case strings.Contains(p, "/opencode/") || strings.Contains(p, "application support/opencode"):
+		return "opencode"
+	case strings.Contains(p, "/.pi/agent/sessions/"):
+		return "pi"
+	case strings.Contains(p, "/.omp/"):
+		return "oh_my_pi"
+	case strings.Contains(p, "cline-dev"):
+		return "cline"
+	case strings.Contains(p, "/cursor/"):
+		return "cursor"
+	case strings.Contains(p, "aider"):
+		return "aider"
+	default:
+		return "generic"
+	}
+}
+
 // ── Update ──
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -378,6 +438,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadTotal = len(msg.files) + len(msg.sessions)
 		m.cacheEntries = msg.cacheEntries
 		m.cacheValid = msg.cacheValid
+		m.loadSourceCounts = msg.sourceCounts
 		if len(msg.sessions) > 0 {
 			m.appendLoadedSessions(msg.sessions)
 		}
@@ -412,6 +473,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Width = m.detailViewportWidth()
 			m.viewport.Height = m.detailViewportHeight()
 			m.refreshDetailViewport()
+		}
+		if m.diagnosticsReady {
+			m.viewport.Width = m.detailViewportWidth()
+			m.viewport.Height = m.detailViewportHeight()
+			m.refreshDiagnosticsViewport()
 		}
 
 	case tea.KeyMsg:
@@ -539,7 +605,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewDetail
 				m.openDetail()
 			case viewDetail:
-				m.view = viewDiagnostics
+				m.openDiagnostics()
 			case viewDiagnostics:
 				m.openDiff()
 			case viewDiff:
@@ -571,12 +637,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openDetail()
 			}
 		case "3":
-			m.view = viewDiagnostics
+			m.openDiagnostics()
 		case "4":
 			m.openDiff()
 		case "w":
 			if (m.view == viewList || m.view == viewDetail) && len(m.filteredIndices) > 0 {
-				m.view = viewDiagnostics
+				m.openDiagnostics()
 			}
 
 		case "/":
@@ -693,6 +759,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case viewDetail:
 				m.viewport, cmd = m.viewport.Update(msg)
+			case viewDiagnostics:
+				m.viewport, cmd = m.viewport.Update(msg)
 			case viewDiff:
 				// No sub-component in diff view
 			}
@@ -711,10 +779,12 @@ func (m *Model) toggleLanguage() {
 	i18n.SetLang(m.lang)
 	m.refreshColumns()
 	m.refreshDetailViewport()
+	m.refreshDiagnosticsViewport()
 }
 
 func (m *Model) openDetail() {
 	m.detailReady = false
+	m.diagnosticsReady = false
 	if !m.tableReady || len(m.sessions) == 0 {
 		return
 	}
@@ -729,7 +799,15 @@ func (m *Model) openDetail() {
 	}
 }
 
+func (m *Model) openDiagnostics() {
+	m.view = viewDiagnostics
+	m.detailReady = false
+	m.refreshDiagnosticsViewport()
+}
+
 func (m *Model) openDiff() {
+	m.detailReady = false
+	m.diagnosticsReady = false
 	m.prepareDiffForCursor()
 	m.view = viewDiff
 }
@@ -775,6 +853,22 @@ func (m *Model) refreshDetailViewport() {
 		return
 	}
 	m.detailReady = false
+}
+
+func (m *Model) refreshDiagnosticsViewport() {
+	if m.view != viewDiagnostics {
+		return
+	}
+	idx := m.findSessionIndex()
+	if idx < 0 || idx >= len(m.sessions) {
+		m.diagnosticsReady = false
+		return
+	}
+	s := m.sessions[idx]
+	m.prepareDetailState(s)
+	m.viewport = viewport.New(m.detailViewportWidth(), m.detailViewportHeight())
+	m.viewport.SetContent(m.renderWasteContent(s, m.detailViewportWidth()))
+	m.diagnosticsReady = true
 }
 
 func (m Model) detailViewportHeight() int {
@@ -852,12 +946,14 @@ func (m *Model) sessionRow(s engine.Session) table.Row {
 		}
 		healthWidth = cols[healthIdx].Width
 	}
-	healthCol := healthCell(health, healthWidth)
+	healthCol := healthCellText(health, healthWidth)
 
 	failStr := fmt.Sprintf("%d", failTools)
 
+	costStr := money4(met.CostEstimated)
 	tokensStr := compactInt(metricsTotalTokens(met))
 	issue := sessionIssueLabel(s)
+	duration := engine.FmtDuration(chartValue(met.DurationSec))
 	switch len(m.table.Columns()) {
 	case 7:
 		return table.Row{
@@ -865,7 +961,7 @@ func (m *Model) sessionRow(s engine.Session) table.Row {
 			sourceDisplay,
 			failStr,
 			fmt.Sprintf("%d", len(s.Anomalies)),
-			costCell(met.CostEstimated),
+			costStr,
 			tokensStr,
 			healthCol,
 		}
@@ -878,9 +974,9 @@ func (m *Model) sessionRow(s engine.Session) table.Row {
 			fmt.Sprintf("%d", totalToolCalls),
 			sr,
 			failStr,
-			costCell(met.CostEstimated),
+			costStr,
 			tokensStr,
-			engine.FmtDuration(chartValue(met.DurationSec)),
+			duration,
 			fmt.Sprintf("%d", len(s.Anomalies)),
 			healthCol,
 			issue,
@@ -894,9 +990,9 @@ func (m *Model) sessionRow(s engine.Session) table.Row {
 			fmt.Sprintf("%d", totalToolCalls),
 			sr,
 			failStr,
-			costCell(met.CostEstimated),
+			costStr,
 			tokensStr,
-			engine.FmtDuration(chartValue(met.DurationSec)),
+			duration,
 			fmt.Sprintf("%d", len(s.Anomalies)),
 			healthCol,
 		}
@@ -908,7 +1004,7 @@ func (m *Model) sessionRow(s engine.Session) table.Row {
 			fmt.Sprintf("%d", totalToolCalls),
 			sr,
 			failStr,
-			costCell(met.CostEstimated),
+			costStr,
 			tokensStr,
 			healthCol,
 			issue,
@@ -920,7 +1016,7 @@ func (m *Model) sessionRow(s engine.Session) table.Row {
 			fmt.Sprintf("%d", nonNegativeInt(met.AssistantTurns)),
 			fmt.Sprintf("%d", totalToolCalls),
 			failStr,
-			costCell(met.CostEstimated),
+			costStr,
 			tokensStr,
 			healthCol,
 		}
@@ -933,7 +1029,7 @@ func (m *Model) sessionRow(s engine.Session) table.Row {
 		fmt.Sprintf("%d", totalToolCalls),
 		sr,
 		failStr,
-		costCell(met.CostEstimated),
+		costStr,
 		tokensStr,
 		healthCol,
 	}
@@ -963,6 +1059,9 @@ func (m Model) renderLoading() string {
 	if m.loadTotal == 0 {
 		lines := []string{
 			boldStyle.Render(i18n.T("loading_discovering")),
+			"",
+			m.renderLoadingStatusLine(0, 0, contentW),
+			m.renderLoadingSourceCounts(contentW),
 			"",
 			dimStyle.Render(truncate(i18n.T("loading_scanning_hint"), contentW)),
 		}
@@ -1000,6 +1099,9 @@ func (m Model) renderLoading() string {
 	lines := []string{
 		boldStyle.Render(i18n.T("loading_sessions")),
 		"",
+		m.renderLoadingStatusLine(progress, pct, contentW),
+		m.renderLoadingSourceCounts(contentW),
+		"",
 		fmt.Sprintf("  %s  %d/%d  %d%%%s", bar, progress, m.loadTotal, pct, cacheInfo),
 		"",
 		dimStyle.Render(truncate(i18n.T("loading_parsing_hint"), contentW)),
@@ -1009,6 +1111,102 @@ func (m Model) renderLoading() string {
 		header,
 		lipgloss.NewStyle().Width(contentW).Padding(1, 2).Render(strings.Join(lines, "\n")),
 	}, "\n")
+}
+
+func (m Model) renderLoadingStatusLine(progress, pct, width int) string {
+	phase := m.loadingPhase(progress)
+	cache := m.loadingCacheLabel()
+	parsed := fmt.Sprintf(i18n.T("loading_parsed"), len(m.sessions), maxInt(m.loadTotal, 0))
+	if m.loadTotal <= 0 {
+		parsed = fmt.Sprintf(i18n.T("loading_parsed"), 0, 0)
+	}
+	line := fmt.Sprintf("%s %s · %s · %s · %d%%",
+		i18n.T("loading_phase"),
+		phase,
+		parsed,
+		cache,
+		pct,
+	)
+	return truncate(line, width)
+}
+
+func (m Model) loadingPhase(progress int) string {
+	if m.loadTotal <= 0 {
+		return i18n.T("loading_phase_find")
+	}
+	if progress >= m.loadTotal {
+		return i18n.T("loading_phase_agg")
+	}
+	if m.cacheValid > 0 && m.loadedFromCache < m.cacheValid {
+		return i18n.T("loading_phase_cache")
+	}
+	return i18n.T("loading_phase_parse")
+}
+
+func (m Model) loadingCacheLabel() string {
+	hits := m.loadedFromCache
+	if hits < 0 {
+		hits = 0
+	}
+	valid := m.cacheValid
+	if valid < 0 {
+		valid = 0
+	}
+	if hits > valid && valid > 0 {
+		hits = valid
+	}
+	entries := m.cacheEntries
+	if entries < valid {
+		entries = valid
+	}
+	if entries < 0 {
+		entries = 0
+	}
+	return fmt.Sprintf(i18n.T("cache_status"), hits, valid, entries)
+}
+
+func (m Model) renderLoadingSourceCounts(width int) string {
+	if len(m.loadSourceCounts) == 0 {
+		return dimStyle.Render(truncate(i18n.T("loading_src_pending"), width))
+	}
+	type item struct {
+		source string
+		count  int
+	}
+	items := make([]item, 0, len(m.loadSourceCounts))
+	for source, count := range m.loadSourceCounts {
+		if count <= 0 {
+			continue
+		}
+		items = append(items, item{source: source, count: count})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].count == items[j].count {
+			return sourceDisplayName(items[i].source) < sourceDisplayName(items[j].source)
+		}
+		return items[i].count > items[j].count
+	})
+	if len(items) == 0 {
+		return dimStyle.Render(truncate(i18n.T("loading_src_pending"), width))
+	}
+	limit := 4
+	if width < 70 {
+		limit = 2
+	}
+	var parts []string
+	for i, it := range items {
+		if i >= limit {
+			remaining := 0
+			for _, rest := range items[i:] {
+				remaining += rest.count
+			}
+			parts = append(parts, fmt.Sprintf("+%d", remaining))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s %d", sourceDisplayName(it.source), it.count))
+	}
+	line := fmt.Sprintf("%s %s", i18n.T("loading_sources"), strings.Join(parts, " · "))
+	return dimStyle.Render(truncate(line, width))
 }
 
 func (m Model) View() string {
@@ -1045,7 +1243,7 @@ func (m Model) View() string {
 				content = m.frameContent(dimStyle.Render(m.selectionHint()))
 			}
 		case viewDiagnostics:
-			content = m.renderWaste()
+			content = m.renderDiagnosticsView()
 		case viewDiff:
 			content = m.renderDiff()
 		}
@@ -1085,6 +1283,7 @@ func (m Model) renderListView() string {
 	contentW := m.frameBodyWidth()
 	var sections []string
 	extraLines := 0
+	showListPanels := m.height == 0 || m.height >= 30
 	if filterBar := m.renderListStatusBar(contentW); filterBar != "" {
 		sections = append(sections, filterBar)
 		extraLines += renderedLineCount(filterBar)
@@ -1093,14 +1292,18 @@ func (m Model) renderListView() string {
 		sections = append(sections, empty)
 		extraLines += renderedLineCount(empty)
 	}
-	if summary := m.renderDriverSummary(contentW); summary != "" {
-		sections = append(sections, summary)
-		extraLines += renderedLineCount(summary)
+	if showListPanels {
+		if summary := m.renderDriverSummary(contentW); summary != "" {
+			sections = append(sections, summary)
+			extraLines += renderedLineCount(summary)
+		}
 	}
-	if selected := m.renderSelectedSessionSummary(maxInt(1, contentW-6)); selected != "" {
-		panel := subtlePanel(i18n.T("list_selected"), selected, contentW)
-		sections = append(sections, panel)
-		extraLines += renderedLineCount(panel)
+	if showListPanels {
+		if selected := m.renderSelectedSessionSummary(maxInt(1, contentW-6)); selected != "" {
+			panel := subtlePanel(i18n.T("list_selected"), selected, contentW)
+			sections = append(sections, panel)
+			extraLines += renderedLineCount(panel)
+		}
 	}
 	tableView := m.table
 	tableView.SetWidth(contentW)
@@ -1238,49 +1441,65 @@ func (m Model) renderSelectedSessionSummary(width int) string {
 	}
 	s := m.sessions[idx]
 	met := s.Metrics
-	okTools, _, totalTools, _ := normalizedToolCounts(met)
+	okTools, failTools, totalTools, _ := normalizedToolCounts(met)
 	success := i18n.T("not_available")
 	if totalTools > 0 {
 		success = fmt.Sprintf("%.0f%%", float64(okTools)/float64(totalTools)*100)
 	}
 
-	issue := i18n.T("list_no_major_anomaly")
-	if len(s.Anomalies) > 0 {
-		issue = anomalyTypeLabel(s.Anomalies[0].Type)
-	}
+	issue := sessionIssueLabel(s)
+	reason := selectedSessionReason(s)
+	duration := durationCell(met.DurationSec)
+	cost := costCell(met.CostEstimated)
+	tokens := tokenCell(metricsTotalTokens(met))
+	issueText := issueCell(issue, s)
+	failText := metricValueStyle(failTools > 0, lipgloss.Color("196")).Render(fmt.Sprintf("%d", failTools))
 	if width < 80 {
 		nameW := minInt(24, maxInt(10, width/3))
-		line1 := fmt.Sprintf("%s  %s %d%%  %s  %s",
+		line1 := fmt.Sprintf("%s  %s %s",
 			truncate(s.Name, nameW),
-			i18n.T("health"), clampHealth(s.Health),
-			money4(met.CostEstimated),
-			compactInt(metricsTotalTokens(met)),
+			i18n.T("list_reason"),
+			reason.Render(),
 		)
-		line2 := fmt.Sprintf("%s %d  %s %d/%d %s  %s %s",
+		line2 := fmt.Sprintf("%s %d%%  %s %s  %s %s  %s %s",
+			i18n.T("health"), clampHealth(s.Health),
+			i18n.T("cost"), cost,
+			i18n.T("tokens"), tokens,
+			i18n.T("duration_col"), duration,
+		)
+		line3 := fmt.Sprintf("%s %d  %s %d/%d %s  %s %s  %s %s",
 			i18n.T("turns_header"), nonNegativeInt(met.AssistantTurns),
 			i18n.T("tools"), okTools, totalTools, success,
-			i18n.T("list_issue"), issue,
+			i18n.T("fail"), failText,
+			i18n.T("list_issue"), issueText,
 		)
 		return lipgloss.JoinVertical(lipgloss.Left,
 			dimStyle.Render(truncate(line1, width)),
 			dimStyle.Render(truncate(line2, width)),
+			dimStyle.Render(truncate(line3, width)),
 		)
 	}
 	nameW := minInt(32, maxInt(14, width/3))
-	line1 := fmt.Sprintf("%s  %s %d%%  %s $%.4f  %s %s",
+	line1 := fmt.Sprintf("%s  %s %d%%  %s %s",
 		truncate(s.Name, nameW),
 		i18n.T("health"), clampHealth(s.Health),
-		i18n.T("cost"), safeAmount(met.CostEstimated),
-		i18n.T("tokens"), compactInt(metricsTotalTokens(met)),
+		i18n.T("list_reason"), reason.Render(),
 	)
-	line2 := fmt.Sprintf("%s %d  %s %d/%d %s  %s %s",
+	line2 := fmt.Sprintf("%s %s  %s %s  %s %s  %s %s",
+		i18n.T("cost"), cost,
+		i18n.T("tokens"), tokens,
+		i18n.T("duration_col"), duration,
+		i18n.T("list_issue"), issueText,
+	)
+	line3 := fmt.Sprintf("%s %d  %s %d/%d %s  %s %s",
 		i18n.T("turns_header"), nonNegativeInt(met.AssistantTurns),
 		i18n.T("tools"), okTools, totalTools, success,
-		i18n.T("list_issue"), issue,
+		i18n.T("fail"), failText,
 	)
 	return lipgloss.JoinVertical(lipgloss.Left,
 		dimStyle.Render(truncate(line1, width)),
 		dimStyle.Render(truncate(line2, width)),
+		dimStyle.Render(truncate(line3, width)),
 	)
 }
 
@@ -1523,6 +1742,20 @@ type listDriverSummary struct {
 	Anomaly listDriverItem
 }
 
+type selectedReason struct {
+	Label string
+	Value string
+	Color lipgloss.Color
+}
+
+func (r selectedReason) Render() string {
+	label := lipgloss.NewStyle().Foreground(r.Color).Bold(true).Render(r.Label)
+	if r.Value == "" || strings.EqualFold(r.Label, r.Value) {
+		return label
+	}
+	return fmt.Sprintf("%s %s", label, lipgloss.NewStyle().Foreground(r.Color).Render(r.Value))
+}
+
 func (m Model) renderDriverSummary(width int) string {
 	if len(m.sessions) < 20 && (m.loadTotal <= 0 || m.loadTotal == len(m.sessions)) && !m.hasAnyFilter() {
 		return ""
@@ -1558,26 +1791,116 @@ func (m Model) parsedDiscoveryLabel() string {
 }
 
 func (m Model) driverSummaryLine(key, label string, item listDriverItem, total int, width int) string {
+	keyColor := driverKeyColor(key)
+	keyText := lipgloss.NewStyle().
+		Background(lipgloss.Color("236")).
+		Foreground(keyColor).
+		Bold(true).
+		Padding(0, 1).
+		Render(key)
+	labelText := lipgloss.NewStyle().Foreground(keyColor).Render(label)
 	if item.Count == 0 {
-		return dimStyle.Render(truncate(fmt.Sprintf("%s %-7s %s", key, label, i18n.T("driver_none")), width))
+		return truncate(fmt.Sprintf("%s %-7s %s", keyText, labelText, dimStyle.Render(i18n.T("driver_none"))), width)
 	}
 	pct := 0
 	if total > 0 {
 		pct = item.Count * 100 / total
 	}
-	text := fmt.Sprintf("%s %-7s %s  %d/%d %d%%  %s %d  %s %s",
-		key,
-		label,
-		item.Label,
-		item.Count,
-		total,
-		pct,
+	text := fmt.Sprintf("%s %-7s %s  %s  %s %s  %s %s",
+		keyText,
+		labelText,
+		boldStyle.Render(item.Label),
+		dimStyle.Render(scanMetricSummary(item.Count, total, pct)),
 		i18n.T("fail"),
-		item.Fail,
+		metricValueStyle(item.Fail > 0, lipgloss.Color("196")).Render(fmt.Sprintf("%d", item.Fail)),
 		i18n.T("cost"),
 		costCell(item.Cost),
 	)
 	return truncate(text, width)
+}
+
+func driverKeyColor(key string) lipgloss.Color {
+	switch key {
+	case "S":
+		return lipgloss.Color("39")
+	case "M":
+		return lipgloss.Color("99")
+	case "A":
+		return lipgloss.Color("208")
+	default:
+		return lipgloss.Color("245")
+	}
+}
+
+func selectedSessionReason(s engine.Session) selectedReason {
+	met := s.Metrics
+	fail := nonNegativeInt(met.ToolCallsFail)
+	if hasAnomalyType(s, "hanging") {
+		return selectedReason{Label: i18n.T("list_reason_hanging"), Value: sessionIssueLabel(s), Color: lipgloss.Color("196")}
+	}
+	if fail > 0 || hasAnomalyType(s, "tool_failures") {
+		value := sessionIssueLabel(s)
+		if fail > 0 {
+			value = fmt.Sprintf("%d %s", fail, i18n.T("fail"))
+		}
+		return selectedReason{Label: i18n.T("list_reason_failure"), Value: value, Color: lipgloss.Color("196")}
+	}
+	if safeAmount(met.CostEstimated) >= 1 {
+		return selectedReason{Label: i18n.T("list_reason_cost"), Value: money4(met.CostEstimated), Color: lipgloss.Color("208")}
+	}
+	if chartValue(met.DurationSec) > 0 {
+		return selectedReason{Label: i18n.T("list_reason_duration"), Value: engine.FmtDuration(chartValue(met.DurationSec)), Color: lipgloss.Color("214")}
+	}
+	return selectedReason{Label: i18n.T("list_no_major_anomaly"), Value: "", Color: lipgloss.Color("42")}
+}
+
+func hasAnomalyType(s engine.Session, kind string) bool {
+	for _, anomaly := range s.Anomalies {
+		if anomaly.Type == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func metricValueStyle(alert bool, color lipgloss.Color) lipgloss.Style {
+	if alert {
+		return lipgloss.NewStyle().Foreground(color).Bold(true)
+	}
+	return dimStyle
+}
+
+func tokenCell(total int) string {
+	total = nonNegativeInt(total)
+	style := greenStyle
+	if total >= 300000 {
+		style = redStyle
+	} else if total >= 100000 {
+		style = orangeStyle
+	}
+	return style.Render(compactInt(total))
+}
+
+func durationCell(sec float64) string {
+	sec = chartValue(sec)
+	style := greenStyle
+	if sec >= 180 {
+		style = redStyle
+	} else if sec >= 60 {
+		style = orangeStyle
+	}
+	return style.Render(engine.FmtDuration(sec))
+}
+
+func issueCell(issue string, s engine.Session) string {
+	if len(s.Anomalies) == 0 {
+		return dimStyle.Render(issue)
+	}
+	return anomalyColor(s.Anomalies[0].Type).Render(issue)
+}
+
+func scanMetricSummary(count, total, pct int) string {
+	return fmt.Sprintf("%d/%d %d%%", count, total, pct)
 }
 
 func (m Model) buildDriverSummary() listDriverSummary {
@@ -1960,6 +2283,18 @@ func (m Model) renderWaste() string {
 		return m.frameContent(dimStyle.Render(m.selectionHint()))
 	}
 	s := m.sessions[idx]
+	return m.frameContent(m.renderWasteContent(s, panelW))
+}
+
+func (m Model) renderDiagnosticsView() string {
+	if !m.diagnosticsReady {
+		return m.renderWaste()
+	}
+	scrollInfo := dimStyle.Render(fmt.Sprintf(" %s: %.0f%% ", i18n.T("scroll_label"), m.viewport.ScrollPercent()*100))
+	return m.frameContent(lipgloss.JoinVertical(lipgloss.Left, scrollInfo, m.viewport.View()))
+}
+
+func (m Model) renderWasteContent(s engine.Session, panelW int) string {
 	cardW := panelW
 	twoColumn := panelW >= 92
 	if twoColumn {
@@ -1987,6 +2322,13 @@ func (m Model) renderWaste() string {
 	var sections []string
 	sections = append(sections, sessionLabel, "")
 
+	if summary := m.renderSlowRunSummary(s); summary != "" {
+		sections = append(sections, summary, "")
+	}
+	if slowPath := m.renderSlowPathEvidence(s); slowPath != "" {
+		sections = append(sections, slowPath, "")
+	}
+
 	// Waste Score Summary
 	scoreCard := m.renderWasteScoreCard(s)
 	if scoreCard != "" {
@@ -1994,8 +2336,8 @@ func (m Model) renderWaste() string {
 	}
 
 	cards := []string{
-		pCard("196", i18n.T("diag_loop_fingerprint"), m.renderFingerprintLoops(s)),
 		pCard("39", i18n.T("diag_tool_latency"), m.renderToolLatency(s)),
+		pCard("196", i18n.T("diag_loop_fingerprint"), m.renderFingerprintLoops(s)),
 		pCard("220", i18n.T("diag_context_util"), m.renderContextUtil(s)),
 		pCard("208", i18n.T("diag_large_params"), m.renderLargeParams(s)),
 		pCard("42", i18n.T("diag_unused_tools"), m.renderUnusedTools(s)),
@@ -2015,10 +2357,134 @@ func (m Model) renderWaste() string {
 			}
 		}
 		sections = append(sections, lipgloss.JoinVertical(lipgloss.Left, rows...))
-		return m.frameContent(lipgloss.JoinVertical(lipgloss.Left, sections...))
+		return lipgloss.JoinVertical(lipgloss.Left, sections...)
 	}
 	sections = append(sections, lipgloss.JoinVertical(lipgloss.Left, cards...))
-	return m.frameContent(lipgloss.JoinVertical(lipgloss.Left, sections...))
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func (m Model) renderSlowRunSummary(s engine.Session) string {
+	panelW := m.frameBodyWidth()
+	primary, detail, color := slowRunPrimarySignal(s)
+	lines := []string{
+		boldStyle.Render(i18n.T("diag_slow_summary_title")),
+		lipgloss.NewStyle().Foreground(color).Bold(true).Render(truncate(primary, maxInt(8, panelW-6))),
+		dimStyle.Render(truncate(detail, maxInt(8, panelW-6))),
+	}
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(color).
+		Padding(1, 2)
+	return styleForOuterWidth(style, panelW).Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+}
+
+func (m Model) renderSlowPathEvidence(s engine.Session) string {
+	panelW := m.frameBodyWidth()
+	bodyW := maxInt(8, panelW-8)
+	var lines []string
+	for _, line := range slowPathLines(s, bodyW) {
+		lines = append(lines, truncate(line, bodyW))
+	}
+	if len(lines) == 0 {
+		lines = append(lines, dimStyle.Render(i18n.T("diag_slow_no_evidence")))
+	}
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Padding(1, 2)
+	return styleForOuterWidth(style, panelW).Render(lipgloss.JoinVertical(lipgloss.Left,
+		boldStyle.Render(i18n.T("diag_slow_path_title")),
+		"",
+		lipgloss.JoinVertical(lipgloss.Left, lines...),
+	))
+}
+
+func slowRunPrimarySignal(s engine.Session) (string, string, lipgloss.Color) {
+	if tl, ok := topSlowTool(s); ok {
+		return i18n.T("diag_slow_primary_tool_latency"),
+			fmt.Sprintf(i18n.T("diag_slow_tool_detail"), tl.ToolName, chartValue(tl.P95Sec), chartValue(tl.MaxSec)),
+			lipgloss.Color("196")
+	}
+	if maxGap := maxGapSeconds(s.Metrics.GapsSec); maxGap >= 60 {
+		return i18n.T("diag_slow_primary_gap"),
+			fmt.Sprintf(i18n.T("diag_slow_gap_detail"), maxGap),
+			lipgloss.Color("196")
+	}
+	if len(s.LoopFingerprints) > 0 || s.LoopCost.TotalLoopCost > 0 {
+		return i18n.T("diag_slow_primary_loop"),
+			i18n.T("diag_slow_loop_detail"),
+			lipgloss.Color("220")
+	}
+	if len(s.LargeParams) > 0 {
+		return i18n.T("diag_slow_primary_params"),
+			i18n.T("diag_slow_params_detail"),
+			lipgloss.Color("208")
+	}
+	if s.ContextUtil.RiskLevel == "critical" || s.ContextUtil.RiskLevel == "warning" {
+		return i18n.T("diag_slow_primary_context"),
+			s.ContextUtil.Suggestion,
+			lipgloss.Color("220")
+	}
+	return i18n.T("diag_slow_primary_clear"), i18n.T("diag_slow_clear_detail"), lipgloss.Color("42")
+}
+
+func slowPathLines(s engine.Session, width int) []string {
+	var lines []string
+	if tl, ok := topSlowTool(s); ok {
+		lines = append(lines, fmt.Sprintf(i18n.T("diag_slow_path_tool"), tl.ToolName, chartValue(tl.P95Sec), chartValue(tl.MaxSec)))
+	}
+	if maxGap := maxGapSeconds(s.Metrics.GapsSec); maxGap > 0 {
+		lines = append(lines, fmt.Sprintf(i18n.T("diag_slow_path_gap"), maxGap))
+	}
+	if len(s.LoopFingerprints) > 0 || s.LoopCost.TotalLoopCost > 0 {
+		lines = append(lines, i18n.T("diag_slow_path_loop"))
+	}
+	if len(s.LargeParams) > 0 {
+		lines = append(lines, fmt.Sprintf(i18n.T("diag_slow_path_params"), len(s.LargeParams)))
+	}
+	if s.ContextUtil.RiskLevel == "critical" || s.ContextUtil.RiskLevel == "warning" {
+		lines = append(lines, fmt.Sprintf(i18n.T("diag_slow_path_context"), s.ContextUtil.RiskLevel))
+	}
+	for i, line := range lines {
+		lines[i] = fmt.Sprintf("%d. %s", i+1, truncate(line, width-3))
+	}
+	return lines
+}
+
+func topSlowTool(s engine.Session) (engine.ToolLatencyItem, bool) {
+	latencies := sortedToolLatencies(s.ToolLatencies)
+	if len(latencies) == 0 {
+		return engine.ToolLatencyItem{}, false
+	}
+	for _, tl := range latencies {
+		if tl.IsSlow {
+			return tl, true
+		}
+	}
+	return latencies[0], chartValue(latencies[0].MaxSec) > 0
+}
+
+func sortedToolLatencies(items []engine.ToolLatencyItem) []engine.ToolLatencyItem {
+	rows := append([]engine.ToolLatencyItem(nil), items...)
+	sort.SliceStable(rows, func(i, j int) bool {
+		left := chartValue(rows[i].P95Sec)
+		right := chartValue(rows[j].P95Sec)
+		if left != right {
+			return left > right
+		}
+		return chartValue(rows[i].MaxSec) > chartValue(rows[j].MaxSec)
+	})
+	return rows
+}
+
+func maxGapSeconds(gaps []float64) float64 {
+	maxGap := 0.0
+	for _, gap := range gaps {
+		if v := chartValue(gap); v > maxGap {
+			maxGap = v
+		}
+	}
+	return maxGap
 }
 
 func (m Model) renderFingerprintLoops(s engine.Session) string {
@@ -2158,13 +2624,14 @@ func (m Model) renderToolLatency(s engine.Session) string {
 	if len(s.ToolLatencies) == 0 {
 		return dimStyle.Render(i18n.T("diag_no_latency"))
 	}
+	latencies := sortedToolLatencies(s.ToolLatencies)
 	if m.frameBodyWidth() < 70 {
 		var lines []string
 		lines = append(lines, dimStyle.Render(fmt.Sprintf("  %-18s %5s %5s",
 			i18n.T("diag_tool_lat_col_name"),
 			i18n.T("diag_tool_lat_col_avg"),
 			i18n.T("diag_tool_lat_col_max"))))
-		for i, tl := range s.ToolLatencies {
+		for i, tl := range latencies {
 			if i >= 6 {
 				break
 			}
@@ -2189,7 +2656,7 @@ func (m Model) renderToolLatency(s engine.Session) string {
 			i18n.T("diag_tool_lat_col_timeout")))
 	var rows []string
 	rows = append(rows, header)
-	for i, tl := range s.ToolLatencies {
+	for i, tl := range latencies {
 		if i >= 8 {
 			break
 		}
@@ -2326,11 +2793,20 @@ func (m Model) renderDiff() string {
 	if winner == i18n.T("diff_tie") {
 		winStyle = yellowStyle
 	}
-	insight := subtlePanel(i18n.T("diff_comparison"), winStyle.Render(fmt.Sprintf(i18n.T("diff_winner_label"), winner))+dimStyle.Render(" · ")+truncate(explanation, maxInt(8, contentW-24)), contentW)
+	verdict := buildDiffVerdict(dr)
+	insightBody := lipgloss.JoinVertical(lipgloss.Left,
+		boldStyle.Render(truncate(verdict, maxInt(8, contentW-8))),
+		winStyle.Render(fmt.Sprintf(i18n.T("diff_winner_label"), winner))+dimStyle.Render(" · ")+truncate(explanation, maxInt(8, contentW-24)),
+	)
+	insight := subtlePanel(i18n.T("diff_verdict_title"), insightBody, contentW)
+	deltas := m.renderDiffDeltaStrip(dr, contentW)
 
 	if contentW < 82 {
 		var rows []string
 		rows = append(rows, insight)
+		if deltas != "" {
+			rows = append(rows, deltas)
+		}
 		for _, e := range dr.Entries {
 			rows = append(rows, fmt.Sprintf("%s  %s → %s %s",
 				dimStyle.Render(diffFieldLabel(e.Field)),
@@ -2348,11 +2824,61 @@ func (m Model) renderDiff() string {
 	summary := greenStyle.Render(truncate(dr.Summary, contentW-4))
 	body := lipgloss.JoinVertical(lipgloss.Left,
 		insight,
+		deltas,
 		lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right),
 		"",
 		summary,
 	)
 	return m.frameContent(body)
+}
+
+func (m Model) renderDiffDeltaStrip(dr engine.SessionDiff, width int) string {
+	entryByField := map[string]engine.DiffEntry{}
+	for _, e := range dr.Entries {
+		entryByField[e.Field] = e
+	}
+	fields := []string{"cost", "tokens", "duration", "turns", "tools", "fail_count", "health"}
+	innerW := maxInt(12, width)
+	var rows []string
+	var row []string
+	rowW := 0
+	for _, field := range fields {
+		e, ok := entryByField[field]
+		if !ok {
+			continue
+		}
+		chip := diffDeltaChip(e, innerW)
+		chipW := lipgloss.Width(chip)
+		if len(row) > 0 && rowW+1+chipW > innerW {
+			rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, row...))
+			row = nil
+			rowW = 0
+		}
+		if len(row) > 0 {
+			row = append(row, " ")
+			rowW++
+		}
+		row = append(row, chip)
+		rowW += chipW
+	}
+	if len(row) > 0 {
+		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, row...))
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+func diffDeltaChip(e engine.DiffEntry, maxW int) string {
+	label := diffFieldLabel(e.Field)
+	value := fmt.Sprintf("%s %s→%s %s", label, e.ValueA, e.ValueB, e.Delta)
+	chipW := minInt(maxInt(16, lipgloss.Width(value)+4), maxInt(16, maxW))
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(diffDeltaColor(e)).
+		Padding(0, 1)
+	return styleForOuterWidth(style, chipW).Render(diffDeltaStyle(e).Render(truncate(value, maxInt(4, chipW-4))))
 }
 
 func (m Model) renderDiffSessionPanel(label, name string, entries []engine.DiffEntry, leftSide bool, width int) string {
@@ -2388,6 +2914,17 @@ func diffDeltaStyle(e engine.DiffEntry) lipgloss.Style {
 		return yellowStyle
 	default:
 		return dimStyle
+	}
+}
+
+func diffDeltaColor(e engine.DiffEntry) lipgloss.Color {
+	switch e.Better {
+	case "B":
+		return lipgloss.Color("42")
+	case "A":
+		return lipgloss.Color("220")
+	default:
+		return lipgloss.Color("245")
 	}
 }
 
@@ -2515,10 +3052,21 @@ func (m *Model) sortColTitle(base, field string) string {
 }
 
 func costCell(amount float64) string {
-	return money4(safeAmount(amount))
+	amount = safeAmount(amount)
+	style := greenStyle
+	if amount >= 1 {
+		style = redStyle
+	} else if amount >= 0.1 {
+		style = orangeStyle
+	}
+	return style.Render(money4(amount))
 }
 
 func healthCell(health int, width int) string {
+	return healthColor(health).Render(healthCellText(health, width))
+}
+
+func healthCellText(health int, width int) string {
 	health = clampHealth(health)
 	score := fmt.Sprintf("%d%%", health)
 	if width < 7 {
@@ -2534,7 +3082,7 @@ func healthCell(health int, width int) string {
 	if candidate := fmt.Sprintf("%s %s", score, label); lipgloss.Width(candidate) <= width {
 		text = candidate
 	}
-	return healthColor(health).Render(truncate(text, width))
+	return truncate(text, width)
 }
 
 // refreshColumns rebuilds column titles after a language switch.
@@ -2552,6 +3100,9 @@ func (m *Model) adjustColumnWidths(width int) {
 
 	if width >= 170 {
 		m.setColumnsAndRefreshRows(m.wideListColumns(22, 13, 18, 5, 5, 5, 5, 8, 7, 8, 5, 9, 16))
+		return
+	} else if width >= 150 {
+		m.setColumnsAndRefreshRows(m.wideListColumns(16, 9, 8, 5, 5, 5, 4, 9, 7, 8, 4, 9, 16))
 		return
 	} else if width > 130 {
 		m.setColumnsAndRefreshRows(m.wideListColumns(14, 13, 10, 5, 5, 5, 4, 7, 6, 5, 4, 9, 7))
@@ -2670,9 +3221,9 @@ func (m Model) renderOverview() string {
 	}
 
 	hero := m.renderDashboardHero(contentW)
-	controls := m.renderDashboardControls(contentW)
-	actionHint := m.renderOverviewActionHint(contentW)
 	metrics := m.renderDashboardMetrics(contentW)
+	actionHint := m.renderOverviewActionHint(contentW)
+	controls := m.renderDashboardControls(contentW)
 
 	var body string
 	if contentW >= 132 {
@@ -2680,7 +3231,7 @@ func (m Model) renderOverview() string {
 		midW := contentW * 33 / 100
 		rightW := contentW - leftW - midW - 4
 		row1 := lipgloss.JoinHorizontal(lipgloss.Top,
-			m.renderTriagePanel(leftW), "  ",
+			m.renderInspectFirstPanel(leftW), "  ",
 			m.renderTokenUsagePanel(midW), "  ",
 			m.renderHealthPanel(rightW),
 		)
@@ -2694,21 +3245,21 @@ func (m Model) renderOverview() string {
 		body = lipgloss.JoinVertical(lipgloss.Left, row1, "", row2)
 	} else if contentW >= 86 {
 		half := (contentW - 2) / 2
-		row1 := lipgloss.JoinHorizontal(lipgloss.Top, m.renderTriagePanel(half), "  ", m.renderHealthPanel(contentW-half-2))
-		row2 := lipgloss.JoinHorizontal(lipgloss.Top, m.renderTokenUsagePanel(half), "  ", m.renderRecentSessionsPanel(contentW-half-2))
-		body = lipgloss.JoinVertical(lipgloss.Left, row1, "", row2, "", m.renderLatencyPanel(contentW), "", m.renderTopAgentsPanel(contentW))
+		row1 := lipgloss.JoinHorizontal(lipgloss.Top, m.renderInspectFirstPanel(half), "  ", m.renderTokenUsagePanel(contentW-half-2))
+		row2 := lipgloss.JoinHorizontal(lipgloss.Top, m.renderLatencyPanel(half), "  ", m.renderRecentSessionsPanel(contentW-half-2))
+		body = lipgloss.JoinVertical(lipgloss.Left, row1, "", row2, "", m.renderHealthPanel(contentW), "", m.renderTopAgentsPanel(contentW))
 	} else {
 		body = lipgloss.JoinVertical(lipgloss.Left,
-			m.renderTriagePanel(contentW), "",
-			m.renderHealthPanel(contentW), "",
+			m.renderInspectFirstPanel(contentW), "",
 			m.renderTokenUsagePanel(contentW), "",
 			m.renderLatencyPanel(contentW), "",
+			m.renderHealthPanel(contentW), "",
 			m.renderRecentSessionsPanel(contentW), "",
 			m.renderTopAgentsPanel(contentW),
 		)
 	}
 
-	page := lipgloss.JoinVertical(lipgloss.Left, hero, controls, actionHint, metrics, body)
+	page := lipgloss.JoinVertical(lipgloss.Left, hero, metrics, actionHint, controls, body)
 	return lipgloss.NewStyle().Width(innerW).Render(page)
 }
 
@@ -2758,25 +3309,10 @@ func (m Model) renderCompactFocus(width int) string {
 	if len(m.sessions) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left, title, dimStyle.Render(i18n.T("no_data")))
 	}
-	rows := topRiskSessions(m.sessions, minInt(3, len(m.sessions)))
-	nameW := maxInt(10, width-31)
 	var lines []string
 	lines = append(lines, title)
-	for _, s := range rows {
-		health := clampHealth(s.Health)
-		issue := i18n.T("list_no_major_anomaly")
-		if len(s.Anomalies) > 0 {
-			issue = anomalyTypeLabel(s.Anomalies[0].Type)
-		}
-		line := fmt.Sprintf("%s %-*s %4d%% %8s  %s",
-			healthColor(health).Render("●"),
-			nameW,
-			truncate(s.Name, nameW),
-			health,
-			money4(s.Metrics.CostEstimated),
-			issue,
-		)
-		lines = append(lines, truncate(line, width))
+	for _, item := range m.inspectFirstItems() {
+		lines = append(lines, truncate(compactInspectLine(item, width), width))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
@@ -2818,6 +3354,47 @@ func topRiskSessions(sessions []engine.Session, limit int) []engine.Session {
 		rows = rows[:limit]
 	}
 	return rows
+}
+
+func topCostSession(sessions []engine.Session) (engine.Session, bool) {
+	if len(sessions) == 0 {
+		return engine.Session{}, false
+	}
+	top := sessions[0]
+	for _, s := range sessions[1:] {
+		if safeAmount(s.Metrics.CostEstimated) > safeAmount(top.Metrics.CostEstimated) {
+			top = s
+		}
+	}
+	return top, true
+}
+
+func topSlowSession(sessions []engine.Session) (engine.Session, bool) {
+	if len(sessions) == 0 {
+		return engine.Session{}, false
+	}
+	top := sessions[0]
+	for _, s := range sessions[1:] {
+		if chartValue(s.Metrics.DurationSec) > chartValue(top.Metrics.DurationSec) {
+			top = s
+		}
+	}
+	return top, true
+}
+
+func topCriticalSession(sessions []engine.Session) (engine.Session, bool) {
+	var top engine.Session
+	found := false
+	for _, s := range sessions {
+		if clampHealth(s.Health) >= 50 {
+			continue
+		}
+		if !found || clampHealth(s.Health) < clampHealth(top.Health) {
+			top = s
+			found = true
+		}
+	}
+	return top, found
 }
 
 func healthColor(health int) lipgloss.Style {
@@ -2981,26 +3558,21 @@ func (m Model) overviewActionMessage() string {
 }
 
 func (m Model) renderDashboardMetrics(width int) string {
+	totalTokens := costSummaryTotalTokens(m.costSummary)
+	totalElapsed := totalElapsedSeconds(m.sessions)
+	p95 := aggregateP95Latency(m.sessions)
+	topAgent, topAgentCost := topAgentByCost(m.sessions)
+	topModel, topModelCost := topModelByCost(m.sessions)
+
 	if width < 70 {
 		cardW := width
-		totalTokens := costSummaryTotalTokens(m.costSummary)
-		toolTotal, toolFail := aggregateToolCounts(m.sessions)
-		errorRate := 0.0
-		if toolTotal > 0 {
-			errorRate = float64(toolFail) / float64(toolTotal) * 100
-		}
-		p95 := aggregateP95Latency(m.sessions)
-		health := clampHealth(int(m.aggStats.AvgHealth))
-		if len(m.sessions) == 0 {
-			health = 0
-		}
 		cards := []string{
-			metricCard(i18n.T("metric_tokens"), compactInt(totalTokens), i18n.T("metric_live"), cardW, "82"),
 			metricCard(i18n.T("metric_cost"), money2(m.costSummary.TotalCost), i18n.T("metric_estimated"), cardW, "82"),
-			metricCard(i18n.T("metric_sessions"), fmt.Sprintf("%d", len(m.sessions)), i18n.T("metric_loaded"), cardW, "82"),
-			metricCard(i18n.T("metric_errors"), fmt.Sprintf("%.2f%%", errorRate), fmt.Sprintf(i18n.T("metric_failed"), toolFail), cardW, "82"),
+			metricCard(i18n.T("metric_tokens"), compactInt(totalTokens), i18n.T("metric_live"), cardW, "82"),
+			metricCard(i18n.T("metric_elapsed"), engine.FmtDuration(totalElapsed), i18n.T("metric_all_sessions"), cardW, "214"),
 			metricCard(i18n.T("metric_p95"), fmt.Sprintf("%.2fs", p95), i18n.T("metric_tool_gaps"), cardW, "39"),
-			metricCard(i18n.T("metric_health"), fmt.Sprintf("%d%%", health), healthLabel(health), cardW, "82"),
+			metricCard(i18n.T("metric_top_agent"), topAgent, money2(topAgentCost), cardW, "45"),
+			metricCard(i18n.T("metric_top_model"), topModel, money2(topModelCost), cardW, "99"),
 		}
 		return lipgloss.JoinVertical(lipgloss.Left, cards...)
 	}
@@ -3008,37 +3580,24 @@ func (m Model) renderDashboardMetrics(width int) string {
 	if cardW < 16 {
 		cardW = (width - 4) / 3
 	}
-	totalTokens := costSummaryTotalTokens(m.costSummary)
-	toolTotal, toolFail := aggregateToolCounts(m.sessions)
-	errorRate := 0.0
-	if toolTotal > 0 {
-		errorRate = float64(toolFail) / float64(toolTotal) * 100
-	}
-	p95 := aggregateP95Latency(m.sessions)
-	health := clampHealth(int(m.aggStats.AvgHealth))
-	if len(m.sessions) == 0 {
-		health = 0
-	}
 	tokenTitle := i18n.T("metric_total_tokens")
 	costTitle := i18n.T("metric_total_cost_usd")
-	errorTitle := i18n.T("metric_error_rate")
+	elapsedTitle := i18n.T("metric_elapsed_time")
 	p95Title := i18n.T("metric_p95_latency")
-	healthTitle := i18n.T("metric_health_score")
 	if cardW < 20 {
 		tokenTitle = i18n.T("metric_tokens")
 		costTitle = i18n.T("metric_cost")
-		errorTitle = i18n.T("metric_errors")
+		elapsedTitle = i18n.T("metric_elapsed")
 		p95Title = i18n.T("metric_p95")
-		healthTitle = i18n.T("metric_health")
 	}
 
 	cards := []string{
-		metricCard(tokenTitle, compactInt(totalTokens), i18n.T("metric_live"), cardW, "82"),
 		metricCard(costTitle, money2(m.costSummary.TotalCost), i18n.T("metric_estimated"), cardW, "82"),
-		metricCard(i18n.T("metric_sessions"), fmt.Sprintf("%d", len(m.sessions)), i18n.T("metric_loaded"), cardW, "82"),
-		metricCard(errorTitle, fmt.Sprintf("%.2f%%", errorRate), fmt.Sprintf(i18n.T("metric_failed"), toolFail), cardW, "82"),
+		metricCard(tokenTitle, compactInt(totalTokens), i18n.T("metric_live"), cardW, "82"),
+		metricCard(elapsedTitle, engine.FmtDuration(totalElapsed), i18n.T("metric_all_sessions"), cardW, "214"),
 		metricCard(p95Title, fmt.Sprintf("%.2fs", p95), i18n.T("metric_tool_gaps"), cardW, "39"),
-		metricCard(healthTitle, fmt.Sprintf("%d%%", health), healthLabel(health), cardW, "82"),
+		metricCard(i18n.T("metric_top_agent"), topAgent, money2(topAgentCost), cardW, "45"),
+		metricCard(i18n.T("metric_top_model"), topModel, money2(topModelCost), cardW, "99"),
 	}
 
 	if width >= 110 {
@@ -3050,10 +3609,11 @@ func (m Model) renderDashboardMetrics(width int) string {
 }
 
 func metricCard(title, value, sub string, width int, color string) string {
+	bodyW := maxInt(4, width-6)
 	body := lipgloss.JoinVertical(lipgloss.Left,
-		dashTitleStyle.Render(title),
-		lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Bold(true).Render(value),
-		dimStyle.Render(sub),
+		dashTitleStyle.Render(truncate(title, bodyW)),
+		lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Bold(true).Render(truncate(value, bodyW)),
+		dimStyle.Render(truncate(sub, bodyW)),
 	)
 	return styleForOuterWidth(dashPanelStyle, width).Height(5).Render(body)
 }
@@ -3161,36 +3721,71 @@ func (m Model) renderAnomalyPanel(width int) string {
 	return dashboardPanel(i18n.T("panel_anomaly_detection"), cyanStyle.Render(i18n.T("panel_view_all")), strings.Join(lines, "\n"), width)
 }
 
-func (m Model) renderTriagePanel(width int) string {
+type inspectFirstItem struct {
+	Label      string
+	EmptyText  string
+	Session    engine.Session
+	HasSession bool
+}
+
+func (m Model) renderInspectFirstPanel(width int) string {
 	innerW := dashboardInnerWidth(width)
 	if len(m.sessions) == 0 {
-		return dashboardPanel(i18n.T("panel_triage_now"), "", dimStyle.Render(i18n.T("triage_no_sessions")), width)
+		return dashboardPanel(i18n.T("panel_inspect_first"), "", dimStyle.Render(i18n.T("triage_no_sessions")), width)
 	}
 
-	s := topRiskSessions(m.sessions, 1)[0]
-	ins := buildSessionInsight(
-		s,
-		engine.GenerateFixes(s.Metrics, s.Anomalies),
-		engine.PredictCostAnomaly(costBaselineSessions(m.sessions, s), s),
-	)
+	items := m.inspectFirstItems()
+	labelW := 0
+	for _, item := range items {
+		labelW = maxInt(labelW, lipgloss.Width(item.Label))
+	}
+	var lines []string
+	for _, item := range items {
+		lines = append(lines, inspectFirstLine(item, labelW, innerW))
+	}
+	return dashboardPanel(i18n.T("panel_inspect_first"), cyanStyle.Render(i18n.T("triage_panel_aside")), strings.Join(lines, "\n"), width)
+}
+
+func (m Model) inspectFirstItems() []inspectFirstItem {
+	costSession, hasCost := topCostSession(m.sessions)
+	slowSession, hasSlow := topSlowSession(m.sessions)
+	criticalSession, hasCritical := topCriticalSession(m.sessions)
+	return []inspectFirstItem{
+		{Label: i18n.T("inspect_top_cost"), Session: costSession, HasSession: hasCost},
+		{Label: i18n.T("inspect_slowest"), Session: slowSession, HasSession: hasSlow},
+		{Label: i18n.T("inspect_critical"), EmptyText: i18n.T("inspect_no_critical"), Session: criticalSession, HasSession: hasCritical},
+	}
+}
+
+func inspectFirstLine(item inspectFirstItem, labelW int, width int) string {
+	if !item.HasSession {
+		return triageLine(item.Label, item.EmptyText, labelW, width)
+	}
+	s := item.Session
 	health := clampHealth(s.Health)
-	nameW := maxInt(8, innerW-17)
-	head := fmt.Sprintf("%s %-*s %3d%% %s",
+	value := fmt.Sprintf("%s %s  %s  %s  %d%%",
 		healthColor(health).Render("●"),
+		truncate(s.Name, maxInt(8, width-labelW-28)),
+		money4(s.Metrics.CostEstimated),
+		engine.FmtDuration(chartValue(s.Metrics.DurationSec)),
+		health,
+	)
+	return triageLine(item.Label, value, labelW, width)
+}
+
+func compactInspectLine(item inspectFirstItem, width int) string {
+	if !item.HasSession {
+		return fmt.Sprintf("%s  %s", item.Label, item.EmptyText)
+	}
+	s := item.Session
+	nameW := maxInt(8, width-lipgloss.Width(item.Label)-27)
+	return fmt.Sprintf("%s  %-*s %8s %8s",
+		item.Label,
 		nameW,
 		truncate(s.Name, nameW),
-		health,
 		money4(s.Metrics.CostEstimated),
+		engine.FmtDuration(chartValue(s.Metrics.DurationSec)),
 	)
-	labelW := lipgloss.Width(i18n.T("triage_evidence_label"))
-	lines := []string{
-		truncate(head, innerW),
-		triageLine(i18n.T("triage_issue_label"), ins.Issue, labelW, innerW),
-		triageLine(i18n.T("triage_impact_label"), ins.Impact, labelW, innerW),
-		triageLine(i18n.T("triage_evidence_label"), ins.Evidence, labelW, innerW),
-		triageLine(i18n.T("triage_next_label"), triageKeyHint(s)+" · "+ins.NextAction, labelW, innerW),
-	}
-	return dashboardPanel(i18n.T("panel_triage_now"), cyanStyle.Render(i18n.T("triage_panel_aside")), strings.Join(lines, "\n"), width)
 }
 
 func triageLine(label, value string, labelW int, width int) string {
@@ -3317,6 +3912,50 @@ func aggregateToolCounts(sessions []engine.Session) (total, failed int) {
 		failed += nonNegativeInt(s.Metrics.ToolCallsFail)
 	}
 	return total, failed
+}
+
+func totalElapsedSeconds(sessions []engine.Session) float64 {
+	total := 0.0
+	for _, s := range sessions {
+		total += chartValue(s.Metrics.DurationSec)
+	}
+	return total
+}
+
+func topAgentByCost(sessions []engine.Session) (string, float64) {
+	costs := map[string]float64{}
+	for _, s := range sessions {
+		name := sourceDisplayName(s.Metrics.SourceTool)
+		costs[name] += safeAmount(s.Metrics.CostEstimated)
+	}
+	return topCostName(costs)
+}
+
+func topModelByCost(sessions []engine.Session) (string, float64) {
+	costs := map[string]float64{}
+	for _, s := range sessions {
+		name := s.Metrics.ModelUsed
+		if name == "" {
+			name = i18n.T("not_available")
+		}
+		costs[name] += safeAmount(s.Metrics.CostEstimated)
+	}
+	return topCostName(costs)
+}
+
+func topCostName(costs map[string]float64) (string, float64) {
+	if len(costs) == 0 {
+		return i18n.T("not_available"), 0
+	}
+	topName := ""
+	topCost := 0.0
+	for name, cost := range costs {
+		if topName == "" || cost > topCost || (cost == topCost && name < topName) {
+			topName = name
+			topCost = cost
+		}
+	}
+	return topName, topCost
 }
 
 func costSummaryTotalTokens(cs engine.CostSummary) int {
@@ -3614,6 +4253,8 @@ func diffFieldLabel(field string) string {
 		return i18n.T("diff_field_health")
 	case "cost":
 		return i18n.T("diff_field_cost")
+	case "tokens":
+		return i18n.T("diff_field_tokens")
 	case "turns":
 		return i18n.T("diff_field_turns")
 	case "tools":

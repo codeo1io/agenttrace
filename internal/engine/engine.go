@@ -1,5 +1,5 @@
 // Package engine provides the core analysis engine for agenttrace.
-// Pure Go. Supports 13 agent formats: Hermes Agent, Claude Code, Codex CLI, Gemini CLI, Qwen Code, OpenCode, OpenClaw, Copilot CLI, Kimi CLI, Oh My Pi, Aider, Cursor, Cline.
+// Pure Go. Supports 14 agent sources: Hermes Agent, Claude Code, Codex CLI, Gemini CLI, Qwen Code, OpenCode, OpenClaw, Copilot CLI, Kimi CLI, Pi, Oh My Pi, Aider, Cursor, Cline.
 package engine
 
 import (
@@ -15,7 +15,7 @@ import (
 	"github.com/luoyuctl/agenttrace/internal/i18n"
 )
 
-const Version = "0.4.0"
+const Version = "0.4.6"
 
 // Severity constants for anomaly severity (internal, not i18n).
 const (
@@ -54,6 +54,7 @@ var ToolDisplayNames = map[string]string{
 	"openclaw":          "OpenClaw",
 	"copilot_cli":       "Copilot CLI",
 	"kimi_cli":          "Kimi CLI",
+	"pi":                "Pi",
 	"oh_my_pi":          "Oh My Pi",
 	"aider":             "Aider",
 	"cursor":            "Cursor",
@@ -789,7 +790,7 @@ func Parse(path string) ([]Event, error) {
 	case "kimi_cli":
 		return parseKimiCLI(fi.Doc)
 	case "oh_my_pi":
-		return parseOhMyPiSessionJSONL(string(fi.Raw))
+		return parseOhMyPiSessionJSONL(string(fi.Raw), piSourceForPath(path))
 	case "aider_chat_history":
 		return parseAiderChatHistory(string(fi.Raw))
 	case "cursor":
@@ -2292,50 +2293,7 @@ func FindSessionFiles(dir string) []string {
 		}
 		return sortFilesByModTime(all)
 	}
-	if isOpenCodeStoragePath(dir) {
-		return collectSessionFiles(dir)
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	type entryInfo struct {
-		path string
-		t    time.Time
-	}
-	var items []entryInfo
-	for _, e := range entries {
-		path := filepath.Join(dir, e.Name())
-		if e.IsDir() {
-			if isClineTaskDir(path) {
-				info, err := e.Info()
-				mt := time.Time{}
-				if err == nil {
-					mt = info.ModTime()
-				}
-				items = append(items, entryInfo{path: path, t: mt})
-			}
-			continue
-		}
-		name := e.Name()
-		if !isSessionFileName(name) {
-			continue
-		}
-		info, err := e.Info()
-		mt := time.Time{}
-		if err == nil {
-			mt = info.ModTime()
-		}
-		items = append(items, entryInfo{path: path, t: mt})
-	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].t.After(items[j].t)
-	})
-	files := make([]string, len(items))
-	for i, it := range items {
-		files[i] = it.path
-	}
-	return files
+	return collectSessionFiles(dir)
 }
 
 func sortFilesByModTime(paths []string) []string {
@@ -2388,6 +2346,7 @@ func KnownSessionDirs() []KnownSessionDir {
 		{Name: "Gemini CLI tmp", Path: filepath.Join(home, ".gemini", "tmp")},
 		{Name: "Qwen Code", Path: filepath.Join(home, ".qwen", "projects")},
 		{Name: "Claude Code", Path: filepath.Join(home, ".claude", "projects")},
+		{Name: "Pi", Path: filepath.Join(home, ".pi", "agent", "sessions")},
 		{Name: "Oh My Pi", Path: filepath.Join(home, ".omp", "agent", "sessions")},
 	}
 	dirs = append(dirs, openCodeKnownSessionDirs(home)...)
@@ -2867,6 +2826,9 @@ func DiffSessions(a, b Session) SessionDiff {
 	// cost (低更好)
 	diff.Entries = append(diff.Entries, compareFloat("cost", a.Metrics.CostEstimated, b.Metrics.CostEstimated, "lower"))
 
+	// tokens (少更好, 代表上下文压力)
+	diff.Entries = append(diff.Entries, compareInt("tokens", diffTotalTokens(a.Metrics), diffTotalTokens(b.Metrics), "lower"))
+
 	// health (高更好)
 	diff.Entries = append(diff.Entries, compareInt("health", a.Health, b.Health, "higher"))
 
@@ -2889,6 +2851,10 @@ func DiffSessions(a, b Session) SessionDiff {
 	diff.Summary = buildDiffSummary(a, b)
 
 	return diff
+}
+
+func diffTotalTokens(m Metrics) int {
+	return m.TokensInput + m.TokensOutput + m.TokensCacheR + m.TokensCacheW
 }
 
 // compareInt 比较整数字段并返回 DiffEntry

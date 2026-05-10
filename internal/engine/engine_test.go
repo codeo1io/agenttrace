@@ -191,6 +191,24 @@ func TestLoadAllSkipsBadFilesAndSortsBySessionStart(t *testing.T) {
 	}
 }
 
+func TestFindSessionFilesCustomDirIncludesNestedSessionRoots(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "2026", "05", "04")
+	if err := os.MkdirAll(nested, 0755); err != nil {
+		t.Fatal(err)
+	}
+	top := writeLoadableHermesSession(t, dir, "top", "2026-01-02T10:00:00Z")
+	deep := writeLoadableHermesSession(t, nested, "deep", "2026-01-02T11:00:00Z")
+
+	files := FindSessionFiles(dir)
+	if !containsPath(files, top) || !containsPath(files, deep) {
+		t.Fatalf("expected explicit dir discovery to include top and nested sessions, got %v", files)
+	}
+	if files[0] != deep {
+		t.Fatalf("expected nested newer session first, got %v", files)
+	}
+}
+
 func TestParseClaudeCode_ToolResultArray(t *testing.T) {
 	doc := map[string]interface{}{
 		"model": "claude",
@@ -448,6 +466,36 @@ func TestParseOhMyPiSessionJSONL(t *testing.T) {
 	}
 }
 
+func TestParsePiSessionJSONLUsesPiSourceFromPath(t *testing.T) {
+	home := t.TempDir()
+	sessionDir := filepath.Join(home, ".pi", "agent", "sessions")
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sessionDir, "session.jsonl")
+	raw := makeJSONL([]interface{}{
+		map[string]interface{}{"type": "session", "version": 3, "id": "pi-session", "cwd": "/work/pi"},
+		map[string]interface{}{
+			"type": "message",
+			"message": map[string]interface{}{
+				"role":    "user",
+				"content": "hello from pi",
+			},
+		},
+	})
+	if err := os.WriteFile(path, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := Analyze(events, "mimo-v2.5-pro"); m.SourceTool != "pi" {
+		t.Fatalf("expected PI source for ~/.pi session, got %+v", m)
+	}
+}
+
 func TestParseOhMyPiSessionJSONL_InvalidHeader(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "broken.jsonl")
@@ -464,6 +512,45 @@ func TestParseOhMyPiSessionJSONL_InvalidHeader(t *testing.T) {
 	}
 	if _, err := Parse(path); err == nil {
 		t.Fatalf("expected invalid oh-my-pi header to fail")
+	}
+}
+
+func TestFindSessionFilesIncludesPiSessionDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	sessionDir := filepath.Join(home, ".pi", "agent", "sessions")
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(sessionDir, "session.jsonl")
+	raw := makeJSONL([]interface{}{
+		map[string]interface{}{"type": "session", "version": 3, "id": "pi-session", "cwd": "/work/pi"},
+		map[string]interface{}{
+			"type": "message",
+			"message": map[string]interface{}{
+				"role":    "user",
+				"content": "hello from pi",
+			},
+		},
+	})
+	if err := os.WriteFile(path, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := DetectFormat(path).Format; got != "oh_my_pi" {
+		t.Fatalf("pi session format: %s", got)
+	}
+	events, err := Parse(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := Analyze(events, "mimo-v2.5-pro"); m.SourceTool != "pi" {
+		t.Fatalf("expected PI source for auto-discovered PI session, got %+v", m)
+	}
+	files := FindSessionFiles("")
+	if !containsPath(files, path) {
+		t.Fatalf("expected PI session file, got %v", files)
 	}
 }
 
@@ -1297,12 +1384,13 @@ func TestReportOverviewJSONIncludesOperationalSummary(t *testing.T) {
 	var payload struct {
 		Version string `json:"version"`
 		Summary struct {
-			TotalSessions int     `json:"total_sessions"`
-			Critical      int     `json:"critical"`
-			TotalCost     float64 `json:"total_cost"`
-			TotalTokens   int     `json:"total_tokens"`
-			ToolFailRate  float64 `json:"tool_fail_rate"`
-			HealthTrend   struct {
+			TotalSessions  int     `json:"total_sessions"`
+			Critical       int     `json:"critical"`
+			TotalCost      float64 `json:"total_cost"`
+			TotalTokens    int     `json:"total_tokens"`
+			ToolFailRate   float64 `json:"tool_fail_rate"`
+			AnomaliesTotal int     `json:"anomalies_total"`
+			HealthTrend    struct {
 				Direction  string `json:"direction"`
 				Regressing bool   `json:"regressing"`
 				Message    string `json:"message"`
@@ -1333,12 +1421,44 @@ func TestReportOverviewJSONIncludesOperationalSummary(t *testing.T) {
 	if payload.Summary.TotalCost != 1 || payload.Summary.TotalTokens != 525 || payload.Summary.ToolFailRate != 25 {
 		t.Fatalf("missing operational totals: %+v", payload.Summary)
 	}
+	if payload.Summary.AnomaliesTotal != 1 {
+		t.Fatalf("missing anomaly total: %+v", payload.Summary)
+	}
 	if payload.Summary.HealthTrend.Direction == "" || payload.Summary.HealthTrend.Message == "" || len(payload.Summary.HealthTrend.Points) != 2 {
 		t.Fatalf("missing health trend: %+v", payload.Summary.HealthTrend)
 	}
 	if len(payload.ByAgent) != 2 || len(payload.RecentSessions) != 2 || len(payload.Anomalies) != 1 {
 		t.Fatalf("missing overview sections: agents=%d recent=%d anomalies=%d",
 			len(payload.ByAgent), len(payload.RecentSessions), len(payload.Anomalies))
+	}
+}
+
+func TestReportOverviewJSONLimitsAnomalies(t *testing.T) {
+	var sessions []Session
+	for i := 0; i < 55; i++ {
+		sessions = append(sessions, Session{
+			Name:      fmt.Sprintf("s%02d", i),
+			Health:    40,
+			Anomalies: []Anomaly{{Type: "hanging", Severity: SeverityHigh}},
+		})
+	}
+
+	var payload struct {
+		Summary struct {
+			AnomaliesTotal     int  `json:"anomalies_total"`
+			AnomaliesReturned  int  `json:"anomalies_returned"`
+			AnomaliesTruncated bool `json:"anomalies_truncated"`
+		} `json:"summary"`
+		Anomalies []AnomalyTop `json:"anomalies"`
+	}
+	if err := json.Unmarshal([]byte(ReportOverviewJSON(ComputeOverview(sessions), sessions)), &payload); err != nil {
+		t.Fatalf("invalid overview json: %v", err)
+	}
+	if payload.Summary.AnomaliesTotal != 55 || payload.Summary.AnomaliesReturned != 50 || !payload.Summary.AnomaliesTruncated {
+		t.Fatalf("bad anomaly limit summary: %+v", payload.Summary)
+	}
+	if len(payload.Anomalies) != 50 {
+		t.Fatalf("expected 50 returned anomalies, got %d", len(payload.Anomalies))
 	}
 }
 

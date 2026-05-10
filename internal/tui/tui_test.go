@@ -349,6 +349,9 @@ func TestListDriverSummaryShowsDominantGroupsAndCounts(t *testing.T) {
 
 	for _, want := range []string{
 		i18n.T("driver_summary_title"),
+		i18n.T("driver_source"),
+		i18n.T("driver_model"),
+		i18n.T("driver_anomaly"),
 		"Claude Code",
 		"claude-sonnet-4",
 		anomalyTypeLabel("tool_failures"),
@@ -475,7 +478,7 @@ func TestListEmptyFilterStateShowsRecoveryPath(t *testing.T) {
 	m.filterText = "no-such-session"
 	m.rebuildFilteredView()
 
-	rendered := m.View()
+	rendered := m.renderWaste()
 	for _, want := range []string{
 		i18n.T("no_visible_sessions_title"),
 		fmt.Sprintf(i18n.T("no_visible_sessions_active"), m.filterLabel()),
@@ -575,6 +578,7 @@ func TestCommandBackspaceRemovesWholeRune(t *testing.T) {
 func TestTabIntoDiffPreparesComparison(t *testing.T) {
 	m := resizeForTest(t, sampleModelForTest(), 100, 30)
 	m.view = viewDiagnostics
+	m.openDiagnostics()
 	m.rebuildFilteredView()
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
@@ -585,6 +589,23 @@ func TestTabIntoDiffPreparesComparison(t *testing.T) {
 	}
 	if len(m.diffResult.Entries) == 0 {
 		t.Fatalf("expected prepared diff entries")
+	}
+}
+
+func TestDiagnosticsViewUsesScrollableViewport(t *testing.T) {
+	m := resizeForTest(t, sampleModelForTest(), 80, 24)
+	m.view = viewList
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	m = next.(Model)
+	if m.view != viewDiagnostics || !m.diagnosticsReady {
+		t.Fatalf("expected diagnostics viewport to be ready, view=%d ready=%v", m.view, m.diagnosticsReady)
+	}
+	before := m.viewport.YOffset
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = next.(Model)
+	if m.viewport.YOffset <= before {
+		t.Fatalf("expected diagnostics viewport to scroll, before=%d after=%d", before, m.viewport.YOffset)
 	}
 }
 
@@ -607,6 +628,21 @@ func TestCompactListKeepsTokensAndHealthReadable(t *testing.T) {
 	}
 	if row[6] != "92%" {
 		t.Fatalf("expected health value, got %q", row[6])
+	}
+}
+
+func TestCompactHeightListKeepsTableRowsVisible(t *testing.T) {
+	m := resizeForTest(t, sampleModelForTest(), 80, 24)
+	m.view = viewList
+
+	rendered := m.View()
+	for _, want := range []string{"session_alpha", "$0.4200", "214.0K", "92%"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("compact-height list should keep table data visible, missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "TOP DRIVERS") {
+		t.Fatalf("compact-height list should prioritize table rows over summary panels:\n%s", rendered)
 	}
 }
 
@@ -662,6 +698,17 @@ func TestWideListKeepsFullOperationalColumns(t *testing.T) {
 	}
 	if row[12] != "No major anomaly" {
 		t.Fatalf("expected issue column, got row=%v", row)
+	}
+	rendered := m.View()
+	for _, want := range []string{"DURATION", "$0.4200", "214.0K", "No major anomaly"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("wide list should render diagnostic data without hiding %q:\n%s", want, rendered)
+		}
+	}
+	for _, clipped := range []string{"DURA…", "$0.42…", "No maj…"} {
+		if strings.Contains(rendered, clipped) {
+			t.Fatalf("wide list should not clip core diagnostic data %q:\n%s", clipped, rendered)
+		}
 	}
 }
 
@@ -1042,13 +1089,37 @@ func TestListViewShowsSelectedSessionSummary(t *testing.T) {
 
 	m := resizeForTest(t, sampleModelForTest(), 120, 32)
 	m.view = viewList
+	m.sessions[1].Metrics.DurationSec = 122
+	m.refreshTable()
 	m.table.SetCursor(1)
 
 	rendered := m.View()
-	for _, want := range []string{"SELECTED SESSION", "session_beta", "$1.2500", "tool failures"} {
+	for _, want := range []string{"SELECTED SESSION", "session_beta", "Reason", "failure", "$1.2500", "461.0K", "DURATION", "2.0m", "tool failures"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("list summary missing %q:\n%s", want, rendered)
 		}
+	}
+}
+
+func TestListViewSelectedSummaryFitsNarrowCriticalList(t *testing.T) {
+	prev := i18n.Current
+	i18n.SetLang(i18n.EN)
+	t.Cleanup(func() { i18n.SetLang(prev) })
+
+	m := resizeForTest(t, sampleModelForTest(), 80, 32)
+	m.view = viewList
+	m.sessions[2].Metrics.DurationSec = 240
+	m.refreshTable()
+	m.runCommand("critical")
+
+	rendered := m.View()
+	for _, want := range []string{"SELECTED SESSION", "gamma", "Reason", "hanging", "DURATION", "4.0m"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("narrow critical list missing %q:\n%s", want, rendered)
+		}
+	}
+	if got := maxRenderedWidth(rendered); got > 80 {
+		t.Fatalf("narrow critical list rendered too wide: got=%d line=%q", got, widestLine(rendered))
 	}
 }
 
@@ -1071,7 +1142,7 @@ func TestCompactOverviewUsesScanFriendlySmallViewport(t *testing.T) {
 
 	rendered := m.View()
 
-	for _, want := range []string{"Next", "FOCUS", "RECENT", "TOKEN", "HEALTH"} {
+	for _, want := range []string{"Next", "INSPECT FIRST", "RECENT", "TOKEN", "HEALTH"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("compact overview missing %q:\n%s", want, rendered)
 		}
@@ -1135,37 +1206,51 @@ func TestOverviewShowsActionHint(t *testing.T) {
 	}
 }
 
-func TestOverviewShowsTriagePanel(t *testing.T) {
+func TestOverviewShowsInspectFirstPanel(t *testing.T) {
 	m := resizeForTest(t, sampleModelForTest(), 120, 36)
+	m.sessions[0].Metrics.DurationSec = 45
+	m.sessions[1].Metrics.DurationSec = 122
+	m.sessions[2].Metrics.DurationSec = 240
 	m.view = viewOverview
 
 	rendered := m.View()
 
-	for _, want := range []string{"TRIAGE NOW", "gamma", "Issue", "Impact", "Evidence", "press ! then Enter"} {
+	for _, want := range []string{"INSPECT FIRST", "Top cost", "Slowest", "Critical", "session_b", "gamma"} {
 		if !strings.Contains(rendered, want) {
-			t.Fatalf("overview triage panel missing %q:\n%s", want, rendered)
+			t.Fatalf("overview inspect-first panel missing %q:\n%s", want, rendered)
 		}
 	}
 	if got := maxRenderedWidth(rendered); got > 120 {
-		t.Fatalf("overview triage panel too wide: got=%d line=%q", got, widestLine(rendered))
+		t.Fatalf("overview inspect-first panel too wide: got=%d line=%q", got, widestLine(rendered))
 	}
 }
 
-func TestOverviewUsesShortMetricTitlesAtStandardWidth(t *testing.T) {
+func TestOverviewPrioritizesSpendTimeMetrics(t *testing.T) {
 	m := resizeForTest(t, sampleModelForTest(), 120, 36)
+	m.sessions[0].Metrics.DurationSec = 45
+	m.sessions[1].Metrics.DurationSec = 122
+	m.sessions[2].Metrics.DurationSec = 240
+	m.costSummary = engine.ComputeCostSummary(m.sessions)
+	m.overview = engine.ComputeOverview(m.sessions)
+	m.aggStats = engine.ComputeAggregateStats(m.sessions)
 	m.view = viewOverview
 
 	rendered := m.View()
 
-	for _, unwanted := range []string{"TOTAL TOKENS", "TOTAL COST", "(USD)", "ERROR RATE", "P95 LATENCY"} {
+	for _, unwanted := range []string{"ERROR RATE"} {
 		if strings.Contains(rendered, unwanted) {
 			t.Fatalf("standard overview should avoid wrapped metric title %q:\n%s", unwanted, rendered)
 		}
 	}
-	for _, want := range []string{"TOKENS", "COST", "ERRORS", "P95", "HEALTH"} {
+	for _, want := range []string{"COST", "TOKENS", "ELAPSED", "P95", "TOP AGENT", "TOP MODEL", "767.0K", "$1.85"} {
 		if !strings.Contains(rendered, want) {
-			t.Fatalf("standard overview missing short metric title %q:\n%s", want, rendered)
+			t.Fatalf("overview missing spend/time metric %q:\n%s", want, rendered)
 		}
+	}
+	metricIdx := strings.Index(rendered, "COST")
+	controlsIdx := strings.Index(rendered, "$ top cost")
+	if metricIdx < 0 || controlsIdx < 0 || metricIdx > controlsIdx {
+		t.Fatalf("spend/time metrics should appear before shortcut hints, metric=%d controls=%d:\n%s", metricIdx, controlsIdx, rendered)
 	}
 }
 
@@ -1203,7 +1288,7 @@ func TestChineseOverviewShowsTranslatedActionHint(t *testing.T) {
 	}
 }
 
-func TestChineseOverviewShowsTranslatedTriagePanel(t *testing.T) {
+func TestChineseOverviewShowsTranslatedInspectFirstPanel(t *testing.T) {
 	prev := i18n.Current
 	i18n.SetLang(i18n.ZH)
 	t.Cleanup(func() { i18n.SetLang(prev) })
@@ -1215,13 +1300,13 @@ func TestChineseOverviewShowsTranslatedTriagePanel(t *testing.T) {
 
 	rendered := m.View()
 
-	for _, want := range []string{"立即排查", "问题", "影响", "证据", "按 ! 再 Enter"} {
+	for _, want := range []string{"优先查看", "最高费用", "最慢会话", "严重会话"} {
 		if !strings.Contains(rendered, want) {
-			t.Fatalf("Chinese overview triage panel missing %q:\n%s", want, rendered)
+			t.Fatalf("Chinese overview inspect-first panel missing %q:\n%s", want, rendered)
 		}
 	}
-	if strings.Contains(rendered, "TRIAGE NOW") {
-		t.Fatalf("Chinese overview leaked English triage label:\n%s", rendered)
+	if strings.Contains(rendered, "INSPECT FIRST") {
+		t.Fatalf("Chinese overview leaked English inspect-first label:\n%s", rendered)
 	}
 }
 
@@ -1234,12 +1319,12 @@ func TestChineseCompactOverviewTranslatesRuntimeLabels(t *testing.T) {
 	m.view = viewOverview
 
 	rendered := m.View()
-	for _, want := range []string{"关注", "最近", "健康"} {
+	for _, want := range []string{"优先查看", "最近", "健康"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("compact overview missing translated label %q:\n%s", want, rendered)
 		}
 	}
-	for _, unwanted := range []string{"FOCUS", "RECENT"} {
+	for _, unwanted := range []string{"INSPECT FIRST", "RECENT"} {
 		if strings.Contains(rendered, unwanted) {
 			t.Fatalf("compact overview leaked English label %q:\n%s", unwanted, rendered)
 		}
@@ -2090,14 +2175,53 @@ func TestDiagnosticsClampsInvalidContextUtilization(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsRendersSlowRunExplanation(t *testing.T) {
+	prev := i18n.Current
+	i18n.SetLang(i18n.EN)
+	t.Cleanup(func() { i18n.SetLang(prev) })
+
+	m := resizeForTest(t, sampleModelForTest(), 120, 40)
+	m.sessions[0].Metrics.GapsSec = []float64{3, 95}
+	m.sessions[0].ToolLatencies = []engine.ToolLatencyItem{
+		{ToolName: "quick", Count: 2, AvgSec: 1, P95Sec: 2, MaxSec: 3},
+		{ToolName: "terminal", Count: 4, AvgSec: 8, P95Sec: 24, MaxSec: 31, IsSlow: true},
+	}
+	m.sessions[0].ContextUtil.RiskLevel = "warning"
+	m.sessions[0].ContextUtil.Suggestion = "compact soon"
+	m.sessions[0].LargeParams = []engine.LargeParamCall{{ToolName: "terminal", ParamSize: 9000, Risk: "high", Detail: "large args"}}
+	m.view = viewDiagnostics
+
+	rendered := m.renderWaste()
+	for _, want := range []string{
+		"SLOW-RUN SUMMARY",
+		"Most likely driver: tool latency",
+		"SLOW PATH",
+		"Slow tool: terminal",
+		"Long gap",
+		"Large params",
+		"Context pressure",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("diagnostics slow-run explanation missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Index(rendered, "SLOW PATH") > strings.Index(rendered, "LOOP FINGERPRINT") {
+		t.Fatalf("slow-path evidence should appear before lower-priority diagnostic cards:\n%s", rendered)
+	}
+}
+
 func TestDiffRendersWinnerInsight(t *testing.T) {
 	m := resizeForTest(t, sampleModelForTest(), 100, 36)
+	m.sessions[0].Metrics.DurationSec = 60
+	m.sessions[1].Metrics.DurationSec = 180
 	m.diffResult = engine.DiffSessions(m.sessions[0], m.sessions[1])
 	m.view = viewDiff
 
 	rendered := m.View()
-	if !strings.Contains(rendered, "Winner:") {
-		t.Fatalf("expected diff winner insight")
+	for _, want := range []string{"DIFF VERDICT", "B is slower", "Winner:", "Cost", "Tokens", "Duration", "Fail count", "Health"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("expected diff explanation %q:\n%s", want, rendered)
+		}
 	}
 }
 
@@ -2241,7 +2365,7 @@ func TestWideDiffUsesFullComparisonLayout(t *testing.T) {
 	m.view = viewDiff
 
 	rendered := m.View()
-	for _, want := range []string{"COMPARISON", "A  session_alpha", "B  session_beta"} {
+	for _, want := range []string{"DIFF VERDICT", "Tokens", "A  session_alpha", "B  session_beta"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("expected %q in wide diff layout", want)
 		}
@@ -2606,10 +2730,45 @@ func TestLoadingRenderWithinTerminalWidth(t *testing.T) {
 		m.loading = true
 		m.loadProgress = 3
 		m.loadTotal = 10
+		m.cacheValid = 4
+		m.cacheEntries = 6
+		m.loadedFromCache = 2
+		m.loadSourceCounts = map[string]int{"claude_code": 7, "codex_cli": 3, "gemini_cli": 1}
 		rendered := m.View()
 		if got := maxRenderedWidth(rendered); got > width {
 			t.Fatalf("loading render too wide: width=%d got=%d line=%q", width, got, widestLine(rendered))
 		}
+	}
+}
+
+func TestLoadingRenderShowsPhaseCacheAndSourceCounts(t *testing.T) {
+	prev := i18n.Current
+	i18n.SetLang(i18n.EN)
+	t.Cleanup(func() { i18n.SetLang(prev) })
+
+	m := resizeForTest(t, sampleModelForTest(), 120, 30)
+	m.loading = true
+	m.loadProgress = 5
+	m.loadTotal = 10
+	m.loadedFromCache = 2
+	m.cacheValid = 4
+	m.cacheEntries = 8
+	m.loadSourceCounts = map[string]int{"claude_code": 6, "codex_cli": 3, "gemini_cli": 1}
+
+	rendered := m.View()
+	for _, want := range []string{
+		"Phase cache restore",
+		"parsed 3/10",
+		"cache hits 2/4 valid (8 entries)",
+		"sources Claude Code 6",
+		"Codex CLI 3",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("loading screen missing %q:\n%s", want, rendered)
+		}
+	}
+	if got := maxRenderedWidth(rendered); got > 120 {
+		t.Fatalf("loading render too wide: got=%d line=%q", got, widestLine(rendered))
 	}
 }
 
@@ -2621,8 +2780,36 @@ func TestLoadingRenderClampsProgressPastTotal(t *testing.T) {
 
 	rendered := m.View()
 
-	if !strings.Contains(rendered, "2/2") || !strings.Contains(rendered, "100%") {
+	if !strings.Contains(rendered, "2/2") || !strings.Contains(rendered, "100%") || !strings.Contains(rendered, "aggregation") {
 		t.Fatalf("expected clamped loading progress, got:\n%s", rendered)
+	}
+}
+
+func TestLoadingSourceCountsUsesCacheAndPathFallback(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := engine.SessionCache{Entries: map[string]engine.CacheEntry{
+		path: {
+			ModTime: info.ModTime().UnixNano(),
+			Size:    info.Size(),
+			Session: engine.Session{Metrics: engine.Metrics{SourceTool: "claude_code"}},
+		},
+	}}
+	counts := loadingSourceCounts(
+		[]string{path, "/Users/test/.gemini/tmp/b.jsonl"},
+		[]loadedSession{{session: engine.Session{Metrics: engine.Metrics{SourceTool: "hermes_jsonl"}}}},
+		cache,
+	)
+
+	if counts["claude_code"] != 1 || counts["gemini_cli"] != 1 || counts["hermes_jsonl"] != 1 {
+		t.Fatalf("bad source counts: %#v", counts)
 	}
 }
 

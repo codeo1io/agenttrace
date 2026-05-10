@@ -4,6 +4,57 @@
 
 No unreleased changes yet.
 
+## v0.4.6 - 2026-05-10
+
+### Fixed
+
+- Show sessions from `~/.pi/agent/sessions` as Pi while keeping
+  legacy `~/.omp/agent/sessions` sessions labeled Oh My Pi.
+
+## v0.4.5 - 2026-05-10
+
+### Fixed
+
+- Added PI auto-discovery for `~/.pi/agent/sessions` while keeping the legacy
+  Oh My Pi `~/.omp/agent/sessions` path for compatibility.
+
+## v0.4.4 - 2026-05-10
+
+### Added
+
+- Added a real local-data marketing refresh script for README and site assets.
+
+### Changed
+
+- Capped overview JSON anomaly details and added anomaly total/truncation metadata
+  so large real histories stay readable for automation and promotional reports.
+- Refreshed README and site screenshots from a real local run.
+
+## v0.4.3 - 2026-05-10
+
+### Changed
+
+- Updated release surfaces for the v0.4.3 distribution.
+
+## v0.4.2 - 2026-05-05
+
+### Changed
+
+- Refreshed README GIF and screenshots from a real local run with color enabled.
+- Updated release surfaces for the v0.4.2 Homebrew and npm distribution.
+
+### Fixed
+
+- Kept Session List table values readable when terminal colors are enabled.
+
+## v0.4.1 - 2026-05-04
+
+### Changed
+
+- Refreshed the README's real local-run screenshots and summary metrics from
+  the latest TUI against local session logs.
+- Updated release surfaces for the v0.4.1 distribution.
+
 ## v0.4.0 - 2026-05-04
 
 ### Changed

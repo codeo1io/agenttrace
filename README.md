@@ -20,7 +20,7 @@
   <a href="https://goreportcard.com/report/github.com/luoyuctl/agenttrace"><img src="https://goreportcard.com/badge/github.com/luoyuctl/agenttrace" alt="Go Report Card"></a>
   <img src="https://img.shields.io/badge/go-1.25+-00ADD8.svg" alt="Go">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/Homebrew-v0.4.0-2bbc8a.svg" alt="Homebrew">
+  <img src="https://img.shields.io/badge/Homebrew-v0.4.6-2bbc8a.svg" alt="Homebrew">
 </p>
 
 <p align="center">
@@ -75,17 +75,17 @@ agenttrace
 That local run found:
 
 ```text
-AGENTTRACE v0.4.0
+AGENTTRACE v0.4.6
 ```
 
 | Signal | What agenttrace found |
 |---|---:|
-| Analyzed sessions | 1,707 |
-| Total tokens | 8.68B |
-| Estimated cost | $4,716.31 |
-| Tool failure rate | 1.54% |
-| Critical sessions | 35 |
-| Average health | 90% |
+| Analyzed sessions | 1,761 |
+| Total tokens | 9.13B |
+| Estimated cost | $5,037.26 |
+| Tool failure rate | 1.1% |
+| Critical sessions | 16 |
+| Average health | 91% |
 
 ## Install
 
@@ -107,6 +107,7 @@ Windows:
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
+The npm wrapper is also available as `agenttrace` after each release is published.
 ## Common workflows
 
 ```bash
@@ -133,7 +134,7 @@ agenttrace --overview \
 
 agenttrace supports local sessions from:
 
-Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces.
+Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces.
 
 ## What you get
 

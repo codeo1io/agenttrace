@@ -2,12 +2,16 @@
 
 Local-first AI coding agent session history for cost, tokens, time, and slow-run diagnosis.
 
+This directory contains the npm wrapper for agenttrace.
+
 Use it to answer two questions:
 
 - Which coding agent sessions burned the most cost, tokens, and wall-clock time?
 - Why did a specific agent task run slowly?
 
 ## Install
+
+Use one of the supported install methods:
 
 ```bash
 npm install -g agenttrace
@@ -34,7 +38,7 @@ From this directory:
 node --check install.js
 node --check run.js
 AGENTTRACE_BIN=/path/to/agenttrace node run.js --version
-AGENTTRACE_RELEASE_TAG=v0.4.0 node install.js
+AGENTTRACE_RELEASE_TAG=v0.4.6 node install.js
 npm pack --dry-run
 ```
 
@@ -59,7 +63,7 @@ agenttrace --overview --fail-under-health 80 --fail-on-critical --max-tool-fail-
 
 ## Supported Sources
 
-agenttrace auto-detects local sessions from Claude Code, Codex CLI, Gemini CLI, Qwen Code, OpenCode, OpenClaw, Copilot CLI, Oh My Pi, Kimi CLI, Hermes Agent, and Aider chat history.
+agenttrace auto-detects local sessions from Claude Code, Codex CLI, Gemini CLI, Qwen Code, OpenCode, OpenClaw, Copilot CLI, Pi, Oh My Pi, Kimi CLI, Hermes Agent, and Aider chat history.
 
 For Aider repositories, run:
 
