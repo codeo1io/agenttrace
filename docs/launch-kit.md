@@ -237,6 +237,7 @@ Open PRs:
 - AGBAJEMUH/Awesome-AI-Evaluation-Guide: https://github.com/AGBAJEMUH/Awesome-AI-Evaluation-Guide/pull/1
 - priyathamkat/Awesome-LLM-Evaluation: https://github.com/priyathamkat/Awesome-LLM-Evaluation/pull/1
 - c1505/Awesome-LLM-Evaluations: https://github.com/c1505/Awesome-LLM-Evaluations/pull/1
+- itsderek23/awesome-eval-driven-development: https://github.com/itsderek23/awesome-eval-driven-development/pull/2
 
 Merged listings:
 
