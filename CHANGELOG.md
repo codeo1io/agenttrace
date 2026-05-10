@@ -4,6 +4,13 @@
 
 No unreleased changes yet.
 
+## v0.4.5 - 2026-05-10
+
+### Fixed
+
+- Added PI auto-discovery for `~/.pi/agent/sessions` while keeping the legacy
+  Oh My Pi `~/.omp/agent/sessions` path for compatibility.
+
 ## v0.4.4 - 2026-05-10
 
 ### Added
