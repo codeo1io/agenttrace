@@ -244,6 +244,7 @@ Open PRs:
 - libukai/awesome-agent-skills: https://github.com/libukai/awesome-agent-skills/pull/54
 - kodustech/awesome-agent-skills: https://github.com/kodustech/awesome-agent-skills/pull/15
 - Chat2AnyLLM/awesome-repo-configs: https://github.com/Chat2AnyLLM/awesome-repo-configs/pull/14
+- philipbankier/awesome-agent-skills: https://github.com/philipbankier/awesome-agent-skills/pull/13
 
 Merged listings:
 
