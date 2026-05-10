@@ -256,6 +256,7 @@ Open PRs:
 - anthropics/claude-code-monitoring-guide: https://github.com/anthropics/claude-code-monitoring-guide/pull/16
 - goabiaryan/awesome-observability: https://github.com/goabiaryan/awesome-observability/pull/4
 - boxabirds/awesome-ai-engineering: https://github.com/boxabirds/awesome-ai-engineering/pull/2
+- Guidely-org/awesome-ai-engineering: https://github.com/Guidely-org/awesome-ai-engineering/pull/1
 
 Merged listings:
 
