@@ -139,6 +139,7 @@ Open PRs:
 - xiaoju111a/awesome-kimi-cli: https://github.com/xiaoju111a/awesome-kimi-cli/pull/1
 - lfglabs-dev/awesome-kimi-cli: https://github.com/lfglabs-dev/awesome-kimi-cli/pull/4
 - agenmod/awesome-agent-cli: https://github.com/agenmod/awesome-agent-cli/pull/1
+- agentablesh/awesome-agent-cli: https://github.com/agentablesh/awesome-agent-cli/pull/1
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
