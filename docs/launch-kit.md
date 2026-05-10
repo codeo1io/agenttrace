@@ -229,6 +229,7 @@ Open PRs:
 - XD3an/awesome-ai-coding-all-in-one: https://github.com/XD3an/awesome-ai-coding-all-in-one/pull/1
 - kax168/awesome-ai-coding-2026: https://github.com/kax168/awesome-ai-coding-2026/pull/1
 - bluegalaxy111/awesome-vibe-coding: https://github.com/bluegalaxy111/awesome-vibe-coding/pull/4
+- hammadhaqqani/awesome-devops-ai: https://github.com/hammadhaqqani/awesome-devops-ai/pull/23
 
 Merged listings:
 
