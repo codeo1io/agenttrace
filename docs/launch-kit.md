@@ -236,6 +236,7 @@ Open PRs:
 - kax168/awesome-ai-dev-tools-2026: https://github.com/kax168/awesome-ai-dev-tools-2026/pull/3
 - claudexia-api/awesome-claude-tools: https://github.com/claudexia-api/awesome-claude-tools/pull/1
 - zjh1943/awesome-claude-code: https://github.com/zjh1943/awesome-claude-code/pull/44
+- gaborsoter/awesome-ai-dev-productivity: https://github.com/gaborsoter/awesome-ai-dev-productivity/pull/2
 
 Merged listings:
 
