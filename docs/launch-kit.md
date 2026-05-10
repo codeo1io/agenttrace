@@ -259,6 +259,7 @@ Open PRs:
 - Guidely-org/awesome-ai-engineering: https://github.com/Guidely-org/awesome-ai-engineering/pull/1
 - cola-runner/awesome-tui-design: https://github.com/cola-runner/awesome-tui-design/pull/1
 - phmullins/awesome-macos-commandline: https://github.com/phmullins/awesome-macos-commandline/pull/12
+- saehun/awesome-terminal: https://github.com/saehun/awesome-terminal/pull/4
 
 Merged listings:
 
