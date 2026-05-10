@@ -208,6 +208,7 @@ Open PRs:
 - awesome_ai_agents follow-up: https://github.com/jim-schwoebel/awesome_ai_agents/pull/254
 - awesome-ai-devtools follow-up: https://github.com/jamesmurdza/awesome-ai-devtools/pull/495
 - awesome-observability follow-up: https://github.com/adriannovegil/awesome-observability/pull/64
+- Awakehsh/awesome-agent-tools: https://github.com/Awakehsh/awesome-agent-tools/pull/2
 - awesome-utils-dev: https://github.com/pegaltier/awesome-utils-dev/pull/29
 - danielrosehill/Awesome-AI-Coding-Tools: https://github.com/danielrosehill/Awesome-AI-Coding-Tools/pull/2
 - antigravity-awesome-skills: https://github.com/sickn33/antigravity-awesome-skills/pull/583
