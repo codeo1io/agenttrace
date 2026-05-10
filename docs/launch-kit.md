@@ -159,6 +159,8 @@ Open PRs:
 - jsnyder/awesome-llm-cli-apps: https://github.com/jsnyder/awesome-llm-cli-apps/pull/1
 - o3-cloud/awesome-llm-cli: https://github.com/o3-cloud/awesome-llm-cli/pull/5
 - bgl761915-debug/cool-linux-apps: https://github.com/bgl761915-debug/cool-linux-apps/pull/1
+- dontriskit/awesome-ai-software-engineering: https://github.com/dontriskit/awesome-ai-software-engineering/pull/7
+- yellcamap/awesome-ai-dev-tools: https://github.com/yellcamap/awesome-ai-dev-tools/pull/2
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
