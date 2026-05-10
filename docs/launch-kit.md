@@ -233,6 +233,8 @@ Open PRs:
 - coderPerseus/awesome-cli-tools-for-agents: https://github.com/coderPerseus/awesome-cli-tools-for-agents/pull/1
 - danielrosehill/Awesome-AI-Evaluations-Tools: https://github.com/danielrosehill/Awesome-AI-Evaluations-Tools/pull/3
 - hparreao/Awesome-AI-Evaluation-Guide: https://github.com/hparreao/Awesome-AI-Evaluation-Guide/pull/2
+- jakemeany523/awesome-llm-evaluation: https://github.com/jakemeany523/awesome-llm-evaluation/pull/1
+- AGBAJEMUH/Awesome-AI-Evaluation-Guide: https://github.com/AGBAJEMUH/Awesome-AI-Evaluation-Guide/pull/1
 
 Merged listings:
 
