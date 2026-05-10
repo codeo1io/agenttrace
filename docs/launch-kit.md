@@ -242,11 +242,11 @@ Open PRs:
 - priyathamkat/Awesome-LLM-Evaluation: https://github.com/priyathamkat/Awesome-LLM-Evaluation/pull/1
 - c1505/Awesome-LLM-Evaluations: https://github.com/c1505/Awesome-LLM-Evaluations/pull/1
 - itsderek23/awesome-eval-driven-development: https://github.com/itsderek23/awesome-eval-driven-development/pull/2
-- tugkanboz/awesome-ai-testing: https://github.com/tugkanboz/awesome-ai-testing/pull/9
 - chaosync-org/awesome-ai-agent-testing: https://github.com/chaosync-org/awesome-ai-agent-testing/pull/6
 
 Merged listings:
 
+- tugkanboz/awesome-ai-testing: https://github.com/tugkanboz/awesome-ai-testing/pull/9
 - awesome-ChatGPT-repositories: https://github.com/taishi-i/awesome-ChatGPT-repositories/pull/130
 - GetBindu/awesome-claude-code-and-skills: https://github.com/GetBindu/awesome-claude-code-and-skills/pull/21
 - awesome-gemini-cli: https://github.com/Piebald-AI/awesome-gemini-cli/pull/47
