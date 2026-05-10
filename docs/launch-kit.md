@@ -223,6 +223,7 @@ Open PRs:
 - xlabs-club/awesome-x-ops: https://github.com/xlabs-club/awesome-x-ops/pull/10
 - onurkanbakirci/awesome-codex-automations: https://github.com/onurkanbakirci/awesome-codex-automations/pull/2
 - alirezadir/Agentic-AI-Systems: https://github.com/alirezadir/Agentic-AI-Systems/pull/2
+- CoderSJX/AI-Resources-Central: https://github.com/CoderSJX/AI-Resources-Central/pull/7
 
 Merged listings:
 
