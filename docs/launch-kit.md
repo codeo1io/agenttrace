@@ -270,6 +270,7 @@ Open PRs:
 - simonpierreboucher02/awesome-claude-code: https://github.com/simonpierreboucher02/awesome-claude-code/pull/1
 - itgoyo/awesome-claude-code: https://github.com/itgoyo/awesome-claude-code/pull/1
 - spinov001-art/awesome-cli-tools-2026: https://github.com/spinov001-art/awesome-cli-tools-2026/pull/1
+- Siilwyn/awesome-cli-tools: https://github.com/Siilwyn/awesome-cli-tools/pull/19
 
 Merged listings:
 
