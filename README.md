@@ -106,7 +106,10 @@ Windows:
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-The npm wrapper is prepared but not published yet; use the install script, Homebrew, Go install, or GitHub release binaries until the npm package is authorized.
+The npm wrapper is prepared but not published yet. Use the install script,
+Homebrew, Go install, or GitHub release binaries until the npm package is
+authorized.
+
 ## Common workflows
 
 ```bash
