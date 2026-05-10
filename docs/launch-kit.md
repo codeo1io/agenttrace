@@ -227,6 +227,8 @@ Merged listings:
 - awesome-ChatGPT-repositories: https://github.com/taishi-i/awesome-ChatGPT-repositories/pull/130
 - GetBindu/awesome-claude-code-and-skills: https://github.com/GetBindu/awesome-claude-code-and-skills/pull/21
 - awesome-gemini-cli: https://github.com/Piebald-AI/awesome-gemini-cli/pull/47
+- milisp/awesome-codex-cli: https://github.com/milisp/awesome-codex-cli/pull/20
+- hashgraph-online/awesome-codex-plugins follow-up: https://github.com/hashgraph-online/awesome-codex-plugins/pull/68
 - awesome-mac: https://github.com/jaywcjlove/awesome-mac/pull/2026
 - awesome-skills: https://github.com/gmh5225/awesome-skills/pull/14
 - charm-in-the-wild: https://github.com/charm-and-friends/charm-in-the-wild/pull/88
