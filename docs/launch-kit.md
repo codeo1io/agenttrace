@@ -225,6 +225,7 @@ Open PRs:
 - alirezadir/Agentic-AI-Systems: https://github.com/alirezadir/Agentic-AI-Systems/pull/2
 - CoderSJX/AI-Resources-Central: https://github.com/CoderSJX/AI-Resources-Central/pull/7
 - dinakars777/awesome-tui: https://github.com/dinakars777/awesome-tui/pull/11
+- doshibadev/awesome-agentic-devtools: https://github.com/doshibadev/awesome-agentic-devtools/pull/4
 
 Merged listings:
 
