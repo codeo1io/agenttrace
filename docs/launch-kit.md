@@ -224,6 +224,7 @@ Open PRs:
 - onurkanbakirci/awesome-codex-automations: https://github.com/onurkanbakirci/awesome-codex-automations/pull/2
 - alirezadir/Agentic-AI-Systems: https://github.com/alirezadir/Agentic-AI-Systems/pull/2
 - CoderSJX/AI-Resources-Central: https://github.com/CoderSJX/AI-Resources-Central/pull/7
+- dinakars777/awesome-tui: https://github.com/dinakars777/awesome-tui/pull/11
 
 Merged listings:
 
