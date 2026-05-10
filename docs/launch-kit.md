@@ -130,6 +130,7 @@ Open PRs:
 - mahonzhan/awesome-agent-harness: https://github.com/mahonzhan/awesome-agent-harness/pull/3
 - awesome-agentops-landscape: https://github.com/dyronrh/awesome-agentops-landscape/pull/4
 - awesome-coding-agent-eval: https://github.com/gudo7208/awesome-coding-agent-eval/pull/1
+- kzhou003/awesome-coding-agent-systems: https://github.com/kzhou003/awesome-coding-agent-systems/pull/1
 - quome-cloud/awesome-coding-agents: https://github.com/quome-cloud/awesome-coding-agents/pull/4
 - KarelDO/awesome-codex: https://github.com/KarelDO/awesome-codex/pull/13
 - darknorth-123/Awesome-Codex-Plugins: https://github.com/darknorth-123/Awesome-Codex-Plugins/pull/1
