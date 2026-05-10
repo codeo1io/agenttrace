@@ -175,24 +175,19 @@ Open PRs:
 - spinov001-art/awesome-llm-tools: https://github.com/spinov001-art/awesome-llm-tools/pull/1
 - dr-saad-la/awesome-llm-tools: https://github.com/dr-saad-la/awesome-llm-tools/pull/7
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
-- awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
 - awesome-agent-clis: https://github.com/ComposioHQ/awesome-agent-clis/pull/8
-- awesome-code-agents: https://github.com/sorrycc/awesome-code-agents/pull/20
 - awesome-code-agents follow-up: https://github.com/sorrycc/awesome-code-agents/pull/22
 - tensorchord/Awesome-LLMOps: https://github.com/tensorchord/Awesome-LLMOps/pull/444
 - awesome-agent-cortex: https://github.com/0xNyk/awesome-agent-cortex/pull/20
-- ARUNAGIRINATHAN-K/awesome-ai-agents: https://github.com/ARUNAGIRINATHAN-K/awesome-ai-agents/pull/27
 - awesome-tuis follow-up: https://github.com/rothgar/awesome-tuis/pull/659
 - LangGPT/awesome-claude-code: https://github.com/LangGPT/awesome-claude-code/pull/58
 - awesome-agent-harness: https://github.com/Picrew/awesome-agent-harness/pull/5
 - command-line-tools: https://github.com/linsa-io/command-line-tools/pull/35
 - awesome-cli-coding-agents: https://github.com/bradAGI/awesome-cli-coding-agents/pull/73
 - awesome-opencode: https://github.com/awesome-opencode/awesome-opencode/pull/334
-- awesome-opensource-ai: https://github.com/alvinreal/awesome-opensource-ai/pull/418
 - awesome-llm-skills: https://github.com/Prat011/awesome-llm-skills/pull/116
 - awesome-ai-plugins: https://github.com/hashgraph-online/awesome-ai-plugins/pull/22
-- awesome-codex-plugins: https://github.com/hashgraph-online/awesome-codex-plugins/pull/65
 - awesome-copilot-agents: https://github.com/Code-and-Sorts/awesome-copilot-agents/pull/53
 - github/awesome-copilot: https://github.com/github/awesome-copilot/pull/1595
 - awesome-agent-skills: https://github.com/heilcheng/awesome-agent-skills/pull/216
@@ -202,7 +197,6 @@ Open PRs:
 - alexanderop/awesome-ai-coding: https://github.com/alexanderop/awesome-ai-coding/pull/1
 - awesome-devtools: https://github.com/devtoolsd/awesome-devtools/pull/213
 - awesome-ai-sdks: https://github.com/e2b-dev/awesome-ai-sdks/pull/175
-- awesome-agents follow-up: https://github.com/kyrolabs/awesome-agents/pull/440
 - awesome_ai_agents follow-up: https://github.com/jim-schwoebel/awesome_ai_agents/pull/254
 - awesome-ai-devtools follow-up: https://github.com/jamesmurdza/awesome-ai-devtools/pull/495
 - Awakehsh/awesome-agent-tools: https://github.com/Awakehsh/awesome-agent-tools/pull/2
@@ -251,6 +245,12 @@ Merged listings:
 - awesome-mac: https://github.com/jaywcjlove/awesome-mac/pull/2026
 - awesome-skills: https://github.com/gmh5225/awesome-skills/pull/14
 - charm-in-the-wild: https://github.com/charm-and-friends/charm-in-the-wild/pull/88
+- gobuild/awesome-go-tools: https://github.com/gobuild/awesome-go-tools/pull/6
+- acvnace/awesome-vibe-coding-resources: https://github.com/acvnace/awesome-vibe-coding-resources/pull/12
+- ARUNAGIRINATHAN-K/awesome-ai-agents-2026: https://github.com/ARUNAGIRINATHAN-K/awesome-ai-agents-2026/pull/27
+- rohitg00/awesome-openclaw: https://github.com/rohitg00/awesome-openclaw/pull/139
+- 0xWelt/Awesome-Vibe-Coding: https://github.com/0xWelt/Awesome-Vibe-Coding/pull/152
+- alvinreal/awesome-opensource-ai: https://github.com/alvinreal/awesome-opensource-ai/pull/418
 - Jenqyang/Awesome-AI-Agents: https://github.com/Jenqyang/Awesome-AI-Agents/pull/204
 - lgaggini/awesome-cli-tui-software: https://github.com/lgaggini/awesome-cli-tui-software/pull/3
 - eltociear/awesome-AI-driven-development: https://github.com/eltociear/awesome-AI-driven-development/pull/48
