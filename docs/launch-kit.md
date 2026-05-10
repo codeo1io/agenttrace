@@ -199,6 +199,7 @@ Open PRs:
 - skyming/awesome-ai-agent: https://github.com/skyming/awesome-ai-agent/pull/6
 - NipunaRanasinghe/awesome-ai-agents: https://github.com/NipunaRanasinghe/awesome-ai-agents/pull/91
 - awesome-ai-agent-monitoring: https://github.com/internetbuilder/awesome-ai-agent-monitoring/pull/3
+- alexanderop/awesome-ai-coding: https://github.com/alexanderop/awesome-ai-coding/pull/1
 - awesome-ai-dev-tools: https://github.com/PierrunoYT/awesome-ai-dev-tools/pull/20
 - awesome-devtools: https://github.com/devtoolsd/awesome-devtools/pull/213
 - awesome-ai-sdks: https://github.com/e2b-dev/awesome-ai-sdks/pull/175
