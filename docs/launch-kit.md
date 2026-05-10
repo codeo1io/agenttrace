@@ -103,11 +103,14 @@ Open PRs:
 
 - awesome-codex-cli: https://github.com/RoggeOhta/awesome-codex-cli/pull/23
 - awesome-ai-coding-tools: https://github.com/ai-for-developers/awesome-ai-coding-tools/pull/288
+- ai-for-developers/awesome-claude: https://github.com/ai-for-developers/awesome-claude/pull/11
 - awesome-vibe-coding: https://github.com/ai-for-developers/awesome-vibe-coding/pull/56
 - awesome-ai-coding: https://github.com/wsxiaoys/awesome-ai-coding/pull/97
 - filipecalegario/awesome-vibe-coding: https://github.com/filipecalegario/awesome-vibe-coding/pull/171
 - awesome-coding-ai: https://github.com/ohong/awesome-coding-ai/pull/6
 - awesome-claude-code-toolkit: https://github.com/rohitg00/awesome-claude-code-toolkit/pull/361
+- ComposioHQ/awesome-claude-skills: https://github.com/ComposioHQ/awesome-claude-skills/pull/766
+- BehiSecc/awesome-claude-skills: https://github.com/BehiSecc/awesome-claude-skills/pull/280
 - jqueryscript/awesome-claude-code: https://github.com/jqueryscript/awesome-claude-code/pull/252
 - awesome-go-cli: https://github.com/mantcz/awesome-go-cli/pull/4
 - awesome-observability: https://github.com/adriannovegil/awesome-observability/pull/63
@@ -153,6 +156,7 @@ Open PRs:
 - awesome-ai-devtools follow-up: https://github.com/jamesmurdza/awesome-ai-devtools/pull/495
 - awesome-observability follow-up: https://github.com/adriannovegil/awesome-observability/pull/64
 - awesome-utils-dev: https://github.com/pegaltier/awesome-utils-dev/pull/29
+- danielrosehill/Awesome-AI-Coding-Tools: https://github.com/danielrosehill/Awesome-AI-Coding-Tools/pull/2
 - antigravity-awesome-skills: https://github.com/sickn33/antigravity-awesome-skills/pull/583
 - VoltAgent/awesome-agent-skills: https://github.com/VoltAgent/awesome-agent-skills/pull/552
 - ComposioHQ/awesome-codex-skills: https://github.com/ComposioHQ/awesome-codex-skills/pull/58
