@@ -195,6 +195,7 @@ Manual-only submission:
 - Terminal Apps: submitted suggestion issue https://github.com/scmmishra/terminal-apps.dev/issues/55. Name: `agenttrace`; GitHub URL: `https://github.com/luoyuctl/agenttrace`.
 - awesome-ai-coding-techniques: submitted technique suggestion https://github.com/inmve/awesome-ai-coding-techniques/issues/37. Suggested technique: inspect AI agent session traces after a run. Followed up on semantic-drift feedback in https://github.com/inmve/awesome-ai-coding-techniques/issues/37#issuecomment-4414284882.
 - awesome-hermes-agent: submitted resource recommendation issue https://github.com/0xNyk/awesome-hermes-agent/issues/67. Suggested category: agentskills.io Ecosystem or Tools & Utilities.
+- vincentkoc/awesome-openclaw: submitted required pre-PR resource request https://github.com/vincentkoc/awesome-openclaw/issues/82. Suggested section: Developer Tooling and Observability.
 - InftyAI/Awesome-LLMOps: closed duplicate PR https://github.com/InftyAI/Awesome-LLMOps/pull/418 in favor of workflow-generated PR https://github.com/InftyAI/Awesome-LLMOps/pull/420.
 
 Terminal Trove draft:
