@@ -131,6 +131,8 @@ Open PRs:
 - quome-cloud/awesome-coding-agents: https://github.com/quome-cloud/awesome-coding-agents/pull/4
 - KarelDO/awesome-codex: https://github.com/KarelDO/awesome-codex/pull/13
 - darknorth-123/Awesome-Codex-Plugins: https://github.com/darknorth-123/Awesome-Codex-Plugins/pull/1
+- launchapp-dev/awesome-ai-coding-tools: https://github.com/launchapp-dev/awesome-ai-coding-tools/pull/3
+- tyler-j-dao/awesome-ai-coding-tools: https://github.com/tyler-j-dao/awesome-ai-coding-tools/pull/2
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
