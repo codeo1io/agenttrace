@@ -222,6 +222,7 @@ Open PRs:
 - skillmatic-ai/awesome-agent-skills: https://github.com/skillmatic-ai/awesome-agent-skills/pull/78
 - xlabs-club/awesome-x-ops: https://github.com/xlabs-club/awesome-x-ops/pull/10
 - onurkanbakirci/awesome-codex-automations: https://github.com/onurkanbakirci/awesome-codex-automations/pull/2
+- alirezadir/Agentic-AI-Systems: https://github.com/alirezadir/Agentic-AI-Systems/pull/2
 
 Merged listings:
 
