@@ -244,6 +244,7 @@ Open PRs:
 - itsderek23/awesome-eval-driven-development: https://github.com/itsderek23/awesome-eval-driven-development/pull/2
 - chaosync-org/awesome-ai-agent-testing: https://github.com/chaosync-org/awesome-ai-agent-testing/pull/6
 - ankitvirdi4/awesome-llm-cost: https://github.com/ankitvirdi4/awesome-llm-cost/pull/2
+- ravsau/awesome-ai-cost-optimization: https://github.com/ravsau/awesome-ai-cost-optimization/pull/2
 
 Merged listings:
 
