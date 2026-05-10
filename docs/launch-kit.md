@@ -154,6 +154,7 @@ Open PRs:
 - awesome-observability follow-up: https://github.com/adriannovegil/awesome-observability/pull/64
 - awesome-utils-dev: https://github.com/pegaltier/awesome-utils-dev/pull/29
 - antigravity-awesome-skills: https://github.com/sickn33/antigravity-awesome-skills/pull/583
+- VoltAgent/awesome-agent-skills: https://github.com/VoltAgent/awesome-agent-skills/pull/552
 
 Merged listings:
 
