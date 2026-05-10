@@ -153,6 +153,7 @@ Open PRs:
 - awesome-ai-devtools follow-up: https://github.com/jamesmurdza/awesome-ai-devtools/pull/495
 - awesome-observability follow-up: https://github.com/adriannovegil/awesome-observability/pull/64
 - awesome-utils-dev: https://github.com/pegaltier/awesome-utils-dev/pull/29
+- antigravity-awesome-skills: https://github.com/sickn33/antigravity-awesome-skills/pull/583
 
 Merged listings:
 
@@ -173,7 +174,7 @@ Manual-only submission:
 - awesome-tuis: likely blocked until the repo is at least 6 months old; its PR template requires repos to be at least 6 months old, PR #658 was closed after reviewer feedback, and follow-up PR #659 is open.
 - Terminal Trove: submit through https://terminaltrove.com/post/ after confirming the author contact email. Suggested categories: `macos`, `linux`, `windows`, `monitoring`, `observability`, `tui`, `json`, `ai`, `cli`, `debugging`, `cross-platform`. Preview PNG: `https://luoyuctl.github.io/agenttrace/assets/readme-real-overview.png`; GIF: `https://luoyuctl.github.io/agenttrace/assets/agenttrace-demo.gif`.
 - Terminal Apps: submitted suggestion issue https://github.com/scmmishra/terminal-apps.dev/issues/55. Name: `agenttrace`; GitHub URL: `https://github.com/luoyuctl/agenttrace`.
-- awesome-ai-coding-techniques: submitted technique suggestion https://github.com/inmve/awesome-ai-coding-techniques/issues/37. Suggested technique: inspect AI agent session traces after a run.
+- awesome-ai-coding-techniques: submitted technique suggestion https://github.com/inmve/awesome-ai-coding-techniques/issues/37. Suggested technique: inspect AI agent session traces after a run. Followed up on semantic-drift feedback in https://github.com/inmve/awesome-ai-coding-techniques/issues/37#issuecomment-4414284882.
 - InftyAI/Awesome-LLMOps: closed duplicate PR https://github.com/InftyAI/Awesome-LLMOps/pull/418 in favor of workflow-generated PR https://github.com/InftyAI/Awesome-LLMOps/pull/420.
 
 Terminal Trove draft:
