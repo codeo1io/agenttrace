@@ -162,6 +162,7 @@ Open PRs:
 - dontriskit/awesome-ai-software-engineering: https://github.com/dontriskit/awesome-ai-software-engineering/pull/7
 - yellcamap/awesome-ai-dev-tools: https://github.com/yellcamap/awesome-ai-dev-tools/pull/2
 - erkcet/awesome-claude-code: https://github.com/erkcet/awesome-claude-code/pull/3
+- shahshrey/awesome-claude-code-mastery: https://github.com/shahshrey/awesome-claude-code-mastery/pull/16
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
