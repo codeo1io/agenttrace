@@ -261,6 +261,7 @@ Open PRs:
 - phmullins/awesome-macos-commandline: https://github.com/phmullins/awesome-macos-commandline/pull/12
 - saehun/awesome-terminal: https://github.com/saehun/awesome-terminal/pull/4
 - closedloop-technologies/awesome-coding-agents: https://github.com/closedloop-technologies/awesome-coding-agents/pull/3
+- kax168/awesome-ai-coding-assistants-2026: https://github.com/kax168/awesome-ai-coding-assistants-2026/pull/3
 
 Merged listings:
 
