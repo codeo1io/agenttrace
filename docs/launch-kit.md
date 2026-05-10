@@ -253,6 +253,7 @@ Open PRs:
 - a16z-infra/llm-app-stack: https://github.com/a16z-infra/llm-app-stack/pull/54
 - ankurkumarz/agentic-ai-knowledge-base: https://github.com/ankurkumarz/agentic-ai-knowledge-base/pull/1
 - mahseema/awesome-ai-tools: https://github.com/mahseema/awesome-ai-tools/pull/1287
+- anthropics/claude-code-monitoring-guide: https://github.com/anthropics/claude-code-monitoring-guide/pull/16
 
 Merged listings:
 
