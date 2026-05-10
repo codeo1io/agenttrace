@@ -192,6 +192,7 @@ Open PRs:
 - github/awesome-copilot: https://github.com/github/awesome-copilot/pull/1595
 - awesome-agent-skills: https://github.com/heilcheng/awesome-agent-skills/pull/216
 - awesome-ai-eval: https://github.com/Vvkmnn/awesome-ai-eval/pull/10
+- skyming/awesome-ai-agent: https://github.com/skyming/awesome-ai-agent/pull/6
 - awesome-ai-dev-tools: https://github.com/PierrunoYT/awesome-ai-dev-tools/pull/20
 - awesome-devtools: https://github.com/devtoolsd/awesome-devtools/pull/213
 - awesome-ai-sdks: https://github.com/e2b-dev/awesome-ai-sdks/pull/175
