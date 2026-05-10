@@ -180,7 +180,6 @@ Open PRs:
 - tensorchord/Awesome-LLMOps: https://github.com/tensorchord/Awesome-LLMOps/pull/444
 - awesome-agent-cortex: https://github.com/0xNyk/awesome-agent-cortex/pull/20
 - LangGPT/awesome-claude-code: https://github.com/LangGPT/awesome-claude-code/pull/58
-- awesome-agent-harness: https://github.com/Picrew/awesome-agent-harness/pull/5
 - command-line-tools: https://github.com/linsa-io/command-line-tools/pull/35
 - awesome-cli-coding-agents: https://github.com/bradAGI/awesome-cli-coding-agents/pull/73
 - awesome-opencode: https://github.com/awesome-opencode/awesome-opencode/pull/334
@@ -259,6 +258,7 @@ Merged listings:
 - adriannovegil/awesome-observability follow-up: https://github.com/adriannovegil/awesome-observability/pull/64
 - pegaltier/awesome-utils-dev: https://github.com/pegaltier/awesome-utils-dev/pull/29
 - llm-toolkit: https://github.com/sumanth-dhanya/llm-toolkit/pull/1
+- Picrew/awesome-agent-harness: listing present on upstream main; closed stale conflicting PR https://github.com/Picrew/awesome-agent-harness/pull/5.
 
 Manual-only submission:
 
