@@ -115,9 +115,6 @@ Open PRs:
 - BehiSecc/awesome-claude-skills: https://github.com/BehiSecc/awesome-claude-skills/pull/280
 - jqueryscript/awesome-claude-code: https://github.com/jqueryscript/awesome-claude-code/pull/252
 - awesome-go-cli: https://github.com/mantcz/awesome-go-cli/pull/4
-- awesome-agents: https://github.com/kyrolabs/awesome-agents/pull/437
-- awesome-ai-devtools: https://github.com/jamesmurdza/awesome-ai-devtools/pull/492
-- awesome_ai_agents: https://github.com/jim-schwoebel/awesome_ai_agents/pull/250
 - awesome-ai-agents-2026: https://github.com/caramaschiHG/awesome-ai-agents-2026/pull/207
 - Awesome-LLMOps: https://github.com/InftyAI/Awesome-LLMOps/pull/420
 - awesome-ai: https://github.com/hemanthgk10/awesome-ai/pull/7
@@ -174,7 +171,6 @@ Open PRs:
 - AnswerZhao/ai-coding-playbook: https://github.com/AnswerZhao/ai-coding-playbook/pull/5
 - sam-blackfly/awesome-llm-tools: https://github.com/sam-blackfly/awesome-llm-tools/pull/2
 - jordimas/awesome-agentic-engineering: https://github.com/jordimas/awesome-agentic-engineering/pull/2
-- llm-toolkit: https://github.com/sumanth-dhanya/llm-toolkit/pull/1
 - spinov001-art/awesome-llm-tools: https://github.com/spinov001-art/awesome-llm-tools/pull/1
 - dr-saad-la/awesome-llm-tools: https://github.com/dr-saad-la/awesome-llm-tools/pull/7
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
@@ -183,7 +179,6 @@ Open PRs:
 - awesome-code-agents follow-up: https://github.com/sorrycc/awesome-code-agents/pull/22
 - tensorchord/Awesome-LLMOps: https://github.com/tensorchord/Awesome-LLMOps/pull/444
 - awesome-agent-cortex: https://github.com/0xNyk/awesome-agent-cortex/pull/20
-- awesome-tuis follow-up: https://github.com/rothgar/awesome-tuis/pull/659
 - LangGPT/awesome-claude-code: https://github.com/LangGPT/awesome-claude-code/pull/58
 - awesome-agent-harness: https://github.com/Picrew/awesome-agent-harness/pull/5
 - command-line-tools: https://github.com/linsa-io/command-line-tools/pull/35
@@ -192,7 +187,6 @@ Open PRs:
 - awesome-llm-skills: https://github.com/Prat011/awesome-llm-skills/pull/116
 - awesome-ai-plugins: https://github.com/hashgraph-online/awesome-ai-plugins/pull/22
 - awesome-copilot-agents: https://github.com/Code-and-Sorts/awesome-copilot-agents/pull/53
-- github/awesome-copilot: https://github.com/github/awesome-copilot/pull/1595
 - awesome-agent-skills: https://github.com/heilcheng/awesome-agent-skills/pull/216
 - awesome-ai-eval: https://github.com/Vvkmnn/awesome-ai-eval/pull/10
 - skyming/awesome-ai-agent: https://github.com/skyming/awesome-ai-agent/pull/6
@@ -264,6 +258,7 @@ Merged listings:
 - PierrunoYT/awesome-ai-dev-tools: https://github.com/PierrunoYT/awesome-ai-dev-tools/pull/20
 - adriannovegil/awesome-observability follow-up: https://github.com/adriannovegil/awesome-observability/pull/64
 - pegaltier/awesome-utils-dev: https://github.com/pegaltier/awesome-utils-dev/pull/29
+- llm-toolkit: https://github.com/sumanth-dhanya/llm-toolkit/pull/1
 
 Manual-only submission:
 
@@ -272,7 +267,7 @@ Manual-only submission:
 - awesome-claude-skills: skip automated PRs unless submitted manually by a human; its contribution guide asks that PRs are not AI-assisted and generally expects social proof.
 - awesome-go: defer until the project is older and has the required quality links; contribution checks expect repository maturity, pkg.go.dev, Go Report Card, and coverage evidence.
 - awesome-cli-apps: PR https://github.com/agarrharr/awesome-cli-apps/pull/1032 was closed without maintainer feedback. Revisit after more external adoption or a clearer category fit.
-- awesome-tuis: likely blocked until the repo is at least 6 months old; its PR template requires repos to be at least 6 months old, PR #658 was closed after reviewer feedback, and follow-up PR #659 is open.
+- awesome-tuis: blocked until the repo is at least 6 months old; its PR template requires repos to be at least 6 months old, and follow-up PR https://github.com/rothgar/awesome-tuis/pull/659 was closed after reviewer feedback.
 - Terminal Trove: submit through https://terminaltrove.com/post/ after confirming the author contact email. Suggested categories: `macos`, `linux`, `windows`, `monitoring`, `observability`, `tui`, `json`, `ai`, `cli`, `debugging`, `cross-platform`. Preview PNG: `https://luoyuctl.github.io/agenttrace/assets/readme-real-overview.png`; GIF: `https://luoyuctl.github.io/agenttrace/assets/agenttrace-demo.gif`.
 - Terminal Apps: submitted suggestion issue https://github.com/scmmishra/terminal-apps.dev/issues/55. Name: `agenttrace`; GitHub URL: `https://github.com/luoyuctl/agenttrace`.
 - awesome-ai-coding-techniques: submitted technique suggestion https://github.com/inmve/awesome-ai-coding-techniques/issues/37. Suggested technique: inspect AI agent session traces after a run. Followed up on semantic-drift feedback in https://github.com/inmve/awesome-ai-coding-techniques/issues/37#issuecomment-4414284882.
@@ -280,6 +275,10 @@ Manual-only submission:
 - vincentkoc/awesome-openclaw: submitted required pre-PR resource request https://github.com/vincentkoc/awesome-openclaw/issues/82. Suggested section: Developer Tooling and Observability.
 - agent-gigmole/awesome-ai-agent-tools: submitted tool suggestion https://github.com/agent-gigmole/awesome-ai-agent-tools/issues/2. Suggested category: Observability & Evaluation.
 - InftyAI/Awesome-LLMOps: closed duplicate PR https://github.com/InftyAI/Awesome-LLMOps/pull/418 in favor of workflow-generated PR https://github.com/InftyAI/Awesome-LLMOps/pull/420.
+- kyrolabs/awesome-agents: closed duplicate PR https://github.com/kyrolabs/awesome-agents/pull/437; follow-up PR https://github.com/kyrolabs/awesome-agents/pull/440 was also closed.
+- jamesmurdza/awesome-ai-devtools: closed duplicate PR https://github.com/jamesmurdza/awesome-ai-devtools/pull/492 in favor of follow-up PR https://github.com/jamesmurdza/awesome-ai-devtools/pull/495.
+- jim-schwoebel/awesome_ai_agents: closed duplicate PR https://github.com/jim-schwoebel/awesome_ai_agents/pull/250 in favor of follow-up PR https://github.com/jim-schwoebel/awesome_ai_agents/pull/254.
+- github/awesome-copilot: PR https://github.com/github/awesome-copilot/pull/1595 was closed as a low-quality automated submission; do not resubmit without a narrower, manual-quality angle.
 
 Terminal Trove draft:
 
