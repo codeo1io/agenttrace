@@ -263,6 +263,7 @@ Open PRs:
 - closedloop-technologies/awesome-coding-agents: https://github.com/closedloop-technologies/awesome-coding-agents/pull/3
 - kax168/awesome-ai-coding-assistants-2026: https://github.com/kax168/awesome-ai-coding-assistants-2026/pull/3
 - vaderyang/awesome-openai-codex: https://github.com/vaderyang/awesome-openai-codex/pull/1
+- taahro/awesome-openai-codex-cli: https://github.com/taahro/awesome-openai-codex-cli/pull/2
 
 Merged listings:
 
