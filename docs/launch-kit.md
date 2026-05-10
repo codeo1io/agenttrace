@@ -275,6 +275,7 @@ Open PRs:
 - abordage/awesome-ai: https://github.com/abordage/awesome-ai/pull/4
 - qualisero/awesome-pi-agent: https://github.com/qualisero/awesome-pi-agent/pull/54
 - FlorianBruniaux/claude-code-ultimate-guide: https://github.com/FlorianBruniaux/claude-code-ultimate-guide/pull/27
+- analyticalrohit/awesome-vibe-coding-guide: https://github.com/analyticalrohit/awesome-vibe-coding-guide/pull/25
 
 Merged listings:
 
