@@ -166,6 +166,7 @@ Open PRs:
 - chendongqi/awesome-ai-coding: https://github.com/chendongqi/awesome-ai-coding/pull/2
 - shalk/awesome-ai-coding: https://github.com/shalk/awesome-ai-coding/pull/3
 - AnswerZhao/ai-coding-playbook: https://github.com/AnswerZhao/ai-coding-playbook/pull/5
+- sam-blackfly/awesome-llm-tools: https://github.com/sam-blackfly/awesome-llm-tools/pull/2
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
