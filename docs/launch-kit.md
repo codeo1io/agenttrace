@@ -274,6 +274,7 @@ Open PRs:
 - CloudAI-X/claude-code-resources: https://github.com/CloudAI-X/claude-code-resources/pull/12
 - abordage/awesome-ai: https://github.com/abordage/awesome-ai/pull/4
 - qualisero/awesome-pi-agent: https://github.com/qualisero/awesome-pi-agent/pull/54
+- FlorianBruniaux/claude-code-ultimate-guide: https://github.com/FlorianBruniaux/claude-code-ultimate-guide/pull/27
 
 Merged listings:
 
