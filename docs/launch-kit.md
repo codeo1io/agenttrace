@@ -168,6 +168,7 @@ Open PRs:
 - shalk/awesome-ai-coding: https://github.com/shalk/awesome-ai-coding/pull/3
 - AnswerZhao/ai-coding-playbook: https://github.com/AnswerZhao/ai-coding-playbook/pull/5
 - sam-blackfly/awesome-llm-tools: https://github.com/sam-blackfly/awesome-llm-tools/pull/2
+- jordimas/awesome-agentic-engineering: https://github.com/jordimas/awesome-agentic-engineering/pull/2
 - llm-toolkit: https://github.com/sumanth-dhanya/llm-toolkit/pull/1
 - spinov001-art/awesome-llm-tools: https://github.com/spinov001-art/awesome-llm-tools/pull/1
 - dr-saad-la/awesome-llm-tools: https://github.com/dr-saad-la/awesome-llm-tools/pull/7
