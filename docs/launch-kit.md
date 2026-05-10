@@ -126,6 +126,7 @@ Open PRs:
 - furudo-erika/awesome-ai-testing-tools: https://github.com/furudo-erika/awesome-ai-testing-tools/pull/1
 - awesome-harness-engineering: https://github.com/ai-boost/awesome-harness-engineering/pull/14
 - walkinglabs/awesome-harness-engineering: https://github.com/walkinglabs/awesome-harness-engineering/pull/26
+- AutoJunjie/awesome-agent-harness: https://github.com/AutoJunjie/awesome-agent-harness/pull/18
 - mahonzhan/awesome-agent-harness: https://github.com/mahonzhan/awesome-agent-harness/pull/3
 - awesome-agentops-landscape: https://github.com/dyronrh/awesome-agentops-landscape/pull/4
 - awesome-coding-agent-eval: https://github.com/gudo7208/awesome-coding-agent-eval/pull/1
