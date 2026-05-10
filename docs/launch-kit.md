@@ -230,6 +230,8 @@ Open PRs:
 - kax168/awesome-ai-coding-2026: https://github.com/kax168/awesome-ai-coding-2026/pull/1
 - bluegalaxy111/awesome-vibe-coding: https://github.com/bluegalaxy111/awesome-vibe-coding/pull/4
 - hammadhaqqani/awesome-devops-ai: https://github.com/hammadhaqqani/awesome-devops-ai/pull/23
+- sorrycc/awesome-code-agents follow-up: https://github.com/sorrycc/awesome-code-agents/pull/23
+- eudk/awesome-ai-tools: https://github.com/eudk/awesome-ai-tools/pull/242
 
 Merged listings:
 
