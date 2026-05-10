@@ -240,6 +240,7 @@ Open PRs:
 - zjh1943/awesome-claude-code: https://github.com/zjh1943/awesome-claude-code/pull/44
 - gaborsoter/awesome-ai-dev-productivity: https://github.com/gaborsoter/awesome-ai-dev-productivity/pull/2
 - saviorand/awesome-ai-assisted-coding: https://github.com/saviorand/awesome-ai-assisted-coding/pull/4
+- karanb192/awesome-claude-skills: https://github.com/karanb192/awesome-claude-skills/pull/75
 
 Merged listings:
 
