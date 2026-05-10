@@ -96,7 +96,6 @@ curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh
 Other install paths:
 
 ```bash
-npm install -g agenttrace
 brew install luoyuctl/tap/agenttrace
 go install github.com/luoyuctl/agenttrace/cmd/agenttrace@latest
 ```
@@ -107,7 +106,7 @@ Windows:
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-The npm wrapper is also available as `agenttrace` after each release is published.
+The npm wrapper is prepared but not published yet; use the install script, Homebrew, Go install, or GitHub release binaries until the npm package is authorized.
 ## Common workflows
 
 ```bash

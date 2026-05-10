@@ -79,10 +79,11 @@ curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh
 其它安装方式：
 
 ```bash
-npm install -g agenttrace
 brew install luoyuctl/tap/agenttrace
 go install github.com/luoyuctl/agenttrace/cmd/agenttrace@latest
 ```
+
+npm wrapper 已准备但尚未发布；在 npm package 获得授权前，请使用安装脚本、Homebrew、Go install 或 GitHub Release binaries。
 
 Windows：
 

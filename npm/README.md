@@ -2,23 +2,18 @@
 
 Local-first AI coding agent session history for cost, tokens, time, and slow-run diagnosis.
 
-This directory contains the npm wrapper for agenttrace.
+This directory contains the prepared npm wrapper for agenttrace. The package is not published yet.
 
 Use it to answer two questions:
 
 - Which coding agent sessions burned the most cost, tokens, and wall-clock time?
 - Why did a specific agent task run slowly?
 
-## Install
+## Status
 
-Use one of the supported install methods:
+The npm package is prepared for maintainer review, but `agenttrace` is not currently published on npm. Do not present npm as an active install path until package publication is explicitly authorized and completed.
 
-```bash
-npm install -g agenttrace
-agenttrace --version
-```
-
-Other install methods:
+## Active Install Methods
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
