@@ -258,6 +258,7 @@ Open PRs:
 - boxabirds/awesome-ai-engineering: https://github.com/boxabirds/awesome-ai-engineering/pull/2
 - Guidely-org/awesome-ai-engineering: https://github.com/Guidely-org/awesome-ai-engineering/pull/1
 - cola-runner/awesome-tui-design: https://github.com/cola-runner/awesome-tui-design/pull/1
+- phmullins/awesome-macos-commandline: https://github.com/phmullins/awesome-macos-commandline/pull/12
 
 Merged listings:
 
