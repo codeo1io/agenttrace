@@ -126,6 +126,7 @@ Open PRs:
 - brandonhimpfen/awesome-llmops: https://github.com/brandonhimpfen/awesome-llmops/pull/4
 - onejune2018/Awesome-LLM-Eval: https://github.com/onejune2018/Awesome-LLM-Eval/pull/38
 - pauldebdeep9/awesome-agentic-evaluation: https://github.com/pauldebdeep9/awesome-agentic-evaluation/pull/2
+- furudo-erika/awesome-ai-testing-tools: https://github.com/furudo-erika/awesome-ai-testing-tools/pull/1
 - awesome-harness-engineering: https://github.com/ai-boost/awesome-harness-engineering/pull/14
 - walkinglabs/awesome-harness-engineering: https://github.com/walkinglabs/awesome-harness-engineering/pull/26
 - mahonzhan/awesome-agent-harness: https://github.com/mahonzhan/awesome-agent-harness/pull/3
