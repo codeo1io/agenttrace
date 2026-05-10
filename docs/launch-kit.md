@@ -228,6 +228,7 @@ Open PRs:
 - doshibadev/awesome-agentic-devtools: https://github.com/doshibadev/awesome-agentic-devtools/pull/4
 - XD3an/awesome-ai-coding-all-in-one: https://github.com/XD3an/awesome-ai-coding-all-in-one/pull/1
 - kax168/awesome-ai-coding-2026: https://github.com/kax168/awesome-ai-coding-2026/pull/1
+- bluegalaxy111/awesome-vibe-coding: https://github.com/bluegalaxy111/awesome-vibe-coding/pull/4
 
 Merged listings:
 
