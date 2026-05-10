@@ -276,6 +276,8 @@ Open PRs:
 - qualisero/awesome-pi-agent: https://github.com/qualisero/awesome-pi-agent/pull/54
 - FlorianBruniaux/claude-code-ultimate-guide: https://github.com/FlorianBruniaux/claude-code-ultimate-guide/pull/27
 - analyticalrohit/awesome-vibe-coding-guide: https://github.com/analyticalrohit/awesome-vibe-coding-guide/pull/25
+- vanna-ai/Awesome-Vibe-Coding-CLI: https://github.com/vanna-ai/Awesome-Vibe-Coding-CLI/pull/5
+- no-fluff/awesome-vibe-coding: submitted required tool proposal https://github.com/no-fluff/awesome-vibe-coding/issues/107
 
 Merged listings:
 
