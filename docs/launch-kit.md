@@ -272,6 +272,7 @@ Open PRs:
 - spinov001-art/awesome-cli-tools-2026: https://github.com/spinov001-art/awesome-cli-tools-2026/pull/1
 - Siilwyn/awesome-cli-tools: https://github.com/Siilwyn/awesome-cli-tools/pull/19
 - CloudAI-X/claude-code-resources: https://github.com/CloudAI-X/claude-code-resources/pull/12
+- abordage/awesome-ai: https://github.com/abordage/awesome-ai/pull/4
 
 Merged listings:
 
