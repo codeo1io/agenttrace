@@ -266,6 +266,7 @@ Open PRs:
 - taahro/awesome-openai-codex-cli: https://github.com/taahro/awesome-openai-codex-cli/pull/2
 - dtunai/awesome-gemini-cli: https://github.com/dtunai/awesome-gemini-cli/pull/4
 - pantheon-org/awesome-opencode: submitted required tool suggestion https://github.com/pantheon-org/awesome-opencode/issues/12
+- yiancode/AwesomeClaudeCode: submitted resource suggestion https://github.com/yiancode/AwesomeClaudeCode/issues/142
 
 Merged listings:
 
