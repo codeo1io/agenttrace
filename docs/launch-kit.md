@@ -262,6 +262,7 @@ Open PRs:
 - saehun/awesome-terminal: https://github.com/saehun/awesome-terminal/pull/4
 - closedloop-technologies/awesome-coding-agents: https://github.com/closedloop-technologies/awesome-coding-agents/pull/3
 - kax168/awesome-ai-coding-assistants-2026: https://github.com/kax168/awesome-ai-coding-assistants-2026/pull/3
+- vaderyang/awesome-openai-codex: https://github.com/vaderyang/awesome-openai-codex/pull/1
 
 Merged listings:
 
