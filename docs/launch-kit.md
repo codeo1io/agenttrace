@@ -246,6 +246,7 @@ Open PRs:
 - ankitvirdi4/awesome-llm-cost: https://github.com/ankitvirdi4/awesome-llm-cost/pull/2
 - ravsau/awesome-ai-cost-optimization: https://github.com/ravsau/awesome-ai-cost-optimization/pull/2
 - u4ma-kev/awesome-ai-agent-cost-control: https://github.com/u4ma-kev/awesome-ai-agent-cost-control/pull/2
+- sjakati98/awesome-tools-for-agents: https://github.com/sjakati98/awesome-tools-for-agents/pull/1
 
 Merged listings:
 
