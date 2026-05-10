@@ -128,6 +128,7 @@ Open PRs:
 - mahonzhan/awesome-agent-harness: https://github.com/mahonzhan/awesome-agent-harness/pull/3
 - awesome-agentops-landscape: https://github.com/dyronrh/awesome-agentops-landscape/pull/4
 - awesome-coding-agent-eval: https://github.com/gudo7208/awesome-coding-agent-eval/pull/1
+- quome-cloud/awesome-coding-agents: https://github.com/quome-cloud/awesome-coding-agents/pull/4
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
