@@ -251,6 +251,7 @@ Open PRs:
 - KalyanKS-NLP/llm-engineer-toolkit: https://github.com/KalyanKS-NLP/llm-engineer-toolkit/pull/27
 - Sumanth077/ai-engineering-toolkit: https://github.com/Sumanth077/ai-engineering-toolkit/pull/18
 - a16z-infra/llm-app-stack: https://github.com/a16z-infra/llm-app-stack/pull/54
+- ankurkumarz/agentic-ai-knowledge-base: https://github.com/ankurkumarz/agentic-ai-knowledge-base/pull/1
 
 Merged listings:
 
