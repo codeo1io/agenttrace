@@ -242,6 +242,8 @@ Open PRs:
 - saviorand/awesome-ai-assisted-coding: https://github.com/saviorand/awesome-ai-assisted-coding/pull/4
 - karanb192/awesome-claude-skills: https://github.com/karanb192/awesome-claude-skills/pull/75
 - libukai/awesome-agent-skills: https://github.com/libukai/awesome-agent-skills/pull/54
+- kodustech/awesome-agent-skills: https://github.com/kodustech/awesome-agent-skills/pull/15
+- Chat2AnyLLM/awesome-repo-configs: https://github.com/Chat2AnyLLM/awesome-repo-configs/pull/14
 
 Merged listings:
 
