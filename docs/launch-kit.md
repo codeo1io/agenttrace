@@ -234,6 +234,7 @@ Open PRs:
 - eudk/awesome-ai-tools: https://github.com/eudk/awesome-ai-tools/pull/242
 - scortt/awesome-ai-dev-tools: https://github.com/scortt/awesome-ai-dev-tools/pull/1
 - kax168/awesome-ai-dev-tools-2026: https://github.com/kax168/awesome-ai-dev-tools-2026/pull/3
+- claudexia-api/awesome-claude-tools: https://github.com/claudexia-api/awesome-claude-tools/pull/1
 
 Merged listings:
 
