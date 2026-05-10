@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+No unreleased changes yet.
+
+## v0.4.6 - 2026-05-10
+
 ### Fixed
 
 - Show sessions from `~/.pi/agent/sessions` as Pi while keeping
