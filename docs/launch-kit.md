@@ -164,6 +164,7 @@ Open PRs:
 - erkcet/awesome-claude-code: https://github.com/erkcet/awesome-claude-code/pull/3
 - shahshrey/awesome-claude-code-mastery: https://github.com/shahshrey/awesome-claude-code-mastery/pull/16
 - chendongqi/awesome-ai-coding: https://github.com/chendongqi/awesome-ai-coding/pull/2
+- shalk/awesome-ai-coding: https://github.com/shalk/awesome-ai-coding/pull/3
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
