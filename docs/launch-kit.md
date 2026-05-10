@@ -248,6 +248,8 @@ Open PRs:
 - u4ma-kev/awesome-ai-agent-cost-control: https://github.com/u4ma-kev/awesome-ai-agent-cost-control/pull/2
 - sjakati98/awesome-tools-for-agents: https://github.com/sjakati98/awesome-tools-for-agents/pull/1
 - moshehbenavraham/Ultimate-Agent-Directory: https://github.com/moshehbenavraham/Ultimate-Agent-Directory/pull/79
+- KalyanKS-NLP/llm-engineer-toolkit: https://github.com/KalyanKS-NLP/llm-engineer-toolkit/pull/27
+- Sumanth077/ai-engineering-toolkit: https://github.com/Sumanth077/ai-engineering-toolkit/pull/18
 
 Merged listings:
 
