@@ -149,6 +149,9 @@ Open PRs:
 - yeaight7/awesome-ai-devtools: https://github.com/yeaight7/awesome-ai-devtools/pull/1
 - Icloudeng/awesome-ai-coding-tools: https://github.com/Icloudeng/awesome-ai-coding-tools/pull/9
 - dremeika/awesome-coding-assistants: https://github.com/dremeika/awesome-coding-assistants/pull/11
+- tranhoangpich/awesome-agentic-coding: https://github.com/tranhoangpich/awesome-agentic-coding/pull/1
+- Transcenda/awesome-agentic-coding: https://github.com/Transcenda/awesome-agentic-coding/pull/2
+- yubing744/awesome-agentic-coding-cli: https://github.com/yubing744/awesome-agentic-coding-cli/pull/1
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
