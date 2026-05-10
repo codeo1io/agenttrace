@@ -157,6 +157,8 @@ Open PRs:
 - rogerchappel/awesome-agentic-engineering: https://github.com/rogerchappel/awesome-agentic-engineering/pull/1
 - AFunLS/awesome-ai-agent-tools: https://github.com/AFunLS/awesome-ai-agent-tools/pull/4
 - jsnyder/awesome-llm-cli-apps: https://github.com/jsnyder/awesome-llm-cli-apps/pull/1
+- o3-cloud/awesome-llm-cli: https://github.com/o3-cloud/awesome-llm-cli/pull/5
+- bgl761915-debug/cool-linux-apps: https://github.com/bgl761915-debug/cool-linux-apps/pull/1
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
