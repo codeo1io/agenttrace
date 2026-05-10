@@ -267,6 +267,7 @@ Open PRs:
 - dtunai/awesome-gemini-cli: https://github.com/dtunai/awesome-gemini-cli/pull/4
 - pantheon-org/awesome-opencode: submitted required tool suggestion https://github.com/pantheon-org/awesome-opencode/issues/12
 - yiancode/AwesomeClaudeCode: submitted resource suggestion https://github.com/yiancode/AwesomeClaudeCode/issues/142
+- simonpierreboucher02/awesome-claude-code: https://github.com/simonpierreboucher02/awesome-claude-code/pull/1
 
 Merged listings:
 
