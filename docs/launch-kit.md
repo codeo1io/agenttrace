@@ -235,6 +235,7 @@ Open PRs:
 - sandipan1/awesome-claude-skills: https://github.com/sandipan1/awesome-claude-skills/pull/7
 - yibie/Awesome-Claude-Skills: https://github.com/yibie/Awesome-Claude-Skills/pull/7
 - coderPerseus/awesome-cli-tools-for-agents: https://github.com/coderPerseus/awesome-cli-tools-for-agents/pull/1
+- danielrosehill/Awesome-AI-Evaluations-Tools: https://github.com/danielrosehill/Awesome-AI-Evaluations-Tools/pull/3
 
 Merged listings:
 
