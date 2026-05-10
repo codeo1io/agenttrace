@@ -241,6 +241,7 @@ Open PRs:
 - gaborsoter/awesome-ai-dev-productivity: https://github.com/gaborsoter/awesome-ai-dev-productivity/pull/2
 - saviorand/awesome-ai-assisted-coding: https://github.com/saviorand/awesome-ai-assisted-coding/pull/4
 - karanb192/awesome-claude-skills: https://github.com/karanb192/awesome-claude-skills/pull/75
+- libukai/awesome-agent-skills: https://github.com/libukai/awesome-agent-skills/pull/54
 
 Merged listings:
 
