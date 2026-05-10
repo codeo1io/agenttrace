@@ -136,6 +136,8 @@ Open PRs:
 - SamurAIGPT/awesome-openclaw: https://github.com/SamurAIGPT/awesome-openclaw/pull/125
 - alvinreal/awesome-openclaw: https://github.com/alvinreal/awesome-openclaw/pull/34
 - hao-ji-xing/awesome-cursor: https://github.com/hao-ji-xing/awesome-cursor/pull/31
+- xiaoju111a/awesome-kimi-cli: https://github.com/xiaoju111a/awesome-kimi-cli/pull/1
+- lfglabs-dev/awesome-kimi-cli: https://github.com/lfglabs-dev/awesome-kimi-cli/pull/4
 - Scottcjn/awesome-agents: https://github.com/Scottcjn/awesome-agents/pull/12
 - awesome-cli-apps-in-a-csv: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/255
 - awesome-cli-apps-in-a-csv follow-up: https://github.com/toolleeo/awesome-cli-apps-in-a-csv/pull/256
