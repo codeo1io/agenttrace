@@ -216,6 +216,7 @@ Open PRs:
 - ComposioHQ/awesome-codex-skills: https://github.com/ComposioHQ/awesome-codex-skills/pull/58
 - JackyST0/awesome-agent-skills: https://github.com/JackyST0/awesome-agent-skills/pull/36
 - skillmatic-ai/awesome-agent-skills: https://github.com/skillmatic-ai/awesome-agent-skills/pull/78
+- xlabs-club/awesome-x-ops: https://github.com/xlabs-club/awesome-x-ops/pull/10
 
 Merged listings:
 
