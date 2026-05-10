@@ -257,6 +257,7 @@ Open PRs:
 - goabiaryan/awesome-observability: https://github.com/goabiaryan/awesome-observability/pull/4
 - boxabirds/awesome-ai-engineering: https://github.com/boxabirds/awesome-ai-engineering/pull/2
 - Guidely-org/awesome-ai-engineering: https://github.com/Guidely-org/awesome-ai-engineering/pull/1
+- cola-runner/awesome-tui-design: https://github.com/cola-runner/awesome-tui-design/pull/1
 
 Merged listings:
 
