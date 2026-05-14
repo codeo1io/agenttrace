@@ -18,7 +18,7 @@ import (
 
 const (
 	pricingURL      = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
-	pricingCacheDir = "agentwaste"
+	pricingCacheDir = "agenttrace"
 	pricingCacheFile = "pricing.json"
 	cacheMaxAge     = 24 * time.Hour
 )

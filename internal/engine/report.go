@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/luoyuctl/agentwaste/internal/i18n"
+	"github.com/luoyuctl/agenttrace/internal/i18n"
 )
 
 // ReportText generates the formatted text report.

@@ -1,4 +1,4 @@
-// Package tui provides the Bubble Tea interactive terminal UI for agentwaste.
+// Package tui provides the Bubble Tea interactive terminal UI for agenttrace.
 // btop-style modern dashboard with three views: Session List, Detail, Compare.
 package tui
 
@@ -11,8 +11,8 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/luoyuctl/agentwaste/internal/engine"
-	"github.com/luoyuctl/agentwaste/internal/i18n"
+	"github.com/luoyuctl/agenttrace/internal/engine"
+	"github.com/luoyuctl/agenttrace/internal/i18n"
 )
 
 // ── Styles ──
@@ -596,7 +596,7 @@ func (m *Model) refreshCompare() {
 
 func (m Model) View() string {
 	// Title bar
-	title := titleStyle.Render(fmt.Sprintf(i18n.T("agentwaste_title"), engine.Version))
+	title := titleStyle.Render(fmt.Sprintf(i18n.T("agenttrace_title"), engine.Version))
 	countBadge := lipgloss.NewStyle().
 		Background(lipgloss.Color("240")).
 		Foreground(lipgloss.Color("229")).

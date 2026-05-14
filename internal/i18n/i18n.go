@@ -1,4 +1,4 @@
-// Package i18n provides bilingual (English/Chinese) translation support for agentwaste.
+// Package i18n provides bilingual (English/Chinese) translation support for agenttrace.
 package i18n
 
 // Lang represents a language code.
@@ -204,7 +204,7 @@ var translations = map[string]map[Lang]string{
 	},
 
 	// ── TUI views ──
-	"agentwaste_title": {
+	"agenttrace_title": {
 		EN: "💸 AGENTWASTE v%s",
 		ZH: "💸 AGENTWASTE v%s",
 	},
@@ -249,8 +249,8 @@ var translations = map[string]map[Lang]string{
 
 	// ── CLI / main ──
 	"supported_models": {
-		EN: "agentwaste v%s — Supported Models",
-		ZH: "agentwaste v%s — 支持模型",
+		EN: "agenttrace v%s — Supported Models",
+		ZH: "agenttrace v%s — 支持模型",
 	},
 	"model_header": {
 		EN: "Model",
@@ -327,8 +327,8 @@ var translations = map[string]map[Lang]string{
 
 	// ── Empty state ──
 	"empty_sessions_hint": {
-		EN: " No AI agent sessions found.\n\n Try: agentwaste --latest -d ~/.hermes/sessions\n      agentwaste --compare -d ~/.hermes/sessions\n\n Place session JSON/JSONL files in ~/.hermes/sessions/ ",
-		ZH: " 未找到 AI 代理会话。\n\n 尝试: agentwaste --latest -d ~/.hermes/sessions\n       agentwaste --compare -d ~/.hermes/sessions\n\n 将会话 JSON/JSONL 文件放在 ~/.hermes/sessions/ ",
+		EN: " No AI agent sessions found.\n\n Try: agenttrace --latest -d ~/.hermes/sessions\n      agenttrace --compare -d ~/.hermes/sessions\n\n Place session JSON/JSONL files in ~/.hermes/sessions/ ",
+		ZH: " 未找到 AI 代理会话。\n\n 尝试: agenttrace --latest -d ~/.hermes/sessions\n       agenttrace --compare -d ~/.hermes/sessions\n\n 将会话 JSON/JSONL 文件放在 ~/.hermes/sessions/ ",
 	},
 	"lang_label": {
 		EN: "EN",

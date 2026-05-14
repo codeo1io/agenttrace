@@ -1,4 +1,4 @@
-// Command agentwaste — multi-format AI agent session performance analyzer.
+// Command agenttrace — multi-format AI agent session performance analyzer.
 // No args: launch interactive Bubble Tea TUI.
 package main
 
@@ -10,10 +10,10 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/luoyuctl/agentwaste/internal/engine"
-	"github.com/luoyuctl/agentwaste/internal/i18n"
-	"github.com/luoyuctl/agentwaste/internal/index"
-	"github.com/luoyuctl/agentwaste/internal/tui"
+	"github.com/luoyuctl/agenttrace/internal/engine"
+	"github.com/luoyuctl/agenttrace/internal/i18n"
+	"github.com/luoyuctl/agenttrace/internal/index"
+	"github.com/luoyuctl/agenttrace/internal/tui"
 )
 
 func main() {
@@ -43,7 +43,7 @@ func main() {
 
 	// Version
 	if *version {
-		fmt.Printf("agentwaste v%s\n", engine.Version)
+		fmt.Printf("agenttrace v%s\n", engine.Version)
 		return
 	}
 
