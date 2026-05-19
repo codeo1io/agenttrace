@@ -54,7 +54,7 @@ agenttrace --overview -f json
 agenttrace
 ```
 
-On a real local machine, agenttrace found `1,707` reportable sessions, `8.68B` tokens, `$4,716.31` estimated cost, and `35` critical sessions without uploading prompts or code.
+On a real local machine, agenttrace surfaces reportable sessions, token spend, estimated cost, and critical runs without uploading prompts or code. The captured run below shows the exact snapshot used for the README assets.
 
 ## Real local run
 
