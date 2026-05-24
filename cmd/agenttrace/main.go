@@ -151,7 +151,7 @@ func main() {
 	}
 
 	if strings.TrimSpace(*searchQuery) != "" {
-		sessions := engine.LoadAll(sessionsDir)
+		sessions := loadSessionsForSearch(sessionsDir)
 		if len(sessions) == 0 {
 			fmt.Fprintf(os.Stderr, i18n.T("no_session_files")+"\n", sessionsDir)
 			os.Exit(1)
@@ -351,6 +351,21 @@ func main() {
 // to discover sessions from ~/.hermes, ~/.claude, ~/.codex, ~/.gemini simultaneously.
 func resolveDefaultDir() string {
 	return ""
+}
+
+func loadSessionsForSearch(sessionsDir string) []engine.Session {
+	if sessionsDir == "" {
+		return engine.LoadAll("")
+	}
+	var sessions []engine.Session
+	for _, f := range engine.FindSessionFiles(sessionsDir) {
+		s, err := engine.LoadSession(f)
+		if err != nil {
+			continue
+		}
+		sessions = append(sessions, *s)
+	}
+	return sessions
 }
 
 func latestSessionFile(files []string) string {
