@@ -523,7 +523,7 @@ func DetectFormat(path string) FormatInfo {
 	if len(data) == 0 {
 		return fi
 	}
-	
+
 	content := strings.TrimSpace(string(data))
 	if content == "" {
 		return fi
