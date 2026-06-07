@@ -60,6 +60,23 @@ var sqliteSessionCache struct {
 	modTimes map[string]int64
 }
 
+// getSQLiteModTimes returns the modification times for a SQLite database and its WAL/SHM files
+func getSQLiteModTimes(dbPath string) int64 {
+	// Get the max mtime of the main DB, WAL, and SHM files
+	mainMod := getFileModTime(dbPath)
+	walMod := getFileModTime(dbPath + "-wal")
+	shmMod := getFileModTime(dbPath + "-shm")
+	
+	maxMod := mainMod
+	if walMod > maxMod {
+		maxMod = walMod
+	}
+	if shmMod > maxMod {
+		maxMod = shmMod
+	}
+	return maxMod
+}
+
 // LoadSQLiteBackedSessionsCached returns cached SQLite sessions, only reloads when DB files change
 func LoadSQLiteBackedSessionsCached(cache SessionCache) []Session {
 	home, _ := os.UserHomeDir()
@@ -70,9 +87,9 @@ func LoadSQLiteBackedSessionsCached(cache SessionCache) []Session {
 	hermesPath := hermesStateDBPath(home)
 	openCodePath := openCodeDBPath(home)
 
-	// Check if DB files have changed
-	hermesMod := getFileModTime(hermesPath)
-	openCodeMod := getFileModTime(openCodePath)
+	// Check if DB files have changed (including WAL/SHM)
+	hermesMod := getSQLiteModTimes(hermesPath)
+	openCodeMod := getSQLiteModTimes(openCodePath)
 
 	// If cache exists and DB files haven't changed, return cache
 	if sqliteSessionCache.sessions != nil {
