@@ -99,6 +99,7 @@ type loadProgressMsg struct {
 	total    int
 	skipped  int
 	done     bool
+	cache    engine.SessionCache // Return updated cache
 }
 
 // startLoadMsg triggers the initial load in Update() (so state changes are on the real model).
@@ -178,6 +179,9 @@ type Model struct {
 	// Dimensions
 	width  int
 	height int
+
+	// Enhanced features
+	actionMenu ActionMenu
 }
 
 func New(dir string) Model {
@@ -225,7 +229,10 @@ func New(dir string) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return func() tea.Msg { return startLoadMsg{} }
+	return tea.Batch(
+		func() tea.Msg { return startLoadMsg{} },
+		tea.EnableMouseAllMotion, // Enable mouse support
+	)
 }
 
 // ── Progressive Loading ──────────────────────────────────────────
@@ -316,8 +323,9 @@ func discoverSessionFilesCmd(dir string, cache engine.SessionCache) tea.Cmd {
 			sourceCounts: loadingSourceCounts(files, nil, cache),
 		}
 		if dir == "" {
-			for _, s := range engine.LoadSQLiteBackedSessions() {
-				msg.sessions = append(msg.sessions, loadedSession{session: s})
+			// Use cached SQLite sessions
+			for _, s := range engine.LoadSQLiteBackedSessionsCached(cache) {
+				msg.sessions = append(msg.sessions, loadedSession{session: s, fromCache: true})
 			}
 			msg.sourceCounts = loadingSourceCounts(files, msg.sessions, cache)
 		}
@@ -364,6 +372,7 @@ func loadNextCmd(files []string, cache engine.SessionCache, idx int) tea.Cmd {
 			msg.sessions = append(msg.sessions, loadedSession{session: *s, fromCache: false})
 		}
 
+		msg.cache = cache // Return updated cache
 		msg.index = end
 		msg.done = end >= len(files)
 		return msg
@@ -429,6 +438,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 
+	// Mouse support
+	case tea.MouseMsg:
+		if !m.loading {
+			return m.HandleMouseEvent(msg)
+		}
+
 	case startLoadMsg:
 		cmd := m.startReload()
 		return m, cmd
@@ -452,6 +467,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.sessions) > 0 {
 			m.appendLoadedSessions(msg.sessions)
 		}
+		// Update cache
+		m.sessionCache = msg.cache
 		if msg.skipped > 0 {
 			m.loadProgress += msg.skipped
 		}
@@ -1217,7 +1234,21 @@ func (m Model) View() string {
 	tabs := m.renderTabs()
 
 	if m.loading {
+		// Use skeleton loading for initial load, original for progress
+		if m.loadTotal == 0 {
+			return m.fitTerminalFrame(m.RenderSkeletonLoading())
+		}
 		return m.fitTerminalFrame(m.renderLoading())
+	}
+
+	// Action menu overlay
+	if m.actionMenu.visible {
+		menu := m.RenderActionMenu()
+		return m.fitTerminalFrame(lipgloss.Place(
+			m.width, m.height-4,
+			lipgloss.Center, lipgloss.Center,
+			menu,
+		))
 	}
 
 	var content string
@@ -1231,7 +1262,12 @@ func (m Model) View() string {
 			if len(m.sessions) == 0 {
 				content = m.frameContent(lipgloss.NewStyle().Padding(1).Render(fmt.Sprintf(i18n.T("empty_sessions_hint"), m.dir, m.dir, m.dir)))
 			} else {
-				content = m.renderListView()
+				// Use split view for wide terminals
+				if m.frameBodyWidth() >= 160 {
+					content = m.RenderSplitListView()
+				} else {
+					content = m.renderListView()
+				}
 			}
 		case viewDetail:
 			if m.detailReady {

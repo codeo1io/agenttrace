@@ -520,6 +520,10 @@ func DetectFormat(path string) FormatInfo {
 	if err != nil {
 		return fi
 	}
+	if len(data) == 0 {
+		return fi
+	}
+	
 	content := strings.TrimSpace(string(data))
 	if content == "" {
 		return fi
@@ -535,8 +539,21 @@ func DetectFormat(path string) FormatInfo {
 		return fi
 	}
 
-	// Try as single JSON blob first
+	// Optimized: fast field detection before full parse
 	if content[0] == '{' || content[0] == '[' {
+		// Fast detection for Claude Code format
+		if hasField(data, "messages") && hasField(data, "model") {
+			var doc map[string]interface{}
+			if err := json.Unmarshal(data, &doc); err == nil {
+				fi.Doc = doc
+				fi.Raw = data
+				fi.Format = detectSingleJSON(doc)
+				if fi.Format == "unknown" && isOpenCodeStorageSessionDoc(path, doc) {
+					fi.Format = "opencode"
+				}
+				return fi
+			}
+		}
 		var doc map[string]interface{}
 		if err := json.Unmarshal(data, &doc); err == nil {
 			fi.Doc = doc
@@ -555,9 +572,10 @@ func DetectFormat(path string) FormatInfo {
 		}
 	}
 
-	// JSONL: check first few valid lines (skip empty and comments)
+	// JSONL: use efficient line splitting
 	var lineObjs []map[string]interface{}
-	for _, line := range strings.Split(content, "\n") {
+	lines := fastSplitLines(content)
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -811,8 +829,10 @@ func Parse(path string) ([]Event, error) {
 // ── Hermes Agent JSONL ──
 
 func parseHermesJSONL(raw string) ([]Event, error) {
-	var events []Event
-	for _, line := range strings.Split(raw, "\n") {
+	// Optimized: pre-allocate slice capacity
+	events := preallocEvents(128)
+	lines := fastSplitLines(raw)
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -2596,9 +2616,11 @@ func collectSessionFiles(dir string) []string {
 }
 
 // ScanAllDirs discovers and loads sessions from all known agent directories.
+// Uses concurrent loading and session cache for optimal performance.
 func ScanAllDirs() []Session {
 	dirs := DiscoverSessionDirs()
-	var sessions []Session
+	cache := LoadSessionCache()
+	var allFiles []string
 	seen := make(map[string]bool)
 	for _, d := range dirs {
 		if skipSQLiteBackedFileDir(d) {
@@ -2610,13 +2632,37 @@ func ScanAllDirs() []Session {
 				continue
 			}
 			seen[f] = true
-			s, err := LoadSession(f)
-			if err != nil {
-				continue
-			}
-			sessions = append(sessions, *s)
+			allFiles = append(allFiles, f)
 		}
 	}
+
+	// Load file sessions using cache
+	var sessions []Session
+	var uncachedPaths []string
+	for _, path := range allFiles {
+		if s, ok := CachedSession(path, cache); ok {
+			sessions = append(sessions, s)
+		} else {
+			uncachedPaths = append(uncachedPaths, path)
+		}
+	}
+
+	// Load uncached sessions in parallel
+	if len(uncachedPaths) > 0 {
+		newSessions := LoadSessionsParallel(uncachedPaths)
+		for _, s := range newSessions {
+			if info, err := os.Stat(s.Path); err == nil {
+				cache.Entries[s.Path] = CacheEntry{
+					ModTime: info.ModTime().UnixNano(),
+					Size:    info.Size(),
+					Session: s,
+				}
+			}
+			sessions = append(sessions, s)
+		}
+		SaveSessionCache(cache)
+	}
+
 	sessions = append(sessions, LoadSQLiteBackedSessions()...)
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].Metrics.SessionStart > sessions[j].Metrics.SessionStart
@@ -4277,8 +4323,10 @@ func AnalyzeToolLatency(events []Event) []ToolLatencyItem {
 			}
 			for _, tc := range ev.ToolCalls {
 				// Find matching tool result
+				found := false
 				for j := i + 1; j < len(events); j++ {
 					if events[j].Role == "tool" && events[j].ToolCallID == tc.ID {
+						found = true
 						tsEnd := parseTS(events[j].Timestamp)
 						if !tsEnd.IsZero() {
 							dur := tsEnd.Sub(tsStart).Seconds()
@@ -4295,13 +4343,6 @@ func AnalyzeToolLatency(events []Event) []ToolLatencyItem {
 					}
 				}
 				// If no matching tool result found, count as timeout
-				found := false
-				for j := i + 1; j < len(events); j++ {
-					if events[j].Role == "tool" && events[j].ToolCallID == tc.ID {
-						found = true
-						break
-					}
-				}
 				if !found {
 					rec := toolLats[tc.Name]
 					if rec == nil {

@@ -3,6 +3,7 @@ package engine
 import (
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -53,9 +54,91 @@ func loadSQLiteBackedSessions() []Session {
 	return sessions
 }
 
-// LoadSQLiteBackedSessions 返回以本地 SQLite 为权威来源的会话。
+// SQLiteSessionCache caches SQLite sessions
+var sqliteSessionCache struct {
+	sessions []Session
+	modTimes map[string]int64
+}
+
+// LoadSQLiteBackedSessionsCached returns cached SQLite sessions, only reloads when DB files change
+func LoadSQLiteBackedSessionsCached(cache SessionCache) []Session {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return nil
+	}
+
+	hermesPath := hermesStateDBPath(home)
+	openCodePath := openCodeDBPath(home)
+
+	// Check if DB files have changed
+	hermesMod := getFileModTime(hermesPath)
+	openCodeMod := getFileModTime(openCodePath)
+
+	// If cache exists and DB files haven't changed, return cache
+	if sqliteSessionCache.sessions != nil {
+		if sqliteSessionCache.modTimes[hermesPath] == hermesMod &&
+			sqliteSessionCache.modTimes[openCodePath] == openCodeMod {
+			return sqliteSessionCache.sessions
+		}
+	}
+
+	// Reload
+	sessions := loadSQLiteBackedSessions()
+
+	// Update cache
+	sqliteSessionCache.sessions = sessions
+	sqliteSessionCache.modTimes = map[string]int64{
+		hermesPath:   hermesMod,
+		openCodePath: openCodeMod,
+	}
+
+	return sessions
+}
+
+// getFileModTime returns file modification time
+func getFileModTime(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.ModTime().UnixNano()
+}
+
+// LoadSQLiteBackedSessions returns sessions from local SQLite databases.
 func LoadSQLiteBackedSessions() []Session {
 	return loadSQLiteBackedSessions()
+}
+
+// openSQLiteWithIndexes opens database and creates indexes
+func openSQLiteWithIndexes(path string, indexFunc func(*sql.DB) error) (*sql.DB, error) {
+	// Open in read-write mode to create indexes
+	u := url.URL{Scheme: "file", Path: path}
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, err
+	}
+
+	// Set connection pool parameters
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	// Create indexes
+	if indexFunc != nil {
+		if err := indexFunc(db); err != nil {
+			log.Printf("Warning: failed to create indexes: %v", err)
+		}
+	}
+
+	// Analyze tables to update statistics
+	im := NewSQLiteIndexManager(db)
+	if err := im.AnalyzeAll(); err != nil {
+		log.Printf("Warning: failed to analyze tables: %v", err)
+	}
+
+	db.Close()
+
+	// Reopen in read-only mode
+	return openSQLiteReadOnly(path)
 }
 
 func skipSQLiteBackedFileDir(dir string) bool {

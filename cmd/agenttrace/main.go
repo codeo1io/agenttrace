@@ -281,19 +281,15 @@ func main() {
 
 	// Waste analysis for latest session
 	if *wasteFlag {
-		files := engine.FindSessionFiles(sessionsDir)
+		cache := engine.LoadSessionCache()
+		files := engine.FindSessionFilesCached(sessionsDir, cache)
 		if len(files) == 0 {
 			fmt.Fprintf(os.Stderr, i18n.T("no_session_files")+"\n", sessionsDir)
 			os.Exit(1)
 		}
-		targetPath := latestSessionFile(files)
-		if targetPath == "" {
+		s := loadLatestSession(files)
+		if s == nil {
 			fmt.Fprint(os.Stderr, i18n.T("cli_no_session_files"))
-			os.Exit(1)
-		}
-		s, err := engine.LoadSession(targetPath)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, i18n.T("cli_error"), err)
 			os.Exit(1)
 		}
 		wr := engine.ComputeWasteReportFromSession(s)
@@ -304,12 +300,16 @@ func main() {
 	// Resolve target path
 	targetPath := path
 	if *latest {
-		files := engine.FindSessionFiles(sessionsDir)
+		cache := engine.LoadSessionCache()
+		files := engine.FindSessionFilesCached(sessionsDir, cache)
 		if len(files) == 0 {
 			fmt.Fprintf(os.Stderr, i18n.T("no_session_files")+"\n", sessionsDir)
 			os.Exit(1)
 		}
-		targetPath = latestSessionFile(files)
+		s := loadLatestSession(files)
+		if s != nil {
+			targetPath = s.Path
+		}
 	}
 
 	if targetPath == "" {
@@ -394,6 +394,65 @@ func latestSessionFile(files []string) string {
 		}
 	}
 	return latest.path
+}
+
+// loadLatestSession loads the latest session using cache for better performance
+func loadLatestSession(files []string) *engine.Session {
+	cache := engine.LoadSessionCache()
+	var latest *engine.Session
+	var latestTime time.Time
+	var uncachedPaths []string
+
+	// First try cache
+	for _, f := range files {
+		if s, ok := engine.CachedSession(f, cache); ok {
+			if s.Metrics.SessionStart != "" {
+				if ts, err := time.Parse(time.RFC3339, s.Metrics.SessionStart); err == nil {
+					if latest == nil || ts.After(latestTime) {
+						latest = &s
+						latestTime = ts
+					}
+				}
+			}
+		} else {
+			uncachedPaths = append(uncachedPaths, f)
+		}
+	}
+
+	// If cache has result, return immediately
+	if latest != nil {
+		return latest
+	}
+
+	// Cache miss, load from files
+	for _, f := range uncachedPaths {
+		s, err := engine.LoadSession(f)
+		if err != nil {
+			continue
+		}
+
+		// Save to cache
+		if info, err := os.Stat(f); err == nil {
+			cache.Entries[f] = engine.CacheEntry{
+				ModTime: info.ModTime().UnixNano(),
+				Size:    info.Size(),
+				Session: *s,
+			}
+		}
+
+		if s.Metrics.SessionStart != "" {
+			if ts, err := time.Parse(time.RFC3339, s.Metrics.SessionStart); err == nil {
+				if latest == nil || ts.After(latestTime) {
+					latest = s
+					latestTime = ts
+				}
+			}
+		}
+	}
+
+	// Save cache
+	engine.SaveSessionCache(cache)
+	return latest
 }
 
 func newerSessionCandidate(a, b struct {
