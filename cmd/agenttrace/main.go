@@ -419,12 +419,7 @@ func loadLatestSession(files []string) *engine.Session {
 		}
 	}
 
-	// If cache has result, return immediately
-	if latest != nil {
-		return latest
-	}
-
-	// Cache miss, load from files
+	// Always check uncached paths for newer sessions
 	for _, f := range uncachedPaths {
 		s, err := engine.LoadSession(f)
 		if err != nil {
