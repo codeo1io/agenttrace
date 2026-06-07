@@ -402,6 +402,7 @@ func loadLatestSession(files []string) *engine.Session {
 	var latest *engine.Session
 	var latestTime time.Time
 	var latestMtime time.Time
+	var hasTimestamp bool // Track if current best has SessionStart
 	var uncachedPaths []string
 
 	// First try cache
@@ -409,13 +410,14 @@ func loadLatestSession(files []string) *engine.Session {
 		if s, ok := engine.CachedSession(f, cache); ok {
 			if s.Metrics.SessionStart != "" {
 				if ts, err := time.Parse(time.RFC3339, s.Metrics.SessionStart); err == nil {
-					if latest == nil || ts.After(latestTime) {
+					if latest == nil || !hasTimestamp || ts.After(latestTime) {
 						latest = &s
 						latestTime = ts
+						hasTimestamp = true
 					}
 				}
-			} else {
-				// Fallback to mtime for untimestamped sessions
+			} else if !hasTimestamp {
+				// Fallback to mtime only if no timestamped session found
 				if info, err := os.Stat(f); err == nil {
 					if latest == nil || info.ModTime().After(latestMtime) {
 						latest = &s
@@ -448,13 +450,14 @@ func loadLatestSession(files []string) *engine.Session {
 
 		if s.Metrics.SessionStart != "" {
 			if ts, err := time.Parse(time.RFC3339, s.Metrics.SessionStart); err == nil {
-				if latest == nil || ts.After(latestTime) {
+				if latest == nil || !hasTimestamp || ts.After(latestTime) {
 					latest = s
 					latestTime = ts
+					hasTimestamp = true
 				}
 			}
-		} else {
-			// Fallback to mtime for untimestamped sessions
+		} else if !hasTimestamp {
+			// Fallback to mtime only if no timestamped session found
 			if latest == nil || info.ModTime().After(latestMtime) {
 				latest = s
 				latestMtime = info.ModTime()

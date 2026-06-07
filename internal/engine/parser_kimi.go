@@ -53,6 +53,7 @@ func parseKimiCLI(doc map[string]interface{}) ([]Event, error) {
 		ts, _ := msg["timestamp"].(string)
 
 		content := msg["content"]
+		hasAssistantEvent := false
 		switch c := content.(type) {
 		case string:
 			events = append(events, Event{
@@ -61,6 +62,7 @@ func parseKimiCLI(doc map[string]interface{}) ([]Event, error) {
 				Timestamp:  ts,
 				SourceTool: "kimi_cli",
 			})
+			hasAssistantEvent = true
 		case []interface{}:
 			for _, block := range c {
 				b, ok := block.(map[string]interface{})
@@ -77,6 +79,7 @@ func parseKimiCLI(doc map[string]interface{}) ([]Event, error) {
 						Timestamp:  ts,
 						SourceTool: "kimi_cli",
 					})
+					hasAssistantEvent = true
 				case "thinking":
 					think, _ := b["thinking"].(string)
 					redacted, _ := b["redacted"].(bool)
@@ -87,6 +90,7 @@ func parseKimiCLI(doc map[string]interface{}) ([]Event, error) {
 						Redacted:   redacted,
 						SourceTool: "kimi_cli",
 					})
+					hasAssistantEvent = true
 				case "tool_use":
 					id, _ := b["id"].(string)
 					name, _ := b["name"].(string)
@@ -113,6 +117,7 @@ func parseKimiCLI(doc map[string]interface{}) ([]Event, error) {
 						Timestamp:  ts,
 						SourceTool: "kimi_cli",
 					})
+					hasAssistantEvent = true
 				case "tool_result":
 					tid, _ := b["tool_use_id"].(string)
 					isErr, _ := b["is_error"].(bool)
@@ -133,28 +138,41 @@ func parseKimiCLI(doc map[string]interface{}) ([]Event, error) {
 						Timestamp:  ts,
 						SourceTool: "kimi_cli",
 					})
+					hasAssistantEvent = true
 				}
 			}
-		default:
-			// Check for OpenAI-style tool_calls in assistant messages
-			if tcs, ok := msg["tool_calls"].([]interface{}); ok {
-				var tcList []ToolCall
-				for _, tc := range tcs {
-					if tcm, ok := tc.(map[string]interface{}); ok {
-						tcItem := ToolCall{ID: str(tcm, "id")}
-						if fn, ok := tcm["function"].(map[string]interface{}); ok {
-							tcItem.Name = str(fn, "name")
-							tcItem.Args = jsonish(fn["arguments"])
-						}
-						tcList = append(tcList, tcItem)
+		}
+
+		// Check for OpenAI-style tool_calls
+		// Only add separate event if we haven't already added an assistant event
+		if tcs, ok := msg["tool_calls"].([]interface{}); ok {
+			var tcList []ToolCall
+			for _, tc := range tcs {
+				if tcm, ok := tc.(map[string]interface{}); ok {
+					tcItem := ToolCall{ID: str(tcm, "id")}
+					if fn, ok := tcm["function"].(map[string]interface{}); ok {
+						tcItem.Name = str(fn, "name")
+						tcItem.Args = jsonish(fn["arguments"])
 					}
+					tcList = append(tcList, tcItem)
 				}
+			}
+			if !hasAssistantEvent {
+				// No content blocks, add a new assistant event
 				events = append(events, Event{
 					Role:       role,
 					ToolCalls:  tcList,
 					Timestamp:  ts,
 					SourceTool: "kimi_cli",
 				})
+			} else {
+				// Attach tool_calls to the last assistant event
+				for i := len(events) - 1; i >= 0; i-- {
+					if events[i].Role == "assistant" && events[i].SourceTool == "kimi_cli" {
+						events[i].ToolCalls = append(events[i].ToolCalls, tcList...)
+						break
+					}
+				}
 			}
 		}
 	}
