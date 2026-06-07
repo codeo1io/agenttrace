@@ -40,13 +40,23 @@ func (ic *IncrementalCache) GetSession(path string) (Session, bool) {
 }
 
 // SetSession sets a session (marks as dirty).
+// Uses actual file metadata when available for cache consistency.
 func (ic *IncrementalCache) SetSession(path string, session Session) {
 	ic.mu.Lock()
 	defer ic.mu.Unlock()
 
+	var modTime int64
+	var size int64
+	if info, err := os.Stat(path); err == nil {
+		modTime = info.ModTime().UnixNano()
+		size = info.Size()
+	} else {
+		modTime = time.Now().UnixNano()
+	}
+
 	entry := CacheEntry{
-		ModTime: time.Now().UnixNano(),
-		Size:    0,
+		ModTime: modTime,
+		Size:    size,
 		Session: session,
 	}
 

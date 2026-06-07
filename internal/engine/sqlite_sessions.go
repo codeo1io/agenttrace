@@ -66,7 +66,7 @@ func getSQLiteModTimes(dbPath string) int64 {
 	mainMod := getFileModTime(dbPath)
 	walMod := getFileModTime(dbPath + "-wal")
 	shmMod := getFileModTime(dbPath + "-shm")
-	
+
 	maxMod := mainMod
 	if walMod > maxMod {
 		maxMod = walMod
