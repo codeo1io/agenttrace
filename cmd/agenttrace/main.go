@@ -401,6 +401,7 @@ func loadLatestSession(files []string) *engine.Session {
 	cache := engine.LoadSessionCache()
 	var latest *engine.Session
 	var latestTime time.Time
+	var latestMtime time.Time
 	var uncachedPaths []string
 
 	// First try cache
@@ -411,6 +412,14 @@ func loadLatestSession(files []string) *engine.Session {
 					if latest == nil || ts.After(latestTime) {
 						latest = &s
 						latestTime = ts
+					}
+				}
+			} else {
+				// Fallback to mtime for untimestamped sessions
+				if info, err := os.Stat(f); err == nil {
+					if latest == nil || info.ModTime().After(latestMtime) {
+						latest = &s
+						latestMtime = info.ModTime()
 					}
 				}
 			}
@@ -427,12 +436,14 @@ func loadLatestSession(files []string) *engine.Session {
 		}
 
 		// Save to cache
-		if info, err := os.Stat(f); err == nil {
-			cache.Entries[f] = engine.CacheEntry{
-				ModTime: info.ModTime().UnixNano(),
-				Size:    info.Size(),
-				Session: *s,
-			}
+		info, err := os.Stat(f)
+		if err != nil {
+			continue
+		}
+		cache.Entries[f] = engine.CacheEntry{
+			ModTime: info.ModTime().UnixNano(),
+			Size:    info.Size(),
+			Session: *s,
 		}
 
 		if s.Metrics.SessionStart != "" {
@@ -441,6 +452,12 @@ func loadLatestSession(files []string) *engine.Session {
 					latest = s
 					latestTime = ts
 				}
+			}
+		} else {
+			// Fallback to mtime for untimestamped sessions
+			if latest == nil || info.ModTime().After(latestMtime) {
+				latest = s
+				latestMtime = info.ModTime()
 			}
 		}
 	}

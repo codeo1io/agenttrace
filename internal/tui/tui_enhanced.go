@@ -456,7 +456,15 @@ func (m Model) RenderSkeletonLoading() string {
 		width = 80
 	}
 
+	// Clamp minimum width to avoid panic
+	if width < 20 {
+		width = 20
+	}
+
 	innerW := width - 4
+	if innerW < 4 {
+		innerW = 4
+	}
 
 	// Hero skeleton
 	hero := lipgloss.NewStyle().
@@ -466,18 +474,26 @@ func (m Model) RenderSkeletonLoading() string {
 		BorderForeground(lipgloss.Color("240")).
 		Render(dimStyle.Render("  Loading agenttrace..."))
 
-	// Metrics skeleton
+	// Metrics skeleton - clamp repeat count
+	metricsRepeat := innerW / 5
+	if metricsRepeat < 1 {
+		metricsRepeat = 1
+	}
 	metrics := lipgloss.NewStyle().
 		Width(innerW).
 		Height(3).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("240")).
-		Render("  " + strings.Repeat("░░░░ ", 8))
+		Render("  " + strings.Repeat("░░░░ ", metricsRepeat))
 
-	// Table skeleton
+	// Table skeleton - clamp row width
+	tableRowW := innerW - 4
+	if tableRowW < 1 {
+		tableRowW = 1
+	}
 	tableRows := make([]string, 10)
 	for i := range tableRows {
-		tableRows[i] = "  " + strings.Repeat("░", innerW-4)
+		tableRows[i] = "  " + strings.Repeat("░", tableRowW)
 	}
 	table := lipgloss.NewStyle().
 		Width(innerW).
