@@ -2,17 +2,17 @@
 
 Thanks for helping make AI coding-agent observability less opaque.
 
-agenttrace is intentionally small: one Go binary, local-first analysis, no database, and no background service. Changes should keep that shape unless there is a clear reason.
+agenttrace is intentionally small: one Rust binary, local-first analysis, no database, and no background service. Changes should keep that shape unless there is a clear reason.
 
 ## Development Setup
 
 ```bash
 git clone https://github.com/luoyuctl/agenttrace.git
 cd agenttrace
-go test ./...
-go build -o agenttrace ./cmd/agenttrace
-./agenttrace --demo
-./agenttrace --doctor
+cargo test
+cargo build --release -p agenttrace
+target/release/agenttrace --demo
+target/release/agenttrace --doctor
 ```
 
 ## Validation Checklist
@@ -20,17 +20,19 @@ go build -o agenttrace ./cmd/agenttrace
 Run the relevant checks before opening a PR:
 
 ```bash
-go test ./...
-go build -o /tmp/agenttrace ./cmd/agenttrace
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+cargo build --release -p agenttrace
 ruby -c homebrew/Formula/agenttrace.rb
 ```
 
 For TUI changes, also check narrow and wide terminals when possible:
 
 ```bash
-./agenttrace --demo
-./agenttrace --demo --doctor
-./agenttrace --demo --overview -f json
+target/release/agenttrace --demo
+target/release/agenttrace --demo --doctor
+target/release/agenttrace --demo --overview -f json
 ```
 
 ## Parser Contributions

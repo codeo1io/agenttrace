@@ -30,7 +30,7 @@ brew install luoyuctl/tap/agenttrace
 ```
 
 ```bash
-go install github.com/luoyuctl/agenttrace/cmd/agenttrace@latest
+cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 ```
 
 ## Useful Commands

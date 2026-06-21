@@ -16,11 +16,9 @@
   <a href="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml"><img src="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://luoyuctl.github.io/agenttrace/"><img src="https://img.shields.io/badge/site-agenttrace-54ff00.svg" alt="Site"></a>
   <a href="https://github.com/luoyuctl/agenttrace/releases/latest"><img src="https://img.shields.io/github/v/release/luoyuctl/agenttrace?color=00ADD8" alt="Release"></a>
-  <a href="https://pkg.go.dev/github.com/luoyuctl/agenttrace"><img src="https://pkg.go.dev/badge/github.com/luoyuctl/agenttrace.svg" alt="Go Reference"></a>
-  <a href="https://goreportcard.com/report/github.com/luoyuctl/agenttrace"><img src="https://goreportcard.com/badge/github.com/luoyuctl/agenttrace" alt="Go Report Card"></a>
-  <img src="https://img.shields.io/badge/go-1.25+-00ADD8.svg" alt="Go">
+  <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/Homebrew-v0.5.2-2bbc8a.svg" alt="Homebrew">
+  <img src="https://img.shields.io/badge/Homebrew-v0.6.0-2bbc8a.svg" alt="Homebrew">
 </p>
 
 <p align="center">
@@ -69,7 +67,7 @@ curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh
 
 ```bash
 brew install luoyuctl/tap/agenttrace
-go install github.com/luoyuctl/agenttrace/cmd/agenttrace@latest
+cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 ```
 
 Windows：
@@ -145,16 +143,16 @@ agenttrace 已被这些项目收录：
 欢迎提交 Parser PR。一个好的 parser 贡献通常包含：
 
 - 一个很小的脱敏 fixture 或合成样本
-- `DetectFormat` 中的格式识别
+- `crates/agenttrace-core/src/parser.rs` 中的格式识别
 - role、timestamp、model、token usage、tool call、tool error 提取
 - 成功解析和坏输入的测试
 
 提交 PR 前请运行：
 
 ```bash
-go test ./...
-go build -o agenttrace ./cmd/agenttrace/
-./agenttrace --doctor
+cargo test
+cargo build --release -p agenttrace
+target/release/agenttrace --doctor
 ```
 
 完整贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)。

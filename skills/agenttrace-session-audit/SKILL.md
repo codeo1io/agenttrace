@@ -13,7 +13,7 @@ Use this skill when session logs need an operational read: spend, token burn, ca
 ## Workflow
 
 1. Prefer the installed `agenttrace` binary when it is available on `PATH`.
-2. If the binary is not available and the current directory is the `luoyuctl/agenttrace` repository, use `go run ./cmd/agenttrace`.
+2. If the binary is not available and the current directory is the `luoyuctl/agenttrace` repository, use `cargo run -q -p agenttrace --`.
 3. Start with discovery unless the user gave a specific file or directory:
 
 ```bash

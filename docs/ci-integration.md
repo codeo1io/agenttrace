@@ -132,7 +132,7 @@ Tune thresholds per repository. A stricter team can start with health `90` and t
 
 This repository also runs agenttrace against its own demo and docs surfaces so repetitive Agent validation becomes a stable CI contract.
 
-The project CI builds `/tmp/agenttrace` and runs:
+The project CI builds `target/release/agenttrace` and runs:
 
 ```bash
 scripts/ci/check-output-contract.sh
@@ -141,6 +141,12 @@ scripts/ci/check-report-semantics.sh
 scripts/ci/check-release-surfaces.sh
 scripts/ci/check-docs-commands.sh
 scripts/ci/check-pages-artifact.sh site
+```
+
+For the full local release gate, including Rust fmt/clippy/test/build, release-binary contract scripts, release surfaces, Homebrew formula syntax, real-data CLI smoke, and Rust TUI real-data smoke, run:
+
+```bash
+scripts/ci/check-rust-release-local.sh
 ```
 
 These checks cover:
@@ -154,5 +160,7 @@ These checks cover:
 - README, Homebrew formula, site metadata, and sample report version drift
 - non-interactive README/docs command smoke tests
 - Pages local asset references and sample report metadata
+- local real-data CLI smoke with sampled real local session files
+- local Rust TUI pty smoke with sampled real local session files
 
 CI uploads generated demo reports as artifacts so reviewers can inspect the JSON, Markdown, and HTML output without rerunning local commands.

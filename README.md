@@ -16,11 +16,9 @@
   <a href="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml"><img src="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://luoyuctl.github.io/agenttrace/"><img src="https://img.shields.io/badge/site-agenttrace-54ff00.svg" alt="Site"></a>
   <a href="https://github.com/luoyuctl/agenttrace/releases/latest"><img src="https://img.shields.io/github/v/release/luoyuctl/agenttrace?color=00ADD8" alt="Release"></a>
-  <a href="https://pkg.go.dev/github.com/luoyuctl/agenttrace"><img src="https://pkg.go.dev/badge/github.com/luoyuctl/agenttrace.svg" alt="Go Reference"></a>
-  <a href="https://goreportcard.com/report/github.com/luoyuctl/agenttrace"><img src="https://goreportcard.com/badge/github.com/luoyuctl/agenttrace" alt="Go Report Card"></a>
-  <img src="https://img.shields.io/badge/go-1.25+-00ADD8.svg" alt="Go">
+  <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/Homebrew-v0.5.4-2bbc8a.svg" alt="Homebrew">
+  <img src="https://img.shields.io/badge/Homebrew-v0.6.0-2bbc8a.svg" alt="Homebrew">
 </p>
 
 <p align="center">
@@ -64,7 +62,7 @@ agenttrace
 That local run found:
 
 ```text
-AGENTTRACE v0.5.4
+AGENTTRACE v0.6.0
 ```
 
 | Signal | What agenttrace found |
@@ -86,7 +84,7 @@ Other install paths:
 
 ```bash
 brew install luoyuctl/tap/agenttrace
-go install github.com/luoyuctl/agenttrace/cmd/agenttrace@latest
+cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 ```
 
 Windows:
@@ -172,16 +170,16 @@ Listed in:
 Parser PRs are welcome. A good parser contribution usually includes:
 
 - a tiny redacted fixture or synthetic sample
-- format detection in `DetectFormat`
+- format detection in `crates/agenttrace-core/src/parser.rs`
 - role, timestamp, model, token usage, tool call, and tool error extraction
 - tests for successful parsing and malformed input
 
 Run before sending a PR:
 
 ```bash
-go test ./...
-go build -o agenttrace ./cmd/agenttrace/
-./agenttrace --doctor
+cargo test
+cargo build --release -p agenttrace
+target/release/agenttrace --doctor
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution flow.

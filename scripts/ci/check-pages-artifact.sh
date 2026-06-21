@@ -14,8 +14,8 @@ fail() {
 [[ -f "$page_dir/demo-report.html" ]] || fail "missing demo-report.html in $page_dir"
 
 demo_report="$page_dir/demo-report.html"
-version="$(sed -nE 's/^const Version = "([^"]+)"/\1/p' "$repo_root/internal/engine/engine.go")"
-[[ -n "$version" ]] || fail "could not read internal/engine Version"
+version="$(sed -nE 's/^version = "([^"]+)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
+[[ -n "$version" ]] || fail "could not read workspace package version"
 
 if ! grep -q "<div class=\"meta\">v$version" "$demo_report" &&
   ! grep -qi "static sample data" "$demo_report"; then
