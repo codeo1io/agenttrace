@@ -2,7 +2,11 @@ use crate::session_cache::{
     cached_dir_listing, cached_file_mod_time_if_fresh, cached_session, delete_cached_session,
     load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
 };
-use crate::{load_sqlite_backed_sessions, parse_file, skip_sqlite_backed_file_dir, Session};
+use crate::{
+    merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
+    Session,
+};
+use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs;
@@ -15,9 +19,44 @@ pub struct KnownSessionDir {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    pub since: Option<DateTime<Utc>>,
+    pub project: String,
+    pub source: String,
+    pub model: String,
+    pub include_history: bool,
+    pub preserve_history: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadReport {
+    pub sessions: Vec<Session>,
+    pub discovered: usize,
+    pub parsed: usize,
+    pub skipped: usize,
+    pub cache_hits: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadProgress {
+    pub discovered: usize,
+    pub processed: usize,
+    pub parsed: usize,
+    pub skipped: usize,
+    pub cache_hits: usize,
+    pub session: Option<Session>,
+}
+
 pub fn known_session_dirs() -> Vec<KnownSessionDir> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
+    };
+    let env_home = |name: &str, fallback: PathBuf| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(fallback)
     };
     let mut dirs = vec![
         KnownSessionDir {
@@ -26,19 +65,19 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
         },
         KnownSessionDir {
             name: "Codex CLI".to_string(),
-            path: home.join(".codex").join("sessions"),
+            path: env_home("CODEX_HOME", home.join(".codex")).join("sessions"),
         },
         KnownSessionDir {
             name: "Codex CLI archived".to_string(),
-            path: home.join(".codex").join("archived_sessions"),
+            path: env_home("CODEX_HOME", home.join(".codex")).join("archived_sessions"),
         },
         KnownSessionDir {
-            name: "Gemini CLI".to_string(),
-            path: home.join(".gemini").join("sessions"),
+            name: "Antigravity CLI".to_string(),
+            path: home.join(".gemini").join("antigravity-cli").join("brain"),
         },
         KnownSessionDir {
-            name: "Gemini CLI tmp".to_string(),
-            path: home.join(".gemini").join("tmp"),
+            name: "Claude Code transcripts".to_string(),
+            path: env_home("CLAUDE_CONFIG_DIR", home.join(".claude")).join("transcripts"),
         },
         KnownSessionDir {
             name: "Qwen Code".to_string(),
@@ -46,15 +85,43 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
         },
         KnownSessionDir {
             name: "Claude Code".to_string(),
-            path: home.join(".claude").join("projects"),
+            path: env_home("CLAUDE_CONFIG_DIR", home.join(".claude")).join("projects"),
         },
         KnownSessionDir {
             name: "Pi".to_string(),
             path: home.join(".pi").join("agent").join("sessions"),
         },
         KnownSessionDir {
+            name: "Pi XDG".to_string(),
+            path: home
+                .join(".config")
+                .join("pi")
+                .join("agent")
+                .join("sessions"),
+        },
+        KnownSessionDir {
             name: "Oh My Pi".to_string(),
             path: home.join(".omp").join("agent").join("sessions"),
+        },
+        KnownSessionDir {
+            name: "WorkBuddy".to_string(),
+            path: home.join(".workbuddy").join("projects"),
+        },
+        KnownSessionDir {
+            name: "Cursor".to_string(),
+            path: home.join(".cursor").join("projects"),
+        },
+        KnownSessionDir {
+            name: "GitHub Copilot CLI".to_string(),
+            path: home.join(".copilot").join("session-state"),
+        },
+        KnownSessionDir {
+            name: "GitHub Copilot CLI OTEL".to_string(),
+            path: home.join(".copilot").join("otel"),
+        },
+        KnownSessionDir {
+            name: "Kimi CLI".to_string(),
+            path: home.join(".kimi").join("sessions"),
         },
     ];
     dirs.extend(open_code_known_session_dirs(&home));
@@ -93,23 +160,100 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
 }
 
 pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
-    let mut sessions = Vec::new();
+    load_sessions_with_options(dir, &LoadOptions::default()).sessions
+}
+
+pub fn load_sessions_with_options(dir: Option<&Path>, options: &LoadOptions) -> LoadReport {
+    load_sessions_with_progress(dir, options, |_| {})
+}
+
+pub fn load_sessions_with_progress(
+    dir: Option<&Path>,
+    options: &LoadOptions,
+    on_progress: impl FnMut(LoadProgress),
+) -> LoadReport {
     let mut cache = load_session_cache();
-    for path in find_session_files_cached(dir, &mut cache, true) {
-        if let Some(session) = cached_session(&path, &mut cache) {
+    load_sessions_with_progress_from_cache(dir, options, &mut cache, on_progress)
+}
+
+pub fn load_sessions_with_progress_from_cache(
+    dir: Option<&Path>,
+    options: &LoadOptions,
+    cache: &mut SessionCache,
+    on_progress: impl FnMut(LoadProgress),
+) -> LoadReport {
+    load_sessions_with_progress_from_cache_mode(dir, options, cache, true, on_progress)
+}
+
+pub fn load_sessions_with_progress_from_cache_mode(
+    dir: Option<&Path>,
+    options: &LoadOptions,
+    cache: &mut SessionCache,
+    emit_progress_sessions: bool,
+    mut on_progress: impl FnMut(LoadProgress),
+) -> LoadReport {
+    let mut sessions = Vec::new();
+    let files = find_session_files_cached(dir, cache, true);
+    let discovered = files.len();
+    let mut cache_hits = 0;
+    let mut skipped = 0;
+    for (index, path) in files.into_iter().enumerate() {
+        let session = if let Some(session) = cached_session(&path, cache) {
+            cache_hits += 1;
+            Some(session)
+        } else if let Ok(session) = parse_file(&path) {
+            let _ = store_session(&path, &session, cache);
+            Some(session)
+        } else {
+            skipped += 1;
+            None
+        };
+        if let Some(session) = session {
+            on_progress(LoadProgress {
+                discovered,
+                processed: index + 1,
+                parsed: sessions.len() + 1,
+                skipped,
+                cache_hits,
+                session: emit_progress_sessions.then(|| session.clone()),
+            });
             sessions.push(session);
-            continue;
-        }
-        if let Ok(session) = parse_file(&path) {
-            let _ = store_session(&path, &session, &mut cache);
-            sessions.push(session);
+        } else {
+            on_progress(LoadProgress {
+                discovered,
+                processed: index + 1,
+                parsed: sessions.len(),
+                skipped,
+                cache_hits,
+                session: None,
+            });
         }
     }
+    let live_parsed = sessions.len();
     if cache.is_dirty() {
-        let _ = save_session_cache(&cache);
+        let _ = save_session_cache(cache);
     }
     if dir.is_none() {
-        sessions.extend(load_sqlite_backed_sessions());
+        sessions.extend(crate::sqlite_sessions::load_sqlite_backed_sessions_since(
+            options.since,
+        ));
+    }
+    if options.preserve_history {
+        let _ = preserve_derived_history(&sessions);
+    }
+    if options.include_history {
+        merge_preserved_history(&mut sessions);
+    }
+    sessions.retain(|session| {
+        options.since.map_or(true, |since| {
+            DateTime::parse_from_rfc3339(&session.metrics.session_start)
+                .ok()
+                .is_some_and(|time| time.with_timezone(&Utc) >= since)
+        }) && matches_filter(&crate::project_name(session), &options.project)
+            && matches_filter(&session.metrics.source_tool, &options.source)
+            && matches_filter(&session.metrics.model_used, &options.model)
+    });
+    if dir.is_none() {
         sessions.sort_by(|a, b| {
             b.metrics
                 .session_start
@@ -117,7 +261,20 @@ pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
                 .then_with(|| b.name.cmp(&a.name))
         });
     }
-    sessions
+    LoadReport {
+        parsed: sessions.len(),
+        skipped: discovered.saturating_sub(live_parsed),
+        sessions,
+        discovered,
+        cache_hits,
+    }
+}
+
+fn matches_filter(value: &str, filter: &str) -> bool {
+    filter.trim().is_empty()
+        || value
+            .to_ascii_lowercase()
+            .contains(&filter.trim().to_ascii_lowercase())
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
@@ -224,6 +381,9 @@ fn walk_session_files_cached(
         if !is_session_file_name(&name) {
             continue;
         }
+        if !is_special_session_file(&path) {
+            continue;
+        }
         if is_gemini_temp_path(&path) && !is_gemini_temp_session_file(&path) {
             continue;
         }
@@ -276,6 +436,9 @@ fn walk_session_files(
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !is_session_file_name(&name) {
+            continue;
+        }
+        if !is_special_session_file(&path) {
             continue;
         }
         if is_gemini_temp_path(&path) && !is_gemini_temp_session_file(&path) {
@@ -345,6 +508,11 @@ pub fn is_session_file_name(name: &str) -> bool {
 fn max_session_dir_depth(dir: &Path) -> usize {
     let slash = dir.to_string_lossy().replace('\\', "/");
     if dir.file_name().and_then(|name| name.to_str()) == Some("projects")
+        && slash.contains("/.workbuddy/")
+    {
+        return 2;
+    }
+    if dir.file_name().and_then(|name| name.to_str()) == Some("projects")
         && slash.contains("/.claude/")
     {
         return 3;
@@ -384,6 +552,17 @@ fn is_gemini_temp_path(path: &Path) -> bool {
     path.to_string_lossy()
         .replace('\\', "/")
         .contains("/.gemini/tmp/")
+}
+
+fn is_special_session_file(path: &Path) -> bool {
+    let slash = path.to_string_lossy().replace('\\', "/");
+    if slash.contains("/.gemini/antigravity-cli/brain/") {
+        return slash.ends_with("/.system_generated/logs/transcript.jsonl");
+    }
+    if slash.contains("/.cursor/projects/") {
+        return slash.contains("/agent-transcripts/") && slash.ends_with(".jsonl");
+    }
+    true
 }
 
 fn is_gemini_temp_session_file(path: &Path) -> bool {

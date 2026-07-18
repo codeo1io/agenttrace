@@ -1,6 +1,9 @@
 mod demo;
+mod diagnostics;
 mod discovery;
 mod doctor;
+mod history;
+mod insights;
 mod parser;
 mod pricing;
 mod reports;
@@ -15,29 +18,45 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use demo::demo_sessions;
+pub use diagnostics::{
+    fix_suggestions, inspect_first, loop_waste_percent, predict_cost_anomaly, session_findings,
+    ContextUtilization, CostAlert, Diagnostics, FindingEvidence, FixSuggestion, InspectFirst,
+    LargeParam, LoopCost, LoopFingerprint, SessionFinding, StuckPattern, ToolLatency, TraceStep,
+    UnusedTool,
+};
+
 pub use discovery::{
     collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, KnownSessionDir,
+    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
+    load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
+    KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
 };
 pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
+pub use history::{history_path, merge_preserved_history, preserve_derived_history};
+pub use insights::{
+    compare_session_outcome, data_health, filter_sessions, project_name, session_capability,
+    session_matches_time_range, DataHealth, SessionComparison, TimeRange,
+};
 pub use parser::{parse_file, parse_raw_session};
 pub use pricing::{
     pricing_cache_path, pricing_source, render_model_pricing_list, render_test_match,
     update_pricing,
 };
 pub use reports::{
-    add_baseline_comparison, report_compare, report_compare_json, report_json,
-    report_json_with_language, report_overview_html, report_overview_json,
-    report_overview_markdown, report_overview_text, report_text, BaselineThresholds,
-    ReportLanguage,
+    add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
+    report_json, report_json_with_language, report_overview_html, report_overview_json,
+    report_overview_json_with_health, report_overview_markdown, report_overview_text, report_text,
+    report_text_with_language, BaselineThresholds, ReportLanguage,
 };
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
-    cached_session, clear_session_cache, load_session_cache, save_session_cache,
-    session_cache_path, store_session, SessionCache,
+    cached_session, clear_session_cache, load_cached_sessions, load_cached_sessions_from_cache,
+    load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,
 };
 pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
-pub use waste::{compute_waste_report, render_waste_report, WasteReport};
+pub use waste::{
+    compute_waste_report, render_waste_report, render_waste_report_with_language, WasteReport,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -267,6 +286,7 @@ pub struct Session {
     pub anomalies: Vec<Anomaly>,
     pub health: i32,
     pub tool_warnings: Vec<ToolWarning>,
+    pub diagnostics: Diagnostics,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -278,6 +298,7 @@ pub struct Overview {
     pub critical: usize,
     pub by_agent: BTreeMap<String, GroupOverview>,
     pub by_model: BTreeMap<String, GroupOverview>,
+    pub by_project: BTreeMap<String, GroupOverview>,
     pub anomalies_top: Vec<AnomalyTop>,
 }
 
@@ -387,15 +408,47 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
     let anomalies = detect_anomalies(&metrics);
     let health = health_score(&anomalies);
     let tool_warnings = validate_tool_warnings(&events);
+    let diagnostics = diagnostics::analyze_diagnostics(&events, &metrics);
     Ok(Session {
-        name: name.to_string(),
+        name: session_display_name(name, &events),
         path: path.to_string(),
         cwd,
         metrics,
         anomalies,
         health,
         tool_warnings,
+        diagnostics,
     })
+}
+
+fn session_display_name(fallback: &str, events: &[Event]) -> String {
+    events
+        .iter()
+        .filter(|event| event.role == "user")
+        .filter_map(|event| {
+            let mut text = event.content.trim();
+            if text.starts_with("# AGENTS.md instructions")
+                || text.starts_with("<environment_context>")
+                || text.starts_with("Another language model started")
+            {
+                return None;
+            }
+            if let Some((_, request)) = text.split_once("## My request for Codex:") {
+                text = request.trim();
+            }
+            let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!title.is_empty()).then(|| {
+                let mut chars = title.chars();
+                let short = chars.by_ref().take(60).collect::<String>();
+                if chars.next().is_some() {
+                    format!("{short}…")
+                } else {
+                    short
+                }
+            })
+        })
+        .next()
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
@@ -645,13 +698,51 @@ pub fn health_score(anomalies: &[Anomaly]) -> i32 {
 fn validate_tool_warnings(events: &[Event]) -> Vec<ToolWarning> {
     let mut empty_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut invalid_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let mut last_key = String::new();
+    let mut last_tool = String::new();
+    let mut consecutive = 0;
+    let mut calls_by_id = BTreeMap::new();
+    let mut redundant: BTreeMap<String, (String, usize, BTreeSet<usize>)> = BTreeMap::new();
+    let mut turn = 0;
     for event in events {
+        if event.role == "user" {
+            if consecutive >= 4 {
+                warnings.push(tool_warning(&last_tool, "dead_loop", consecutive, "high"));
+            }
+            last_key.clear();
+            last_tool.clear();
+            consecutive = 0;
+            turn += 1;
+        }
         if event.role != "assistant" || event.tool_calls.is_empty() {
             continue;
         }
         for tool_call in &event.tool_calls {
             let name = tool_call.name.trim();
             let args = tool_call.args.trim();
+            if !tool_call.id.is_empty() {
+                calls_by_id.insert(tool_call.id.clone(), name.to_string());
+            }
+            let normalized = normalize_tool_args(args);
+            let key = format!("{name}\0{normalized}");
+            if key == last_key {
+                consecutive += 1;
+            } else {
+                if consecutive >= 4 {
+                    warnings.push(tool_warning(&last_tool, "dead_loop", consecutive, "high"));
+                }
+                last_key = key.clone();
+                last_tool = name.to_string();
+                consecutive = 1;
+            }
+            if !normalized.is_empty() {
+                let entry = redundant
+                    .entry(key)
+                    .or_insert_with(|| (name.to_string(), 0, BTreeSet::new()));
+                entry.1 += 1;
+                entry.2.insert(turn);
+            }
             if (args.is_empty() || args == "{}") && tool_requires_args(name) {
                 *empty_counts.entry(name.to_string()).or_insert(0) += 1;
                 continue;
@@ -661,13 +752,72 @@ fn validate_tool_warnings(events: &[Event]) -> Vec<ToolWarning> {
             }
         }
     }
-    let mut warnings = Vec::new();
+    if consecutive >= 4 {
+        warnings.push(tool_warning(&last_tool, "dead_loop", consecutive, "high"));
+    }
     for (name, count) in empty_counts {
         warnings.push(tool_warning(&name, "empty_args", count, "medium"));
     }
     for (name, count) in invalid_counts {
         warnings.push(tool_warning(&name, "invalid_args", count, "medium"));
     }
+    let mut last_failed = String::new();
+    let mut failure_chain = 0;
+    for event in events {
+        if event.role == "user" {
+            if failure_chain >= 3 {
+                warnings.push(tool_warning(
+                    &last_failed,
+                    "fail_retry_chain",
+                    failure_chain,
+                    "high",
+                ));
+            }
+            last_failed.clear();
+            failure_chain = 0;
+        } else if event.role == "tool" && event.is_error {
+            let name = calls_by_id
+                .get(&event.tool_call_id)
+                .cloned()
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            if name == last_failed {
+                failure_chain += 1;
+            } else {
+                if failure_chain >= 3 {
+                    warnings.push(tool_warning(
+                        &last_failed,
+                        "fail_retry_chain",
+                        failure_chain,
+                        "high",
+                    ));
+                }
+                last_failed = name;
+                failure_chain = 1;
+            }
+        }
+    }
+    if failure_chain >= 3 {
+        warnings.push(tool_warning(
+            &last_failed,
+            "fail_retry_chain",
+            failure_chain,
+            "high",
+        ));
+    }
+    for (_, (name, count, turns)) in redundant {
+        if count >= 4 && turns.len() >= 3 {
+            warnings.push(tool_warning(&name, "redundant", count, "low"));
+        }
+    }
+    warnings.sort_by(|left, right| {
+        warning_rank(&right.severity)
+            .cmp(&warning_rank(&left.severity))
+            .then_with(|| left.tool_name.cmp(&right.tool_name))
+            .then_with(|| left.pattern.cmp(&right.pattern))
+    });
     warnings
 }
 
@@ -675,6 +825,9 @@ fn tool_warning(name: &str, pattern: &str, count: usize, severity: &str) -> Tool
     let detail = match pattern {
         "empty_args" => format!("Tool '{name}' had {count} call(s) with empty arguments"),
         "invalid_args" => format!("Tool '{name}' had {count} call(s) with malformed arguments"),
+        "dead_loop" => format!("Tool '{name}' repeated the same call {count} times"),
+        "fail_retry_chain" => format!("Tool '{name}' failed {count} consecutive times"),
+        "redundant" => format!("Tool '{name}' repeated the same call {count} times across turns"),
         _ => String::new(),
     };
     ToolWarning {
@@ -683,6 +836,23 @@ fn tool_warning(name: &str, pattern: &str, count: usize, severity: &str) -> Tool
         count,
         detail,
         severity: severity.to_string(),
+    }
+}
+
+fn normalize_tool_args(args: &str) -> String {
+    let args = args.trim();
+    serde_json::from_str::<Value>(args)
+        .ok()
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| args.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn warning_rank(severity: &str) -> u8 {
+    match severity {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
     }
 }
 
@@ -725,6 +895,10 @@ fn looks_like_structured_args(args: &str) -> bool {
 }
 
 pub fn compute_overview(sessions: &[Session]) -> Overview {
+    compute_overview_iter(sessions.iter())
+}
+
+pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) -> Overview {
     let mut overview = Overview::default();
     for session in sessions {
         overview.total_sessions += 1;
@@ -749,6 +923,13 @@ pub fn compute_overview(sessions: &[Session]) -> Overview {
         let model_entry = overview.by_model.entry(model).or_default();
         model_entry.sessions += 1;
         model_entry.cost += session.metrics.cost_estimated;
+
+        let project_entry = overview
+            .by_project
+            .entry(project_name(session))
+            .or_default();
+        project_entry.sessions += 1;
+        project_entry.cost += session.metrics.cost_estimated;
 
         for anomaly in &session.anomalies {
             overview.anomalies_top.push(AnomalyTop {
@@ -814,11 +995,11 @@ pub fn evaluate_overview_gate(
     failures
 }
 
-pub fn average_health(sessions: &[Session]) -> f64 {
+pub fn average_health<T: std::borrow::Borrow<Session>>(sessions: &[T]) -> f64 {
     if sessions.is_empty() {
         return 0.0;
     }
-    let total: i32 = sessions.iter().map(|session| session.health).sum();
+    let total: i32 = sessions.iter().map(|session| session.borrow().health).sum();
     total as f64 / sessions.len() as f64
 }
 
@@ -846,8 +1027,49 @@ pub fn total_tokens(session: &Session) -> i64 {
         + session.metrics.tokens_cache_r
 }
 
+pub fn format_tokens(value: i64) -> String {
+    let (divisor, suffix) = match value.unsigned_abs() {
+        999_950_000_000.. => (1_000_000_000_000.0, "T"),
+        999_950_000.. => (1_000_000_000.0, "B"),
+        999_950.. => (1_000_000.0, "M"),
+        1_000.. => (1_000.0, "K"),
+        _ => return value.to_string(),
+    };
+    format!("{:.1}{suffix}", value as f64 / divisor)
+}
+
+pub fn format_count(value: usize) -> String {
+    format_tokens(value as i64)
+}
+
+pub fn format_cost(value: f64) -> String {
+    if !value.is_finite() {
+        return "$0.0000".to_string();
+    }
+    let abs = value.abs();
+    if abs >= 999_950_000_000.0 {
+        format!("${:.1}T", value / 1_000_000_000_000.0)
+    } else if abs >= 999_950_000.0 {
+        format!("${:.1}B", value / 1_000_000_000.0)
+    } else if abs >= 999_950.0 {
+        format!("${:.1}M", value / 1_000_000.0)
+    } else if abs >= 999.95 {
+        format!("${:.1}K", value / 1_000.0)
+    } else if abs >= 10.0 {
+        format!("${value:.2}")
+    } else {
+        format!("${value:.4}")
+    }
+}
+
 pub fn round4(value: f64) -> f64 {
-    (value * 10000.0).round() / 10000.0
+    let scaled = value * 10000.0;
+    let rounded = if scaled.fract().abs() >= 0.5 - 1e-9 {
+        scaled.trunc() + scaled.signum()
+    } else {
+        scaled.trunc()
+    };
+    rounded / 10000.0
 }
 
 pub(crate) use pricing::token_cost;
@@ -1187,6 +1409,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_name_uses_first_real_user_request() {
+        let session = session_from_events(
+            "rollout-2026-07-19-random",
+            "session.jsonl",
+            vec![
+                Event {
+                    role: "user".to_string(),
+                    content: "# AGENTS.md instructions\n<INSTRUCTIONS>...</INSTRUCTIONS>".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "user".to_string(),
+                    content: "# Files mentioned by the user:\n\n## My request for Codex:\n修复全局 Token 展示格式".to_string(),
+                    ..Event::default()
+                },
+            ],
+        )
+        .expect("build session");
+
+        assert_eq!(session.name, "修复全局 Token 展示格式");
+    }
+
+    #[test]
+    fn parsers_preserve_codex_and_pi_workspaces() {
+        let codex = parse_raw_session(
+            "codex",
+            "rollout.jsonl",
+            r#"{"type":"session_meta","timestamp":"2026-07-19T00:00:00Z","payload":{"cwd":"/work/codex"}}
+{"type":"response_item","timestamp":"2026-07-19T00:00:01Z","payload":{"type":"message","role":"user","content":"task"}}"#,
+        )
+        .expect("parse codex");
+        assert_eq!(codex.cwd, "/work/codex");
+
+        let pi = parse_raw_session(
+            "pi",
+            "/home/user/.pi/agent/sessions/session.jsonl",
+            r#"{"type":"session","version":3,"id":"1","cwd":"/work/pi"}
+{"type":"message","timestamp":"2026-07-19T00:00:00Z","message":{"role":"user","content":"task"}}"#,
+        )
+        .expect("parse pi");
+        assert_eq!(pi.cwd, "/work/pi");
+    }
+
+    #[test]
     fn tool_file_surfaces_follow_go_structured_key_rules() {
         let files = extract_tool_call_files(
             r#"{"path":"./README.md","command":"go test ./...","nested":{"file_path":"file://src/lib.rs"},"url":"https://example.com/file.txt","body":"a\nb"}"#,
@@ -1258,6 +1524,17 @@ mod tests {
     }
 
     #[test]
+    fn token_counts_use_compact_units() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1.0K");
+        assert_eq!(format_tokens(1_250_000), "1.2M");
+        assert_eq!(format_tokens(43_719_584_174), "43.7B");
+        assert_eq!(format_tokens(2_500_000_000_000), "2.5T");
+        assert_eq!(format_tokens(999_950), "1.0M");
+        assert_eq!(format_cost(35_240.741_6), "$35.2K");
+    }
+
+    #[test]
     fn tool_result_error_null_matches_go_success_rules() {
         let metrics = analyze(
             &[
@@ -1301,6 +1578,73 @@ mod tests {
         assert_eq!(metrics.tool_calls_total, 3);
         assert_eq!(metrics.tool_calls_ok, 1);
         assert_eq!(metrics.tool_calls_fail, 2);
+    }
+
+    #[test]
+    fn detects_dead_loop_failure_chain_and_redundant_tool_calls() {
+        let mut events = vec![Event {
+            role: "user".to_string(),
+            ..Event::default()
+        }];
+        for turn in 0..4 {
+            events.push(Event {
+                role: "assistant".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: turn.to_string(),
+                    name: "bash".to_string(),
+                    args: r#"{"cmd":"test"}"#.to_string(),
+                }],
+                ..Event::default()
+            });
+            events.push(Event {
+                role: "tool".to_string(),
+                tool_call_id: turn.to_string(),
+                is_error: true,
+                ..Event::default()
+            });
+        }
+        let warnings = validate_tool_warnings(&events);
+        assert!(warnings
+            .iter()
+            .any(|item| item.pattern == "fail_retry_chain"));
+
+        let redundant = (0..4)
+            .flat_map(|index| {
+                [
+                    Event {
+                        role: "user".to_string(),
+                        ..Event::default()
+                    },
+                    Event {
+                        role: "assistant".to_string(),
+                        tool_calls: vec![ToolCall {
+                            id: index.to_string(),
+                            name: "bash".to_string(),
+                            args: r#"{"cmd":"test"}"#.to_string(),
+                        }],
+                        ..Event::default()
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_tool_warnings(&redundant)
+            .iter()
+            .any(|item| item.pattern == "redundant"));
+
+        let repeated = (0..4)
+            .map(|index| Event {
+                role: "assistant".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: index.to_string(),
+                    name: "bash".to_string(),
+                    args: "same".to_string(),
+                }],
+                ..Event::default()
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_tool_warnings(&repeated)
+            .iter()
+            .any(|item| item.pattern == "dead_loop"));
     }
 
     #[test]
@@ -1389,5 +1733,63 @@ mod tests {
         );
         assert!(is_high_authority_category("write_files"));
         assert!(!is_high_authority_category("read_only_files"));
+    }
+
+    #[test]
+    fn session_capability_and_coverage_degrade_with_available_data() {
+        let detailed = Session {
+            metrics: Metrics {
+                tokens_input: 10,
+                duration_sec: 1.0,
+                gaps_sec: vec![1.0],
+                ..Metrics::default()
+            },
+            ..test_session()
+        };
+        let aggregate = Session {
+            metrics: Metrics {
+                tokens_input: 10,
+                duration_sec: 1.0,
+                ..Metrics::default()
+            },
+            ..test_session()
+        };
+        let limited = test_session();
+        assert_eq!(session_capability(&detailed), "detailed");
+        assert_eq!(session_capability(&aggregate), "aggregate");
+        assert_eq!(session_capability(&limited), "limited");
+        let health = data_health(&[detailed, aggregate, limited], 3, 0);
+        assert_eq!(health.with_tokens, 2);
+        assert_eq!(health.with_duration, 2);
+        assert_eq!(health.with_event_timing, 1);
+        assert_eq!(health.with_diagnostics, 1);
+    }
+
+    #[test]
+    fn session_comparison_reuses_shared_outcome_rules() {
+        let mut current = test_session();
+        current.metrics.duration_sec = 5.0;
+        current.metrics.cost_estimated = 1.0;
+        current.metrics.tool_calls_fail = 0;
+        let mut previous = test_session();
+        previous.metrics.duration_sec = 10.0;
+        previous.metrics.cost_estimated = 2.0;
+        previous.metrics.tool_calls_fail = 2;
+        let comparison = compare_session_outcome(&current, &previous);
+        assert_eq!(comparison.outcome, "faster_cheaper");
+        assert_eq!(comparison.reasons, vec!["fewer_failures"]);
+    }
+
+    fn test_session() -> Session {
+        Session {
+            name: "test".to_string(),
+            path: "test".to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        }
     }
 }

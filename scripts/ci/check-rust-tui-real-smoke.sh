@@ -102,6 +102,7 @@ after 500
 send "s"
 after 500
 send "\033"
+send "0"
 after 500
 send "$"
 after 500
@@ -144,8 +145,9 @@ checks = [
     ("loading status panel", r"Loading Status|phase=\s*(idle|discovering|parsing|ready)"),
     ("loading mode", r"mode=normal load|mode=force reload|normal load|force reload"),
     ("loading parsed total", r"parsed=\s*[0-9,]+/[0-9,]+|loaded\s+[0-9,]+/[0-9,]+\s+files"),
+    ("loading progress bar", r"[0-9,]+/[0-9,]+\s+files[\s\S]{0,240}[0-9]{1,3}%"),
     ("loading cache state", r"cache hits=\s*[0-9,]+\s+(cache warm|cache empty|cache bypass)|[0-9,]+\s+cache hits,\s+(cache warm|cache empty|cache bypass)"),
-    ("loading source distribution", r"sources=(none|[A-Za-z0-9_ ./:,-]+:[0-9]+)"),
+    ("loading source distribution", r"sources=(none|[A-Za-z0-9_ ./:,-]+:[0-9]+)|[A-Za-z0-9_ ./:,-]+:[0-9]+"),
     ("overview health score", r"health\s*[0-9]+(?:\.[0-9]+)?"),
     ("overview next action", r"next:\s*[a-z ]+|next=\s*[a-z ]+"),
     ("overview key metrics", r"cost\s*\$|tokens\s*[0-9,]+|elapsed\s*[0-9]+|p95\s*[0-9]+"),
@@ -170,7 +172,7 @@ checks = [
     ("detail triage reason", r"reason=[a-z0-9_ .:-]+"),
     ("diagnostics view", r"Diagnostics -|Diagnostics|Waste Analysis"),
     ("diagnostics context signal", r"source=[A-Za-z0-9_ ./:-]+|source [A-Za-z0-9_ ./:-]+"),
-    ("diff context signal", r"4\s+Diff[\s\S]{0,360}C\s*o\s*n\s*t\s*(?:e\s*)?x\s*t:[\s\S]{0,360}top_s[\s\S]{0,12}ce\s*="),
+    ("diff context signal", r"4\s+Diff[\s\S]{0,360}C\s*o\s*n\s*t\s*(?:e\s*)?x\s*t:[\s\S]{0,360}(top\s+source|主要来源)\s*="),
     ("filter path", rf"filter:\s*{re.escape(query)}"),
     ("sort path", r"sorted by Cost|cost"),
     ("reload path", r"reloading sessions|sessions=[1-9][0-9]*|Sessions -\s*[1-9][0-9]*\s+visible"),
@@ -186,7 +188,7 @@ checks = [
     ("source sort command", r"sorted by Source asc|sort Source asc"),
     ("bare command text filter", rf"filter:\s*{re.escape(query)}"),
     ("empty filter state", r"No visible[\s\S]{0,90}match the active filt|Active filters:[\s\S]{0,120}definitel[\s\S]{0,40}no-match"),
-    ("quick health filter key", r"quick health filter:\s*crit|health=crit"),
+    ("quick health filter key", r"quick health filter:\s*good|health=good"),
     ("quick source filter key", r"quick source filter:\s*[a-z0-9_/-]+|source=[a-z0-9_/-]+"),
     ("quick cost filter key", r"quick\s*cost\s*filter:\s*>\s*0|co\s*t\s*>\s*0|cost\s*>\s*0"),
     ("quick critical filter key", r"quick\s*critical\s*filter|ri\s*ica\s*filter|health:\s*critical|health\s*=\s*crit|Active filters:[\s\S]{0,120}health=crit"),

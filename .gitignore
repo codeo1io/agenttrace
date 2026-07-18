@@ -6,3 +6,10 @@ agentwaste
 .playwright-mcp/
 .codegraph/
 target/
+node_modules/
+.DS_Store
+*.tsbuildinfo
+apps/desktop/vite.config.js
+apps/desktop/vite.config.d.ts
+apps/desktop/src-tauri/gen/
+apps/desktop/coverage/

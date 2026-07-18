@@ -1,7 +1,7 @@
 use crate::reports::{json_float, json_string};
 use crate::{
-    canonical_sessions, highest_authority_for_metrics, round4, total_tokens, SearchResult, Session,
-    VERSION,
+    canonical_sessions, format_cost, format_tokens, highest_authority_for_metrics, round4,
+    total_tokens, SearchResult, Session, VERSION,
 };
 use std::collections::BTreeSet;
 
@@ -116,13 +116,13 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
     }
     for result in results {
         out.push_str(&format!(
-            "\n{}  {}  {}  health={}  ${:.4}  {} TOKENS\n",
+            "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
             result.name,
             result.source_tool,
             result.model,
             result.health,
-            result.cost,
-            result.tokens
+            format_cost(result.cost),
+            format_tokens(result.tokens)
         ));
         if !result.cwd.is_empty() {
             out.push_str(&format!("  cwd: {}\n", result.cwd));
@@ -255,6 +255,7 @@ mod tests {
             anomalies: Vec::new(),
             health: 100,
             tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
         };
 
         let matches = search_session_evidence(&session, "billing");

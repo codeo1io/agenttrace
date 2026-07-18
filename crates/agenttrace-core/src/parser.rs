@@ -84,6 +84,24 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some(events) = parse_codex_rollout_jsonl(raw) {
             return session_from_events(name, path, events);
         }
+        if let Some(events) = parse_workbuddy_jsonl(raw) {
+            return session_from_events(name, path, events);
+        }
+        if let Some(events) = parse_antigravity_jsonl(raw) {
+            return session_from_events(name, path, events);
+        }
+        if let Some(events) = parse_cursor_transcript_jsonl(raw) {
+            return session_from_events(name, path, events);
+        }
+        if let Some(events) = parse_claude_transcript_jsonl(raw) {
+            return session_from_events(name, path, events);
+        }
+        if let Some(events) = parse_copilot_session_jsonl(raw) {
+            return session_from_events(name, path, events);
+        }
+        if let Some(events) = parse_kimi_wire_jsonl(raw) {
+            return session_from_events(name, path, events);
+        }
     }
     if is_qwen_code_jsonl(raw) {
         return session_from_events(name, path, parse_qwen_code_jsonl(raw)?);
@@ -132,6 +150,503 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         return Ok(session);
     }
     bail!("unsupported session format: {}", path)
+}
+
+fn parse_copilot_session_jsonl(raw: &str) -> Option<Vec<Event>> {
+    let entries = jsonl_objects(raw);
+    if !entries
+        .iter()
+        .any(|entry| string(entry.get("type")) == Some("session.start"))
+    {
+        return None;
+    }
+    let mut events = Vec::new();
+    for entry in entries {
+        let typ = string(entry.get("type")).unwrap_or("");
+        let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
+        let data = entry.get("data").and_then(Value::as_object);
+        match typ {
+            "session.start" => events.push(Event {
+                role: "session_meta".to_string(),
+                timestamp,
+                cwd: data
+                    .and_then(|data| data.get("context"))
+                    .and_then(|context| context.get("cwd"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            }),
+            "user.message" | "assistant.message" => events.push(Event {
+                role: typ.trim_end_matches(".message").to_string(),
+                content: data
+                    .and_then(|data| data.get("content").or_else(|| data.get("message")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp,
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            }),
+            "tool.execution_start" => events.push(Event {
+                role: "assistant".to_string(),
+                timestamp,
+                tool_calls: vec![ToolCall {
+                    id: data
+                        .and_then(|data| data.get("toolCallId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: data
+                        .and_then(|data| data.get("toolName"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    args: jsonish(data.and_then(|data| data.get("arguments"))),
+                }],
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            }),
+            "tool.execution_complete" => events.push(Event {
+                role: "tool".to_string(),
+                timestamp,
+                tool_call_id: data
+                    .and_then(|data| data.get("toolCallId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                is_error: data
+                    .and_then(|data| data.get("success"))
+                    .and_then(Value::as_bool)
+                    == Some(false),
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            }),
+            "session.shutdown" => {
+                if let Some(metrics) = data
+                    .and_then(|data| data.get("modelMetrics"))
+                    .and_then(Value::as_object)
+                {
+                    for (model, metric) in metrics {
+                        if let Some(usage) = metric.get("usage").and_then(usage_from_value) {
+                            events.insert(
+                                0,
+                                Event {
+                                    role: "meta".to_string(),
+                                    timestamp: timestamp.clone(),
+                                    usage,
+                                    model_used: model.clone(),
+                                    source_tool: "copilot_cli".to_string(),
+                                    ..Event::default()
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    non_empty(events)
+}
+
+fn parse_kimi_wire_jsonl(raw: &str) -> Option<Vec<Event>> {
+    let entries = jsonl_objects(raw);
+    if !entries.iter().any(|entry| {
+        entry
+            .get("message")
+            .and_then(Value::as_object)
+            .is_some_and(|message| message.contains_key("type") && message.contains_key("payload"))
+    }) {
+        return None;
+    }
+    let mut events = Vec::new();
+    for entry in entries {
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(Value::as_f64)
+            .map(|seconds| timestamp_millis((seconds * 1000.0) as i64))
+            .unwrap_or_default();
+        let Some(message) = entry.get("message").and_then(Value::as_object) else {
+            continue;
+        };
+        let typ = string(message.get("type")).unwrap_or("");
+        let payload = message.get("payload").and_then(Value::as_object);
+        match typ {
+            "TurnBegin" | "SteerInput" => events.push(Event {
+                role: "user".to_string(),
+                content: payload
+                    .and_then(|payload| payload.get("user_input"))
+                    .map(|value| jsonish(Some(value)))
+                    .unwrap_or_default(),
+                timestamp,
+                source_tool: "kimi_cli".to_string(),
+                ..Event::default()
+            }),
+            "TextPart" => events.push(Event {
+                role: "assistant".to_string(),
+                content: payload
+                    .and_then(|payload| payload.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp,
+                source_tool: "kimi_cli".to_string(),
+                ..Event::default()
+            }),
+            "ThinkPart" => events.push(Event {
+                role: "assistant".to_string(),
+                reasoning: payload
+                    .and_then(|payload| payload.get("think").or_else(|| payload.get("text")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp,
+                source_tool: "kimi_cli".to_string(),
+                ..Event::default()
+            }),
+            "ToolCall" | "ToolCallPart" => events.push(Event {
+                role: "assistant".to_string(),
+                timestamp,
+                tool_calls: vec![ToolCall {
+                    id: payload
+                        .and_then(|payload| payload.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    name: payload
+                        .and_then(|payload| payload.get("function"))
+                        .and_then(|function| function.get("name"))
+                        .or_else(|| payload.and_then(|payload| payload.get("name")))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    args: jsonish(
+                        payload
+                            .and_then(|payload| payload.get("function"))
+                            .and_then(|function| function.get("arguments"))
+                            .or_else(|| payload.and_then(|payload| payload.get("arguments"))),
+                    ),
+                }],
+                source_tool: "kimi_cli".to_string(),
+                ..Event::default()
+            }),
+            "ToolResult" => events.push(Event {
+                role: "tool".to_string(),
+                content: payload
+                    .map(|payload| jsonish(Some(&Value::Object(payload.clone()))))
+                    .unwrap_or_default(),
+                timestamp,
+                source_tool: "kimi_cli".to_string(),
+                ..Event::default()
+            }),
+            "StatusUpdate" => {
+                if let Some(usage) = payload
+                    .and_then(|payload| payload.get("token_usage"))
+                    .and_then(usage_from_value)
+                {
+                    events.insert(
+                        0,
+                        Event {
+                            role: "meta".to_string(),
+                            usage,
+                            source_tool: "kimi_cli".to_string(),
+                            ..Event::default()
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    non_empty(events)
+}
+
+fn parse_antigravity_jsonl(raw: &str) -> Option<Vec<Event>> {
+    let entries = jsonl_objects(raw);
+    if !entries.iter().any(|entry| {
+        matches!(
+            string(entry.get("type")),
+            Some("PLANNER_RESPONSE" | "USER_INPUT" | "CONVERSATION_HISTORY")
+        ) && entry.contains_key("step_index")
+            && entry.contains_key("created_at")
+    }) {
+        return None;
+    }
+    let mut events = Vec::new();
+    for entry in entries {
+        let typ = string(entry.get("type")).unwrap_or("");
+        let timestamp = string(entry.get("created_at")).unwrap_or("").to_string();
+        match typ {
+            "USER_INPUT" => events.push(Event {
+                role: "user".to_string(),
+                content: string(entry.get("content")).unwrap_or("").to_string(),
+                timestamp,
+                source_tool: "antigravity_cli".to_string(),
+                ..Event::default()
+            }),
+            "PLANNER_RESPONSE" => {
+                let tool_calls = entry
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| {
+                        let call = call.as_object()?;
+                        Some(ToolCall {
+                            name: string(call.get("name")).unwrap_or("").to_string(),
+                            args: jsonish(call.get("args")),
+                            ..ToolCall::default()
+                        })
+                    })
+                    .collect();
+                events.push(Event {
+                    role: "assistant".to_string(),
+                    content: string(entry.get("content")).unwrap_or("").to_string(),
+                    reasoning: string(entry.get("thinking")).unwrap_or("").to_string(),
+                    timestamp,
+                    tool_calls,
+                    source_tool: "antigravity_cli".to_string(),
+                    ..Event::default()
+                });
+            }
+            "CONVERSATION_HISTORY" | "SYSTEM_MESSAGE" => {}
+            _ => events.push(Event {
+                role: "tool".to_string(),
+                content: string(entry.get("content")).unwrap_or("").to_string(),
+                timestamp,
+                is_error: string(entry.get("status")).is_some_and(|status| status != "DONE"),
+                source_tool: "antigravity_cli".to_string(),
+                ..Event::default()
+            }),
+        }
+    }
+    non_empty(events)
+}
+
+fn parse_cursor_transcript_jsonl(raw: &str) -> Option<Vec<Event>> {
+    let entries = jsonl_objects(raw);
+    if entries.is_empty()
+        || !entries.iter().all(|entry| {
+            entry.contains_key("role") && entry.get("message").and_then(Value::as_object).is_some()
+        })
+    {
+        return None;
+    }
+    let mut events = Vec::new();
+    for entry in entries {
+        let role = string(entry.get("role")).unwrap_or("");
+        let Some(message) = entry.get("message").and_then(Value::as_object) else {
+            continue;
+        };
+        let mut content = Vec::new();
+        let mut tool_calls = Vec::new();
+        for block in message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(block) = block.as_object() else {
+                continue;
+            };
+            match string(block.get("type")).unwrap_or("") {
+                "text" => content.push(string(block.get("text")).unwrap_or("").to_string()),
+                "tool_use" => tool_calls.push(ToolCall {
+                    id: string(block.get("id")).unwrap_or("").to_string(),
+                    name: string(block.get("name")).unwrap_or("").to_string(),
+                    args: jsonish(block.get("input")),
+                }),
+                _ => {}
+            }
+        }
+        events.push(Event {
+            role: role.to_string(),
+            content: content.join("\n"),
+            tool_calls,
+            source_tool: "cursor".to_string(),
+            ..Event::default()
+        });
+    }
+    non_empty(events)
+}
+
+fn parse_claude_transcript_jsonl(raw: &str) -> Option<Vec<Event>> {
+    let entries = jsonl_objects(raw);
+    if !entries.iter().any(|entry| {
+        matches!(string(entry.get("type")), Some("tool_use" | "tool_result"))
+            && entry.contains_key("timestamp")
+            && entry.contains_key("tool_name")
+    }) {
+        return None;
+    }
+    let mut events = Vec::new();
+    for entry in entries {
+        let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
+        match string(entry.get("type")).unwrap_or("") {
+            "user" | "assistant" => events.push(Event {
+                role: string(entry.get("type")).unwrap_or("").to_string(),
+                content: string(entry.get("content")).unwrap_or("").to_string(),
+                timestamp,
+                source_tool: "claude_code".to_string(),
+                ..Event::default()
+            }),
+            "tool_use" => events.push(Event {
+                role: "assistant".to_string(),
+                timestamp,
+                tool_calls: vec![ToolCall {
+                    name: string(entry.get("tool_name")).unwrap_or("").to_string(),
+                    args: jsonish(entry.get("tool_input")),
+                    ..ToolCall::default()
+                }],
+                source_tool: "claude_code".to_string(),
+                ..Event::default()
+            }),
+            "tool_result" => events.push(Event {
+                role: "tool".to_string(),
+                content: jsonish(entry.get("tool_output")),
+                timestamp,
+                source_tool: "claude_code".to_string(),
+                ..Event::default()
+            }),
+            _ => {}
+        }
+    }
+    non_empty(events)
+}
+
+fn parse_workbuddy_jsonl(raw: &str) -> Option<Vec<Event>> {
+    let entries = jsonl_objects(raw);
+    if !entries.iter().any(|entry| {
+        matches!(
+            string(entry.get("type")),
+            Some("function_call" | "function_call_result" | "reasoning")
+        ) && entry.contains_key("sessionId")
+            && entry.contains_key("cwd")
+    }) {
+        return None;
+    }
+    let mut events = Vec::new();
+    let mut model = "unknown".to_string();
+    let mut latest_usage = None;
+    for entry in entries {
+        if let Some(next) = entry
+            .get("providerData")
+            .and_then(Value::as_object)
+            .and_then(|data| string(data.get("model")))
+            .filter(|value| !value.is_empty())
+        {
+            model = next.to_string();
+        }
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(number_as_i64)
+            .map(timestamp_millis)
+            .unwrap_or_default();
+        let cwd = string(entry.get("cwd")).unwrap_or("").to_string();
+        match string(entry.get("type")).unwrap_or("") {
+            "message" => {
+                let role = string(entry.get("role")).unwrap_or("");
+                let content = workbuddy_content(entry.get("content"));
+                if !content.is_empty() {
+                    events.push(Event {
+                        role: role.to_string(),
+                        content,
+                        timestamp,
+                        cwd,
+                        model_used: model.clone(),
+                        source_tool: "workbuddy".to_string(),
+                        ..Event::default()
+                    });
+                }
+                latest_usage = workbuddy_usage(&entry).or(latest_usage);
+            }
+            "reasoning" => {
+                let reasoning = workbuddy_content(
+                    entry
+                        .get("content")
+                        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+                        .or_else(|| entry.get("rawContent")),
+                );
+                if !reasoning.is_empty() {
+                    events.push(Event {
+                        role: "assistant".to_string(),
+                        reasoning,
+                        timestamp,
+                        cwd,
+                        model_used: model.clone(),
+                        source_tool: "workbuddy".to_string(),
+                        ..Event::default()
+                    });
+                }
+            }
+            "function_call" => {
+                latest_usage = workbuddy_usage(&entry).or(latest_usage);
+                events.push(Event {
+                    role: "assistant".to_string(),
+                    timestamp,
+                    cwd,
+                    tool_calls: vec![ToolCall {
+                        id: string(entry.get("callId")).unwrap_or("").to_string(),
+                        name: string(entry.get("name")).unwrap_or("").to_string(),
+                        args: jsonish(entry.get("arguments")),
+                    }],
+                    model_used: model.clone(),
+                    source_tool: "workbuddy".to_string(),
+                    ..Event::default()
+                });
+            }
+            "function_call_result" => events.push(Event {
+                role: "tool".to_string(),
+                content: jsonish(entry.get("output")),
+                timestamp,
+                cwd,
+                tool_call_id: string(entry.get("callId")).unwrap_or("").to_string(),
+                is_error: string(entry.get("status")).is_some_and(|status| status != "completed"),
+                model_used: model.clone(),
+                source_tool: "workbuddy".to_string(),
+                ..Event::default()
+            }),
+            _ => {}
+        }
+    }
+    if let Some(usage) = latest_usage {
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                usage,
+                model_used: model,
+                source_tool: "workbuddy".to_string(),
+                ..Event::default()
+            },
+        );
+    }
+    non_empty(events)
+}
+
+fn workbuddy_content(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn workbuddy_usage(entry: &Map<String, Value>) -> Option<TokenUsage> {
+    let mut usage = entry
+        .get("message")
+        .and_then(|message| message.get("usage"))
+        .or_else(|| entry.get("providerData").and_then(|data| data.get("usage")))
+        .and_then(usage_from_value)?;
+    let cached = usage.get("cache_read_input_tokens").copied().unwrap_or(0);
+    if let Some(input) = usage.get_mut("input_tokens") {
+        *input = (*input - cached).max(0);
+    }
+    Some(usage)
 }
 
 fn parse_openclaw_value(value: &Value) -> Option<Vec<Event>> {
@@ -638,6 +1153,14 @@ fn parse_oh_my_pi_jsonl(path: &str, raw: &str) -> anyhow::Result<Vec<Event>> {
                 bail!("oh_my_pi: invalid session header");
             }
             seen_header = true;
+            if let Some(cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty()) {
+                meta_events.push(Event {
+                    role: "meta".to_string(),
+                    cwd: cwd.to_string(),
+                    source_tool: source_tool.clone(),
+                    ..Event::default()
+                });
+            }
             continue;
         }
 
@@ -1368,15 +1891,18 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<Vec<Event>> {
         match typ {
             "session_meta" => {
                 saw_codex = true;
+                let mut cwd = String::new();
                 if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
                     if let Some(next_model) = string(payload.get("model")).filter(|m| !m.is_empty())
                     {
                         model = next_model.to_string();
                     }
+                    cwd = string(payload.get("cwd")).unwrap_or("").to_string();
                 }
                 events.push(Event {
                     role: "meta".to_string(),
                     timestamp: ts,
+                    cwd,
                     model_used: model.clone(),
                     source_tool: "codex_cli".to_string(),
                     ..Event::default()
@@ -3303,6 +3829,7 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
                 "cache_creation_input_tokens",
                 "cacheCreationInputTokens",
                 "cache_creation",
+                "cacheWriteTokens",
             ][..],
         ),
         (
@@ -3311,6 +3838,7 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
                 "cache_read_input_tokens",
                 "cacheReadInputTokens",
                 "cache_read",
+                "cacheReadTokens",
             ][..],
         ),
     ] {

@@ -11,6 +11,17 @@ The goal is to catch agent workflow regressions before they become invisible cos
 
 Start with report-only artifacts, then turn on blocking thresholds once the team knows its normal health and tool failure range.
 
+Use `--range today|7d|30d|all`, `--project`, `--source`, and
+`--model-filter` to keep reports and gates on the same explicit scope. JSON
+reports include `data_health` and `by_project` so automation can distinguish a
+healthy run from missing, skipped, or fallback-priced data.
+
+Long-term history is opt-in. `--preserve-history` stores only derived metrics
+(time, project label, source, model, tokens, cost, health, and anomaly labels)
+under the user data directory. It does not copy session paths, prompts, replies,
+or tool arguments. Add `--include-history` when a report should merge those
+preserved metrics with live sessions.
+
 ## Local Check
 
 ```bash

@@ -28,11 +28,13 @@ mkdir -p "$out_dir"
 run cargo fmt --check
 run cargo clippy -- -D warnings
 run cargo test
+run python3 scripts/generate-testdata.py --check
 run cargo build --release -p agenttrace
 run scripts/ci/check-cargo-manifests.sh
 
 [[ -x "$bin" ]] || fail "release binary is not executable: $bin"
 run "$bin" --version
+run_env AGENTTRACE_BIN="$bin" python3 scripts/ci/check-single-binary-entrypoints.py
 
 run_env AGENTTRACE_BIN="$bin" AGENTTRACE_CI_OUT="$out_dir/contracts" \
   scripts/ci/check-output-contract.sh

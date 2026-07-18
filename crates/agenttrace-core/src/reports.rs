@@ -1,7 +1,8 @@
 use crate::{
-    average_health, canonical_sessions, classify_tool_authority, fmt_duration,
-    highest_authority_for_metrics, is_high_authority_category, round4, sorted_keys, sorted_set,
-    total_tokens, Anomaly, GroupOverview, Overview, Session, ToolCall, VERSION,
+    average_health, canonical_sessions, classify_tool_authority, fmt_duration, format_cost,
+    format_count, format_tokens, highest_authority_for_metrics, is_high_authority_category, round4,
+    sorted_keys, sorted_set, total_tokens, Anomaly, GroupOverview, Overview, Session, ToolCall,
+    VERSION,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
@@ -22,6 +23,15 @@ pub enum ReportLanguage {
     #[default]
     En,
     Zh,
+}
+
+impl ReportLanguage {
+    fn t(self, en: &'static str, zh: &'static str) -> &'static str {
+        match self {
+            Self::En => en,
+            Self::Zh => zh,
+        }
+    }
 }
 
 pub fn report_json(session: &Session) -> String {
@@ -171,6 +181,10 @@ pub fn report_json_with_language(session: &Session, language: ReportLanguage) ->
 }
 
 pub fn report_text(session: &Session) -> String {
+    report_text_with_language(session, ReportLanguage::En)
+}
+
+pub fn report_text_with_language(session: &Session, language: ReportLanguage) -> String {
     let metrics = &session.metrics;
     let total_tokens = total_tokens(session);
     let total_tools = metrics.tool_calls_ok + metrics.tool_calls_fail;
@@ -190,48 +204,75 @@ pub fn report_text(session: &Session) -> String {
     out.push_str(&sep);
     out.push('\n');
     out.push_str(&format!(
-        "  AGENTTRACE v{} — AI Agent Session Performance Report\n",
-        VERSION
+        "  AGENTTRACE v{} — {}\n",
+        VERSION,
+        language.t(
+            "AI Agent Session Performance Report",
+            "AI 智能体会话性能报告"
+        )
     ));
     out.push_str(&sep);
     out.push_str("\n\n");
 
-    out.push_str("💸 MONEY WASTE\n");
+    out.push_str(language.t("💸 MONEY WASTE\n", "💸 成本与 Token\n"));
     out.push_str(&sub);
     out.push('\n');
     out.push_str(&format!(
-        "  Input:       {:>10}  tokens\n",
-        metrics.tokens_input
+        "  {}:       {:>10}  {}\n",
+        language.t("Input", "输入"),
+        format_tokens(metrics.tokens_input),
+        language.t("tokens", "Token")
     ));
     out.push_str(&format!(
-        "  Output:      {:>10}  tokens\n",
-        metrics.tokens_output
+        "  {}:      {:>10}  {}\n",
+        language.t("Output", "输出"),
+        format_tokens(metrics.tokens_output),
+        language.t("tokens", "Token")
     ));
     if metrics.tokens_cache_w > 0 || metrics.tokens_cache_r > 0 {
         out.push_str(&format!(
-            "  Cache write: {:>10}  tokens\n",
-            metrics.tokens_cache_w
+            "  {}: {:>10}  {}\n",
+            language.t("Cache write", "缓存写入"),
+            format_tokens(metrics.tokens_cache_w),
+            language.t("tokens", "Token")
         ));
         out.push_str(&format!(
-            "  Cache read:  {:>10}  tokens\n",
-            metrics.tokens_cache_r
+            "  {}:  {:>10}  {}\n",
+            language.t("Cache read", "缓存读取"),
+            format_tokens(metrics.tokens_cache_r),
+            language.t("tokens", "Token")
         ));
     }
     out.push_str("  ────────────────────────────────────\n");
-    out.push_str(&format!("  Total tokens: {:>10}\n", total_tokens));
     out.push_str(&format!(
-        "  Money wasted: ${:>11.4}  (model: {})\n\n",
-        metrics.cost_estimated, metrics.model_used
+        "  {}: {:>10}\n",
+        language.t("Total tokens", "Token 总数"),
+        format_tokens(total_tokens)
+    ));
+    out.push_str(&format!(
+        "  {}: {:>12}  ({}: {})\n\n",
+        language.t("Estimated cost", "估算成本"),
+        format_cost(metrics.cost_estimated),
+        language.t("model", "模型"),
+        metrics.model_used
     ));
 
-    out.push_str("📊 ACTIVITY\n");
+    out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
     out.push_str(&sub);
     out.push('\n');
     out.push_str(&format!(
-        "  Messages:    {} user  |  {} turns\n",
-        metrics.user_messages, metrics.assistant_turns
+        "  {}:    {} {}  |  {} {}\n",
+        language.t("Messages", "消息"),
+        metrics.user_messages,
+        language.t("user", "用户"),
+        metrics.assistant_turns,
+        language.t("turns", "轮次")
     ));
-    out.push_str(&format!("  Tool calls:  {}\n", metrics.tool_calls_total));
+    out.push_str(&format!(
+        "  {}:  {}\n",
+        language.t("Tool calls", "工具调用"),
+        metrics.tool_calls_total
+    ));
     if total_tools > 0 {
         let rate = metrics.tool_calls_ok as f64 / total_tools as f64;
         let success_emoji = if rate < 0.70 {
@@ -242,31 +283,52 @@ pub fn report_text(session: &Session) -> String {
             "🟢"
         };
         out.push_str(&format!(
-            "  Success:     {} ({}/{}) {}\n",
-            success_rate, metrics.tool_calls_ok, total_tools, success_emoji
+            "  {}:     {} ({}/{}) {}\n",
+            language.t("Success", "成功率"),
+            success_rate,
+            metrics.tool_calls_ok,
+            total_tools,
+            success_emoji
         ));
     }
     out.push('\n');
 
-    out.push_str("⏱️  LATENCY\n");
+    out.push_str(language.t("⏱️  LATENCY\n", "⏱️  延迟\n"));
     out.push_str(&sub);
     out.push('\n');
     if gaps.is_empty() {
-        out.push_str("  (no gap data)\n");
+        out.push_str(language.t("  (no gap data)\n", "  （无间隔数据）\n"));
     } else {
-        out.push_str(&format!("  min:     {:.1}s\n", gaps[0]));
-        out.push_str(&format!("  median:  {:.1}s\n", percentile(&gaps, 0.50)));
+        out.push_str(&format!(
+            "  {}:     {:.1}s\n",
+            language.t("min", "最小"),
+            gaps[0]
+        ));
+        out.push_str(&format!(
+            "  {}:  {:.1}s\n",
+            language.t("median", "中位数"),
+            percentile(&gaps, 0.50)
+        ));
         out.push_str(&format!("  p95:     {:.1}s\n", percentile(&gaps, 0.95)));
-        out.push_str(&format!("  max:     {:.1}s\n", gaps[gaps.len() - 1]));
-        out.push_str(&format!("  avg:     {:.1}s\n", average(&gaps)));
+        out.push_str(&format!(
+            "  {}:     {:.1}s\n",
+            language.t("max", "最大"),
+            gaps[gaps.len() - 1]
+        ));
+        out.push_str(&format!(
+            "  {}:     {:.1}s\n",
+            language.t("avg", "平均"),
+            average(&gaps)
+        ));
     }
     out.push_str(&format!(
-        "  Duration: {}\n\n",
-        fmt_duration(metrics.duration_sec)
+        "  {}: {}\n\n",
+        language.t("Duration", "总耗时"),
+        fmt_duration_for_language(metrics.duration_sec, language)
     ));
 
     if !metrics.tool_usage.is_empty() {
-        out.push_str("🔧 TOP TOOLS\n");
+        out.push_str(language.t("🔧 TOP TOOLS\n", "🔧 高频工具\n"));
         out.push_str(&sub);
         out.push('\n');
         for (tool, count) in top_tool_rows(&metrics.tool_usage).into_iter().take(8) {
@@ -275,51 +337,71 @@ pub fn report_text(session: &Session) -> String {
         out.push('\n');
     }
 
-    out.push_str("🧠 THINKING / COT\n");
+    out.push_str(language.t("🧠 THINKING / COT\n", "🧠 推理 / 思维链\n"));
     out.push_str(&sub);
     out.push('\n');
     if metrics.reasoning_blocks > 0 {
         let (quality_emoji, quality_label) = if avg_reason < 400.0 {
-            ("🔴", "shallow")
+            ("🔴", language.t("shallow", "浅"))
         } else if avg_reason < 800.0 {
-            ("🟡", "moderate")
+            ("🟡", language.t("moderate", "中等"))
         } else {
-            ("🟢", "deep")
+            ("🟢", language.t("deep", "深入"))
         };
-        out.push_str(&format!("  Blocks: {}\n", metrics.reasoning_blocks));
-        out.push_str(&format!("  Avg:    {:.0} chars\n", avg_reason));
-        out.push_str(&format!("  Total:  {} chars\n", metrics.reasoning_chars));
-        out.push_str(&format!("  Quality: {} {}\n", quality_emoji, quality_label));
+        out.push_str(&format!(
+            "  {}: {}\n",
+            language.t("Blocks", "块数"),
+            metrics.reasoning_blocks
+        ));
+        out.push_str(&format!(
+            "  {}:    {:.0} {}\n",
+            language.t("Avg", "平均"),
+            avg_reason,
+            language.t("chars", "字符")
+        ));
+        out.push_str(&format!(
+            "  {}:  {} {}\n",
+            language.t("Total", "总计"),
+            metrics.reasoning_chars,
+            language.t("chars", "字符")
+        ));
+        out.push_str(&format!(
+            "  {}: {} {}\n",
+            language.t("Quality", "质量"),
+            quality_emoji,
+            quality_label
+        ));
         if metrics.reasoning_redact > 0 {
             out.push_str(&format!(
-                "  ⚠️  {} blocks REDACTED\n",
-                metrics.reasoning_redact
+                "  ⚠️  {} {}\n",
+                metrics.reasoning_redact,
+                language.t("blocks REDACTED", "个块已脱敏")
             ));
         }
     } else {
-        out.push_str("  (no thinking blocks)\n");
+        out.push_str(language.t("  (no thinking blocks)\n", "  （无推理块）\n"));
     }
     out.push('\n');
 
-    out.push_str("🚨 ANOMALIES\n");
+    out.push_str(language.t("🚨 ANOMALIES\n", "🚨 异常\n"));
     out.push_str(&sub);
     out.push('\n');
     if session.anomalies.is_empty() {
-        out.push_str("  ✅ No anomalies detected\n");
+        out.push_str(language.t("  ✅ No anomalies detected\n", "  ✅ 未检测到异常\n"));
     } else {
         for anomaly in &session.anomalies {
             out.push_str(&format!(
                 "  {} [{}] {}: {}\n",
                 anomaly_emoji(&anomaly.severity),
-                severity_label(&anomaly.severity),
-                anomaly_type_label(&anomaly.kind),
-                anomaly.detail
+                severity_label_for_language(&anomaly.severity, language),
+                anomaly_type_label_for_language(&anomaly.kind, language),
+                anomaly_detail_for_language(anomaly, language)
             ));
         }
     }
     out.push('\n');
 
-    out.push_str("💯 HEALTH SCORE\n");
+    out.push_str(language.t("💯 HEALTH SCORE\n", "💯 健康评分\n"));
     out.push_str(&sub);
     out.push('\n');
     out.push_str(&format!(
@@ -334,10 +416,19 @@ pub fn report_text(session: &Session) -> String {
 }
 
 pub fn report_overview_json(overview: &Overview, sessions: &[Session]) -> String {
+    report_overview_json_with_health(overview, sessions, None)
+}
+
+pub fn report_overview_json_with_health(
+    overview: &Overview,
+    sessions: &[Session],
+    data_health: Option<&crate::DataHealth>,
+) -> String {
     let ordered = canonical_sessions(sessions);
     let summary = overview_summary(overview, &ordered);
     let agents = group_items(&overview.by_agent, true);
     let models = group_items(&overview.by_model, false);
+    let projects = group_items(&overview.by_project, false);
     let recent_sessions: Vec<Value> = ordered
         .iter()
         .take(10)
@@ -378,9 +469,11 @@ pub fn report_overview_json(overview: &Overview, sessions: &[Session]) -> String
         "surfaces": surfaces(&ordered),
         "by_agent": agents,
         "by_model": models,
+        "by_project": projects,
         "recent_sessions": recent_sessions,
         "incident_timelines": incident_timelines(&ordered),
         "anomalies": anomalies,
+        "data_health": data_health,
     });
     if let Value::Object(obj) = &mut payload {
         let summary = obj.remove("summary").unwrap_or(Value::Null);
@@ -481,19 +574,22 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     ));
     out.push_str(&format!(
         "  🟢 Healthy:   {} ({}%)\n",
-        overview.healthy, healthy_pct
+        format_count(overview.healthy),
+        healthy_pct
     ));
     out.push_str(&format!(
         "  🟡 Warning:   {} ({}%)\n",
-        overview.warning, warning_pct
+        format_count(overview.warning),
+        warning_pct
     ));
     out.push_str(&format!(
         "  🔴 Critical:   {} ({}%)\n",
-        overview.critical, critical_pct
+        format_count(overview.critical),
+        critical_pct
     ));
     out.push_str(&format!(
-        "  💰 Total estimated cost:      ${:.2}\n\n",
-        overview.total_cost
+        "  💰 Total estimated cost:      {}\n\n",
+        format_cost(overview.total_cost)
     ));
 
     let timelines = overview_incident_timelines(&ordered, 3);
@@ -559,10 +655,10 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     out.push_str("  ── By Agent ──\n");
     for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
-            "    {:<30} {:>4} Sessions  ${:>7.2}\n",
+            "    {:<30} {:>4} Sessions  {:>8}\n",
             tool_display_name(&agent),
-            group.sessions,
-            group.cost
+            format_count(group.sessions),
+            format_cost(group.cost)
         ));
     }
     out.push('\n');
@@ -573,8 +669,10 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         .take(8)
     {
         out.push_str(&format!(
-            "    {:<25} {:>4} Sessions  ${:>7.2}\n",
-            model, group.sessions, group.cost
+            "    {:<25} {:>4} Sessions  {:>8}\n",
+            model,
+            format_count(group.sessions),
+            format_cost(group.cost)
         ));
     }
     out.push('\n');
@@ -606,10 +704,15 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
 
     out.push_str("# agenttrace overview\n\n");
     out.push_str("| Metric | Value |\n|---|---:|\n");
-    out.push_str(&format!("| Sessions | {} |\n", overview.total_sessions));
+    out.push_str(&format!(
+        "| Sessions | {} |\n",
+        format_count(overview.total_sessions)
+    ));
     out.push_str(&format!(
         "| Healthy / Warning / Critical | {} / {} / {} |\n",
-        overview.healthy, overview.warning, overview.critical
+        format_count(overview.healthy),
+        format_count(overview.warning),
+        format_count(overview.critical)
     ));
     out.push_str(&format!(
         "| Average health | {:.1} |\n",
@@ -620,12 +723,12 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         markdown_cell(&trend.message)
     ));
     out.push_str(&format!(
-        "| Total estimated cost | ${:.2} |\n",
-        overview.total_cost
+        "| Total estimated cost | {} |\n",
+        format_cost(overview.total_cost)
     ));
     out.push_str(&format!(
-        "| Total tokens | {:.0} |\n",
-        number_obj(&summary, "total_tokens")
+        "| Total tokens | {} |\n",
+        format_tokens(number_obj(&summary, "total_tokens") as i64)
     ));
     out.push_str(&format!(
         "| Tool failures | {:.0} / {:.0} ({:.1}%) |\n\n",
@@ -700,10 +803,10 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     out.push_str("| Agent | Sessions | Cost |\n|---|---:|---:|\n");
     for (agent, group) in sorted_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
-            "| {} | {} | ${:.2} |\n",
+            "| {} | {} | {} |\n",
             markdown_cell(&tool_display_name(&agent)),
-            group.sessions,
-            group.cost
+            format_count(group.sessions),
+            format_cost(group.cost)
         ));
     }
 
@@ -713,13 +816,13 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     );
     for session in ordered.iter().take(10) {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | ${:.4} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
             markdown_cell(&session.name),
             markdown_cell(&tool_display_name(&session.metrics.source_tool)),
             markdown_cell(&session.metrics.model_used),
             session.health,
-            session.metrics.cost_estimated,
-            session.anomalies.len()
+            format_cost(session.metrics.cost_estimated),
+            format_count(session.anomalies.len())
         ));
     }
 
@@ -786,16 +889,16 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
         overview.total_sessions, overview.healthy, overview.warning, overview.critical
     ));
     w(format!(
-        "<div class=\"metric\"><span>Total tokens</span><strong>{:.0}</strong><p>+ live</p></div>",
-        number_obj(&summary, "total_tokens")
+        "<div class=\"metric\"><span>Total tokens</span><strong>{}</strong><p>+ live</p></div>",
+        format_tokens(number_obj(&summary, "total_tokens") as i64)
     ));
     w(format!(
         "<div class=\"metric\"><span>Average health</span><strong>{:.1}</strong><p>Fleet quality score</p></div>",
         number_obj(&summary, "avg_health")
     ));
     w(format!(
-        "<div class=\"metric\"><span>Total estimated cost</span><strong>${:.2}</strong><p>Estimated session cost</p></div>",
-        overview.total_cost
+        "<div class=\"metric\"><span>Total estimated cost</span><strong>{}</strong><p>Estimated session cost</p></div>",
+        format_cost(overview.total_cost)
     ));
     w(format!(
         "<div class=\"metric {}\"><span>Tool failures</span><strong>{:.0}/{:.0}</strong><p>{:.1}% failure rate</p></div>",
@@ -877,15 +980,15 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     w("<section><h2>Recent sessions</h2><table><thead><tr><th>Session</th><th>Source</th><th>Model</th><th class=\"num\">Total tokens</th><th class=\"num\">Cost</th><th class=\"num\">Health</th><th class=\"num\">Anomalies</th></tr></thead><tbody>".to_string());
     for session in ordered.iter().take(20) {
         w(format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">${:.4}</td><td class=\"num {}\">{}</td><td class=\"num\">{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num {}\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(&session.name),
             html_escape(&tool_display_name(&session.metrics.source_tool)),
             html_escape(&session.metrics.model_used),
-            total_tokens(session),
-            session.metrics.cost_estimated,
+            format_tokens(total_tokens(session)),
+            format_cost(session.metrics.cost_estimated),
             html_escape(health_class(session.health)),
             session.health,
-            session.anomalies.len()
+            format_count(session.anomalies.len())
         ));
     }
     w("</tbody></table></section>".to_string());
@@ -893,10 +996,10 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     w("<section><h2>By agent</h2><table><thead><tr><th>Agent</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (agent, group) in agents {
         w(format!(
-            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">${:.2}</td></tr>",
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(&tool_display_name(&agent)),
-            group.sessions,
-            group.cost
+            format_count(group.sessions),
+            format_cost(group.cost)
         ));
     }
     w("</tbody></table></section>".to_string());
@@ -904,10 +1007,10 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     w("<section><h2>By model</h2><table><thead><tr><th>Model</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (model, group) in models.iter().take(12) {
         w(format!(
-            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">${:.2}</td></tr>",
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(model),
-            group.sessions,
-            group.cost
+            format_count(group.sessions),
+            format_cost(group.cost)
         ));
     }
     w("</tbody></table></section>".to_string());
@@ -938,12 +1041,22 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
 }
 
 pub fn report_compare(sessions: &[Session], model: &str) -> String {
+    report_compare_with_language(sessions, model, ReportLanguage::En)
+}
+
+pub fn report_compare_with_language(
+    sessions: &[Session],
+    model: &str,
+    language: ReportLanguage,
+) -> String {
     let sep = "━".repeat(76);
     let mut out = String::new();
     out.push_str(&sep);
     out.push('\n');
     out.push_str(&format!(
-        "  AGENTTRACE — Multi-Session Comparison  (model: {})\n",
+        "  AGENTTRACE — {}  ({}: {})\n",
+        language.t("Multi-Session Comparison", "多会话对比"),
+        language.t("model", "模型"),
         model
     ));
     out.push_str(&sep);
@@ -951,7 +1064,13 @@ pub fn report_compare(sessions: &[Session], model: &str) -> String {
     out.push('\n');
     out.push_str(&format!(
         "  {:<28} {:>4} {:>5} {:>5} {:>5} {:>9} {:>7}\n",
-        "SESSION", "TURNS", "TOOLS", "SUCC%", "FAIL", "COST", "HEALTH"
+        language.t("SESSION", "会话"),
+        language.t("TURNS", "轮次"),
+        language.t("TOOLS", "工具"),
+        language.t("SUCC%", "成功%"),
+        language.t("FAIL", "失败"),
+        language.t("COST", "成本"),
+        language.t("HEALTH", "健康")
     ));
     out.push_str(&format!("  {}\n", "─".repeat(70)));
     for session in sessions {
@@ -967,13 +1086,13 @@ pub fn report_compare(sessions: &[Session], model: &str) -> String {
         };
         let name = truncate_runes(&session.name, 27);
         out.push_str(&format!(
-            "  {:<28} {:>4} {:>5} {:>5} {:>5} ${:>8.4} {} {}/100\n",
+            "  {:<28} {:>4} {:>5} {:>5} {:>5} {:>9} {} {}/100\n",
             name,
-            metrics.assistant_turns,
-            metrics.tool_calls_total,
+            format_count(metrics.assistant_turns),
+            format_count(metrics.tool_calls_total),
             success_rate,
-            metrics.tool_calls_fail,
-            metrics.cost_estimated,
+            format_count(metrics.tool_calls_fail),
+            format_cost(metrics.cost_estimated),
             health_emoji(session.health),
             session.health
         ));
@@ -1069,15 +1188,35 @@ fn anomaly_emoji(severity: &str) -> &'static str {
 }
 
 fn severity_label(severity: &str) -> String {
+    severity_label_for_language(severity, ReportLanguage::En)
+}
+
+fn severity_label_for_language(severity: &str, language: ReportLanguage) -> String {
     match severity.to_ascii_lowercase().as_str() {
-        "high" => "HIGH".to_string(),
-        "medium" => "MEDIUM".to_string(),
-        "low" => "LOW".to_string(),
+        "critical" => language.t("CRITICAL", "严重").to_string(),
+        "high" => language.t("HIGH", "高").to_string(),
+        "warning" | "medium" => language.t("MEDIUM", "中").to_string(),
+        "good" | "low" => language.t("LOW", "低").to_string(),
         _ => severity.to_ascii_uppercase(),
     }
 }
 
 fn anomaly_type_label(kind: &str) -> String {
+    anomaly_type_label_for_language(kind, ReportLanguage::En)
+}
+
+fn anomaly_type_label_for_language(kind: &str, language: ReportLanguage) -> String {
+    if language == ReportLanguage::Zh {
+        return match kind {
+            "hanging" => "卡顿".to_string(),
+            "latency" => "延迟".to_string(),
+            "tool_failures" => "工具失败".to_string(),
+            "shallow_thinking" => "推理过浅".to_string(),
+            "redacted" | "redaction" => "推理脱敏".to_string(),
+            "no_tools" => "未使用工具".to_string(),
+            other => other.replace('_', " "),
+        };
+    }
     match kind {
         "hanging" => "hanging".to_string(),
         "latency" => "latency".to_string(),
@@ -1904,7 +2043,8 @@ fn build_incident_timeline(session: &Session) -> IncidentTimelineSummary {
                 "Burn divergence",
                 format!(
                     "{} tokens per assistant turn across {} turn(s)",
-                    tokens_per_turn, metrics.assistant_turns
+                    format_tokens(tokens_per_turn),
+                    metrics.assistant_turns
                 ),
                 "medium",
             );
@@ -2176,7 +2316,8 @@ fn possible_cost_driver_note_strict(session: &Session) -> Option<String> {
         if tokens_per_turn >= 50000 {
             return Some(format!(
                 "possible driver: {} tokens per assistant turn across {} turn(s)",
-                tokens_per_turn, metrics.assistant_turns
+                format_tokens(tokens_per_turn),
+                metrics.assistant_turns
             ));
         }
     }
@@ -2204,6 +2345,7 @@ mod tests {
             anomalies: Vec::new(),
             health: 100,
             tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
         };
 
         let report = report_compare_json(&[session]);
@@ -2227,9 +2369,38 @@ mod tests {
             anomalies: Vec::new(),
             health: 100,
             tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
         };
 
         let report = report_compare(&[session], "default");
         assert!(report.contains("打开中文文件"));
+    }
+
+    #[test]
+    fn text_and_compare_reports_support_chinese() {
+        let session = Session {
+            name: "会话".to_string(),
+            path: "/tmp/session.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                assistant_turns: 2,
+                tool_calls_total: 4,
+                tool_calls_ok: 4,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+
+        let report = report_text_with_language(&session, ReportLanguage::Zh);
+        assert!(report.contains("AI 智能体会话性能报告"));
+        assert!(report.contains("成本与 Token"));
+        assert!(!report.contains("MONEY WASTE"));
+
+        let compare = report_compare_with_language(&[session], "default", ReportLanguage::Zh);
+        assert!(compare.contains("多会话对比"));
+        assert!(compare.contains("会话"));
     }
 }

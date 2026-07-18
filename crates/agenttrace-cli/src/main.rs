@@ -1,11 +1,13 @@
 use agenttrace_core::{
-    add_baseline_comparison, compute_overview, demo_sessions, evaluate_overview_gate,
-    find_session_files, load_sessions_from_dir, parse_file, pricing_cache_path,
-    render_doctor_report, render_model_pricing_list, render_test_match, render_waste_report,
-    report_compare, report_compare_json, report_json_with_language, report_overview_html,
-    report_overview_json, report_overview_markdown, report_overview_text, report_search_json,
-    report_search_text, report_text, search_sessions, update_pricing, BaselineThresholds,
-    ReportLanguage, Session, VERSION,
+    add_baseline_comparison, average_health, compute_overview, data_health, demo_sessions,
+    evaluate_overview_gate, filter_sessions, find_session_files, fix_suggestions, inspect_first,
+    load_sessions_with_options, parse_file, predict_cost_anomaly, pricing_cache_path,
+    render_doctor_report, render_model_pricing_list, render_test_match,
+    render_waste_report_with_language, report_compare_json, report_json_with_language,
+    report_overview_html, report_overview_json_with_health, report_overview_markdown,
+    report_overview_text, report_search_json, report_search_text, report_text_with_language,
+    search_sessions, session_capability, tool_fail_rate, total_tokens, update_pricing,
+    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
@@ -28,6 +30,12 @@ struct Args {
     compare: bool,
     #[arg(long)]
     overview: bool,
+    #[arg(long)]
+    sessions: bool,
+    #[arg(long)]
+    diagnostics: bool,
+    #[arg(long)]
+    inspect: Option<usize>,
     #[arg(short = 'm', default_value = "default")]
     model: String,
     #[arg(short = 'o')]
@@ -68,6 +76,34 @@ struct Args {
     baseline_max_token_delta_pct: f64,
     #[arg(long = "lang", default_value = "en")]
     lang: String,
+    #[arg(long, default_value = "all")]
+    range: String,
+    #[arg(long, default_value = "")]
+    project: String,
+    #[arg(long, default_value = "")]
+    source: String,
+    #[arg(long = "model-filter", default_value = "")]
+    model_filter: String,
+    #[arg(long, default_value = "")]
+    query: String,
+    #[arg(long, default_value = "")]
+    health: String,
+    #[arg(long, default_value = "")]
+    cost: String,
+    #[arg(long, default_value = "")]
+    anomaly: String,
+    #[arg(long, default_value = "recent")]
+    sort: String,
+    #[arg(long, default_value = "desc")]
+    order: String,
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    #[arg(long = "clear-cache")]
+    clear_cache: bool,
+    #[arg(long = "preserve-history")]
+    preserve_history: bool,
+    #[arg(long = "include-history")]
+    include_history: bool,
 }
 
 fn main() {
@@ -84,6 +120,14 @@ fn run() -> anyhow::Result<()> {
     if args.version {
         println!("agenttrace v{}", VERSION);
         return Ok(());
+    }
+
+    if args.clear_cache {
+        agenttrace_core::clear_session_cache()?;
+        println!("Session cache cleared.");
+        if !has_session_action(&args) {
+            return Ok(());
+        }
     }
 
     if args.update_pricing {
@@ -136,7 +180,7 @@ fn run() -> anyhow::Result<()> {
         let out = if args.format == "json" {
             report_compare_json(&sessions)
         } else {
-            report_compare(&sessions, &args.model)
+            agenttrace_core::report_compare_with_language(&sessions, &args.model, language)
         };
         write_output(&args.output, &(out.clone() + "\n"))?;
         print!("{out}");
@@ -145,24 +189,59 @@ fn run() -> anyhow::Result<()> {
 
     if args.waste {
         let session = load_latest_session(&args)?;
-        let out = render_waste_report(&session);
+        let out = render_waste_report_with_language(&session, language);
         write_output(&args.output, &(out.clone() + "\n"))?;
         print!("{out}");
         return Ok(());
     }
 
-    if args.latest || args.path.is_some() {
+    if (args.latest || args.path.is_some())
+        && !args.sessions
+        && !args.diagnostics
+        && args.inspect.is_none()
+    {
         let session = load_latest_session(&args)?;
         let out = match args.format.as_str() {
             "json" => report_json_with_language(&session, language),
-            _ => report_text(&session),
+            _ => report_text_with_language(&session, language),
         };
         write_output(&args.output, &(out.clone() + "\n"))?;
         print!("{out}");
         return Ok(());
     }
 
-    let sessions = load_sessions(&args)?;
+    let (sessions, load_report) = load_sessions_report(&args)?;
+
+    if args.sessions || args.diagnostics || args.inspect.is_some() {
+        let sessions = prepare_cli_view(sessions, &args)?;
+        if sessions.is_empty() {
+            bail!("No sessions match the requested filters");
+        }
+        if args.sessions {
+            let out = render_session_list(&sessions, &args.format, args.limit);
+            write_output(&args.output, &(out.clone() + "\n"))?;
+            print!("{out}");
+            return Ok(());
+        }
+        let session = if let Some(rank) = args.inspect {
+            if rank == 0 {
+                bail!("--inspect rank starts at 1");
+            }
+            let item = inspect_first(&sessions)
+                .get(rank - 1)
+                .cloned()
+                .context("inspect rank exceeds available priority sessions")?;
+            &sessions[item.index]
+        } else if args.latest {
+            latest_session(&sessions).expect("sessions checked non-empty")
+        } else {
+            sessions.first().expect("sessions checked non-empty")
+        };
+        let out = render_diagnostics(session, &sessions, &args.format, language)?;
+        write_output(&args.output, &(out.clone() + "\n"))?;
+        print!("{out}");
+        return Ok(());
+    }
 
     if let Some(query) = args.search.as_deref() {
         let results = search_sessions(&sessions, query, args.search_limit);
@@ -179,7 +258,17 @@ fn run() -> anyhow::Result<()> {
     if args.overview {
         let overview = compute_overview(&sessions);
         let mut out = match args.format.as_str() {
-            "json" => report_overview_json(&overview, &sessions),
+            "json" => {
+                let health = data_health(
+                    &sessions,
+                    sessions.len() + load_report.as_ref().map(|item| item.skipped).unwrap_or(0),
+                    load_report
+                        .as_ref()
+                        .map(|item| item.cache_hits)
+                        .unwrap_or(0),
+                );
+                report_overview_json_with_health(&overview, &sessions, Some(&health))
+            }
             "markdown" | "md" => report_overview_markdown(&overview, &sessions),
             "html" => report_overview_html(&overview, &sessions),
             _ => report_overview_text(&overview, &sessions),
@@ -211,7 +300,26 @@ fn run() -> anyhow::Result<()> {
             for failure in failures {
                 eprintln!("Gate failed: {failure}");
             }
-            eprintln!("Inspect demo data with: agenttrace --demo --overview -f json");
+            eprintln!("Local evidence:");
+            eprintln!("- avg health: {:.1}", average_health(&sessions));
+            eprintln!("- critical sessions: {}", overview.critical);
+            eprintln!("- tool fail rate: {:.1}%", tool_fail_rate(&sessions));
+            if let Some(session) = sessions.iter().min_by(|left, right| {
+                left.health
+                    .cmp(&right.health)
+                    .then_with(|| left.path.cmp(&right.path))
+                    .then_with(|| left.name.cmp(&right.name))
+            }) {
+                eprintln!("- lowest-health session: {}", session.path);
+            }
+            let inspect = if args.demo {
+                "agenttrace --demo --overview -f json".to_string()
+            } else if let Some(dir) = args.dir.as_deref() {
+                format!("agenttrace -d {:?} --overview -f json", dir)
+            } else {
+                "agenttrace --overview -f json".to_string()
+            };
+            eprintln!("- inspect: `{inspect}`");
             std::process::exit(2);
         }
         return Ok(());
@@ -280,6 +388,18 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--baseline-max-cost-delta-pct"
             | "--baseline-max-token-delta-pct"
             | "--lang"
+            | "--range"
+            | "--project"
+            | "--source"
+            | "--model-filter"
+            | "--query"
+            | "--health"
+            | "--cost"
+            | "--anomaly"
+            | "--sort"
+            | "--order"
+            | "--limit"
+            | "--inspect"
     )
 }
 
@@ -316,17 +436,27 @@ fn report_language(value: &str) -> ReportLanguage {
 }
 
 fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
+    load_sessions_report(args).map(|(sessions, _)| sessions)
+}
+
+fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
     if args.demo {
-        return demo_sessions();
+        return Ok((prepare_explicit_sessions(demo_sessions()?, args)?, None));
     }
     if let Some(path) = args.path.as_deref() {
         let path = PathBuf::from(path);
         if path.is_file() {
-            return Ok(vec![parse_file(&path)?]);
+            return Ok((
+                prepare_explicit_sessions(vec![parse_file(&path)?], args)?,
+                None,
+            ));
         }
         if path.is_dir() {
             if is_cline_task_dir(&path) {
-                return Ok(vec![parse_file(&path)?]);
+                return Ok((
+                    prepare_explicit_sessions(vec![parse_file(&path)?], args)?,
+                    None,
+                ));
             }
             bail!(
                 "Error loading {}: positional path must be a session file",
@@ -336,10 +466,25 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
         bail!("session path does not exist: {}", path.display());
     }
     let dir = args.dir.as_deref().map(PathBuf::from);
-    let sessions = if dir.is_none() {
-        load_sessions_from_dir(None)
+    let (sessions, report) = if dir.is_none() {
+        let range = parse_range(args)?;
+        let report = load_sessions_with_options(
+            None,
+            &LoadOptions {
+                since: range.since(Utc::now()),
+                project: args.project.clone(),
+                source: args.source.clone(),
+                model: args.model_filter.clone(),
+                include_history: args.include_history,
+                preserve_history: args.preserve_history,
+            },
+        );
+        (report.sessions.clone(), Some(report))
     } else {
-        load_parseable_sessions_from_files(dir.as_deref())?
+        (
+            prepare_explicit_sessions(load_parseable_sessions_from_files(dir.as_deref())?, args)?,
+            None,
+        )
     };
     if sessions.is_empty() {
         bail!(
@@ -347,7 +492,35 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
             args.dir.as_deref().unwrap_or("")
         );
     }
-    Ok(sessions)
+    Ok((sessions, report))
+}
+
+fn parse_range(args: &Args) -> anyhow::Result<TimeRange> {
+    TimeRange::parse(&args.range).context("range must be today, 7d, 30d, or all")
+}
+
+fn filter_cli_sessions(sessions: Vec<Session>, args: &Args) -> anyhow::Result<Vec<Session>> {
+    Ok(filter_sessions(
+        &sessions,
+        parse_range(args)?,
+        &args.project,
+        &args.source,
+        &args.model_filter,
+        Utc::now(),
+    ))
+}
+
+fn prepare_explicit_sessions(
+    mut sessions: Vec<Session>,
+    args: &Args,
+) -> anyhow::Result<Vec<Session>> {
+    if args.preserve_history {
+        agenttrace_core::preserve_derived_history(&sessions)?;
+    }
+    if args.include_history {
+        agenttrace_core::merge_preserved_history(&mut sessions);
+    }
+    filter_cli_sessions(sessions, args)
 }
 
 fn load_latest_session(args: &Args) -> anyhow::Result<Session> {
@@ -476,6 +649,211 @@ fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn prepare_cli_view(mut sessions: Vec<Session>, args: &Args) -> anyhow::Result<Vec<Session>> {
+    validate_view_filters(args)?;
+    sessions.retain(|session| {
+        matches_text(session, &args.query)
+            && matches_health(session.health, &args.health)
+            && matches_number(session.metrics.cost_estimated, &args.cost)
+            && (args.anomaly.is_empty()
+                || session.anomalies.iter().any(|item| {
+                    args.anomaly.eq_ignore_ascii_case("any")
+                        || item
+                            .kind
+                            .to_ascii_lowercase()
+                            .contains(&args.anomaly.to_ascii_lowercase())
+                        || item
+                            .detail
+                            .to_ascii_lowercase()
+                            .contains(&args.anomaly.to_ascii_lowercase())
+                }))
+    });
+    let descending = match args.order.as_str() {
+        "asc" => false,
+        "desc" => true,
+        _ => bail!("--order must be asc or desc"),
+    };
+    sessions.sort_by(|left, right| {
+        let ordering = match args.sort.as_str() {
+            "recent" | "time" => left.metrics.session_start.cmp(&right.metrics.session_start),
+            "health" => left.health.cmp(&right.health),
+            "cost" => left
+                .metrics
+                .cost_estimated
+                .total_cmp(&right.metrics.cost_estimated),
+            "turns" => left
+                .metrics
+                .assistant_turns
+                .cmp(&right.metrics.assistant_turns),
+            "failures" => left
+                .metrics
+                .tool_calls_fail
+                .cmp(&right.metrics.tool_calls_fail),
+            "source" => left.metrics.source_tool.cmp(&right.metrics.source_tool),
+            "name" => left.name.cmp(&right.name),
+            "anomalies" => left.anomalies.len().cmp(&right.anomalies.len()),
+            _ => std::cmp::Ordering::Equal,
+        };
+        let ordering = if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        ordering.then_with(|| left.path.cmp(&right.path))
+    });
+    if !matches!(
+        args.sort.as_str(),
+        "recent"
+            | "time"
+            | "health"
+            | "cost"
+            | "turns"
+            | "failures"
+            | "source"
+            | "name"
+            | "anomalies"
+    ) {
+        bail!("unsupported --sort value: {}", args.sort);
+    }
+    Ok(sessions)
+}
+
+fn matches_text(session: &Session, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    query.is_empty()
+        || [
+            session.name.as_str(),
+            session.path.as_str(),
+            session.cwd.as_str(),
+            session.metrics.source_tool.as_str(),
+            session.metrics.model_used.as_str(),
+        ]
+        .iter()
+        .any(|value| value.to_ascii_lowercase().contains(&query))
+        || session
+            .metrics
+            .tool_usage
+            .keys()
+            .chain(session.metrics.file_usage.keys())
+            .any(|value| value.to_ascii_lowercase().contains(&query))
+        || session.anomalies.iter().any(|item| {
+            item.kind.to_ascii_lowercase().contains(&query)
+                || item.detail.to_ascii_lowercase().contains(&query)
+        })
+}
+
+fn matches_health(health: i32, filter: &str) -> bool {
+    match filter.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "good" | "healthy" => health >= 80,
+        "warn" | "warning" => (50..80).contains(&health),
+        "crit" | "critical" => health < 50,
+        filter => matches_number(health as f64, filter),
+    }
+}
+
+fn validate_view_filters(args: &Args) -> anyhow::Result<()> {
+    if !args.health.is_empty()
+        && !matches!(
+            args.health.to_ascii_lowercase().as_str(),
+            "good" | "healthy" | "warn" | "warning" | "crit" | "critical"
+        )
+        && !valid_number_filter(&args.health)
+    {
+        bail!("invalid --health filter: {}", args.health);
+    }
+    if !args.cost.is_empty() && !valid_number_filter(&args.cost) {
+        bail!("invalid --cost filter: {}", args.cost);
+    }
+    Ok(())
+}
+
+fn valid_number_filter(filter: &str) -> bool {
+    [">=", "<=", ">", "<", "="]
+        .iter()
+        .find_map(|prefix| filter.strip_prefix(prefix))
+        .is_some_and(|value| value.parse::<f64>().is_ok())
+}
+
+fn matches_number(value: f64, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    for (prefix, compare) in [
+        (
+            ">=",
+            std::cmp::Ordering::is_ge as fn(std::cmp::Ordering) -> bool,
+        ),
+        ("<=", std::cmp::Ordering::is_le),
+        (">", std::cmp::Ordering::is_gt),
+        ("<", std::cmp::Ordering::is_lt),
+        ("=", std::cmp::Ordering::is_eq),
+    ] {
+        if let Some(raw) = filter.strip_prefix(prefix) {
+            return raw
+                .parse::<f64>()
+                .ok()
+                .is_some_and(|target| compare(value.total_cmp(&target)));
+        }
+    }
+    false
+}
+
+fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
+    let sessions = sessions.iter().take(limit).collect::<Vec<_>>();
+    if format == "json" {
+        return serde_json::to_string_pretty(&sessions).expect("sessions serialize");
+    }
+    let mut lines =
+        vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
+    lines.extend(sessions.into_iter().map(|session| {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
+            session.name,
+            session.health,
+            session_capability(session),
+            session.metrics.source_tool,
+            session.metrics.model_used,
+            session.metrics.cost_estimated,
+            total_tokens(session),
+            session.metrics.tool_calls_fail,
+            session.anomalies.len()
+        )
+    }));
+    lines.join("\n")
+}
+
+fn render_diagnostics(
+    session: &Session,
+    history: &[Session],
+    format: &str,
+    language: ReportLanguage,
+) -> anyhow::Result<String> {
+    let alert = predict_cost_anomaly(history, session);
+    let fixes = fix_suggestions(session);
+    if format == "json" {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "session": session,
+            "cost_alert": alert,
+            "fix_suggestions": fixes,
+        }))?);
+    }
+    let mut out = report_text_with_language(session, language);
+    out.push_str("\nDiagnostics\n-----------\n");
+    out.push_str(&serde_json::to_string_pretty(&session.diagnostics)?);
+    if alert.triggered {
+        out.push_str(&format!(
+            "\nCost alert [{}]: {}",
+            alert.level, alert.message
+        ));
+    }
+    for fix in fixes {
+        out.push_str(&format!("\nFix [{}]: {}", fix.severity, fix.action));
+    }
+    Ok(out)
+}
+
 fn has_post_pricing_action(args: &Args) -> bool {
     args.path.is_some()
         || args.list_models
@@ -484,6 +862,9 @@ fn has_post_pricing_action(args: &Args) -> bool {
         || args.latest
         || args.compare
         || args.overview
+        || args.sessions
+        || args.diagnostics
+        || args.inspect.is_some()
         || args.waste
         || args
             .search
@@ -497,6 +878,9 @@ fn has_session_action(args: &Args) -> bool {
         || args.latest
         || args.compare
         || args.overview
+        || args.sessions
+        || args.diagnostics
+        || args.inspect.is_some()
         || args.waste
         || args.baseline.is_some()
         || args
@@ -555,6 +939,33 @@ mod tests {
             latest_session(&[alpha, omega]).map(|session| session.name.as_str()),
             Some("omega")
         );
+    }
+
+    #[test]
+    fn cli_view_filters_sorts_and_renders_diagnostics_json() {
+        let mut args = compare_args(None);
+        args.sessions = true;
+        args.health = "crit".to_string();
+        args.sort = "cost".to_string();
+        args.order = "desc".to_string();
+        let mut critical = session("critical", "/tmp/critical", "2026-01-01T00:00:00Z");
+        critical.health = 40;
+        critical.metrics.cost_estimated = 2.0;
+        critical.metrics.tool_calls_fail = 2;
+        let mut healthy = session("healthy", "/tmp/healthy", "2026-01-02T00:00:00Z");
+        healthy.metrics.cost_estimated = 3.0;
+
+        let filtered = prepare_cli_view(vec![healthy, critical], &args).expect("filter");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "critical");
+        assert!(render_session_list(&filtered, "json", 20).contains("\"critical\""));
+        let diagnostics = render_diagnostics(&filtered[0], &filtered, "json", ReportLanguage::En)
+            .expect("diagnostics");
+        assert!(diagnostics.contains("\"diagnostics\""));
+        assert!(diagnostics.contains("\"cost_alert\""));
+
+        args.cost = "expensive".to_string();
+        assert!(prepare_cli_view(filtered, &args).is_err());
     }
 
     #[test]
@@ -680,6 +1091,7 @@ mod tests {
             anomalies: Vec::new(),
             health: 100,
             tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
         }
     }
 
@@ -694,6 +1106,9 @@ mod tests {
             dir,
             compare: true,
             overview: false,
+            sessions: false,
+            diagnostics: false,
+            inspect: None,
             model: "default".to_string(),
             output: None,
             latest: false,
@@ -714,6 +1129,20 @@ mod tests {
             baseline_max_cost_delta_pct: 0.0,
             baseline_max_token_delta_pct: 0.0,
             lang: "en".to_string(),
+            range: "all".to_string(),
+            project: String::new(),
+            source: String::new(),
+            model_filter: String::new(),
+            query: String::new(),
+            health: String::new(),
+            cost: String::new(),
+            anomaly: String::new(),
+            sort: "recent".to_string(),
+            order: "desc".to_string(),
+            limit: 20,
+            clear_cache: false,
+            preserve_history: false,
+            include_history: false,
         }
     }
 

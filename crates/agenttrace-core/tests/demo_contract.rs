@@ -37,6 +37,29 @@ fn demo_overview_exposes_ci_contract_fields() {
         .unwrap()
         .iter()
         .any(|item| item == "test_or_build"));
+    assert!(report["by_project"].is_array());
+}
+
+#[test]
+fn range_and_project_filters_share_one_session_scope() {
+    let mut sessions = demo_sessions().expect("demo sessions parse");
+    sessions[0].cwd = "/work/alpha".to_string();
+    sessions[1].cwd = "/work/beta".to_string();
+    sessions[2].cwd = "/work/alpha".to_string();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-05-03T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let filtered = agenttrace_core::filter_sessions(
+        &sessions,
+        agenttrace_core::TimeRange::Days7,
+        "alpha",
+        "",
+        "",
+        now,
+    );
+    assert!(filtered
+        .iter()
+        .all(|session| session.cwd.ends_with("alpha")));
 }
 
 #[test]
@@ -52,19 +75,21 @@ fn demo_search_returns_metadata_evidence() {
 
 #[test]
 fn overview_high_authority_tools_follow_go_classifier() {
-    let mut metrics = Metrics::default();
-    metrics.tool_usage = BTreeMap::from([
-        ("bash".to_string(), 1),
-        ("read_file".to_string(), 1),
-        ("terminal".to_string(), 1),
-        ("write_file".to_string(), 1),
-    ]);
-    metrics.tool_authority = BTreeMap::from([
-        ("read_only_files".to_string(), 1),
-        ("shell_exec".to_string(), 1),
-        ("write_files".to_string(), 1),
-    ]);
-    metrics.highest_authority = "shell_exec".to_string();
+    let metrics = Metrics {
+        tool_usage: BTreeMap::from([
+            ("bash".to_string(), 1),
+            ("read_file".to_string(), 1),
+            ("terminal".to_string(), 1),
+            ("write_file".to_string(), 1),
+        ]),
+        tool_authority: BTreeMap::from([
+            ("read_only_files".to_string(), 1),
+            ("shell_exec".to_string(), 1),
+            ("write_files".to_string(), 1),
+        ]),
+        highest_authority: "shell_exec".to_string(),
+        ..Metrics::default()
+    };
 
     let sessions = vec![Session {
         name: "authority".to_string(),
@@ -74,6 +99,7 @@ fn overview_high_authority_tools_follow_go_classifier() {
         anomalies: Vec::new(),
         health: 100,
         tool_warnings: Vec::new(),
+        diagnostics: agenttrace_core::Diagnostics::default(),
     }];
     let overview = compute_overview(&sessions);
     let report: Value =

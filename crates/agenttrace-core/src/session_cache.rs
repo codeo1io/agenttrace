@@ -1,11 +1,12 @@
-use crate::{Anomaly, Metrics, Session, ToolWarning};
+use crate::{Anomaly, Diagnostics, Metrics, Session, ToolWarning};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 11;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 16;
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionCache {
@@ -27,6 +28,20 @@ struct CacheEntry {
 struct CacheEntryHeader {
     mod_time: i64,
     size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileFingerprint {
+    mod_time: i64,
+    size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SqliteSnapshot {
+    schema_version: i64,
+    database: FileFingerprint,
+    wal: Option<FileFingerprint>,
+    sessions: Vec<GoSession>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +73,8 @@ struct GoSession {
     health: i32,
     #[serde(default, rename = "ToolWarnings")]
     tool_warnings: Vec<GoToolWarning>,
+    #[serde(default, rename = "Diagnostics")]
+    diagnostics: Diagnostics,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -140,11 +157,85 @@ pub fn session_cache_path() -> PathBuf {
 }
 
 pub fn clear_session_cache() -> anyhow::Result<()> {
-    match fs::remove_file(session_cache_path()) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
+    let cache = session_cache_path();
+    for path in [
+        cache.clone(),
+        cache.with_file_name("hermes-sqlite.json"),
+        cache.with_file_name("opencode-sqlite.json"),
+    ] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
+    Ok(())
+}
+
+pub(crate) fn load_sqlite_snapshot(database: &Path, name: &str) -> Option<Vec<Session>> {
+    load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name))
+}
+
+fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Vec<Session>> {
+    let raw = fs::read(snapshot_path).ok()?;
+    let snapshot = serde_json::from_slice::<SqliteSnapshot>(&raw).ok()?;
+    if snapshot.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION
+        || snapshot.database != file_fingerprint(database)?
+        || snapshot.wal != file_fingerprint(&sqlite_wal_path(database))
+    {
+        return None;
+    }
+    Some(
+        snapshot
+            .sessions
+            .into_iter()
+            .map(|session| session.into_session(&database.to_string_lossy()))
+            .collect(),
+    )
+}
+
+pub(crate) fn store_sqlite_snapshot(
+    database: &Path,
+    name: &str,
+    sessions: &[Session],
+) -> anyhow::Result<()> {
+    store_sqlite_snapshot_at(database, &sqlite_snapshot_path(name), sessions)
+}
+
+fn store_sqlite_snapshot_at(
+    database: &Path,
+    path: &Path,
+    sessions: &[Session],
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let snapshot = SqliteSnapshot {
+        schema_version: SQLITE_SNAPSHOT_SCHEMA_VERSION,
+        database: file_fingerprint(database).ok_or_else(|| anyhow::anyhow!("database missing"))?,
+        wal: file_fingerprint(&sqlite_wal_path(database)),
+        sessions: sessions.iter().map(GoSession::from_session).collect(),
+    };
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec(&snapshot)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn sqlite_snapshot_path(name: &str) -> PathBuf {
+    session_cache_path().with_file_name(format!("{name}-sqlite.json"))
+}
+
+fn sqlite_wal_path(database: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", database.to_string_lossy()))
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileFingerprint {
+        mod_time: file_mod_time_nanos(&metadata),
+        size: metadata.len() as i64,
+    })
 }
 
 pub fn load_session_cache() -> SessionCache {
@@ -198,6 +289,32 @@ pub fn load_session_cache() -> SessionCache {
         dirs,
         ..SessionCache::default()
     }
+}
+
+pub fn load_cached_sessions(dir: Option<&Path>) -> Vec<Session> {
+    let mut cache = load_session_cache();
+    load_cached_sessions_from_cache(dir, &mut cache)
+}
+
+pub fn load_cached_sessions_from_cache(
+    dir: Option<&Path>,
+    cache: &mut SessionCache,
+) -> Vec<Session> {
+    let paths = cache
+        .raw_entries
+        .keys()
+        .chain(cache.entries.keys())
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+    let sessions = paths
+        .into_iter()
+        .filter(|path| dir.map_or(true, |dir| path.starts_with(dir)))
+        .filter_map(|path| cached_session(&path, cache))
+        .collect();
+    if cache.is_dirty() {
+        let _ = save_session_cache(cache);
+    }
+    sessions
 }
 
 impl SessionCache {
@@ -460,6 +577,7 @@ impl GoSession {
                 .iter()
                 .map(GoToolWarning::from_tool_warning)
                 .collect(),
+            diagnostics: session.diagnostics.clone(),
         }
     }
 
@@ -484,6 +602,7 @@ impl GoSession {
                 .into_iter()
                 .map(GoToolWarning::into_tool_warning)
                 .collect(),
+            diagnostics: self.diagnostics,
         }
     }
 }
@@ -660,5 +779,45 @@ fn anomaly_emoji(severity: &str) -> &'static str {
         "medium" => "🟡",
         "low" => "🟢",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_snapshot_is_invalidated_by_database_or_wal_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-sqlite-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let database = root.join("state.db");
+        let snapshot = root.join("snapshot.json");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&database, b"db").expect("write database");
+        let session = Session {
+            name: "cached".to_string(),
+            path: database.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+
+        store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
+        assert_eq!(
+            load_sqlite_snapshot_from(&database, &snapshot)
+                .expect("cache hit")
+                .len(),
+            1
+        );
+
+        fs::write(sqlite_wal_path(&database), b"wal").expect("write wal");
+        assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
+        let _ = fs::remove_dir_all(root);
     }
 }

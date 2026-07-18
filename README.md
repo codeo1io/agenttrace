@@ -105,6 +105,14 @@ agenttrace --doctor
 # Generate machine-readable evidence
 agenttrace --overview -f json
 
+# Focus the same TUI/report scope by time, project, agent, or model
+agenttrace --overview -f json --range 7d --project agenttrace
+agenttrace --overview -f json --source codex --model-filter gpt-5
+
+# Opt in to long-term derived history; prompts, replies, paths, and tool arguments are not stored
+agenttrace --overview -f json --preserve-history
+agenttrace --overview -f json --include-history --range 30d
+
 # Search local session metadata without indexing prompt text
 agenttrace --search billing
 agenttrace --search internal/ws -f json
@@ -135,7 +143,8 @@ Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Her
 
 | Need | agenttrace gives you |
 |---|---|
-| Historical spend review | Sessions grouped across agents with token totals, model pricing, estimated cost, and elapsed time |
+| Historical spend review | Sessions grouped across projects, agents, and models with Today/7d/30d/All ranges |
+| Data confidence | Parse skips, cache hits, unknown sources/models, pricing fallbacks, and latest observed session |
 | Slow-task diagnosis | Latency stats, long gaps, hanging sessions, retry loops, slow tools, large params, and context pressure |
 | Regression evidence | Local baseline comparison when supplied, incident timelines, and conservative tool authority categories in reports |
 | First-session triage | Sort and filter by cost, duration, health, failures, anomalies, model, source, or text search |
@@ -150,6 +159,19 @@ Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Her
 - Cursor import: [docs/cursor-import.md](docs/cursor-import.md)
 - Parser guide: [docs/parser-guide.md](docs/parser-guide.md)
 - Launch notes: [docs/launch-kit.md](docs/launch-kit.md)
+- Desktop implementation plan: [docs/desktop-plan.md](docs/desktop-plan.md)
+- Desktop design reference: [docs/desktop-design-reference.md](docs/desktop-design-reference.md)
+
+Desktop development:
+
+```bash
+cd apps/desktop
+pnpm install
+pnpm tauri dev
+pnpm tauri build
+```
+
+Unsigned macOS and Windows desktop bundles are built by [the Desktop workflow](.github/workflows/desktop.yml). Platform signing can be added without changing the local-only analysis architecture.
 
 Listed in:
 

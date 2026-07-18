@@ -1,0 +1,11 @@
+{
+  "name": "agenttrace-monorepo",
+  "private": true,
+  "packageManager": "pnpm@10.12.4",
+  "scripts": {
+    "check": "cargo check --workspace && pnpm --dir apps/desktop build",
+    "test": "cargo test --workspace && pnpm --dir apps/desktop test",
+    "desktop:dev": "pnpm --dir apps/desktop tauri dev",
+    "desktop:build": "pnpm --dir apps/desktop tauri build"
+  }
+}

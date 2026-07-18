@@ -15,5 +15,6 @@ publish = false
 [dependencies]
 agenttrace-core = { version = "0.6.0", path = "../agenttrace-core" }
 anyhow.workspace = true
+chrono.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true

@@ -1,4 +1,5 @@
 use crate::{detect_anomalies, health_score, token_cost, Metrics, Session};
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -34,15 +35,24 @@ struct SqliteSessionAgg {
     usage_cost_set: bool,
     source_tool: String,
     path: String,
+    cwd: String,
 }
 
 pub fn load_sqlite_backed_sessions() -> Vec<Session> {
+    load_sqlite_backed_sessions_since(None)
+}
+
+pub(crate) fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) -> Vec<Session> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
     let mut sessions = Vec::new();
-    sessions.extend(load_hermes_sqlite_sessions(&hermes_state_db_path(&home)));
-    sessions.extend(load_opencode_sqlite_sessions(&opencode_db_path(&home)));
+    for path in hermes_state_db_paths(&home) {
+        sessions.extend(load_hermes_sqlite_sessions(&path, since));
+    }
+    for path in opencode_db_paths(&home) {
+        sessions.extend(load_opencode_sqlite_sessions(&path, since));
+    }
     sessions
 }
 
@@ -50,12 +60,18 @@ pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return false;
     };
-    if sqlite_file_exists(&hermes_state_db_path(&home))
+    if hermes_state_db_paths(&home)
+        .iter()
+        .any(|path| sqlite_file_exists(path))
         && clean_path(dir) == clean_path(&home.join(".hermes").join("sessions"))
     {
         return true;
     }
-    if sqlite_file_exists(&opencode_db_path(&home)) && is_opencode_storage_root(dir) {
+    if opencode_db_paths(&home)
+        .iter()
+        .any(|path| sqlite_file_exists(path))
+        && is_opencode_storage_root(dir)
+    {
         return true;
     }
     false
@@ -65,11 +81,47 @@ fn hermes_state_db_path(home: &Path) -> PathBuf {
     home.join(".hermes").join("state.db")
 }
 
+fn hermes_state_db_paths(home: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![hermes_state_db_path(home)];
+    if let Ok(entries) = std::fs::read_dir(home.join(".hermes").join("profiles")) {
+        paths.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path().join("state.db"))
+                .filter(|path| path.is_file()),
+        );
+    }
+    paths
+}
+
 fn opencode_db_path(home: &Path) -> PathBuf {
     home.join(".local")
         .join("share")
         .join("opencode")
         .join("opencode.db")
+}
+
+fn opencode_db_paths(home: &Path) -> Vec<PathBuf> {
+    let primary = opencode_db_path(home);
+    let Some(dir) = primary.parent() else {
+        return vec![primary];
+    };
+    let mut paths = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("opencode") && name.ends_with(".db"))
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        paths.push(primary);
+    }
+    paths.sort();
+    paths
 }
 
 fn sqlite_file_exists(path: &Path) -> bool {
@@ -83,21 +135,38 @@ fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
     )
 }
 
-fn load_hermes_sqlite_sessions(path: &Path) -> Vec<Session> {
+fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
     if !sqlite_file_exists(path) {
         return Vec::new();
     }
+    if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "hermes") {
+        return filter_since(sessions, since);
+    }
+    let sessions = query_hermes_sqlite_sessions(path, None);
+    let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
+    filter_since(sessions, since)
+}
+
+fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
     let Ok(db) = open_sqlite_read_only(path) else {
         return Vec::new();
     };
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
-    let Ok(mut stmt) = db.prepare(
+    let cwd = if sqlite_has_column(&db, "sessions", "cwd") {
+        "cwd"
+    } else {
+        "''"
+    };
+    let sql = format!(
         "select id, model, started_at, ended_at, message_count, tool_call_count, \
-         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens from sessions",
-    ) else {
+         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, {cwd} from sessions \
+         where (?1 is null or started_at >= ?1)"
+    );
+    let Ok(mut stmt) = db.prepare(&sql) else {
         return Vec::new();
     };
-    let Ok(rows) = stmt.query_map([], |row| {
+    let since_unix = since.map(|value| value.timestamp() as f64);
+    let Ok(rows) = stmt.query_map([since_unix], |row| {
         Ok(SqliteSessionAgg {
             id: row.get::<_, String>(0)?,
             model: string_or(row.get::<_, Option<String>>(1)?, "default"),
@@ -110,6 +179,7 @@ fn load_hermes_sqlite_sessions(path: &Path) -> Vec<Session> {
             output_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
             cache_read_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
             cache_write_tokens: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+            cwd: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
             source_tool: "hermes_db".to_string(),
             path: path.to_string_lossy().to_string(),
             ..SqliteSessionAgg::default()
@@ -130,14 +200,23 @@ fn load_hermes_sqlite_sessions(path: &Path) -> Vec<Session> {
         .collect()
 }
 
-fn load_opencode_sqlite_sessions(path: &Path) -> Vec<Session> {
+fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
     if !sqlite_file_exists(path) {
         return Vec::new();
     }
+    if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
+        return filter_since(sessions, since);
+    }
+    let sessions = query_opencode_sqlite_sessions(path, None);
+    let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
+    filter_since(sessions, since)
+}
+
+fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
     let Ok(db) = open_sqlite_read_only(path) else {
         return Vec::new();
     };
-    let mut aggs = opencode_sqlite_session_rows(&db, path);
+    let mut aggs = opencode_sqlite_session_rows(&db, path, since);
     if aggs.is_empty() {
         return Vec::new();
     }
@@ -157,12 +236,38 @@ fn load_opencode_sqlite_sessions(path: &Path) -> Vec<Session> {
         .collect()
 }
 
-fn opencode_sqlite_session_rows(db: &Connection, path: &Path) -> HashMap<String, SqliteSessionAgg> {
-    let Ok(mut stmt) = db.prepare("select id, title, time_created, time_updated from session")
-    else {
+fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Session> {
+    sessions
+        .into_iter()
+        .filter(|session| {
+            since.map_or(true, |since| {
+                DateTime::parse_from_rfc3339(&session.metrics.session_start)
+                    .ok()
+                    .is_some_and(|time| time.with_timezone(&Utc) >= since)
+            })
+        })
+        .collect()
+}
+
+fn opencode_sqlite_session_rows(
+    db: &Connection,
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> HashMap<String, SqliteSessionAgg> {
+    let directory = if sqlite_has_column(db, "session", "directory") {
+        "directory"
+    } else {
+        "''"
+    };
+    let sql = format!(
+        "select id, title, time_created, time_updated, {directory} from session \
+         where (?1 is null or time_created >= ?1)"
+    );
+    let Ok(mut stmt) = db.prepare(&sql) else {
         return HashMap::new();
     };
-    let Ok(rows) = stmt.query_map([], |row| {
+    let since_millis = since.map(|value| value.timestamp_millis());
+    let Ok(rows) = stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
         Ok((
             id.clone(),
@@ -171,6 +276,7 @@ fn opencode_sqlite_session_rows(db: &Connection, path: &Path) -> HashMap<String,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 start_unix: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as f64 / 1000.0,
                 end_unix: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as f64 / 1000.0,
+                cwd: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 source_tool: "opencode_db".to_string(),
                 path: path.to_string_lossy().to_string(),
                 ..SqliteSessionAgg::default()
@@ -404,11 +510,12 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     Session {
         name,
         path: agg.path,
-        cwd: String::new(),
+        cwd: agg.cwd,
         metrics,
         anomalies,
         health,
         tool_warnings: Vec::new(),
+        diagnostics: crate::Diagnostics::default(),
     }
 }
 
@@ -437,6 +544,15 @@ fn string(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("")
 }
 
+fn sqlite_has_column(db: &Connection, table: &str, column: &str) -> bool {
+    db.prepare(&format!("pragma table_info({table})"))
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .map(|rows| rows.filter_map(Result::ok).any(|name| name == column))
+        })
+        .unwrap_or(false)
+}
+
 fn number_as_i64(value: Option<&Value>) -> i64 {
     match value {
         Some(Value::Number(number)) => number
@@ -456,4 +572,19 @@ fn is_opencode_storage_root(path: &Path) -> bool {
 
 fn clean_path(path: &Path) -> PathBuf {
     path.components().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_session_preserves_workspace() {
+        let session = session_from_sqlite_agg(SqliteSessionAgg {
+            id: "session".to_string(),
+            cwd: "/work/sqlite".to_string(),
+            ..SqliteSessionAgg::default()
+        });
+        assert_eq!(session.cwd, "/work/sqlite");
+    }
 }

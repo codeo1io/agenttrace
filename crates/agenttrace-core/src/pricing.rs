@@ -48,12 +48,21 @@ pub(crate) fn lookup_price(model: &str) -> Price {
     lookup_price_in(model, &catalog.entries)
 }
 
+pub(crate) fn has_specific_price(model: &str) -> bool {
+    if matches!(model.trim(), "" | "default" | "unknown") {
+        return false;
+    }
+    match_variants(model)
+        .into_iter()
+        .any(|variant| pricing_catalog().entries.contains_key(&variant))
+}
+
 pub fn list_pricing() -> BTreeMap<String, Price> {
     let mut entries = builtin_pricing();
     entries.remove("default");
     let catalog = pricing_catalog();
-    for (name, price) in catalog.entries {
-        entries.insert(name, price);
+    for (name, price) in &catalog.entries {
+        entries.insert(name.clone(), *price);
     }
     entries
 }
@@ -193,16 +202,14 @@ pub(crate) fn token_cost(
     )
 }
 
-fn pricing_catalog() -> PricingCatalog {
-    PRICING_CATALOG
-        .get_or_init(|| {
-            load_pricing_cache().unwrap_or_else(|| PricingCatalog {
-                entries: builtin_pricing(),
-                source: "builtin".to_string(),
-                loaded_at: None,
-            })
+fn pricing_catalog() -> &'static PricingCatalog {
+    PRICING_CATALOG.get_or_init(|| {
+        load_pricing_cache().unwrap_or_else(|| PricingCatalog {
+            entries: builtin_pricing(),
+            source: "builtin".to_string(),
+            loaded_at: None,
         })
-        .clone()
+    })
 }
 
 fn load_pricing_cache() -> Option<PricingCatalog> {
@@ -914,34 +921,6 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
     .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builtin_fallback_includes_go_alias_slice() {
-        let prices = builtin_pricing();
-        for name in [
-            "claude-haiku-3.5",
-            "pa/gpt-5.4",
-            "gpt-5.1-codex-mini",
-            "deepseek-v4-pro",
-            "glm-5.1",
-            "mimo-v2.5-pro",
-            "minimax-2.7-highspeed",
-            "qwen/qwen3.6-plus-04-02:free",
-            "qwen3.6:35b-a3b-coding-nvfp4",
-            "stepfun/step-3.5-flash:free",
-            "grok-3",
-        ] {
-            assert!(
-                prices.contains_key(name),
-                "missing builtin pricing for {name}"
-            );
-        }
-    }
-}
-
 fn common_pricing_models() -> &'static [&'static str] {
     &[
         "claude-sonnet-4",
@@ -999,4 +978,32 @@ fn user_cache_dir() -> PathBuf {
         return home.join(".cache");
     }
     std::env::temp_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_fallback_includes_go_alias_slice() {
+        let prices = builtin_pricing();
+        for name in [
+            "claude-haiku-3.5",
+            "pa/gpt-5.4",
+            "gpt-5.1-codex-mini",
+            "deepseek-v4-pro",
+            "glm-5.1",
+            "mimo-v2.5-pro",
+            "minimax-2.7-highspeed",
+            "qwen/qwen3.6-plus-04-02:free",
+            "qwen3.6:35b-a3b-coding-nvfp4",
+            "stepfun/step-3.5-flash:free",
+            "grok-3",
+        ] {
+            assert!(
+                prices.contains_key(name),
+                "missing builtin pricing for {name}"
+            );
+        }
+    }
 }

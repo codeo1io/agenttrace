@@ -35,7 +35,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-for (const name of ["agenttrace-core", "agenttrace-tui", "agenttrace"]) {
+for (const name of ["agenttrace-core", "agenttrace-tui", "agenttrace", "agenttrace-desktop"]) {
   const pkg = packages.get(name);
   assert(pkg, `missing workspace package ${name}`);
   for (const [field, expected] of Object.entries(required)) {

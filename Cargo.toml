@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "apps/desktop/src-tauri",
   "crates/agenttrace-core",
   "crates/agenttrace-cli",
   "crates/agenttrace-tui",

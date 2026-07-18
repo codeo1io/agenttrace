@@ -1,6 +1,7 @@
 use agenttrace_core::{
-    build_doctor_report, find_session_files, load_sessions_from_dir, parse_file,
-    render_waste_report, search_sessions, session_cache_path,
+    build_doctor_report, find_session_files, load_sessions_from_dir, load_sessions_with_progress,
+    parse_file, render_waste_report, search_sessions, session_cache_path, session_capability,
+    LoadOptions,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -13,6 +14,81 @@ const SAMPLE_JSONL: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:
 {"role":"assistant","content":"I will inspect the route.","timestamp":"2026-05-02T10:00:01Z","reasoning":"Find the route and keep the change small.","tool_calls":[{"id":"t1","name":"rg","args":"billing export"}],"ModelUsed":"claude-sonnet-4"}
 {"role":"tool","content":"{\"success\":true}","tool_call_id":"t1","timestamp":"2026-05-02T10:00:02Z"}
 "#;
+
+fn generated_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata/generated")
+        .join(name)
+}
+
+#[test]
+fn generated_capability_and_step_fixtures_cover_degradation() {
+    let detailed = parse_file(&generated_fixture("detailed-tool-steps.jsonl")).unwrap();
+    assert_eq!(session_capability(&detailed), "detailed");
+    assert_eq!(detailed.diagnostics.steps.len(), 3);
+    assert_eq!(detailed.diagnostics.steps[0].status, "ok");
+    assert_eq!(detailed.diagnostics.steps[1].status, "error");
+    assert_eq!(detailed.diagnostics.steps[2].status, "missing");
+}
+
+#[test]
+fn generated_sql_builds_an_aggregate_only_session() {
+    let root = temp_root("agenttrace-generated-aggregate");
+    let home = root.join("home");
+    let db_path = home.join(".hermes/state.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Connection::open(&db_path).unwrap();
+    db.execute_batch(&fs::read_to_string(generated_fixture("aggregate-session.sql")).unwrap())
+        .unwrap();
+    drop(db);
+    with_home(&home, || {
+        let sessions = agenttrace_core::load_sqlite_backed_sessions();
+        let aggregate = sessions
+            .iter()
+            .find(|session| session.name == "aggregate")
+            .unwrap();
+        assert_eq!(session_capability(aggregate), "aggregate");
+        assert!(aggregate.diagnostics.steps.is_empty());
+        let limited = sessions
+            .iter()
+            .find(|session| session.name == "limited")
+            .unwrap();
+        assert_eq!(session_capability(limited), "limited");
+        assert!(limited.diagnostics.steps.is_empty());
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generated_steps_never_serialize_content_or_arguments() {
+    let session = parse_file(&generated_fixture("tool-step-redaction.jsonl")).unwrap();
+    let json = serde_json::to_string(&session.diagnostics.steps).unwrap();
+    assert!(!json.contains("SHOULD_NOT_LEAK"));
+}
+
+#[test]
+fn generated_provider_fixtures_stay_parseable() {
+    for (name, source) in [
+        ("workbuddy.jsonl", "workbuddy"),
+        ("antigravity.jsonl", "antigravity_cli"),
+        ("copilot-session.jsonl", "copilot_cli"),
+        ("kimi-wire.jsonl", "kimi_cli"),
+        ("openclaw-wrapper.json", "openclaw"),
+        ("qwen-stream.jsonl", "qwen_code"),
+    ] {
+        let parsed =
+            parse_file(&generated_fixture(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(parsed.metrics.source_tool, source, "{name}");
+    }
+
+    let root = temp_root("agenttrace-generated-pi");
+    let path = root.join(".pi/agent/sessions/pi-session.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::copy(generated_fixture("pi-session.jsonl"), &path).unwrap();
+    assert_eq!(parse_file(&path).unwrap().metrics.source_tool, "pi");
+    let _ = fs::remove_dir_all(root);
+}
 
 #[test]
 fn rust_discovers_and_loads_real_jsonl_files() {
@@ -32,7 +108,7 @@ fn rust_discovers_and_loads_real_jsonl_files() {
 
         let sessions = load_sessions_from_dir(Some(&root));
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].name, "session");
+        assert_eq!(sessions[0].name, "Inspect billing export.");
         assert_eq!(sessions[0].metrics.model_used, "claude-sonnet-4");
         assert_eq!(sessions[0].metrics.source_tool, "hermes_jsonl");
         assert_eq!(sessions[0].metrics.tool_calls_total, 1);
@@ -41,6 +117,162 @@ fn rust_discovers_and_loads_real_jsonl_files() {
 
     let parsed = parse_file(&session_path).expect("parse single file");
     assert_eq!(parsed.health, loaded_health.expect("loaded session health"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_parses_workbuddy_messages_tools_usage_and_millis() {
+    let root = temp_root("agenttrace-rust-workbuddy");
+    fs::create_dir_all(&root).expect("create workbuddy temp dir");
+    let session_path = root.join("session.jsonl");
+    fs::write(
+        &session_path,
+        r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}],"timestamp":1783777800000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"agent":"cli"}}
+{"type":"reasoning","content":[],"rawContent":[{"type":"reasoning_text","text":"check first"}],"timestamp":1783777801000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"model":"glm-5.2","agent":"cli"}}
+{"type":"function_call","name":"Read","callId":"c1","arguments":"{\"path\":\"a.rs\"}","timestamp":1783777802000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":60}},"providerData":{"model":"glm-5.2","agent":"cli"}}
+{"type":"function_call_result","name":"Read","callId":"c1","status":"completed","output":{"type":"text","text":"ok"},"timestamp":1783777803000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"model":"glm-5.2","agent":"cli"}}
+{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}],"timestamp":1783777804000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80}},"providerData":{"model":"glm-5.2","agent":"cli"}}
+"#,
+    )
+    .expect("write workbuddy session");
+
+    let parsed = parse_file(&session_path).expect("parse workbuddy session");
+    assert_eq!(parsed.cwd, "/tmp/project");
+    assert_eq!(parsed.metrics.source_tool, "workbuddy");
+    assert_eq!(parsed.metrics.model_used, "glm-5.2");
+    assert_eq!(parsed.metrics.tool_calls_total, 1);
+    assert_eq!(parsed.metrics.tool_calls_ok, 1);
+    assert_eq!(parsed.metrics.reasoning_blocks, 1);
+    assert_eq!(parsed.metrics.tokens_input, 40);
+    assert_eq!(parsed.metrics.tokens_output, 30);
+    assert_eq!(parsed.metrics.tokens_cache_r, 80);
+    assert_eq!(parsed.metrics.session_start, "2026-07-11T13:50:00Z");
+    assert_eq!(parsed.metrics.session_end, "2026-07-11T13:50:04Z");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_parses_antigravity_cli_transcript() {
+    let root = temp_root("agenttrace-rust-antigravity");
+    fs::create_dir_all(&root).expect("create antigravity temp dir");
+    let path = root.join("transcript.jsonl");
+    fs::write(
+        &path,
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:33:40Z","content":"inspect"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:33:41Z","thinking":"check","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"a.rs"}}]}
+{"step_index":2,"source":"MODEL","type":"VIEW_FILE","status":"DONE","created_at":"2026-05-19T19:33:42Z","content":"ok"}
+"#,
+    )
+    .expect("write antigravity transcript");
+
+    let parsed = parse_file(&path).expect("parse antigravity transcript");
+    assert_eq!(parsed.metrics.source_tool, "antigravity_cli");
+    assert_eq!(parsed.metrics.tool_calls_total, 1);
+    assert_eq!(parsed.metrics.tool_calls_ok, 1);
+    assert_eq!(parsed.metrics.reasoning_blocks, 1);
+    assert_eq!(parsed.metrics.session_start, "2026-05-19T19:33:40Z");
+    assert_eq!(parsed.metrics.session_end, "2026-05-19T19:33:42Z");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_parses_cursor_agent_transcript() {
+    let root = temp_root("agenttrace-rust-cursor-transcript");
+    fs::create_dir_all(&root).expect("create cursor temp dir");
+    let path = root.join("session.jsonl");
+    fs::write(
+        &path,
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"inspect"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"checking"},{"type":"tool_use","name":"Read","input":{"path":"a.rs"}}]}}
+"#,
+    )
+    .expect("write cursor transcript");
+
+    let parsed = parse_file(&path).expect("parse cursor transcript");
+    assert_eq!(parsed.metrics.source_tool, "cursor");
+    assert_eq!(parsed.metrics.tool_calls_total, 1);
+    assert_eq!(parsed.metrics.user_messages, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_parses_claude_flat_transcript() {
+    let root = temp_root("agenttrace-rust-claude-transcript");
+    fs::create_dir_all(&root).expect("create claude temp dir");
+    let path = root.join("session.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"user","timestamp":"2026-03-19T11:21:41Z","content":"inspect"}
+{"type":"tool_use","timestamp":"2026-03-19T11:21:42Z","tool_name":"read","tool_input":{"path":"a.rs"}}
+{"type":"tool_result","timestamp":"2026-03-19T11:21:43Z","tool_name":"read","tool_output":"ok"}
+"#,
+    )
+    .expect("write claude transcript");
+
+    let parsed = parse_file(&path).expect("parse claude transcript");
+    assert_eq!(parsed.metrics.source_tool, "claude_code");
+    assert_eq!(parsed.metrics.tool_calls_total, 1);
+    assert_eq!(parsed.metrics.tool_calls_ok, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_parses_copilot_session_state() {
+    let root = temp_root("agenttrace-rust-copilot-session");
+    fs::create_dir_all(&root).expect("create copilot temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"user.message","timestamp":"2026-05-07T10:00:01Z","data":{"content":"inspect"}}
+{"type":"tool.execution_start","timestamp":"2026-05-07T10:00:02Z","data":{"toolName":"Read","toolCallId":"c1","arguments":{"path":"a.rs"}}}
+{"type":"tool.execution_complete","timestamp":"2026-05-07T10:00:03Z","data":{"toolCallId":"c1","success":true}}
+{"type":"session.shutdown","timestamp":"2026-05-07T10:00:04Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":40}}}}}
+"#,
+    )
+    .expect("write copilot session");
+
+    let parsed = parse_file(&path).expect("parse copilot session");
+    assert_eq!(parsed.cwd, "/tmp/copilot");
+    assert_eq!(parsed.metrics.source_tool, "copilot_cli");
+    assert_eq!(parsed.metrics.model_used, "gpt-5.4");
+    assert_eq!(parsed.metrics.tool_calls_total, 1);
+    assert_eq!(parsed.metrics.tool_calls_ok, 1);
+    assert_eq!(parsed.metrics.tokens_input, 100);
+    assert_eq!(parsed.metrics.tokens_cache_r, 40);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_parses_kimi_wire_session() {
+    let root = temp_root("agenttrace-rust-kimi-wire");
+    fs::create_dir_all(&root).expect("create kimi temp dir");
+    let path = root.join("wire.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"metadata","protocol_version":"2"}
+{"timestamp":1770000000.0,"message":{"type":"TurnBegin","payload":{"user_input":"inspect"}}}
+{"timestamp":1770000001.0,"message":{"type":"ThinkPart","payload":{"text":"check"}}}
+{"timestamp":1770000002.0,"message":{"type":"ToolCall","payload":{"id":"c1","name":"Read","arguments":{"path":"a.rs"}}}}
+{"timestamp":1770000003.0,"message":{"type":"ToolResult","payload":{"id":"c1","result":"ok"}}}
+{"timestamp":1770000004.0,"message":{"type":"StatusUpdate","payload":{"token_usage":{"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":40}}}}
+"#,
+    )
+    .expect("write kimi wire session");
+
+    let parsed = parse_file(&path).expect("parse kimi wire session");
+    assert_eq!(parsed.metrics.source_tool, "kimi_cli");
+    assert_eq!(parsed.metrics.tool_calls_total, 1);
+    assert_eq!(parsed.metrics.tool_calls_ok, 1);
+    assert_eq!(parsed.metrics.reasoning_blocks, 1);
+    assert_eq!(parsed.metrics.tokens_input, 100);
+    assert_eq!(parsed.metrics.tokens_cache_r, 40);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -182,7 +414,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(11)
+            Some(16)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -190,7 +422,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert!(entry.get("mod_time").and_then(Value::as_i64).is_some());
         assert_eq!(
             entry.pointer("/session/Name").and_then(Value::as_str),
-            Some("session")
+            Some("Inspect billing export.")
         );
         assert_eq!(
             entry
@@ -226,6 +458,48 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
 }
 
 #[test]
+fn rust_reports_monotonic_load_progress_and_real_cache_hits() {
+    let root = temp_root("agenttrace-rust-load-progress");
+    let sessions_dir = root.join("sessions");
+    let cache_dir = root.join("cache");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    fs::write(sessions_dir.join("a.jsonl"), SAMPLE_JSONL).expect("write session a");
+    fs::write(sessions_dir.join("b.jsonl"), SAMPLE_JSONL).expect("write session b");
+    fs::write(sessions_dir.join("bad.jsonl"), "not a session\n").expect("write bad session");
+
+    with_session_cache(&cache_dir, || {
+        let mut first = Vec::new();
+        let report =
+            load_sessions_with_progress(Some(&sessions_dir), &LoadOptions::default(), |progress| {
+                first.push(progress)
+            });
+        assert_eq!(report.discovered, 3);
+        assert_eq!(report.parsed, 2);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.cache_hits, 0);
+        assert_eq!(
+            first.iter().map(|item| item.processed).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(first.last().map(|item| item.skipped), Some(1));
+
+        let mut second = Vec::new();
+        let report =
+            load_sessions_with_progress(Some(&sessions_dir), &LoadOptions::default(), |progress| {
+                second.push(progress)
+            });
+        assert_eq!(report.cache_hits, 2);
+        assert_eq!(second.last().map(|item| item.cache_hits), Some(2));
+        assert_eq!(
+            second.iter().filter(|item| item.session.is_some()).count(),
+            2
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_refreshes_cache_entries_from_old_schema_version() {
     let root = temp_root("agenttrace-rust-session-cache-old-schema");
     let home = root.join("home");
@@ -252,14 +526,14 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
     with_home_and_cache(&home, &cache_dir, || {
         let sessions = load_sessions_from_dir(Some(&sessions_dir));
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].name, "session");
+        assert_eq!(sessions[0].name, "Inspect billing export.");
         assert_eq!(sessions[0].metrics.source_tool, "hermes_jsonl");
 
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(11)
+            Some(16)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -302,7 +576,7 @@ fn rust_refreshes_cache_entries_missing_tool_arg_usage() {
     with_home_and_cache(&home, &cache_dir, || {
         let sessions = load_sessions_from_dir(Some(&sessions_dir));
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].name, "session");
+        assert_eq!(sessions[0].name, "Inspect billing export.");
         assert_eq!(
             sessions[0].metrics.tool_arg_usage.get("billing export"),
             Some(&1)
