@@ -17,82 +17,135 @@ section{border:1px solid var(--line);background:rgba(16,20,25,.78);padding:20px;
 <body>
 <main>
 <header>
-<div><div class="brand">agenttrace</div><h1>AI agent session overview</h1><p>Static report generated from local coding-agent traces.</p><p>Static sample data: this local-first snapshot is a representative public artifact, not a full current generated report; current demo output may include incident timelines, baseline comparison fields, and tool authority summaries. No hosted tracing or uploaded logs.</p></div>
-<div class="meta">v0.5.4<br>1761 Sessions<br><code>agenttrace --overview -f html</code></div>
+<div><div class="brand">agenttrace</div><h1>AI agent session overview</h1><p>Static report generated from local coding-agent traces.</p></div>
+<div class="meta">v0.6.0<br>500 Sessions<br><code>agenttrace --overview -f html</code></div>
 </header>
 <div class="grid" aria-label="summary metrics">
-<div class="metric"><span>Sessions</span><strong>1761</strong><p>1411 Healthy / 334 Warning / 16 Critical</p></div>
-<div class="metric"><span>Total tokens</span><strong>9126644351</strong><p>+ live</p></div>
-<div class="metric"><span>Average health</span><strong>91.8</strong><p>Fleet quality score</p></div>
-<div class="metric"><span>Total estimated cost</span><strong>$5036.55</strong><p>Estimated session cost</p></div>
-<div class="metric "><span>Tool failures</span><strong>1374/125116</strong><p>1.1% failure rate</p></div>
+<div class="metric"><span>Sessions</span><strong>500</strong><p>182 Healthy / 316 Warning / 2 Critical</p></div>
+<div class="metric"><span>Total tokens</span><strong>4.0B</strong><p>+ live</p></div>
+<div class="metric"><span>Average health</span><strong>77.7</strong><p>Fleet quality score</p></div>
+<div class="metric"><span>Total estimated cost</span><strong>$2.6K</strong><p>Estimated session cost</p></div>
+<div class="metric "><span>Tool failures</span><strong>469/16066</strong><p>2.9% failure rate</p></div>
 </div>
-<section><h2>Health Trend</h2><p>Health score stable at 93</p></section>
+<section><h2>Tool authority</h2>
+<p><strong>Highest category</strong>: <code>shell_exec</code></p>
+<table><caption>Authority category counts</caption><thead><tr><th>Authority category</th><th class="num">Count</th></tr></thead><tbody>
+<tr><td><code>read_only_files</code></td><td class="num">15597</td></tr>
+<tr><td><code>shell_exec</code></td><td class="num">469</td></tr>
+</tbody></table>
+<p><strong>High-authority tools</strong>: <code>Shell</code></p>
+</section>
+<section><h2>Possible cost drivers</h2><table><thead><tr><th>Session</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Local session 1</td><td>possible driver: 801.4K tokens per assistant turn across 1 turn(s)</td></tr>
+<tr><td>Local session 2</td><td>possible driver: 11.1M tokens per assistant turn across 11 turn(s)</td></tr>
+<tr><td>Local session 3</td><td>possible driver: 2.5M tokens per assistant turn across 5 turn(s)</td></tr>
+<tr><td>Local session 4</td><td>possible driver: 1.5M tokens per assistant turn across 4 turn(s)</td></tr>
+<tr><td>Local session 5</td><td>possible driver: 4.7M tokens per assistant turn across 1 turn(s)</td></tr>
+<tr><td>Local session 6</td><td>possible driver: 1.2M tokens per assistant turn across 6 turn(s)</td></tr>
+<tr><td>Local session 8</td><td>possible driver: 3.0M tokens per assistant turn across 10 turn(s)</td></tr>
+<tr><td>Local session 9</td><td>possible driver: 32.1M tokens per assistant turn across 1 turn(s)</td></tr>
+</tbody></table></section>
+<section><h2>Health Trend</h2><p>Health score stable at 72</p></section>
+<section><h2>Incident timeline</h2>
+<table><thead><tr><th>Session</th><th>Signal</th><th>Evidence</th><th>Severity</th></tr></thead><tbody>
+<tr><td>Local session 1</td><td>Last milestone</td><td>1 assistant turn(s) completed over 6.7m</td><td>LOW</td></tr>
+<tr><td>Local session 1</td><td>Longest idle gap</td><td>404.0s gap between recorded events</td><td>HIGH</td></tr>
+<tr><td>Local session 1</td><td>Touched surface</td><td>1 unique tool(s), 1 total calls; top tool Read x1</td><td>LOW</td></tr>
+<tr><td>Local session 1</td><td>Burn divergence</td><td>801.4K tokens per assistant turn across 1 turn(s)</td><td>MEDIUM</td></tr>
+<tr><td>Local session 2</td><td>Last milestone</td><td>11 assistant turn(s) completed over 4h 41m</td><td>LOW</td></tr>
+<tr><td>Local session 2</td><td>Longest idle gap</td><td>16916.0s gap between recorded events</td><td>HIGH</td></tr>
+<tr><td>Local session 2</td><td>Touched surface</td><td>1 unique tool(s), 11 total calls; top tool Read x11</td><td>LOW</td></tr>
+<tr><td>Local session 2</td><td>Burn divergence</td><td>11.1M tokens per assistant turn across 11 turn(s)</td><td>MEDIUM</td></tr>
+<tr><td>Local session 3</td><td>Last milestone</td><td>5 assistant turn(s) completed over 38.8m</td><td>LOW</td></tr>
+<tr><td>Local session 3</td><td>Longest idle gap</td><td>2327.0s gap between recorded events</td><td>HIGH</td></tr>
+<tr><td>Local session 3</td><td>Touched surface</td><td>1 unique tool(s), 5 total calls; top tool Read x5</td><td>LOW</td></tr>
+<tr><td>Local session 3</td><td>Burn divergence</td><td>2.5M tokens per assistant turn across 5 turn(s)</td><td>MEDIUM</td></tr>
+<tr><td>Local session 4</td><td>Last milestone</td><td>4 assistant turn(s) completed over 51.2m</td><td>LOW</td></tr>
+<tr><td>Local session 4</td><td>Longest idle gap</td><td>3073.0s gap between recorded events</td><td>HIGH</td></tr>
+<tr><td>Local session 4</td><td>Touched surface</td><td>1 unique tool(s), 4 total calls; top tool Read x4</td><td>LOW</td></tr>
+<tr><td>Local session 4</td><td>Burn divergence</td><td>1.5M tokens per assistant turn across 4 turn(s)</td><td>MEDIUM</td></tr>
+<tr><td>Local session 5</td><td>Last milestone</td><td>1 assistant turn(s) completed over 5h 15m</td><td>LOW</td></tr>
+<tr><td>Local session 5</td><td>Longest idle gap</td><td>18935.0s gap between recorded events</td><td>HIGH</td></tr>
+<tr><td>Local session 5</td><td>Burn divergence</td><td>4.7M tokens per assistant turn across 1 turn(s)</td><td>MEDIUM</td></tr>
+<tr><td>Local session 6</td><td>Last milestone</td><td>6 assistant turn(s) completed over 30.7m</td><td>LOW</td></tr>
+<tr><td>Local session 6</td><td>Longest idle gap</td><td>1840.0s gap between recorded events</td><td>HIGH</td></tr>
+<tr><td>Local session 6</td><td>Touched surface</td><td>1 unique tool(s), 6 total calls; top tool Read x6</td><td>LOW</td></tr>
+<tr><td>Local session 6</td><td>Burn divergence</td><td>1.2M tokens per assistant turn across 6 turn(s)</td><td>MEDIUM</td></tr>
+<tr><td>Local session 7</td><td>Last milestone</td><td>1 assistant turn(s) completed over 2.3m</td><td>LOW</td></tr>
+<tr><td>Local session 7</td><td>Longest idle gap</td><td>140.0s gap between recorded events</td><td>MEDIUM</td></tr>
+<tr><td>Local session 8</td><td>Last milestone</td><td>10 assistant turn(s) completed over 1h 49m</td><td>LOW</td></tr>
+<tr><td>Local session 8</td><td>Longest idle gap</td><td>6545.0s gap between recorded events</td><td>HIGH</td></tr>
+<tr><td>Local session 8</td><td>Touched surface</td><td>1 unique tool(s), 10 total calls; top tool Read x10</td><td>LOW</td></tr>
+<tr><td>Local session 8</td><td>Burn divergence</td><td>3.0M tokens per assistant turn across 10 turn(s)</td><td>MEDIUM</td></tr>
+</tbody></table>
+</section>
 <section><h2>Recent sessions</h2><table><thead><tr><th>Session</th><th>Source</th><th>Model</th><th class="num">Total tokens</th><th class="num">Cost</th><th class="num">Health</th><th class="num">Anomalies</th></tr></thead><tbody>
-<tr><td>cron_0842e373cedb_20260510_103446</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">231046</td><td class="num">$0.0262</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>rollout-2026-05-10T10-33-05-019e0fbb-2da0-7570-b5f6-52a87f36c475</td><td>Codex CLI</td><td>gpt-5.5</td><td class="num">4287306</td><td class="num">$3.8765</td><td class="num health-good">88</td><td class="num">1</td></tr>
-<tr><td>rollout-2026-05-10T10-28-58-019e0fb7-6630-7d33-abbb-49598571d2f0</td><td>Codex CLI</td><td>default</td><td class="num">112</td><td class="num">$0.0003</td><td class="num health-good">88</td><td class="num">1</td></tr>
-<tr><td>rollout-2026-05-10T10-10-26-019e0fa6-6f54-7e52-bd20-ef397dbef095</td><td>Codex CLI</td><td>gpt-5.5</td><td class="num">24795262</td><td class="num">$18.9060</td><td class="num health-good">88</td><td class="num">1</td></tr>
-<tr><td>rollout-2026-05-10T10-00-22-019e0f9d-3aa3-7dc3-888d-d0018aa9db58</td><td>Codex CLI</td><td>gpt-5.5</td><td class="num">15596970</td><td class="num">$12.6673</td><td class="num health-warn">70</td><td class="num">1</td></tr>
-<tr><td>cron_7d8438ade909_20260510_100054</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">746516</td><td class="num">$0.0548</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_092908</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">273808</td><td class="num">$0.0572</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_a0badf79a0f1_20260510_090002</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">0</td><td class="num">$0.0000</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_08a59868b230_20260510_084925</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">151445</td><td class="num">$0.0210</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_cecb519df4ac_20260510_083045</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">2443632</td><td class="num">$0.0530</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_082323</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">227107</td><td class="num">$0.0365</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_071728</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">267343</td><td class="num">$0.0252</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_061436</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">144309</td><td class="num">$0.0215</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_051108</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">142889</td><td class="num">$0.0273</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_040841</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">132873</td><td class="num">$0.0174</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_030507</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">167354</td><td class="num">$0.0143</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_020059</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">157768</td><td class="num">$0.0323</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260510_005452</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">232633</td><td class="num">$0.0182</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260509_234835</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">366561</td><td class="num">$0.0555</td><td class="num health-good">100</td><td class="num">0</td></tr>
-<tr><td>cron_0842e373cedb_20260509_224516</td><td>Hermes Agent (DB)</td><td>deepseek-v4-pro</td><td class="num">109427</td><td class="num">$0.0188</td><td class="num health-good">100</td><td class="num">0</td></tr>
+<tr><td>Local session 1</td><td>Codex CLI</td><td>gpt-5.6-sol</td><td class="num">801.4K</td><td class="num">$0.7107</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 2</td><td>Codex CLI</td><td>gpt-5.6-sol</td><td class="num">121.8M</td><td class="num">$18.16</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 3</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">12.3M</td><td class="num">$4.7401</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 4</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">6.1M</td><td class="num">$1.1556</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 5</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">4.7M</td><td class="num">$1.5482</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 6</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">7.5M</td><td class="num">$1.0671</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 7</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">1.1K</td><td class="num">$0.0033</td><td class="num health-good">88</td><td class="num">1</td></tr>
+<tr><td>Local session 8</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">30.5M</td><td class="num">$6.3198</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 9</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">32.1M</td><td class="num">$2.8116</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 10</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">2.5M</td><td class="num">$0.7959</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 11</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">1.1M</td><td class="num">$0.5281</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 12</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">6.0M</td><td class="num">$2.0965</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 13</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">4.8M</td><td class="num">$1.5469</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 14</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">747.8K</td><td class="num">$0.5526</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 15</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">4.7M</td><td class="num">$1.4864</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 16</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">7.9M</td><td class="num">$2.0678</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 17</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">51.3M</td><td class="num">$11.71</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 18</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">2.0M</td><td class="num">$0.6909</td><td class="num health-good">88</td><td class="num">1</td></tr>
+<tr><td>Local session 19</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">1.4M</td><td class="num">$0.6791</td><td class="num health-warn">70</td><td class="num">1</td></tr>
+<tr><td>Local session 20</td><td>Codex CLI</td><td>gpt-5.6-luna</td><td class="num">24.5M</td><td class="num">$5.3941</td><td class="num health-warn">70</td><td class="num">1</td></tr>
 </tbody></table></section>
 <section><h2>By agent</h2><table><thead><tr><th>Agent</th><th class="num">Sessions</th><th class="num">Cost</th></tr></thead><tbody>
-<tr><td>Codex CLI</td><td class="num">615</td><td class="num">$4520.23</td></tr>
-<tr><td>Hermes Agent (DB)</td><td class="num">603</td><td class="num">$105.81</td></tr>
-<tr><td>Claude Code</td><td class="num">343</td><td class="num">$331.13</td></tr>
-<tr><td>OpenCode (DB)</td><td class="num">188</td><td class="num">$79.38</td></tr>
-<tr><td>Generic JSON/JSONL</td><td class="num">12</td><td class="num">$0.00</td></tr>
+<tr><td>Codex CLI</td><td class="num">215</td><td class="num">$1.9K</td></tr>
+<tr><td>Claude Code</td><td class="num">115</td><td class="num">$319.56</td></tr>
+<tr><td>Pi</td><td class="num">102</td><td class="num">$246.88</td></tr>
+<tr><td>Hermes Agent (DB)</td><td class="num">52</td><td class="num">$23.62</td></tr>
+<tr><td>workbuddy</td><td class="num">8</td><td class="num">$0.5499</td></tr>
+<tr><td>OpenCode (DB)</td><td class="num">5</td><td class="num">$26.50</td></tr>
+<tr><td>Generic JSON/JSONL</td><td class="num">3</td><td class="num">$0.0000</td></tr>
 </tbody></table></section>
 <section><h2>By model</h2><table><thead><tr><th>Model</th><th class="num">Sessions</th><th class="num">Cost</th></tr></thead><tbody>
-<tr><td>gpt-5.5</td><td class="num">124</td><td class="num">$2969.85</td></tr>
-<tr><td>gpt-5.4</td><td class="num">384</td><td class="num">$1400.10</td></tr>
-<tr><td>gpt-5.3-codex</td><td class="num">82</td><td class="num">$147.00</td></tr>
-<tr><td>claude-sonnet-4-6</td><td class="num">57</td><td class="num">$124.42</td></tr>
-<tr><td>glm-5.1</td><td class="num">99</td><td class="num">$87.61</td></tr>
-<tr><td>deepseek-v4-pro</td><td class="num">191</td><td class="num">$60.15</td></tr>
-<tr><td>mlx-community/Qwen3.6-35B-A3B-4bit</td><td class="num">2</td><td class="num">$36.27</td></tr>
-<tr><td>qwen3.6-plus</td><td class="num">47</td><td class="num">$33.51</td></tr>
-<tr><td>glm-5</td><td class="num">41</td><td class="num">$31.59</td></tr>
-<tr><td>glm-5-turbo</td><td class="num">20</td><td class="num">$27.14</td></tr>
-<tr><td>kimi-k2.6</td><td class="num">18</td><td class="num">$23.09</td></tr>
-<tr><td>minimax-2.7</td><td class="num">132</td><td class="num">$22.31</td></tr>
+<tr><td>gpt-5.5</td><td class="num">149</td><td class="num">$1.7K</td></tr>
+<tr><td>glm-5.2</td><td class="num">83</td><td class="num">$359.35</td></tr>
+<tr><td>gpt-5.6-luna</td><td class="num">43</td><td class="num">$197.86</td></tr>
+<tr><td>mimo-v2.5-pro-ultraspeed</td><td class="num">89</td><td class="num">$150.86</td></tr>
+<tr><td>gpt-5.6-sol</td><td class="num">16</td><td class="num">$60.43</td></tr>
+<tr><td>claude-opus-4-8</td><td class="num">2</td><td class="num">$47.10</td></tr>
+<tr><td>gpt-5.4</td><td class="num">5</td><td class="num">$14.64</td></tr>
+<tr><td>kimi-k2.7-code</td><td class="num">12</td><td class="num">$12.56</td></tr>
+<tr><td>claude-sonnet-5</td><td class="num">18</td><td class="num">$11.28</td></tr>
+<tr><td>kimi-k2.7-code-highspeed</td><td class="num">9</td><td class="num">$7.4208</td></tr>
+<tr><td>gpt-5.6-terra</td><td class="num">3</td><td class="num">$3.9158</td></tr>
+<tr><td>deepseek-v4-pro</td><td class="num">8</td><td class="num">$0.9617</td></tr>
 </tbody></table></section>
 <section><h2>Recent anomalies</h2>
 <table><thead><tr><th>Session</th><th>Type</th><th>Age</th></tr></thead><tbody>
-<tr><td>003bbfc3-abd2-4543-80d4-da9e743ac30d</td><td>hanging</td><td>now</td></tr>
-<tr><td>035057ee-b5d3-4973-a979-edc162ec8d8f</td><td>hanging</td><td>now</td></tr>
-<tr><td>035057ee-b5d3-4973-a979-edc162ec8d8f</td><td>shallow thinking</td><td>now</td></tr>
-<tr><td>035057ee-b5d3-4973-a979-edc162ec8d8f</td><td>tool failures</td><td>now</td></tr>
-<tr><td>067531ee-ea81-4139-9bc2-de1700bddecb</td><td>hanging</td><td>now</td></tr>
-<tr><td>09c7c008-de2c-4174-8141-fd557e60f246</td><td>hanging</td><td>now</td></tr>
-<tr><td>104f245e-2485-4107-a320-16f950000c94</td><td>shallow thinking</td><td>now</td></tr>
-<tr><td>104f245e-2485-4107-a320-16f950000c94</td><td>tool failures</td><td>now</td></tr>
-<tr><td>15292f42-b24b-4dda-a933-55c1d80c93e4</td><td>shallow thinking</td><td>now</td></tr>
-<tr><td>17623e3d-87ee-4194-bddc-44953243bfc6</td><td>hanging</td><td>now</td></tr>
-<tr><td>19fd2728-7709-43cb-9274-f356d8533f51</td><td>shallow thinking</td><td>now</td></tr>
-<tr><td>1a41c99d-3820-44fa-8dd2-1d51f3b4654c</td><td>hanging</td><td>now</td></tr>
-<tr><td>1a41c99d-3820-44fa-8dd2-1d51f3b4654c</td><td>shallow thinking</td><td>now</td></tr>
-<tr><td>1be3cd5d-2124-4363-bef9-933c32d3ca19</td><td>tool failures</td><td>now</td></tr>
-<tr><td>21045ccd-62d5-4116-b75a-9410e0f6b193</td><td>hanging</td><td>now</td></tr>
-<tr><td>2380d30a-87a7-481e-b514-9cc584639cdc</td><td>hanging</td><td>now</td></tr>
-<tr><td>23cb327a-1bb2-40d3-8df0-bf863eff4746</td><td>hanging</td><td>now</td></tr>
-<tr><td>267ce38a-8e9c-491f-a46e-747ebfaab86d</td><td>hanging</td><td>now</td></tr>
-<tr><td>2e0d8878-4525-412c-8a56-111eea7ed197</td><td>hanging</td><td>now</td></tr>
-<tr><td>33c3d19c-cb7a-49cc-b359-b065bc80f896</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 1</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 10</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 100</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 101</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 102</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 104</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 105</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 106</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 11</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 110</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 111</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 114</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 117</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 118</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 119</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 12</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 122</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 123</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 125</td><td>hanging</td><td>now</td></tr>
+<tr><td>Local session 127</td><td>hanging</td><td>now</td></tr>
 </tbody></table>
 </section>
 </main>
