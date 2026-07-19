@@ -802,14 +802,20 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
         .expect("write session");
     let metadata = fs::metadata(&session_path).expect("session metadata");
     let cache_path = cache_dir.join("sessions.json");
+    let session_path_json = format!(
+        "\"{}\"",
+        session_path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\"', "\\\"")
+    );
     fs::write(
             &cache_path,
             format!(
-                r#"{{"schema_version":16,"entries":{{"{}":{{"mod_time":{},"size":{},"session":{{"Name":"cached","Path":"{}","Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
-                session_path.to_string_lossy(),
+                r#"{{"schema_version":16,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
-                metadata.len(),
-                session_path.to_string_lossy()
+                metadata.len()
             ),
         )
         .expect("write cache");
