@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 - 2026-07-19
 
 ### Added
 
@@ -17,8 +17,19 @@
 
 - Split the Rust TUI into state, presentation, filtering, and test modules and
   moved shared data-health/comparison logic into `agenttrace-core`.
+- Streamed JSONL object parsing instead of retaining whole-file JSON trees,
+  reducing peak memory by about 44% on a 2.53 GiB local session corpus while
+  keeping report totals unchanged.
+- Added `Ctrl+d`/`Ctrl+u` half-page movement and `G` end navigation to the TUI.
 - Updated public docs, Pages, plugin, and Skill surfaces to describe the Rust
   implementation and honest per-source evidence limits.
+
+### Fixed
+
+- Invalidated SQLite session snapshots when the database, WAL, or SHM file
+  changes.
+- Hardened preserved-history loading against malformed short identifiers and
+  stabilized the real-data CLI/TUI release smoke checks.
 
 ### Validation
 
