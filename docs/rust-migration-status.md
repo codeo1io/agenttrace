@@ -1,6 +1,6 @@
 # Rust Migration Status
 
-The Rust migration is complete for `v0.6.0`. Rust is the only implementation in the repository.
+The Rust migration is complete in the `v0.6.0` source tree. Rust is the only implementation in the repository. This document describes release readiness; it does not claim that the public `v0.6.0` tag or assets already exist.
 
 ## Final State
 

@@ -6,6 +6,7 @@ agentwaste
 .playwright-mcp/
 .codegraph/
 target/
+.tmp/
 node_modules/
 .DS_Store
 *.tsbuildinfo

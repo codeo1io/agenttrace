@@ -383,7 +383,8 @@ scripts/ci/check-pages-artifact.sh site
 
 Before sharing a release publicly, compare these surfaces against `gh release list --repo luoyuctl/agenttrace --limit 1`:
 
-- README release and Homebrew badges point at the latest version.
+- README release links point at the latest public release, while the Homebrew
+  badge remains version-neutral until the tap is verified separately.
 - `homebrew/Formula/agenttrace.rb` and `homebrew/README.md` match the current install story.
 - `site/index.html` JSON-LD `softwareVersion`, `site/demo-report.html`, `site/llms.txt`, `site/robots.txt`, and `site/sitemap.xml` remain present and version-consistent where they mention a release.
 - GitHub Discussions, release notes, and launch copy do not point readers at stale release links.

@@ -18,7 +18,7 @@
   <a href="https://github.com/luoyuctl/agenttrace/releases/latest"><img src="https://img.shields.io/github/v/release/luoyuctl/agenttrace?color=00ADD8" alt="Release"></a>
   <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/Homebrew-v0.6.0-2bbc8a.svg" alt="Homebrew">
+  <a href="https://github.com/luoyuctl/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-tap-2bbc8a.svg" alt="Homebrew tap"></a>
 </p>
 
 <p align="center">
@@ -28,6 +28,8 @@
 ---
 
 **agenttrace** is a local-first terminal TUI and report generator for AI coding-agent session history. It reads Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces, then helps with two daily jobs: see what multiple agents spent across cost, tokens, and time; and diagnose why a task ran slowly.
+
+One `agenttrace` binary provides both interfaces: run it without a report action to open the TUI, or pass flags such as `--sessions` and `--overview` for CLI output.
 
 ## Why agenttrace?
 
@@ -45,7 +47,7 @@ It helps you answer:
 
 ## Real local run
 
-These screenshots were captured from a local run against real session logs. They are not `--demo` output and not test fixtures.
+These screenshots and figures are a redacted sample of the latest 500 real local sessions captured for the v0.6.0 source tree. They are not `--demo` output, current telemetry, or test fixtures.
 
 ```bash
 agenttrace
@@ -67,14 +69,19 @@ AGENTTRACE v0.6.0
 
 | Signal | What agenttrace found |
 |---|---:|
-| Analyzed sessions | 1,761 |
-| Total tokens | 9.13B |
-| Estimated cost | $5,037.26 |
-| Tool failure rate | 1.1% |
-| Critical sessions | 16 |
-| Average health | 91% |
+| Analyzed sessions | 500 |
+| Total tokens | 4.0B |
+| Estimated cost | $2.6K |
+| Tool failure rate | 2.9% |
+| Critical sessions | 2 |
+| Average health | 77.7% |
 
 ## Install
+
+The commands below install the latest public channel, which can lag behind the
+`v0.6.0` source tree until its release assets and tap formula are published.
+Check the installed version with `agenttrace --version`. To test the current
+source tree, use the Git-based Cargo command below.
 
 ```bash
 curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
@@ -93,51 +100,11 @@ Windows:
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-## Common workflows
+## Quickstart
 
 ```bash
-# Open the local TUI
 agenttrace
-
-# Check detected agent directories and cache state
-agenttrace --doctor
-
-# Generate machine-readable evidence
-agenttrace --overview -f json
-
-# Focus the same TUI/report scope by time, project, agent, or model
-agenttrace --overview -f json --range 7d --project agenttrace
-agenttrace --overview -f json --source codex --model-filter gpt-5
-
-# Opt in to long-term derived history; prompts, replies, paths, and tool arguments are not stored
-agenttrace --overview -f json --preserve-history
-agenttrace --overview -f json --include-history --range 30d
-
-# Search local session metadata without indexing prompt text
-agenttrace --search billing
-agenttrace --search internal/ws -f json
-
-# Create a self-contained report for CI artifacts or issue links
-agenttrace --overview -f html -o agenttrace-overview.html
-
-# Save a local baseline, then compare a later run
-agenttrace --overview -f json -o agenttrace-baseline.json
-agenttrace --overview -f json \
-  --baseline agenttrace-baseline.json \
-  -o agenttrace-overview.json
-
-# Fail CI on unhealthy agent runs
-agenttrace --overview \
-  --fail-under-health 80 \
-  --fail-on-critical \
-  --max-tool-fail-rate 15
 ```
-
-## Supported logs
-
-agenttrace supports local sessions from:
-
-Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces.
 
 ## What you get
 
@@ -145,6 +112,8 @@ Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Her
 |---|---|
 | Historical spend review | Sessions grouped across projects, agents, and models with Today/7d/30d/All ranges |
 | Data confidence | Parse skips, cache hits, unknown sources/models, pricing fallbacks, and latest observed session |
+| Honest capability levels | `Detailed`, `Aggregate`, or `Limited` per session so missing event-level evidence is never presented as a complete trace |
+| Privacy-safe steps | Tool-step metadata and duration when the source provides call IDs and timestamps; no prompt, response, result, or tool-argument body is stored in steps |
 | Slow-task diagnosis | Latency stats, long gaps, hanging sessions, retry loops, slow tools, large params, and context pressure |
 | Regression evidence | Local baseline comparison when supplied, incident timelines, and conservative tool authority categories in reports |
 | First-session triage | Sort and filter by cost, duration, health, failures, anomalies, model, source, or text search |
@@ -168,24 +137,13 @@ Desktop development:
 cd apps/desktop
 pnpm install
 pnpm tauri dev
-pnpm tauri build
 ```
 
-Unsigned macOS and Windows desktop bundles are built by [the Desktop workflow](.github/workflows/desktop.yml). Platform signing can be added without changing the local-only analysis architecture.
+Listed in these open source projects:
 
-Listed in:
-
-- [Awesome Gemini CLI](https://github.com/Piebald-AI/awesome-gemini-cli)
-- [Charm in the Wild](https://github.com/charm-and-friends/charm-in-the-wild)
-- [Awesome Claude Code and Skills](https://github.com/GetBindu/awesome-claude-code-and-skills)
-- [awesome-x-ops](https://github.com/xlabs-club/awesome-x-ops)
-- [Awesome DevOps AI](https://github.com/hammadhaqqani/awesome-devops-ai)
-- [agentic-ai-knowledge-base](https://github.com/ankurkumarz/agentic-ai-knowledge-base)
-- [awesome-harness-engineering](https://github.com/walkinglabs/awesome-harness-engineering)
-- [awesome-ai-tools](https://github.com/QAInsights/awesome-ai-tools)
-- [awesome-claude-code-toolkit](https://github.com/rohitg00/awesome-claude-code-toolkit)
-- [awesome-ai-plugins](https://github.com/hashgraph-online/awesome-ai-plugins)
-- [awesome-agent-skills](https://github.com/kodustech/awesome-agent-skills)
+- [awesome-mac](https://github.com/jaywcjlove/awesome-mac)
+- [antigravity-awesome-skills](https://github.com/sickn33/antigravity-awesome-skills)
+- [awesome-claude-skills](https://github.com/BehiSecc/awesome-claude-skills)
 
 ## Contributing
 
@@ -196,10 +154,18 @@ Parser PRs are welcome. A good parser contribution usually includes:
 - role, timestamp, model, token usage, tool call, and tool error extraction
 - tests for successful parsing and malformed input
 
+Generated parser fixtures are deterministic:
+
+```bash
+python3 scripts/generate-testdata.py
+python3 scripts/generate-testdata.py --check
+```
+
 Run before sending a PR:
 
 ```bash
 cargo test
+python3 scripts/generate-testdata.py --check
 cargo build --release -p agenttrace
 target/release/agenttrace --doctor
 ```

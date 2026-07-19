@@ -44,8 +44,7 @@
         "codeRepository": "https://github.com/luoyuctl/agenttrace",
         "license": "https://github.com/luoyuctl/agenttrace/blob/master/LICENSE",
         "sameAs": [
-          "https://github.com/luoyuctl/agenttrace",
-          "https://crates.io/crates/agenttrace"
+          "https://github.com/luoyuctl/agenttrace"
         ],
         "offers": {
           "@type": "Offer",
@@ -79,7 +78,7 @@
           <p class="hero-lede">
             agenttrace turns Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider,
             Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi, Oh My Pi, Kimi CLI,
-            Copilot-style logs, and JSON/JSONL traces into a fast terminal cockpit for cost, token, health,
+            Copilot-style logs, and JSON/JSONL traces into one Rust binary for cost, token, health,
             latency, failure, and slow-run diagnosis. No hosted backend. No prompt upload.
           </p>
           <div class="install-row" aria-label="Install command">
@@ -101,20 +100,21 @@
           <img src="assets/readme-real-overview.png" alt="agenttrace overview from a real local run with sessions, token cost, latency, and health" />
         </div>
 
-        <div class="live-ledger" id="evidence" aria-label="Real local run metrics">
+        <div class="live-ledger" id="evidence" aria-label="Redacted local sample metrics captured on 2026-07-18">
           <article><span>sessions analyzed</span><strong>1,761</strong></article>
           <article><span>tokens traced</span><strong>9.13B</strong></article>
           <article><span>estimated cost</span><strong>$5,037.26</strong></article>
           <article><span>critical runs</span><strong>16</strong></article>
           <article><span>average health</span><strong>91%</strong></article>
         </div>
+        <p class="terminal-label">redacted static sample · captured 2026-07-18 · not current telemetry</p>
       </section>
 
       <section class="operator-grid" aria-label="What agenttrace helps with">
         <article>
           <span>01 / Observe</span>
           <h2>One local timeline for messy agent history.</h2>
-          <p>Bring together multi-agent runs, source tools, models, turns, tokens, cost, latency, health, and local baseline deltas without sending prompts to another service.</p>
+          <p>Bring together multi-agent runs, source tools, models, turns, tokens, cost, latency, health, and local baseline deltas. Detailed, Aggregate, and Limited labels show how much evidence each source actually provides.</p>
         </article>
         <article>
           <span>02 / Rank</span>
@@ -124,7 +124,7 @@
         <article>
           <span>03 / Diagnose</span>
           <h2>Move from slow to a specific reason.</h2>
-          <p>Surface hanging gaps, slow tools, retry chains, repeated loops, large params, incident timelines, conservative tool authority categories, and concrete next actions.</p>
+          <p>Surface hanging gaps, slow tools, retry chains, repeated loops, large params, privacy-safe tool-step metadata, conservative tool authority categories, and concrete next actions.</p>
         </article>
       </section>
 
@@ -219,7 +219,7 @@
         <div>
           <p class="terminal-label">open source</p>
           <h2>Small enough to run locally. Useful enough to attach to a review.</h2>
-          <p>agenttrace is MIT licensed, built in Go, and shaped around real agent operator pain: cost surprises, long-running tasks, tool loops, failing calls, and unclear regressions.</p>
+          <p>agenttrace is MIT licensed, built in Rust with ratatui and crossterm, and shaped around real agent operator pain: cost surprises, long-running tasks, tool loops, failing calls, and unclear regressions.</p>
         </div>
         <div class="community-links" aria-label="Project links">
           <a href="https://github.com/luoyuctl/agenttrace">Source code</a>

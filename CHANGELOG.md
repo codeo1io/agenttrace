@@ -1,8 +1,55 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 - 2026-07-19
 
-v0.5.2 release candidate notes:
+### Added
+
+- Replaced the Go implementation with a Rust workspace while preserving one
+  `agenttrace` binary for both CLI reports and the terminal TUI.
+- Added cached background session loading, Hermes/OpenCode SQLite sources,
+  `Detailed`/`Aggregate`/`Limited` data capability labels, coverage reporting,
+  privacy-safe tool-step metadata, actionable issue filters, and shared Core
+  findings/comparison rules across CLI and TUI.
+- Added deterministic generated parser fixtures and CI checks for provider
+  coverage, data degradation, step redaction, and single-binary entrypoints.
+
+### Changed
+
+- Split the Rust TUI into state, presentation, filtering, and test modules and
+  moved shared data-health/comparison logic into `agenttrace-core`.
+- Streamed JSONL object parsing instead of retaining whole-file JSON trees,
+  reducing peak memory by about 44% on a 2.53 GiB local session corpus while
+  keeping report totals unchanged.
+- Added `Ctrl+d`/`Ctrl+u` half-page movement and `G` end navigation to the TUI.
+- Updated public docs, Pages, plugin, and Skill surfaces to describe the Rust
+  implementation and honest per-source evidence limits.
+
+### Fixed
+
+- Invalidated SQLite session snapshots when the database, WAL, or SHM file
+  changes.
+- Hardened preserved-history loading against malformed short identifiers and
+  stabilized the real-data CLI/TUI release smoke checks.
+
+### Validation
+
+- The Rust workspace, release binary, parser fixtures, CLI/TUI PTY entrypoints,
+  report contracts, Homebrew syntax, and Pages artifact are covered by the
+  local release gate.
+
+## v0.5.4 - 2026-05-24
+
+### Changed
+
+- Published cross-platform command-line release assets and checksums.
+
+## v0.5.3 - 2026-05-24
+
+### Changed
+
+- Refreshed release-facing artifacts for the v0.5 line.
+
+## v0.5.2 - 2026-05-24
 
 ### Fixed
 
@@ -19,7 +66,7 @@ v0.5.2 release candidate notes:
   parsed session cache entries, entries reusable for the current scan, and
   cached directory listings. (#239)
 
-v0.5.0 release candidate notes:
+## v0.5.0 - 2026-05-18
 
 ### Added
 

@@ -18,7 +18,7 @@
   <a href="https://github.com/luoyuctl/agenttrace/releases/latest"><img src="https://img.shields.io/github/v/release/luoyuctl/agenttrace?color=00ADD8" alt="Release"></a>
   <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/Homebrew-v0.6.0-2bbc8a.svg" alt="Homebrew">
+  <a href="https://github.com/luoyuctl/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-tap-2bbc8a.svg" alt="Homebrew tap"></a>
 </p>
 
 <p align="center">
@@ -28,6 +28,8 @@
 ---
 
 **agenttrace** 是一个本地优先的终端 TUI 和报告生成工具，用来分析 AI 编程 Agent 的会话历史。它会读取 Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Pi、Oh My Pi、Kimi CLI、Copilot-style logs 和通用 JSON/JSONL traces，主要帮你做两件事：汇总多个 Agent 历史会话的成本、Token 和耗时；定位某次任务为什么跑得慢。
+
+CLI 和 TUI 来自同一个 `agenttrace` 二进制：不带报告动作时进入 TUI，传入 `--sessions`、`--overview` 等参数时输出 CLI 报告。
 
 ## 为什么需要 agenttrace？
 
@@ -45,6 +47,8 @@ AI 编程 Agent 越来越像一套小型构建系统：会调用工具、重试�
 
 ## 真实本机运行
 
+以下截图和数字来自为 v0.6.0 源码树采集的最新 500 条真实本机会话脱敏样本，不是当前遥测数据，也不是测试 fixture。
+
 ```bash
 agenttrace
 ```
@@ -58,6 +62,10 @@ agenttrace
 | <img src="assets/readme-real-detail.png" alt="agenttrace detail view showing health, cost, tool failures, and next action from a real local session" width="100%"> | <img src="assets/readme-real-diagnostics.png" alt="agenttrace diagnostics view showing latency, context window, and large parameter calls from real local logs" width="100%"> |
 
 ## 安装
+
+以下命令安装当前公开渠道版本；在 v0.6.0 Release 资产和 Homebrew Formula
+发布前，它们可能落后于 v0.6.0 源码树。可用 `agenttrace --version` 检查实际版本；
+如需体验当前源码树，请使用下面的 Git Cargo 安装命令。
 
 ```bash
 curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
@@ -76,39 +84,20 @@ Windows：
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
-## 常用工作流
+## Quickstart
 
 ```bash
-# 打开本地 TUI
 agenttrace
-
-# 检查会话目录探测和缓存状态
-agenttrace --doctor
-
-# 生成机器可读证据
-agenttrace --overview -f json
-
-# 生成可放到 CI artifact 或 issue 里的独立 HTML 报告
-agenttrace --overview -f html -o agenttrace-overview.html
-
-# 保存本地 baseline，再对比后续运行
-agenttrace --overview -f json -o agenttrace-baseline.json
-agenttrace --overview -f json \
-  --baseline agenttrace-baseline.json \
-  -o agenttrace-overview.json
 ```
-
-## 支持哪些Agent
-
-agenttrace 支持这些本地会话来源：
-
-Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Pi、Oh My Pi、Kimi CLI、Copilot-style logs，以及通用 JSON/JSONL traces。
 
 ## 你会得到什么
 
 | 需求 | agenttrace 提供 |
 |---|---|
 | 历史消耗总览 | 跨 Agent 会话聚合，展示 token 总量、模型价格、估算成本和真实耗时 |
+| 数据可信度 | 展示解析跳过、缓存命中、未知来源/模型、价格回退和字段覆盖率 |
+| 能力降级 | 每个会话标记为 `Detailed`、`Aggregate` 或 `Limited`，不把缺失的事件证据包装成完整 Trace |
+| 脱敏步骤 | 来源提供调用 ID 和时间戳时展示 Tool Step 元数据和耗时，不在 Step 中保存 prompt、回复、结果或工具参数正文 |
 | 慢任务诊断 | 延迟统计、长间隔、挂起会话、重试循环、慢工具、大参数和上下文压力 |
 | 回归证据 | 在提供本地 baseline 时进行对比，并在报告中展示 incident timeline 和保守的 tool authority 分类 |
 | 优先级排序 | 按成本、耗时、轮次、健康分、失败、异常、模型、来源或文本搜索筛选 |
@@ -123,20 +112,22 @@ Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cline、Aider、Cursor export
 - Cursor 导入：[docs/cursor-import.md](docs/cursor-import.md)
 - Parser 指南：[docs/parser-guide.md](docs/parser-guide.md)
 - 发布说明草案：[docs/launch-kit.md](docs/launch-kit.md)
+- 桌面端实现计划：[docs/desktop-plan.md](docs/desktop-plan.md)
+- 桌面端设计参考：[docs/desktop-design-reference.md](docs/desktop-design-reference.md)
+
+桌面端开发：
+
+```bash
+cd apps/desktop
+pnpm install
+pnpm tauri dev
+```
 
 agenttrace 已被这些项目收录：
 
-- [Awesome Gemini CLI](https://github.com/Piebald-AI/awesome-gemini-cli)
-- [Charm in the Wild](https://github.com/charm-and-friends/charm-in-the-wild)
-- [Awesome Claude Code and Skills](https://github.com/GetBindu/awesome-claude-code-and-skills)
-- [awesome-x-ops](https://github.com/xlabs-club/awesome-x-ops)
-- [Awesome DevOps AI](https://github.com/hammadhaqqani/awesome-devops-ai)
-- [agentic-ai-knowledge-base](https://github.com/ankurkumarz/agentic-ai-knowledge-base)
-- [awesome-harness-engineering](https://github.com/walkinglabs/awesome-harness-engineering)
-- [awesome-ai-tools](https://github.com/QAInsights/awesome-ai-tools)
-- [awesome-claude-code-toolkit](https://github.com/rohitg00/awesome-claude-code-toolkit)
-- [awesome-ai-plugins](https://github.com/hashgraph-online/awesome-ai-plugins)
-- [awesome-agent-skills](https://github.com/kodustech/awesome-agent-skills)
+- [awesome-mac](https://github.com/jaywcjlove/awesome-mac)
+- [antigravity-awesome-skills](https://github.com/sickn33/antigravity-awesome-skills)
+- [awesome-claude-skills](https://github.com/BehiSecc/awesome-claude-skills)
 
 ## 贡献
 
@@ -147,10 +138,18 @@ agenttrace 已被这些项目收录：
 - role、timestamp、model、token usage、tool call、tool error 提取
 - 成功解析和坏输入的测试
 
+生成式 fixture 使用确定性脚本维护：
+
+```bash
+python3 scripts/generate-testdata.py
+python3 scripts/generate-testdata.py --check
+```
+
 提交 PR 前请运行：
 
 ```bash
 cargo test
+python3 scripts/generate-testdata.py --check
 cargo build --release -p agenttrace
 target/release/agenttrace --doctor
 ```

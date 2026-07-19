@@ -9,10 +9,10 @@ fail() {
 version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
 [[ -n "$version" ]] || fail "could not read workspace package version"
 
-grep -q "Homebrew-v$version-" README.md \
-  || fail "README Homebrew badge is not aligned with engine version $version"
-grep -q "Homebrew-v$version-" README.zh-CN.md \
-  || fail "README.zh-CN Homebrew badge is not aligned with engine version $version"
+grep -q "Homebrew-tap-" README.md \
+  || fail "README must link to the Homebrew tap without claiming an unpublished version"
+grep -q "Homebrew-tap-" README.zh-CN.md \
+  || fail "README.zh-CN must link to the Homebrew tap without claiming an unpublished version"
 grep -q "AGENTTRACE v$version" README.md \
   || fail "README sample output is not aligned with engine version $version"
 grep -q "version \"$version\"" homebrew/Formula/agenttrace.rb \
@@ -21,6 +21,8 @@ grep -q "agenttrace v$version" homebrew/Formula/agenttrace.rb \
   || fail "Homebrew formula test is not aligned with engine version $version"
 grep -q "\"softwareVersion\": \"$version\"" site/index.html \
   || fail "site structured metadata is not aligned with engine version $version"
+grep -q "\"version\": \"$version\"" .codex-plugin/plugin.json \
+  || fail "Codex plugin manifest is not aligned with source-tree version $version"
 grep -q "cargo build --release -p agenttrace" install.sh \
   || fail "install.sh source-build fallback must use cargo"
 grep -q "cargo build --release -p agenttrace" install.ps1 \
@@ -81,6 +83,20 @@ fi
 
 if grep -R -Eqi "pkg.go.dev|goreportcard|img.shields.io/badge/go-" README.md README.zh-CN.md site docs/launch-kit.md; then
   fail "README badges must advertise the Rust default implementation, not Go"
+fi
+
+if grep -R -Eqi "built in Go|Bubble Tea terminal UI" README.md README.zh-CN.md site .codex-plugin skills; then
+  fail "public surfaces must describe the Rust ratatui implementation"
+fi
+
+for asset in assets/readme-real-overview.png assets/readme-real-diagnostics.png; do
+  [[ -f "$asset" ]] || fail "plugin screenshot asset is missing: $asset"
+  grep -q "\"./$asset\"" .codex-plugin/plugin.json \
+    || fail "plugin manifest must reference existing screenshot $asset"
+done
+
+if grep -q "crates.io/crates/agenttrace" site/index.html; then
+  fail "site must not advertise crates.io before the crate exists"
 fi
 
 if grep -R -Eqi "setup-go|(^|[^[:alnum:]_/-])go[[:space:]]+build|GOOS|GOARCH" .github/workflows; then
