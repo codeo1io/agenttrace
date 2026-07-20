@@ -138,7 +138,7 @@ jobs:
             echo "NPM_TOKEN is required to publish the npm package." >&2
             exit 1
           }
-          npm publish "dist/agenttrace-${GITHUB_REF_NAME#v}.tgz" --access public
+          npm publish "./dist/agenttrace-${GITHUB_REF_NAME#v}.tgz" --access public
 
       - name: Render Homebrew and WinGet manifests
         run: |
