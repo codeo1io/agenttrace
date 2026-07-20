@@ -15,13 +15,6 @@ fail() {
 [[ -f "$page_dir/llms.txt" ]] || fail "missing llms.txt in $page_dir"
 
 demo_report="$page_dir/demo-report.html"
-version="$(sed -nE 's/^version = "([^"]+)"/\1/p' "$repo_root/Cargo.toml" | head -1)"
-[[ -n "$version" ]] || fail "could not read workspace package version"
-
-if ! grep -q "<div class=\"meta\">v$version" "$demo_report" &&
-  ! grep -qi "static sample data" "$demo_report"; then
-  fail "demo-report.html must use current version metadata or clearly identify static sample data"
-fi
 
 has_static_sample=false
 if grep -qi "static sample data" "$demo_report"; then
