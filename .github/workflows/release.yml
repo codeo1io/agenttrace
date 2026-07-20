@@ -130,7 +130,7 @@ jobs:
           cd npm
           npm pack --pack-destination ../dist
 
-      - name: Publish npm launcher
+      - name: Configure npm registry authentication
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -138,6 +138,10 @@ jobs:
             echo "NPM_TOKEN is required to publish the npm package." >&2
             exit 1
           }
+          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
+
+      - name: Publish npm launcher
+        run: |
           npm publish "./dist/agenttrace-${GITHUB_REF_NAME#v}.tgz" --access public
 
       - name: Render Homebrew and WinGet manifests

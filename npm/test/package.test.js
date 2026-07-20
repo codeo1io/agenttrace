@@ -27,5 +27,6 @@ test("publishes one agenttrace command backed by the native installer", () => {
 		join(packageRoot, "..", ".github", "workflows", "release.yml"),
 		"utf8",
 	);
+	assert.match(releaseWorkflow, /npm config set \/\/registry\.npmjs\.org\/:_authToken/);
 	assert.match(releaseWorkflow, /npm publish "\.\/dist\/agenttrace-/);
 });
