@@ -68,7 +68,10 @@ pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language, WasteReport,
 };
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = match option_env!("AGENTTRACE_RELEASE_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Event {

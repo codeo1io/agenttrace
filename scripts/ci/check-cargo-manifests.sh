@@ -47,6 +47,7 @@ for (const name of ["agenttrace-core", "agenttrace-tui", "agenttrace"]) {
 }
 
 const version = packages.get("agenttrace").version;
+assert(version === "0.0.0-dev", `workspace version ${version} must use the development-version placeholder`);
 for (const [name, pkg] of packages) {
   assert(pkg.version === version, `${name} version ${pkg.version} does not match workspace version ${version}`);
   for (const dep of pkg.dependencies) {

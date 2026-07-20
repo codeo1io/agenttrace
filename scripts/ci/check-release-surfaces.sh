@@ -6,23 +6,18 @@ fail() {
 	exit 1
 }
 
-version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
-[[ -n "$version" ]] || fail "could not read workspace package version"
+workspace_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
+[[ "$workspace_version" = "0.0.0-dev" ]] ||
+	fail "workspace must use the development-version placeholder"
 
 grep -q "Homebrew-tap-" README.md ||
 	fail "README must link to the Homebrew tap without claiming an unpublished version"
 grep -q "Homebrew-tap-" README.zh-CN.md ||
 	fail "README.zh-CN must link to the Homebrew tap without claiming an unpublished version"
-grep -q "AGENTTRACE v$version" README.md ||
-	fail "README sample output is not aligned with engine version $version"
-grep -q "version \"$version\"" homebrew/Formula/agenttrace.rb ||
-	fail "Homebrew formula version is not aligned with engine version $version"
-grep -q "agenttrace v$version" homebrew/Formula/agenttrace.rb ||
-	fail "Homebrew formula test is not aligned with engine version $version"
-grep -q "\"softwareVersion\": \"$version\"" site/index.html ||
-	fail "site structured metadata is not aligned with engine version $version"
-grep -q "\"version\": \"$version\"" .codex-plugin/plugin.json ||
-	fail "Codex plugin manifest is not aligned with source-tree version $version"
+grep -q "AGENTTRACE_RELEASE_VERSION" .github/workflows/release.yml ||
+	fail "release workflow must derive the binary version from the release tag"
+grep -q "manifest.version = process.env.RELEASE_VERSION" .github/workflows/release.yml ||
+	fail "release workflow must derive the npm package version from the release tag"
 grep -q "cargo build --release -p agenttrace" install.sh ||
 	fail "install.sh source-build fallback must use cargo"
 grep -q "cargo build --release -p agenttrace" install.ps1 ||
@@ -124,22 +119,6 @@ if git ls-files '*.go' go.mod go.sum 'cmd/**' 'internal/**' | while IFS= read -r
 	fail "Go implementation files must not be tracked in the Rust-only tree"
 fi
 
-if ! grep -q "<div class=\"meta\">v$version" site/demo-report.html &&
-	! grep -qi "static sample data" site/demo-report.html; then
-	fail "site demo report must use current version metadata or clearly identify static sample data"
-fi
-
-node -e '
-const fs = require("fs");
-const version = process.argv[1];
-const files = ["README.md", "README.zh-CN.md", "homebrew/Formula/agenttrace.rb", "site/index.html", "site/demo-report.html"];
-const pattern = /\bv?(\d+\.\d+\.\d+)\b/g;
-for (const file of files) {
-  const text = fs.readFileSync(file, "utf8");
-  for (const match of text.matchAll(pattern)) {
-    if (match[1] !== version) {
-      throw new Error(`${file} contains stale version ${match[0]}, expected ${version}`);
-    }
-  }
-}
-' "$version" || fail "release surface version drift detected"
+npm_version="$(node -p "require('./npm/package.json').version")"
+[[ "$npm_version" = "0.0.0-release" ]] ||
+	fail "npm package must keep the release-version placeholder outside release CI"

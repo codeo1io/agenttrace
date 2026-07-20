@@ -21,25 +21,15 @@ These scripts remain at repository root because users invoke them through stable
 
 ## Homebrew
 
-`homebrew/Formula/agenttrace.rb` is the source-tree Formula used for local validation. The public tap is maintained separately at `luoyuctl/homebrew-tap`; it should be updated only after the corresponding GitHub Release assets are available.
+The checked-in `homebrew/Formula/agenttrace.rb` is a `HEAD` Formula used only for local validation. The release workflow generates the versioned, checksum-pinned Formula from the tag and GitHub Release assets, then publishes it to `luoyuctl/homebrew-tap`.
 
-Validate the source-tree Formula with:
+npm and WinGet are also release channels:
 
-```bash
-ruby -c homebrew/Formula/agenttrace.rb
-```
+- The workflow sets the npm package version from the `v*` tag immediately before packing and publishing it. Its postinstall hook downloads the matching checksummed GitHub Release binary.
+- The workflow renders Homebrew and WinGet metadata from the same `checksums.txt` artifact.
+- WinGet submits `Luoyuctl.AgentTrace` through `winget-create`.
 
-## Future package channels
-
-npm and WinGet publication are not current release guarantees unless their package definitions, credentials, generated manifests, and release-workflow steps are committed together in an approved packaging change.
-
-When adding a channel:
-
-1. Keep package-specific code in a top-level channel directory such as `npm/` or `winget/`.
-2. Generate binary URLs and checksums from the published GitHub Release; never duplicate unchecked binaries.
-3. Add deterministic local tests and CI coverage for the package contract.
-4. Update README install guidance only after the release path is live.
-5. Document whether the last step is automated or requires a maintainer-owned external submission.
+The source tree deliberately uses non-release version placeholders. A release tag is the only source of a public version, so package metadata and rendered manifests never need manual version bumps.
 
 ## Release checks
 
