@@ -19,6 +19,8 @@
   <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <a href="https://github.com/luoyuctl/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-tap-2bbc8a.svg" alt="Homebrew tap"></a>
+  <a href="https://www.npmjs.com/package/agenttrace"><img src="https://img.shields.io/npm/v/agenttrace?label=npm" alt="npm"></a>
+  <a href="https://github.com/microsoft/winget-pkgs"><img src="https://img.shields.io/badge/WinGet-Luoyuctl.AgentTrace-0078D4.svg" alt="WinGet"></a>
 </p>
 
 <p align="center">
@@ -78,23 +80,30 @@ AGENTTRACE v0.7.1
 
 ## Install
 
-The commands below install the latest public channel, which can lag behind the
-`v0.7.1` source tree until its release assets and tap formula are published.
-Check the installed version with `agenttrace --version`. To test the current
-source tree, use the Git-based Cargo command below.
+Install the latest public release with your package manager. Check the installed
+version with `agenttrace --version`.
 
 ```bash
-curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
-```
-
-Other install paths:
-
-```bash
+# macOS and Linux
 brew install luoyuctl/tap/agenttrace
-cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
+
+# macOS, Linux, and Windows (requires Node.js 18+)
+npm install -g agenttrace
 ```
 
 Windows:
+
+```powershell
+winget install --id Luoyuctl.AgentTrace --exact
+```
+
+The package names above become available once the corresponding release has
+been published. Manual installs remain available without a package manager:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
+```
 
 ```powershell
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex

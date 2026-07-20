@@ -5,12 +5,11 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: read
-
 jobs:
   build:
     name: Build release assets
+    permissions:
+      contents: read
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -86,7 +85,11 @@ jobs:
       attestations: write
       contents: write
       id-token: write
+      issues: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -112,3 +115,67 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
+
+      - name: Pack npm launcher
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p "require('./npm/package.json').version")"
+          test "$package_version" = "$version"
+          cd npm
+          npm pack --pack-destination ../dist
+
+      - name: Publish npm launcher
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || {
+            echo "NPM_TOKEN is required to publish the npm package." >&2
+            exit 1
+          }
+          npm publish "dist/agenttrace-${GITHUB_REF_NAME#v}.tgz" --access public
+
+      - name: Render Homebrew and WinGet manifests
+        run: |
+          scripts/release/render-channels.sh \
+            "${GITHUB_REF_NAME#v}" \
+            dist/checksums.txt \
+            channel-dist
+
+      - name: Publish Homebrew Formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          test -n "$HOMEBREW_TAP_TOKEN" || {
+            echo "HOMEBREW_TAP_TOKEN is required to update luoyuctl/homebrew-tap." >&2
+            exit 1
+          }
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/luoyuctl/homebrew-tap.git" homebrew-tap
+          install -Dm644 channel-dist/homebrew/Formula/agenttrace.rb homebrew-tap/Formula/agenttrace.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/agenttrace.rb
+          git diff --cached --quiet || git commit -m "agenttrace ${GITHUB_REF_NAME}"
+          git push origin HEAD
+
+      - name: Upload WinGet manifests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: agenttrace-winget-${{ github.ref_name }}
+          path: channel-dist/winget
+          if-no-files-found: error
+
+      - name: Submit WinGet manifest
+        env:
+          WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+        run: |
+          test -n "$WINGET_GITHUB_TOKEN" || {
+            echo "WINGET_GITHUB_TOKEN is required to submit the WinGet manifest." >&2
+            exit 1
+          }
+          docker run --rm \
+            -e WINGET_GITHUB_TOKEN \
+            -v "$PWD/channel-dist/winget/manifests:/manifests:ro" \
+            ghcr.io/microsoft/winget-create:latest \
+            submit /manifests --token "$WINGET_GITHUB_TOKEN" --submit \
+              --prtitle "New version: Luoyuctl.AgentTrace $GITHUB_REF_NAME"

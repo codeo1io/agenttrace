@@ -103,6 +103,9 @@ jobs:
       - name: Validate Homebrew formula syntax
         run: ruby -c homebrew/Formula/agenttrace.rb
 
+      - name: Test npm package contract
+        run: npm --prefix npm test
+
       - name: Validate Cargo manifests
         run: scripts/ci/check-cargo-manifests.sh
 

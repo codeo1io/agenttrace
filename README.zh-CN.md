@@ -19,6 +19,8 @@
   <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <a href="https://github.com/luoyuctl/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-tap-2bbc8a.svg" alt="Homebrew tap"></a>
+  <a href="https://www.npmjs.com/package/agenttrace"><img src="https://img.shields.io/npm/v/agenttrace?label=npm" alt="npm"></a>
+  <a href="https://github.com/microsoft/winget-pkgs"><img src="https://img.shields.io/badge/WinGet-Luoyuctl.AgentTrace-0078D4.svg" alt="WinGet"></a>
 </p>
 
 <p align="center">
@@ -70,22 +72,28 @@ agenttrace
 
 ## 安装
 
-以下命令安装当前公开渠道版本；在 v0.7.1 Release 资产和 Homebrew Formula
-发布前，它们可能落后于 v0.7.1 源码树。可用 `agenttrace --version` 检查实际版本；
-如需体验当前源码树，请使用下面的 Git Cargo 安装命令。
+优先通过包管理器安装当前公开版本；可用 `agenttrace --version` 检查实际版本。
 
 ```bash
-curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
-```
-
-其它安装方式：
-
-```bash
+# macOS 和 Linux
 brew install luoyuctl/tap/agenttrace
-cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
+
+# macOS、Linux 和 Windows（需要 Node.js 18+）
+npm install -g agenttrace
 ```
 
 Windows：
+
+```powershell
+winget install --id Luoyuctl.AgentTrace --exact
+```
+
+以上包名会在对应版本发布后可用。没有包管理器时，仍可直接安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
+```
 
 ```powershell
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
@@ -100,7 +108,7 @@ agenttrace
 ## 你会得到什么
 
 | 需求 | agenttrace 提供 |
-|---|---|
+| --- | --- |
 | 历史消耗总览 | 跨 Agent 会话聚合，展示 token 总量、模型价格、估算成本和真实耗时 |
 | 数据可信度 | 展示解析跳过、缓存命中、未知来源/模型、价格回退和字段覆盖率 |
 | 能力降级 | 每个会话标记为 `Detailed`、`Aggregate` 或 `Limited`，不把缺失的事件证据包装成完整 Trace |
@@ -112,9 +120,9 @@ agenttrace
 
 ## 文档
 
-- 官网：https://luoyuctl.github.io/agenttrace/
-- AI Agent 可观测性指南：https://luoyuctl.github.io/agenttrace/ai-agent-observability.html
-- 示例 HTML 报告：https://luoyuctl.github.io/agenttrace/demo-report.html
+- 官网：<https://luoyuctl.github.io/agenttrace/>
+- AI Agent 可观测性指南：<https://luoyuctl.github.io/agenttrace/ai-agent-observability.html>
+- 示例 HTML 报告：<https://luoyuctl.github.io/agenttrace/demo-report.html>
 - 文档导航：[docs/README.md](docs/README.md)
 - CI 集成：[docs/guides/ci-integration.md](docs/guides/ci-integration.md)
 - 治理报告：[docs/guides/governance-reports.md](docs/guides/governance-reports.md)

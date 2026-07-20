@@ -1,0 +1,47 @@
+{
+  "name": "agenttrace",
+  "version": "0.7.0",
+  "description": "Local-first TUI and reports for AI coding-agent session history, cost, tokens, time, and slow-run diagnosis.",
+  "license": "MIT",
+  "homepage": "https://github.com/luoyuctl/agenttrace#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luoyuctl/agenttrace.git"
+  },
+  "bugs": {
+    "url": "https://github.com/luoyuctl/agenttrace/issues"
+  },
+  "author": "Luoyuctl",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "agent",
+    "observability",
+    "tui",
+    "cli",
+    "ai"
+  ],
+  "bin": {
+    "agenttrace": "bin/agenttrace.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "scripts",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}
