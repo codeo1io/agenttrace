@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use super::*;
 
 pub(super) fn session_matches(session: &Session, query: &str) -> bool {
@@ -182,12 +184,9 @@ pub(super) fn active_filter_summary(app: &App, language: Language) -> String {
     if !app.model_filter.is_empty() {
         filters.push(format!("{}: {}", label("model", "模型"), app.model_filter));
     }
-    if !app.project_filter.is_empty() {
-        filters.push(format!(
-            "{}: {}",
-            label("project", "项目"),
-            app.project_filter
-        ));
+    let project = active_project_filter_label(app);
+    if !project.is_empty() {
+        filters.push(format!("{}: {}", label("project", "项目"), project));
     }
     if app.range_filter != TimeRange::All {
         filters.push(format!(
@@ -199,7 +198,23 @@ pub(super) fn active_filter_summary(app: &App, language: Language) -> String {
     if let Some((op, value)) = app.cost_filter {
         filters.push(format!(
             "{}: {}{}",
-            label("cost", "成本"),
+            label("cost", "花费"),
+            cost_op_label(op),
+            value
+        ));
+    }
+    if let Some((op, value)) = app.failure_filter {
+        filters.push(format!(
+            "{}: {}{}",
+            label("failed", "失败次数"),
+            cost_op_label(op),
+            value
+        ));
+    }
+    if let Some((op, value)) = app.context_filter {
+        filters.push(format!(
+            "{}: {}{}%",
+            label("context", "上下文"),
             cost_op_label(op),
             value
         ));
@@ -227,6 +242,17 @@ pub(super) fn active_filter_summary(app: &App, language: Language) -> String {
         ));
     }
     filters.join(" · ")
+}
+
+pub(super) fn active_project_filter_label(app: &App) -> String {
+    if app.project_id_filter.is_empty() {
+        return app.project_filter.clone();
+    }
+    app.sessions
+        .iter()
+        .find(|session| resolve_project(session).id == app.project_id_filter)
+        .map(project_name)
+        .unwrap_or_else(|| app.project_id_filter.clone())
 }
 
 fn capability_filter_label(value: &str, language: Language) -> &'static str {
