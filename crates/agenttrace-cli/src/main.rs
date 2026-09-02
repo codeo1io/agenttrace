@@ -248,7 +248,7 @@ fn run() -> anyhow::Result<()> {
             Some(sample) if sample < total_sessions => (
                 matched.into_iter().take(sample).collect::<Vec<_>>(),
                 Some(format!(
-                    "sampled newest {sample} of {total_sessions} sessions (--sample {sample})"
+                    "sampled first {sample} of {total_sessions} sessions in the --sort {} --order {} view (--sample {sample})", args.sort, args.order
                 )),
             ),
             _ => (matched, None),
@@ -291,7 +291,7 @@ fn run() -> anyhow::Result<()> {
             Some(sample) if sample < total_sessions => (
                 matched.into_iter().take(sample).collect::<Vec<_>>(),
                 Some(format!(
-                    "sampled newest {sample} of {total_sessions} sessions (--sample {sample})"
+                    "sampled first {sample} of {total_sessions} sessions in the --sort {} --order {} view (--sample {sample})", args.sort, args.order
                 )),
             ),
             _ => (matched, None),

@@ -21,7 +21,15 @@ const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(
 /// entries with the oldest source-file fingerprint (mtime) are dropped
 /// at save time, so an ever-growing corpus can no longer grow the
 /// snapshot without limit.
-const MAX_SESSION_CACHE_ENTRIES: usize = 20_000;
+pub const MAX_SESSION_CACHE_ENTRIES: usize = 20_000;
+
+/// Hard bound on the serialized `sessions.json` size. The entry-count
+/// bound alone cannot stop unbounded growth: entries carry full tool-arg
+/// maps and directory listings, so a corpus of large sessions can grow
+/// the cache to hundreds of MB at 20,000 entries. Eviction follows the
+/// same policy as the count bound: oldest source-file fingerprint first
+/// (pass-9 CU-22).
+pub const MAX_SESSION_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionCache {
@@ -131,6 +139,8 @@ struct GoMetrics {
     tokens_input: i64,
     #[serde(default, rename = "TokensOutput")]
     tokens_output: i64,
+    #[serde(default, rename = "TokensReasoning")]
+    tokens_reasoning: i64,
     #[serde(default, rename = "TokensCacheW")]
     tokens_cache_w: i64,
     #[serde(default, rename = "TokensCacheR")]
@@ -633,10 +643,69 @@ fn enforce_entry_bound(cache: &mut SessionCache, max: usize) -> usize {
     dropped
 }
 
+/// Enforces the serialized-size bound by dropping the entries with the
+/// oldest source-file fingerprint (mtime) first -- the same eviction order
+/// as `enforce_entry_bound` -- until the estimated serialized size fits
+/// under `max` bytes. The estimate is the sum of each entry's serialized
+/// JSON length, matching what `save_session_cache` writes. Returns how
+/// many entries were dropped (pass-9 CU-22).
+fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
+    let sizes: Vec<(String, usize)> = cache
+        .raw_entries
+        .iter()
+        .map(|(path, value)| {
+            (
+                path.clone(),
+                serde_json::to_string(value)
+                    .map(|text| text.len())
+                    .unwrap_or(0),
+            )
+        })
+        .chain(cache.entries.iter().map(|(path, entry)| {
+            (
+                path.clone(),
+                serde_json::to_string(entry)
+                    .map(|text| text.len())
+                    .unwrap_or(0),
+            )
+        }))
+        .collect();
+    let mut by_age: Vec<(i64, String, usize)> = sizes
+        .into_iter()
+        .filter_map(|(path, bytes)| {
+            cached_entry_header(&path, cache).map(|header| (header.mod_time, path, bytes))
+        })
+        .collect();
+    let total: usize = by_age.iter().map(|(_, _, bytes)| *bytes).sum();
+    if total <= max {
+        return 0;
+    }
+    // Oldest first; drop entries until the estimate fits.
+    by_age.sort_by_key(|(mod_time, _, _)| *mod_time);
+    let mut dropped = 0;
+    let mut remaining = total;
+    for (_, path, bytes) in by_age {
+        if remaining <= max {
+            break;
+        }
+        if cache.entries.remove(&path).is_some() | cache.raw_entries.remove(&path).is_some() {
+            dropped += 1;
+            remaining = remaining.saturating_sub(bytes);
+        }
+    }
+    if dropped > 0 {
+        cache.dirty = true;
+    }
+    dropped
+}
+
 pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
-    // Hard bound before serializing: beyond MAX_SESSION_CACHE_ENTRIES the
-    // oldest-fingerprint entries are dropped (pass-8 F8-3).
+    // Hard bounds before serializing: beyond MAX_SESSION_CACHE_ENTRIES the
+    // oldest-fingerprint entries are dropped (pass-8 F8-3), and the
+    // serialized size is capped at MAX_SESSION_CACHE_BYTES with the same
+    // eviction order (pass-9 CU-22).
     enforce_entry_bound(cache, MAX_SESSION_CACHE_ENTRIES);
+    enforce_byte_bound(cache, MAX_SESSION_CACHE_BYTES);
     if let Some(parent) = cache.path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -823,6 +892,7 @@ impl GoMetrics {
             reasoning_redact: metrics.reasoning_redact,
             tokens_input: metrics.tokens_input,
             tokens_output: metrics.tokens_output,
+            tokens_reasoning: metrics.tokens_reasoning,
             tokens_cache_w: metrics.tokens_cache_w,
             tokens_cache_r: metrics.tokens_cache_r,
             gaps_sec: metrics.gaps_sec.clone(),
@@ -858,6 +928,7 @@ impl GoMetrics {
             reasoning_redact: self.reasoning_redact,
             tokens_input: self.tokens_input,
             tokens_output: self.tokens_output,
+            tokens_reasoning: self.tokens_reasoning,
             tokens_cache_w: self.tokens_cache_w,
             tokens_cache_r: self.tokens_cache_r,
             timestamps: Vec::new(),
@@ -946,7 +1017,6 @@ fn anomaly_emoji(severity: &str) -> &'static str {
         _ => "",
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1273,6 +1343,103 @@ mod tests {
         let before = cache.dirty;
         let dropped_again = enforce_entry_bound(&mut cache, 3);
         assert_eq!(dropped_again, 0);
+        assert_eq!(cache.dirty, before);
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn tokens_reasoning_survives_the_cache_round_trip() {
+        // CU-20: the reasoning breakdown is part of the cached metrics
+        // schema (TokensReasoning); a cache written by this build must
+        // restore it, and one written before the field existed must
+        // default to zero instead of failing to deserialize.
+        let metrics = Metrics {
+            tokens_input: 80,
+            tokens_output: 60,
+            tokens_reasoning: 40,
+            ..Metrics::default()
+        };
+        let cached = GoMetrics::from_metrics(&metrics);
+        assert_eq!(cached.tokens_reasoning, 40);
+        let restored: Metrics = cached.into_metrics();
+        assert_eq!(restored.tokens_reasoning, 40);
+        assert_eq!(restored.tokens_output, 60);
+
+        // Old-schema JSON without TokensReasoning deserializes to zero.
+        let legacy = serde_json::json!({
+            "TokensInput": 5,
+            "TokensOutput": 5
+        });
+        let legacy: GoMetrics = serde_json::from_value(legacy).expect("legacy entry parses");
+        assert_eq!(legacy.tokens_reasoning, 0);
+    }
+
+    #[test]
+    fn byte_bound_evicts_oldest_entries_until_the_estimate_fits() {
+        // CU-22: the entry-count bound alone cannot stop unbounded growth;
+        // once the serialized estimate exceeds the ceiling the oldest
+        // source files drop first, in the same order as the count bound.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-byte-bound-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let mut cache = SessionCache::default();
+        let mut paths = Vec::new();
+        for i in 0..4u64 {
+            let file = root.join(format!("session-{i}.jsonl"));
+            fs::write(&file, b"session").expect("write session file");
+            let stamp = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_000_000 + i * 1_000);
+            let handle = fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open file");
+            handle.set_modified(stamp).expect("set deterministic mtime");
+            drop(handle);
+            let session = Session {
+                name: format!("session-{i}"),
+                path: file.to_string_lossy().to_string(),
+                cwd: String::new(),
+                metrics: Metrics::default(),
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: Diagnostics::default(),
+            };
+            store_session(&file, &session, &mut cache).expect("store entry");
+            paths.push(file.to_string_lossy().to_string());
+        }
+
+        // Four default entries are tiny; use a ceiling that fits only the
+        // newest two to exercise the eviction path deterministically.
+        let sizes: Vec<usize> = cache
+            .entries
+            .values()
+            .map(|entry| serde_json::to_string(entry).expect("serialize").len())
+            .collect();
+        let total: usize = sizes.iter().sum();
+        let oldest_two: usize = sizes[..2].iter().sum();
+        let max = total - oldest_two;
+        let dropped = enforce_byte_bound(&mut cache, max);
+        assert_eq!(dropped, 2, "the two oldest entries drop first");
+        assert_eq!(cache.entry_count(), 2);
+        assert!(cache.dirty, "eviction must persist through the next save");
+        assert!(
+            !paths[..2]
+                .iter()
+                .any(|path| cache.entries.contains_key(&cache_key(Path::new(path)))),
+            "oldest mtimes are the ones evicted"
+        );
+        assert!(
+            paths[2..]
+                .iter()
+                .all(|path| cache.entries.contains_key(&cache_key(Path::new(path)))),
+            "newest mtimes survive"
+        );
+        // In-bounds caches stay untouched and clean.
+        let before = cache.dirty;
+        assert_eq!(enforce_byte_bound(&mut cache, usize::MAX), 0);
         assert_eq!(cache.dirty, before);
         let _ = fs::remove_dir_all(root);
     }

@@ -19,7 +19,9 @@ report discloses its coverage: `audited_sessions` / `total_sessions` /
 `excluded_reason` in JSON, and a leading `(auditing N of M sessions)` line in
 text, Markdown, and HTML. `--limit` caps list views only — it never filters
 aggregates. To bound an expensive audit explicitly, use `--sample N`, which
-audits the newest N sessions and names the exclusion in every format.
+audits the first N sessions of the active `--sort`/`--order` view
+(newest-first by default) and names that view in the exclusion reason, in
+every format.
 
 Use JSON for automation, Markdown for PR artifacts, HTML for a self-contained visual report, or text for terminal review:
 
@@ -34,7 +36,7 @@ agenttrace --recommend --range 30d -f markdown -o recommendations.md
 agenttrace --audit --range 30d -f json
 ```
 
-The audit groups sessions by source and normalized model, and reports input, output, cache-write, and cache-read tokens; per-million-token rates; estimated component costs; and pricing confidence.
+The audit groups sessions by source and normalized model, and reports input, output, cache-write, and cache-read tokens; per-million-token rates; estimated component costs; and pricing confidence. Thinking tokens (Gemini `thoughtsTokenCount` and OpenAI-compatible `reasoning_tokens`/`thinking_tokens` aliases) are billed at the output rate: they are folded into the output count and additionally broken out as `tokens.reasoning` plus a `reasoning_share_pct` of billed output tokens per model row.
 
 Pricing status is intentionally explicit:
 

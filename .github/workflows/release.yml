@@ -10,7 +10,7 @@ jobs:
     name: Verify release sources
     permissions:
       contents: read
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -37,7 +37,7 @@ jobs:
     name: Build release assets
     permissions:
       contents: read
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -114,7 +114,7 @@ jobs:
   release:
     name: Publish GitHub release
     needs: [build, verify]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       attestations: write

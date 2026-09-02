@@ -934,6 +934,26 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         let doctor = build_doctor_report(Some(&sessions_dir), false);
         assert_eq!(doctor.cache_entries, 1);
         assert_eq!(doctor.cached_valid, 1);
+        // CU-22: --doctor discloses the cache's on-disk size and the hard
+        // bounds save_session_cache enforces, so operators can tell an
+        // entry-count eviction from a byte-ceiling one.
+        assert!(doctor.cache_size_bytes > 0, "cache file exists on disk");
+        assert!(
+            doctor.cache_limits.contains("entries<=20000"),
+            "entry bound disclosed: {}",
+            doctor.cache_limits
+        );
+        assert!(
+            doctor.cache_limits.contains("bytes<=67108864"),
+            "byte bound disclosed: {}",
+            doctor.cache_limits
+        );
+        let rendered = agenttrace_core::render_doctor_report(Some(&sessions_dir), false, "text")
+            .expect("render doctor report");
+        assert!(
+            rendered.contains("hard bounds"),
+            "text doctor output names the bounds: {rendered}"
+        );
 
         fs::write(&session_path, "not a session\n").expect("invalidate session cache entry");
         let after_stale = load_sessions_from_dir(Some(&sessions_dir));
@@ -1862,6 +1882,141 @@ fn rust_discovers_qwen_project_chat_files() {
         assert!(doc
             .pointer(&format!("/dirs/{}", escape_json_pointer(&chat_dir)))
             .is_some());
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_discovers_gemini_cli_tmp_chats_and_checkpoints() {
+    // CU-18: ~/.gemini/tmp (<session-id>/chats|checkpoints/*.json) is the
+    // Gemini CLI session store the README promises; until now it was not a
+    // discovery root at all.
+    let root = temp_root("agenttrace-rust-gemini-tmp");
+    let home = root.join("home");
+    let chats = home
+        .join(".gemini")
+        .join("tmp")
+        .join("sess-1")
+        .join("chats");
+    let checkpoints = home
+        .join(".gemini")
+        .join("tmp")
+        .join("sess-1")
+        .join("checkpoints");
+    let cache_dir = home.join("cache");
+    fs::create_dir_all(&chats).expect("create chats dir");
+    fs::create_dir_all(&checkpoints).expect("create checkpoints dir");
+    let chat_path = chats.join("chat.json");
+    let checkpoint_path = checkpoints.join("cp.json");
+    fs::write(
+        &chat_path,
+        r#"{"checkpoint":{"model":"gemini-2.5-flash","conversation":[{"role":"user","timestamp":"2026-01-02T10:00:00Z","parts":[{"text":"List the failing tests."}]}],"tokenUsage":{"inputTokens":80,"outputTokens":20,"thoughtsTokenCount":40}}}"#,
+    )
+    .expect("write gemini chat");
+    fs::write(
+        &checkpoint_path,
+        r#"{"checkpoint":{"model":"gemini-2.5-pro","conversation":[{"role":"user","timestamp":"2026-01-02T11:00:00Z","parts":[{"text":"Checkpoint."}]}],"tokenUsage":{"inputTokens":8,"outputTokens":2}}}"#,
+    )
+    .expect("write gemini checkpoint");
+
+    with_home_and_cache(&home, &cache_dir, || {
+        let files = find_session_files(None);
+        assert!(
+            files.contains(&chat_path),
+            "chats/*.json must be discovered: {files:?}"
+        );
+        assert!(
+            files.contains(&checkpoint_path),
+            "checkpoints/*.json must be discovered: {files:?}"
+        );
+
+        let sessions = load_sessions_from_dir(None);
+        assert!(
+            sessions.len() >= 2,
+            "both gemini tmp sessions must load: {}",
+            sessions.len()
+        );
+        let thoughts = sessions
+            .iter()
+            .find(|session| session.path == chat_path.to_string_lossy())
+            .expect("chat session loaded");
+        assert_eq!(thoughts.metrics.source_tool, "gemini_cli");
+        assert_eq!(thoughts.metrics.tokens_input, 80);
+        assert_eq!(thoughts.metrics.tokens_output, 60);
+        assert_eq!(
+            thoughts.metrics.tokens_reasoning, 40,
+            "thoughtsTokenCount must reach the reasoning breakdown (CU-20)"
+        );
+        let plain = sessions
+            .iter()
+            .find(|session| session.path == checkpoint_path.to_string_lossy())
+            .expect("checkpoint session loaded");
+        assert_eq!(plain.metrics.source_tool, "gemini_cli");
+        assert_eq!(plain.metrics.tokens_reasoning, 0);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_discovers_antigravity_conversation_sidecars_but_not_the_store() {
+    // CU-19: ~/.gemini/antigravity-cli/conversations/ holds an
+    // undocumented SQLite store (.db) plus protobuf blobs (.pb); only the
+    // JSON trajectory sidecars next to them are a documented, parseable
+    // surface, and only those are admitted.
+    let root = temp_root("agenttrace-rust-antigravity-conversations");
+    let home = root.join("home");
+    let conversations = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations");
+    let cache_dir = home.join("cache");
+    fs::create_dir_all(&conversations).expect("create conversations dir");
+    let sidecar = conversations.join("11111111-2222-3333-4444-555555555555.trajectory.json");
+    fs::write(
+        &sidecar,
+        r#"{"trajectoryId":"11111111-2222-3333-4444-555555555555","trajectoryType":"CORTEX_TRAJECTORY_TYPE_MAIN","steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","status":"COMPLETED","metadata":{"createdAt":"2026-09-01T10:00:00Z"},"userInput":{"userResponse":"Ship the fix"}},{"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","status":"COMPLETED","metadata":{"createdAt":"2026-09-01T10:00:05Z"},"plannerResponse":{"response":"On it.","thinking":"Check the eviction order first.","toolCalls":[{"name":"run_commands","argumentsJson":"{\"commands\":[\"cargo test\"]}"}]}},{"type":"CORTEX_STEP_TYPE_VIEW_FILE","status":"COMPLETED","metadata":{"createdAt":"2026-09-01T10:00:07Z"},"viewFile":{"absolutePathUri":"file:///work/x.rs","startLine":1,"endLine":2}}]}"#,
+    )
+    .expect("write trajectory sidecar");
+    fs::write(
+        conversations.join("store.db"),
+        b"SQLite format 3 binary store",
+    )
+    .expect("write sqlite store");
+    fs::write(conversations.join("blob.pb"), b"protobuf bytes").expect("write pb blob");
+
+    with_home_and_cache(&home, &cache_dir, || {
+        let files = find_session_files(None);
+        assert!(
+            files.contains(&sidecar),
+            "trajectory sidecars must be discovered: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == "db" || ext == "pb")
+            }),
+            "the SQLite store and protobuf blobs must never be admitted: {files:?}"
+        );
+
+        let sessions = load_sessions_from_dir(None);
+        let sidecar_session = sessions
+            .iter()
+            .find(|session| session.path == sidecar.to_string_lossy())
+            .expect("sidecar session loaded");
+        assert_eq!(sidecar_session.metrics.source_tool, "antigravity_cli");
+        assert_eq!(sidecar_session.metrics.user_messages, 1);
+        assert_eq!(sidecar_session.metrics.reasoning_blocks, 1);
+        assert_eq!(sidecar_session.metrics.tool_calls_total, 1);
+        // The VIEW_FILE step uses the wire-case key `absolutePathUri`
+        // (the daemon tags the Go field `json:"absolutePathUri"`); it must
+        // surface as a tool event, never be silently dropped (pass-10 F1).
+        assert_eq!(
+            sidecar_session.metrics.tool_results, 1,
+            "VIEW_FILE must surface as a tool event"
+        );
+        assert_eq!(sidecar_session.metrics.events_total, 3);
     });
 
     let _ = fs::remove_dir_all(root);

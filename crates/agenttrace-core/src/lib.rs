@@ -325,6 +325,11 @@ pub struct Metrics {
     pub reasoning_redact: usize,
     pub tokens_input: i64,
     pub tokens_output: i64,
+    /// Thinking tokens reported separately by the source (Gemini
+    /// `thoughtsTokenCount` and OpenAI-compatible `reasoning_tokens`),
+    /// billed at the output rate and already included in
+    /// `tokens_output` (pass-9 CU-20).
+    pub tokens_reasoning: i64,
     pub tokens_cache_w: i64,
     pub tokens_cache_r: i64,
     #[serde(skip)]
@@ -635,6 +640,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     metrics.tokens_output = metrics
                         .tokens_output
                         .saturating_add(usage_tokens("output_tokens"));
+                    metrics.tokens_reasoning = metrics
+                        .tokens_reasoning
+                        .saturating_add(usage_tokens("reasoning_tokens"));
                     metrics.tokens_cache_w = metrics
                         .tokens_cache_w
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));

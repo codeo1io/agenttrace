@@ -15,6 +15,11 @@ pub struct DoctorReport {
     pub cache_entries: usize,
     pub cache_dirs: usize,
     pub cached_valid: usize,
+    /// On-disk size of `sessions.json`, zero when absent.
+    pub cache_size_bytes: u64,
+    /// The hard bounds `save_session_cache` enforces before serializing
+    /// (entries and serialized bytes; pass-9 CU-22).
+    pub cache_limits: String,
     pub sessions: usize,
     pub session_files: usize,
     pub directories: Vec<DoctorDirReport>,
@@ -87,6 +92,14 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_entries: cache.entries.len(),
         cache_dirs: cache.dirs,
         cached_valid,
+        cache_size_bytes: std::fs::metadata(&cache.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+        cache_limits: format!(
+            "entries<={}, bytes<={}",
+            crate::session_cache::MAX_SESSION_CACHE_ENTRIES,
+            crate::session_cache::MAX_SESSION_CACHE_BYTES
+        ),
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
         directories: doctor_directories(dir, &files, &sqlite_sessions),
@@ -264,6 +277,10 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     out.push_str(&format!(
         "  {} parsed session cache entries, {} reusable for this scan, {} cached directory listings\n",
         report.cache_entries, report.cached_valid, report.cache_dirs
+    ));
+    out.push_str(&format!(
+        "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first)\n",
+        report.cache_size_bytes, report.cache_limits
     ));
     out.push_str("\nProviders:\n");
     for dir in &report.directories {

@@ -212,6 +212,44 @@ fn governance_sampling_is_explicit_and_disclosed() {
         sampled["total_estimated_cost"], full["total_estimated_cost"],
         "sampling a subset must change the aggregate"
     );
+    // CU-21: the reason names the active view. `--sample` takes the first
+    // N of the --sort/--order ordering, so the disclosure must say which
+    // ordering produced the sample instead of claiming "newest".
+    let sorted = run_json(&[
+        "--demo", "--audit", "-f", "json", "--sample", "2", "--sort", "cost", "--order", "asc",
+    ]);
+    let sorted_reason = sorted["excluded_reason"]
+        .as_str()
+        .expect("sorted sample names its exclusion");
+    assert!(
+        sorted_reason.contains("--sort cost"),
+        "reason must name the sort: {sorted_reason}"
+    );
+    assert!(
+        sorted_reason.contains("--order asc"),
+        "reason must name the order: {sorted_reason}"
+    );
+    // The --compare branch carries its own copy of the disclosure string;
+    // pin it too so the twin cannot drift back to "newest".
+    let compared = run_json(&[
+        "--demo",
+        "--compare",
+        "-f",
+        "json",
+        "--sample",
+        "2",
+        "--sort",
+        "cost",
+        "--order",
+        "asc",
+    ]);
+    let compared_reason = compared["excluded_reason"]
+        .as_str()
+        .expect("compare sample names its exclusion");
+    assert!(
+        compared_reason.contains("--sort cost") && compared_reason.contains("--order asc"),
+        "compare reason must name the view: {compared_reason}"
+    );
 
     let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .args(["--demo", "--audit", "--sample", "2"])

@@ -146,6 +146,29 @@ caught the first live upstream format event — Codex zstd rollouts
 (candidate 44) — and pinned the dependency lane's target SQLite at
 3.53.2 with MSRV 1.88.0.
 
+Updated again 2026-09-03 after cycle 5, assessment pass 9, and research
+pass 8. Cycle 5 is committed as HEAD `696206f` ("fix: audit every matching
+session, disclose coverage, and evict stale cache paths"; CU-11..CU-16,
+203/203 tests, `cargo fmt --check` and `cargo clippy --workspace
+--all-targets` clean — re-verified live by assessment pass 9, which also
+re-ran `--demo`/`--doctor` and confirmed the fork PR #1 CI green on the
+exact sha). New sources folded in below: the cycle-5 implementation record
+(`docs/stewardship/2026-09-03-cycle5-implementation-record.md`) and
+reconciliation (`…-cycle5-reconciliation.md`); assessment pass 9
+(`docs/stewardship/2026-09-03-cycle5-adversarial-assessment.md`), which
+found zero repeats of F8-1..F8-10 but opened one **critical stewardship
+finding** (commit `6632014` committed `runs-on: self-hosted` into all three
+workflows while local `master` tracks `origin`/upstream — and upstream PR
+#282, carrying cycles 1–4, was closed unmerged on 2026-09-02 by the fork
+owner citing exactly that contamination, so the hazard has already cost one
+upstream attempt); and research pass 8
+(`docs/stewardship/2026-09-03-research-extensions.md`, candidates 50–51 plus
+strengthened notes on candidates 2/3/19/23/26), which live-verified a
+discovery gap (Gemini CLI `~/.gemini/tmp` and Antigravity
+`~/.gemini/antigravity-cli/conversations/` are invisible to auto-discovery
+while the formats parse fine) and re-censused the landscape (ccusage 18.3k★,
+codeburn 10.7k★, upstream master unmoved at `e005952` since the fork point).
+
 ### Completed in cycle 1 (recorded 2026-09-02)
 
 Preserved history; each entry names the evidence that closed it, as
@@ -338,6 +361,73 @@ assessment pass 8 on freshly built binaries. Record:
   (`discovery.rs:237-239`), so ranged runs push time filtering into
   SQL; no `None`-only parameter remains at the discovery call site.
 
+### Completed in cycle 5 (recorded 2026-09-03)
+
+Cycle 5 is HEAD `696206f`, verified 203/203 tests, fmt/clippy clean, and
+independently re-verified by assessment pass 9 (fresh `cargo test`,
+`--demo --overview -f json`, and `--doctor -d testdata` on rebuilt
+binaries; fork PR #1 CI green on the exact sha per the reconciliation).
+Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
+(CU-11..CU-16, each verified live on the operator corpus).
+
+- **Governance report coverage honesty** (pass-8 F8-1, HIGH; candidate 45).
+  Closed with CU-11: all six governance-class commands audit every matching
+  session by default; sampling moved behind an explicit, always-disclosed
+  `--sample N`; JSON carries `audited_sessions`/`total_sessions`/
+  `excluded_reason` and text/Markdown/HTML lead with the coverage phrase;
+  `--limit` became a pure display cap (also closing P3-5's overview half);
+  and the Go-flag shim's `--sample` value-flag gap was caught and fixed
+  live. Evidence: the F8-1 reproducer inverted — default `--audit --range
+  all` reports `audited=1410 total=1410 cost=701.0454` (was the silently
+  sampled `3.4427`); CLI-smoke pins updated to the new contract. Residual,
+  filed below: the `--sample` exclusion reason hard-codes "newest"
+  regardless of the active `--sort` order (pass-9).
+- **Truthful discovery accounting** (pass-8 F8-2; candidate 46). Closed
+  with CU-12: `data_health.discovered` comes from the loader, `skipped` is
+  parse failures only, and a new `out_of_scope` count separates range- and
+  filter-excluded sources; multi-session SQLite sources render as "N
+  sessions from M sources". Evidence: `--overview --range 1d` reports
+  `discovered=364, parsed=73, out_of_scope=291` (was `discovered=71`).
+- **Session-cache eviction** (pass-8 F8-3; candidate 47). Closed with
+  CU-13: `prune_dead_entries` runs at load (dead paths marked dirty so the
+  shrink persists) and `MAX_SESSION_CACHE_ENTRIES = 20_000` drops
+  oldest-source-mtime entries at save. Evidence: live cycle on the operator
+  cache — 737→721 entries, dead paths 16→0, snapshot 9,366,610→9,340,395
+  bytes; eviction unit-tested including idempotence. Residual, filed
+  below: no byte ceiling on the snapshot (pass-9).
+- **Float hygiene in costing and statistics** (pass-8 F8-5/F8-6; candidate
+  49). Closed with CU-14: `json_float` renders non-finite values as `null`
+  with `data_health.non_finite_costs` forcing confidence low;
+  `convert_litellm` rejects non-finite rates; the divergent `reports.rs`
+  percentile is deleted and all call sites share `crate::percentile`, with
+  a source-level guard against re-introduction.
+- **Docs-contract check for behavioral claims** (pass-8 F8-7/F8-8;
+  candidate 48). Closed with CU-15: the guide's 24-hour auto-refresh claim
+  and stale schema-4 prose replaced with the truth; README (en + zh-CN)
+  documents flags-before-positional plus `--limit`/`--sample` semantics;
+  `check-docs-commands.sh` now greps the real schema constants out of
+  `session_cache.rs` and fails on the removed phrasings — red→green
+  verified against `git show HEAD:`.
+- **Codex zstd rollout handling — minimum cut** (candidate 44 minimum
+  acceptance). Closed with CU-16: `parse_file` sniffs the zstd magic
+  `28 B5 2F FD` and bails with a named, actionable error instead of the
+  misleading "not valid UTF-8"; unit + live probe confirmed. The full
+  decode cut remains open under candidate 44.
+- **Cycle-3 residuals on closed items** (pass 7, confirmed unaddressed
+  at `93aaf05`): the surrogate-repair byte scan has no escaped-backslash
+  lookbehind and can rewrite literal `\uXXXX` text on already-failing
+  lines (`parser.rs:3796`); `SQLITE_SNAPSHOT_SCHEMA_VERSION` stayed 5
+  across CU-5's naming-semantics change (`session_cache.rs:9`), so warm
+  pre-CU-5 snapshots keep serving placeholder names; and per-writer
+  temp suffixes are never swept, so crashed writers leak
+  `*.tmp.<pid>.<seq>` orphans (`session_cache.rs:237`). Acceptance: a
+  backslash-parity guard plus a corpus line; a bump-or-compatible
+  decision on the snapshot schema version pinned by a version test; an
+  orphan sweep on load. Evidence: a corpus line for the lookbehind
+  case; a cache-version test; an orphan-sweep test. Status change,
+  cycle 4: all three residuals closed (CU-10 for the lookbehind and
+  the schema bump, CU-9 for the sweep — see Completed).
+
 ### Hardening lane
 
 - **Local-calendar day windows** (pass-3 P3-2). `--range today` and its
@@ -381,7 +471,9 @@ assessment pass 8 on freshly built binaries. Record:
   inverted (exit 2 while `slower_than_baseline: true`); a clean fixture
   exits 0; both pinned by CLI tests. Status change, cycle 4: closed
   (CU-8 — see Completed); the F8-1 sampling sibling below is the
-  remaining `--limit` semantics question.
+  remaining `--limit` semantics question. Status change, cycle 5: that
+  sibling is closed too — CU-11 makes `--limit` a pure display cap with a
+  stderr redirect note, closing this item's acceptance in full.
 - **Doctor caches what it parses** (pass-3 P3-6). `--doctor` re-parses
   every uncached file on every run and never writes the session cache,
   making the first-run triage path the slowest command on large corpora.
@@ -566,20 +658,8 @@ assessment pass 8 on freshly built binaries. Record:
   threads `options.since` into the SQL push-down
   (`discovery.rs:237-239`); a scan-cost assertion remains desirable
   but the dead-parameter defect is gone.
-- **Cycle-3 residuals on closed items** (pass 7, confirmed unaddressed
-  at `93aaf05`): the surrogate-repair byte scan has no escaped-backslash
-  lookbehind and can rewrite literal `\uXXXX` text on already-failing
-  lines (`parser.rs:3796`); `SQLITE_SNAPSHOT_SCHEMA_VERSION` stayed 5
-  across CU-5's naming-semantics change (`session_cache.rs:9`), so warm
-  pre-CU-5 snapshots keep serving placeholder names; and per-writer
-  temp suffixes are never swept, so crashed writers leak
-  `*.tmp.<pid>.<seq>` orphans (`session_cache.rs:237`). Acceptance: a
-  backslash-parity guard plus a corpus line; a bump-or-compatible
-  decision on the snapshot schema version pinned by a version test; an
-  orphan sweep on load. Evidence: a corpus line for the lookbehind
-  case; a cache-version test; an orphan-sweep test. Status change,
-  cycle 4: all three residuals closed (CU-10 for the lookbehind and
-  the schema bump, CU-9 for the sweep — see Completed).
+
+
 - **Governance report coverage honesty** (pass-8 F8-1, HIGH; research
   candidate 45; the governance sibling of the open "`--limit` and gate
   scoping" item). The audit-class commands (`--audit`, `--recommend`,
@@ -596,7 +676,9 @@ assessment pass 8 on freshly built binaries. Record:
   `audited_sessions`/`total_sessions` plus an exclusion reason while
   text/HTML render "(auditing N of M sessions)". Evidence: a
   regression test asserting audit totals equal overview totals on a
-  shared fixture; the pass-8 reproducer inverted.
+  shared fixture; the pass-8 reproducer inverted. Status change, cycle 5:
+  closed (CU-11 — see Completed); pass 9 filed the residual
+  `--sample`-wording item below.
 - **Truthful discovery accounting** (pass-8 F8-2; research candidate
   46). `data_health` recomputes `discovered` as
   `sessions.len() + skipped`, discarding the loader's true
@@ -607,7 +689,7 @@ assessment pass 8 on freshly built binaries. Record:
   from the loader; ranged runs report parsed versus out-of-range
   separately so "Parse coverage N/M" is true for every range.
   Evidence: a ranged-versus-all test asserting `discovered` is
-  range-independent.
+  range-independent. Status change, cycle 5: closed (CU-12 — see Completed).
 - **Session-cache eviction** (pass-8 F8-3; research candidate 47; the
   still-open acceptance of "Cache and history durability"). The
   session cache never evicts entries whose files are gone —
@@ -618,7 +700,8 @@ assessment pass 8 on freshly built binaries. Record:
   Acceptance: load-time pruning of nonexistent paths plus a documented
   entry or byte bound. Evidence: a before/after size measurement on
   the operator corpus; an eviction test asserting pruned paths stay
-  pruned across saves.
+  pruned across saves. Status change, cycle 5: closed (CU-13 — see
+  Completed); the byte-ceiling residual pass 9 measured is filed below.
 - **Float hygiene in costing and statistics** (pass-8 F8-5/F8-6;
   research candidate 49). `json_float` falls through to
   `.expect("float serializes")` for inf/NaN (`reports.rs:1446-1452`),
@@ -632,7 +715,8 @@ assessment pass 8 on freshly built binaries. Record:
   `convert_litellm` rejects non-finite rates, and one percentile
   implementation serves everywhere. Evidence: a poisoned-catalog
   fixture producing JSON instead of a panic; a parity test pinning the
-  single percentile definition.
+  single percentile definition. Status change, cycle 5: closed (CU-14 —
+  see Completed; re-verified by pass 9 at `reports.rs:1462-1475`).
 - **Docs-contract check for behavioral claims** (pass-8 F8-7/F8-8;
   research candidate 48; extends "CI that tells the truth").
   `docs/guides/governance-reports.md:52-55` still claims snapshot schema
@@ -644,7 +728,9 @@ assessment pass 8 on freshly built binaries. Record:
   schema number equals the `session_cache.rs` constant, no guide
   claims automatic network refresh, and README documents
   flags-before-positional. Evidence: the check fails on current guide
-  text and passes after correction.
+  text and passes after correction. Status change, cycle 5: closed (CU-15 —
+  see Completed; the contract check now reads the schema constants from
+  source).
 - **Repository and hot-path hygiene** (pass-8 F8-10/F8-9, INFO; F8-9
   extends the installer-checksum acceptance of "Platform and channel
   parity"). Four untracked worktree files linger (two stewardship
@@ -660,6 +746,83 @@ assessment pass 8 on freshly built binaries. Record:
   `builtin_pricing` behind a `OnceLock`; both installers verify a
   checksum. Evidence: `git status --short` free of pre-existing
   carryovers; a checksum test vector for each installer.
+- **Upstream-portable branch and CI hygiene** (pass-9, CRITICAL
+  stewardship; evidence from upstream, not just local review). Commit
+  `6632014` committed `runs-on: self-hosted` into `ci.yml:21`,
+  `release.yml:13/40/117`, and `dependency-review.yml:16` (AGENTS.md rule
+  3), and those commits sit on local `master`, whose tracking target is
+  `origin` = upstream `luoyuctl/agenttrace` — a plain `git push` from
+  `master` ships the runner override and all fork work upstream (rules
+  1–3). The hazard is proven, not hypothetical: upstream PR #282 (cycles
+  1–4, +11,362/−260) was closed unmerged on 2026-09-02 by the fork owner
+  citing exactly this contamination, and the owner stated a cleaned,
+  upstream-only PR can follow. Acceptance: no branch intended for upstream
+  carries `runs-on: self-hosted` (a check script greps the three workflows
+  on candidate upstream-bound branches); local `master`'s upstream is
+  repointed to `fork/master` or `master` stops carrying work ahead of
+  upstream; the cleaned re-apply rides a fork feature branch only, per
+  rule 2 and rule 4 (operator approval before any upstream PR). Evidence:
+  `git config branch.master.remote` prints `fork`; a grep shows zero
+  `self-hosted` matches on the candidate branch; the reconciliation record
+  shows upstream `e005952` unmoved.
+- **`--sample` disclosure must name the active ordering** (pass-9; the
+  residual of the closed F8-1). The exclusion reason hard-codes
+  "sampled newest {N} of {M}" (`main.rs:249-251` and `:292-294`), but the
+  sampled vector is ordered by the user's `--sort` (`--sort name` yields
+  name-first, not newest), so the disclosure can be factually wrong.
+  Acceptance: the reason names the active ordering (for example "sampled
+  first N by sort order (name)") or `--sample` is rejected for non-time
+  sorts. Evidence: a CLI test running `--audit --sort name --sample N`
+  asserting the reason string matches the sort key.
+- **Untrusted git-root selection and unmemoized project resolution**
+  (pass-9; extends the open N10 cost-ceiling item with a
+  privacy/robustness angle). `resolve_project` walks up from the
+  session-recorded `cwd` (untrusted log content) to the nearest `.git`
+  (`insights.rs:166-231`), then delivery evidence runs
+  `git -C <root> log --all` (`governance.rs:746-775`), embedding commit
+  timestamps of arbitrary local repositories into shareable reports; argv
+  is used (no shell injection), but untrusted content selects the
+  subprocess target, and `resolve_project`/`git_root` is recomputed per
+  session per report with no memoization (O(sessions × path depth) stat
+  calls plus one git spawn per distinct root). Acceptance: git roots are
+  restricted to directories the discovery pass actually scanned (or the
+  correlation is opt-in and labeled), roots are memoized per normalized
+  path, and each root's git query runs under a timeout in a bounded pool
+  (folding N10's acceptance in). Evidence: a fixture whose session `cwd`
+  points outside the scanned tree produces a labeled
+  no-correlation verdict instead of committing a foreign repo's
+  timestamps; a timing assertion on a multi-root fixture.
+- **Hermes `state.db` tool-failure signal** (pass-9, data quality).
+  Ingestion sets `tool_calls_ok = tool_call_count` and never records
+  failures (`sqlite_sessions.rs:180-196`), so every Hermes session reports
+  a 0% tool fail-rate and optimistic health while file-backed providers
+  surface real failures. Acceptance: the reader extracts a real failure
+  signal from `state.db` where the schema offers one (schema research
+  first: error/status columns on the message or event tables), with
+  provenance disclosing "failures unrecorded" for schemas that lack it.
+  Evidence: a fixture database whose failing calls move the fail-rate off
+  zero, or a documented schema finding that no signal exists plus the
+  provenance label in reports.
+- **Session-cache byte ceiling** (pass-9; the F8-3 follow-on). CU-13's
+  bound is entry-count only (20,000) and entries carry full tool-arg maps
+  and directory listings, so a corpus of large sessions can grow
+  `sessions.json` to hundreds of MB before the count bound trips — the
+  operator snapshot is already 9.3 MB at 721 entries, and every dirty save
+  rewrites the whole file. Acceptance: a documented byte ceiling enforced
+  at save (evicting oldest-source-mtime entries first, same policy as the
+  count bound) with the limit surfaced in `--doctor`. Evidence: a unit
+  test constructing over-ceiling entries asserting the persisted size
+  stays under the ceiling; a doctor run printing the bound.
+- **TUI force-reload cache race** (pass-9, INFO). The background loader
+  thread owns the session cache while the main thread can clear it on a
+  force reload (`app.rs:881-951`); reloads are guarded by `pending_load`,
+  but clear/delete racing a concurrent thread save can resurrect a stale
+  cache or leave a benign orphan temp. No user-data corruption is
+  possible. Acceptance: force reload invalidates the in-flight loader's
+  write path (generation counter or cache ownership moved to the loader
+  exclusively), or the race is documented as benign with a test pinning
+  the worst case. Evidence: a concurrency test asserting a forced clear
+  during an in-flight load cannot persist pre-clear entries.
 
 ### Capability lane (researched, prioritized)
 
@@ -677,7 +840,16 @@ assessment pass 8 on freshly built binaries. Record:
   2026-08-20 (brink 52★, AIUsageMonitor, trayt, switchboard, plus the
   rotation tools claude-unlimited/carousel/kicker) are all live
   monitoring or limit relief — none post-run diagnosis — so the
-  diagnosis framing stays the differentiator.
+  diagnosis framing stays the differentiator. Strengthened by research
+  pass 8: budget caps and month-end pace projection are now
+  ecosystem-validated wants — claude-cost-tracker-mcp ships both (plus
+  per-model breakdown), codeburn (10.7k★) is cross-tool budget
+  attribution, and upstream #103 (10 comments) asks for the same — so
+  this candidate gains an optional acceptance: explicit budget caps
+  (per-day/month/project) evaluated post-run with a
+  `--fail-over-budget` exit gate reusing CU-8's gate machinery, and a
+  month-end pace projection line in the overview; framed as diagnosis,
+  never billing.
 - **Second pricing and model-metadata source** (research candidate 4,
   models.dev). Acceptance: the catalog accepts multiple upstreams with
   per-model provenance and a documented precedence rule; context-window
@@ -715,7 +887,14 @@ assessment pass 8 on freshly built binaries. Record:
   6: Claude Code fixed managed-OTEL settings being ignored on warm
   starts — a live, managed producer posture worth citing in the
   ingest-half design — and the dedicated conventions repo is still
-  tagless (re-verified), so the export schema stays tag-gated.
+  tagless (re-verified), so the export schema stays tag-gated. Research
+  pass 8: Claude Code's CLI now documents native OTel in all three signals
+  (`CLAUDE_CODE_ENABLE_TELEMETRY` plus `OTEL_METRICS_EXPORTER`/
+  `OTEL_LOGS_EXPORTER`/`OTEL_TRACES_EXPORTER` — counters for tokens,
+  cost, sessions, LOC, and tool decisions; traces beta), strengthening the
+  ingest half's live-producer posture; and the dedicated conventions repo
+  now marks many `gen_ai.*` attributes Stable while remaining tagless, so
+  the tag-gated pin stands.
 - **Shareable baseline config and multi-machine merge** (research candidate
   7). Acceptance: a committed `.agenttrace.toml` carries gate thresholds,
   pricing overrides, and model aliases with defined precedence over flags;
@@ -849,7 +1028,13 @@ assessment pass 8 on freshly built binaries. Record:
   sampling, structuredContent) — target it; the read-only analytics
   tools need no redesign under the new optional capabilities. Research
   pass 6: shares the read-only tool contract with candidate 37's skill
-  surface — settle one contract before either ships.
+  surface — settle one contract before either ships. Research pass 8: a
+  live MCP usage-analytics server now exists
+  (yuziri-open/claude-cost-tracker-mcp: `track_usage`,
+  `get_current_session`, `get_daily_summary`, `get_monthly_summary`),
+  validating both the demand and a tool taxonomy agenttrace's read-only
+  diagnosis set (`session_overview`, `top_sessions`, `anomalies`,
+  `compare_baseline`) can adopt or extend.
 - **SARIF 2.1.0 export for CI gates** (research candidate 20). Gate and
   anomaly findings exist only in agenttrace's own JSON; SARIF is the
   interchange format GitHub code scanning ingests from any CLI.
@@ -886,7 +1071,9 @@ assessment pass 8 on freshly built binaries. Record:
   databases — and upstream's `rust-version` moves to 1.88.0; pass 8
   (F8-4) re-flagged the staleness and found `cargo audit` unavailable
   in this environment, so the lane should add an advisory-scan CI job
-  alongside the bumps.
+  alongside the bumps. Research pass 8: upstream's dependabot queue
+  still holds #278/#279 plus `actions/checkout` 6→7 (#259, open since
+  June) — fold all three.
 - **Cost provenance for priced sessions** (research candidate 24,
   confidence 86%; implements the promotion path named in issue #103).
   The vendored snapshot collapses every provider of a model onto one bare
@@ -920,7 +1107,12 @@ assessment pass 8 on freshly built binaries. Record:
   local evidence yet. Acceptance: dual-output files accepted as a
   documented `-d` input with fixtures, after first verifying whether the
   Gemini parser already accepts the shape. Evidence: a real dual-output
-  fixture in `testdata/`; doctor and docs updated.
+  fixture in `testdata/`; doctor and docs updated. Research pass 8: the
+  official docs now pin the surfaces precisely — `/export` writes
+  Markdown, JSONL, or HTML (default HTML since the 2026-05-14 weekly
+  update), and Dual Output documents its event schema plus a reverse
+  `--input-file` control channel — so the fixture work has a published
+  contract to verify against (upstream radar #237).
 - **Release-channel identity and an all-channel version guard** (research
   candidate 27, confidence 70%; issue #272). The npm package is
   `@zack78/agenttrace` while Homebrew and WinGet publish as
@@ -1059,7 +1251,45 @@ assessment pass 8 on freshly built binaries. Record:
   actionable error surfaced in doctor/data-health; full: decode behind
   a feature flag. Evidence: a zstd-magic fixture producing the named
   error (or parsing, in the full cut); a canary test pinning the
-  behavior.
+  behavior. Status change, cycle 5: the minimum acceptance is met (CU-16 —
+  see Completed; zstd magic sniffed with a named, actionable error); the
+  full decode cut remains this item's open half.
+- **Gemini CLI and Antigravity conversations discovery roots** (research
+  candidate 50, confidence 100% — verified live; upstream radar #236).
+  Auto-discovery finds neither `~/.gemini/tmp` (Gemini CLI's session
+  store, where the existing helper predicates already expect a depth-4
+  walk over `chats`/`checkpoints` subdirs — `discovery.rs:533`,
+  `:584-590`) nor `~/.gemini/antigravity-cli/conversations/` (where
+  official Antigravity docs and the platform's own skill reference say
+  conversation histories live; agenttrace scans only `…/brain`, accepting
+  just `…/.system_generated/logs/transcript.jsonl`). Verified live this
+  pass: a valid Gemini checkpoint in `~/.gemini/tmp` and an Antigravity
+  conversation in `…/conversations/` are both invisible to
+  auto-discovery (`Session files: 0` under a synthetic `HOME`) while the
+  same Gemini file parses cleanly when passed positionally — the README
+  lists Gemini CLI as supported, so this is a claimed-capability gap, not
+  a nice-to-have. Acceptance: two `KnownSessionDir` roots added with
+  fixtures proving both shapes load end to end through auto-discovery
+  (not just positional parsing), `--doctor` reporting both as found, and
+  README/provider tables staying truthful; an Antigravity fixture must
+  come from or be validated against a real `conversations/` file, since
+  the committed fixture covers the brain/log shape. Evidence: the
+  synthetic-`HOME` reproducer inverted (found > 0 for both roots); unit
+  tests pinning the root list; the fixture round trip.
+- **Pricing snapshot age disclosure and scheduled refresh** (research
+  candidate 51, confidence high; serves open issue #103's honesty half).
+  The bundled snapshot is dated `2026-09-02`
+  (`pricing.rs:16`, pinned by test) while the LiteLLM catalog commits
+  multiple times per day (three commits on 2026-09-02 alone), so shipped
+  binaries age immediately and nothing tells the user how stale their
+  rates are; refresh is manual (`--update-pricing`) by privacy design,
+  which stays. Acceptance: `data_health` (and the text overview) carry a
+  `pricing_snapshot_age_days` line with a soft staleness warning past a
+  documented threshold; `scripts/pricing/update-snapshot.sh` runs on a
+  scheduled quarantined workflow (network-explicit, like the canary
+  policy) opening a PR rather than committing directly. Evidence: a test
+  pinning the age computation against a fixed clock; a workflow file plus
+  one opened refresh PR as the artifact.
 
 Candidates 41 (Windows-source leniency: BOM/UTF-16 plus the P7-1 lenient
 fallback) and 42 (baseline gate exit semantics) were filed in the
@@ -1069,7 +1299,15 @@ candidates 43 (catalog-tiered cache and reasoning pricing) and 44
 (Codex zstd rollout handling) above, plus hardening candidates 45–49
 (governance coverage honesty, truthful discovery accounting, cache
 eviction, float hygiene, docs-contract checks) filed in the hardening
-lane under their pass-8 finding IDs.
+lane under their pass-8 finding IDs. Research pass 8 adds capability
+candidates 50 (Gemini CLI and Antigravity conversations discovery roots)
+and 51 (pricing snapshot age disclosure and scheduled refresh) above,
+files pass-9 hardening items (upstream-portable branch and CI hygiene,
+`--sample` ordering disclosure, untrusted git-root selection,
+Hermes tool-failure signal, cache byte ceiling, TUI reload race) in the
+hardening lane, and strengthens candidates 2/3/19/23/26 with the
+current census (ccusage 18.3k★, codeburn 10.7k★, upstream master
+unmoved at `e005952` since the fork point).
 
 Items leave this section only when their acceptance criteria and evidence
 expectations are met and recorded in the Completed record above, and the
