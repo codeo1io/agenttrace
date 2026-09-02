@@ -92,6 +92,11 @@ struct Args {
     baseline_max_cost_delta_pct: f64,
     #[arg(long = "baseline-max-token-delta-pct", default_value_t = 0.0)]
     baseline_max_token_delta_pct: f64,
+    /// Opt out of the baseline regression gate: keep the comparison in the
+    /// report but do not fail the run (exit 2) on a threshold breach
+    /// (pass-7 P7-3).
+    #[arg(long = "no-baseline-gate")]
+    no_baseline_gate: bool,
     #[arg(long = "lang", default_value = "en", value_name = "en|zh")]
     lang: String,
     #[arg(long, default_value = "all")]
@@ -371,11 +376,12 @@ fn run() -> anyhow::Result<()> {
                 args.include_history,
             ),
         };
+        let mut baseline_breaches = None;
         if let Some(baseline) = args.baseline.as_deref() {
             if args.format != "json" {
                 bail!("--baseline requires --overview -f json");
             }
-            out = add_baseline_comparison(
+            let (compared, breaches) = add_baseline_comparison(
                 &out,
                 baseline,
                 BaselineThresholds {
@@ -384,6 +390,8 @@ fn run() -> anyhow::Result<()> {
                     max_token_delta_pct: args.baseline_max_token_delta_pct,
                 },
             )?;
+            out = compared;
+            baseline_breaches = Some(breaches);
         }
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
@@ -419,6 +427,28 @@ fn run() -> anyhow::Result<()> {
             };
             eprintln!("- inspect: `{inspect}`");
             std::process::exit(2);
+        }
+        // Pass-7 P7-3: a baseline threshold breach used to leave the
+        // booleans buried in the JSON while the process exited 0 — the
+        // opposite of what a gate promises. Breach now exits 2 (mirroring
+        // the health gate) unless --no-baseline-gate opts out.
+        if !args.no_baseline_gate {
+            if let Some(breaches) = baseline_breaches.filter(|b| b.any()) {
+                eprintln!("Gate failed: baseline regression above threshold");
+                eprintln!("Local evidence:");
+                if breaches.slower_than_baseline {
+                    eprintln!("- duration delta above --baseline-max-duration-delta-pct");
+                }
+                if breaches.cost_above_threshold {
+                    eprintln!("- cost delta above --baseline-max-cost-delta-pct");
+                }
+                if breaches.tokens_above_threshold {
+                    eprintln!("- token delta above --baseline-max-token-delta-pct");
+                }
+                eprintln!("- inspect: `baseline_comparison` in the report JSON");
+                eprintln!("- opt out: --no-baseline-gate");
+                std::process::exit(2);
+            }
         }
         return Ok(());
     }
@@ -537,6 +567,7 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--baseline-max-duration-delta-pct"
             | "--baseline-max-cost-delta-pct"
             | "--baseline-max-token-delta-pct"
+            | "--no-baseline-gate"
             | "--lang"
             | "--range"
             | "--project"
@@ -1255,6 +1286,7 @@ mod tests {
             baseline_max_duration_delta_pct: 0.0,
             baseline_max_cost_delta_pct: 0.0,
             baseline_max_token_delta_pct: 0.0,
+            no_baseline_gate: false,
             lang: "en".to_string(),
             range: "all".to_string(),
             project: String::new(),

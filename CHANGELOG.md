@@ -4,6 +4,16 @@
 
 ### Changed
 
+- The generic-JSONL fallback no longer silently drops recoverable lines (pass-7 P7-1): a lone-surrogate line is repaired via the same lenient machinery the format detectors use, an Event-typed usage block (`"usage": {"input": {"tokens": 5}}`) and numeric-string usage coerce instead of failing the whole event, and a lowercase `usage` key is no longer invisible next to `Usage`. Lines that still cannot parse are counted per reason and surfaced everywhere: per-session `metrics.line_skips`, aggregate `data_health.line_skips`, and a `Dropped lines` row in the text, Markdown, and HTML overviews; any lost line also caps `data_health.confidence` at `low`.
+- Baseline regression thresholds now gate the exit code (pass-7 P7-3): `--baseline` with any `--baseline-max-*-delta-pct` breach fails the run with exit 2 (mirroring `--fail-under-health`) and names the breached thresholds on stderr, where the breach booleans previously sat unread in the report JSON while the process exited 0. `--no-baseline-gate` keeps the comparison in the report without failing the build.
+- Session files written with a UTF-8 BOM now parse (one BOM is stripped at the shared parse entry, and nowhere else — a U+FEFF inside content survives), and UTF-16 files fail with a named, actionable error (`... is UTF-16 encoded; convert it to UTF-8 and retry`) instead of a generic read failure (pass-7 P7-2). PowerShell 5.1's default `>` redirection produces exactly this shape.
+- The pricing-catalog cache and the derived-history file now stage through a unique temp sibling and rename into place (pass-7 P7-5), extending the pass-6 atomic-write hardening to the last two raw `fs::write` callers; a torn or corrupt `history.json` is quarantined as `history.json.corrupt` with a visible warning instead of silently wiping the durable record, and orphaned `<name>.json.tmp.<pid>.<seq>` siblings are swept (age > 1 hour) whenever the session cache loads.
+- The lone-surrogate repair no longer rewrites literal `\\uXXXX` text: escaped-backslash pairs advance together, so `"\\ud800"` (an escaped backslash followed by `ud800`) keeps its literal bytes while a real lone surrogate in the same line still repairs (cycle-3 residual).
+- The SQLite snapshot cache schema was bumped 5 → 6: cycle 3's placeholder-name rewrite shipped while the version stayed at 5, so v5 snapshots could carry stale names under new semantics; they now regenerate (cycle-3 residual).
+- Fixed a `clippy::useless_format` finding in the TUI provider/model row label under the current toolchain.
+
+### Added
+
 - Extended the token and cost hardening to the SQLite ingestion paths (OpenCode `opencode.db` and Hermes `state.db`), which the first hardening pass had missed: adversarial token counts now saturate instead of overflowing the per-session accumulator (a crafted database previously crashed debug builds with exit 101) or wrapping negative (`u64::MAX` previously reported `"input": -1`), and negative token columns in Hermes databases are clamped to zero. The earlier entry below claimed repo-wide coverage that this path disproved; it is now true.
 - SQLite-backed OpenCode sessions now prefer the authoritative totals recorded on the session row (`cost` and the five token columns) over message-derived aggregation when present, keep the derived path for older schemas, and disclose the choice: `provenance.tokens` reports `stored_session_totals`, the per-session `stored_totals_delta` exposes how far derived aggregation drifted, and `data_health` summarizes both (`stored_totals_sessions`, `stored_totals_delta_tokens`). The SQLite snapshot cache schema was bumped (v5) so cached entries regenerate under the new semantics.
 - Sessions with an unknown start time (for example OpenCode rows with `time_created = 0`) are no longer silently dropped from `--range`/`--since` views; they stay visible in an unknown-time bucket and `data_health` reports the count as `unknown_time_sessions`.
@@ -23,6 +33,7 @@
 
 ### Added
 
+- Committed generic-loss adversarial fixture (`testdata/generated/adversarial/generic-loss.jsonl`) pinning the pass-7 P7-1 shapes: a recovered lone-surrogate line, a coerced Event-typed usage line, and a counted unparseable line, asserted from file through `data_health`.
 - A test pinning `PRICING_SNAPSHOT_DATE` to the bundled `pricing_snapshot.json` payload's `_snapshot.date`, so the const and the snapshot can no longer drift apart silently.
 - Committed adversarial SQLite repro fixtures (`testdata/generated/adversarial/sqlite/`, regenerable via `scripts/fixtures/make-adversarial-sqlite.py`) with regression tests covering the overflow, wrap, negative-column, stored-totals, and unknown-time paths.
 

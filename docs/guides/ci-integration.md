@@ -122,6 +122,11 @@ jobs:
             --baseline-max-cost-delta-pct 15 \
             --baseline-max-token-delta-pct 20 \
             -o agenttrace-overview.json
+          # Since the pass-7 fix (P7-3), a breach of any --baseline-max-*
+          # threshold fails the step with exit 2, exactly like
+          # --fail-under-health — previously the booleans sat unread in
+          # the JSON while the step stayed green. Add --no-baseline-gate
+          # to keep the comparison informative without failing the build.
       - name: Write Markdown summary
         if: always()
         run: |

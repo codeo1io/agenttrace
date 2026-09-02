@@ -6,7 +6,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 17;
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 5;
+// Bumped 5 → 6 (cycle-4 CU-10): cycle 3's naming change (placeholder
+// titles replaced by first-user-message names) shipped while this stayed
+// at 5, so v5 snapshots can carry stale names under new semantics. The
+// version check regenerates them on next use.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 6;
+
+/// Orphaned temp files (crashed writers) are swept when the cache loads.
+/// Live writers finish quickly; one hour is generous enough that a sweep
+/// never races an in-flight write (pass-7 P7-5).
+const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionCache {
@@ -136,6 +145,14 @@ struct GoMetrics {
     cost_estimated: f64,
     #[serde(default, rename = "StoredTotalsDelta")]
     stored_totals_delta: i64,
+    /// Parse lines lost inside the session source, by reason (pass-7
+    /// P7-1). Preserved across cache round-trips; absent on clean parses.
+    #[serde(
+        default,
+        rename = "LineSkips",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    line_skips: BTreeMap<String, usize>,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
 }
@@ -233,8 +250,9 @@ fn store_sqlite_snapshot_at(
 /// `<name>.json.tmp` sibling made two concurrent agenttrace processes race
 /// on the same temp file, failing or tearing the save. The suffix is unique
 /// per process and per write within the process; the atomic rename is
-/// unchanged.
-fn unique_temp_path(path: &Path) -> PathBuf {
+/// unchanged. Shared by the pricing-catalog and derived-history writes
+/// (pass-7 P7-5).
+pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -245,6 +263,43 @@ fn unique_temp_path(path: &Path) -> PathBuf {
         .to_string();
     name.push_str(&format!(".tmp.{}.{}", std::process::id(), seq));
     path.with_file_name(name)
+}
+
+/// Remove temp files left behind by crashed writers (pass-7 P7-5):
+/// `<name>.json.tmp.<pid>.<seq>` siblings in the cache directory older
+/// than `max_age`. Returns how many were removed. Live writers finish
+/// quickly, so a generous `max_age` keeps the sweep from racing one.
+pub(crate) fn sweep_orphaned_temps(path: &Path, max_age: std::time::Duration) -> usize {
+    let Some(dir) = path.parent() else {
+        return 0;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.contains(".tmp.") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(now);
+        if now
+            .duration_since(modified)
+            .unwrap_or(std::time::Duration::ZERO)
+            >= max_age
+            && fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn sqlite_snapshot_path(name: &str) -> PathBuf {
@@ -269,6 +324,7 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
 
 pub fn load_session_cache() -> SessionCache {
     let path = session_cache_path();
+    sweep_orphaned_temps(&path, ORPHAN_TEMP_MAX_AGE);
     let Ok(raw) = fs::read_to_string(&path) else {
         return SessionCache {
             path,
@@ -696,6 +752,7 @@ impl GoMetrics {
             duration_sec: metrics.duration_sec,
             cost_estimated: metrics.cost_estimated,
             stored_totals_delta: metrics.stored_totals_delta,
+            line_skips: metrics.line_skips.clone(),
             provenance: metrics.provenance.clone(),
         }
     }
@@ -731,6 +788,7 @@ impl GoMetrics {
             duration_sec: self.duration_sec,
             cost_estimated: self.cost_estimated,
             stored_totals_delta: self.stored_totals_delta,
+            line_skips: self.line_skips.clone(),
             provenance: self.provenance,
         }
     }
@@ -926,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_five_round_trips_provenance_and_rejects_schema_four() {
+    fn sqlite_snapshot_schema_six_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -959,7 +1017,10 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        assert_eq!(doc["schema_version"], 5);
+        // Version six (cycle-4 CU-10): cycle 3 shipped the placeholder-name
+        // rewrite while the version stayed at five, so v5 snapshots can
+        // carry stale names under new semantics and must regenerate.
+        assert_eq!(doc["schema_version"], 6);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -970,19 +1031,44 @@ mod tests {
             Some(&serde_json::Value::from(720)),
             "the stored-versus-derived delta must survive the snapshot cache"
         );
-        let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema five cache hit");
+        let loaded = load_sqlite_snapshot_from(&database, &snapshot).expect("schema six cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(4);
+        old["schema_version"] = serde_json::Value::from(5);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema three json"),
+            serde_json::to_vec(&old).expect("schema five json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn orphaned_temp_siblings_are_swept_on_cache_load() {
+        // Pass-7 P7-5: a crashed writer leaves `<name>.json.tmp.<pid>.<seq>`
+        // siblings behind forever. The sweep (run when the cache loads,
+        // production age one hour) removes only temp siblings past the
+        // age; real cache files are never touched.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-sweep-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let cache = root.join("sessions.json");
+        fs::write(&cache, b"{}").expect("write cache");
+        let orphan = unique_temp_path(&cache);
+        fs::write(&orphan, b"torn").expect("write orphan temp");
+        let neighbor = root.join("unrelated.txt");
+        fs::write(&neighbor, b"keep").expect("write neighbor");
+        let removed = sweep_orphaned_temps(&cache, std::time::Duration::ZERO);
+        assert_eq!(removed, 1, "the orphaned temp is removed");
+        assert!(!orphan.exists(), "orphan temp is gone");
+        assert!(cache.exists(), "the cache itself is untouched");
+        assert!(neighbor.exists(), "non-temp neighbors are untouched");
         let _ = fs::remove_dir_all(root);
     }
 }

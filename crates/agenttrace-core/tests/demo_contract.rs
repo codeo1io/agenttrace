@@ -143,21 +143,23 @@ fn demo_baseline_comparison_is_stable_for_identical_report() {
         std::process::id()
     ));
     fs::write(&path, &report).expect("write baseline");
-    let compared: Value = serde_json::from_str(
-        &add_baseline_comparison(
-            &report,
-            path.to_str().unwrap(),
-            BaselineThresholds {
-                max_duration_delta_pct: 1.5,
-                max_cost_delta_pct: 2.5,
-                max_token_delta_pct: 3.5,
-            },
-        )
-        .expect("baseline compare"),
+    let (compared_json, breaches) = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
     )
-    .expect("valid compared json");
+    .expect("baseline compare");
+    let compared: Value = serde_json::from_str(&compared_json).expect("valid compared json");
     let _ = fs::remove_file(path);
 
+    // Identical report vs itself: no threshold is breached, and the
+    // breach booleans the exit-code gate reads (pass-7 P7-3) agree.
+    assert!(!breaches.any());
+    assert!(!breaches.slower_than_baseline);
     assert_eq!(
         compared["baseline_comparison"]["thresholds"]["max_duration_delta_pct"],
         1.5

@@ -128,6 +128,10 @@ pub struct DataHealth {
     /// Sessions whose start time is unknown (empty or unparseable). They
     /// stay visible in time-ranged views instead of being dropped.
     pub unknown_time_sessions: usize,
+    /// Parse lines lost inside otherwise-parsed sessions, by reason
+    /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub line_skips: BTreeMap<String, usize>,
 }
 
 pub fn session_capability(session: &Session) -> &'static str {
@@ -315,6 +319,12 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
         .iter()
         .filter(|s| parse_ts(&s.metrics.session_start).is_none())
         .count();
+    let mut line_skips = BTreeMap::new();
+    for session in sessions {
+        for (reason, count) in &session.metrics.line_skips {
+            *line_skips.entry(reason.clone()).or_insert(0) += count;
+        }
+    }
     DataHealth {
         discovered,
         parsed,
@@ -329,7 +339,12 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
             .max()
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_default(),
-        confidence: if parsed == 0 || skipped > 0 || unknown_sources > 0 || unknown_models > 0 {
+        confidence: if parsed == 0
+            || skipped > 0
+            || unknown_sources > 0
+            || unknown_models > 0
+            || !line_skips.is_empty()
+        {
             "low"
         } else if fallback_pricing > 0 {
             "medium"
@@ -349,6 +364,7 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
         stored_totals_sessions,
         stored_totals_delta_tokens,
         unknown_time_sessions,
+        line_skips,
         with_duration: sessions
             .iter()
             .filter(|s| s.metrics.duration_sec > 0.0)

@@ -1495,10 +1495,7 @@ fn audit_text(audit: &CostAudit, language: Language) -> String {
             coverage.unpriced_or_unknown_sessions
         ),
         String::new(),
-        format!(
-            "{}",
-            text(language, "Provider/model rows", "提供商/模型明细")
-        ),
+        text(language, "Provider/model rows", "提供商/模型明细").to_string(),
     ];
     if audit.by_provider_model.is_empty() {
         lines.push(format!("- {}", text(language, "none", "无")));

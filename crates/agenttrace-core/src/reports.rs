@@ -6,6 +6,7 @@ use crate::{
     Session, ToolCall, VERSION,
 };
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::cmp::Reverse;
@@ -17,6 +18,37 @@ pub struct BaselineThresholds {
     pub max_duration_delta_pct: f64,
     pub max_cost_delta_pct: f64,
     pub max_token_delta_pct: f64,
+}
+
+/// Which baseline thresholds a run breached (pass-7 P7-3). The report
+/// JSON has always carried these booleans; they now also gate the CLI
+/// exit code (exit 2, mirroring `--fail-under-health`) unless
+/// `--no-baseline-gate` opts out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct BaselineBreaches {
+    pub slower_than_baseline: bool,
+    pub cost_above_threshold: bool,
+    pub tokens_above_threshold: bool,
+}
+
+impl BaselineBreaches {
+    pub fn any(&self) -> bool {
+        self.slower_than_baseline || self.cost_above_threshold || self.tokens_above_threshold
+    }
+}
+
+/// Renders per-reason parse-line losses (pass-7 P7-1) for report
+/// surfaces: `unparseable_line=1, event_schema=2`, or empty when the
+/// parse was clean so report bytes stay unchanged for clean corpora.
+fn line_skips_cell(skips: &BTreeMap<String, usize>) -> String {
+    if skips.is_empty() {
+        return String::new();
+    }
+    skips
+        .iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -536,6 +568,12 @@ pub fn report_overview_text_with_context(
         data_health.cache_hits,
         data_health.confidence
     ));
+    if !data_health.line_skips.is_empty() {
+        out.push_str(&format!(
+            "  Dropped lines: {}\n",
+            line_skips_cell(&data_health.line_skips)
+        ));
+    }
     out.push_str(&format!(
         "  Pricing: {} | exact={} fallback={} unknown={}\n",
         audit.pricing_source,
@@ -559,6 +597,12 @@ pub fn report_overview_markdown_with_context(
     let mut out = report_overview_markdown(overview, sessions);
     out.push_str("\n## Scope and confidence\n\n| Field | Value |\n|---|---|\n");
     out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {}/{} parsed; {} skipped; {} cache hits |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", scope.range, scope.earliest_session_at, scope.latest_session_at, data_health.parsed, data_health.discovered, data_health.skipped, data_health.cache_hits, data_health.confidence, markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
+    if !data_health.line_skips.is_empty() {
+        out.push_str(&format!(
+            "| Dropped lines | {} |\n",
+            markdown_cell(&line_skips_cell(&data_health.line_skips))
+        ));
+    }
     render_recommendations_markdown(&mut out, &recommendations(sessions));
     out
 }
@@ -575,6 +619,12 @@ pub fn report_overview_html_with_context(
     let recommendations = recommendations(sessions);
     let mut appendix = String::from("<section><h2>Scope and confidence</h2><table><tbody>");
     appendix.push_str(&format!("<tr><th>Range</th><td>{}</td></tr><tr><th>Session window</th><td>{} → {}</td></tr><tr><th>Parse coverage</th><td>{}/{} parsed; {} skipped; {} cache hits</td></tr><tr><th>Confidence</th><td>{}</td></tr><tr><th>Pricing</th><td>{}</td></tr>", html_escape(&scope.range), html_escape(&scope.earliest_session_at), html_escape(&scope.latest_session_at), data_health.parsed, data_health.discovered, data_health.skipped, data_health.cache_hits, html_escape(&data_health.confidence), html_escape(&audit.pricing_source)));
+    if !data_health.line_skips.is_empty() {
+        appendix.push_str(&format!(
+            "<tr><th>Dropped lines</th><td>{}</td></tr>",
+            html_escape(&line_skips_cell(&data_health.line_skips))
+        ));
+    }
     appendix.push_str("</tbody></table></section>");
     appendix.push_str("<section><h2>Prioritized recommendations</h2><table><thead><tr><th>Priority</th><th>Finding</th><th>Impact</th><th>Action</th></tr></thead><tbody>");
     for item in recommendations.iter().take(12) {
@@ -635,7 +685,7 @@ pub fn add_baseline_comparison(
     report_json: &str,
     baseline_path: &str,
     thresholds: BaselineThresholds,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, BaselineBreaches)> {
     let mut report: Value = serde_json::from_str(report_json)?;
     let baseline: Value = serde_json::from_str(&fs::read_to_string(baseline_path)?)?;
     let summary = report
@@ -690,7 +740,12 @@ pub fn add_baseline_comparison(
     if let Value::Object(obj) = &mut report {
         obj.insert("baseline_comparison".to_string(), comparison);
     }
-    Ok(serde_json::to_string_pretty(&report)?)
+    let breaches = BaselineBreaches {
+        slower_than_baseline: duration_delta > thresholds.max_duration_delta_pct,
+        cost_above_threshold: cost_delta > thresholds.max_cost_delta_pct,
+        tokens_above_threshold: token_delta > thresholds.max_token_delta_pct,
+    };
+    Ok((serde_json::to_string_pretty(&report)?, breaches))
 }
 
 pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String {

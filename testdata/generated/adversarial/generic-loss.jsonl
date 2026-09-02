@@ -1,0 +1,4 @@
+{"role":"user","content":"first line parses cleanly"}
+{"role":"user","content":"lone \ud800 surrogate recovers"}
+{"role":"meta","content":"usage nested event shape","usage":{"input":{"tokens":7}}}
+{"role":"user","content":"broken \uzzzz escape stays skipped"}

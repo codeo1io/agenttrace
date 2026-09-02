@@ -1,7 +1,7 @@
 use agenttrace_core::{
-    build_doctor_report, find_session_files, load_sessions_from_dir, load_sessions_with_options,
-    load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
-    session_cache_path, session_capability, total_tokens, LoadOptions,
+    build_doctor_report, data_health, find_session_files, load_sessions_from_dir,
+    load_sessions_with_options, load_sessions_with_progress, parse_file, render_waste_report,
+    search_sessions, session_cache_path, session_capability, total_tokens, LoadOptions,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -424,6 +424,32 @@ fn unicode_escape_hostile_lines_never_panic_from_format_detection() {
         parsed.is_err(),
         "hostile unicode escapes must leave the file unrecognized, got {parsed:?}"
     );
+}
+
+#[test]
+fn generic_fallback_recovers_recoverable_lines_and_reports_the_rest() {
+    // Pass-7 P7-1 committed reproducer: a lone-surrogate line and an
+    // Event-typed usage line used to vanish from the generic JSONL
+    // fallback with byte-identical health; the broken escape must be
+    // counted as a loss instead of ignored.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata/generated/adversarial/generic-loss.jsonl");
+    let session = parse_file(&fixture).expect("generic-loss fixture parses");
+    assert_eq!(session.metrics.user_messages, 2);
+    assert_eq!(session.metrics.tokens_input, 7);
+    assert_eq!(
+        session.metrics.line_skips,
+        std::collections::BTreeMap::from([("unparseable_line".to_string(), 1)])
+    );
+    // The per-reason losses aggregate into DataHealth (pass-7 P7-1) so
+    // every surface can disclose them.
+    let health = data_health(&[session], 1, 0);
+    assert_eq!(
+        health.line_skips,
+        std::collections::BTreeMap::from([("unparseable_line".to_string(), 1)])
+    );
+    assert_eq!(health.confidence, "low");
 }
 
 #[test]

@@ -58,7 +58,7 @@ pub use reports::{
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_text, report_overview_text_with_context,
-    report_text, report_text_with_language, BaselineThresholds, ReportLanguage,
+    report_text, report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage,
 };
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
@@ -130,7 +130,12 @@ pub struct Event {
     pub tool_call_id: String,
     #[serde(default, rename = "is_error", alias = "IsError")]
     pub is_error: bool,
-    #[serde(default, rename = "Usage")]
+    #[serde(
+        default,
+        rename = "Usage",
+        alias = "usage",
+        deserialize_with = "deserialize_usage_map"
+    )]
     pub usage: BTreeMap<String, i64>,
     #[serde(default, rename = "ModelUsed", deserialize_with = "deserialize_string")]
     pub model_used: String,
@@ -179,6 +184,45 @@ impl<'de> Deserialize<'de> for ToolCall {
             ),
         })
     }
+}
+
+/// Usage maps arrive from untrusted logs in several shapes (pass-7
+/// P7-1): flat integers (the strict contract), numeric strings, and
+/// Event-typed nested objects whose numeric leaves are worth keeping.
+/// Coerce leniently instead of letting the whole event fail to
+/// deserialize and drop the line.
+fn deserialize_usage_map<'de, D>(deserializer: D) -> Result<BTreeMap<String, i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(lenient_usage_map(&value))
+}
+
+fn lenient_usage_map(value: &Value) -> BTreeMap<String, i64> {
+    let mut usage = BTreeMap::new();
+    let Some(object) = value.as_object() else {
+        return usage;
+    };
+    for (key, entry) in object {
+        match entry {
+            // Event-typed usage (e.g. `"input": {"tokens": 5}`): keep the
+            // numeric leaves under a joined name.
+            Value::Object(nested) => {
+                for (leaf_key, leaf) in nested {
+                    if let Some(number) = parser::number_as_i64(leaf) {
+                        usage.insert(format!("{key}_{leaf_key}"), number);
+                    }
+                }
+            }
+            other => {
+                if let Some(number) = parser::number_as_i64(other) {
+                    usage.insert(key.clone(), number);
+                }
+            }
+        }
+    }
+    usage
 }
 
 fn deserialize_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -296,6 +340,11 @@ pub struct Metrics {
     /// authoritative totals stored on the session row (SQLite sources).
     /// Zero unless stored totals were applied.
     pub stored_totals_delta: i64,
+    /// Parse lines lost inside this session's source file, by reason
+    /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
+    /// Empty for clean parses.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub line_skips: BTreeMap<String, usize>,
     pub provenance: MetricProvenance,
 }
 
@@ -374,12 +423,22 @@ pub struct SearchResult {
 pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Session> {
     let mut events = Vec::new();
     let mut line_objects = Vec::new();
+    // Pass-7 P7-1: this fallback used to strict-parse each line and
+    // silently `continue` past recoverable ones (lone surrogates,
+    // Event-typed usage), losing whole lines with no health signal.
+    // Lines now go through the same lenient machinery the format
+    // detectors use, and every loss is counted with a reason.
+    let mut line_skips: BTreeMap<String, usize> = BTreeMap::new();
+    let count_skip = |reason: &str, skips: &mut BTreeMap<String, usize>| {
+        *skips.entry(reason.to_string()).or_insert(0) += 1;
+    };
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+        let Some(value) = parser::parse_jsonl_value_lenient(line) else {
+            count_skip("unparseable_line", &mut line_skips);
             continue;
         };
         if line_objects.len() < 20 {
@@ -391,9 +450,11 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
             .as_object()
             .is_some_and(|object| object.contains_key("type"));
         let Ok(mut event) = serde_json::from_value::<Event>(value) else {
+            count_skip("event_schema", &mut line_skips);
             continue;
         };
         if event.role.is_empty() && !has_event_type {
+            count_skip("non_event", &mut line_skips);
             continue;
         }
         if event.source_tool.is_empty() {
@@ -408,7 +469,11 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
     for event in &mut events {
         event.source_tool = source_tool.to_string();
     }
-    session_from_events(name, path, events)
+    let mut session = session_from_events(name, path, events)?;
+    if !line_skips.is_empty() {
+        session.metrics.line_skips = line_skips;
+    }
+    Ok(session)
 }
 
 fn jsonl_source_tool(objects: &[serde_json::Map<String, Value>]) -> &'static str {
@@ -1512,6 +1577,47 @@ fn severity_rank(severity: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_typed_and_string_usage_coerce_instead_of_dropping_the_event() {
+        // Pass-7 P7-1: strict `BTreeMap<String, i64>` usage rejected the
+        // shapes real agents write, and the generic fallback then dropped
+        // the whole line with no signal.
+        let event: Event = serde_json::from_str(
+            r#"{"role":"user","content":"x","usage":{"input":{"tokens":5},"output":"2"}}"#,
+        )
+        .expect("lenient usage deserializes");
+        assert_eq!(
+            event.usage,
+            BTreeMap::from([("input_tokens".to_string(), 5), ("output".to_string(), 2),])
+        );
+        // Lowercase `usage` used to be invisible next to rename="Usage".
+        let lower: Event =
+            serde_json::from_str(r#"{"role":"user","content":"y","usage":{"input_tokens":"5"}}"#)
+                .expect("lowercase usage key deserializes");
+        assert_eq!(lower.usage.get("input_tokens"), Some(&5));
+    }
+
+    #[test]
+    fn parse_jsonl_session_recovers_recoverable_lines_and_counts_losses() {
+        // Pass-7 P7-1 reproducer: a lone-surrogate line and an Event-typed
+        // usage line used to vanish silently; an unparseable line must be
+        // counted, not ignored.
+        let raw = concat!(
+            "{\"role\":\"user\",\"content\":\"clean\"}\n",
+            "{\"role\":\"user\",\"content\":\"lone \\ud800 tail\"}\n",
+            "{\"role\":\"meta\",\"content\":\"usage\",\"usage\":{\"input\":{\"tokens\":7}}}\n",
+            "{\"role\":\"user\",\"content\":\"broken \\uzzzz }\n",
+        );
+        let session = parse_jsonl_session("generic-loss", "generic-loss.jsonl", raw)
+            .expect("generic fallback parses");
+        assert_eq!(session.metrics.user_messages, 2);
+        assert_eq!(
+            session.metrics.line_skips,
+            BTreeMap::from([("unparseable_line".to_string(), 1)])
+        );
+        assert_eq!(session.metrics.tokens_input, 7);
+    }
 
     #[test]
     fn adversarial_token_counts_stay_bounded_and_non_negative() {

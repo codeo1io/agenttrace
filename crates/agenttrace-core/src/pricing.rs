@@ -331,7 +331,12 @@ fn write_pricing_cache(raw: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, raw)?;
+    // Stage through a unique temp sibling, then rename into place so a
+    // crash mid-write can no longer leave a torn catalog behind
+    // (pass-7 P7-5); sweep_orphaned_temps reclaims the temp.
+    let tmp = crate::session_cache::unique_temp_path(&path);
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 

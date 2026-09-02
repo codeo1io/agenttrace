@@ -2,6 +2,7 @@ use crate::{project_name, Anomaly, Diagnostics, Metrics, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +44,12 @@ pub fn preserve_derived_history(sessions: &[Session]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(&records)?)?;
+    // Stage through a unique temp sibling, then rename into place so a
+    // crash mid-write can no longer tear the only durable record of
+    // derived sessions (pass-7 P7-5).
+    let tmp = crate::session_cache::unique_temp_path(&path);
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&records)?)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -60,10 +66,30 @@ pub fn merge_preserved_history(live: &mut Vec<Session>) {
 }
 
 fn load_records() -> BTreeMap<String, DerivedSession> {
-    std::fs::read(history_path())
-        .ok()
-        .map(|raw| decode_records(&raw))
-        .unwrap_or_default()
+    let path = history_path();
+    let Ok(raw) = std::fs::read(&path) else {
+        return BTreeMap::new();
+    };
+    records_from_bytes(&path, &raw)
+}
+
+/// Decode history bytes; a torn or corrupt file is quarantined (renamed
+/// to `<name>.json.corrupt`, kept for inspection) instead of silently
+/// zeroing the only durable record of derived sessions (pass-7 P7-5).
+fn records_from_bytes(path: &Path, raw: &[u8]) -> BTreeMap<String, DerivedSession> {
+    match serde_json::from_slice::<BTreeMap<String, DerivedSession>>(raw) {
+        Ok(_) => decode_records(raw),
+        Err(_) => {
+            let quarantine = path.with_extension("json.corrupt");
+            let _ = std::fs::rename(path, &quarantine);
+            eprintln!(
+                "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
+                path.display(),
+                quarantine.display()
+            );
+            BTreeMap::new()
+        }
+    }
 }
 
 fn decode_records(raw: &[u8]) -> BTreeMap<String, DerivedSession> {
@@ -180,5 +206,31 @@ mod tests {
         .unwrap();
         assert_eq!(decode_records(&raw).len(), 1);
         assert_eq!(short.into_session().name, "history-x");
+    }
+
+    #[test]
+    fn torn_history_file_is_quarantined_not_silently_discarded() {
+        // Pass-7 P7-5: a half-written history file (interrupted raw write)
+        // used to decode to an empty map and silently wipe the durable
+        // record. It must move aside, visibly, with the bytes preserved.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-corrupt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("history.json");
+        std::fs::write(&path, b"{\"torn\": ").expect("write torn history");
+        let records = records_from_bytes(&path, b"{\"torn\": ");
+        assert!(records.is_empty(), "torn history yields no records");
+        let quarantine = root.join("history.json.corrupt");
+        assert!(
+            quarantine.exists(),
+            "torn history must be quarantined beside the cache"
+        );
+        assert!(!path.exists(), "torn history must not be re-read in place");
+        let preserved = std::fs::read(&quarantine).expect("quarantine preserves bytes");
+        assert_eq!(preserved, b"{\"torn\": ");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

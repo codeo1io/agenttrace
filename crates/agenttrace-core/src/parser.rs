@@ -18,8 +18,19 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             }
         }
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read session file {}", path.display()))?;
+    let raw =
+        std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
+    // Windows tooling (notably PowerShell 5.1's `>` redirection) writes
+    // UTF-16 with a BOM by default; name the encoding instead of failing
+    // with a generic read error (pass-7 P7-2).
+    if raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF]) {
+        bail!(
+            "session file {} is UTF-16 encoded; convert it to UTF-8 and retry",
+            path.display()
+        );
+    }
+    let raw = String::from_utf8(raw)
+        .with_context(|| format!("read session file {} (not valid UTF-8)", path.display()))?;
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
     parse_raw_session(&name, &path_text, &raw)
@@ -61,6 +72,11 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
 }
 
 pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Session> {
+    // Strip one UTF-8 BOM at offset 0 and nowhere else (pass-7 P7-2):
+    // every parse path funnels through this entry, so a single strip
+    // covers every format, and a U+FEFF embedded later in the content
+    // survives as content.
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let trimmed = raw.trim();
     if is_aider_history(path, trimmed) {
         return session_from_events(name, path, parse_aider_chat_history(raw)?);
@@ -3769,7 +3785,11 @@ fn jsonl_objects(raw: &str) -> impl Iterator<Item = Map<String, Value>> + '_ {
         })
 }
 
-fn parse_jsonl_value_lenient(line: &str) -> Option<Value> {
+/// Lenient single-line JSONL parse: strict first, then lone-surrogate
+/// repair. Shared by the format detectors and the generic-JSONL fallback
+/// (`parse_jsonl_session`) so a recoverable line is never silently
+/// dropped (pass-7 P7-1).
+pub(crate) fn parse_jsonl_value_lenient(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(line)
         .ok()
         .or_else(|| repair_lone_surrogates(line).and_then(|line| serde_json::from_str(&line).ok()))
@@ -3799,6 +3819,16 @@ fn repair_lone_surrogates(line: &str) -> Option<String> {
     let mut changed = false;
     let mut i = 0;
     while i < bytes.len() {
+        // Escaped-backslash pairs advance together so literal `\uXXXX`
+        // text (written `\\uXXXX` in the raw line) is never mistaken for
+        // an escape start and rewritten (pass-7 residual on the cycle-3
+        // repair). Both bytes are ASCII, so the slice below cannot cut a
+        // character.
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'\\') {
+            out.push_str(&line[i..i + 2]);
+            i += 2;
+            continue;
+        }
         if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'u') && i + 6 <= bytes.len() {
             if let Some(code) = hex_escape_u16(&bytes[i + 2..i + 6]) {
                 if (0xD800..=0xDBFF).contains(&code) {
@@ -4161,6 +4191,66 @@ fn session_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn bom_is_stripped_once_at_offset_zero_and_nowhere_else() {
+        // Pass-7 P7-2: a UTF-8 BOM used to defeat every format detector
+        // ("unsupported session format"); stripping once at the shared
+        // entry fixes every path, while a U+FEFF embedded later in the
+        // content survives as content.
+        let bom_prefixed = concat!(
+            "\u{feff}",
+            "{\"role\":\"user\",\"content\":\"bom-prefixed\"}\n"
+        );
+        let session =
+            parse_raw_session("bom", "bom.jsonl", bom_prefixed).expect("BOM-prefixed file parses");
+        assert_eq!(session.metrics.user_messages, 1);
+
+        let mid_content = "{\"role\":\"user\",\"content\":\"keeps \u{feff} inside\"}\n";
+        let session =
+            parse_raw_session("mid", "mid.jsonl", mid_content).expect("mid-content BOM parses");
+        assert_eq!(session.metrics.user_messages, 1);
+    }
+
+    #[test]
+    fn utf16_files_fail_with_a_named_encoding_error() {
+        // Pass-7 P7-2: PowerShell's default `>` redirection produces
+        // UTF-16; the failure must name the encoding and the fix, not a
+        // generic invalid-UTF-8 read error.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-utf16-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("utf16.jsonl");
+        // UTF-16LE BOM + `"x"` payload.
+        fs::write(&file, [0xFF, 0xFE, 0x22, 0x00, 0x78, 0x00, 0x22, 0x00])
+            .expect("write utf16 file");
+        let err = parse_file(&file).expect_err("utf16 file must be rejected with a named error");
+        let message = err.to_string();
+        assert!(
+            message.contains("UTF-16"),
+            "error must name the encoding, got: {message}"
+        );
+        assert!(
+            message.contains("convert"),
+            "error must name the remedy, got: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn escaped_backslash_pairs_never_mask_surrogate_repair() {
+        // Pass-7 residual on the cycle-3 repair: literal `\\ud800` text
+        // (an escaped backslash followed by `ud800`) used to be mistaken
+        // for a lone-surrogate escape and rewritten, corrupting the
+        // literal while the real surrogate sat a field later.
+        let line = r#"{"a":"\\ud800","b":"\ud800"}"#;
+        let repaired = repair_lone_surrogates(line).expect("real lone surrogate still repairs");
+        assert_eq!(repaired, r#"{"a":"\\ud800","b":"\ufffd"}"#);
+    }
 
     #[test]
     fn sum_numbers_saturates_alias_pairs_instead_of_overflowing() {

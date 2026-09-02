@@ -99,6 +99,25 @@ and pi and ships a statusline beta, but remains usage/cost aggregation
 only — the defensible center is diagnosis (loops, latency, health,
 governance, TUI drill-down), not accounting.
 
+Updated again 2026-09-02 after cycle 3 and assessment pass 7 plus
+research pass 6. Cycle 3 is committed as HEAD `93aaf05` ("fix: harden
+untrusted-input handling across parsing, accounting, and durability";
+PR #282 open), subsuming the cycle-1/2 tree: 179/179 tests recorded by
+the implementation record and 180/180 re-verified by pass 7 on freshly
+built binaries, with `cargo fmt --check` and `cargo clippy --workspace
+--all-targets` clean. New sources folded in below: the cycle-3
+implementation record
+(`docs/stewardship/2026-09-02-cycle-3-implementation-record.md`, change
+units CU-1..CU-5), pass 7
+(`docs/reviews/2026-09-02-adversarial-repository-assessment-pass7.md`,
+findings P7-1–P7-5), and research pass 6
+(`docs/research/2026-09-02-extensions-research-pass6.md`, candidates
+37–42). Research pass 6 also produced the first fully-quiet upstream
+drift census (Claude Code 2.1.258, ccusage v20.0.20, opencode v1.18.26,
+MCP 2026-07-28, OTel GenAI conventions still tagless) and found the
+skill-channel entrant kelviq/tare (174★, three weeks old) — competitive
+posture notes appear in the capability lane below.
+
 ### Completed in cycle 1 (recorded 2026-09-02)
 
 Preserved history; each entry names the evidence that closed it, as
@@ -179,40 +198,72 @@ independently re-verified by assessment pass 6.
   `opencode_unknown_time_session_stays_visible_in_range`, and the
   TEXT-typed-column regression the batch's own DB-mutation fuzzing found.
 
+### Completed in cycle 3 (recorded 2026-09-02)
+
+Preserved history; evidence as recorded in
+`docs/stewardship/2026-09-02-cycle-3-implementation-record.md`
+(179/179 tests in debug and release, fmt and clippy clean, all runnable
+`scripts/ci/check-*.sh` green) and independently re-verified by
+assessment pass 7 on a freshly built release binary (180/180 at HEAD
+`93aaf05`, the commit carrying cycles 1–3; PR #282 open).
+
+- **UTF-16 escape repair never slices mid-character** (pass-6 P6-1,
+  HIGH). Closed with CU-1: `hex_escape_u16` reads escape hex from bytes
+  with ASCII checks — no `&str` slicing at computed byte indexes; both
+  crash sites (`parser.rs:3785`/`:3791`) are gone. Evidence recorded:
+  fixture-first red→green — the pre-fix run reproduced the exact
+  production panic at `parser.rs:3785:28`; the corpus is committed as
+  `testdata/generated/adversarial/unicode-escape.jsonl` (both pass-6
+  reproducers plus lone/paired repair, `\uzzzz`, truncated, and
+  valid-pair shapes); the release binary now exits 1 with the standard
+  "unsupported session format" degraded error where it previously
+  exited 101 with a panic, and `--doctor`, `--waste`, `--sessions`,
+  `--diagnostics`, `--latest`, and directory scans exit 0 over hostile
+  corpora; a lone `\ud800` becomes U+FFFD while valid pairs survive as
+  😀, asserted end to end; pass 7 re-verified zero panics across a fresh
+  hostile corpus (surrogates, `\uzzzz`, truncated escapes, 5000-deep
+  nesting, `1e400`, NUL/C0 controls, non-UTF-8 bytes). Residual,
+  tracked below: the byte scan has no escaped-backslash lookbehind, so
+  literal `\uXXXX` text on an already-failing line can be rewritten
+  (`parser.rs:3796`).
+- **Honest fallback token accounting** (pass-6 P6-4). Closed with CU-2:
+  the character-versus-byte decision is recorded in code — characters
+  are intended at all three sites; `estimate_tokens_from_text` keeps 4
+  chars/token for ASCII and counts one token per non-ASCII character;
+  `reasoning_chars` counts characters with the unit pinned by test and a
+  doc comment; provenance keeps `estimated_from_text`. Evidence
+  recorded: red→green CJK fixtures (`"中文测试中文测试"` estimates 8
+  tokens, was 6, tolerance ±25% of one-token-per-CJK-character;
+  `reasoning_chars` 4 for `"中文测试"`, was 12). No residual.
+- **`--version` precedence over action validation** (pass-6 P6-2, the
+  residue cycle 2's record named). Closed with CU-3: the early return
+  was hoisted above `validate_primary_action` and
+  `validate_gate_thresholds`, making `CHANGELOG.md`'s claim true rather
+  than rewording it. Evidence recorded: CLI tests pin
+  `agenttrace --overview --version` and the reversed order (exit 0,
+  version banner). No residual.
+- **Cache-persist temp-file race** (pass-6 P6-3). Closed with CU-4:
+  `unique_temp_path` writes `<name>.tmp.<pid>.<seq>` at both persist
+  sites with the same atomic rename. Evidence recorded: an 8-writer
+  concurrent-persist test asserts every save succeeds, the snapshot
+  loads, and no temp file survives. Residual, tracked below: crashed
+  writers can still orphan unique temp siblings (no sweep on load), and
+  the rest of the durability family stays open in the hardening lane.
+- **Placeholder-title gate** (research candidate 34). Closed with CU-5:
+  titles matching `New session - ` are treated as absent, naming falls
+  back to first-user-message text recovered from the `part`⋈`message`
+  join, real provider titles still win, and four-value naming provenance
+  discloses the gate (`provider:placeholder`). Evidence recorded:
+  fixture tests over placeholder/real/empty titles plus the live census
+  — 12/227 local sessions still carried the placeholder at
+  implementation time (215 had provider summaries), so the gate serves
+  exactly the sessions the provider does not summarize. Residual,
+  tracked below: `SQLITE_SNAPSHOT_SCHEMA_VERSION` stayed 5 across the
+  naming change (`session_cache.rs:9`), so warm pre-CU-5 snapshots keep
+  serving placeholder names until invalidated.
+
 ### Hardening lane
 
-- **UTF-16 escape repair must never slice mid-character** (pass-6 P6-1,
-  HIGH). `repair_lone_surrogates` slices `&line[i+2..i+6]` and
-  `&line[i+8..i+12]` after a rejected `\u` escape (`parser.rs:3785`,
-  `:3791`); when the "hex" bytes contain multi-byte UTF-8 the slice lands
-  off a char boundary and the process panics. Reproduced on freshly
-  built debug **and release** binaries (exit 101) from
-  `{"prompt":"\u中文测试"}` and `{"prompt":"\ud800\u中文测试"}`, and
-  reachable through format detection (`parse_jsonl_value_lenient` →
-  `jsonl_objects` → every JSONL detector), so `--overview`, `--doctor`,
-  `--waste`, `--latest`, `--sessions`, `--diagnostics`, direct `-d`
-  files, and directory scans all die; the TUI survives only because its
-  loader thread dies ("loader disconnected"). The 7,500-run mutation
-  fuzzer never produced a `\u` escape before multi-byte bytes and the
-  adversarial corpus contains none — a proven blind spot in the
-  acceptance net (the only related test covers `\ud83c` followed by
-  ASCII). Acceptance: hex parsed from bytes with ASCII checks (no `&str`
-  slicing), or both slice edges guarded by `is_char_boundary`; rejected
-  escapes pass through untouched; the adversarial corpus gains
-  `\u`-before-multibyte cases. Evidence: the pass-6 reproducers committed
-  as fixtures under `testdata/generated/adversarial/`; debug and release
-  binaries exit 0 with degraded, labeled output on both reproducers; a
-  discovery contract test asserts the file is reported
-  unparseable-or-degraded, never fatal.
-- **Honest fallback token accounting** (pass-6 P6-4). The
-  estimate-bytes÷4 fallback under-counts CJK by ~40–60% and
-  `reasoning_chars` stores `event.reasoning.len()` bytes, not characters
-  (`lib.rs:555`, `:562`, `:577`). Acceptance: an explicit
-  byte-versus-character decision at each estimate site, CJK-aware where
-  characters are intended, the estimator named in provenance;
-  `reasoning_chars` fixed or renamed to match its unit. Evidence: a CJK
-  fixture asserting the estimate within a stated tolerance; a test
-  pinning the unit in the field name.
 - **Local-calendar day windows** (pass-3 P3-2). `--range today` and its
   alias `--range 1d` are UTC-calendar-day windows, silently dropping
   sessions from earlier in the user's local day. Acceptance: `today`
@@ -240,6 +291,19 @@ independently re-verified by assessment pass 6.
   recipe. Acceptance: the limit applies in the overview branch or the
   combination errors loudly. Evidence: a CLI test pinning
   `--overview --limit N` behavior.
+- **Baseline thresholds must gate the exit code** (pass-7 P7-3; research
+  candidate 42). `--baseline-max-*-delta-pct` exists as CLI surface and
+  the report JSON carries `slower_than_baseline: true`, yet the process
+  exits 0 on breach (`main.rs:388-421`, `reports.rs:672-677`), while
+  `docs/guides/ci-integration.md:116-124` documents the baseline step as
+  a CI check whose `run:` block inherits exit-code-only semantics — the
+  gate cannot fail on regression today. Acceptance: a threshold breach
+  exits nonzero (exit 2, mirroring `--fail-under-health`) or an
+  explicit `--fail-on-baseline-regression` flag gates it; a run with no
+  baseline present stays exit 0 with a labeled skip; the guide's
+  snippet shows the failing exit. Evidence: the pass-7 reproducer
+  inverted (exit 2 while `slower_than_baseline: true`); a clean fixture
+  exits 0; both pinned by CLI tests.
 - **Doctor caches what it parses** (pass-3 P3-6). `--doctor` re-parses
   every uncached file on every run and never writes the session cache,
   making the first-run triage path the slowest command on large corpora.
@@ -260,13 +324,22 @@ independently re-verified by assessment pass 6.
   documented size or entry bound; the pricing cache honors the isolation
   variable. Evidence: a growth test writing N history entries then
   asserting a bounded file; an isolation test asserting no writes outside
-  the sandboxed cache root. Extended by pass 6 (P6-3): cache persist
-  writes through a fixed `<name>.json.tmp` sibling (`session_cache.rs:226`,
-  `:518`), so two concurrent agenttrace processes race on the same temp
-  file (load self-heals, so the impact is a failed or torn save under
-  concurrency). Additional acceptance: a unique temp suffix per writer
-  with the same atomic rename. Evidence: a concurrent-persist test (two
-  writers, no failed rename, no torn cache). Research pass 5 context:
+  the sandboxed cache root. Status change, cycle 3: the P6-3
+  concurrency acceptance is met (CU-4 — see Completed: a unique
+  `<name>.tmp.<pid>.<seq>` suffix per writer with the same atomic
+  rename; an 8-writer test asserts every save succeeds, the snapshot
+  loads, and no temp file survives). Extended by pass 7 (P7-5):
+  `pricing.json` and `history.json` are still written non-atomically
+  with `std::fs::write` (`pricing.rs:329-336`, `history.rs:36-41`), so
+  an interrupted write silently discards the preserved history — the
+  one durable record, given Claude Code's 30-day default transcript
+  retention. Additional acceptance: the same unique-temp-and-rename for
+  both files, with a truncated file quarantined under a visible warning
+  rather than silently discarded, and orphaned temp siblings swept on
+  load (pass-7 residual: crashed writers leak `*.tmp.<pid>.<seq>`
+  orphans, `session_cache.rs:237`). Evidence: an interrupted-write
+  fixture recovering with a visible warning; an orphan-sweep test.
+  Research pass 5 context:
   Claude Code deletes transcripts after 30 days by default
   (`desktopSessionCleanupPeriodDays`), so the preserved history is
   increasingly the only durable record — the durability docs should cite
@@ -304,6 +377,35 @@ independently re-verified by assessment pass 6.
   cycle 2: the unknown-time bucketing acceptance is met (`data_health.
   unknown_time_sessions`, CU-3 — see Completed); the skip-reason counts
   and the attributed-versus-unattributed token split remain open.
+  Extended by pass 7 (P7-1): the generic-JSONL fallback strict-parses
+  each line through `parse_jsonl_session` (`lib.rs:382`, `:393`) and
+  silently drops recoverable lines — a lone-surrogate line,
+  string-typed usage fields, or an Event-typed `usage` object each lose
+  whole lines (and `usage: BTreeMap<String, i64>` at `lib.rs:134`
+  coerces nothing), so a mixed corpus loses single lines with no health
+  signal at all. Additional acceptance: the fallback routes through the
+  same lenient line parser and `number_as_i64` coercion the format
+  detectors use, and the skip-reason counts (the still-open acceptance
+  above) count exactly these lines with reasons. Evidence: the pass-7
+  reproducers (lone-surrogate line, string-typed usage, Event-typed
+  usage) each counted in `data_health` with a reason instead of
+  dropped.
+- **BOM handling at every parse entry** (pass-7 P7-2; research candidate
+  41). No parse path strips a leading UTF-8 BOM — a BOM-prefixed JSONL
+  file fails detection with the misleading "unsupported session format"
+  (`parser.rs:22`/`:63` read the bytes straight through), and a UTF-16LE
+  file fails the same way; PowerShell 5.1's `>` redirection writes
+  UTF-16LE with BOM by default (Microsoft `about_Redirection`), this
+  project ships `install.ps1` and winget, and RFC 8259 §8.1 explicitly
+  flags the implementer's BOM question — so Windows-sourced logs are a
+  first-class population. Acceptance: one BOM strip at the shared parse
+  entry for every format (lenient paths included), UTF-8-BOM files
+  parsing identically to BOM-less ones, and either UTF-16
+  sniff-and-transcode or a diagnosis-grade error naming the encoding.
+  Evidence: fixtures — a UTF-8-BOM variant of one committed corpus per
+  family and a UTF-16LE transcript — parse or fail with a named
+  encoding cause; a test asserting the strip happens once and only at
+  offset 0.
 - **Proxy-governable networking** (pass-2 N4, research candidate 12).
   `--update-pricing` is the one documented network action and it bypasses
   operator proxy policy: pinned ureq 2.12 ignores
@@ -343,14 +445,11 @@ independently re-verified by assessment pass 6.
   ("runs fully offline by default"), so the drift check must fail on the
   removed phrasing, not merely warn.
 - **CLI surface polish** (pass-2 N9, closed for `--lang` in cycle 2;
-  extended by pass-3 P3-7, pass-4 P4-2/P4-3, and pass-6 P6-2, with the N7
-  residue). `--version` no longer depends on `--lang` parsing first, but
-  the CHANGELOG still over-claims: `agenttrace --overview --version`
-  exits 1 because action validation runs before the version early-return
-  while `--version` is itself an action (P6-2; `main.rs:136` precedes
-  `main.rs:150`). Acceptance: either the version early-return wins over
-  action validation or `CHANGELOG.md:11` is reworded to match, and
-  `--overview --version` is pinned by a CLI test. Also: stdout report output never ends
+  P6-2's `--version`-versus-action-validation ordering closed in cycle 3
+  — CU-3 hoisted the early return above both validators, pinned by CLI
+  tests in both flag orders, making the CHANGELOG claim true; see
+  Completed. Still open here: pass-3 P3-7, pass-4 P4-2/P4-3, and the N7
+  residue). Acceptance: stdout report output never ends
   with a newline while the same command's `-o` file does (P3-7); the
   Go-flag shim silently discards every argument after the first
   positional (P4-2 — warn on stderr whenever a discarded argument begins
@@ -369,6 +468,27 @@ independently re-verified by assessment pass 6.
   replaced by upstream-stored summary columns where the provider offers
   them (capability candidate 8). Evidence: a timing assertion on a
   multi-root fixture; a timeout test with a stubbed slow git.
+- **Plumb or delete the SQLite `since` push-down** (pass-7 P7-4). The
+  `since` parameter on the SQLite ingestion path is `None` at both call
+  sites (`sqlite_sessions.rs:164`, `:232`), so the SQL time push-down
+  is unreachable and `--since`/`--range` filtering happens only after
+  full ingestion. Acceptance: either `since` is threaded from the CLI
+  filters with a scan-cost assertion on a large fixture, or the
+  parameter and the dead SQL arm are deleted in favor of the
+  candidate-36 watermark design. Evidence: a test pinning whichever
+  behavior survives; no `None`-only parameter remains.
+- **Cycle-3 residuals on closed items** (pass 7, confirmed unaddressed
+  at `93aaf05`): the surrogate-repair byte scan has no escaped-backslash
+  lookbehind and can rewrite literal `\uXXXX` text on already-failing
+  lines (`parser.rs:3796`); `SQLITE_SNAPSHOT_SCHEMA_VERSION` stayed 5
+  across CU-5's naming-semantics change (`session_cache.rs:9`), so warm
+  pre-CU-5 snapshots keep serving placeholder names; and per-writer
+  temp suffixes are never swept, so crashed writers leak
+  `*.tmp.<pid>.<seq>` orphans (`session_cache.rs:237`). Acceptance: a
+  backslash-parity guard plus a corpus line; a bump-or-compatible
+  decision on the snapshot schema version pinned by a version test; an
+  orphan sweep on load. Evidence: a corpus line for the lookbehind
+  case; a cache-version test; an orphan-sweep test.
 
 ### Capability lane (researched, prioritized)
 
@@ -379,6 +499,10 @@ independently re-verified by assessment pass 6.
   sessions consumed a window. Evidence: fixture-driven test asserting
   window math; a demo command showing drain attribution without any
   billing claim. Framed as diagnosis, honoring the invoice non-goal.
+  Strengthened by research pass 6: tare's top-level user ask is exactly
+  the rolling window — "how full is the 5-hour window right now, and is
+  it safe to start a big task?" — so the block-window readout outranks
+  weekly views.
 - **Second pricing and model-metadata source** (research candidate 4,
   models.dev). Acceptance: the catalog accepts multiple upstreams with
   per-model provenance and a documented precedence rule; context-window
@@ -393,7 +517,11 @@ independently re-verified by assessment pass 6.
   samples and fails loudly on coverage or label drift; the default test
   path stays network-free. Evidence: a canary run log diffed against
   expectations; a policy note that samples are synthetic or consented and
-  redacted.
+  redacted. Strengthened by research pass 6: the first fully-quiet
+  drift census (every tracked head unchanged in a day-over-day
+  re-fetch) — the canary's proof of value is a quiet day plus catching
+  the next opencode migration; add the skills channel (candidate 37)
+  and DeepSeek Harness to the watch list.
 - **OTel GenAI export, then ingest** (research candidate 2). Acceptance:
   `agenttrace export` maps sessions to pinned `gen_ai` semantic-convention
   spans and metrics loadable by a stock collector; ingest of agents' own
@@ -404,7 +532,11 @@ independently re-verified by assessment pass 6.
   dedicated `open-telemetry/semantic-conventions-genai` repo (active, no
   stable tag yet) — pin the schema only when tagged; and Claude Code
   itself now emits an OTel cost metric and events (fed by `modelPricing`),
-  giving the later ingest half a live upstream producer.
+  giving the later ingest half a live upstream producer. Research pass
+  6: Claude Code fixed managed-OTEL settings being ignored on warm
+  starts — a live, managed producer posture worth citing in the
+  ingest-half design — and the dedicated conventions repo is still
+  tagless (re-verified), so the export schema stays tag-gated.
 - **Shareable baseline config and multi-machine merge** (research candidate
   7). Acceptance: a committed `.agenttrace.toml` carries gate thresholds,
   pricing overrides, and model aliases with defined precedence over flags;
@@ -430,7 +562,8 @@ independently re-verified by assessment pass 6.
   `parent_id` is set on 98/227 (43%) live local sessions while
   `summary_*` delivery columns are schema-present but 0/227 populated,
   so delivery evidence must degrade gracefully; `title` handling is
-  refined by candidate 34 (placeholder gate).
+  refined by candidate 34 (placeholder gate — landed in cycle 3 as
+  CU-5; see Completed).
 - **Statusline output surface** (research candidate 9, confidence 84%).
   Claude Code's statusline is a documented scriptable surface now fed
   `prompt_cache` and `rate_limits.spend_limit` objects, and statusline
@@ -443,7 +576,10 @@ independently re-verified by assessment pass 6.
   pass 5: ccusage ships a `statusline` beta, and the local machine's Node
   HUD needs a shell cache wrapper purely to stay render-fast — the
   latency budget must be shell-fast, which a single Rust binary
-  satisfies natively.
+  satisfies natively. Research pass 6: three more HUD entrants in six
+  weeks (vibepulse 184★, claude-codex-battery 104★, clawdmeter-plus
+  88★) — hardware and menu-bar consumers confirm the latency budget
+  is the product.
 - **Compaction and re-cache cost analytics** (research candidate 10,
   confidence 78%). Both majors standardized on compaction and re-cache
   vocabulary in one release cycle: OpenCode stores durable compaction
@@ -474,7 +610,10 @@ independently re-verified by assessment pass 6.
   flag accepted by insights and the TUI range views, building on the
   local-calendar fix in the hardening lane. Evidence: unit tests pinning
   day boundaries in two timezones; the pass-3 P3-2 reproducer visible in
-  the local zone.
+  the local zone. Research pass 6: Claude Code 2.1.257 records the
+  user's clock in `timeZone`/`timeFormat` settings — prefer the
+  provider-recorded `timeZone` from `~/.claude/settings.json`, falling
+  back to the local zone.
 - **Sub-agent attribution** (research candidate 14). Claude Code marks
   sub-agent turns with `isSidechain`; our own fixture carries it and
   `parser.rs` never reads it (grep: zero matches). Acceptance: sidechain
@@ -526,7 +665,9 @@ independently re-verified by assessment pass 6.
   test; no new blocking network dependency. Strengthened by research
   pass 5: MCP published stable revision 2026-07-28 (elicitation, tasks,
   sampling, structuredContent) — target it; the read-only analytics
-  tools need no redesign under the new optional capabilities.
+  tools need no redesign under the new optional capabilities. Research
+  pass 6: shares the read-only tool contract with candidate 37's skill
+  surface — settle one contract before either ships.
 - **SARIF 2.1.0 export for CI gates** (research candidate 20). Gate and
   anomaly findings exist only in agenttrace's own JSON; SARIF is the
   interchange format GitHub code scanning ingests from any CLI.
@@ -553,7 +694,10 @@ independently re-verified by assessment pass 6.
   Acceptance: lockfile bumps with the full workspace suite green; an
   update-deps CI job that fails on drift beyond one minor; the MSRV
   statement re-checked. Evidence: the refreshed `Cargo.lock` diff plus
-  the passing suite; the new CI job visible.
+  the passing suite; the new CI job visible. Research pass 6 re-verified
+  currency (ureq 3.4.0, rusqlite 0.40.2, crossterm 0.29.0, ratatui
+  0.30.2) and found dependabot PRs #278/#279 open upstream — fold them
+  into this lane rather than parallel bumps.
 - **Cost provenance for priced sessions** (research candidate 24,
   confidence 86%; implements the promotion path named in issue #103).
   The vendored snapshot collapses every provider of a model onto one bare
@@ -612,17 +756,12 @@ independently re-verified by assessment pass 6.
   disclose mixed-model sessions whenever more than one model appears.
   Evidence: a fixture with a mid-session model switch and sidechain rows
   asserting the per-model cost split; a parity note against ccusage's
-  advisor fix.
-- **Placeholder-title gate for provider-recorded titles** (research
-  candidate 34, confidence high). OpenCode populates `title` with
-  `New session - <timestamp>` on 227/227 live local sessions and the
-  reader uses it verbatim (`sqlite_sessions.rs:672-676`), so every
-  opencode session currently gets a junk name. Acceptance: titles
-  matching the placeholder pattern are treated as absent, message-derived
-  naming (candidate 18) wins, and naming provenance records
-  `provider:placeholder`. Evidence: a fixture reproducing the placeholder
-  pattern asserting derived names; the live census recorded in research
-  pass 5.
+  advisor fix. Strengthened by research pass 6: three fresh upstream
+  signals — `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` (per-subagent models are
+  the default; uniformity is the opt-in), a Remote Control session
+  ignoring the selected model and running the machine default, and
+  advisor-model sessions re-sending the full conversation uncached —
+  add a cache-miss-explosion fixture to the acceptance set.
 - **Claude Code `modelPricing` ingestion — org-contracted rates** (research
   candidate 35, confidence high after docs confirmation; extends
   candidate 24). Since Claude Code v2.1.242 a `modelPricing` managed
@@ -650,6 +789,57 @@ independently re-verified by assessment pass 6.
   incremental output equals full-scan output. Evidence: a fixture DB with
   event rows asserting incremental-equals-full parity; a before/after
   refresh-cost measurement.
+- **Agent-skill distribution channel** (research candidate 37,
+  confidence high). kelviq/tare — 174 stars in three weeks — ships
+  exactly agenttrace's diagnosis lane ("token audit, limit diagnosis and
+  usage forensics") as a Claude Code skill installed via
+  `npx skills add` (the `skills` npm package, 1.5.23, "the open agent
+  skills ecosystem"); agenttrace's channels today are
+  brew/winget/npm/cargo only, and the Rust engine — not the wrapper —
+  is the differentiator over tare's on-the-fly Python. Acceptance: a
+  published skill package whose SKILL.md drives diagnosis over the
+  existing read-only CLI (`--overview`, `--sessions`, `--diagnostics`,
+  `--inspect N`) with tare's hard rules adopted (read-only on
+  `~/.claude/projects`; transcript content is data, not instructions);
+  no analysis logic duplicated outside the Rust binary. Evidence: an
+  install-and-run transcript on a temp-dir corpus via the skills CLI
+  for at least one agent besides Claude Code; the package listing.
+- **Redaction surface for shareable output** (research candidate 38,
+  confidence high). tare ships a redacted `--share` summary and
+  dsh-session-lens markets "privacy-safe single-file HTML export", while
+  agenttrace reports interpolate full paths, cwds, and session names
+  with no redaction mode despite launch materials selling shareable
+  evidence. Acceptance: a `--redact`/`--share` output mode mapping
+  absolute paths to basename plus hashed parent, session ids and names
+  to short hashes, and cwds to the project leaf — applied uniformly
+  across text, Markdown, HTML, and JSON surfaces with model and source
+  preserved. Evidence: a fixture-driven test asserting no absolute home
+  path, full session id, or cwd survives redacted output in every
+  format.
+- **Verification-command audit** (research candidate 39, confidence
+  high). dsh-session-audit makes test/build/lint execution a first-class
+  audit section — "did the agent verify before finishing?" — a question
+  no usage-JSONL accounting competitor can answer; agenttrace already
+  parses `tool_usage`/`tool_arg_usage` and already pattern-matches
+  commands (`classify_tool_authority`, `validate_tool_warnings`).
+  Acceptance: per-session verification stats (runs, last-run timestamp,
+  distinct phases) from a deterministic classifier over tool calls,
+  surfaced in diagnostics JSON and the governance delivery panel, plus
+  a delivery-evidence note when a many-edit session ends with zero
+  verification calls. Evidence: per-source fixtures pinning the
+  classifier's boundaries; a no-verification session producing the
+  note.
+- **CSV export** (research candidate 40, confidence high). tare
+  advertises a spreadsheet export as a named capability; agenttrace
+  ships json/md/html only. Acceptance: `-f csv` for the session tables
+  with the same filter semantics and RFC 4180 quoting. Evidence: a
+  round-trip test parsing the CSV back and comparing row-for-row with
+  the JSON tables.
+
+Candidates 41 (Windows-source leniency: BOM/UTF-16 plus the P7-1 lenient
+fallback) and 42 (baseline gate exit semantics) are filed in the
+hardening lane above under their pass-7 finding IDs, sharing numbering
+with research pass 6.
 
 Items leave this section only when their acceptance criteria and evidence
 expectations are met and recorded in the Completed record above, and the
