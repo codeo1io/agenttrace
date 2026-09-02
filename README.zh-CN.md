@@ -102,6 +102,17 @@ iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.p
 agenttrace
 ```
 
+### 标志写在会话路径之前
+
+`agenttrace` 保持与 Go `flag` 兼容的参数解析：只有在第一个位置参数**之前**的选项标志才会被识别。位置参数之后的任何内容都被当作位置上下文处理，其后的标志会被忽略，因此：
+
+```bash
+agenttrace sessions.jsonl -f json    # -f 被忽略（在路径之后）
+agenttrace -f json sessions.jsonl    # -f json 生效
+```
+
+`--limit` 只限制列表视图（例如 overview 的 `recent_sessions`）；它从不过滤聚合值、审计总额或建议。治理报告默认覆盖全部会话——需要显式、带披露的上限时使用 `--sample N`（JSON 中会输出 `audited_sessions` / `total_sessions` / `excluded_reason`）。
+
 ## 你会得到什么
 
 | 需求 | agenttrace 提供 |

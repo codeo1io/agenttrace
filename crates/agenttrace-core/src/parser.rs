@@ -29,6 +29,18 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             path.display()
         );
     }
+    // Codex ≥0.152 stores rollouts as zstd frames (magic 28 B5 2F FD,
+    // upstream PR #41357); they are no longer plain JSONL. Name the
+    // format instead of failing with a generic "not valid UTF-8"
+    // (pass-7 research, candidate 44 minimum).
+    if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        bail!(
+            "session file {} is zstd-compressed (Codex rollout format); decompress it to JSONL first (e.g. `zstd -d {} -o {}.jsonl`)",
+            path.display(),
+            path.display(),
+            path.display()
+        );
+    }
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", path.display()))?;
     let name = session_name(path);
@@ -93,6 +105,12 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             return session_from_events(name, path, events);
         }
         if let Some(events) = parse_hermes_json_value(value) {
+            return session_from_events(name, path, events);
+        }
+        // Single-object Antigravity trajectory sidecars
+        // (<uuid>.trajectory.json) sit next to the SQLite conversation
+        // store and parse as one JSON document, not JSONL (CU-19).
+        if let Some(events) = parse_antigravity_trajectory(raw) {
             return session_from_events(name, path, events);
         }
     }
@@ -368,6 +386,152 @@ fn parse_kimi_wire_jsonl(raw: &str) -> Option<Vec<Event>> {
                     );
                 }
             }
+            _ => {}
+        }
+    }
+    non_empty(events)
+}
+
+/// Parses a decrypted Antigravity trajectory sidecar
+/// (`<uuid>.trajectory.json` under
+/// `~/.gemini/antigravity-cli/conversations/`). The on-disk conversation
+/// store itself is an undocumented SQLite database (agy 1.1.23:
+/// `user_version=1`, 7 tables) whose blobs are protobuf payloads; the JSON
+/// sidecar is the documented reader surface (schema cross-checked against
+/// mjacobs/agy-reader `internal/daemon/types.go`, verified against agy
+/// 1.1.23 on 2026-09-01). Steps carry no token usage — events only.
+fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
+    let value: Value = serde_json::from_str(raw.trim_start()).ok()?;
+    let obj = value.as_object()?;
+    let steps = obj.get("steps")?.as_array()?;
+    if steps.is_empty() {
+        return None;
+    }
+    let is_trajectory_step = |entry: &&Value| {
+        entry
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|typ| typ.starts_with("CORTEX_STEP_TYPE_"))
+            && entry
+                .pointer("/metadata/createdAt")
+                .and_then(Value::as_str)
+                .is_some()
+    };
+    steps.iter().find(is_trajectory_step)?;
+    let mut events = Vec::new();
+    for step in steps {
+        let typ = step.get("type").and_then(Value::as_str).unwrap_or("");
+        let timestamp = step
+            .pointer("/metadata/createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let event = |role: &str, content: String, is_error: bool| Event {
+            role: role.to_string(),
+            content,
+            timestamp: timestamp.clone(),
+            is_error,
+            source_tool: "antigravity_cli".to_string(),
+            ..Event::default()
+        };
+        match typ {
+            "CORTEX_STEP_TYPE_USER_INPUT" => {
+                let content = step
+                    .pointer("/userInput/userResponse")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !content.is_empty() {
+                    events.push(event("user", content, false));
+                }
+            }
+            "CORTEX_STEP_TYPE_PLANNER_RESPONSE" => {
+                let response = step
+                    .pointer("/plannerResponse/response")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let thinking = step
+                    .pointer("/plannerResponse/thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let tool_calls: Vec<ToolCall> = step
+                    .pointer("/plannerResponse/toolCalls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| {
+                        let name = call.get("name")?.as_str()?.to_string();
+                        let args = call
+                            .get("argumentsJson")
+                            .and_then(Value::as_str)
+                            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                            .as_ref()
+                            .map(|value| jsonish(Some(value)))
+                            .unwrap_or_default();
+                        Some(ToolCall {
+                            name,
+                            args,
+                            ..ToolCall::default()
+                        })
+                    })
+                    .collect();
+                if response.is_empty() && thinking.is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
+                let mut assistant = event("assistant", response, false);
+                assistant.reasoning = thinking;
+                assistant.tool_calls = tool_calls;
+                events.push(assistant);
+            }
+            "CORTEX_STEP_TYPE_RUN_COMMAND" => {
+                let command = step
+                    .pointer("/runCommand/commandLine")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        step.pointer("/runCommand/proposedCommandLine")
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("")
+                    .to_string();
+                if command.is_empty() {
+                    continue;
+                }
+                let exit = step.pointer("/runCommand/exitCode").and_then(Value::as_i64);
+                events.push(event("tool", command, exit.is_some_and(|code| code != 0)));
+            }
+            "CORTEX_STEP_TYPE_ERROR_MESSAGE" => {
+                let content = jsonish(step.pointer("/errorMessage"));
+                if content.is_empty() {
+                    continue;
+                }
+                events.push(event("tool", content, true));
+            }
+            "CORTEX_STEP_TYPE_VIEW_FILE" => {
+                // The wire key is lower-case "Uri" (daemon types.go tags it
+                // `json:"absolutePathUri"`); the upper-case spelling is
+                // tolerated as an alias for producers that copied this
+                // parser's original (wrong-case) reading.
+                let path = step
+                    .pointer("/viewFile/absolutePathUri")
+                    .or_else(|| step.pointer("/viewFile/absolutePathURI"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if path.is_empty() {
+                    continue;
+                }
+                let start = step.pointer("/viewFile/startLine").and_then(Value::as_i64);
+                let end = step.pointer("/viewFile/endLine").and_then(Value::as_i64);
+                let content = match (start, end) {
+                    (Some(start), Some(end)) => format!("view {path} lines {start}-{end}"),
+                    _ => format!("view {path}"),
+                };
+                events.push(event("tool", content, false));
+            }
+            // INVOKE_SUBAGENT children live in their own trajectory files;
+            // SYSTEM_MESSAGE/CHECKPOINT/GENERIC carry no transcript content.
             _ => {}
         }
     }
@@ -1803,6 +1967,21 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
             "candidatesTokenCount",
         ],
     );
+    // Thinking tokens are billed at the output rate but reported
+    // separately from candidates/completion tokens (Gemini
+    // usageMetadata.thoughtsTokenCount and the OpenAI-compatible
+    // reasoning_tokens aliases); fold them into output and keep the
+    // breakdown for the audit (pass-9 CU-20).
+    let reasoning = sum_numbers(
+        obj,
+        &[
+            "thoughtsTokenCount",
+            "thinkingTokenCount",
+            "thinking_tokens",
+            "reasoning_tokens",
+        ],
+    );
+    let output = output.saturating_add(reasoning);
     let cache_read = sum_numbers(
         obj,
         &["cache_read_input_tokens", "cacheRead", "cached_tokens"],
@@ -1813,6 +1992,9 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     }
     if output > 0 {
         usage.insert("output_tokens".to_string(), output);
+    }
+    if reasoning > 0 {
+        usage.insert("reasoning_tokens".to_string(), reasoning);
     }
     if cache_read > 0 {
         usage.insert("cache_read_input_tokens".to_string(), cache_read);
@@ -3562,8 +3744,32 @@ fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
                 "output_tokens",
                 "completion_tokens",
             ],
-        ),
+        )
+        .saturating_add(first_number(
+            obj,
+            &[
+                "thoughtsTokenCount",
+                "thinkingTokenCount",
+                "thinking_tokens",
+                "reasoning_tokens",
+            ],
+        )),
     );
+    // Thinking tokens are billed at the output rate but reported
+    // separately by the API (Gemini usageMetadata.thoughtsTokenCount);
+    // folded above, broken out here for the audit (pass-9 CU-20).
+    let reasoning = first_number(
+        obj,
+        &[
+            "thoughtsTokenCount",
+            "thinkingTokenCount",
+            "thinking_tokens",
+            "reasoning_tokens",
+        ],
+    );
+    if reasoning > 0 {
+        usage.insert("reasoning_tokens".to_string(), reasoning);
+    }
     usage.insert(
         "cache_read_input_tokens".to_string(),
         first_number(
@@ -3914,6 +4120,28 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
             usage.insert(target.to_string(), value);
         }
     }
+    // Thinking tokens ride the output rate but are reported separately
+    // (Gemini usageMetadata.thoughtsTokenCount and the OpenAI-compatible
+    // reasoning aliases); fold into output and keep the breakdown
+    // (pass-9 CU-20).
+    if let Some(reasoning) = [
+        "thoughtsTokenCount",
+        "thinkingTokenCount",
+        "thinking_tokens",
+        "reasoning_tokens",
+    ]
+    .iter()
+    .find_map(|key| obj.get(*key))
+    .and_then(number_as_i64)
+    .filter(|value| *value > 0)
+    {
+        if let Some(output) = usage.get_mut("output_tokens") {
+            *output = output.saturating_add(reasoning);
+        } else {
+            usage.insert("output_tokens".to_string(), reasoning);
+        }
+        usage.insert("reasoning_tokens".to_string(), reasoning);
+    }
     if usage.is_empty() {
         None
     } else {
@@ -4250,6 +4478,215 @@ mod tests {
         let line = r#"{"a":"\\ud800","b":"\ud800"}"#;
         let repaired = repair_lone_surrogates(line).expect("real lone surrogate still repairs");
         assert_eq!(repaired, r#"{"a":"\\ud800","b":"\ufffd"}"#);
+    }
+
+    #[test]
+    fn antigravity_trajectory_sidecar_parses_user_planner_and_commands() {
+        // CU-19: `<uuid>.trajectory.json` sidecars under
+        // ~/.gemini/antigravity-cli/conversations/ carry CORTEX_STEP_TYPE_*
+        // steps. The on-disk store (.db/.pb) is rejected upstream; this is
+        // the documented reader surface (agy-reader types.go, agy 1.1.23).
+        let raw = serde_json::json!({
+            "trajectoryId": "11111111-2222-3333-4444-555555555555",
+            "trajectoryType": "CORTEX_TRAJECTORY_TYPE_MAIN",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_USER_INPUT",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:00Z"},
+                    "userInput": {"userResponse": "Ship the fix"}
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:05Z"},
+                    "plannerResponse": {
+                        "response": "Running the failing test first.",
+                        "thinking": "The regression came from the cache eviction.",
+                        "toolCalls": [
+                            {
+                                "name": "run_commands",
+                                "argumentsJson": "{\"commands\":[\"cargo test\"]}"
+                            }
+                        ]
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:06Z"},
+                    "runCommand": {"commandLine": "cargo test", "exitCode": 2}
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_CHECKPOINT",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:07Z"}
+                }
+            ]
+        })
+        .to_string();
+        let session = parse_raw_session("traj", "traj.trajectory.json", &raw)
+            .expect("trajectory sidecar parses");
+        assert!(session.metrics.user_messages >= 1);
+        assert!(session.metrics.assistant_turns >= 1);
+        assert!(session.metrics.tool_calls_total >= 1);
+        assert!(session.metrics.tool_results >= 1);
+        assert!(
+            session.metrics.tool_calls_fail >= 1,
+            "non-zero exit code must count as a failed tool call"
+        );
+        let events = parse_antigravity_trajectory(&raw).expect("events");
+        let planner = events
+            .iter()
+            .find(|event| event.role == "assistant")
+            .expect("planner response survives as an assistant event");
+        assert!(
+            planner.reasoning.contains("cache eviction"),
+            "planner thinking must land in the reasoning field"
+        );
+        assert!(
+            planner.tool_calls[0].args.contains("cargo test"),
+            "argumentsJson must be parsed from its JSON string: {:?}",
+            planner.tool_calls[0].args
+        );
+        assert!(events
+            .iter()
+            .all(|event| event.source_tool == "antigravity_cli"));
+    }
+
+    #[test]
+    fn antigravity_view_file_accepts_wire_case_path_key() {
+        // Pass-10 F1: the daemon serializes the field as
+        // `json:"absolutePathUri"` (types.go); the upper-case `URI`
+        // spelling is kept only as a tolerated alias. Real sidecars must
+        // never silently drop VIEW_FILE steps.
+        let step = |key: &str| {
+            let mut view_file = serde_json::Map::new();
+            view_file.insert(key.to_string(), serde_json::json!("file:///work/x.rs"));
+            view_file.insert("startLine".to_string(), serde_json::json!(1));
+            view_file.insert("endLine".to_string(), serde_json::json!(2));
+            serde_json::json!({
+                "trajectoryId": "11111111-2222-3333-4444-555555555555",
+                "trajectoryType": "CORTEX_TRAJECTORY_TYPE_MAIN",
+                "steps": [
+                    {
+                        "type": "CORTEX_STEP_TYPE_VIEW_FILE",
+                        "status": "COMPLETED",
+                        "metadata": {"createdAt": "2026-09-01T10:00:07Z"},
+                        "viewFile": view_file
+                    }
+                ]
+            })
+            .to_string()
+        };
+        for key in ["absolutePathUri", "absolutePathURI"] {
+            let events =
+                parse_antigravity_trajectory(&step(key)).expect("view-file sidecar parses");
+            let view = events
+                .iter()
+                .find(|event| event.role == "tool")
+                .unwrap_or_else(|| panic!("VIEW_FILE step with `{key}` must yield a tool event"));
+            assert_eq!(
+                view.content, "view file:///work/x.rs lines 1-2",
+                "wire-case key `{key}` must carry path and line range"
+            );
+            assert!(!view.is_error);
+        }
+    }
+
+    #[test]
+    fn antigravity_trajectory_sniff_rejects_generic_steps_arrays() {
+        // `steps` alone is not evidence: countless JSON payloads nest a
+        // steps array without CORTEX_STEP_TYPE markers or createdAt
+        // metadata. The sniff requires both.
+        let generic = serde_json::json!({
+            "steps": [
+                {"type": "build", "command": "make"},
+                {"type": "test", "command": "make check"}
+            ]
+        })
+        .to_string();
+        assert!(
+            parse_raw_session("generic", "generic.trajectory.json", &generic).is_err(),
+            "generic steps arrays must fall through to the unsupported-format error"
+        );
+        assert!(parse_antigravity_trajectory(&generic).is_none());
+    }
+
+    #[test]
+    fn thinking_tokens_fold_into_output_and_break_out_at_every_usage_site() {
+        // CU-20: thoughtsTokenCount (Gemini), thinkingTokenCount and the
+        // OpenAI-compatible reasoning aliases are billed at the output
+        // rate, so they fold into output_tokens and are additionally
+        // reported as reasoning_tokens for the audit.
+        let qwen = qwen_usage(Some(&serde_json::json!({
+            "output_tokens": 10,
+            "reasoning_tokens": 5
+        })))
+        .expect("qwen usage");
+        assert_eq!(qwen["output_tokens"], 15);
+        assert_eq!(qwen["reasoning_tokens"], 5);
+
+        let gemini = gemini_usage(&serde_json::json!({
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 20,
+            "thoughtsTokenCount": 40
+        }))
+        .expect("gemini usage");
+        assert_eq!(gemini["input_tokens"], 100);
+        assert_eq!(gemini["output_tokens"], 60);
+        assert_eq!(gemini["reasoning_tokens"], 40);
+
+        let generic = usage_from_value(&serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 7,
+            "thinking_tokens": 3
+        }))
+        .expect("generic usage");
+        assert_eq!(generic["output_tokens"], 10);
+        assert_eq!(generic["reasoning_tokens"], 3);
+
+        // Zero thinking tokens leave the map unchanged: corpora without
+        // thinking models must not grow a spurious key.
+        let bare = usage_from_value(&serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 7
+        }))
+        .expect("bare usage");
+        assert_eq!(bare["output_tokens"], 7);
+        assert!(!bare.contains_key("reasoning_tokens"));
+    }
+
+    #[test]
+    fn thinking_tokens_reach_the_session_metrics_breakdown() {
+        // End to end through the Gemini checkpoint parser: the folded
+        // number lands in metrics.tokens_output and the breakdown in
+        // metrics.tokens_reasoning (pass-9 CU-20).
+        let raw = serde_json::json!({
+            "checkpoint": {
+                "model": "gemini-2.5-flash",
+                "conversation": [
+                    {
+                        "role": "user",
+                        "timestamp": "2026-01-02T10:00:00Z",
+                        "parts": [{"text": "Resume this checkpoint."}]
+                    }
+                ],
+                "tokenUsage": {
+                    "inputTokens": 80,
+                    "outputTokens": 20,
+                    "thoughtsTokenCount": 40
+                }
+            }
+        })
+        .to_string();
+        let session = parse_raw_session("cp", "chats/cp.json", &raw).expect("checkpoint parses");
+        assert_eq!(session.metrics.tokens_input, 80);
+        assert_eq!(
+            session.metrics.tokens_output, 60,
+            "thoughtsTokenCount is billed at the output rate and must fold in"
+        );
+        assert_eq!(session.metrics.tokens_reasoning, 40);
     }
 
     #[test]

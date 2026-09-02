@@ -14,6 +14,15 @@ agenttrace --range 30d --project storefront --source claude_code
 
 Supported controls include `--range today|7d|30d|all`, `--project`, `--source`, `--model-filter`, `--query`, `--health`, `--cost`, `--anomaly`, `--sort`, `--order`, and `--limit`.
 
+By default every governance report audits **every** session in scope, and the
+report discloses its coverage: `audited_sessions` / `total_sessions` /
+`excluded_reason` in JSON, and a leading `(auditing N of M sessions)` line in
+text, Markdown, and HTML. `--limit` caps list views only — it never filters
+aggregates. To bound an expensive audit explicitly, use `--sample N`, which
+audits the first N sessions of the active `--sort`/`--order` view
+(newest-first by default) and names that view in the exclusion reason, in
+every format.
+
 Use JSON for automation, Markdown for PR artifacts, HTML for a self-contained visual report, or text for terminal review:
 
 ```bash
@@ -27,7 +36,7 @@ agenttrace --recommend --range 30d -f markdown -o recommendations.md
 agenttrace --audit --range 30d -f json
 ```
 
-The audit groups sessions by source and normalized model, and reports input, output, cache-write, and cache-read tokens; per-million-token rates; estimated component costs; and pricing confidence.
+The audit groups sessions by source and normalized model, and reports input, output, cache-write, and cache-read tokens; per-million-token rates; estimated component costs; and pricing confidence. Thinking tokens (Gemini `thoughtsTokenCount` and OpenAI-compatible `reasoning_tokens`/`thinking_tokens` aliases) are billed at the output rate: they are folded into the output count and additionally broken out as `tokens.reasoning` plus a `reasoning_share_pct` of billed output tokens per model row.
 
 Pricing status is intentionally explicit:
 
@@ -48,9 +57,18 @@ To map internal model names or override per-million-token rates locally, set `AG
 AGENTTRACE_PRICING_FILE=pricing-overrides.json agenttrace --audit -f json
 ```
 
-Pricing data is cached locally. A cache older than 24 hours is refreshed automatically when a price lookup starts; if the refresh fails, the stale cache remains usable and is reported as stale. Use `--update-pricing` to force an explicit refresh.
+Pricing data is cached locally and normal runs never touch the network: the
+cached catalog is served as-is regardless of age, a cache older than 24 hours
+is simply labeled `cache(stale)` in the pricing source field, and the only
+refresh path is the explicit `--update-pricing` action. If a refresh fails,
+the stale cache remains usable and is reported as stale.
 
-The session cache is schema 17 and the SQLite snapshot is schema 4 because both now persist provenance. Older versions are discarded and rebuilt on the next load; the migration is read-only and does not modify source session files.
+The session cache is schema 17 and the SQLite snapshot is schema 6 because
+both now persist provenance. Older versions are discarded and rebuilt on the
+next load; the migration is read-only and does not modify source session
+files. Cache entries whose source file has disappeared are pruned the next
+time the cache loads, and the snapshot is bounded at 20,000 entries (oldest
+source-file mtime drops first).
 
 ## Prioritized recommendations
 

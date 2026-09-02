@@ -1,7 +1,8 @@
 use agenttrace_core::{
-    build_doctor_report, data_health, find_session_files, load_sessions_from_dir,
-    load_sessions_with_options, load_sessions_with_progress, parse_file, render_waste_report,
-    search_sessions, session_cache_path, session_capability, total_tokens, LoadOptions,
+    build_doctor_report, data_health, data_health_scoped, find_session_files,
+    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress, parse_file,
+    render_waste_report, search_sessions, session_cache_path, session_capability, total_tokens,
+    LoadOptions,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -933,6 +934,26 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         let doctor = build_doctor_report(Some(&sessions_dir), false);
         assert_eq!(doctor.cache_entries, 1);
         assert_eq!(doctor.cached_valid, 1);
+        // CU-22: --doctor discloses the cache's on-disk size and the hard
+        // bounds save_session_cache enforces, so operators can tell an
+        // entry-count eviction from a byte-ceiling one.
+        assert!(doctor.cache_size_bytes > 0, "cache file exists on disk");
+        assert!(
+            doctor.cache_limits.contains("entries<=20000"),
+            "entry bound disclosed: {}",
+            doctor.cache_limits
+        );
+        assert!(
+            doctor.cache_limits.contains("bytes<=67108864"),
+            "byte bound disclosed: {}",
+            doctor.cache_limits
+        );
+        let rendered = agenttrace_core::render_doctor_report(Some(&sessions_dir), false, "text")
+            .expect("render doctor report");
+        assert!(
+            rendered.contains("hard bounds"),
+            "text doctor output names the bounds: {rendered}"
+        );
 
         fs::write(&session_path, "not a session\n").expect("invalidate session cache entry");
         let after_stale = load_sessions_from_dir(Some(&sessions_dir));
@@ -1867,6 +1888,141 @@ fn rust_discovers_qwen_project_chat_files() {
 }
 
 #[test]
+fn rust_discovers_gemini_cli_tmp_chats_and_checkpoints() {
+    // CU-18: ~/.gemini/tmp (<session-id>/chats|checkpoints/*.json) is the
+    // Gemini CLI session store the README promises; until now it was not a
+    // discovery root at all.
+    let root = temp_root("agenttrace-rust-gemini-tmp");
+    let home = root.join("home");
+    let chats = home
+        .join(".gemini")
+        .join("tmp")
+        .join("sess-1")
+        .join("chats");
+    let checkpoints = home
+        .join(".gemini")
+        .join("tmp")
+        .join("sess-1")
+        .join("checkpoints");
+    let cache_dir = home.join("cache");
+    fs::create_dir_all(&chats).expect("create chats dir");
+    fs::create_dir_all(&checkpoints).expect("create checkpoints dir");
+    let chat_path = chats.join("chat.json");
+    let checkpoint_path = checkpoints.join("cp.json");
+    fs::write(
+        &chat_path,
+        r#"{"checkpoint":{"model":"gemini-2.5-flash","conversation":[{"role":"user","timestamp":"2026-01-02T10:00:00Z","parts":[{"text":"List the failing tests."}]}],"tokenUsage":{"inputTokens":80,"outputTokens":20,"thoughtsTokenCount":40}}}"#,
+    )
+    .expect("write gemini chat");
+    fs::write(
+        &checkpoint_path,
+        r#"{"checkpoint":{"model":"gemini-2.5-pro","conversation":[{"role":"user","timestamp":"2026-01-02T11:00:00Z","parts":[{"text":"Checkpoint."}]}],"tokenUsage":{"inputTokens":8,"outputTokens":2}}}"#,
+    )
+    .expect("write gemini checkpoint");
+
+    with_home_and_cache(&home, &cache_dir, || {
+        let files = find_session_files(None);
+        assert!(
+            files.contains(&chat_path),
+            "chats/*.json must be discovered: {files:?}"
+        );
+        assert!(
+            files.contains(&checkpoint_path),
+            "checkpoints/*.json must be discovered: {files:?}"
+        );
+
+        let sessions = load_sessions_from_dir(None);
+        assert!(
+            sessions.len() >= 2,
+            "both gemini tmp sessions must load: {}",
+            sessions.len()
+        );
+        let thoughts = sessions
+            .iter()
+            .find(|session| session.path == chat_path.to_string_lossy())
+            .expect("chat session loaded");
+        assert_eq!(thoughts.metrics.source_tool, "gemini_cli");
+        assert_eq!(thoughts.metrics.tokens_input, 80);
+        assert_eq!(thoughts.metrics.tokens_output, 60);
+        assert_eq!(
+            thoughts.metrics.tokens_reasoning, 40,
+            "thoughtsTokenCount must reach the reasoning breakdown (CU-20)"
+        );
+        let plain = sessions
+            .iter()
+            .find(|session| session.path == checkpoint_path.to_string_lossy())
+            .expect("checkpoint session loaded");
+        assert_eq!(plain.metrics.source_tool, "gemini_cli");
+        assert_eq!(plain.metrics.tokens_reasoning, 0);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_discovers_antigravity_conversation_sidecars_but_not_the_store() {
+    // CU-19: ~/.gemini/antigravity-cli/conversations/ holds an
+    // undocumented SQLite store (.db) plus protobuf blobs (.pb); only the
+    // JSON trajectory sidecars next to them are a documented, parseable
+    // surface, and only those are admitted.
+    let root = temp_root("agenttrace-rust-antigravity-conversations");
+    let home = root.join("home");
+    let conversations = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations");
+    let cache_dir = home.join("cache");
+    fs::create_dir_all(&conversations).expect("create conversations dir");
+    let sidecar = conversations.join("11111111-2222-3333-4444-555555555555.trajectory.json");
+    fs::write(
+        &sidecar,
+        r#"{"trajectoryId":"11111111-2222-3333-4444-555555555555","trajectoryType":"CORTEX_TRAJECTORY_TYPE_MAIN","steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","status":"COMPLETED","metadata":{"createdAt":"2026-09-01T10:00:00Z"},"userInput":{"userResponse":"Ship the fix"}},{"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","status":"COMPLETED","metadata":{"createdAt":"2026-09-01T10:00:05Z"},"plannerResponse":{"response":"On it.","thinking":"Check the eviction order first.","toolCalls":[{"name":"run_commands","argumentsJson":"{\"commands\":[\"cargo test\"]}"}]}},{"type":"CORTEX_STEP_TYPE_VIEW_FILE","status":"COMPLETED","metadata":{"createdAt":"2026-09-01T10:00:07Z"},"viewFile":{"absolutePathUri":"file:///work/x.rs","startLine":1,"endLine":2}}]}"#,
+    )
+    .expect("write trajectory sidecar");
+    fs::write(
+        conversations.join("store.db"),
+        b"SQLite format 3 binary store",
+    )
+    .expect("write sqlite store");
+    fs::write(conversations.join("blob.pb"), b"protobuf bytes").expect("write pb blob");
+
+    with_home_and_cache(&home, &cache_dir, || {
+        let files = find_session_files(None);
+        assert!(
+            files.contains(&sidecar),
+            "trajectory sidecars must be discovered: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == "db" || ext == "pb")
+            }),
+            "the SQLite store and protobuf blobs must never be admitted: {files:?}"
+        );
+
+        let sessions = load_sessions_from_dir(None);
+        let sidecar_session = sessions
+            .iter()
+            .find(|session| session.path == sidecar.to_string_lossy())
+            .expect("sidecar session loaded");
+        assert_eq!(sidecar_session.metrics.source_tool, "antigravity_cli");
+        assert_eq!(sidecar_session.metrics.user_messages, 1);
+        assert_eq!(sidecar_session.metrics.reasoning_blocks, 1);
+        assert_eq!(sidecar_session.metrics.tool_calls_total, 1);
+        // The VIEW_FILE step uses the wire-case key `absolutePathUri`
+        // (the daemon tags the Go field `json:"absolutePathUri"`); it must
+        // surface as a tool event, never be silently dropped (pass-10 F1).
+        assert_eq!(
+            sidecar_session.metrics.tool_results, 1,
+            "VIEW_FILE must surface as a tool event"
+        );
+        assert_eq!(sidecar_session.metrics.events_total, 3);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_renders_waste_report_for_testdata_latest_slice() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -2139,4 +2295,171 @@ fn write_opencode_db(path: &std::path::Path) {
         "#,
     )
     .expect("seed opencode db");
+}
+
+#[test]
+fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
+    // Pass-8 F8-2: the CLI used to recompute `discovered` as
+    // sessions.len() + skipped, so `--overview --range 1d` reported
+    // discovered=71 while 1,400+ files existed and parse failures in
+    // out-of-range files were invisible. `discovered` must come from
+    // the loader (range-independent) and ranged runs must separate
+    // parsed from out-of-scope sessions.
+    let root = temp_root("agenttrace-range-health");
+    fs::create_dir_all(&root).expect("create range-health dir");
+    let recent = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"recent work","timestamp":"2026-09-01T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
+"#;
+    let old = r#"{"role":"session_meta","timestamp":"2020-01-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"ancient work","timestamp":"2020-01-02T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2020-01-02T10:00:01Z"}
+"#;
+    fs::write(root.join("recent.jsonl"), recent).expect("write recent session");
+    fs::write(root.join("old.jsonl"), old).expect("write old session");
+    with_session_cache(&root.join("cache"), || {
+        let all = agenttrace_core::load_sessions_with_options(
+            Some(&root),
+            &LoadOptions {
+                since: None,
+                ..LoadOptions::default()
+            },
+        );
+        let day = agenttrace_core::load_sessions_with_options(
+            Some(&root),
+            &LoadOptions {
+                since: Some(chrono::Utc::now() - chrono::Duration::days(30)),
+                ..LoadOptions::default()
+            },
+        );
+        assert_eq!(all.discovered, 2);
+        assert_eq!(
+            day.discovered, all.discovered,
+            "discovered must be range-independent"
+        );
+        let health_all =
+            data_health_scoped(&all.sessions, all.discovered, all.skipped, all.cache_hits);
+        let health_day =
+            data_health_scoped(&day.sessions, day.discovered, day.skipped, day.cache_hits);
+        assert_eq!(health_all.parsed, 2);
+        assert_eq!(
+            health_all.out_of_scope, 0,
+            "no filter excludes anything for all-time"
+        );
+        assert_eq!(health_day.parsed, 1, "only the recent session is in scope");
+        assert_eq!(
+            health_day.out_of_scope, 1,
+            "the out-of-range session must be counted, not erased from the denominator"
+        );
+        assert_eq!(health_day.skipped, 0, "out-of-range is not a parse failure");
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cache_dead_paths_are_persisted_away_across_runs() {
+    // Pass-8 F8-3 end to end: after the source file disappears, the
+    // next cached load prunes the entry and the re-saved snapshot no
+    // longer carries the dead path (the operator snapshot had 761 of
+    // 1,487 entries dead and growing every day).
+    let root = temp_root("agenttrace-cache-prune");
+    let sessions = root.join("sessions");
+    fs::create_dir_all(&sessions).expect("create sessions dir");
+    let body = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"work","timestamp":"2026-09-01T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
+"#;
+    let keep = sessions.join("keep.jsonl");
+    let drop_path = sessions.join("drop.jsonl");
+    fs::write(&keep, body).expect("write keep");
+    fs::write(&drop_path, body).expect("write drop");
+    with_session_cache(&root.join("cache"), || {
+        let first = load_sessions_with_options(Some(&sessions), &LoadOptions::default());
+        assert_eq!(first.sessions.len(), 2, "both sessions parse");
+        let snapshot = root.join("cache").join("sessions.json");
+        assert!(snapshot.exists(), "cache snapshot exists after first run");
+        let before = fs::read_to_string(&snapshot).expect("read snapshot");
+        assert!(
+            before.contains("drop.jsonl"),
+            "second session is cached by path"
+        );
+
+        fs::remove_file(&drop_path).expect("delete source file");
+        let second = load_sessions_with_options(Some(&sessions), &LoadOptions::default());
+        assert_eq!(second.sessions.len(), 1, "only the surviving file parses");
+        let after = fs::read_to_string(&snapshot).expect("re-read snapshot");
+        assert!(
+            !after.contains("drop.jsonl"),
+            "dead entry is pruned from the persisted snapshot"
+        );
+        assert!(after.contains("keep.jsonl"), "live entry stays cached");
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn non_finite_costs_lower_health_confidence_and_stay_visible() {
+    // Pass-8 F8-5: a session whose estimated cost is not finite must
+    // surface as `non_finite_costs` and drop confidence to low instead
+    // of silently joining a total or panicking in the writer.
+    let root = temp_root("agenttrace-nonfinite-health");
+    fs::create_dir_all(&root).expect("create dir");
+    fs::write(
+        root.join("poisoned.jsonl"),
+        r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"work","timestamp":"2026-09-01T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
+"#,
+    )
+    .expect("write session");
+    with_session_cache(&root.join("cache"), || {
+        let report = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        let session = &report.sessions[0];
+        let mut poisoned = session.clone();
+        poisoned.metrics.cost_estimated = f64::INFINITY;
+        let health = data_health_scoped(
+            &[poisoned],
+            report.discovered,
+            report.skipped,
+            report.cache_hits,
+        );
+        assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
+        assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
+        let clean = data_health_scoped(
+            &report.sessions,
+            report.discovered,
+            report.skipped,
+            report.cache_hits,
+        );
+        assert_eq!(clean.non_finite_costs, 0);
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
+    // Pass-7 research / candidate-44 minimum (CU-16): Codex >=0.152
+    // writes rollouts as zstd frames (magic 28 B5 2F FD). The parser
+    // must name the format instead of the old misleading "not valid
+    // UTF-8" — this is the smallest step toward Codex coverage.
+    let root = temp_root("agenttrace-zstd-sniff");
+    fs::create_dir_all(&root).expect("create dir");
+    let rollout = root.join("rollout-2026-09-03.jsonl");
+    fs::write(&rollout, [0x28u8, 0xB5, 0x2F, 0xFD, 0x00, 0x01]).expect("write zstd frame");
+    let err = parse_file(&rollout)
+        .expect_err("zstd frame must not parse as JSONL")
+        .to_string();
+    assert!(
+        err.contains("zstd-compressed"),
+        "error must name the format, got: {err}"
+    );
+    assert!(
+        err.contains("zstd -d"),
+        "error must offer the decompression recipe"
+    );
+    assert!(
+        !err.contains("not valid UTF-8"),
+        "the misleading UTF-8 error is gone"
+    );
+    let _ = fs::remove_dir_all(root);
 }

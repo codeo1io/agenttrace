@@ -112,8 +112,10 @@ const search = readJson("search-snapshot");
 assert(typeof search.count === "number" && Array.isArray(search.results), "search snapshot shape changed");
 
 const compare = readJson("compare-snapshot");
-assert(Array.isArray(compare) && compare.length > 0, "compare snapshot shape changed");
-assert(compare.every((item) => item.name && item.metrics && typeof item.health === "number"), "compare snapshot entries changed");
+assert(compare.sessions && Array.isArray(compare.sessions) && compare.sessions.length > 0, "compare snapshot shape changed");
+assert(compare.sessions.every((item) => item.name && item.metrics && typeof item.health === "number"), "compare snapshot entries changed");
+assert(compare.audited_sessions === compare.sessions.length, "compare must disclose the audited session count");
+assert(compare.total_sessions === compare.sessions.length, "default compare audits every matching session");
 NODE
 
 echo "Rust real CLI smoke passed: source_dir=$source_dir sampled_files=$copied query=$query"

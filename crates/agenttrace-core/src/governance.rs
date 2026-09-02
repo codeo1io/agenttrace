@@ -32,6 +32,9 @@ pub struct ModelCostAudit {
     pub pricing_source: String,
     pub sessions: usize,
     pub tokens: TokenBreakdown,
+    /// Thinking-token share of billed output tokens (0-100), only when
+    /// the source reports a separate thinking count (pass-9 CU-20).
+    pub reasoning_share_pct: Option<f64>,
     pub rates_per_million_usd: Option<PriceBreakdown>,
     pub component_cost_usd: Option<PriceBreakdown>,
     pub estimated_cost_usd: Option<f64>,
@@ -44,6 +47,10 @@ pub struct ModelCostAudit {
 pub struct TokenBreakdown {
     pub input: i64,
     pub output: i64,
+    /// Thinking tokens billed at the output rate and already included in
+    /// `output` (pass-9 CU-20); zero when the source reports no separate
+    /// thinking count.
+    pub reasoning: i64,
     pub cache_write: i64,
     pub cache_read: i64,
     pub total: i64,
@@ -231,6 +238,10 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .tokens
             .output
             .saturating_add(session.metrics.tokens_output);
+        row.tokens.reasoning = row
+            .tokens
+            .reasoning
+            .saturating_add(session.metrics.tokens_reasoning);
         row.tokens.cache_write = row
             .tokens
             .cache_write
@@ -318,12 +329,20 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                     (Some(rates), Some(components), Some(total))
                 })
                 .unwrap_or((None, None, None));
+            let reasoning_share_pct = if row.tokens.reasoning > 0 && row.tokens.output > 0 {
+                Some(round4(
+                    row.tokens.reasoning as f64 / row.tokens.output as f64 * 100.0,
+                ))
+            } else {
+                None
+            };
             ModelCostAudit {
                 provider,
                 model,
                 pricing_source,
                 sessions: row.sessions,
                 tokens: row.tokens,
+                reasoning_share_pct,
                 rates_per_million_usd,
                 component_cost_usd,
                 estimated_cost_usd,
@@ -372,6 +391,7 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
     let tokens = TokenBreakdown {
         input: session.metrics.tokens_input,
         output: session.metrics.tokens_output,
+        reasoning: session.metrics.tokens_reasoning,
         cache_write: session.metrics.tokens_cache_w,
         cache_read: session.metrics.tokens_cache_r,
         total: total_tokens(session),
@@ -1058,6 +1078,32 @@ mod tests {
         let items = recommendations(&[looping, pressured]);
         assert_eq!(items[0].category, "context");
         assert_eq!(items[0].priority, "P0");
+    }
+
+    #[test]
+    fn cost_audit_breaks_out_reasoning_tokens_and_their_share() {
+        // CU-20: thinking tokens are billed at the output rate; the audit
+        // must fold them into output, break them out as tokens.reasoning,
+        // and expose their share of billed output tokens.
+        let mut thinker = session("thinker");
+        thinker.metrics.tokens_input = 1_000;
+        thinker.metrics.tokens_output = 600;
+        thinker.metrics.tokens_reasoning = 400;
+        let audit = cost_audit(&[thinker]);
+        assert_eq!(audit.by_provider_model.len(), 1);
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.tokens.output, 600);
+        assert_eq!(row.tokens.reasoning, 400);
+        let share = row.reasoning_share_pct.expect("share computed");
+        assert!((share - 66.6667).abs() < 0.01, "share is 400/600: {share}");
+
+        // Corpora without thinking models keep the old shape: no
+        // reasoning key gymnastics, share stays null.
+        let plain = session("plain");
+        let audit = cost_audit(&[plain]);
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.tokens.reasoning, 0);
+        assert!(row.reasoning_share_pct.is_none());
     }
 
     #[test]

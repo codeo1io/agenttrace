@@ -89,9 +89,9 @@ pub fn report_json_with_language(session: &Session, language: ReportLanguage) ->
     };
     let latency_avg = average(&gaps);
     let latency_max = gaps.last().copied().unwrap_or(0.0);
-    let latency_median = percentile(&gaps, 0.50);
+    let latency_median = crate::percentile(&gaps, 0.50);
     let latency_min = gaps.first().copied().unwrap_or(0.0);
-    let latency_p95 = percentile(&gaps, 0.95);
+    let latency_p95 = crate::percentile(&gaps, 0.95);
 
     let mut out = String::new();
     out.push_str("{\n");
@@ -340,9 +340,12 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         out.push_str(&format!(
             "  {}:  {:.1}s\n",
             language.t("median", "中位数"),
-            percentile(&gaps, 0.50)
+            crate::percentile(&gaps, 0.50)
         ));
-        out.push_str(&format!("  p95:     {:.1}s\n", percentile(&gaps, 0.95)));
+        out.push_str(&format!(
+            "  p95:     {:.1}s\n",
+            crate::percentile(&gaps, 0.95)
+        ));
         out.push_str(&format!(
             "  {}:     {:.1}s\n",
             language.t("max", "最大"),
@@ -448,6 +451,10 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
     out
 }
 
+/// Upper bound on the overview `recent_sessions` list view. `--limit`
+/// can shrink it; nothing grows it past the internal cap.
+const RECENT_SESSIONS_MAX: usize = 10;
+
 pub fn report_overview_json(overview: &Overview, sessions: &[Session]) -> String {
     report_overview_json_with_health(overview, sessions, None)
 }
@@ -517,6 +524,9 @@ pub fn report_overview_json_with_health(
 
 /// `generated_at_override` pins `scope.generated_at` (used for `--demo` so the
 /// JSON is byte-deterministic); `None` stamps the real wall clock.
+/// `display_limit` caps the recent_sessions list view only (`--limit`);
+/// every aggregate in the report covers all sessions (pass-3 P3-5,
+/// pass-8 F8-1).
 pub fn report_overview_json_with_context(
     overview: &Overview,
     sessions: &[Session],
@@ -524,9 +534,16 @@ pub fn report_overview_json_with_context(
     range: crate::TimeRange,
     includes_preserved_history: bool,
     generated_at_override: Option<&str>,
+    display_limit: usize,
 ) -> String {
     let base = report_overview_json_with_health(overview, sessions, data_health);
     let mut payload: Value = serde_json::from_str(&base).expect("overview JSON is valid");
+    if let Some(list) = payload
+        .get_mut("recent_sessions")
+        .and_then(Value::as_array_mut)
+    {
+        list.truncate(display_limit.min(RECENT_SESSIONS_MAX));
+    }
     let mut scope = report_scope(sessions, range, includes_preserved_history);
     if let Some(timestamp) = generated_at_override {
         scope.generated_at = timestamp.to_string();
@@ -560,12 +577,11 @@ pub fn report_overview_text_with_context(
         "  Range: {} | sessions: {} | {} to {}\n",
         scope.range, scope.sessions_in_scope, scope.earliest_session_at, scope.latest_session_at
     ));
+    // Out-of-scope sessions are disclosed instead of shrinking the
+    // `discovered` denominator (pass-8 F8-2).
     out.push_str(&format!(
-        "  Parse: {}/{} parsed, {} skipped, {} cache hits | confidence: {}\n",
-        data_health.parsed,
-        data_health.discovered,
-        data_health.skipped,
-        data_health.cache_hits,
+        "  Parse: {} | confidence: {}\n",
+        parse_coverage_phrase(data_health, ", "),
         data_health.confidence
     ));
     if !data_health.line_skips.is_empty() {
@@ -596,7 +612,7 @@ pub fn report_overview_markdown_with_context(
     let audit = cost_audit(sessions);
     let mut out = report_overview_markdown(overview, sessions);
     out.push_str("\n## Scope and confidence\n\n| Field | Value |\n|---|---|\n");
-    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {}/{} parsed; {} skipped; {} cache hits |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", scope.range, scope.earliest_session_at, scope.latest_session_at, data_health.parsed, data_health.discovered, data_health.skipped, data_health.cache_hits, data_health.confidence, markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
+    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", scope.range, scope.earliest_session_at, scope.latest_session_at, parse_coverage_phrase(data_health, "; "), data_health.confidence, markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
             "| Dropped lines | {} |\n",
@@ -618,7 +634,7 @@ pub fn report_overview_html_with_context(
     let audit = cost_audit(sessions);
     let recommendations = recommendations(sessions);
     let mut appendix = String::from("<section><h2>Scope and confidence</h2><table><tbody>");
-    appendix.push_str(&format!("<tr><th>Range</th><td>{}</td></tr><tr><th>Session window</th><td>{} → {}</td></tr><tr><th>Parse coverage</th><td>{}/{} parsed; {} skipped; {} cache hits</td></tr><tr><th>Confidence</th><td>{}</td></tr><tr><th>Pricing</th><td>{}</td></tr>", html_escape(&scope.range), html_escape(&scope.earliest_session_at), html_escape(&scope.latest_session_at), data_health.parsed, data_health.discovered, data_health.skipped, data_health.cache_hits, html_escape(&data_health.confidence), html_escape(&audit.pricing_source)));
+    appendix.push_str(&format!("<tr><th>Range</th><td>{}</td></tr><tr><th>Session window</th><td>{} → {}</td></tr><tr><th>Parse coverage</th><td>{}</td></tr><tr><th>Confidence</th><td>{}</td></tr><tr><th>Pricing</th><td>{}</td></tr>", html_escape(&scope.range), html_escape(&scope.earliest_session_at), html_escape(&scope.latest_session_at), html_escape(&parse_coverage_phrase(data_health, "; ")), html_escape(&data_health.confidence), html_escape(&audit.pricing_source)));
     if !data_health.line_skips.is_empty() {
         appendix.push_str(&format!(
             "<tr><th>Dropped lines</th><td>{}</td></tr>",
@@ -1444,10 +1460,17 @@ pub(crate) fn go_json_escape(value: String) -> String {
 }
 
 pub(crate) fn json_float(value: f64) -> String {
-    if value.is_finite() && value.fract() == 0.0 {
+    // Total by construction: non-finite values (reachable only through
+    // hostile catalog data, guarded upstream in convert_litellm) render
+    // as null instead of panicking, and data_health flags the session
+    // via `non_finite_costs` (pass-8 F8-5).
+    if !value.is_finite() {
+        return "null".to_string();
+    }
+    if value.fract() == 0.0 {
         format!("{value:.0}")
     } else {
-        serde_json::to_string(&value).expect("float serializes")
+        serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
     }
 }
 
@@ -1772,14 +1795,6 @@ fn top_tools(tools: &BTreeMap<String, usize>) -> BTreeMap<String, usize> {
         .take(10)
         .map(|(key, value)| (key.clone(), *value))
         .collect()
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
 }
 
 fn average(values: &[f64]) -> f64 {
@@ -2488,6 +2503,37 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
         .map(|ts| ts.with_timezone(&Utc))
 }
 
+/// Human-readable parse-coverage phrase shared by the text, Markdown,
+/// and HTML overview renderers (`sep` is ", " or "; ").
+///
+/// `discovered`/`skipped`/`out_of_scope` count source files while
+/// `parsed` counts sessions — SQLite snapshot sources yield many
+/// sessions per file, so when more sessions parsed than files were
+/// discovered the phrase switches to "N sessions from M sources"
+/// instead of a nonsensical "1410/364 parsed" (pass-8 F8-2).
+/// Out-of-scope files are disclosed, never folded into the denominator;
+/// when nothing is out of scope the phrase stays byte-identical to the
+/// pre-cycle-5 rendering (the --demo golden depends on it).
+fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
+    let base = if health.parsed > health.discovered {
+        format!(
+            "{} sessions from {} sources",
+            health.parsed, health.discovered
+        )
+    } else {
+        format!("{}/{} parsed", health.parsed, health.discovered)
+    };
+    let mut phrase = format!("{base}{sep}{} skipped{sep}", health.skipped);
+    if health.out_of_scope > 0 {
+        phrase.push_str(&format!(
+            "{} outside range/filters{sep}",
+            health.out_of_scope
+        ));
+    }
+    phrase.push_str(&format!("{} cache hits", health.cache_hits));
+    phrase
+}
+
 fn markdown_cell(value: &str) -> String {
     value.replace('|', "\\|").replace('\n', "<br>")
 }
@@ -2638,5 +2684,75 @@ mod tests {
         let compare = report_compare_with_language(&[session], "default", ReportLanguage::Zh);
         assert!(compare.contains("多会话对比"));
         assert!(compare.contains("会话"));
+    }
+
+    #[test]
+    fn parse_coverage_phrase_discloses_scope_and_handles_multi_session_sources() {
+        // Pass-8 F8-2: ranged runs must disclose out-of-scope files, and
+        // SQLite-backed corpora (many sessions per file) must not render
+        // the nonsensical "1410/364 parsed". The no-scope case must stay
+        // byte-identical to the pre-cycle-5 demo golden.
+        let mut health = crate::DataHealth {
+            discovered: 3,
+            parsed: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_coverage_phrase(&health, ", "),
+            "3/3 parsed, 0 skipped, 0 cache hits",
+            "golden demo phrase stays byte-identical"
+        );
+        health.discovered = 364;
+        health.parsed = 73;
+        health.out_of_scope = 291;
+        assert_eq!(
+            parse_coverage_phrase(&health, ", "),
+            "73/364 parsed, 0 skipped, 291 outside range/filters, 330 cache hits"
+                .replace("330", &health.cache_hits.to_string()),
+        );
+        health.cache_hits = 330;
+        assert_eq!(
+            parse_coverage_phrase(&health, ", "),
+            "73/364 parsed, 0 skipped, 291 outside range/filters, 330 cache hits"
+        );
+        health.discovered = 364;
+        health.parsed = 1410;
+        health.out_of_scope = 0;
+        assert_eq!(
+            parse_coverage_phrase(&health, "; "),
+            "1410 sessions from 364 sources; 0 skipped; 330 cache hits"
+        );
+    }
+
+    #[test]
+    fn json_float_renders_non_finite_values_as_null_instead_of_panicking() {
+        // Pass-8 F8-5: a poisoned or overflowing catalog price used to
+        // reach the report writer and panic on `.expect("float
+        // serializes")`. Non-finite costs now render as null and data
+        // health carries `non_finite_costs`, so the corruption is
+        // visible instead of fatal.
+        assert_eq!(json_float(f64::INFINITY), "null");
+        assert_eq!(json_float(f64::NEG_INFINITY), "null");
+        assert_eq!(json_float(f64::NAN), "null");
+        assert_eq!(json_float(1.0), "1");
+        assert_eq!(json_float(0.5), "0.5");
+    }
+
+    #[test]
+    fn crate_percentile_is_the_only_percentile_and_matches_go() {
+        // Pass-8 F8-6: reports.rs used to carry a second, divergent
+        // percentile ((len-1)*p, rounded) next to the Go-pinned len*p
+        // definition — p95 of 20 values differed (19 vs 20). The local
+        // copy is gone; both call sites must land on the crate
+        // definition pinned by `percentile_matches_go_index_rule`.
+        let values: Vec<f64> = (1..=20).map(|v| v as f64).collect();
+        assert_eq!(crate::percentile(&values, 0.95), 20.0);
+        assert_eq!(crate::percentile(&values, 0.50), 11.0);
+        assert_eq!(crate::percentile(&[], 0.95), 0.0);
+        let source = include_str!("reports.rs");
+        assert!(
+            !source.contains("\nfn percentile("),
+            "reports.rs must not re-declare percentile; use crate::percentile"
+        );
     }
 }

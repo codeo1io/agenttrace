@@ -101,7 +101,11 @@ agenttrace
 
 ```bash
 # Audit raw token components, normalized pricing, and fallback confidence.
+# By default this audits every matching session; audited_sessions /
+# total_sessions in the JSON (and "(auditing N of M sessions)" in text)
+# disclose the coverage. Bound it explicitly with --sample N.
 agenttrace --audit --range 30d -f json
+# agenttrace --audit --sample 500 -f json
 
 # Optional local model aliases and per-million-token price overrides.
 AGENTTRACE_PRICING_FILE=pricing-overrides.json agenttrace --audit -f json
@@ -131,6 +135,22 @@ prioritized recommendations, MCP governance, context trends, and delivery
 signals in JSON, Markdown, and HTML output. All cost and delivery fields are
 explicitly estimates or heuristics; they are not provider billing or proof that
 a commit reached `main`.
+
+### Flags go before the session path
+
+`agenttrace` keeps Go-`flag`-compatible argument parsing: option flags are
+recognized only **before** the first positional argument. Anything after the
+positional is treated as positional context and flags there are ignored, so:
+
+```bash
+agenttrace sessions.jsonl -f json    # -f is IGNORED (after the path)
+agenttrace -f json sessions.jsonl    # -f json works
+```
+
+`--limit` caps list views only (for example the overview's `recent_sessions`);
+it never filters aggregates, audit totals, or recommendations. Governance
+reports are unbounded by default — use `--sample N` for an explicitly
+disclosed bound.
 
 ## What you get
 

@@ -426,6 +426,18 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
             cw: model.cache_write_cost * 1e6,
             cr: model.cache_read_cost * 1e6,
         };
+        // Hostile or overflowing catalog rates must not reach costing:
+        // the 1e6 scaling can turn a near-f64-max per-token cost into
+        // inf, which used to survive into reports (pass-8 F8-5). Skip
+        // the entry; the model falls back to default pricing and shows
+        // up in data_health as fallback_pricing.
+        if !(price.input.is_finite()
+            && price.output.is_finite()
+            && price.cw.is_finite()
+            && price.cr.is_finite())
+        {
+            continue;
+        }
         let priority = provider_priority(&model.provider);
         match selected.get(&normalized) {
             Some((existing, _)) if *existing >= priority => {}
@@ -1327,6 +1339,43 @@ mod tests {
         assert!(
             pricing_source_for_catalog("alias-model", &catalog, &overrides)
                 .contains("via user override alias")
+        );
+    }
+
+    #[test]
+    fn convert_litellm_rejects_non_finite_scaled_rates() {
+        // Pass-8 F8-5: per-token rates near f64::MAX turn into inf after
+        // the *1e6 scaling and used to flow into costing, poisoning
+        // totals until json_float panicked. Non-finite entries are
+        // skipped; the model falls back to default pricing (and shows
+        // up as fallback_pricing in data health) instead of lying with
+        // a NaN cost.
+        let hostile = serde_json::json!({
+            "finite-model": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015,
+                "mode": "chat",
+                "litellm_provider": "finite"
+            },
+            "poisoned-model": {
+                "input_cost_per_token": 1.7976931348623157e308,
+                "output_cost_per_token": 0.000015,
+                "mode": "chat",
+                "litellm_provider": "poisoned"
+            }
+        });
+        let catalog = convert_litellm(
+            serde_json::to_vec(&hostile)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        assert!(
+            catalog.contains_key("finite-model"),
+            "finite entries survive the conversion"
+        );
+        assert!(
+            !catalog.contains_key("poisoned-model"),
+            "entries whose scaled price is non-finite are dropped"
         );
     }
 }

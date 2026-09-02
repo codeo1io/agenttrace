@@ -72,8 +72,19 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
             path: env_home("CODEX_HOME", home.join(".codex")).join("archived_sessions"),
         },
         KnownSessionDir {
+            name: "Gemini CLI".to_string(),
+            path: home.join(".gemini").join("tmp"),
+        },
+        KnownSessionDir {
             name: "Antigravity CLI".to_string(),
             path: home.join(".gemini").join("antigravity-cli").join("brain"),
+        },
+        KnownSessionDir {
+            name: "Antigravity CLI conversations".to_string(),
+            path: home
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("conversations"),
         },
         KnownSessionDir {
             name: "Claude Code transcripts".to_string(),

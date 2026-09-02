@@ -43,9 +43,9 @@ pub use governance::{
 };
 pub use history::{history_path, merge_preserved_history, preserve_derived_history};
 pub use insights::{
-    compare_session_outcome, data_health, filter_sessions, project_name, report_scope,
-    resolve_project, session_capability, session_matches_time_range, DataHealth, ProjectIdentity,
-    ReportScope, SessionComparison, SourceScope, TimeRange,
+    compare_session_outcome, data_health, data_health_scoped, filter_sessions, project_name,
+    report_scope, resolve_project, session_capability, session_matches_time_range, DataHealth,
+    ProjectIdentity, ReportScope, SessionComparison, SourceScope, TimeRange,
 };
 pub use parser::{parse_file, parse_raw_session};
 pub use pricing::{
@@ -325,6 +325,11 @@ pub struct Metrics {
     pub reasoning_redact: usize,
     pub tokens_input: i64,
     pub tokens_output: i64,
+    /// Thinking tokens reported separately by the source (Gemini
+    /// `thoughtsTokenCount` and OpenAI-compatible `reasoning_tokens`),
+    /// billed at the output rate and already included in
+    /// `tokens_output` (pass-9 CU-20).
+    pub tokens_reasoning: i64,
     pub tokens_cache_w: i64,
     pub tokens_cache_r: i64,
     #[serde(skip)]
@@ -635,6 +640,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     metrics.tokens_output = metrics
                         .tokens_output
                         .saturating_add(usage_tokens("output_tokens"));
+                    metrics.tokens_reasoning = metrics
+                        .tokens_reasoning
+                        .saturating_add(usage_tokens("reasoning_tokens"));
                     metrics.tokens_cache_w = metrics
                         .tokens_cache_w
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
@@ -1306,7 +1314,11 @@ fn parse_ts(value: &str) -> Option<DateTime<Utc>> {
         .map(|ts| ts.and_utc())
 }
 
-fn percentile(sorted: &[f64], p: f64) -> f64 {
+pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
+    // The single percentile definition for the whole crate (pass-8
+    // F8-6): truncating at len*p, pinned as Go-compatible by
+    // `percentile_matches_go_index_rule`. reports.rs used to carry a
+    // divergent (len-1)*p-rounding copy (20 vs 19 at p=0.95).
     if sorted.is_empty() {
         return 0.0;
     }

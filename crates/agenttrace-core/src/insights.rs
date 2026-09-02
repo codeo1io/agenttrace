@@ -107,7 +107,14 @@ pub struct SourceScope {
 pub struct DataHealth {
     pub discovered: usize,
     pub parsed: usize,
+    /// Sessions that failed to parse (loader `skipped`); never counts
+    /// sessions merely excluded by range/filters.
     pub skipped: usize,
+    /// Sessions the loader discovered but the report scope excludes
+    /// (time range, project/source/model filters). Separate from
+    /// `skipped` so "Parse coverage N/M" is true for every range
+    /// (pass-8 F8-2).
+    pub out_of_scope: usize,
     pub cache_hits: usize,
     pub unknown_sources: usize,
     pub unknown_models: usize,
@@ -132,6 +139,10 @@ pub struct DataHealth {
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
+    /// Sessions whose estimated cost is not a finite number (poisoned
+    /// or overflowing pricing inputs). Their costs render as null in
+    /// reports; the count keeps the corruption visible (pass-8 F8-5).
+    pub non_finite_costs: usize,
 }
 
 pub fn session_capability(session: &Session) -> &'static str {
@@ -294,6 +305,43 @@ pub fn report_scope(
 }
 
 pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -> DataHealth {
+    // Legacy semantics kept for callers without a LoadReport (TUI view,
+    // explicit-path runs): parse failures and scope exclusions cannot be
+    // separated, so they fold into `skipped` and out_of_scope stays 0.
+    let parsed = sessions.len();
+    let skipped = discovered.saturating_sub(parsed);
+    data_health_from_parts(sessions, discovered, skipped, 0, cache_hits)
+}
+
+/// Truthful coverage accounting from the discovery loader (pass-8
+/// F8-2): `discovered` is the loader's range-independent file-scan
+/// count, `parse_failures` is the loader's `skipped`, and everything
+/// else the loader discovered but the report excludes lands in
+/// `out_of_scope` instead of shrinking the denominator.
+pub fn data_health_scoped(
+    sessions: &[Session],
+    discovered: usize,
+    parse_failures: usize,
+    cache_hits: usize,
+) -> DataHealth {
+    let parsed = sessions.len();
+    let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
+    data_health_from_parts(
+        sessions,
+        discovered,
+        parse_failures,
+        out_of_scope,
+        cache_hits,
+    )
+}
+
+fn data_health_from_parts(
+    sessions: &[Session],
+    discovered: usize,
+    skipped: usize,
+    out_of_scope: usize,
+    cache_hits: usize,
+) -> DataHealth {
     let parsed = sessions.len();
     let unknown_sources = sessions
         .iter()
@@ -307,7 +355,6 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
         .iter()
         .filter(|s| !pricing::has_specific_price(&s.metrics.model_used))
         .count();
-    let skipped = discovered.saturating_sub(parsed);
     let stored_totals_sessions = sessions
         .iter()
         .filter(|s| s.metrics.provenance.tokens == "stored_session_totals")
@@ -325,10 +372,15 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
             *line_skips.entry(reason.clone()).or_insert(0) += count;
         }
     }
+    let non_finite_costs = sessions
+        .iter()
+        .filter(|s| !s.metrics.cost_estimated.is_finite())
+        .count();
     DataHealth {
         discovered,
         parsed,
         skipped,
+        out_of_scope,
         cache_hits,
         unknown_sources,
         unknown_models,
@@ -343,6 +395,7 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
             || skipped > 0
             || unknown_sources > 0
             || unknown_models > 0
+            || non_finite_costs > 0
             || !line_skips.is_empty()
         {
             "low"
@@ -365,6 +418,7 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
         stored_totals_delta_tokens,
         unknown_time_sessions,
         line_skips,
+        non_finite_costs,
         with_duration: sessions
             .iter()
             .filter(|s| s.metrics.duration_sec > 0.0)
