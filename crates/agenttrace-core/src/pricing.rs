@@ -9,6 +9,11 @@ use std::time::{Duration, SystemTime};
 
 const PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+/// Trimmed LiteLLM chat-model pricing snapshot, vendored so agenttrace is
+/// fully offline by default. Regenerate with `scripts/pricing/update-snapshot.sh`
+/// and keep `PRICING_SNAPSHOT_DATE` in sync with the date it prints.
+const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
+const PRICING_SNAPSHOT_DATE: &str = "2026-09-02";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -26,7 +31,6 @@ pub struct PricingCatalog {
     pub entries: BTreeMap<String, Price>,
     pub aliases: BTreeMap<String, String>,
     pub source: String,
-    pub loaded_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,13 +96,17 @@ pub fn pricing_source() -> String {
 }
 
 fn catalog_source(catalog: &PricingCatalog) -> String {
-    match (catalog.source.as_str(), catalog.loaded_at) {
-        ("cache", Some(time)) => format!("LiteLLM (cached {})", format_cache_time(time)),
-        ("cache(stale)", Some(time)) => {
-            format!("LiteLLM (stale cache {})", format_cache_time(time))
+    // Labels are deliberately clock-free: identical inputs must produce
+    // byte-identical reports (see scripts/ci/check-deterministic-output.sh).
+    // The previous labels embedded cache/fetch timestamps.
+    match catalog.source.as_str() {
+        "cache" => "LiteLLM (cached catalog)".to_string(),
+        "cache(stale)" => {
+            "LiteLLM (cached catalog, stale; run --update-pricing to refresh)".to_string()
         }
-        ("remote", Some(time)) => format!("LiteLLM (fetched {})", format_cache_time(time)),
-        _ => "built-in fallback (use --update-pricing for latest)".to_string(),
+        "remote" => "LiteLLM (just refreshed)".to_string(),
+        "snapshot" => format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)"),
+        _ => "built-in fallback (run --update-pricing for the latest catalog)".to_string(),
     }
 }
 
@@ -133,7 +141,18 @@ pub fn pricing_cache_path() -> PathBuf {
 pub fn update_pricing() -> anyhow::Result<usize> {
     let (raw, entries) = download_pricing(Duration::from_secs(30))?;
     write_pricing_cache(&raw)?;
-    Ok(entries.len())
+    let count = entries.len();
+    // Publish the fresh catalog to later pricing_catalog() consumers in
+    // this process (a no-op when the singleton was already initialized).
+    let mut catalog = PricingCatalog {
+        entries,
+        aliases: BTreeMap::new(),
+        source: "remote".to_string(),
+    };
+    let override_models = apply_pricing_overrides(&mut catalog);
+    let _ = PRICING_OVERRIDE_MODELS.set(override_models);
+    let _ = PRICING_CATALOG.set(catalog);
+    Ok(count)
 }
 
 pub fn render_model_pricing_list() -> String {
@@ -228,54 +247,64 @@ pub(crate) fn token_cost(
 }
 
 fn pricing_catalog() -> &'static PricingCatalog {
-    PRICING_CATALOG.get_or_init(|| {
-        let mut catalog = load_pricing_cache().unwrap_or_else(|| PricingCatalog {
+    PRICING_CATALOG.get_or_init(load_catalog_for_current_env)
+}
+
+/// Resolve the pricing catalog without touching the network: a cached
+/// catalog is served as-is regardless of age, and when no cache exists the
+/// bundled snapshot is used. The only network path is the explicit
+/// `--update-pricing` action.
+fn load_catalog_for_current_env() -> PricingCatalog {
+    let mut catalog = load_pricing_cache().unwrap_or_else(fallback_catalog);
+    let override_models = apply_pricing_overrides(&mut catalog);
+    let _ = PRICING_OVERRIDE_MODELS.set(override_models);
+    catalog
+}
+
+fn fallback_catalog() -> PricingCatalog {
+    let entries = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+    if entries.is_empty() {
+        return PricingCatalog {
             entries: builtin_pricing(),
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
-            loaded_at: None,
-        });
-        if catalog.source == "cache(stale)" {
-            if let Ok((raw, entries)) = download_pricing(Duration::from_secs(5)) {
-                if write_pricing_cache(&raw).is_ok() {
-                    catalog = PricingCatalog {
-                        entries,
-                        aliases: BTreeMap::new(),
-                        source: "remote".to_string(),
-                        loaded_at: Some(SystemTime::now()),
-                    };
-                }
-            }
-        }
-        let mut override_models = BTreeSet::new();
-        if let Some((prices, aliases)) = load_pricing_overrides() {
-            override_models.extend(prices.keys().cloned());
-            catalog.entries.extend(prices);
-            catalog.aliases.extend(aliases);
-        }
-        let _ = PRICING_OVERRIDE_MODELS.set(override_models);
-        catalog
-    })
+        };
+    }
+    PricingCatalog {
+        entries,
+        aliases: BTreeMap::new(),
+        source: "snapshot".to_string(),
+    }
+}
+
+fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
+    let mut override_models = BTreeSet::new();
+    if let Some((prices, aliases)) = load_pricing_overrides() {
+        override_models.extend(prices.keys().cloned());
+        catalog.entries.extend(prices);
+        catalog.aliases.extend(aliases);
+    }
+    override_models
 }
 
 fn load_pricing_cache() -> Option<PricingCatalog> {
     let path = pricing_cache_path();
     let metadata = path.metadata().ok()?;
-    let loaded_at = metadata.modified().ok();
+    let stale = metadata
+        .modified()
+        .ok()
+        .and_then(|time| SystemTime::now().duration_since(time).ok())
+        .map(|age| age > CACHE_MAX_AGE)
+        .unwrap_or(false);
     let raw = std::fs::read(&path).ok()?;
     let entries = convert_litellm(&raw);
     if entries.is_empty() {
         return None;
     }
-    let stale = loaded_at
-        .and_then(|time| SystemTime::now().duration_since(time).ok())
-        .map(|age| age > CACHE_MAX_AGE)
-        .unwrap_or(false);
     Some(PricingCatalog {
         entries,
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
-        loaded_at,
     })
 }
 
@@ -1081,11 +1110,6 @@ fn write_pricing_header(out: &mut String, name_width: usize) {
     out.push_str(&format!("  {}\n", "-".repeat(name_width + 24)));
 }
 
-fn format_cache_time(time: SystemTime) -> String {
-    let datetime: chrono::DateTime<chrono::Local> = time.into();
-    datetime.format("%Y-%m-%d %H:%M").to_string()
-}
-
 fn user_cache_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1155,6 +1179,127 @@ mod tests {
         assert_eq!(resolve_alias("loop", &aliases), "loop");
     }
 
+    /// Run `body` with the pricing cache environment pointed at an empty
+    /// temporary directory unique to this invocation. The lock serializes
+    /// invocations: they mutate process-global env vars, so parallel runs
+    /// previously read each other's cache state, and the shared pid-keyed
+    /// directory let one test's cleanup delete another's seeded cache file
+    /// (`cache re-read: NotFound` flakes under the combined CI test run).
+    fn with_isolated_cache_env<T>(body: impl FnOnce() -> T) -> T {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prior_home = std::env::var_os("HOME");
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-test-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp cache dir");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        std::env::set_var("HOME", &dir);
+        let result = body();
+        match prior_xdg {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prior_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn catalog_uses_bundled_snapshot_without_cache_and_never_writes_one() {
+        with_isolated_cache_env(|| {
+            let catalog = load_catalog_for_current_env();
+            assert_eq!(catalog.source, "snapshot");
+            assert!(!catalog.entries.is_empty());
+            assert!(catalog.entries.contains_key("claude-sonnet-4-5"));
+            // The offline read path must not create or rewrite a cache file:
+            // this is the guarantee that reports and tests never download.
+            assert!(!pricing_cache_path().exists());
+        });
+    }
+
+    #[test]
+    fn stale_cache_is_served_as_is_without_download_or_rewrite() {
+        with_isolated_cache_env(|| {
+            let raw = br#"{"anthropic/claude-sonnet-4-5":{"input_cost_per_token":3e-6,"output_cost_per_token":1.5e-5,"cache_creation_input_token_cost":3.75e-7,"cache_read_input_token_cost":3e-7,"mode":"chat","litellm_provider":"anthropic"}}"#;
+            let path = pricing_cache_path();
+            std::fs::create_dir_all(path.parent().expect("cache parent")).expect("cache dir");
+            std::fs::write(&path, raw).expect("cache seed");
+            std::fs::File::open(&path)
+                .expect("cache open")
+                .set_modified(SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60))
+                .expect("backdate cache");
+            let before = std::fs::read(&path).expect("cache read");
+            let catalog = load_catalog_for_current_env();
+            assert_eq!(catalog.source, "cache(stale)");
+            assert_eq!(
+                catalog.entries.get("claude-sonnet-4-5").map(|p| p.input),
+                Some(3.0)
+            );
+            let after = std::fs::read(&path).expect("cache re-read");
+            assert_eq!(
+                before, after,
+                "the read path must never rewrite the pricing cache"
+            );
+        });
+    }
+
+    #[test]
+    fn pricing_source_labels_carry_no_wall_clock() {
+        let catalog = |source: &str| PricingCatalog {
+            entries: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            source: source.to_string(),
+        };
+        assert_eq!(
+            catalog_source(&catalog("cache")),
+            "LiteLLM (cached catalog)"
+        );
+        assert_eq!(
+            catalog_source(&catalog("cache(stale)")),
+            "LiteLLM (cached catalog, stale; run --update-pricing to refresh)"
+        );
+        assert_eq!(
+            catalog_source(&catalog("remote")),
+            "LiteLLM (just refreshed)"
+        );
+        assert_eq!(
+            catalog_source(&catalog("snapshot")),
+            format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)")
+        );
+        assert_eq!(
+            catalog_source(&catalog("builtin")),
+            "built-in fallback (run --update-pricing for the latest catalog)"
+        );
+    }
+
+    #[test]
+    fn pricing_snapshot_date_is_pinned_to_the_bundled_payload() {
+        // The const and the snapshot payload were previously kept in sync
+        // by prose only (a header comment in update-snapshot.sh). This pin
+        // goes red the moment one drifts from the other (P5-3).
+        let snapshot: serde_json::Value =
+            serde_json::from_str(PRICING_SNAPSHOT_JSON).expect("bundled snapshot parses");
+        let date = snapshot["_snapshot"]["date"]
+            .as_str()
+            .expect("_snapshot.date is a string");
+        assert_eq!(
+            date, PRICING_SNAPSHOT_DATE,
+            "PRICING_SNAPSHOT_DATE drifted from the bundled pricing_snapshot.json; \
+             update the const together with the snapshot (see \
+             scripts/pricing/update-snapshot.sh)"
+        );
+    }
+
     #[test]
     fn pricing_source_is_specific_to_the_price_that_matched() {
         let catalog = PricingCatalog {
@@ -1164,7 +1309,6 @@ mod tests {
             ]),
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
-            loaded_at: Some(SystemTime::UNIX_EPOCH),
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
         assert!(

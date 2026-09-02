@@ -177,7 +177,10 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
     } else {
         0.0
     };
-    let wasted_tokens = (metrics.tokens_input - metrics.tokens_cache_r).max(0);
+    let wasted_tokens = metrics
+        .tokens_input
+        .saturating_sub(metrics.tokens_cache_r)
+        .max(0);
     let price = pricing::lookup_price(&metrics.model_used);
     let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
     let (rating, suggestion) = if hit_rate >= 80.0 {

@@ -1,0 +1,7 @@
+{"prompt":"\u中文测试"}
+{"prompt":"\ud800\u中文测试"}
+{"prompt":"lone \ud800 with pair \ud83d\ude00 end"}
+{"prompt":"\uzzzz not hex"}
+{"prompt":"\u00e9 valid bmp escape"}
+{"prompt":"truncated \u4e2"}
+{"prompt":"\ud83d\ude0e emoji pair only"}

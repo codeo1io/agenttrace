@@ -119,6 +119,15 @@ pub struct DataHealth {
     pub with_tools: usize,
     pub with_event_timing: usize,
     pub with_diagnostics: usize,
+    /// Sessions whose token totals came from the authoritative columns
+    /// stored on the session row instead of message aggregation.
+    pub stored_totals_sessions: usize,
+    /// Aggregate magnitude of stored-versus-derived token drift across
+    /// those sessions (saturating, never negative).
+    pub stored_totals_delta_tokens: i64,
+    /// Sessions whose start time is unknown (empty or unparseable). They
+    /// stay visible in time-ranged views instead of being dropped.
+    pub unknown_time_sessions: usize,
 }
 
 pub fn session_capability(session: &Session) -> &'static str {
@@ -129,7 +138,7 @@ pub fn session_capability(session: &Session) -> &'static str {
     {
         "detailed"
     } else if m.duration_sec > 0.0
-        || m.tokens_input + m.tokens_output > 0
+        || m.tokens_input.saturating_add(m.tokens_output) > 0
         || m.tool_calls_total > 0
         || !matches!(m.model_used.as_str(), "" | "default" | "unknown")
     {
@@ -228,7 +237,11 @@ pub fn filter_sessions(
 }
 pub fn session_matches_time_range(session: &Session, range: TimeRange, now: DateTime<Utc>) -> bool {
     range.since(now).map_or(true, |since| {
-        parse_ts(&session.metrics.session_start).is_some_and(|time| time >= since)
+        // Unknown start times stay visible (N7 unknown-time bucket);
+        // only sessions with a known start before the cutoff drop out.
+        parse_ts(&session.metrics.session_start)
+            .map(|time| time >= since)
+            .unwrap_or(true)
     })
 }
 
@@ -252,7 +265,7 @@ pub fn report_scope(
                 ..SourceScope::default()
             });
         entry.sessions += 1;
-        entry.tokens += total_tokens(session);
+        entry.tokens = entry.tokens.saturating_add(total_tokens(session));
         entry.estimated_cost += session.metrics.cost_estimated;
     }
     ReportScope {
@@ -291,6 +304,17 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
         .filter(|s| !pricing::has_specific_price(&s.metrics.model_used))
         .count();
     let skipped = discovered.saturating_sub(parsed);
+    let stored_totals_sessions = sessions
+        .iter()
+        .filter(|s| s.metrics.provenance.tokens == "stored_session_totals")
+        .count();
+    let stored_totals_delta_tokens = sessions.iter().fold(0i64, |acc, s| {
+        acc.saturating_add(s.metrics.stored_totals_delta.saturating_abs())
+    });
+    let unknown_time_sessions = sessions
+        .iter()
+        .filter(|s| parse_ts(&s.metrics.session_start).is_none())
+        .count();
     DataHealth {
         discovered,
         parsed,
@@ -315,8 +339,16 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
         .to_string(),
         with_tokens: sessions
             .iter()
-            .filter(|s| s.metrics.tokens_input + s.metrics.tokens_output > 0)
+            .filter(|s| {
+                s.metrics
+                    .tokens_input
+                    .saturating_add(s.metrics.tokens_output)
+                    > 0
+            })
             .count(),
+        stored_totals_sessions,
+        stored_totals_delta_tokens,
+        unknown_time_sessions,
         with_duration: sessions
             .iter()
             .filter(|s| s.metrics.duration_sec > 0.0)

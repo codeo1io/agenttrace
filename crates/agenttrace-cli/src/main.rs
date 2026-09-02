@@ -92,7 +92,7 @@ struct Args {
     baseline_max_cost_delta_pct: f64,
     #[arg(long = "baseline-max-token-delta-pct", default_value_t = 0.0)]
     baseline_max_token_delta_pct: f64,
-    #[arg(long = "lang", default_value = "en")]
+    #[arg(long = "lang", default_value = "en", value_name = "en|zh")]
     lang: String,
     #[arg(long, default_value = "all")]
     range: String,
@@ -133,6 +133,14 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let args = Args::parse_from(go_flag_compatible_args(std::env::args_os()));
+    // --version must win over argument validation, including action
+    // validation: `--lang fr --version` used to fail in report_language()
+    // and `--overview --version` in validate_primary_action() before the
+    // early return ran (pass-6 P6-2).
+    if args.version {
+        write_stdout(&format!("agenttrace v{}\n", VERSION))?;
+        return Ok(());
+    }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
     if matches!(args.format.as_str(), "markdown" | "md" | "html")
@@ -145,12 +153,8 @@ fn run() -> anyhow::Result<()> {
     {
         bail!("markdown and html formats require --overview or a governance report action");
     }
-    let language = report_language(&args.lang);
 
-    if args.version {
-        write_stdout(&format!("agenttrace v{}\n", VERSION))?;
-        return Ok(());
-    }
+    let language = report_language(&args.lang)?;
 
     if args.clear_cache {
         agenttrace_core::clear_session_cache()?;
@@ -341,6 +345,9 @@ fn run() -> anyhow::Result<()> {
                 Some(&health),
                 range,
                 args.include_history,
+                // Pinned epoch keeps --demo JSON byte-deterministic (CI
+                // determinism check); real runs stamp the wall clock.
+                args.demo.then_some(agenttrace_core::DEMO_REPORT_EPOCH),
             ),
             "markdown" | "md" => report_overview_markdown_with_context(
                 &overview,
@@ -571,10 +578,11 @@ fn session_mod_time(session: &Session) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-fn report_language(value: &str) -> ReportLanguage {
+fn report_language(value: &str) -> anyhow::Result<ReportLanguage> {
     match value.to_ascii_lowercase().as_str() {
-        "zh" | "zh-cn" | "zh_cn" | "chinese" => ReportLanguage::Zh,
-        _ => ReportLanguage::En,
+        "en" | "english" => Ok(ReportLanguage::En),
+        "zh" | "zh-cn" | "zh_cn" | "chinese" => Ok(ReportLanguage::Zh),
+        other => bail!("unsupported --lang value '{other}'; supported languages: en, zh"),
     }
 }
 
@@ -984,6 +992,44 @@ mod tests {
     use super::*;
     use agenttrace_core::Metrics;
     use std::io::Write;
+
+    #[test]
+    fn report_language_accepts_supported_values_and_rejects_the_rest() {
+        assert_eq!(report_language("en").unwrap(), ReportLanguage::En);
+        assert_eq!(report_language("EN").unwrap(), ReportLanguage::En);
+        assert_eq!(report_language("english").unwrap(), ReportLanguage::En);
+        assert_eq!(report_language("zh").unwrap(), ReportLanguage::Zh);
+        assert_eq!(report_language("zh-CN").unwrap(), ReportLanguage::Zh);
+        assert_eq!(report_language("zh_cn").unwrap(), ReportLanguage::Zh);
+        assert_eq!(report_language("chinese").unwrap(), ReportLanguage::Zh);
+        // Unknown values previously fell back to English silently.
+        assert!(report_language("fr").is_err());
+        assert!(report_language("").is_err());
+    }
+
+    #[test]
+    fn demo_overview_json_is_byte_deterministic() {
+        // The CI determinism check compares --demo --overview -f json byte for
+        // byte; the wall clock used to leak through scope.generated_at and
+        // flake whenever two runs straddled a second boundary.
+        let sessions = agenttrace_core::demo_sessions().expect("demo sessions");
+        let overview = compute_overview(&sessions);
+        let health = data_health(&sessions, sessions.len(), 0);
+        let render = || {
+            report_overview_json_with_context(
+                &overview,
+                &sessions,
+                Some(&health),
+                TimeRange::All,
+                false,
+                Some(agenttrace_core::DEMO_REPORT_EPOCH),
+            )
+        };
+        let first = render();
+        let second = render();
+        assert_eq!(first, second);
+        assert!(first.contains(agenttrace_core::DEMO_REPORT_EPOCH));
+    }
 
     #[test]
     fn latest_session_prefers_session_timestamp_over_mod_time() {

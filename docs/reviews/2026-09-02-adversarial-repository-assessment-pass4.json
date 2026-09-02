@@ -1,0 +1,133 @@
+{
+  "run_id": "1efeb12cc1334ebdae35747e4ad161e1",
+  "phase_id": "assess",
+  "action_id": "assess:assess",
+  "attempt_id": "85e7736ff7b747358c41536c298c4983",
+  "status": "succeeded",
+  "summary": "Fourth adversarial assessment of agenttrace (e005952 + uncommitted cycle-1 tree, verified unchanged from pass 3). New attack surfaces this pass: the TUI crate driven under a real PTY, the CLI argument-parsing shim, npm/homebrew release artifacts, CI smoke harnesses, and a full documentation command sweep (37 documented commands executed against the real binary). Baseline re-confirmed first: cargo test --workspace 159/159, clippy 0 warnings. Eight NEW findings, all distinct from F1-F19, N1-N10 and P3-1..P3-9; every reproducible one was reproduced end-to-end. (1) HIGH: the default TUI launch panics with exit 101 and a raw Rust panic whenever stdout is not a TTY (ratatui::init() at app.rs:72) - this is the README quickstart 'agenttrace', and the doc sweep hit the panic from 6 documented commands across 4 documents (both READMEs, launch-kit, governance-reports); it breaks piped/cron/CI/docker usage of the tool's advertised entry point. (2) MEDIUM: go_flag_compatible_args (main.rs:474-507) silently truncates argv at the first positional, so 'agenttrace file.jsonl --latest -f json' drops --latest and -f json with empty stderr and prints a text report; 'agenttrace -- a.jsonl b.jsonl --sessions' also drops the second file; the hand-maintained flag_takes_value list (24 entries) is a sync trap that would silently misroute a future flag's value into args.path. (3) MEDIUM: filter-only invocations silently launch a full-screen TUI because --range/--project/--source are not actions - docs/guides/governance-reports.md:12's canonical scope example does exactly this (verified under a PTY). (4) MEDIUM: the npm tarball ships zero tests - npm pack lists 5 files with no test/, so npm test on the published package passes vacuously (verified by extracting tarball contents: pass 0 / fail 0), and files lists a nonexistent lib/ dir; the one JS test covering the network-facing install.js never runs against the shipped artifact. (5) MEDIUM->LOW: the repo's own PTY TUI smoke harness (expect script) is complete but permanently gated on AGENTTRACE_TUI_REAL_DIR which is set nowhere; new evidence shows it can be ungated on --demo - I drove 28 keystrokes against --demo via my own PTY driver with rc=0/no panic, and also clean on empty dir, garbage-only dir and nonexistent dir. (6) LOW: AGENTTRACE_SESSION_CACHE_DIR isolates only the session cache; pricing_cache_path() (pricing.rs:137-139) ignores it, so CI/test isolation is partial and parallel jobs share ~/.cache/agenttrace/pricing.json - the first behavioural divergence caused by the user_cache_dir() triplication (P3-8). (7) LOW: history_path() (history.rs:25-34) is a fourth, differently-shaped home resolver (XDG_DATA_HOME/HOME/.local/share/temp; no macOS Application Support, no USERPROFILE) - on Windows the history file lands in the temp dir. (8) LOW: preserved history has no eviction and is fully rewritten each run, and discovery.rs:242 discards its write errors. Negative results recorded: real TUI key-walk clean on all inputs, guarded expects unreachable, flag_takes_value currently complete, --version matches the Homebrew formula test block, 27/37 doc commands pass. No commits, pushes, PRs or CI runs this turn; two new artifacts added under docs/reviews/. Full evidence and prioritized remediation in the pass-4 report.",
+  "artifacts": [
+    "docs/reviews/2026-09-02-adversarial-repository-assessment-pass4.md",
+    "docs/reviews/2026-09-02-adversarial-repository-assessment-pass4.json"
+  ],
+  "evidence_refs": [
+    "crates/agenttrace-tui/src/app.rs:71-76",
+    "crates/agenttrace-cli/src/main.rs:474-513",
+    "crates/agenttrace-cli/src/main.rs:514-549",
+    "crates/agenttrace-cli/src/main.rs:1076-1089",
+    "crates/agenttrace-cli/src/main.rs:912-924",
+    "crates/agenttrace-cli/src/main.rs:196-203",
+    "crates/agenttrace-cli/src/main.rs:585-613",
+    "crates/agenttrace-core/src/pricing.rs:137-139",
+    "crates/agenttrace-core/src/session_cache.rs:154",
+    "crates/agenttrace-core/src/doctor.rs:325",
+    "crates/agenttrace-core/src/history.rs:25-60",
+    "crates/agenttrace-core/src/discovery.rs:242",
+    "crates/agenttrace-core/tests/discovery_contract.rs:1550-1578",
+    "npm/package.json",
+    "npm/test/package.test.js",
+    ".github/workflows/ci.yml:84",
+    "scripts/ci/check-rust-tui-real-smoke.sh",
+    "scripts/ci/check-docs-commands.sh",
+    "docs/guides/governance-reports.md:12",
+    "README.md:99",
+    "repro: ./agenttrace </dev/null >/dev/null 2>&1; echo $? -> 101 (ratatui init panic)",
+    "repro: ./agenttrace /tmp/at4/a.jsonl --latest -f json | head -1 -> text report banner",
+    "repro: ./agenttrace -- /tmp/at4/a.jsonl /tmp/at4/b.jsonl --sessions -> single-session text report",
+    "repro: npm pack --dry-run (5 files, no test/) + npm test on extracted tarball -> pass 0 / fail 0",
+    "repro: /tmp/pty_drive.py --demo 28 keystrokes -> rc=0, no panic",
+    "repro: /tmp/docsweep.py -> 37 documented commands executed"
+  ],
+  "findings": [
+    {
+      "severity": "high",
+      "file": "crates/agenttrace-tui/src/app.rs",
+      "line": 72,
+      "issue": "P4-1 Default TUI launch panics with exit 101 and a raw Rust panic when stdout is not a TTY: ratatui::init() panics on ENXIO inside run_with_app, which already returns anyhow::Result<()>. Breaks the README quickstart (README.md:99, README.zh-CN.md), --demo in cron/CI, pipes, docker run without -t, and non-interactive SSH. Reproduced: 'agenttrace </dev/null >/dev/null; echo $?' -> 101 with 'failed to initialize terminal: Os { code: 6 ... }'. Doc sweep hit this from 6 documented commands across 4 documents."
+    },
+    {
+      "severity": "medium",
+      "file": "crates/agenttrace-cli/src/main.rs",
+      "line": 498,
+      "issue": "P4-2 go_flag_compatible_args silently truncates argv at the first positional argument (break at main.rs:500), discarding every later flag and positional with empty stderr. Reproduced: 'agenttrace a.jsonl --latest -f json' prints a text report (flags dropped); 'agenttrace -- a.jsonl b.jsonl --sessions' drops the second file and --sessions. flag_takes_value (main.rs:514-549) is a hand-maintained 24-entry list: any future value-taking flag forgotten there would have its VALUE become args.path ('session path does not exist: <value>')."
+    },
+    {
+      "severity": "medium",
+      "file": "docs/guides/governance-reports.md",
+      "line": 12,
+      "issue": "P4-3 Filter-only invocations silently launch a full-screen TUI: --range/--project/--source/--model-filter/--health/--cost are not in has_session_action (main.rs:912-924), so the code falls through to the TUI (main.rs:196-203). The doc's canonical scope example 'agenttrace --range 30d --project storefront --source claude_code' renders a TUI under a PTY (verified) and panics per P4-1 under a pipe."
+    },
+    {
+      "severity": "medium",
+      "file": "npm/package.json",
+      "line": 21,
+      "issue": "P4-4 Published npm tarball ships zero tests: 'files' omits test/ so npm pack lists 5 files without it; running npm test against exactly the tarball contents yields pass 0 / fail 0 (vacuous green), meaning the sole JS test covering the network-facing install.js never runs against the artifact users download. 'files' also lists 'lib', a directory that does not exist in the repo."
+    },
+    {
+      "severity": "medium",
+      "file": ".github/workflows/ci.yml",
+      "line": 84,
+      "issue": "P4-5 The complete PTY-driven TUI smoke harness (scripts/ci/check-rust-tui-real-smoke.sh, a real expect script) never runs: gated on 'if: env.AGENTTRACE_TUI_REAL_DIR != \"\"' which is set nowhere. New evidence: gating exists only because source_dir defaults to the maintainer's private $HOME/.pi/agent/sessions; I drove the equivalent 28-keystroke sequence against --demo via a PTY driver with rc=0 and no panic (also clean on empty/garbage/nonexistent dirs), so the harness can be ungated on the deterministic demo corpus."
+    },
+    {
+      "severity": "low",
+      "file": "crates/agenttrace-core/src/pricing.rs",
+      "line": 137,
+      "issue": "P4-6 AGENTTRACE_SESSION_CACHE_DIR isolates only the session cache (session_cache.rs:154, doctor.rs:325 honor it) while pricing_cache_path() calls its own user_cache_dir() copy and ignores it, so CI/test cache isolation is partial and parallel jobs share ~/.cache/agenttrace/pricing.json. discovery_contract.rs:1550-1578 sets this variable believing it isolates the process. First behavioural divergence produced by the user_cache_dir() triplication (P3-8)."
+    },
+    {
+      "severity": "low",
+      "file": "crates/agenttrace-core/src/history.rs",
+      "line": 25,
+      "issue": "P4-7 Fourth, differently-shaped private home-directory resolver: history_path() uses AGENTTRACE_HISTORY_DIR -> XDG_DATA_HOME -> HOME/.local/share -> temp_dir, with no macOS Application Support and no USERPROFILE, so on Windows the preserved-history file lands in the temp dir (same platform class as P3-1) and history.json can live in a different root than sessions.json/pricing.json."
+    },
+    {
+      "severity": "low",
+      "file": "crates/agenttrace-core/src/history.rs",
+      "line": 36,
+      "issue": "P4-8 Preserved history has no eviction or TTL: preserve_derived_history loads the entire history.json, inserts, and rewrites the whole map on every run; merge_preserved_history materialises every record ever kept into memory and the visible list. discovery.rs:242 ('let _ = preserve_derived_history(&sessions);') also discards write errors, so a full disk or permission failure is invisible."
+    }
+  ],
+  "resolved_questions": [
+    "Does the TUI actually crash in non-tty contexts, or does ratatui degrade gracefully? ANSWERED: it panics (exit 101, raw Rust panic text) - reproduced via '< /dev/null > file'. run_with_app already returns anyhow::Result, so the fix is a one-line guard or manual Terminal::new.",
+    "Is the Go-flag truncation visible to the user in any way? ANSWERED: no - stderr is completely empty when flags are dropped, and clap never sees them (argv is truncated before Args::parse_from). Deliberate (unit test at main.rs:1076) but silent.",
+    "Why is the TUI real-data smoke permanently disabled, and can it be enabled without private data? ANSWERED: it is gated on AGENTTRACE_TUI_REAL_DIR (never set) because its default source dir is the maintainer's own $HOME/.pi/agent/sessions; a PTY key-walk against the deterministic --demo corpus passes (rc=0, no panic), so an ungated demo variant is viable today.",
+    "Does the published npm package carry its tests? ANSWERED: no - npm pack omits test/ (5 files shipped), and npm test on the tarball contents passes with 0 tests; 'files' also references a nonexistent lib/ directory.",
+    "Is the flag_takes_value list currently out of sync? ANSWERED: no - I diffed it against all value-taking fields in Args and it is complete for all 24 flags; the risk is future drift, not a present mis-parse.",
+    "Are the TUI's expect('governance initialized') calls reachable panics? ANSWERED: no - ensure_governance calls get_or_insert_with (app.rs:1466-1468) before them.",
+    "Do the TUI and CLI hold up against real PTY input and hostile directories? ANSWERED: yes - 28-keystroke PTY walk on --demo plus empty dir, garbage-only dir and nonexistent -d all exit rc=0 with no panic."
+  ],
+  "provisional_future_work": [
+    {
+      "phase": "harden",
+      "note": "P4-1: guard ratatui::init() with a tty check (or Terminal::new(...)? ) in run_with_app and print 'not a terminal - use --overview' exiting 1; add a non-tty CI test."
+    },
+    {
+      "phase": "harden",
+      "note": "P4-2: emit a one-line stderr warning when go_flag_compatible_args truncates arguments beginning with '-'; add a drift test asserting flag_takes_value covers every Option<String>/value flag in Args."
+    },
+    {
+      "phase": "harden",
+      "note": "P4-3: reject (or default) filter-only invocations that would otherwise silently launch the TUI; fixes the first example in docs/guides/governance-reports.md."
+    },
+    {
+      "phase": "release",
+      "note": "P4-4: add test/ to npm 'files' (drop nonexistent lib/), and extend check-release-surfaces.sh with an 'npm pack --dry-run' content assertion so the tarball's test coverage cannot silently vanish again."
+    },
+    {
+      "phase": "ci",
+      "note": "P4-5: add an ungated --demo PTY smoke job reusing the existing expect script (export demo sessions to a temp dir), keeping AGENTTRACE_TUI_REAL_DIR as the opt-in for real logs - closes N5."
+    },
+    {
+      "phase": "refactor",
+      "note": "P4-6 + P4-7: introduce a single paths module (home_dir/cache_dir/data_dir with Windows fallbacks) and route pricing_cache_path and history_path through it; unify with the three user_cache_dir copies (P3-8)."
+    },
+    {
+      "phase": "harden",
+      "note": "P4-8: cap preserved-history records (most-recent N) and stop discarding preserve_derived_history errors at discovery.rs:242."
+    },
+    {
+      "phase": "assess",
+      "note": "Pass-3 correctness items remain the highest-severity open work overall: P3-1 (HOME-only discovery blocks Windows), P3-2 (UTC --range today/1d), P3-3 (split percentile implementations)."
+    }
+  ]
+}

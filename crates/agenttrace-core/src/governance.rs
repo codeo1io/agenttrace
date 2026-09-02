@@ -223,11 +223,23 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         let model = normalized_model(&session.metrics.model_used);
         let row = rows.entry((provider, model.clone())).or_default();
         row.sessions += 1;
-        row.tokens.input += session.metrics.tokens_input;
-        row.tokens.output += session.metrics.tokens_output;
-        row.tokens.cache_write += session.metrics.tokens_cache_w;
-        row.tokens.cache_read += session.metrics.tokens_cache_r;
-        row.tokens.total += total_tokens(session);
+        row.tokens.input = row
+            .tokens
+            .input
+            .saturating_add(session.metrics.tokens_input);
+        row.tokens.output = row
+            .tokens
+            .output
+            .saturating_add(session.metrics.tokens_output);
+        row.tokens.cache_write = row
+            .tokens
+            .cache_write
+            .saturating_add(session.metrics.tokens_cache_w);
+        row.tokens.cache_read = row
+            .tokens
+            .cache_read
+            .saturating_add(session.metrics.tokens_cache_r);
+        row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
         row.cost += session.metrics.cost_estimated;
         if matches!(model.as_str(), "default" | "unknown" | "multiple") {
             row.unknown += 1;
@@ -240,7 +252,17 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             coverage.fallback_priced_sessions += 1;
         }
     }
-    coverage.confidence = if coverage.unpriced_or_unknown_sessions > 0 {
+    let negative_components = sessions
+        .iter()
+        .filter(|session| {
+            session.metrics.tokens_input < 0
+                || session.metrics.tokens_output < 0
+                || session.metrics.tokens_cache_r < 0
+                || session.metrics.tokens_cache_w < 0
+                || session.metrics.cost_estimated < 0.0
+        })
+        .count();
+    coverage.confidence = if coverage.unpriced_or_unknown_sessions > 0 || negative_components > 0 {
         "low"
     } else if coverage.fallback_priced_sessions > 0 {
         "medium"
@@ -587,7 +609,10 @@ pub fn context_trends(sessions: &[Session]) -> ContextTrend {
             } else {
                 round4(value.context / value.sessions as f64)
             },
-            cache_effectiveness_pct: pct(value.cache_read, value.input + value.cache_read),
+            cache_effectiveness_pct: pct(
+                value.cache_read,
+                value.input.saturating_add(value.cache_read),
+            ),
             repeated_file_reads: value
                 .files
                 .values()
@@ -873,9 +898,15 @@ fn add_context_session(aggregate: &mut ContextAggregate, session: &Session) {
         "warning" => aggregate.warnings += 1,
         _ => {}
     }
-    aggregate.cache_read += session.metrics.tokens_cache_r;
-    aggregate.input += session.metrics.tokens_input;
-    aggregate.output += session.metrics.tokens_output;
+    // Saturating: per-session token totals can sit at i64::MAX, so plain
+    // `+=` overflowed across sessions in the context aggregate.
+    aggregate.cache_read = aggregate
+        .cache_read
+        .saturating_add(session.metrics.tokens_cache_r);
+    aggregate.input = aggregate.input.saturating_add(session.metrics.tokens_input);
+    aggregate.output = aggregate
+        .output
+        .saturating_add(session.metrics.tokens_output);
     aggregate.cost += session.metrics.cost_estimated;
     aggregate.reads += session
         .metrics
@@ -905,7 +936,10 @@ fn context_totals(value: &ContextAggregate) -> ContextTrendTotals {
             .values()
             .map(|count| count.saturating_sub(1))
             .sum(),
-        cache_effectiveness_pct: pct(value.cache_read, value.input + value.cache_read),
+        cache_effectiveness_pct: pct(
+            value.cache_read,
+            value.input.saturating_add(value.cache_read),
+        ),
         read_to_write_ratio: ratio(value.reads, value.writes),
         output_cost_per_million_tokens: if value.output == 0 {
             0.0

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 17;
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 4;
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionCache {
@@ -134,6 +134,8 @@ struct GoMetrics {
     duration_sec: f64,
     #[serde(default, rename = "CostEstimated")]
     cost_estimated: f64,
+    #[serde(default, rename = "StoredTotalsDelta")]
+    stored_totals_delta: i64,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
 }
@@ -221,10 +223,28 @@ fn store_sqlite_snapshot_at(
         shm: file_fingerprint(&sqlite_shm_path(database)),
         sessions: sessions.iter().map(GoSession::from_session).collect(),
     };
-    let tmp = path.with_extension("json.tmp");
+    let tmp = unique_temp_path(path);
     fs::write(&tmp, serde_json::to_vec(&snapshot)?)?;
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+/// Per-writer temp path for atomic cache writes (pass-6 P6-3): the fixed
+/// `<name>.json.tmp` sibling made two concurrent agenttrace processes race
+/// on the same temp file, failing or tearing the save. The suffix is unique
+/// per process and per write within the process; the atomic rename is
+/// unchanged.
+fn unique_temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sessions.json")
+        .to_string();
+    name.push_str(&format!(".tmp.{}.{}", std::process::id(), seq));
+    path.with_file_name(name)
 }
 
 fn sqlite_snapshot_path(name: &str) -> PathBuf {
@@ -512,14 +532,7 @@ pub fn save_session_cache(cache: &SessionCache) -> anyhow::Result<()> {
             .collect();
         doc.insert("dirs".to_string(), Value::Object(dirs));
     }
-    let tmp = cache.path.with_file_name(format!(
-        "{}.tmp",
-        cache
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("sessions.json")
-    ));
+    let tmp = unique_temp_path(&cache.path);
     fs::write(&tmp, serde_json::to_vec(&Value::Object(doc))?)?;
     fs::rename(tmp, &cache.path)?;
     Ok(())
@@ -682,6 +695,7 @@ impl GoMetrics {
             session_end: metrics.session_end.clone(),
             duration_sec: metrics.duration_sec,
             cost_estimated: metrics.cost_estimated,
+            stored_totals_delta: metrics.stored_totals_delta,
             provenance: metrics.provenance.clone(),
         }
     }
@@ -716,6 +730,7 @@ impl GoMetrics {
             session_end: self.session_end,
             duration_sec: self.duration_sec,
             cost_estimated: self.cost_estimated,
+            stored_totals_delta: self.stored_totals_delta,
             provenance: self.provenance,
         }
     }
@@ -798,6 +813,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn concurrent_persist_never_races_on_a_shared_temp_file() {
+        // Pass-6 P6-3: cache persist used a fixed `<name>.json.tmp`
+        // sibling, so two concurrent writers raced on the same temp file
+        // (failed or torn save). With the per-writer suffix every persist
+        // must succeed, the final snapshot must load, and no temp files
+        // may survive the atomic renames.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-temp-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let database = root.join("state.db");
+        let snapshot = root.join("snapshot.json");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&database, b"db").expect("write database");
+        let session = Session {
+            name: "cached".to_string(),
+            path: database.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn({
+                    let database = database.clone();
+                    let snapshot = snapshot.clone();
+                    let session = session.clone();
+                    move || store_sqlite_snapshot_at(&database, &snapshot, &[session]).map(|_| i)
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer
+                .join()
+                .expect("writer thread must not panic")
+                .expect("concurrent persist must not fail");
+        }
+        assert_eq!(
+            load_sqlite_snapshot_from(&database, &snapshot)
+                .expect("snapshot must survive the race")
+                .len(),
+            1
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .expect("read temp dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files must not survive: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sqlite_snapshot_is_invalidated_by_database_wal_or_shm_changes() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-cache-{}-{:?}",
@@ -851,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_four_round_trips_provenance_and_rejects_schema_three() {
+    fn sqlite_snapshot_schema_five_round_trips_provenance_and_rejects_schema_four() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -866,8 +941,9 @@ mod tests {
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
             metrics: Metrics {
+                stored_totals_delta: 720,
                 provenance: crate::MetricProvenance {
-                    tokens: "reported_by_agent".to_string(),
+                    tokens: "stored_session_totals".to_string(),
                     duration: "timestamp_span".to_string(),
                     tool_results: "reported_by_agent".to_string(),
                     pricing_source: "LiteLLM (cached)".to_string(),
@@ -883,21 +959,24 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        assert_eq!(doc["schema_version"], 4);
+        assert_eq!(doc["schema_version"], 5);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
-            Some("reported_by_agent")
+            Some("stored_session_totals")
         );
         assert_eq!(
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema four cache hit")[0]
-                .metrics
-                .provenance
-                .duration,
-            "timestamp_span"
+            doc.pointer("/sessions/0/Metrics/StoredTotalsDelta"),
+            Some(&serde_json::Value::from(720)),
+            "the stored-versus-derived delta must survive the snapshot cache"
         );
+        let loaded =
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema five cache hit");
+        assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
+        assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
+        assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(3);
+        old["schema_version"] = serde_json::Value::from(4);
         fs::write(
             &snapshot,
             serde_json::to_vec(&old).expect("schema three json"),

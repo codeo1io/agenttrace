@@ -1,5 +1,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
+use std::io::IsTerminal;
+
 use agenttrace_core::{
     attention_priority, attention_rank, average_health, canonical_sessions, clear_session_cache,
     compute_overview, compute_overview_iter, context_trends, cost_audit, data_health,
@@ -69,6 +71,16 @@ fn parse_language(value: Option<&str>) -> Option<Language> {
 }
 
 fn run_with_app(app: App) -> anyhow::Result<()> {
+    // ratatui::init() panics (exit 101) when stdout is not a terminal,
+    // which made the README quickstart crash in every piped context —
+    // CI, cron, docker without -t, IDE consoles. Fail with a normal
+    // error and point at the non-interactive output path instead.
+    if !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "stdout is not a terminal; run agenttrace interactively, or use \
+             `agenttrace --overview` for non-interactive output"
+        );
+    }
     let mut terminal = ratatui::init();
     let result = run_app(&mut terminal, app);
     ratatui::restore();

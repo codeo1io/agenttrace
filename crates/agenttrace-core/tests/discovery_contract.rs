@@ -1,7 +1,7 @@
 use agenttrace_core::{
-    build_doctor_report, find_session_files, load_sessions_from_dir, load_sessions_with_progress,
-    parse_file, render_waste_report, search_sessions, session_cache_path, session_capability,
-    LoadOptions,
+    build_doctor_report, find_session_files, load_sessions_from_dir, load_sessions_with_options,
+    load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
+    session_cache_path, session_capability, total_tokens, LoadOptions,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -20,6 +20,459 @@ fn generated_fixture(name: &str) -> std::path::PathBuf {
         .join("../..")
         .join("testdata/generated")
         .join(name)
+}
+
+fn adversarial_sqlite_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata/generated/adversarial/sqlite")
+        .join(name)
+}
+
+/// Copies an opencode database fixture into a temporary HOME so it loads
+/// through the normal discovery path (databases are only discovered under
+/// `$HOME/.local/share/opencode/`).
+fn seed_home_with_opencode_db(home: &std::path::Path, db_path: &std::path::Path) {
+    let target = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(target.parent().expect("db parent")).expect("create db parent");
+    fs::copy(db_path, &target).expect("copy opencode fixture db");
+}
+
+#[test]
+fn adversarial_sqlite_overflow_db_neither_panics_nor_wraps() {
+    // P5-1 reproducer: two assistant messages with i64::MAX input tokens
+    // made the per-session accumulator `agg.input_tokens += input`
+    // overflow (debug exit 101) or wrap negative (release). Loading must
+    // saturate: total pinned at the i64 ceiling, never negative, never a
+    // panic. Regression guard for the cycle-2 H1 hardening.
+    let root = temp_root("agenttrace-adversarial-sqlite-overflow");
+    let home = root.join("home");
+    seed_home_with_opencode_db(&home, &adversarial_sqlite_fixture("overflow.db"));
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1, "overflow fixture must yield one session");
+        let metrics = &sessions[0].metrics;
+        assert_eq!(
+            metrics.tokens_input,
+            i64::MAX,
+            "saturated accumulation must pin input at the i64 ceiling"
+        );
+        assert_eq!(metrics.tokens_output, 2);
+        assert!(metrics.tokens_input >= 0);
+        assert!(metrics.tokens_output >= 0);
+        assert!(metrics.cost_estimated.is_finite());
+        assert!(metrics.cost_estimated >= 0.0);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn adversarial_sqlite_u64_max_input_saturates_instead_of_wrapping() {
+    // P5-2 reproducer: a `tokens.input` of u64::MAX wrapped through
+    // `n as i64` and was reported as `"input": -1` by --latest -f json.
+    // The value must saturate at i64::MAX instead.
+    let root = temp_root("agenttrace-adversarial-sqlite-wrap");
+    let home = root.join("home");
+    seed_home_with_opencode_db(&home, &adversarial_sqlite_fixture("wrap.db"));
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1, "wrap fixture must yield one session");
+        let metrics = &sessions[0].metrics;
+        assert_eq!(
+            metrics.tokens_input,
+            i64::MAX,
+            "u64::MAX input must saturate at i64::MAX, not wrap to -1"
+        );
+        assert_eq!(metrics.tokens_output, 1);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opencode_stored_session_totals_preferred_with_delta() {
+    // CU-2 (candidate 8, totals scope): when the upstream session row
+    // records authoritative totals (cost + the five token columns), those
+    // displace message-derived aggregation, the provenance says so, and
+    // the stored-versus-derived delta is exposed on the session for
+    // data_health reporting.
+    let root = temp_root("agenttrace-opencode-stored-totals");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (
+            id text primary key,
+            title text,
+            time_created integer,
+            time_updated integer,
+            cost real,
+            tokens_input integer,
+            tokens_output integer,
+            tokens_reasoning integer,
+            tokens_cache_read integer,
+            tokens_cache_write integer
+        );
+        create table message (session_id text, data text);
+        create table part (session_id text, data text);
+        insert into session values (
+            'ses_stored', 'Stored DB', 1764750000000, 1764750004000,
+            0.5, 1000, 200, 40, 30, 20
+        );
+        insert into message values (
+            'ses_stored',
+            '{"id":"msg1","role":"assistant","modelID":"claude-sonnet-4","tokens":{"input":400,"output":150,"reasoning":10,"cache":{"read":5,"write":5}}}'
+        );
+        "#,
+    )
+    .expect("seed stored-totals opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+        let metrics = &sessions[0].metrics;
+        assert_eq!(metrics.source_tool, "opencode_db");
+        assert_eq!(metrics.tokens_input, 1000, "stored input must win");
+        assert_eq!(
+            metrics.tokens_output, 240,
+            "stored output must include stored reasoning tokens"
+        );
+        assert_eq!(metrics.tokens_cache_r, 30);
+        assert_eq!(metrics.tokens_cache_w, 20);
+        assert_eq!(metrics.cost_estimated, 0.5, "stored cost must win");
+        assert_eq!(
+            metrics.provenance.tokens, "stored_session_totals",
+            "provenance must disclose that totals came from the session row"
+        );
+        // derived = 400 + 150 + 10 + 5 + 5 = 570; stored = 1000+240+30+20 = 1290
+        assert_eq!(
+            metrics.stored_totals_delta, 720,
+            "delta must expose how far derived aggregation drifted"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opencode_placeholder_titles_gate_to_message_derived_names() {
+    // Research candidate 34: OpenCode fills `title` with
+    // `New session - <timestamp>` on every session it does not summarize
+    // (227/227 placeholder titles in the live census at research pass 5),
+    // and the reader used it verbatim. The placeholder must be treated as
+    // absent so the first user message text names the session, with the
+    // gate disclosed in naming provenance.
+    let root = temp_root("agenttrace-opencode-placeholder-title");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (id text primary key, title text, time_created integer, time_updated integer);
+        create table message (id text, session_id text, data text);
+        create table part (id text, session_id text, message_id text, time_created integer, time_updated integer, data text);
+        insert into session values ('ses_placeholder', 'New session - 2026-08-10T01:13:33.266Z', 1764750000000, 1764750004000);
+        insert into session values ('ses_real_title', 'Real provider title', 1764750100000, 1764750104000);
+        insert into session values ('ses_empty_title', '', 1764750200000, 1764750204000);
+        insert into message values ('msg1', 'ses_placeholder', '{"id":"msg1","role":"user"}');
+        insert into message values ('msg2', 'ses_real_title', '{"id":"msg2","role":"user"}');
+        insert into message values ('msg3', 'ses_empty_title', '{"id":"msg3","role":"assistant"}');
+        insert into part values ('part1', 'ses_placeholder', 'msg1', 1, 1, '{"type":"text","text":"audit the billing export please"}');
+        insert into part values ('part2', 'ses_real_title', 'msg2', 2, 2, '{"type":"text","text":"this text must not become the name"}');
+        "#,
+    )
+    .expect("seed placeholder-title opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            3,
+            "placeholder fixture must yield three sessions"
+        );
+        let by_name = |needle: &str| sessions.iter().find(|s| s.name.contains(needle));
+
+        let placeholder = by_name("audit the billing export")
+            .expect("placeholder title must yield to the message-derived name");
+        assert_eq!(placeholder.name, "audit the billing export please");
+        assert!(!placeholder.name.contains("New session"));
+        assert_eq!(
+            placeholder.metrics.provenance.naming, "provider:placeholder",
+            "the gate must be disclosed in naming provenance"
+        );
+
+        let titled = by_name("Real provider title").expect("real titles survive");
+        assert_eq!(titled.metrics.provenance.naming, "provider_title");
+
+        let empty = sessions
+            .iter()
+            .find(|s| s.name == "ses_empty_title")
+            .expect("empty title with no user text falls back to the session id");
+        assert_eq!(empty.metrics.provenance.naming, "session_id");
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opencode_missing_stored_columns_fall_back_to_derived() {
+    // CU-2 companion: an older schema without the stored-total columns
+    // keeps the derived path and the usual provenance, with zero delta.
+    let root = temp_root("agenttrace-opencode-derived-fallback");
+    let home = root.join("home");
+    write_opencode_db(
+        &home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("opencode.db"),
+    );
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+        let metrics = &sessions[0].metrics;
+        assert_eq!(metrics.tokens_input, 42);
+        assert_eq!(metrics.tokens_output, 22);
+        assert_eq!(metrics.provenance.tokens, "reported_by_agent");
+        assert_eq!(metrics.stored_totals_delta, 0);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opencode_text_valued_stored_columns_do_not_drop_the_session() {
+    // SQLite columns are dynamically typed: a TEXT "999" in a stored
+    // token column previously failed the row conversion and silently
+    // dropped the whole session. It must parse; unparseable values fall
+    // back to derived aggregation instead of dropping the row.
+    let root = temp_root("agenttrace-opencode-text-stored");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (
+            id text primary key, title text, time_created, time_updated,
+            cost, tokens_input, tokens_output, tokens_reasoning,
+            tokens_cache_read, tokens_cache_write
+        );
+        create table message (session_id text, data text);
+        create table part (session_id text, data text);
+        insert into session values (
+            'ses_text', 'Text DB', 1764750000000, 1764750004000,
+            '0.25', '999', 'not-a-number', 40, 30, 20
+        );
+        insert into message values (
+            'ses_text',
+            '{"id":"msg1","role":"assistant","modelID":"claude-sonnet-4","tokens":{"input":400,"output":150,"cache":{"read":5,"write":5}}}'
+        );
+        "#,
+    )
+    .expect("seed text-valued opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "session must survive text-valued columns"
+        );
+        let metrics = &sessions[0].metrics;
+        assert_eq!(metrics.tokens_input, 999, "TEXT '999' must parse");
+        assert_eq!(metrics.cost_estimated, 0.25, "TEXT '0.25' cost must parse");
+        assert_eq!(
+            metrics.provenance.tokens, "stored_session_totals",
+            "stored columns that parse still win"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opencode_unknown_time_session_stays_visible_in_range() {
+    // CU-3 (N7): a session with time_created = 0 (unknown time) used to
+    // vanish from every --range/--since view via both the SQL predicate
+    // and the post-load filter. It must stay visible; its unknown-time
+    // status is counted by data_health instead.
+    let root = temp_root("agenttrace-opencode-unknown-time");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (
+            id text primary key, title text, time_created integer, time_updated integer
+        );
+        create table message (session_id text, data text);
+        create table part (session_id text, data text);
+        insert into session values ('ses_unknown', 'Unknown Time', 0, 0);
+        insert into message values ('ses_unknown', '{"id":"m1","role":"user"}');
+        "#,
+    )
+    .expect("seed unknown-time opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let since = chrono::Utc::now() - chrono::Duration::days(7);
+        let report = load_sessions_with_options(
+            None,
+            &LoadOptions {
+                since: Some(since),
+                ..LoadOptions::default()
+            },
+        );
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "unknown-time session must stay visible under --range 7d"
+        );
+        let metrics = &report.sessions[0].metrics;
+        assert_eq!(
+            metrics.session_start, "",
+            "start stays unknown, not fabricated"
+        );
+        let health = agenttrace_core::data_health(&report.sessions, report.discovered, 0);
+        assert_eq!(
+            health.unknown_time_sessions, 1,
+            "unknown-time bucket is counted"
+        );
+        assert_eq!(health.stored_totals_sessions, 0);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn hermes_negative_token_columns_are_clamped() {
+    // CU-1: a corrupt hermes state.db with negative token columns must
+    // not propagate negatives into reports (the adjacent event/tool
+    // counts already clamp with .max(0)).
+    let root = temp_root("agenttrace-hermes-negative-tokens");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".hermes")).expect("create hermes dir");
+    let db = Connection::open(home.join(".hermes").join("state.db")).expect("open hermes db");
+    db.execute_batch(
+        r#"
+        create table sessions (
+            id text primary key, model text, started_at real, ended_at real,
+            message_count integer, tool_call_count integer,
+            input_tokens integer, output_tokens integer,
+            cache_read_tokens integer, cache_write_tokens integer
+        );
+        create table messages (session_id text, role text);
+        insert into sessions values ('neg', 'gpt-5.1', 1760000000, 1760000060, 1, 0, -500, -20, -10, -5);
+        insert into messages values ('neg', 'user');
+        "#,
+    )
+    .expect("seed negative hermes db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+        let metrics = &sessions[0].metrics;
+        assert_eq!(metrics.tokens_input, 0, "negative input must clamp to 0");
+        assert_eq!(metrics.tokens_output, 0);
+        assert_eq!(metrics.tokens_cache_r, 0);
+        assert_eq!(metrics.tokens_cache_w, 0);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn unicode_escape_hostile_lines_never_panic_from_format_detection() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata/generated/adversarial/unicode-escape.jsonl");
+    let parsed = parse_file(&fixture);
+    assert!(
+        parsed.is_err(),
+        "hostile unicode escapes must leave the file unrecognized, got {parsed:?}"
+    );
+}
+
+#[test]
+fn unicode_escape_hostile_file_does_not_kill_directory_scans() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata/generated/adversarial");
+    let sessions = load_sessions_from_dir(Some(&dir));
+    assert!(
+        sessions.len() >= 3,
+        "clean neighbors must survive a hostile unicode file, got {}",
+        sessions.len()
+    );
+}
+
+#[test]
+fn generated_adversarial_corpus_stays_bounded_and_non_negative() {
+    // The committed repro corpus from the adversarial assessment: two
+    // claude_code sessions with 1e300 usage, an oh-my-pi usage carrying two
+    // legal i64::MAX aliases, and a workbuddy entry with clamped-negative
+    // input plus a cache-read subtraction. Parsing and aggregating it must
+    // neither panic (debug overflow checks) nor produce negative totals
+    // (release wrapping) — the H1 acceptance criterion.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("testdata/generated/adversarial");
+    let sessions = load_sessions_from_dir(Some(&dir));
+    assert!(
+        sessions.len() >= 3,
+        "expected the adversarial corpus to yield sessions, got {}",
+        sessions.len()
+    );
+    let mut grand_total = 0i64;
+    for session in &sessions {
+        let tokens = total_tokens(session);
+        assert!(
+            tokens >= 0,
+            "session {} reported negative tokens {tokens}",
+            session.name
+        );
+        assert!(session.metrics.cost_estimated.is_finite());
+        assert!(session.metrics.cost_estimated >= 0.0);
+        grand_total = grand_total.saturating_add(tokens);
+    }
+    assert_eq!(
+        grand_total,
+        i64::MAX,
+        "saturated sessions must pin the ceiling"
+    );
 }
 
 #[test]
@@ -1510,31 +1963,45 @@ fn with_home(home: &std::path::Path, f: impl FnOnce()) {
 }
 
 fn with_session_cache(cache: &std::path::Path, f: impl FnOnce()) {
-    let _guard = env_lock().lock().expect("env lock");
-    let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-    std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
+    // The guard is scoped so it is released before any caught panic is
+    // resumed; resuming the unwind while still holding the lock used to
+    // poison the mutex and cascade one flaky failure into every later
+    // env-isolated test in the binary.
+    let result = {
+        let _guard = lock_env();
+        let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
+        result
+    };
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
 }
 
 fn with_home_and_cache(home: &std::path::Path, cache: &std::path::Path, f: impl FnOnce()) {
-    let _guard = env_lock().lock().expect("env lock");
-    let previous_home = std::env::var_os("HOME");
-    let previous_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
-    let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
-    let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-    std::env::set_var("HOME", home);
-    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-    std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-    std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    restore_env("HOME", previous_home);
-    restore_env("XDG_CONFIG_HOME", previous_xdg_config);
-    restore_env("XDG_CACHE_HOME", previous_xdg_cache);
-    restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
+    // See with_session_cache: the guard must be dropped before the caught
+    // panic is resumed, or the poisoned mutex fails every later test that
+    // needs the env lock (observed as 10 simultaneous "failures" from a
+    // single flaky assertion).
+    let result = {
+        let _guard = lock_env();
+        let previous_home = std::env::var_os("HOME");
+        let previous_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
+        let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("HOME", home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        restore_env("HOME", previous_home);
+        restore_env("XDG_CONFIG_HOME", previous_xdg_config);
+        restore_env("XDG_CACHE_HOME", previous_xdg_cache);
+        restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
+        result
+    };
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
@@ -1553,9 +2020,28 @@ fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
 }
 
 fn bump_dir_mtime(path: &std::path::Path) {
+    // Directory mtimes advance only once per timestamp tick, and on
+    // coarse-granularity filesystems (this /tmp is ext2/ext3) a quick
+    // write+remove usually lands inside the same tick, leaving the mtime
+    // unchanged and the directory cache stale. Keep bumping until the
+    // mtime actually moves so cache-invalidation tests are deterministic.
+    let before =
+        file_mod_time_nanos_for_test(&fs::metadata(path).expect("dir metadata before bump"));
     let marker = path.join(format!(".agenttrace-mtime-{}", std::process::id()));
-    fs::write(&marker, b"x").expect("write mtime marker");
-    fs::remove_file(marker).expect("remove mtime marker");
+    for _ in 0..400 {
+        fs::write(&marker, b"x").expect("write mtime marker");
+        fs::remove_file(&marker).expect("remove mtime marker");
+        let after =
+            file_mod_time_nanos_for_test(&fs::metadata(path).expect("dir metadata after bump"));
+        if after != before {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!(
+        "directory mtime did not advance on this filesystem: {}",
+        path.display()
+    );
 }
 
 fn file_mod_time_nanos_for_test(metadata: &fs::Metadata) -> i64 {
@@ -1570,6 +2056,16 @@ fn file_mod_time_nanos_for_test(metadata: &fs::Metadata) -> i64 {
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Acquire the shared env lock. Poisoning is tolerated on purpose: a
+/// poisoned mutex must fail only the test that panicked, not every test
+/// that still needs the lock (see with_home_and_cache).
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    match env_lock().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn write_hermes_state_db(path: &std::path::Path) {

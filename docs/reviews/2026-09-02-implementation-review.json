@@ -1,0 +1,434 @@
+{
+  "status": "complete",
+  "phase": "independent_review",
+  "verdict": "Not ready",
+  "scope": {
+    "base": "e005952",
+    "branch": "working-tree (uncommitted changes on root commit)",
+    "head_sha": "e005952",
+    "files_changed": 10,
+    "untracked_in_scope": [
+      "crates/agenttrace-core/src/pricing_snapshot.json",
+      "scripts/pricing/update-snapshot.sh",
+      "scripts/ci/check-plugin-version.sh"
+    ]
+  },
+  "intent": "Cycle 1 batch: H1 adversarial token-count hardening + H2 offline-by-default pricing; ride-alongs F12 --lang, F14 .gitignore, F19 plugin-version CI guard",
+  "intent_confidence": "explicit",
+  "reviewers": [
+    "correctness",
+    "testing",
+    "maintainability",
+    "security",
+    "performance",
+    "api-contract",
+    "reliability",
+    "adversarial"
+  ],
+  "independence_disclosure": "All personas ran in-thread as lenses of a single reviewer (no subagent primitive in harness). Cross-model pass skipped: host-family attestation failed (CLAUDECODE/CODEX_SANDBOX/CURSOR_AGENT unset). No Stage 5b validator available; P1/P2 findings carry direct empirical reproduction instead.",
+  "findings": [
+    {
+      "#": 1,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        "crates/agenttrace-core/src/parser.rs:3570-3574: fn sum_numbers(obj: &Map<String, Value>, keys: &[&str]) -> i64 { keys.iter().filter_map(|key| obj.get(*key)).filter_map(number_as_i64).sum() }",
+        "Empirical, debug build, isolated cache (XDG_CACHE_HOME pointed at an empty dir; first run required because the session cache otherwise masks the repro): oh-my-pi corpus {\"type\":\"session\",\"id\":\"sess-1\",...} + message with usage {\"input\": 9223372036854775807,\"input_tokens\": 9223372036854775807} -> panicked at accum.rs:206 'attempt to add with overflow'; backtrace frames name agenttrace_core::parser::sum_numbers::{closure#0} and number_as_i64.",
+        "Empirical, release build: same corpus exits 0, overview shows $0.0000 estimated cost and no token line -- the wrapped negative sum fails the `input > 0` gate and the usage is silently dropped (undercount, not crash).",
+        "Call sites: parser.rs:1380-1383 (oh_my_pi_usage: input/output/cacheRead/cacheWrite alias pairs) and parser.rs:1774-1791 (qwen_usage: same alias strategy).",
+        "The cycle's clamp (number_as_i64) is correct per value but does not bound the sum: each alias is in range; 9223372036854775807 + 9223372036854775807 overflows.",
+        "Provenance: sum_numbers body unchanged in this diff (only number_as_i64, ~line 3577+, was touched); reported because the cycle's H1 acceptance claims saturating arithmetic across aggregation."
+      ],
+      "file": "crates/agenttrace-core/src/parser.rs",
+      "first_evidence": "crates/agenttrace-core/src/parser.rs:3570-3574: `keys.iter().filter_map(|key| obj.get(*key)).filter_map(number_as_i64).sum()`",
+      "independent_reviewers": [
+        "adversarial"
+      ],
+      "line": 3573,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "adversarial"
+      ],
+      "severity": "P1",
+      "suggested_fix": "In sum_numbers (parser.rs:3570-3575) replace `.sum()` with `.fold(0i64, i64::saturating_add)`. This single edit covers all four oh_my_pi_usage sums and all four qwen_usage sums. Add a unit test feeding a usage map with two i64::MAX aliases through the oh-my-pi parser and asserting a non-negative saturated result.",
+      "title": "sum_numbers alias aggregation overflows on legal integers",
+      "why_it_matters": "sum_numbers sums alias keys with plain .sum(), so two perfectly legal in-range JSON integers (each i64::MAX) overflow when both aliases appear in one usage object. This is reachable from oh_my_pi_usage (parser.rs:1380-1383: input+input_tokens, output+output_tokens, cacheRead+cache_read_input_tokens, cacheWrite+cache_creation_input_tokens) and qwen_usage (parser.rs:1774-1791). Empirically, an oh-my-pi session whose usage carries {\"input\": 9223372036854775807, \"input_tokens\": 9223372036854775807} panics the debug binary inside sum_numbers; in release the wrapped sum is negative, the `input > 0` gate drops the field, and the session silently reports zero tokens and $0.0000 cost. The number_as_i64 clamping added this cycle cannot prevent this: each value is individually in range; only the sum overflows. So the parser itself both panics (debug) and silently undercounts (release) on adversarial logs, violating the H1 acceptance criterion."
+    },
+    {
+      "#": 2,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        "crates/agenttrace-core/src/reports.rs:1518: let total_tokens: i64 = sessions.iter().map(total_tokens).sum();",
+        "Empirical, debug build, isolated cache: `./target/debug/agenttrace -d <dir-with-2-adversarial-sessions> --overview -f json` -> panicked at core/src/iter/traits/accum.rs:206 'attempt to add with overflow'; backtrace frame: agenttrace_core::reports::overview_summary -> <i64 as Sum>::sum.",
+        "Empirical, release build, isolated cache: same corpus -> JSON summary.total_tokens = -2 (the original F1 symptom) with total_sessions = 2.",
+        "Repro corpus: two JSONL files of the form {\"type\":\"assistant\",\"timestamp\":\"2026-09-0N..\",\"cwd\":\"/tmp/proj\",\"message\":{\"id\":\"msg-N\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":1e300,\"output_tokens\":1e300}}}; per-session totals correctly saturate to i64::MAX (the new fix works per session), and the overflow occurs only when summing across sessions.",
+        "Same unguarded pattern duplicated at crates/agenttrace-tui/src/shared.rs:226-231 and crates/agenttrace-tui/src/presentation.rs:3596-3601 (total_tokens_all), reached from explorer.rs:667 and explorer.rs:875.",
+        "Contrast (what the cycle did fix, verified): crates/agenttrace-core/src/lib.rs:527 `.max(0)` clamp per event field, lib.rs:534/537/540/543 saturating_add accumulators, lib.rs:1087-1094 saturating total_tokens(session).",
+        "Provenance: cited line unchanged in this working-tree diff (git diff e005952 does not touch reports.rs; repo has a single root commit e005952). The finding is that this cycle's stated H1 acceptance is unmet, not that the line was edited."
+      ],
+      "file": "crates/agenttrace-core/src/reports.rs",
+      "first_evidence": "crates/agenttrace-core/src/reports.rs:1518: `let total_tokens: i64 = sessions.iter().map(total_tokens).sum();`",
+      "independent_reviewers": [
+        "correctness"
+      ],
+      "line": 1518,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "correctness"
+      ],
+      "severity": "P1",
+      "suggested_fix": "Replace the plain .sum() with a saturating fold at all three sites: reports.rs:1518 -> sessions.iter().map(total_tokens).fold(0i64, i64::saturating_add); and the two total_tokens_all copies at crates/agenttrace-tui/src/shared.rs:226 and crates/agenttrace-tui/src/presentation.rs:3596 -> .fold(0i64, i64::saturating_add). Add a regression test that loads two sessions each saturated at i64::MAX and asserts the overview total is i64::MAX (never negative, never panicking).",
+      "title": "Cross-session token totals still overflow",
+      "why_it_matters": "The cycle's H1 acceptance criterion is 'no panic and no negative totals on adversarial token counts', and it is still violated at the report layer. With two session files whose usage values saturate to i64::MAX (for example input_tokens 1e300 in claude_code-format logs), overview_summary panics in debug builds ('attempt to add with overflow') and prints summary.total_tokens = -2 in release builds. That -2 is the exact original F1 symptom. The per-session fix in lib.rs (max(0) clamp at 527, saturating_add at 534-543, saturating total_tokens at 1087-1094) moved the overflow boundary to cross-session aggregation but did not close it: any multi-session corpus of adversarial logs crashes the CLI in debug and reports negative totals in release. The TUI duplicates the same pattern (total_tokens_all), so both surfaces stay wrong."
+    },
+    {
+      "#": 3,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        ".github/workflows/ci.yml:51: scripts/ci/check-output-contract.sh (representative line of the wired guard list at lines 51-104; check-plugin-version.sh does not appear anywhere in the file).",
+        "grep -rn 'check-plugin-version' scripts/ .github/ docs/ -> no hits outside the script file itself.",
+        "scripts/ci/check-plugin-version.sh exists as an untracked file in the working tree and is documented in CHANGELOG.md's Unreleased section as part of this cycle's F19 work."
+      ],
+      "file": ".github/workflows/ci.yml",
+      "first_evidence": ".github/workflows/ci.yml:51: `            scripts/ci/check-output-contract.sh` (wired-guard list lines 51-104 contains no check-plugin-version.sh step anywhere in the file)",
+      "independent_reviewers": [
+        "testing"
+      ],
+      "line": 51,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "testing"
+      ],
+      "severity": "P2",
+      "suggested_fix": "Add a workflow step in .github/workflows/ci.yml (for example next to check-cargo-manifests.sh around line 104) with `run: scripts/ci/check-plugin-version.sh`, mirroring the existing steps' shell/setup shape; verify with `act`-style local run or push and watch the job.",
+      "title": "check-plugin-version.sh not wired into CI",
+      "why_it_matters": "The cycle ships scripts/ci/check-plugin-version.sh as the F19 plugin-version-sync guard, and the local full_tests phase ran it manually (it passed), but nothing in CI ever executes it: .github/workflows/ci.yml lists check-output-contract, check-deterministic-output, check-report-semantics, check-release-surfaces, check-docs-commands, check-rust-real-cli-smoke, check-rust-tui-real-smoke, and check-cargo-manifests -- no step runs check-plugin-version.sh, and no other script calls it (grep over scripts/, .github/, docs/ finds zero references). A guard that never runs detects nothing: the next plugin/version drift will pass CI exactly as before this cycle, so the F19 acceptance 'wire it into CI' is not actually met."
+    },
+    {
+      "#": 4,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        "crates/agenttrace-core/src/parser.rs:639: *input = (*input - cached).max(0);",
+        "Empirical, debug build, isolated cache: workbuddy corpus (reasoning entry with sessionId+cwd, then message entry with usage {\"input_tokens\":-1e300,\"cache_read_input_tokens\":50}) -> panicked at crates/agenttrace-core/src/parser.rs:639:18 'attempt to subtract with overflow'.",
+        "Empirical, release build: same corpus exits 0 with summary.total_tokens = 9223372036854775807 (wrapped subtraction survived .max(0) and saturated the totals).",
+        "Reachability: parse_workbuddy_jsonl requires entries of type function_call/function_call_result/reasoning carrying sessionId and cwd keys; workbuddy_usage reads entry.message.usage or entry.providerData.usage (parser.rs:633-641).",
+        "Provenance: line unchanged in this diff; reported because adversarial-token hardening is this cycle's stated scope (H1)."
+      ],
+      "file": "crates/agenttrace-core/src/parser.rs",
+      "first_evidence": "crates/agenttrace-core/src/parser.rs:639: `*input = (*input - cached).max(0);`",
+      "independent_reviewers": [
+        "adversarial"
+      ],
+      "line": 639,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "adversarial"
+      ],
+      "severity": "P2",
+      "suggested_fix": "At parser.rs:639 replace `*input = (*input - cached).max(0);` with `*input = input.saturating_sub(cached);`. Add a workbuddy-format test with input_tokens = -1e300 and cache_read_input_tokens = 50 asserting no panic and a zero-or-small input.",
+      "title": "Workbuddy cache subtraction underflows",
+      "why_it_matters": "workbuddy_usage computes (*input - cached).max(0) with plain subtraction. An adversarial workbuddy-format log with a negative input_tokens value that clamps to i64::MIN (for example -1e300) plus any positive cache_read makes the subtraction overflow: the debug binary panics with 'attempt to subtract with overflow' at parser.rs:639, and the release binary wraps to a huge positive that survives .max(0), producing a grossly inflated total_tokens of 9223372036854775807 in the report. Either way the acceptance 'no panic and no [wrong] totals on adversarial token counts' fails for this format. The correct saturating primitive already exists elsewhere in this same fix (lib.rs uses saturating_add); this one site was missed."
+    },
+    {
+      "#": 5,
+      "autofix_class": "manual",
+      "confidence": 75,
+      "evidence": [
+        "docs/decisions/2026-09-02-cycle-1-batch-selection.md:105: 'plus a committed generated fixture from the repro corpus; H2's' (H1 evidence commitment).",
+        "ROADMAP.md:63-68: 'Acceptance: no panic and no negative totals on adversarial token counts; ... corpus (`/tmp/at-hugelogs` style fixture) committed as a generated fixture.'",
+        "Repo listing: testdata/ and testdata/generated/ contain provider-format fixtures only; git ls-files has no adversarial/overflow/corpus artifact.",
+        "The /tmp/at-hugelogs corpus used during assessment and (per full_tests phase notes) during verification lives outside the repo and is not reproducible from it."
+      ],
+      "file": "docs/decisions/2026-09-02-cycle-1-batch-selection.md",
+      "first_evidence": "docs/decisions/2026-09-02-cycle-1-batch-selection.md:105: `plus a committed generated fixture from the repro corpus; H2's`",
+      "independent_reviewers": [
+        "testing"
+      ],
+      "line": 105,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "testing"
+      ],
+      "severity": "P2",
+      "suggested_fix": "Commit a generated adversarial corpus under testdata/generated/ (two sessions with 1e300 usage values; an oh-my-pi usage object carrying two i64::MAX alias keys; a workbuddy entry with negative input_tokens plus positive cache_read), plus a test that runs the full load->analyze->overview pipeline over it asserting: no panic, and every token total >= 0. The three reproducers used in this review are ready-made seeds.",
+      "title": "Adversarial repro-corpus fixture not committed",
+      "why_it_matters": "The committed plan makes a generated adversarial corpus part of H1's evidence: ROADMAP.md:63-68 requires 'a committed generated fixture from the repro corpus' as H1 acceptance evidence, and the decision doc repeats it. No such fixture exists: testdata/ contains format fixtures (claude-code-preamble.jsonl, cline-task, codex-rollout-with-aider-text.jsonl, gemini-*, plus testdata/generated/*.jsonl) but nothing adversarial (no huge/negative/overflow corpus), and `git ls-files | grep -iE 'adversarial|huge|overflow|corpus'` returns nothing. This missing detection net is not hypothetical: the residual overflows in findings #1-#3 exist precisely because no committed corpus exercises them in CI. Without it, every future refactor of the aggregation path can silently regress H1."
+    }
+  ],
+  "actionable_findings": [
+    {
+      "#": 1,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        "crates/agenttrace-core/src/parser.rs:3570-3574: fn sum_numbers(obj: &Map<String, Value>, keys: &[&str]) -> i64 { keys.iter().filter_map(|key| obj.get(*key)).filter_map(number_as_i64).sum() }",
+        "Empirical, debug build, isolated cache (XDG_CACHE_HOME pointed at an empty dir; first run required because the session cache otherwise masks the repro): oh-my-pi corpus {\"type\":\"session\",\"id\":\"sess-1\",...} + message with usage {\"input\": 9223372036854775807,\"input_tokens\": 9223372036854775807} -> panicked at accum.rs:206 'attempt to add with overflow'; backtrace frames name agenttrace_core::parser::sum_numbers::{closure#0} and number_as_i64.",
+        "Empirical, release build: same corpus exits 0, overview shows $0.0000 estimated cost and no token line -- the wrapped negative sum fails the `input > 0` gate and the usage is silently dropped (undercount, not crash).",
+        "Call sites: parser.rs:1380-1383 (oh_my_pi_usage: input/output/cacheRead/cacheWrite alias pairs) and parser.rs:1774-1791 (qwen_usage: same alias strategy).",
+        "The cycle's clamp (number_as_i64) is correct per value but does not bound the sum: each alias is in range; 9223372036854775807 + 9223372036854775807 overflows.",
+        "Provenance: sum_numbers body unchanged in this diff (only number_as_i64, ~line 3577+, was touched); reported because the cycle's H1 acceptance claims saturating arithmetic across aggregation."
+      ],
+      "file": "crates/agenttrace-core/src/parser.rs",
+      "first_evidence": "crates/agenttrace-core/src/parser.rs:3570-3574: `keys.iter().filter_map(|key| obj.get(*key)).filter_map(number_as_i64).sum()`",
+      "independent_reviewers": [
+        "adversarial"
+      ],
+      "line": 3573,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "adversarial"
+      ],
+      "severity": "P1",
+      "suggested_fix": "In sum_numbers (parser.rs:3570-3575) replace `.sum()` with `.fold(0i64, i64::saturating_add)`. This single edit covers all four oh_my_pi_usage sums and all four qwen_usage sums. Add a unit test feeding a usage map with two i64::MAX aliases through the oh-my-pi parser and asserting a non-negative saturated result.",
+      "title": "sum_numbers alias aggregation overflows on legal integers",
+      "why_it_matters": "sum_numbers sums alias keys with plain .sum(), so two perfectly legal in-range JSON integers (each i64::MAX) overflow when both aliases appear in one usage object. This is reachable from oh_my_pi_usage (parser.rs:1380-1383: input+input_tokens, output+output_tokens, cacheRead+cache_read_input_tokens, cacheWrite+cache_creation_input_tokens) and qwen_usage (parser.rs:1774-1791). Empirically, an oh-my-pi session whose usage carries {\"input\": 9223372036854775807, \"input_tokens\": 9223372036854775807} panics the debug binary inside sum_numbers; in release the wrapped sum is negative, the `input > 0` gate drops the field, and the session silently reports zero tokens and $0.0000 cost. The number_as_i64 clamping added this cycle cannot prevent this: each value is individually in range; only the sum overflows. So the parser itself both panics (debug) and silently undercounts (release) on adversarial logs, violating the H1 acceptance criterion."
+    },
+    {
+      "#": 2,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        "crates/agenttrace-core/src/reports.rs:1518: let total_tokens: i64 = sessions.iter().map(total_tokens).sum();",
+        "Empirical, debug build, isolated cache: `./target/debug/agenttrace -d <dir-with-2-adversarial-sessions> --overview -f json` -> panicked at core/src/iter/traits/accum.rs:206 'attempt to add with overflow'; backtrace frame: agenttrace_core::reports::overview_summary -> <i64 as Sum>::sum.",
+        "Empirical, release build, isolated cache: same corpus -> JSON summary.total_tokens = -2 (the original F1 symptom) with total_sessions = 2.",
+        "Repro corpus: two JSONL files of the form {\"type\":\"assistant\",\"timestamp\":\"2026-09-0N..\",\"cwd\":\"/tmp/proj\",\"message\":{\"id\":\"msg-N\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":1e300,\"output_tokens\":1e300}}}; per-session totals correctly saturate to i64::MAX (the new fix works per session), and the overflow occurs only when summing across sessions.",
+        "Same unguarded pattern duplicated at crates/agenttrace-tui/src/shared.rs:226-231 and crates/agenttrace-tui/src/presentation.rs:3596-3601 (total_tokens_all), reached from explorer.rs:667 and explorer.rs:875.",
+        "Contrast (what the cycle did fix, verified): crates/agenttrace-core/src/lib.rs:527 `.max(0)` clamp per event field, lib.rs:534/537/540/543 saturating_add accumulators, lib.rs:1087-1094 saturating total_tokens(session).",
+        "Provenance: cited line unchanged in this working-tree diff (git diff e005952 does not touch reports.rs; repo has a single root commit e005952). The finding is that this cycle's stated H1 acceptance is unmet, not that the line was edited."
+      ],
+      "file": "crates/agenttrace-core/src/reports.rs",
+      "first_evidence": "crates/agenttrace-core/src/reports.rs:1518: `let total_tokens: i64 = sessions.iter().map(total_tokens).sum();`",
+      "independent_reviewers": [
+        "correctness"
+      ],
+      "line": 1518,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "correctness"
+      ],
+      "severity": "P1",
+      "suggested_fix": "Replace the plain .sum() with a saturating fold at all three sites: reports.rs:1518 -> sessions.iter().map(total_tokens).fold(0i64, i64::saturating_add); and the two total_tokens_all copies at crates/agenttrace-tui/src/shared.rs:226 and crates/agenttrace-tui/src/presentation.rs:3596 -> .fold(0i64, i64::saturating_add). Add a regression test that loads two sessions each saturated at i64::MAX and asserts the overview total is i64::MAX (never negative, never panicking).",
+      "title": "Cross-session token totals still overflow",
+      "why_it_matters": "The cycle's H1 acceptance criterion is 'no panic and no negative totals on adversarial token counts', and it is still violated at the report layer. With two session files whose usage values saturate to i64::MAX (for example input_tokens 1e300 in claude_code-format logs), overview_summary panics in debug builds ('attempt to add with overflow') and prints summary.total_tokens = -2 in release builds. That -2 is the exact original F1 symptom. The per-session fix in lib.rs (max(0) clamp at 527, saturating_add at 534-543, saturating total_tokens at 1087-1094) moved the overflow boundary to cross-session aggregation but did not close it: any multi-session corpus of adversarial logs crashes the CLI in debug and reports negative totals in release. The TUI duplicates the same pattern (total_tokens_all), so both surfaces stay wrong."
+    },
+    {
+      "#": 3,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        ".github/workflows/ci.yml:51: scripts/ci/check-output-contract.sh (representative line of the wired guard list at lines 51-104; check-plugin-version.sh does not appear anywhere in the file).",
+        "grep -rn 'check-plugin-version' scripts/ .github/ docs/ -> no hits outside the script file itself.",
+        "scripts/ci/check-plugin-version.sh exists as an untracked file in the working tree and is documented in CHANGELOG.md's Unreleased section as part of this cycle's F19 work."
+      ],
+      "file": ".github/workflows/ci.yml",
+      "first_evidence": ".github/workflows/ci.yml:51: `            scripts/ci/check-output-contract.sh` (wired-guard list lines 51-104 contains no check-plugin-version.sh step anywhere in the file)",
+      "independent_reviewers": [
+        "testing"
+      ],
+      "line": 51,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "testing"
+      ],
+      "severity": "P2",
+      "suggested_fix": "Add a workflow step in .github/workflows/ci.yml (for example next to check-cargo-manifests.sh around line 104) with `run: scripts/ci/check-plugin-version.sh`, mirroring the existing steps' shell/setup shape; verify with `act`-style local run or push and watch the job.",
+      "title": "check-plugin-version.sh not wired into CI",
+      "why_it_matters": "The cycle ships scripts/ci/check-plugin-version.sh as the F19 plugin-version-sync guard, and the local full_tests phase ran it manually (it passed), but nothing in CI ever executes it: .github/workflows/ci.yml lists check-output-contract, check-deterministic-output, check-report-semantics, check-release-surfaces, check-docs-commands, check-rust-real-cli-smoke, check-rust-tui-real-smoke, and check-cargo-manifests -- no step runs check-plugin-version.sh, and no other script calls it (grep over scripts/, .github/, docs/ finds zero references). A guard that never runs detects nothing: the next plugin/version drift will pass CI exactly as before this cycle, so the F19 acceptance 'wire it into CI' is not actually met."
+    },
+    {
+      "#": 4,
+      "autofix_class": "gated_auto",
+      "confidence": 100,
+      "evidence": [
+        "crates/agenttrace-core/src/parser.rs:639: *input = (*input - cached).max(0);",
+        "Empirical, debug build, isolated cache: workbuddy corpus (reasoning entry with sessionId+cwd, then message entry with usage {\"input_tokens\":-1e300,\"cache_read_input_tokens\":50}) -> panicked at crates/agenttrace-core/src/parser.rs:639:18 'attempt to subtract with overflow'.",
+        "Empirical, release build: same corpus exits 0 with summary.total_tokens = 9223372036854775807 (wrapped subtraction survived .max(0) and saturated the totals).",
+        "Reachability: parse_workbuddy_jsonl requires entries of type function_call/function_call_result/reasoning carrying sessionId and cwd keys; workbuddy_usage reads entry.message.usage or entry.providerData.usage (parser.rs:633-641).",
+        "Provenance: line unchanged in this diff; reported because adversarial-token hardening is this cycle's stated scope (H1)."
+      ],
+      "file": "crates/agenttrace-core/src/parser.rs",
+      "first_evidence": "crates/agenttrace-core/src/parser.rs:639: `*input = (*input - cached).max(0);`",
+      "independent_reviewers": [
+        "adversarial"
+      ],
+      "line": 639,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "adversarial"
+      ],
+      "severity": "P2",
+      "suggested_fix": "At parser.rs:639 replace `*input = (*input - cached).max(0);` with `*input = input.saturating_sub(cached);`. Add a workbuddy-format test with input_tokens = -1e300 and cache_read_input_tokens = 50 asserting no panic and a zero-or-small input.",
+      "title": "Workbuddy cache subtraction underflows",
+      "why_it_matters": "workbuddy_usage computes (*input - cached).max(0) with plain subtraction. An adversarial workbuddy-format log with a negative input_tokens value that clamps to i64::MIN (for example -1e300) plus any positive cache_read makes the subtraction overflow: the debug binary panics with 'attempt to subtract with overflow' at parser.rs:639, and the release binary wraps to a huge positive that survives .max(0), producing a grossly inflated total_tokens of 9223372036854775807 in the report. Either way the acceptance 'no panic and no [wrong] totals on adversarial token counts' fails for this format. The correct saturating primitive already exists elsewhere in this same fix (lib.rs uses saturating_add); this one site was missed."
+    },
+    {
+      "#": 5,
+      "autofix_class": "manual",
+      "confidence": 75,
+      "evidence": [
+        "docs/decisions/2026-09-02-cycle-1-batch-selection.md:105: 'plus a committed generated fixture from the repro corpus; H2's' (H1 evidence commitment).",
+        "ROADMAP.md:63-68: 'Acceptance: no panic and no negative totals on adversarial token counts; ... corpus (`/tmp/at-hugelogs` style fixture) committed as a generated fixture.'",
+        "Repo listing: testdata/ and testdata/generated/ contain provider-format fixtures only; git ls-files has no adversarial/overflow/corpus artifact.",
+        "The /tmp/at-hugelogs corpus used during assessment and (per full_tests phase notes) during verification lives outside the repo and is not reproducible from it."
+      ],
+      "file": "docs/decisions/2026-09-02-cycle-1-batch-selection.md",
+      "first_evidence": "docs/decisions/2026-09-02-cycle-1-batch-selection.md:105: `plus a committed generated fixture from the repro corpus; H2's`",
+      "independent_reviewers": [
+        "testing"
+      ],
+      "line": 105,
+      "owner": "downstream-resolver",
+      "pre_existing": false,
+      "requires_verification": true,
+      "reviewers": [
+        "testing"
+      ],
+      "severity": "P2",
+      "suggested_fix": "Commit a generated adversarial corpus under testdata/generated/ (two sessions with 1e300 usage values; an oh-my-pi usage object carrying two i64::MAX alias keys; a workbuddy entry with negative input_tokens plus positive cache_read), plus a test that runs the full load->analyze->overview pipeline over it asserting: no panic, and every token total >= 0. The three reproducers used in this review are ready-made seeds.",
+      "title": "Adversarial repro-corpus fixture not committed",
+      "why_it_matters": "The committed plan makes a generated adversarial corpus part of H1's evidence: ROADMAP.md:63-68 requires 'a committed generated fixture from the repro corpus' as H1 acceptance evidence, and the decision doc repeats it. No such fixture exists: testdata/ contains format fixtures (claude-code-preamble.jsonl, cline-task, codex-rollout-with-aider-text.jsonl, gemini-*, plus testdata/generated/*.jsonl) but nothing adversarial (no huge/negative/overflow corpus), and `git ls-files | grep -iE 'adversarial|huge|overflow|corpus'` returns nothing. This missing detection net is not hypothetical: the residual overflows in findings #1-#3 exist precisely because no committed corpus exercises them in CI. Without it, every future refactor of the aggregation path can silently regress H1."
+    }
+  ],
+  "triage_groups": [
+    {
+      "title": "Adversarial token hardening finish",
+      "findings": [
+        1,
+        4,
+        2,
+        5
+      ],
+      "context": "F1 fix stopped at the per-session layer; three unguarded aggregation sites remain and the detection net was never committed",
+      "preferred_resolution": "Fix #1 then #4 then #2 (saturating folds), then commit the corpus #5",
+      "why": "One saturating-arithmetic pass plus one committed fixture closes all four; #5 keeps them closed",
+      "kind": "apply-queue"
+    }
+  ],
+  "pre_existing_findings": [],
+  "requirements_completeness": {
+    "plan_source": "inferred",
+    "items": [
+      {
+        "req": "H1 saturating aggregation across aggregation paths",
+        "status": "partially addressed",
+        "findings": [
+          1,
+          2,
+          4
+        ]
+      },
+      {
+        "req": "H1 number_as_i64 range-validates",
+        "status": "partially addressed",
+        "note": "clamps with comment+tests; roadmap wording diverges (residual risk)"
+      },
+      {
+        "req": "H1 committed adversarial fixture",
+        "status": "not addressed",
+        "findings": [
+          5
+        ]
+      },
+      {
+        "req": "H2 zero network on default/test paths",
+        "status": "met"
+      },
+      {
+        "req": "H2 dated vendored snapshot in binary",
+        "status": "met",
+        "note": "2026-09-02, 2458 models, 533393 bytes"
+      },
+      {
+        "req": "H2 wall-clock-free pricing_source",
+        "status": "met",
+        "note": "byte-identical consecutive runs"
+      },
+      {
+        "req": "H2 cache never rewritten / stale served as-is",
+        "status": "met"
+      },
+      {
+        "req": "H2 PRIVACY.md accuracy",
+        "status": "met"
+      },
+      {
+        "req": "F12 --lang validation",
+        "status": "met"
+      },
+      {
+        "req": "F14 .gitignore cleanup",
+        "status": "met"
+      },
+      {
+        "req": "F19 plugin-version guard wired into CI",
+        "status": "partially addressed",
+        "findings": [
+          3
+        ]
+      }
+    ]
+  },
+  "residual_risks": [
+    "governance.rs:330 and reports.rs:1519-1523 sum f64 costs and usize tool counts across sessions; f64 cannot integer-overflow and usize counts are bounded by session count, so no equivalent risk was found there.",
+    "Manual verification hygiene: the session cache (~/.cache/agenttrace) can mask parser regressions on re-runs -- the second identical invocation loads cached metrics and skips the panicking parse path. Anyone re-verifying adversarial repros must use an isolated XDG_CACHE_HOME or a fresh corpus.",
+    "qwen_stats_usage and qwen_usage share sum_numbers, so finding #2's fold fix must be verified against both entry shapes, not just oh-my-pi.",
+    "CI runs cargo test in debug mode only, so release-mode wrapping (findings #1-#3 all wrap silently in release) would not panic loudly even after a corpus lands; a release-mode assertion on non-negative totals would close that gap.",
+    "The two duplicated total_tokens_all implementations (shared.rs and presentation.rs) drift-prone copies; findings #1's fix should ideally extract one helper.",
+    "std::env::set_var from parallel test threads mutates process-global state; the code comment argues this only changes which valid catalog other tests load, which held during this review's runs.",
+    "Pre-existing F11 (session_cache.rs concurrent sessions.json.tmp rename race across processes) was explicitly out of this cycle's scope and remains open; not re-litigated here.",
+    "H2 offline posture verified clean: with HTTP(S)_PROXY/ALL_PROXY pointed at a dead 127.0.0.1:9 proxy and an empty XDG_CACHE_HOME, `agenttrace --demo --overview -f json` exits 0 with pricing_source 'LiteLLM snapshot 2026-09-02 (bundled)' and creates no cache files; consecutive runs are byte-identical. The only network path is update_pricing behind --update-pricing (main.rs:163-174), handled before report actions so the singleton cannot be pre-initialized stale.",
+    "Stale-cache behavior verified: a backdated pricing.json (mtime 2026-08-01) survives a default run byte-identical (md5 unchanged) with no rewrite and no download attempt; the unit test at pricing.rs:1222 asserts the same at API level.",
+    "The --update-pricing download itself could not be exercised end-to-end in this offline environment; its error path when the network is unreachable is untested here (out of scope for H2, which governs default/test paths).",
+    "PRIVACY.md matches shipped behavior (offline by default, dated snapshot, --update-pricing as the sole network exception).",
+    "The vendored snapshot is 533,393 bytes (2,458 models) embedded via include_str!; the release binary is 11,147,232 bytes. This is an accepted consequence of H2's 'dated vendored snapshot in the binary' requirement, not a defect; startup parses it lazily and --demo runs complete in normal interactive time.",
+    "No hot-path regressions observed: fmt clean, workspace tests 154/154, and the two offline demo runs plus stale-cache run showed no measurable latency anomalies.",
+    "pricing_source label vocabulary changed this cycle ('snapshot' -> 'LiteLLM snapshot <date> (bundled)', 'cache(stale)' -> human-readable stale text at pricing.rs:104-108). No in-repo consumer depends on the old strings: grep over scripts/ci/*.sh, README.md, and docs/ finds no assertion on pricing_source or legacy 'LiteLLM (fetched' text. External consumers of the JSON field would see a one-time label change; v0.0.0-dev has no published contract to break.",
+    "--lang now rejects unknown values with exit 1 and a clear message (verified: --lang fr -> \"unsupported --lang value 'fr'; supported languages: en, zh\"; --lang zh renders Chinese). Help text declares value_name en|zh. No consumer docs reference --lang values outside docs/archive (compat notes), so no doc contract breaks.",
+    "ROADMAP.md:65 words H1 as 'number_as_i64 range-validates instead of wrapping or saturating silently'; shipped code clamps (saturates) with comment+tests asserting the clamp. Intent met, wording divergent -- amend ROADMAP or file follow-up (was P3 advisory, demoted).",
+    "with_isolated_cache_env (pricing.rs:1186-1204) keys its temp dir by pid only and remove_dir_all on entry+exit; the two pricing tests can theoretically delete each other's seeded cache. 0/40 stress iterations flaked; latent only (was P3 advisory, demoted)."
+  ],
+  "testing_gaps": [
+    "No multi-session adversarial corpus (two i64::MAX-saturated sessions) exercising overview_summary / total_tokens_all; existing tests cover only single-session clamping.",
+    "No test feeds two i64::MAX alias keys through oh_my_pi/qwen usage parsing.",
+    "No test covers negative usage values in the workbuddy format.",
+    "No multi-session adversarial corpus test (cross-session sum path).",
+    "No alias-pair i64::MAX test for oh_my_pi/qwen usage parsing.",
+    "No workbuddy negative-usage test.",
+    "No CI execution of scripts/ci/check-plugin-version.sh (finding #4).",
+    "cargo test --workspace: 154 passed / 0 failed and cargo fmt clean on re-run this review; the gaps above are coverage, not red tests."
+  ],
+  "coverage": {
+    "cross_model": "skipped (unknown host family)",
+    "validator": "unavailable; empirical reproduction anchors P1/P2",
+    "quote_gate_first_pass_demotions": 5,
+    "suppressed_by_confidence": {
+      "50": 2
+    },
+    "mode_aware_demotions": 2,
+    "mechanics": "stable # from final helper pass",
+    "baseline": "cargo test --workspace 154/0, cargo fmt clean"
+  },
+  "artifact_path": "/tmp/compound-engineering-1000/ce-code-review/20260902-060558-632f0e94",
+  "run_id": "20260902-060558-632f0e94"
+}

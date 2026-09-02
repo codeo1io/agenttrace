@@ -1,0 +1,152 @@
+{
+  "run_id": "314df0f829fe49af8de46938c7b579a6",
+  "phase_id": "assess",
+  "action_id": "assess:assess",
+  "attempt_id": "bc230ca4eeff4f4a8ba827847562b538",
+  "generated": "2026-09-02",
+  "head": "e005952",
+  "baseline": "cargo test --workspace: 147 passed / 0 failed; cargo fmt --check clean",
+  "skill": "ce-code-review (in-thread substitution; no subagent/cross-model surface in this harness)",
+  "reproduced": [
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5"
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "high",
+      "file": "crates/agenttrace-core/src/lib.rs",
+      "line": 1076,
+      "issue": "total_tokens() and the token accumulators (lib.rs:527,544,558,562) use unguarded i64 arithmetic fed by number_as_i64 (parser.rs:3576-3585) whose u64->i64 cast wraps negative and f64->i64 cast saturates to i64::MAX. Reproduced: a log with input_tokens=1e300 panics the debug build ('attempt to add with overflow', lib.rs:1077, exit 101) and makes the release build silently report TOKENS=-2 with cost 166020696663385.94 in --sessions and --overview -f json."
+    },
+    {
+      "id": "F2",
+      "severity": "high",
+      "file": "crates/agenttrace-core/src/pricing.rs",
+      "line": 236,
+      "issue": "pricing_catalog() lazily performs a blocking 5s network download (pricing.rs:239) whenever the pricing cache is >24h old, reached from the ordinary report path via analyze() (lib.rs:488), waste.rs:181, governance.rs:84, sqlite_sessions.rs:483. Reproduced: 'agenttrace --demo --overview -f json' fetched 2,090,796 bytes from raw.githubusercontent.com and rewrote the cache. PRIVACY.md:5 claims only --update-pricing downloads; no offline opt-out env var exists."
+    },
+    {
+      "id": "F3",
+      "severity": "high",
+      "file": "crates/agenttrace-core/src/pricing.rs",
+      "line": 258,
+      "issue": "cargo test performs live network I/O and mutates the user cache: reproduced with a stale $XDG_CACHE_HOME/agenttrace/pricing.json, 'cargo test -p agenttrace-core --lib pricing' passed and rewrote the file to 2,090,796 bytes. ci.yml:44 runs tests with no network isolation and ci.yml:6-7 schedules a nightly cron, so the suite is non-hermetic."
+    },
+    {
+      "id": "F4",
+      "severity": "medium",
+      "file": "crates/agenttrace-core/src/session_cache.rs",
+      "line": 528,
+      "issue": "Session cache entries for deleted files are never pruned (delete_cached_session_key at session_cache.rs:476 is only called when the exact path is revisited). Reproduced: after deleting every log file, all 4 cache keys persisted unchanged and were rewritten on save, so sessions.json grows unboundedly."
+    },
+    {
+      "id": "F5",
+      "severity": "medium",
+      "file": "crates/agenttrace-core/src/pricing.rs",
+      "line": 131,
+      "issue": "pricing_source embeds a wall-clock 'fetched <now>' vs 'cached <ts>' vs 'built-in fallback' string that is emitted into --overview -f json, so identical invocations differ across the cache-staleness boundary (reproduced) and cost values themselves change with cache state (cache_read 0.0 built-in vs 0.125 LiteLLM). scripts/ci/check-deterministic-output.sh only holds within one warm-cache job."
+    },
+    {
+      "id": "F6",
+      "severity": "medium",
+      "file": "crates/agenttrace-core/src/history.rs",
+      "line": 41,
+      "issue": "preserve_derived_history writes the whole accumulated history with a direct fs::write (no tmp+rename, unlike session_cache.rs:515-526), and decode_records (history.rs:65) maps a parse error to an empty map, so an interrupted write silently destroys all preserved history on the next run."
+    },
+    {
+      "id": "F7",
+      "severity": "medium",
+      "file": "crates/agenttrace-core/src/history.rs",
+      "line": 55,
+      "issue": "session_id uses DefaultHasher::new(), whose algorithm is documented as unspecified and not stable across Rust releases; a toolchain bump silently re-keys every preserved record, orphaning and duplicating history in merge_preserved_history."
+    },
+    {
+      "id": "F8",
+      "severity": "medium",
+      "file": "crates/agenttrace-core/src/pricing.rs",
+      "line": 1089,
+      "issue": "user_cache_dir() is hand-rolled and duplicated in pricing.rs:1089, doctor.rs:333 and session_cache.rs:743 with macOS/XDG branches only; history_path() (history.rs:21) has the same shape. On stock Windows HOME is unset, so the pricing cache, session cache and preserved history all land in %TEMP% and are periodically purged, despite windows-amd64/arm64 being first-class release targets."
+    },
+    {
+      "id": "F9",
+      "severity": "medium",
+      "file": "install.sh",
+      "line": 52,
+      "issue": "install.sh performs no integrity verification of the downloaded release binary beyond a >1,000,000 byte size check, while the npm channel (npm/scripts/install.js:75-85) does verify a .sha256 sibling; the two official install channels have inconsistent supply-chain posture."
+    },
+    {
+      "id": "F10",
+      "severity": "low",
+      "file": "crates/agenttrace-core/src/governance.rs",
+      "line": 735,
+      "issue": "Command::new(\"git\").args([\"-C\", root, ...]) executes git inside a directory derived from untrusted session-log cwd values; a crafted repository's local .git/config (e.g. core.fsmonitor) can execute a command. No shell injection, but the path is untrusted input."
+    },
+    {
+      "id": "F11",
+      "severity": "low",
+      "file": "crates/agenttrace-core/src/session_cache.rs",
+      "line": 515,
+      "issue": "save_session_cache writes a fixed sessions.json.tmp then renames with no locking, so concurrent agenttrace processes race on the same path; a lost rename surfaces as ENOENT which discovery.rs:239 swallows via 'let _ ='. Suggest a PID-suffixed temp name."
+    },
+    {
+      "id": "F12",
+      "severity": "low",
+      "file": "crates/agenttrace-cli/src/main.rs",
+      "line": 574,
+      "issue": "report_language() maps any unknown --lang value to English with no warning ('--lang fr' exits 0), unlike --format which is a validated clap value_enum."
+    },
+    {
+      "id": "F13",
+      "severity": "low",
+      "file": "scripts/ci/check-release-surfaces.sh",
+      "line": 1,
+      "issue": "The grep-based release-surface checks assert text presence rather than behavior: e.g. the requirement that install.sh contain 'cargo build --release -p agenttrace' is satisfied by the echo string at install.sh:63, and the npm checksum requirement is satisfied by the error message alone."
+    },
+    {
+      "id": "F14",
+      "severity": "low",
+      "file": ".gitignore",
+      "line": 13,
+      "issue": ".gitignore carries entries from a different project (apps/desktop/vite.config.js, apps/desktop/src-tauri/gen/, apps/desktop/coverage/, agentwaste); no such paths exist in this Rust-only tree, and the vite.config.js entry would silently ignore a real file."
+    },
+    {
+      "id": "F15",
+      "severity": "low",
+      "file": ".github/workflows/ci.yml",
+      "line": 33,
+      "issue": "Cargo.toml:12 declares rust-version = 1.80 but CI only sets up the stable toolchain, so the declared MSRV is never exercised and can drift silently."
+    },
+    {
+      "id": "F16",
+      "severity": "low",
+      "file": "crates/agenttrace-core/src/parser.rs",
+      "line": 21,
+      "issue": "read_to_string fails for non-UTF-8 session files and discovery.rs:225-228 only increments 'skipped' without recording a cause, so a whole provider can silently vanish from data_health."
+    },
+    {
+      "id": "F17",
+      "severity": "low",
+      "file": "scripts/ci/check-docs-commands.sh",
+      "line": 26,
+      "issue": "CI script writes to fixed /tmp scratch paths (/tmp/agenttrace-docs-md.stdout, /tmp/agenttrace-docs-html.stdout) shared across concurrent jobs and users."
+    },
+    {
+      "id": "F18",
+      "severity": "low",
+      "file": "crates/agenttrace-core/src/discovery.rs",
+      "line": 246,
+      "issue": "The --since filter uses is_some_and on RFC-3339 parsing, so sessions with an unparseable session_start are silently excluded from every --since result rather than being bucketed or surfaced."
+    },
+    {
+      "id": "F19",
+      "severity": "low",
+      "file": ".codex-plugin/plugin.json",
+      "line": 3,
+      "issue": "Plugin manifest pins version 0.7.1 against CHANGELOG.md:3 with no CI check tying them together; the workspace version is a 0.0.0-dev placeholder so drift would be silent."
+    }
+  ]
+}

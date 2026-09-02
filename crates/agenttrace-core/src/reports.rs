@@ -483,17 +483,24 @@ pub fn report_overview_json_with_health(
     serde_json::to_string_pretty(&payload).expect("overview report serializes")
 }
 
+/// `generated_at_override` pins `scope.generated_at` (used for `--demo` so the
+/// JSON is byte-deterministic); `None` stamps the real wall clock.
 pub fn report_overview_json_with_context(
     overview: &Overview,
     sessions: &[Session],
     data_health: Option<&crate::DataHealth>,
     range: crate::TimeRange,
     includes_preserved_history: bool,
+    generated_at_override: Option<&str>,
 ) -> String {
     let base = report_overview_json_with_health(overview, sessions, data_health);
     let mut payload: Value = serde_json::from_str(&base).expect("overview JSON is valid");
+    let mut scope = report_scope(sessions, range, includes_preserved_history);
+    if let Some(timestamp) = generated_at_override {
+        scope.generated_at = timestamp.to_string();
+    }
     let context = json!({
-        "scope": report_scope(sessions, range, includes_preserved_history),
+        "scope": scope,
         "cost_audit": cost_audit(sessions),
         "recommendations": recommendations(sessions),
         "mcp_governance": mcp_governance(sessions),
@@ -1515,7 +1522,12 @@ fn parse_avg_reasoning_chars(detail: &str) -> Option<f64> {
 }
 
 fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
-    let total_tokens: i64 = sessions.iter().map(total_tokens).sum();
+    // Saturating: per-session totals can legitimately sit at i64::MAX, so a
+    // plain `.sum()` overflowed across sessions (debug panic, release -2).
+    let total_tokens: i64 = sessions
+        .iter()
+        .map(total_tokens)
+        .fold(0i64, i64::saturating_add);
     let total_tools: usize = sessions
         .iter()
         .map(|s| s.metrics.tool_calls_ok + s.metrics.tool_calls_fail)
@@ -2470,6 +2482,33 @@ fn possible_cost_driver_note_strict(session: &Session) -> Option<String> {
 mod tests {
     use super::*;
     use crate::Metrics;
+
+    #[test]
+    fn overview_summary_totals_saturate_across_sessions() {
+        // Two sessions whose usage saturates each session total to i64::MAX
+        // previously overflowed the cross-session `.sum()` here: debug builds
+        // panicked and release builds printed `total_tokens = -2` — the
+        // original F1 symptom.
+        let session = Session {
+            name: "adversarial".to_string(),
+            path: "/tmp/adversarial.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                tokens_input: i64::MAX,
+                tokens_output: i64::MAX,
+                tokens_cache_w: i64::MAX,
+                tokens_cache_r: i64::MAX,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let sessions = vec![session.clone(), session];
+        let summary = overview_summary(&crate::Overview::default(), &sessions);
+        assert_eq!(summary["total_tokens"].as_i64(), Some(i64::MAX));
+    }
 
     #[test]
     fn compare_json_formats_zero_cost_like_go() {

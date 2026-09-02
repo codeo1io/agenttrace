@@ -122,7 +122,7 @@ pub(super) fn top_driver<T: Borrow<Session>>(
         });
         entry.sessions += 1;
         entry.failures += session.metrics.tool_calls_fail;
-        entry.tokens += total_tokens(session);
+        entry.tokens = entry.tokens.saturating_add(total_tokens(session));
         entry.cost += session.metrics.cost_estimated;
     }
     groups.into_values().max_by(compare_driver_items)
@@ -141,7 +141,7 @@ pub(super) fn top_anomaly_driver<T: Borrow<Session>>(sessions: &[T]) -> Option<D
                 });
             entry.sessions += 1;
             entry.failures += session.metrics.tool_calls_fail;
-            entry.tokens += total_tokens(session);
+            entry.tokens = entry.tokens.saturating_add(total_tokens(session));
             entry.cost += session.metrics.cost_estimated;
         }
     }
@@ -224,10 +224,12 @@ pub(super) fn format_compact_cost(cost: f64) -> String {
 }
 
 pub(super) fn total_tokens_all<T: Borrow<Session>>(sessions: &[T]) -> i64 {
+    // Saturating: cross-session totals must stay bounded when individual
+    // sessions saturate (mirrors reports.rs overview_summary).
     sessions
         .iter()
         .map(|session| total_tokens(session.borrow()))
-        .sum()
+        .fold(0i64, i64::saturating_add)
 }
 
 pub(super) fn total_duration<T: Borrow<Session>>(sessions: &[T]) -> f64 {
@@ -280,6 +282,29 @@ pub(super) fn format_duration(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn total_tokens_all_saturates_across_sessions() {
+        // Cross-session aggregation must saturate: two sessions whose totals
+        // sit at i64::MAX previously wrapped the shared overview to -2.
+        use agenttrace_core::{Metrics, Session};
+        let session = Session {
+            name: "adversarial".to_string(),
+            path: "/tmp/adversarial.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                tokens_input: i64::MAX,
+                tokens_output: i64::MAX,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Default::default(),
+        };
+        let sessions = vec![session.clone(), session];
+        assert_eq!(total_tokens_all(&sessions), i64::MAX);
+    }
 
     #[test]
     fn production_helpers_render_their_own_loading_summary() {

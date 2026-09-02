@@ -28,6 +28,12 @@ const DEMO_SHALLOW_SESSION: &str = r#"{"role":"session_meta","timestamp":"2026-0
 {"role":"assistant","content":"Maybe add a rollback note.","timestamp":"2026-05-02T10:35:40Z","reasoning":"Small note.","ModelUsed":"gemini-2.5-pro"}
 "#;
 
+/// Wall-clock time pinned for `--demo` reports so demo JSON output is byte
+/// deterministic (the CI determinism check compares back-to-back runs byte
+/// for byte; a real clock flakes whenever runs straddle a second boundary).
+/// Set just after the newest event in the synthetic dataset.
+pub const DEMO_REPORT_EPOCH: &str = "2026-05-02T10:36:00Z";
+
 pub fn demo_sessions() -> anyhow::Result<Vec<Session>> {
     Ok(vec![
         parse_jsonl_session(

@@ -3326,7 +3326,7 @@ pub(super) fn top_driver<T: Borrow<Session>>(
         });
         entry.sessions += 1;
         entry.failures += session.metrics.tool_calls_fail;
-        entry.tokens += total_tokens(session);
+        entry.tokens = entry.tokens.saturating_add(total_tokens(session));
         entry.cost += session.metrics.cost_estimated;
     }
     groups.into_values().max_by(compare_driver_items)
@@ -3347,7 +3347,7 @@ pub(super) fn top_anomaly_driver<T: Borrow<Session>>(sessions: &[T]) -> Option<D
             });
             entry.sessions += 1;
             entry.failures += session.metrics.tool_calls_fail;
-            entry.tokens += total_tokens(session);
+            entry.tokens = entry.tokens.saturating_add(total_tokens(session));
             entry.cost += session.metrics.cost_estimated;
         }
     }
@@ -3594,10 +3594,12 @@ fn format_optional_cost(cost: Option<f64>, language: Language) -> String {
 }
 
 pub(super) fn total_tokens_all<T: Borrow<Session>>(sessions: &[T]) -> i64 {
+    // Saturating: cross-session totals must stay bounded when individual
+    // sessions saturate (mirrors shared.rs and reports.rs overview_summary).
     sessions
         .iter()
         .map(|session| total_tokens(session.borrow()))
-        .sum()
+        .fold(0i64, i64::saturating_add)
 }
 
 pub(super) fn total_duration<T: Borrow<Session>>(sessions: &[T]) -> f64 {

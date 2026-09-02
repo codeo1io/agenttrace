@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Extended the token and cost hardening to the SQLite ingestion paths (OpenCode `opencode.db` and Hermes `state.db`), which the first hardening pass had missed: adversarial token counts now saturate instead of overflowing the per-session accumulator (a crafted database previously crashed debug builds with exit 101) or wrapping negative (`u64::MAX` previously reported `"input": -1`), and negative token columns in Hermes databases are clamped to zero. The earlier entry below claimed repo-wide coverage that this path disproved; it is now true.
+- SQLite-backed OpenCode sessions now prefer the authoritative totals recorded on the session row (`cost` and the five token columns) over message-derived aggregation when present, keep the derived path for older schemas, and disclose the choice: `provenance.tokens` reports `stored_session_totals`, the per-session `stored_totals_delta` exposes how far derived aggregation drifted, and `data_health` summarizes both (`stored_totals_sessions`, `stored_totals_delta_tokens`). The SQLite snapshot cache schema was bumped (v5) so cached entries regenerate under the new semantics.
+- Sessions with an unknown start time (for example OpenCode rows with `time_created = 0`) are no longer silently dropped from `--range`/`--since` views; they stay visible in an unknown-time bucket and `data_health` reports the count as `unknown_time_sessions`.
+- The default TUI now fails with a normal error (`stdout is not a terminal; ... use agenttrace --overview`) instead of panicking with exit 101 when stdout is not a terminal — the README quickstart previously crashed in every piped context (CI, cron, docker without `-t`, IDE consoles).
+- `--version` now wins over argument validation, including action validation: `agenttrace --lang fr --version` and `agenttrace --overview --version` print the version instead of rejecting the unsupported language or the action combination first (pass-6 P6-2).
+- Fixed a crash every non-interactive surface inherited from format detection: a single log line containing a `\u` escape followed by multi-byte UTF-8 (for example `{"prompt":"\u中文测试"}`) sliced mid-character inside the lone-surrogate repair path and killed `--overview`, `--doctor`, `--waste`, `--latest`, `--sessions`, `--diagnostics`, positional files, and directory scans with exit 101 in debug and release builds. Escape hex is now read from bytes, rejected escapes pass through untouched, and the adversarial corpus gained unicode-escape reproducers plus contract tests asserting the file degrades to "unsupported format" while clean neighbors keep loading (pass-6 P6-1).
+- The fallback token estimate (used when a session records no usage block) is now CJK-aware: ASCII text keeps the classic four-characters-per-token rate while every non-ASCII character counts as roughly one token, where the previous bytes-divided-by-four heuristic under-counted CJK by 40-60%. `reasoning_chars` now counts characters rather than bytes, matching the unit its name promises, and a new `Naming` provenance distinguishes `first_user_request`, `file_name`, `provider_title`, `message_derived`, `session_id`, and `provider:placeholder` session names (pass-6 P6-4, research candidate 34).
+- OpenCode sessions whose recorded `title` is a `New session - <timestamp>` placeholder (every session the provider does not summarize; 227/227 in the live census) are now named from their first user message text instead of carrying the placeholder as their name; real provider titles still win, and the gate is disclosed through `provider:placeholder` naming provenance (research candidate 34).
+- `--demo --overview -f json` now pins `scope.generated_at` to a fixed synthetic epoch (`2026-05-02T10:36:00Z`, just after the newest demo event) instead of the wall clock, so the deterministic-output check no longer flakes whenever two back-to-back runs straddle a second boundary; real (non-demo) reports still stamp the actual generation time.
+- Session-cache and SQLite-snapshot writes now stage through a per-writer unique temp file (process id plus an in-process counter) before the same atomic rename, so two concurrent agenttrace processes can no longer race on a shared `<name>.json.tmp` and fail or tear a save (pass-6 P6-3).
+- Governance cost audits no longer report `confidence: "high"` when any session in scope carries a negative token or cost component.
+- Hardened token and cost aggregation against adversarial or corrupt session logs: token counts now saturate instead of overflowing, negative usage values are clamped, and reports can no longer print negative token totals or panicked and absurd costs.
+- Made pricing fully offline by default: report and test paths never download anything. A dated LiteLLM snapshot (2,458 chat models, trimmed from the ~2 MB catalog to 533 KB) is bundled with the binary and used whenever no cached catalog exists; the network is touched only by the explicit `--update-pricing` command.
+- Stabilized `pricing_source` labels: they no longer embed fetch or cache timestamps, so identical inputs produce byte-identical reports across runs and cache states.
+- `--lang` now rejects unsupported values with an error instead of silently falling back to English.
+- Removed stale `.gitignore` entries (`agentwaste`, `apps/desktop/...`) left over from an earlier layout that no longer exists in this tree, and ignore the local `.hermes/` harness-state directory.
+
+### Added
+
+- A test pinning `PRICING_SNAPSHOT_DATE` to the bundled `pricing_snapshot.json` payload's `_snapshot.date`, so the const and the snapshot can no longer drift apart silently.
+- Committed adversarial SQLite repro fixtures (`testdata/generated/adversarial/sqlite/`, regenerable via `scripts/fixtures/make-adversarial-sqlite.py`) with regression tests covering the overflow, wrap, negative-column, stored-totals, and unknown-time paths.
+
+- Added `scripts/pricing/update-snapshot.sh` to regenerate the bundled pricing snapshot.
+- Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
+
 ## v0.7.1 - 2026-07-20
 
 ### Changed

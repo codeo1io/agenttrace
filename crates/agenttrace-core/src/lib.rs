@@ -18,7 +18,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use demo::demo_sessions;
+pub use demo::{demo_sessions, DEMO_REPORT_EPOCH};
 pub use diagnostics::{
     attention_priority, attention_rank, fix_suggestions, inspect_first, inspect_reason,
     loop_waste_percent, needs_attention, predict_cost_anomaly, session_findings,
@@ -256,6 +256,8 @@ pub struct MetricProvenance {
     pub cost: String,
     #[serde(rename = "PricingSource")]
     pub pricing_source: String,
+    #[serde(rename = "Naming")]
+    pub naming: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -273,6 +275,7 @@ pub struct Metrics {
     pub tool_authority: BTreeMap<String, usize>,
     pub highest_authority: String,
     pub reasoning_blocks: usize,
+    /// Characters (Unicode scalar values), not bytes (pass-6 P6-4).
     pub reasoning_chars: usize,
     pub reasoning_lens: Vec<usize>,
     pub reasoning_redact: usize,
@@ -289,6 +292,10 @@ pub struct Metrics {
     pub session_end: String,
     pub duration_sec: f64,
     pub cost_estimated: f64,
+    /// How far message-derived token aggregation drifted from the
+    /// authoritative totals stored on the session row (SQLite sources).
+    /// Zero unless stored totals were applied.
+    pub stored_totals_delta: i64,
     pub provenance: MetricProvenance,
 }
 
@@ -437,13 +444,20 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
             break;
         }
     }
-    let metrics = analyze(&events, &model);
+    let mut metrics = analyze(&events, &model);
+    let display_name = session_display_name(name, &events);
+    metrics.provenance.naming = if display_name != name {
+        "first_user_request"
+    } else {
+        "file_name"
+    }
+    .to_string();
     let anomalies = detect_anomalies(&metrics);
     let health = health_score(&anomalies);
     let tool_warnings = validate_tool_warnings(&events);
     let diagnostics = diagnostics::analyze_diagnostics(&events, &metrics);
     Ok(Session {
-        name: session_display_name(name, &events),
+        name: display_name,
         path: path.to_string(),
         cwd,
         metrics,
@@ -454,34 +468,55 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
     })
 }
 
+/// Single-source text→title transform for message-derived session names.
+/// Shared by the JSONL path (per-event) and the SQLite path (first user
+/// message text) so both name sessions identically.
+pub(crate) fn display_title_from_text(text: &str) -> Option<String> {
+    let mut text = text.trim();
+    if text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("<environment_context>")
+        || text.starts_with("Another language model started")
+    {
+        return None;
+    }
+    if let Some((_, request)) = text.split_once("## My request for Codex:") {
+        text = request.trim();
+    }
+    let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then(|| {
+        let mut chars = title.chars();
+        let short = chars.by_ref().take(60).collect::<String>();
+        if chars.next().is_some() {
+            format!("{short}…")
+        } else {
+            short
+        }
+    })
+}
+
 fn session_display_name(fallback: &str, events: &[Event]) -> String {
     events
         .iter()
         .filter(|event| event.role == "user")
-        .filter_map(|event| {
-            let mut text = event.content.trim();
-            if text.starts_with("# AGENTS.md instructions")
-                || text.starts_with("<environment_context>")
-                || text.starts_with("Another language model started")
-            {
-                return None;
-            }
-            if let Some((_, request)) = text.split_once("## My request for Codex:") {
-                text = request.trim();
-            }
-            let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            (!title.is_empty()).then(|| {
-                let mut chars = title.chars();
-                let short = chars.by_ref().take(60).collect::<String>();
-                if chars.next().is_some() {
-                    format!("{short}…")
-                } else {
-                    short
-                }
-            })
-        })
+        .filter_map(|event| display_title_from_text(&event.content))
         .next()
         .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Fallback token estimate, used only when no usage block exists and named
+/// `estimated_from_text` in `provenance.tokens`. CJK-aware: ASCII text keeps
+/// the classic 4-characters-per-token rate while every non-ASCII character
+/// counts as roughly one token (pass-6 P6-4 — the previous bytes/4 heuristic
+/// under-counted CJK by ~40–60% because CJK is ≥1 token per character but
+/// only ~3/4 token per byte).
+fn estimate_tokens_from_text(text: &str) -> i64 {
+    // Scaled by 4 so an ASCII character contributes 1 and a non-ASCII
+    // character contributes 4 (one whole token).
+    let mut scaled: u64 = 0;
+    for ch in text.chars() {
+        scaled = scaled.saturating_add(if ch.is_ascii() { 1 } else { 4 });
+    }
+    (scaled / 4) as i64
 }
 
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
@@ -521,45 +556,60 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             metrics.timestamps.push(ts);
         }
 
+        // Usage values arrive from untrusted session logs; clamp negatives
+        // (corrupt data) and accumulate with saturation so adversarial or
+        // corrupt token counts can never wrap into negative totals.
+        let usage_tokens = |key: &str| -> i64 { event.usage.get(key).copied().unwrap_or(0).max(0) };
+
         match event.role.as_str() {
             "session_meta" | "meta" => {
                 if !event.usage.is_empty() {
-                    metrics.tokens_input += event.usage.get("input_tokens").copied().unwrap_or(0);
-                    metrics.tokens_output += event.usage.get("output_tokens").copied().unwrap_or(0);
-                    metrics.tokens_cache_w += event
-                        .usage
-                        .get("cache_creation_input_tokens")
-                        .copied()
-                        .unwrap_or(0);
-                    metrics.tokens_cache_r += event
-                        .usage
-                        .get("cache_read_input_tokens")
-                        .copied()
-                        .unwrap_or(0);
+                    metrics.tokens_input = metrics
+                        .tokens_input
+                        .saturating_add(usage_tokens("input_tokens"));
+                    metrics.tokens_output = metrics
+                        .tokens_output
+                        .saturating_add(usage_tokens("output_tokens"));
+                    metrics.tokens_cache_w = metrics
+                        .tokens_cache_w
+                        .saturating_add(usage_tokens("cache_creation_input_tokens"));
+                    metrics.tokens_cache_r = metrics
+                        .tokens_cache_r
+                        .saturating_add(usage_tokens("cache_read_input_tokens"));
                 }
             }
             "user" => {
                 metrics.user_messages += 1;
                 if !event.content.is_empty() && !has_meta_usage {
-                    metrics.tokens_input += std::cmp::max(1, event.content.len() as i64 / 4);
+                    metrics.tokens_input = metrics.tokens_input.saturating_add(std::cmp::max(
+                        1,
+                        estimate_tokens_from_text(&event.content),
+                    ));
                 }
             }
             "assistant" => {
                 metrics.assistant_turns += 1;
                 if !event.reasoning.is_empty() {
                     metrics.reasoning_blocks += 1;
-                    let chars = event.reasoning.len();
+                    // Characters, not bytes — the field name promises the
+                    // unit (pass-6 P6-4).
+                    let chars = event.reasoning.chars().count();
                     metrics.reasoning_chars += chars;
                     metrics.reasoning_lens.push(chars);
                     if event.redacted {
                         metrics.reasoning_redact += 1;
                     }
                     if !has_meta_usage {
-                        metrics.tokens_output += std::cmp::max(1, chars as i64 / 4);
+                        metrics.tokens_output = metrics.tokens_output.saturating_add(
+                            std::cmp::max(1, estimate_tokens_from_text(&event.reasoning)),
+                        );
                     }
                 }
                 if !event.content.is_empty() && !has_meta_usage {
-                    metrics.tokens_output += std::cmp::max(1, event.content.len() as i64 / 4);
+                    metrics.tokens_output = metrics.tokens_output.saturating_add(std::cmp::max(
+                        1,
+                        estimate_tokens_from_text(&event.content),
+                    ));
                 }
                 metrics.tool_calls_total += event.tool_calls.len();
                 for tool_call in &event.tool_calls {
@@ -1074,10 +1124,12 @@ pub fn tool_fail_rate(sessions: &[Session]) -> f64 {
 }
 
 pub fn total_tokens(session: &Session) -> i64 {
-    session.metrics.tokens_input
-        + session.metrics.tokens_output
-        + session.metrics.tokens_cache_w
-        + session.metrics.tokens_cache_r
+    session
+        .metrics
+        .tokens_input
+        .saturating_add(session.metrics.tokens_output)
+        .saturating_add(session.metrics.tokens_cache_w)
+        .saturating_add(session.metrics.tokens_cache_r)
 }
 
 pub fn format_tokens(value: i64) -> String {
@@ -1462,6 +1514,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adversarial_token_counts_stay_bounded_and_non_negative() {
+        let events = vec![
+            Event {
+                role: "session_meta".to_string(),
+                usage: BTreeMap::from([
+                    ("input_tokens".to_string(), i64::MAX),
+                    ("output_tokens".to_string(), i64::MAX),
+                    ("cache_creation_input_tokens".to_string(), i64::MAX),
+                    ("cache_read_input_tokens".to_string(), i64::MAX),
+                ]),
+                ..Event::default()
+            },
+            Event {
+                role: "session_meta".to_string(),
+                usage: BTreeMap::from([
+                    ("input_tokens".to_string(), 7),
+                    ("output_tokens".to_string(), -9),
+                    ("cache_read_input_tokens".to_string(), -1_000),
+                ]),
+                ..Event::default()
+            },
+        ];
+        let session = session_from_events("adversarial", "adversarial.jsonl", events)
+            .expect("session from adversarial events");
+        assert_eq!(session.metrics.tokens_input, i64::MAX);
+        assert_eq!(session.metrics.tokens_output, i64::MAX);
+        assert_eq!(session.metrics.tokens_cache_w, i64::MAX);
+        assert_eq!(session.metrics.tokens_cache_r, i64::MAX);
+        assert_eq!(total_tokens(&session), i64::MAX);
+        assert!(session.metrics.cost_estimated.is_finite());
+        assert!(session.metrics.cost_estimated >= 0.0);
+    }
+
+    #[test]
+    fn total_tokens_saturates_instead_of_wrapping_negative() {
+        let session = session_from_events("saturate", "saturate.jsonl", vec![Event::default()])
+            .expect("session");
+        let mut session = session;
+        session.metrics.tokens_input = i64::MAX;
+        session.metrics.tokens_output = i64::MAX;
+        session.metrics.tokens_cache_w = 5;
+        session.metrics.tokens_cache_r = 5;
+        assert_eq!(total_tokens(&session), i64::MAX);
+    }
+
+    #[test]
     fn session_name_uses_first_real_user_request() {
         let session = session_from_events(
             "rollout-2026-07-19-random",
@@ -1676,6 +1774,102 @@ mod tests {
         assert_eq!(reported.tokens_input, 100);
         assert_eq!(reported.tokens_output, 20);
         assert_eq!(reported.provenance.tokens, "reported_by_agent");
+    }
+
+    #[test]
+    fn fallback_token_estimate_is_cjk_aware() {
+        // Pass-6 P6-4: the old bytes/4 heuristic estimated 8 CJK
+        // characters (24 bytes) at 6 tokens when real tokenizers use
+        // roughly one token per CJK character (~8). Stated tolerance:
+        // ±25% of the one-token-per-CJK-character model.
+        let metrics = analyze(
+            &[Event {
+                role: "user".to_string(),
+                content: "中文测试中文测试".to_string(),
+                ..Event::default()
+            }],
+            "gpt-5",
+        );
+        assert_eq!(metrics.tokens_input, 8);
+
+        // ASCII keeps the classic 4-characters-per-token rate.
+        let metrics = analyze(
+            &[Event {
+                role: "user".to_string(),
+                content: "12345678".to_string(),
+                ..Event::default()
+            }],
+            "gpt-5",
+        );
+        assert_eq!(metrics.tokens_input, 2);
+
+        // Mixed text: "café 中文" = 5 ASCII + 3 non-ASCII → (5 + 12)/4 = 4.
+        let metrics = analyze(
+            &[Event {
+                role: "user".to_string(),
+                content: "café 中文".to_string(),
+                ..Event::default()
+            }],
+            "gpt-5",
+        );
+        assert_eq!(metrics.tokens_input, 4);
+    }
+
+    #[test]
+    fn reasoning_chars_counts_characters_not_bytes() {
+        // Pins the unit the field name promises: 4 characters of CJK are
+        // 12 UTF-8 bytes, and reasoning_chars must report characters.
+        let metrics = analyze(
+            &[Event {
+                role: "assistant".to_string(),
+                content: "ok".to_string(),
+                reasoning: "中文测试".to_string(),
+                ..Event::default()
+            }],
+            "gpt-5",
+        );
+        assert_eq!(metrics.reasoning_chars, 4);
+        assert_eq!(metrics.reasoning_lens, vec![4]);
+    }
+
+    #[test]
+    fn naming_provenance_marks_fallback_names() {
+        // Without a usable user request the file name survives and the
+        // provenance must say so.
+        let session = session_from_events(
+            "file-stem",
+            "path",
+            vec![Event {
+                role: "assistant".to_string(),
+                content: "answer only".to_string(),
+                ..Event::default()
+            }],
+        )
+        .expect("session builds");
+        assert_eq!(session.name, "file-stem");
+        assert_eq!(session.metrics.provenance.naming, "file_name");
+
+        // With a usable user request the derived title wins and the
+        // provenance says where it came from.
+        let session = session_from_events(
+            "file-stem",
+            "path",
+            vec![
+                Event {
+                    role: "user".to_string(),
+                    content: "please audit the billing export".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    content: "answer".to_string(),
+                    ..Event::default()
+                },
+            ],
+        )
+        .expect("session builds");
+        assert_eq!(session.name, "please audit the billing export");
+        assert_eq!(session.metrics.provenance.naming, "first_user_request");
     }
 
     #[test]

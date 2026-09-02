@@ -636,7 +636,10 @@ fn workbuddy_usage(entry: &Map<String, Value>) -> Option<TokenUsage> {
         .and_then(usage_from_value)?;
     let cached = usage.get("cache_read_input_tokens").copied().unwrap_or(0);
     if let Some(input) = usage.get_mut("input_tokens") {
-        *input = (*input - cached).max(0);
+        // `saturating_sub`: adversarial magnitudes clamp input_tokens to
+        // i64::MIN, where a plain subtraction underflows (debug panic) or
+        // wraps to a huge positive that survives `.max(0)` (release).
+        *input = input.saturating_sub(cached).max(0);
     }
     Some(usage)
 }
@@ -3570,15 +3573,31 @@ fn sum_numbers(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
     keys.iter()
         .filter_map(|key| obj.get(*key))
         .filter_map(number_as_i64)
-        .sum()
+        // Saturating: alias keys can each carry a legal in-range value whose
+        // sum overflows (e.g. two i64::MAX entries for the same counter),
+        // which previously wrapped the usage negative.
+        .fold(0i64, i64::saturating_add)
 }
 
-fn number_as_i64(value: &Value) -> Option<i64> {
+pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
     match value {
-        Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_u64().map(|n| n as i64))
-            .or_else(|| number.as_f64().map(|n| n as i64)),
+        Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_u64()
+                // Clamp instead of wrapping: u64 values above i64::MAX
+                // previously cast to a negative i64 through `as i64`,
+                // letting corrupt logs flip token totals negative.
+                .map(|n| n.min(i64::MAX as u64) as i64)
+                .or_else(|| {
+                    number
+                        .as_f64()
+                        // `as` casts from f64 to i64 saturate, so absurd
+                        // magnitudes (e.g. 1e300) land on the i64 bounds
+                        // instead of wrapping; downstream aggregation is
+                        // saturating as well.
+                        .map(|n| n as i64)
+                })
+        }),
         Value::String(text) => text.parse::<i64>().ok(),
         _ => None,
     }
@@ -3756,6 +3775,24 @@ fn parse_jsonl_value_lenient(line: &str) -> Option<Value> {
         .or_else(|| repair_lone_surrogates(line).and_then(|line| serde_json::from_str(&line).ok()))
 }
 
+/// Parses the four bytes of a `\uXXXX` escape. Reading hex from **bytes**
+/// (not a `&str` slice) is what keeps `repair_lone_surrogates` panic-free:
+/// when a rejected `\u` escape is followed by multi-byte UTF-8, the four
+/// bytes after it are simply not ASCII hex and the escape passes through
+/// untouched (pass-6 P6-1 — the old `&line[i+2..i+6]` sliced
+/// mid-character and crashed every report action, release builds
+/// included).
+fn hex_escape_u16(mut bytes: &[u8]) -> Option<u16> {
+    let mut value: u16 = 0;
+    for _ in 0..4 {
+        let byte = *bytes.first()?;
+        let digit = (byte as char).to_digit(16)?;
+        value = value.checked_mul(16)?.checked_add(digit as u16)?;
+        bytes = &bytes[1..];
+    }
+    Some(value)
+}
+
 fn repair_lone_surrogates(line: &str) -> Option<String> {
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
@@ -3763,15 +3800,17 @@ fn repair_lone_surrogates(line: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'u') && i + 6 <= bytes.len() {
-            let hex = &line[i + 2..i + 6];
-            if let Ok(code) = u16::from_str_radix(hex, 16) {
+            if let Some(code) = hex_escape_u16(&bytes[i + 2..i + 6]) {
                 if (0xD800..=0xDBFF).contains(&code) {
-                    if i + 12 <= bytes.len()
+                    let pair = i + 12 <= bytes.len()
                         && bytes.get(i + 6) == Some(&b'\\')
                         && bytes.get(i + 7) == Some(&b'u')
-                        && u16::from_str_radix(&line[i + 8..i + 12], 16)
-                            .is_ok_and(|next| (0xDC00..=0xDFFF).contains(&next))
-                    {
+                        && hex_escape_u16(&bytes[i + 8..i + 12])
+                            .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next));
+                    if pair {
+                        // Both hex groups are ASCII, so `i..i + 12` lies on
+                        // char boundaries and the slice below cannot cut a
+                        // character.
                         out.push_str(&line[i..i + 12]);
                         i += 12;
                     } else {
@@ -4117,4 +4156,124 @@ fn session_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("session")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sum_numbers_saturates_alias_pairs_instead_of_overflowing() {
+        // `input` and `input_tokens` are both legal in-range integers; the
+        // alias sum previously wrapped negative on i64::MAX pairs.
+        let value = serde_json::json!({
+            "input": 9_223_372_036_854_775_807i64,
+            "input_tokens": 9_223_372_036_854_775_807i64,
+        });
+        let obj = value.as_object().expect("object");
+        assert_eq!(sum_numbers(obj, &["input", "input_tokens"]), i64::MAX);
+        assert_eq!(sum_numbers(obj, &["output", "output_tokens"]), 0);
+    }
+
+    #[test]
+    fn workbuddy_usage_survives_negative_input_with_cache_read() {
+        // input_tokens clamps to i64::MIN for adversarial magnitudes; the
+        // cache subtraction previously underflowed there (debug panic,
+        // release wrap to a huge positive).
+        let value = serde_json::json!({
+            "message": {
+                "usage": {
+                    "input_tokens": i64::MIN,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 5
+                }
+            }
+        });
+        let usage = workbuddy_usage(value.as_object().expect("object")).expect("usage");
+        assert_eq!(usage.get("input_tokens"), Some(&0));
+        assert_eq!(usage.get("output_tokens"), Some(&10));
+    }
+
+    #[test]
+    fn number_as_i64_saturates_extreme_numbers_instead_of_wrapping() {
+        // u64::MAX previously wrapped to -1 through `as i64`, letting a
+        // corrupt log flip token totals negative; it now saturates.
+        let over_i64 = serde_json::json!(9_223_372_036_854_775_808u64);
+        assert_eq!(number_as_i64(&over_i64), Some(i64::MAX));
+        let u64_max = serde_json::json!(u64::MAX);
+        assert_eq!(number_as_i64(&u64_max), Some(i64::MAX));
+        // 1e300 exceeds i64 range; the f64 cast saturates at the bounds
+        // rather than producing a garbage in-range value.
+        let huge_float = serde_json::json!(1e300);
+        assert_eq!(number_as_i64(&huge_float), Some(i64::MAX));
+        let huge_negative = serde_json::json!(-1e300);
+        assert_eq!(number_as_i64(&huge_negative), Some(i64::MIN));
+        // In-range values keep exact parsing.
+        assert_eq!(number_as_i64(&serde_json::json!(42)), Some(42));
+        assert_eq!(number_as_i64(&serde_json::json!("42")), Some(42));
+    }
+
+    #[test]
+    fn repair_lone_surrogates_never_slices_mid_character() {
+        // Pass-6 P6-1: a rejected `\u` escape followed by multi-byte
+        // UTF-8 inside the next four bytes used to slice `line` at a
+        // non-char-boundary and panic. The hex must be read from bytes:
+        // when the four bytes are not ASCII hex the escape passes through
+        // untouched (None = unchanged), never a panic.
+        assert_eq!(repair_lone_surrogates(r#"{"prompt":"\u中文测试"}"#), None);
+        // High surrogate whose would-be pair hex contains multi-byte
+        // UTF-8: the pair check must fail safely and the lone surrogate
+        // becomes U+FFFD while the rest of the line is copied verbatim.
+        assert_eq!(
+            repair_lone_surrogates(r#"{"prompt":"\ud800\u中文测试"}"#).as_deref(),
+            Some(r#"{"prompt":"\ufffd\u中文测试"}"#)
+        );
+        // Non-hex ASCII after `\u` passes through unchanged.
+        assert_eq!(
+            repair_lone_surrogates(r#"{"prompt":"\uzzzz not hex"}"#),
+            None
+        );
+        // Truncated escape at end of line passes through unchanged.
+        assert_eq!(
+            repair_lone_surrogates(r#"{"prompt":"truncated \u4e2"}"#),
+            None
+        );
+        // Valid escapes stay untouched (no change -> None).
+        assert_eq!(
+            repair_lone_surrogates(r#"{"prompt":"\u00e9 valid bmp escape"}"#),
+            None
+        );
+        assert_eq!(
+            repair_lone_surrogates(r#"{"prompt":"\ud83d\ude0e emoji pair only"}"#),
+            None
+        );
+        // A lone surrogate half still becomes U+FFFD.
+        assert_eq!(
+            repair_lone_surrogates(r#"{"prompt":"lone \ud800 half"}"#).as_deref(),
+            Some(r#"{"prompt":"lone \ufffd half"}"#)
+        );
+        assert_eq!(
+            repair_lone_surrogates(r#"{"prompt":"lone \udc00 low half"}"#).as_deref(),
+            Some(r#"{"prompt":"lone \ufffd low half"}"#)
+        );
+    }
+
+    #[test]
+    fn lenient_parse_repairs_lone_surrogates_and_keeps_valid_pairs() {
+        // End to end through the lenient path: the lone surrogate is
+        // replaced, the valid pair survives as one character, and the
+        // value is a real object again.
+        let value =
+            parse_jsonl_value_lenient(r#"{"prompt":"lone \ud800 with pair \ud83d\ude00 end"}"#)
+                .expect("repaired line must parse");
+        assert_eq!(
+            value.get("prompt").and_then(|p| p.as_str()),
+            Some("lone \u{fffd} with pair \u{1f600} end")
+        );
+        // The P6-1 reproducers must degrade to "unparseable line", not
+        // panic.
+        assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
+        assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
+        assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
 }

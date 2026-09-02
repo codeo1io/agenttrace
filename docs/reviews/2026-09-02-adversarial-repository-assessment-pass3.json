@@ -1,0 +1,165 @@
+{
+  "run_id": "1efeb12cc1334ebdae35747e4ad161e1",
+  "phase_id": "assess",
+  "action_id": "assess:assess",
+  "attempt_id": "2fae66cf9ace48c8811caed66f250b28",
+  "status": "completed",
+  "summary": "Third adversarial repository assessment of agenttrace at e005952 plus the uncommitted cycle-1 working tree, run from zero with methods deliberately different from passes 1-2 (contradiction hunting between code paths, environment manipulation, timezone manipulation, corpus fuzzing, timing). Baseline re-confirmed: cargo test --workspace 159/159, clippy 0 warnings, fmt clean. Nine NEW findings, seven of them reproduced end-to-end; none repeat F1-F19 or N1-N10. Highest impact: (1) session auto-discovery depends solely on HOME with no USERPROFILE/HOMEDRIVE+HOMEPATH fallback anywhere in the workspace, while install.ps1/winget/npm all ship Windows as a first-class target - a default Windows install discovers zero sessions (reproduced via env -u HOME). (2) --range today and its alias --range 1d are UTC-calendar-day windows, so users east of UTC silently lose every session from earlier in their own day, and '1d' is not a rolling 24h window at all; the filter gates the entire CLI view and the TUI range filter. (3) Two divergent percentile() implementations (lib.rs trunc(len*p) vs reports.rs round((len-1)*p)) run over the same gap array, so a single --latest -f json report states p95=29 in its latency block and p95=31.0s in its own anomaly detail. (4) C0 control characters from untrusted session content (session names come from the first user message) reach stdout, markdown and HTML unfiltered - html_escape only handles &<>; reproduced with an OSC title-set sequence. (5) --limit is silently ignored by --overview, including the --baseline CI gate, though honored by --sessions/--compare/governance. (6) --doctor re-parses every uncached file on every run and never writes the session cache (7.6s on a 1500-file corpus every time), despite being the documented first command. (7) stdout report output never ends with a newline while the -o file does. (8) Three byte-identical private user_cache_dir() copies in one crate plus duplicated TUI ranking helpers - the exact duplication pattern that left sqlite_sessions.rs unhardened (N1, re-verified still open). (9) Dead count_by_root loop in doctor_directories. Negative results recorded so the next pass does not re-walk them: 21-file malformed corpus x all subcommands (no panics/hangs/negative totals), 1500-file perf (8.0s cold / 0.55s cached), search is substring-only (no ReDoS surface), HTML tag injection correctly escaped, plugin.json 0.7.1 and pricing_snapshot.json consistent, every command in skills/agenttrace-session-audit/SKILL.md runs as written. Skill routing: found and loaded the compound-engineering router and its ce-code-review skill; this harness exposes no subagent dispatch, so all lenses ran in-thread - disclosed in the artifact, and inter-lens agreement is not independent corroboration. Full evidence, reproducers (in /tmp/at3/) and a prioritized remediation order are in docs/reviews/2026-09-02-adversarial-repository-assessment-pass3.md. No commits, pushes, PRs or CI runs were made this turn; only the two docs/reviews/*pass3* artifacts were added.",
+  "artifacts": [
+    "docs/reviews/2026-09-02-adversarial-repository-assessment-pass3.md",
+    "docs/reviews/2026-09-02-adversarial-repository-assessment-pass3.json"
+  ],
+  "evidence_refs": [
+    "crates/agenttrace-core/src/discovery.rs:51-53",
+    "crates/agenttrace-core/src/sqlite_sessions.rs:47",
+    "crates/agenttrace-core/src/sqlite_sessions.rs:61",
+    "crates/agenttrace-core/src/insights.rs:50",
+    "crates/agenttrace-core/src/insights.rs:65-70",
+    "crates/agenttrace-core/src/insights.rs:229-233",
+    "crates/agenttrace-cli/src/main.rs:617",
+    "crates/agenttrace-tui/src/app.rs:1312",
+    "crates/agenttrace-tui/src/app.rs:1397",
+    "crates/agenttrace-core/src/lib.rs:1205-1217",
+    "crates/agenttrace-core/src/lib.rs:676",
+    "crates/agenttrace-core/src/lib.rs:680",
+    "crates/agenttrace-core/src/reports.rs:1715-1721",
+    "crates/agenttrace-core/src/reports.rs:60",
+    "crates/agenttrace-core/src/reports.rs:62",
+    "crates/agenttrace-core/src/reports.rs:2287",
+    "crates/agenttrace-core/src/lib.rs:457",
+    "crates/agenttrace-core/src/reports.rs:2429-2431",
+    "crates/agenttrace-cli/src/main.rs:215-217",
+    "crates/agenttrace-cli/src/main.rs:239-240",
+    "crates/agenttrace-cli/src/main.rs:289",
+    "crates/agenttrace-cli/src/main.rs:326",
+    "crates/agenttrace-core/src/doctor.rs:162-170",
+    "crates/agenttrace-core/src/doctor.rs:124-133",
+    "crates/agenttrace-core/src/doctor.rs:333",
+    "crates/agenttrace-core/src/pricing.rs:1113",
+    "crates/agenttrace-core/src/session_cache.rs:743",
+    "crates/agenttrace-tui/src/shared.rs:111",
+    "crates/agenttrace-tui/src/presentation.rs:3315",
+    "crates/agenttrace-cli/src/main.rs:233,249,259,276,290,309,321,381",
+    "docs/guides/governance-reports.md:15",
+    "skills/agenttrace-session-audit/SKILL.md"
+  ],
+  "findings": [
+    {
+      "id": "P3-1",
+      "severity": "high",
+      "categories": ["correctness", "portability", "dx"],
+      "title": "Session auto-discovery is HOME-only; a default Windows install discovers nothing",
+      "file": "crates/agenttrace-core/src/discovery.rs",
+      "line": "51-53",
+      "evidence": "known_session_dirs() returns Vec::new() when HOME is unset; same guard at sqlite_sessions.rs:47 and :61; grep -rn 'USERPROFILE|cfg(windows)' crates/ returns zero matches. install.ps1/winget/npm-win32 all ship Windows (README.md:78-83). REPRODUCED: env -u HOME -u XDG_CACHE_HOME agenttrace --doctor -> 'Session files: 0', 'Providers:' empty; --overview -> 'Error: No session files found in '.",
+      "recommendation": "Add one shared home_dir() helper that tries HOME, then USERPROFILE, then HOMEDRIVE+HOMEPATH (or adopt the dirs/home crate); use it from discovery and sqlite_sessions; add a unit test with HOME unset asserting the Windows fallback chain is attempted."
+    },
+    {
+      "id": "P3-2",
+      "severity": "medium",
+      "categories": ["correctness", "i18n", "reliability"],
+      "title": "--range today and alias --range 1d are UTC-calendar-day windows; silently drop sessions from earlier in the user's local day",
+      "file": "crates/agenttrace-core/src/insights.rs",
+      "line": "50, 65-70",
+      "evidence": "'today' | 'day' | '1d' => Self::Today; Today => now.date_naive().and_hms_opt(0,0,0).and_utc() with now=Utc::now() (main.rs:617; TUI app.rs:1312 -> :1397). session_matches_time_range gates the whole CLI view. REPRODUCED with TZ=Asia/Tokyo and a session at 2026-09-02T01:00+09:00: --range today and --range 1d both say 'No sessions match the requested filters'; --range 7d and default include it.",
+      "recommendation": "Compute Today as local midnight (Local::now().date_naive()) and make 1d a rolling now - 24h. Add a test pinning a +09:00 session against TimeRange::Today."
+    },
+    {
+      "id": "P3-3",
+      "severity": "medium",
+      "categories": ["correctness", "maintainability"],
+      "title": "Two divergent percentile() implementations contradict each other inside the same report",
+      "file": "crates/agenttrace-core/src/lib.rs",
+      "line": "1205-1217",
+      "evidence": "lib.rs uses idx=(len*p) as isize (truncation); reports.rs:1715 uses idx=((len-1)*p).round(). Both run over the same gaps slice: lib.rs:676/680 (detect_anomalies, decides the anomaly and its detail string) vs reports.rs:60/62 (latency block). REPRODUCED with 20 gaps (18x1s, 29s, 31s): --latest -f json reports latency.p95=29, max=31, while anomalies[0].detail='p95 latency = 31.0s'.",
+      "recommendation": "Delete one implementation, export the survivor from a single stats module, and add a test asserting the anomaly detail and the latency block agree on a fixed corpus."
+    },
+    {
+      "id": "P3-4",
+      "severity": "medium",
+      "categories": ["security", "output-hygiene"],
+      "title": "C0 control characters from untrusted session content reach the terminal and every report format unfiltered",
+      "file": "crates/agenttrace-core/src/reports.rs",
+      "line": "2287",
+      "evidence": "html_escape handles only &, <, >; grep for is_control/u{1b}/x07 across crates/ finds nothing; session names derive from the first user message (lib.rs:457). REPRODUCED with content '\\u001b]0;pwned\\u0007ansi': --sessions, --search, --overview -f markdown and -f html all contain the raw ESC byte (grep -c $'\\x1b' -> 1). HTML tag injection from the same corpus IS correctly escaped, so this is specifically the control-character class.",
+      "recommendation": "Strip C0/C1 controls (except \\t and \\n) once at the point strings enter the Session/report models, or centrally in the text/markdown/HTML cell writers; add a fixture test."
+    },
+    {
+      "id": "P3-5",
+      "severity": "medium",
+      "categories": ["dx", "correctness"],
+      "title": "--limit is silently ignored by --overview, including the --baseline CI gate",
+      "file": "crates/agenttrace-cli/src/main.rs",
+      "line": "326",
+      "evidence": "Governance (main.rs:215-217), --compare (:239-240) and --sessions (:289) apply .take(args.limit); the --overview branch calls compute_overview(&sessions) and evaluate_overview_gate(...) on the full set. REPRODUCED: --overview --limit 1 on a 3-session dir prints 'Total Sessions: 3'. docs/guides/governance-reports.md:15 documents --limit.",
+      "recommendation": "Apply the limit in the overview branch, or reject --limit with --overview loudly. Separately make --limit 0 a range error instead of 'No sessions match the requested filters'."
+    },
+    {
+      "id": "P3-6",
+      "severity": "medium",
+      "categories": ["performance"],
+      "title": "--doctor re-parses every uncached file on every run and never writes the session cache",
+      "file": "crates/agenttrace-core/src/doctor.rs",
+      "line": "162-170",
+      "evidence": "cached_session() is read-only; the else-branch parse_file(file) result is discarded; store_session/save_session_cache are never called from doctor.rs (only discovery.rs:234 and session_cache.rs:324). REPRODUCED on a 1500-file corpus with a fresh XDG_CACHE_HOME: 7.6s, then 7.7s again, and the cache directory was never created; --overview is 8.0s then 0.5s.",
+      "recommendation": "Reuse the discovery load path (which stores and saves), or call store_session + save_session_cache while doctor walks."
+    },
+    {
+      "id": "P3-7",
+      "severity": "low",
+      "categories": ["dx", "posix"],
+      "title": "Report output to stdout never ends with a newline while the same command's -o file does",
+      "file": "crates/agenttrace-cli/src/main.rs",
+      "line": "233,249,259,276,290,309,321,381",
+      "evidence": "Every branch does write_output(&args.output, &(out.clone() + \"\\n\"))?; then write_stdout(&out)?. REPRODUCED: --overview -f markdown -o f.md -> 956 bytes ending in \\n; the same command piped -> 955 bytes; -f json stdout ends with '7d'.",
+      "recommendation": "write_stdout(&(out + newline)) where newline is the same separator already appended for the -o file."
+    },
+    {
+      "id": "P3-8",
+      "severity": "low",
+      "categories": ["maintainability"],
+      "title": "Byte-identical user_cache_dir() exists three times in one crate; TUI ranking helpers duplicated across two files",
+      "file": "crates/agenttrace-core/src/doctor.rs",
+      "line": "333, 1113, 743",
+      "evidence": "doctor.rs:333, pricing.rs:1113 and session_cache.rs:743 each define a private, byte-identical user_cache_dir(). tui/shared.rs:111,131,226 and tui/presentation.rs:3315,3335,3596 duplicate top_driver/top_anomaly_driver/total_tokens_all; the cycle-1 hardening had to apply the same saturating_add fix in both TUI files. Same disease as percentile (P3-3) and number_as_i64 (N1, re-verified still open at sqlite_sessions.rs:590-599, :403, :410-413).",
+      "recommendation": "Hoist to single modules (crate::paths::user_cache_dir, crate::stats::percentile, crate::jsonnum::number_as_i64) and re-export; delete the copies. This is the structural enabler for permanently fixing N1."
+    },
+    {
+      "id": "P3-9",
+      "severity": "low",
+      "categories": ["maintainability", "performance"],
+      "title": "count_by_root in doctor_directories is dead code",
+      "file": "crates/agenttrace-core/src/doctor.rs",
+      "line": "124-133",
+      "evidence": "The BTreeMap is built and incremented but never read; per-directory counts are recomputed below with a fresh files.iter().filter(). Adds an O(files x known-roots) pass the report does not use.",
+      "recommendation": "Delete the block."
+    }
+  ],
+  "resolved_questions": [
+    {
+      "question": "Does any Windows/USERPROFILE home-directory fallback exist anywhere in the workspace?",
+      "answer": "No. grep -rn 'USERPROFILE|target_os = \"windows\"|cfg(windows)' across crates/ returns zero matches, while install.ps1, winget/ and npm win32 all target Windows. Confirms P3-1 is a real gap, not a known-works case."
+    },
+    {
+      "question": "Is N1 (sqlite ingestion left unhardened by cycle 1) still open?",
+      "answer": "Yes. sqlite_sessions.rs:590-599 still converts via 'as i64' (wrapping), :403 uses plain '+', :410-413 use plain '+='. The new adversarial_token_counts_stay_bounded_and_non_negative test only exercises the lib.rs path, so N1 remains untested as well as unfixed."
+    },
+    {
+      "question": "Is the cycle-1 hardening itself sound where it was applied?",
+      "answer": "Yes for the paths it touched: the lib.rs saturating accumulators plus the new tests hold on the committed testdata/generated/adversarial corpus, and my 21-file malformed-input sweep x all subcommands produced no panics, hangs or negative totals in debug or release. The regression is purely scope (which copies got missed), not correctness."
+    },
+    {
+      "question": "Are prior-pass claims about HTML/markdown injection accurate?",
+      "answer": "Partially: HTML tag injection (<script>, <img onerror>) from session names IS correctly escaped in --overview -f html, so that specific claim should not be re-filed. What survives is the control-character class (P3-4) and markdown_cell's narrow escaping (reports.rs:2429-2431 covers only | and \\n), consistent with N8."
+    }
+  ],
+  "provisional_future_work": [
+    "Fix P3-1 with a shared home-dir resolver (HOME/USERPROFILE/HOMEDRIVE+HOMEPATH) plus a Windows-path unit test; this unblocks the whole product on a shipped platform.",
+    "Fix P3-2: local-midnight semantics for TimeRange::Today and a rolling 24h window for '1d'; add a timezone-pinned test before touching code.",
+    "Consolidate P3-8's duplicated helpers (user_cache_dir, percentile, number_as_i64, TUI ranking fns) into single modules, then use that structure to fix N1 in sqlite_sessions.rs for good.",
+    "Strip C0/C1 controls at the report/model boundary to close P3-4 across all four output surfaces in one change.",
+    "Make --overview honor --limit (or reject it loudly) so --baseline gates cannot be silently evaluated over an unintended scope (P3-5).",
+    "Let --doctor populate the session cache it already reads (P3-6); it is the documented first-run command and currently the slowest path.",
+    "Re-verify the still-open CI/doc items: N5 (AGENTTRACE_TUI_REAL_DIR never set in .github/workflows/ci.yml) and N6 (docs/guides/governance-reports.md:51 still claims automatic network refresh)."
+  ]
+}

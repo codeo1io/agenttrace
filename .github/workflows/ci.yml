@@ -103,5 +103,8 @@ jobs:
       - name: Validate Cargo manifests
         run: scripts/ci/check-cargo-manifests.sh
 
+      - name: Codex plugin version sync
+        run: scripts/ci/check-plugin-version.sh
+
       - name: Validate helper scripts
         run: bash -n scripts/record-demo.sh scripts/ci/*.sh
