@@ -1,10 +1,11 @@
 use agenttrace_core::{
     add_baseline_comparison, average_health, compute_overview, context_trends, cost_audit,
-    data_health, delivery_evidence_with_git, demo_sessions, evaluate_overview_gate,
-    filter_sessions, fix_suggestions, inspect_first, load_sessions_with_options, mcp_governance,
-    parse_file, predict_cost_anomaly, pricing_cache_path, recommendations, render_doctor_report,
-    render_model_pricing_list, render_test_match, render_waste_report_with_language,
-    report_compare_json, report_json_with_language, report_overview_html_with_context,
+    data_health, data_health_scoped, delivery_evidence_with_git, demo_sessions,
+    evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
+    load_sessions_with_options, mcp_governance, parse_file, predict_cost_anomaly,
+    pricing_cache_path, recommendations, render_doctor_report, render_model_pricing_list,
+    render_test_match, render_waste_report_with_language, report_compare_json,
+    report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
     report_overview_text_with_context, report_search_json, report_search_text,
     report_text_with_language, search_sessions, session_capability, tool_fail_rate, total_tokens,
@@ -121,6 +122,12 @@ struct Args {
     order: String,
     #[arg(long, default_value_t = 20)]
     limit: usize,
+    /// Explicitly bound governance reports to the newest N sessions.
+    /// Governance reports audit every matching session by default;
+    /// sampling is always disclosed via audited_sessions/total_sessions
+    /// (pass-8 F8-1).
+    #[arg(long)]
+    sample: Option<usize>,
     #[arg(long = "clear-cache")]
     clear_cache: bool,
     #[arg(long = "preserve-history")]
@@ -148,6 +155,9 @@ fn run() -> anyhow::Result<()> {
     }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
+    if args.sample == Some(0) {
+        bail!("--sample must be at least 1");
+    }
     if matches!(args.format.as_str(), "markdown" | "md" | "html")
         && !(args.overview
             || args.audit
@@ -220,17 +230,35 @@ fn run() -> anyhow::Result<()> {
         || args.context_trends
         || args.delivery_evidence
     {
-        let sessions = prepare_cli_view(load_sessions(&args)?, &args)?
-            .into_iter()
-            .take(args.limit)
-            .collect::<Vec<_>>();
-        if sessions.is_empty() {
+        // Governance reports audit every matching session by default;
+        // bounded sampling is explicit (--sample) and always disclosed.
+        // `--limit` is a display cap for list views only and no longer
+        // filters aggregate data (pass-8 F8-1).
+        if args.limit != 20 {
+            eprintln!(
+                "Note: --limit no longer bounds governance reports; it caps list views. Use --sample N for bounded, disclosed sampling."
+            );
+        }
+        let matched = prepare_cli_view(load_sessions(&args)?, &args)?;
+        if matched.is_empty() {
             bail!("No sessions match the requested filters");
         }
+        let total_sessions = matched.len();
+        let (sessions, excluded_reason) = match args.sample {
+            Some(sample) if sample < total_sessions => (
+                matched.into_iter().take(sample).collect::<Vec<_>>(),
+                Some(format!(
+                    "sampled newest {sample} of {total_sessions} sessions (--sample {sample})"
+                )),
+            ),
+            _ => (matched, None),
+        };
         let value = if args.audit {
             serde_json::to_value(cost_audit(&sessions))?
         } else if args.recommend {
-            serde_json::to_value(recommendations(&sessions))?
+            serde_json::json!({
+                "recommendations": serde_json::to_value(recommendations(&sessions))?,
+            })
         } else if args.mcp_governance {
             serde_json::to_value(mcp_governance(&sessions))?
         } else if args.context_trends {
@@ -238,6 +266,7 @@ fn run() -> anyhow::Result<()> {
         } else {
             serde_json::to_value(delivery_evidence_with_git(&sessions))?
         };
+        let value = attach_audit_coverage(value, sessions.len(), total_sessions, excluded_reason);
         let out = render_governance_report(&value, &args.format)?;
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
@@ -245,15 +274,52 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.compare {
-        let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
-        let sessions = sessions.into_iter().take(args.limit).collect::<Vec<_>>();
-        if sessions.is_empty() {
+        // Same coverage contract as the governance branch: --compare
+        // audits every matching session unless --sample bounds it, and
+        // the bound is disclosed (pass-8 F8-1 sibling at main.rs:249).
+        if args.limit != 20 {
+            eprintln!(
+                "Note: --limit no longer bounds governance reports; it caps list views. Use --sample N for bounded, disclosed sampling."
+            );
+        }
+        let matched = prepare_cli_view(load_sessions(&args)?, &args)?;
+        if matched.is_empty() {
             bail!("No sessions match the requested filters");
         }
+        let total_sessions = matched.len();
+        let (sessions, excluded_reason) = match args.sample {
+            Some(sample) if sample < total_sessions => (
+                matched.into_iter().take(sample).collect::<Vec<_>>(),
+                Some(format!(
+                    "sampled newest {sample} of {total_sessions} sessions (--sample {sample})"
+                )),
+            ),
+            _ => (matched, None),
+        };
         let out = if args.format == "json" {
-            report_compare_json(&sessions)
+            let compared =
+                serde_json::from_str::<serde_json::Value>(&report_compare_json(&sessions))
+                    .context("compare report serializes")?;
+            let value = attach_audit_coverage(
+                serde_json::json!({ "sessions": compared }),
+                sessions.len(),
+                total_sessions,
+                excluded_reason,
+            );
+            serde_json::to_string_pretty(&value)?
         } else {
-            agenttrace_core::report_compare_with_language(&sessions, &args.model, language)
+            let mut out = String::new();
+            out.push_str(&format!(
+                "(auditing {} of {} sessions)\n",
+                sessions.len(),
+                total_sessions
+            ));
+            out.push_str(&agenttrace_core::report_compare_with_language(
+                &sessions,
+                &args.model,
+                language,
+            ));
+            out
         };
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
@@ -334,14 +400,25 @@ fn run() -> anyhow::Result<()> {
 
     if args.overview {
         let overview = compute_overview(&sessions);
-        let health = data_health(
-            &sessions,
-            sessions.len() + load_report.as_ref().map(|item| item.skipped).unwrap_or(0),
-            load_report
-                .as_ref()
-                .map(|item| item.cache_hits)
-                .unwrap_or(0),
-        );
+        // `discovered` comes from the loader (range-independent) and
+        // parse failures stay separate from sessions excluded by the
+        // range/filters, so "Parse coverage N/M" is true for every
+        // range (pass-8 F8-2).
+        let health = match load_report.as_ref() {
+            Some(report) => data_health_scoped(
+                &sessions,
+                report.discovered,
+                report.skipped,
+                report.cache_hits,
+            ),
+            None => data_health(&sessions, sessions.len(), 0),
+        };
+        if args.limit < sessions.len() {
+            eprintln!(
+                "Note: --limit caps list views only; this overview's aggregates cover all {} sessions.",
+                sessions.len()
+            );
+        }
         let range = parse_range(&args)?;
         let mut out = match args.format.as_str() {
             "json" => report_overview_json_with_context(
@@ -353,6 +430,7 @@ fn run() -> anyhow::Result<()> {
                 // Pinned epoch keeps --demo JSON byte-deterministic (CI
                 // determinism check); real runs stamp the wall clock.
                 args.demo.then_some(agenttrace_core::DEMO_REPORT_EPOCH),
+                args.limit,
             ),
             "markdown" | "md" => report_overview_markdown_with_context(
                 &overview,
@@ -465,12 +543,90 @@ fn write_stdout(value: &str) -> anyhow::Result<()> {
 
 fn render_governance_report(value: &serde_json::Value, format: &str) -> anyhow::Result<String> {
     let json = serde_json::to_string_pretty(value)?;
+    // Every governance report discloses its coverage: "(auditing N of M
+    // sessions)" in the human-readable formats, audited_sessions/
+    // total_sessions/excluded_reason in the JSON (pass-8 F8-1).
+    let disclosure = audit_coverage_phrase(value);
     Ok(match format {
         "json" => json,
-        "markdown" | "md" => format!("```json\n{json}\n```"),
-        "html" => format!("<pre>{}</pre>", escape_html(&json)),
-        _ => render_plain_value(value, 0),
+        "markdown" | "md" => {
+            if disclosure.is_empty() {
+                format!("```json\n{json}\n```")
+            } else {
+                format!("{disclosure}```json\n{json}\n```")
+            }
+        }
+        "html" => {
+            if disclosure.is_empty() {
+                format!("<pre>{}</pre>", escape_html(&json))
+            } else {
+                format!(
+                    "<p>{}</p><pre>{}</pre>",
+                    escape_html(disclosure.trim_end()),
+                    escape_html(&json)
+                )
+            }
+        }
+        _ => {
+            if disclosure.is_empty() {
+                render_plain_value(value, 0)
+            } else {
+                let mut out = disclosure;
+                out.push_str(&render_plain_value(value, 0));
+                out
+            }
+        }
     })
+}
+
+fn audit_coverage_phrase(value: &serde_json::Value) -> String {
+    let audited = value.get("audited_sessions").and_then(|item| item.as_u64());
+    let total = value.get("total_sessions").and_then(|item| item.as_u64());
+    match (audited, total) {
+        (Some(audited), Some(total)) => {
+            let mut phrase = format!("(auditing {audited} of {total} sessions)");
+            if let Some(reason) = value.get("excluded_reason").and_then(|item| item.as_str()) {
+                phrase.push_str(&format!("; {reason}"));
+            }
+            phrase.push('\n');
+            phrase
+        }
+        _ => String::new(),
+    }
+}
+
+fn attach_audit_coverage(
+    mut value: serde_json::Value,
+    audited_sessions: usize,
+    total_sessions: usize,
+    excluded_reason: Option<String>,
+) -> serde_json::Value {
+    let coverage = serde_json::json!({
+        "audited_sessions": audited_sessions,
+        "total_sessions": total_sessions,
+        "excluded_reason": excluded_reason,
+    });
+    match &mut value {
+        serde_json::Value::Object(map) => {
+            if let serde_json::Value::Object(fields) = coverage {
+                for (key, field) in fields {
+                    map.insert(key, field);
+                }
+            }
+            value
+        }
+        _ => {
+            let mut wrapped = serde_json::json!({ "report": value });
+            if let serde_json::Value::Object(map) = &mut wrapped {
+                if let serde_json::Value::Object(fields) = coverage {
+                    for (key, field) in fields {
+                        map.insert(key, field);
+                    }
+                }
+            }
+            wrapped
+        }
+    }
 }
 
 fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
@@ -580,6 +736,7 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--sort"
             | "--order"
             | "--limit"
+            | "--sample"
             | "--inspect"
     )
 }
@@ -1054,6 +1211,9 @@ mod tests {
                 TimeRange::All,
                 false,
                 Some(agenttrace_core::DEMO_REPORT_EPOCH),
+                // CLI default --limit (20): the recent_sessions list view
+                // keeps its internal top-10 cap (pass-3 P3-5).
+                20,
             )
         };
         let first = render();
@@ -1168,6 +1328,30 @@ mod tests {
                 OsString::from("-f"),
                 OsString::from("json"),
                 OsString::from("session.jsonl"),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_flag_shim_treats_sample_as_a_value_flag() {
+        // CU-11: --sample takes a value; the Go-compatible shim must
+        // consume it so later flags (like -f json) still parse instead
+        // of being silently dropped as "positional".
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--sample"),
+            OsString::from("20"),
+            OsString::from("-f"),
+            OsString::from("json"),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("--sample"),
+                OsString::from("20"),
+                OsString::from("-f"),
+                OsString::from("json"),
             ]
         );
     }
@@ -1299,6 +1483,7 @@ mod tests {
             sort: "recent".to_string(),
             order: "desc".to_string(),
             limit: 20,
+            sample: None,
             clear_cache: false,
             preserve_history: false,
             include_history: false,

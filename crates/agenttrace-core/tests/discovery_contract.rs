@@ -1,7 +1,8 @@
 use agenttrace_core::{
-    build_doctor_report, data_health, find_session_files, load_sessions_from_dir,
-    load_sessions_with_options, load_sessions_with_progress, parse_file, render_waste_report,
-    search_sessions, session_cache_path, session_capability, total_tokens, LoadOptions,
+    build_doctor_report, data_health, data_health_scoped, find_session_files,
+    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress, parse_file,
+    render_waste_report, search_sessions, session_cache_path, session_capability, total_tokens,
+    LoadOptions,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -2139,4 +2140,171 @@ fn write_opencode_db(path: &std::path::Path) {
         "#,
     )
     .expect("seed opencode db");
+}
+
+#[test]
+fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
+    // Pass-8 F8-2: the CLI used to recompute `discovered` as
+    // sessions.len() + skipped, so `--overview --range 1d` reported
+    // discovered=71 while 1,400+ files existed and parse failures in
+    // out-of-range files were invisible. `discovered` must come from
+    // the loader (range-independent) and ranged runs must separate
+    // parsed from out-of-scope sessions.
+    let root = temp_root("agenttrace-range-health");
+    fs::create_dir_all(&root).expect("create range-health dir");
+    let recent = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"recent work","timestamp":"2026-09-01T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
+"#;
+    let old = r#"{"role":"session_meta","timestamp":"2020-01-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"ancient work","timestamp":"2020-01-02T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2020-01-02T10:00:01Z"}
+"#;
+    fs::write(root.join("recent.jsonl"), recent).expect("write recent session");
+    fs::write(root.join("old.jsonl"), old).expect("write old session");
+    with_session_cache(&root.join("cache"), || {
+        let all = agenttrace_core::load_sessions_with_options(
+            Some(&root),
+            &LoadOptions {
+                since: None,
+                ..LoadOptions::default()
+            },
+        );
+        let day = agenttrace_core::load_sessions_with_options(
+            Some(&root),
+            &LoadOptions {
+                since: Some(chrono::Utc::now() - chrono::Duration::days(30)),
+                ..LoadOptions::default()
+            },
+        );
+        assert_eq!(all.discovered, 2);
+        assert_eq!(
+            day.discovered, all.discovered,
+            "discovered must be range-independent"
+        );
+        let health_all =
+            data_health_scoped(&all.sessions, all.discovered, all.skipped, all.cache_hits);
+        let health_day =
+            data_health_scoped(&day.sessions, day.discovered, day.skipped, day.cache_hits);
+        assert_eq!(health_all.parsed, 2);
+        assert_eq!(
+            health_all.out_of_scope, 0,
+            "no filter excludes anything for all-time"
+        );
+        assert_eq!(health_day.parsed, 1, "only the recent session is in scope");
+        assert_eq!(
+            health_day.out_of_scope, 1,
+            "the out-of-range session must be counted, not erased from the denominator"
+        );
+        assert_eq!(health_day.skipped, 0, "out-of-range is not a parse failure");
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cache_dead_paths_are_persisted_away_across_runs() {
+    // Pass-8 F8-3 end to end: after the source file disappears, the
+    // next cached load prunes the entry and the re-saved snapshot no
+    // longer carries the dead path (the operator snapshot had 761 of
+    // 1,487 entries dead and growing every day).
+    let root = temp_root("agenttrace-cache-prune");
+    let sessions = root.join("sessions");
+    fs::create_dir_all(&sessions).expect("create sessions dir");
+    let body = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"work","timestamp":"2026-09-01T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
+"#;
+    let keep = sessions.join("keep.jsonl");
+    let drop_path = sessions.join("drop.jsonl");
+    fs::write(&keep, body).expect("write keep");
+    fs::write(&drop_path, body).expect("write drop");
+    with_session_cache(&root.join("cache"), || {
+        let first = load_sessions_with_options(Some(&sessions), &LoadOptions::default());
+        assert_eq!(first.sessions.len(), 2, "both sessions parse");
+        let snapshot = root.join("cache").join("sessions.json");
+        assert!(snapshot.exists(), "cache snapshot exists after first run");
+        let before = fs::read_to_string(&snapshot).expect("read snapshot");
+        assert!(
+            before.contains("drop.jsonl"),
+            "second session is cached by path"
+        );
+
+        fs::remove_file(&drop_path).expect("delete source file");
+        let second = load_sessions_with_options(Some(&sessions), &LoadOptions::default());
+        assert_eq!(second.sessions.len(), 1, "only the surviving file parses");
+        let after = fs::read_to_string(&snapshot).expect("re-read snapshot");
+        assert!(
+            !after.contains("drop.jsonl"),
+            "dead entry is pruned from the persisted snapshot"
+        );
+        assert!(after.contains("keep.jsonl"), "live entry stays cached");
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn non_finite_costs_lower_health_confidence_and_stay_visible() {
+    // Pass-8 F8-5: a session whose estimated cost is not finite must
+    // surface as `non_finite_costs` and drop confidence to low instead
+    // of silently joining a total or panicking in the writer.
+    let root = temp_root("agenttrace-nonfinite-health");
+    fs::create_dir_all(&root).expect("create dir");
+    fs::write(
+        root.join("poisoned.jsonl"),
+        r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"user","content":"work","timestamp":"2026-09-01T10:00:00Z"}
+{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
+"#,
+    )
+    .expect("write session");
+    with_session_cache(&root.join("cache"), || {
+        let report = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        let session = &report.sessions[0];
+        let mut poisoned = session.clone();
+        poisoned.metrics.cost_estimated = f64::INFINITY;
+        let health = data_health_scoped(
+            &[poisoned],
+            report.discovered,
+            report.skipped,
+            report.cache_hits,
+        );
+        assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
+        assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
+        let clean = data_health_scoped(
+            &report.sessions,
+            report.discovered,
+            report.skipped,
+            report.cache_hits,
+        );
+        assert_eq!(clean.non_finite_costs, 0);
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
+    // Pass-7 research / candidate-44 minimum (CU-16): Codex >=0.152
+    // writes rollouts as zstd frames (magic 28 B5 2F FD). The parser
+    // must name the format instead of the old misleading "not valid
+    // UTF-8" — this is the smallest step toward Codex coverage.
+    let root = temp_root("agenttrace-zstd-sniff");
+    fs::create_dir_all(&root).expect("create dir");
+    let rollout = root.join("rollout-2026-09-03.jsonl");
+    fs::write(&rollout, [0x28u8, 0xB5, 0x2F, 0xFD, 0x00, 0x01]).expect("write zstd frame");
+    let err = parse_file(&rollout)
+        .expect_err("zstd frame must not parse as JSONL")
+        .to_string();
+    assert!(
+        err.contains("zstd-compressed"),
+        "error must name the format, got: {err}"
+    );
+    assert!(
+        err.contains("zstd -d"),
+        "error must offer the decompression recipe"
+    );
+    assert!(
+        !err.contains("not valid UTF-8"),
+        "the misleading UTF-8 error is gone"
+    );
+    let _ = fs::remove_dir_all(root);
 }

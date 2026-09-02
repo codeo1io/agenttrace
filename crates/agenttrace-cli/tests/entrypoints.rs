@@ -152,3 +152,123 @@ fn baseline_regression_gates_the_exit_code_and_opt_out_flags_work() {
     );
     let _ = std::fs::remove_dir_all(work);
 }
+
+fn run_json(args: &[&str]) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(args)
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "agenttrace {:?} failed: {:?}",
+        args,
+        output
+    );
+    serde_json::from_slice(&output.stdout).expect("parse JSON report")
+}
+
+#[test]
+fn governance_audit_matches_overview_totals_and_discloses_coverage() {
+    // Pass-8 F8-1: governance reports used to sample the newest 20
+    // sessions by default (176x cost understatement on the operator
+    // corpus, exit 0, no disclosure). By default every matching session
+    // is audited, the JSON discloses audited_sessions/total_sessions,
+    // and the audit totals equal the overview's cost audit on the same
+    // corpus.
+    let audit = run_json(&["--demo", "--audit", "-f", "json"]);
+    assert_eq!(audit["audited_sessions"], 3, "demo audit covers 3 sessions");
+    assert_eq!(audit["total_sessions"], 3);
+    assert!(
+        audit["excluded_reason"].is_null(),
+        "default run excludes nothing silently"
+    );
+    let overview = run_json(&["--demo", "--overview", "-f", "json"]);
+    assert_eq!(
+        audit["total_estimated_cost"], overview["cost_audit"]["total_estimated_cost"],
+        "audit totals must equal overview totals on the same corpus"
+    );
+    assert_eq!(
+        overview["data_health"]["discovered"], 3,
+        "overview discovered count must cover the whole demo corpus"
+    );
+}
+
+#[test]
+fn governance_sampling_is_explicit_and_disclosed() {
+    // Bounded sampling exists only behind --sample and always discloses
+    // both counts and the exclusion reason.
+    let sampled = run_json(&["--demo", "--audit", "-f", "json", "--sample", "2"]);
+    assert_eq!(sampled["audited_sessions"], 2);
+    assert_eq!(sampled["total_sessions"], 3);
+    let reason = sampled["excluded_reason"]
+        .as_str()
+        .expect("sampled run names its exclusion");
+    assert!(
+        reason.contains("--sample 2"),
+        "exclusion reason must name the sampling flag: {reason}"
+    );
+    let full = run_json(&["--demo", "--audit", "-f", "json"]);
+    assert_ne!(
+        sampled["total_estimated_cost"], full["total_estimated_cost"],
+        "sampling a subset must change the aggregate"
+    );
+
+    let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--audit", "--sample", "2"])
+        .output()
+        .expect("run text audit");
+    assert!(text.status.success());
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains("(auditing 2 of 3 sessions)"),
+        "text output must disclose coverage, got: {stdout}"
+    );
+
+    let zero = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--audit", "--sample", "0"])
+        .output()
+        .expect("run zero-sample audit");
+    assert_eq!(
+        zero.status.code(),
+        Some(1),
+        "--sample 0 must be rejected loudly, got {:?}",
+        zero.status
+    );
+
+    let recommend = run_json(&["--demo", "--recommend", "-f", "json"]);
+    assert_eq!(recommend["audited_sessions"], 3);
+    assert!(
+        recommend["recommendations"].is_array(),
+        "wrapped recommendation list stays addressable"
+    );
+}
+
+#[test]
+fn overview_limit_caps_list_views_only() {
+    // Pass-3 P3-5: --overview used to ignore --limit entirely while the
+    // documented --baseline CI recipe used it. The limit is now a
+    // display cap for list views (recent_sessions); every aggregate
+    // still covers the whole corpus.
+    let capped = run_json(&["--demo", "--overview", "-f", "json", "--limit", "2"]);
+    assert_eq!(
+        capped["recent_sessions"]
+            .as_array()
+            .expect("recent_sessions list")
+            .len(),
+        2,
+        "--limit must cap the recent_sessions list view"
+    );
+    assert_eq!(
+        capped["summary"]["total_sessions"], 3,
+        "aggregates must stay unbounded by --limit"
+    );
+    let full = run_json(&["--demo", "--overview", "-f", "json"]);
+    assert_eq!(
+        full["recent_sessions"]
+            .as_array()
+            .expect("recent_sessions list")
+            .len(),
+        3,
+        "default limit (20) keeps every demo session visible up to the internal cap"
+    );
+}

@@ -29,6 +29,18 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             path.display()
         );
     }
+    // Codex ≥0.152 stores rollouts as zstd frames (magic 28 B5 2F FD,
+    // upstream PR #41357); they are no longer plain JSONL. Name the
+    // format instead of failing with a generic "not valid UTF-8"
+    // (pass-7 research, candidate 44 minimum).
+    if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        bail!(
+            "session file {} is zstd-compressed (Codex rollout format); decompress it to JSONL first (e.g. `zstd -d {} -o {}.jsonl`)",
+            path.display(),
+            path.display(),
+            path.display()
+        );
+    }
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", path.display()))?;
     let name = session_name(path);
