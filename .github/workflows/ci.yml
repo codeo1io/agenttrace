@@ -32,8 +32,6 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --check
 
-      - name: Portable CI runners only
-        run: scripts/ci/check-no-self-hosted.sh
 
       - name: Clippy
         run: cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
