@@ -493,9 +493,17 @@ fn workspaces_render_filtered_reports_and_project_resolution() {
         .expect("start delivery workspace");
     let pending = format!("{:?}", terminal.backend().buffer());
     assert!(pending.contains("Correlating local Git commits"));
-    for _ in 0..50 {
+    // Deadline-based rather than a fixed iteration count: under heavy CI
+    // load the governance thread can exceed a fixed 0.5s budget and the
+    // following assertion would flake (same class as the TUI loader
+    // waits below).
+    let delivery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.governance_delivery_pending() {
         app.poll_governance_delivery();
         if !app.governance_delivery_pending() {
+            break;
+        }
+        if std::time::Instant::now() >= delivery_deadline {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1720,25 +1728,37 @@ fn startup_uses_cache_immediately_but_waits_without_cache() {
 }
 
 fn wait_for_pending_load(app: &mut App) {
-    for _ in 0..50 {
+    // Deadline-based rather than a fixed 50x20ms budget: the background
+    // loader only needs milliseconds unloaded, but under parallel test
+    // load a fixed one-second budget flakes (observed 2-in-15 full-suite
+    // runs). Ten seconds keeps the fast path fast and the slow path
+    // still fails with the same diagnostic.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.pending_load.is_some() {
         app.poll_pending_load();
         if app.pending_load.is_none() {
             return;
         }
+        if std::time::Instant::now() >= deadline {
+            panic!("pending TUI load did not finish");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    panic!("pending TUI load did not finish");
 }
 
 fn wait_for_progress(app: &mut App) {
-    for _ in 0..50 {
+    // Same deadline discipline as wait_for_pending_load above.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.load_state.processed == 0 {
         app.poll_pending_load();
         if app.load_state.processed > 0 {
             return;
         }
+        if std::time::Instant::now() >= deadline {
+            panic!("pending TUI load did not report progress");
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    panic!("pending TUI load did not report progress");
 }
 
 fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: &str) -> Session {
