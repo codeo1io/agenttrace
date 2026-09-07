@@ -169,6 +169,30 @@ discovery gap (Gemini CLI `~/.gemini/tmp` and Antigravity
 while the formats parse fine) and re-censused the landscape (ccusage 18.3k★,
 codeburn 10.7k★, upstream master unmoved at `e005952` since the fork point).
 
+Updated again 2026-09-03 after cycle 6 and assessment pass 10. Cycle 6
+shipped CU-17..CU-22 as commit `bfa4f22` ("fix: restore portable CI
+runners, bill thinking tokens, and bound the cache by bytes"; stacks on
+`696206f`; 213/213 tests, fmt/clippy clean, and the fork PR #2 CI job
+"Test and build" green on the exact sha — run 33675196174 — including
+the first live pass of CU-17's portable-runner guard on a GitHub-hosted
+`ubuntu-latest`). Pass 10's adversarial review re-verified every
+cycle-6 claim live and found one required pre-commit fix (**F1**: the
+VIEW_FILE trajectory step used `absolutePathURI` while the wire key is
+`absolutePathUri` — wire-case mismatch silently dropped the step),
+which final validation reproduced, fixed (`parser.rs:517` wire-case
+primary with the wrong-case tolerated as an alias), and pinned with a
+unit test plus a wire-case contract fixture. Records:
+`docs/stewardship/2026-09-03-cycle6-{prioritization,
+stewardship-request,implementation-record,full-suite-validation,
+independent-review,final-validation,reconciliation}.md`. New context
+filed below: candidate 52 (the Antigravity SQLite/protobuf store decode
+that CU-19 deliberately did not fake), the fork dependency-review
+hygiene item (an environmental red check on every fork PR), and the
+F1-class prevention rule (contract fixtures must use wire-cased keys
+copied from the producer's source). The local full-suite replication
+of the ci.yml `test` job matched the remote run exactly (213/213, same
+21-step ledger) — the replication is now the pre-push gate of record.
+
 ### Completed in cycle 1 (recorded 2026-09-02)
 
 Preserved history; each entry names the evidence that closed it, as
@@ -427,6 +451,80 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   case; a cache-version test; an orphan-sweep test. Status change,
   cycle 4: all three residuals closed (CU-10 for the lookbehind and
   the schema bump, CU-9 for the sweep — see Completed).
+
+### Completed in cycle 6 (recorded 2026-09-03)
+
+Cycle 6 is commit `bfa4f22` (parent `696206f`; fork branch
+`fix/portable-runners-thinking-tokens-cache-bytes`, fork PR #2),
+verified 213/213 tests, fmt clean, the CI clippy invocation clean, and
+independently re-verified by pass-10 review plus final validation
+(including a release-mode test run and a PTY TUI smoke). The fork CI
+"Test and build" job passed on the exact pushed sha (run 33675196174,
+GitHub-hosted `ubuntu-latest`). Record:
+`docs/stewardship/2026-09-03-cycle6-implementation-record.md`.
+
+- **Upstream-portable branch and CI hygiene** (pass-9, CRITICAL). Closed
+  with CU-17: all five `runs-on: self-hosted` occurrences (ci.yml:21,
+  dependency-review.yml:16, release.yml:13/40/117 — commit `6632014`'s
+  contamination, the exact cause upstream PR #282 was closed for) are
+  reverted to `ubuntu-latest`; new guard
+  `scripts/ci/check-no-self-hosted.sh` (narrow `runs-on:.*self-hosted`
+  pattern, file:line output) runs as a CI step in ci.yml; and local
+  `master`'s tracking was repointed to the fork (`branch.master.remote
+  = fork`, environment-only config, never committed). Evidence: the guard
+  exits 0 on the shipped tree and exits 1 with a precise file:line on a
+deliberate contamination; the CI step itself is green in run 33675196174
+  on `CARGO_HOME=/home/runner/.cargo`; the reconciliation shows upstream
+  `e005952` unmoved and zero upstream pushes or PRs.
+- **Gemini CLI `~/.gemini/tmp` discovery root** (candidate 50, first
+  half). Closed with CU-18: `known_session_dirs()` gains the root with
+  the existing chats/checkpoints gating; contract tests discover, parse
+  (`gemini_cli`), and flow `thoughtsTokenCount` into the CU-20 breakdown
+  end to end; the new fixture `testdata/gemini-thoughts-checkpoint.json`
+  pins the shape. The README's "reads … Gemini CLI …" claim is live
+  again.
+- **Antigravity conversations root + trajectory sidecars** (candidate 50,
+  second half). Closed with CU-19: `~/.gemini/antigravity-cli/
+  conversations/` is a known session dir; new parser
+  `parse_antigravity_trajectory` (dispatched from the single-object
+  branch of `parse_raw_session`, `parser.rs:403`) sniffs
+  `CORTEX_STEP_TYPE_*` + `metadata.createdAt` (both required) and maps
+  USER_INPUT/PLANNER_RESPONSE (thinking → reasoning, toolCalls parsed)/
+  RUN_COMMAND (non-zero exitCode → failed)/ERROR_MESSAGE/VIEW_FILE
+  (line ranges). Admission stays JSON-only — `.db`/`.pb` never enter
+  discovery (contract-asserted); the store's real shape was documented
+  from the agy reference implementation (`internal/daemon/types.go`),
+  not invented. Includes the F1 fix: the VIEW_FILE wire key is
+  `absolutePathUri` (producer-verified) with the wrong-case spelling
+  tolerated as an alias — pinned by a wire-case contract fixture that
+  failed loudly before the fix. Residual, filed as candidate 52: full
+  SQLite/protobuf store decode.
+- **Gemini-family thinking tokens** (candidate 25). Closed with CU-20:
+  `thoughtsTokenCount` is billed into output and surfaced as
+  `tokens_reasoning` (serde-default additive field; schema stays 17) with
+  `reasoning_share_pct` in `--audit`/overview; gemini-3.x fixtures landed
+  (`testdata/gemini-thoughts-checkpoint.json` plus contract fixtures);
+  live audit shows reasoning 40 / share 50.0 on the fixture corpus. The
+  changelog note that baselines shift is covered by this roadmap record
+  and the release-notes naming below.
+- **`--sample` disclosure names the active view** (pass-9; F8-1
+  residual). Closed with CU-21: the exclusion reason renders the active
+  sort/order (default view discloses `--sort recent --order desc`),
+  verified live in both the single-view and `--compare` twin paths
+  (`main.rs:251`/:294) and pinned by the extended
+  `governance_sampling_is_explicit_and_disclosed` CLI test including
+  the previously unpinned `--compare` string.
+- **Session-cache byte ceiling** (pass-9; F8-3 follow-on). Closed with
+  CU-22: `MAX_SESSION_CACHE_BYTES = 64 MiB` enforced at save via
+  `enforce_byte_bound` (oldest-source-mtime first, same policy as the
+  count bound), surfaced in `--doctor` alongside the entry bound.
+  Evidence: a unit test constructing over-ceiling entries asserts the
+  persisted size stays under the ceiling; the doctor output prints the
+  bound.
+
+Release-notes naming: "restore portable CI runners, bill thinking
+tokens, and bound the cache by bytes" is the commit subject on fork PR
+#2, and the per-CU detail lives in the PR body and the cycle-6 records.
 
 ### Hardening lane
 
@@ -764,7 +862,8 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   rule 2 and rule 4 (operator approval before any upstream PR). Evidence:
   `git config branch.master.remote` prints `fork`; a grep shows zero
   `self-hosted` matches on the candidate branch; the reconciliation record
-  shows upstream `e005952` unmoved.
+  shows upstream `e005952` unmoved. Status change, cycle 6: closed (CU-17 —
+  see Completed).
 - **`--sample` disclosure must name the active ordering** (pass-9; the
   residual of the closed F8-1). The exclusion reason hard-codes
   "sampled newest {N} of {M}" (`main.rs:249-251` and `:292-294`), but the
@@ -773,7 +872,8 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   Acceptance: the reason names the active ordering (for example "sampled
   first N by sort order (name)") or `--sample` is rejected for non-time
   sorts. Evidence: a CLI test running `--audit --sort name --sample N`
-  asserting the reason string matches the sort key.
+  asserting the reason string matches the sort key. Status change, cycle
+  6: closed (CU-21 — see Completed).
 - **Untrusted git-root selection and unmemoized project resolution**
   (pass-9; extends the open N10 cost-ceiling item with a
   privacy/robustness angle). `resolve_project` walks up from the
@@ -812,7 +912,24 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   at save (evicting oldest-source-mtime entries first, same policy as the
   count bound) with the limit surfaced in `--doctor`. Evidence: a unit
   test constructing over-ceiling entries asserting the persisted size
-  stays under the ceiling; a doctor run printing the bound.
+  stays under the ceiling; a doctor run printing the bound. Status
+  change, cycle 6: closed (CU-22 — see Completed; `MAX_SESSION_CACHE_BYTES`
+  = 64 MiB, enforced at save, doctor surfaces both bounds).
+- **Fork dependency-review false red** (cycle 6 CI observation, MEDIUM
+  stewardship). The `Dependency Review` workflow fails on every fork PR
+  — "Dependency review is not supported on this repository … ensure that
+  Dependency graph is enabled" — including PR #1 (pre-existing since
+  2026-09-02) and PR #2 (run 33675196248). The check is non-required
+  (fork `master` has no branch protection), but it taints
+  `mergeStateStatus` to UNSTABLE and trains reviewers to ignore red
+  checks. Acceptance: either the workflow becomes fork-tolerant (for
+  example `continue-on-error` or an early clean exit when dependency
+  review is unsupported, without weakening the upstream check) or the
+  operator enables the dependency graph in fork
+  `settings/security_analysis`; the choice should be operator-informed
+  since it trades signal for noise. Evidence: a green (or cleanly
+  skipped) dependency-review run on a fork PR, with the upstream-run
+  behavior provably unchanged.
 - **TUI force-reload cache race** (pass-9, INFO). The background loader
   thread owns the session cache while the main thread can clear it on a
   force reload (`app.rs:881-951`); reloads are guarded by `pending_load`,
@@ -1099,7 +1216,7 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   into output with a reasoning breakdown, gemini-3.x fixtures, reasoning
   share in `--audit`, and a changelog note that baselines shift.
   Evidence: a fixture with `thoughtsTokenCount` asserting the output
-  includes it.
+  includes it. Status change, cycle 6: closed (CU-20 — see Completed).
 - **Qwen Code dual-output transcripts** (research candidate 26,
   confidence 62%; radar issue #237). Qwen Code documents Dual Output
   `--json-file` as "a canonical machine-readable transcript" and changed
@@ -1275,7 +1392,23 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   come from or be validated against a real `conversations/` file, since
   the committed fixture covers the brain/log shape. Evidence: the
   synthetic-`HOME` reproducer inverted (found > 0 for both roots); unit
-  tests pinning the root list; the fixture round trip.
+  tests pinning the root list; the fixture round trip. Status change,
+  cycle 6: closed (CU-18/CU-19 — see Completed; the pass-9 acceptance is
+  met for the documented JSON sidecar surface, and the full
+  SQLite/protobuf store decode is filed as candidate 52 below).
+- **Antigravity SQLite/protobuf store decode** (candidate 52, cycle 6;
+  the open half of candidate 50). CU-19 admitted only the documented
+  JSON `<uuid>.trajectory.json` sidecars; the real conversation store is
+  an undocumented SQLite `.db` (`user_version=1`, 7 tables) whose blobs
+  are protobuf `.pb`, documented so far only via the agy reference
+  implementation (`internal/daemon/types.go`; agy 1.1.23) — gstack
+  #1977. Acceptance: schema reverse-engineered against a real corpus
+  (at least one real `conversations/` directory, not synthetic), decode
+  gated behind a feature flag with `.db`/`.pb` still rejected by
+  default, and a provenance line disclosing sidecar-versus-store
+  coverage. Evidence: a round-trip test on a real store capture; a
+  discovery test proving the default JSON-only admission is unchanged.
+  Prerequisite: a corpus — until one exists this stays parked.
 - **Pricing snapshot age disclosure and scheduled refresh** (research
   candidate 51, confidence high; serves open issue #103's honesty half).
   The bundled snapshot is dated `2026-09-02`
@@ -1307,7 +1440,16 @@ files pass-9 hardening items (upstream-portable branch and CI hygiene,
 Hermes tool-failure signal, cache byte ceiling, TUI reload race) in the
 hardening lane, and strengthens candidates 2/3/19/23/26 with the
 current census (ccusage 18.3k★, codeburn 10.7k★, upstream master
-unmoved at `e005952` since the fork point).
+unmoved at `e005952` since the fork point). Cycle 6 closes candidates 25
+and 50 (CU-20 and CU-18/CU-19 — see Completed), files candidate 52
+(Antigravity store decode) and the fork dependency-review hygiene item in
+the hardening lane, and adds the F1-class prevention rule — contract
+fixtures must use wire-cased keys copied from the producer's source — to
+the cycle-6 records. Next-cycle shortlist, in dependency order: the fork
+dependency-review fix (unblocks clean merge signals for every later PR),
+ROADMAP/release-notes hygiene ride-alongs, then candidate 51 and the
+parse-size-cap/installer-checksum items deferred by the cycle-6
+prioritization.
 
 Items leave this section only when their acceptance criteria and evidence
 expectations are met and recorded in the Completed record above, and the
