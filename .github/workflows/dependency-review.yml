@@ -20,4 +20,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Review dependency changes
+        # Fork PRs cannot read the base snapshot the action diffs against,
+        # so on forks this step fails with an auth error and paints the PR
+        # red for a reason unrelated to the change. Repo-owned PRs (and
+        # same-repo branches) review as before; forks skip with an
+        # explanation (cycle 7 R2, pass-11 A11-8 adjacency).
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+      - name: Note fork skip
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true
+        run: >-
+          echo "Dependency review skipped: fork PRs cannot access the base
+          snapshot. Maintainers review dependencies after checkout."

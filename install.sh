@@ -51,7 +51,40 @@ if ! curl -fsSL -o "$TMP" "$RELEASE_URL"; then
   echo "   Build from source: git clone https://github.com/${REPO}.git && cd agenttrace && cargo build --release -p agenttrace"
   exit 1
 fi
-chmod +x "$TMP"
+chmod 0755 "$TMP"
+
+# — checksum verification (parity with release.yml's .sha256 sidecars) —
+# release.yml uploads "${ASSET}.sha256" next to every binary. Older
+# releases predate the sidecar, so a missing sidecar warns instead of
+# failing; a present sidecar that does not match fails the install
+# (pass-11 A11-3, cycle 7).
+CHECKSUM_URL="${RELEASE_URL}.sha256"
+TMP_SHA=$(mktemp)
+if curl -fsSL -o "$TMP_SHA" "$CHECKSUM_URL"; then
+  EXPECTED=$(cut -d' ' -f1 "$TMP_SHA" | tr -d '\r\n')
+  ACTUAL=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$TMP" | cut -d' ' -f1)
+  elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL=$(shasum -a 256 "$TMP" | cut -d' ' -f1)
+  else
+    echo "⚠️  No sha256 tool found (sha256sum or shasum); skipping checksum verification."
+  fi
+  if [ -n "$ACTUAL" ]; then
+    if [ "$EXPECTED" != "$ACTUAL" ]; then
+      rm -f "$TMP" "$TMP_SHA"
+      echo "❌ Checksum mismatch for ${ASSET}."
+      echo "   Expected: ${EXPECTED}"
+      echo "   Actual:   ${ACTUAL}"
+      echo "   The download may be corrupted or tampered with; not installing."
+      exit 1
+    fi
+    echo "   SHA-256 verified."
+  fi
+else
+  echo "⚠️  No checksum sidecar at ${CHECKSUM_URL}; skipping checksum verification."
+fi
+rm -f "$TMP_SHA"
 
 # — size check —
 SIZE=$(wc -c < "$TMP")

@@ -31,6 +31,19 @@ pub const MAX_SESSION_CACHE_ENTRIES: usize = 20_000;
 /// (pass-9 CU-22).
 pub const MAX_SESSION_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Walk-semantics version for cached directory listings. Bumped when the
+/// discovery walk's directory set changes so stale listings are dropped
+/// once at load (see `load_session_cache`). v2: symlinked child
+/// directories are followed (Codex `#42135`, cycle 7).
+const DIR_LISTING_WALK_VERSION: i64 = 2;
+
+fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
+    doc.get("dirs")
+        .and_then(Value::as_object)
+        .map(|dirs| dirs.is_empty())
+        .unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionCache {
     path: PathBuf,
@@ -371,23 +384,35 @@ pub fn load_session_cache() -> SessionCache {
                 .collect()
         })
         .unwrap_or_default();
-    let dirs = doc
-        .get("dirs")
-        .and_then(Value::as_object)
-        .map(|dirs| {
-            dirs.iter()
-                .filter_map(|(path, value)| {
-                    serde_json::from_value::<DirCacheEntry>(value.clone())
-                        .ok()
-                        .map(|entry| (path.clone(), entry))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Directory listings are versioned by walk semantics: v2 follows
+    // symlinked child directories (Codex `#42135`, cycle 7), so listings
+    // written by the older walker — which silently omitted them — are
+    // dropped once at load instead of hiding files until each parent
+    // directory's mtime happens to change.
+    let listings_current =
+        doc.get("dir_listing_version").and_then(Value::as_i64) == Some(DIR_LISTING_WALK_VERSION);
+    let dirs = if listings_current {
+        doc.get("dirs")
+            .and_then(Value::as_object)
+            .map(|dirs| {
+                dirs.iter()
+                    .filter_map(|(path, value)| {
+                        serde_json::from_value::<DirCacheEntry>(value.clone())
+                            .ok()
+                            .map(|entry| (path.clone(), entry))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    let listing_stale = !listings_current && !dirs_were_empty(&doc);
     let mut cache = SessionCache {
         path,
         raw_entries,
         dirs,
+        dirty: listing_stale,
         ..SessionCache::default()
     };
     // Dead-path eviction (pass-8 F8-3): entries whose source file no
@@ -611,28 +636,59 @@ fn delete_cached_session_key(path: &str, cache: &mut SessionCache) {
     }
 }
 
+/// Deduplicated cache paths with each path sized exactly once: a path
+/// decoded from `raw_entries` also lives in `entries` (see
+/// `cached_entry`), so chaining the two maps' keys counts it twice — the
+/// byte bound then over-evicts (up to ~2x near the ceiling) and the
+/// entry bound wastes drop slots and under-drops. The size is the larger
+/// of the raw and decoded serialized forms (pass-11 A11-2, cycle 7).
+fn cache_paths_sized_once(cache: &SessionCache) -> Vec<(String, usize)> {
+    let mut sized: BTreeMap<String, usize> = BTreeMap::new();
+    for (path, value) in &cache.raw_entries {
+        let bytes = serde_json::to_string(value)
+            .map(|text| text.len())
+            .unwrap_or(0);
+        sized.insert(path.clone(), bytes);
+    }
+    for (path, entry) in &cache.entries {
+        let bytes = serde_json::to_string(entry)
+            .map(|text| text.len())
+            .unwrap_or(0);
+        let slot = sized.entry(path.clone()).or_insert(0);
+        if bytes > *slot {
+            *slot = bytes;
+        }
+    }
+    sized.into_iter().collect()
+}
+
 /// Enforces the entry bound by dropping the entries with the oldest
 /// source-file fingerprint (mtime) first; keeps at most `max` entries.
-/// Returns how many entries were dropped (pass-8 F8-3).
+/// Returns how many entries were dropped (pass-8 F8-3). The bound walks
+/// the deduplicated path union so a path present in both maps costs one
+/// drop slot, not two (pass-11 A11-2); an entry without a decodable
+/// header is undatable, not unevictable — it counts as the oldest age so
+/// the bound is total, not best-effort (F5-5, cycle-5 review).
 fn enforce_entry_bound(cache: &mut SessionCache, max: usize) -> usize {
     let total = cache.entry_count();
     if total <= max {
         return 0;
     }
-    let paths: Vec<String> = cache
-        .raw_entries
-        .keys()
-        .chain(cache.entries.keys())
-        .cloned()
-        .collect();
-    let mut by_age: Vec<(i64, String)> = paths
+    let mut by_age: Vec<(i64, String)> = cache_paths_sized_once(cache)
         .into_iter()
-        .filter_map(|path| cached_entry_header(&path, cache).map(|header| (header.mod_time, path)))
+        .map(|(path, _bytes)| {
+            (
+                cached_entry_header(&path, cache).map_or(i64::MIN, |header| header.mod_time),
+                path,
+            )
+        })
         .collect();
     by_age.sort_unstable();
     let drop = total - max;
     let mut dropped = 0;
     for (_, path) in by_age.into_iter().take(drop) {
+        // `|`, not `||`: a path can live in both maps and both copies
+        // must go in the same drop.
         if cache.entries.remove(&path).is_some() | cache.raw_entries.remove(&path).is_some() {
             dropped += 1;
         }
@@ -647,33 +703,19 @@ fn enforce_entry_bound(cache: &mut SessionCache, max: usize) -> usize {
 /// oldest source-file fingerprint (mtime) first -- the same eviction order
 /// as `enforce_entry_bound` -- until the estimated serialized size fits
 /// under `max` bytes. The estimate is the sum of each entry's serialized
-/// JSON length, matching what `save_session_cache` writes. Returns how
-/// many entries were dropped (pass-9 CU-22).
+/// JSON length, matching what `save_session_cache` writes, counting each
+/// path of the deduplicated union once (pass-11 A11-2); headerless
+/// entries count as the oldest age (F5-5). Returns how many entries were
+/// dropped (pass-9 CU-22).
 fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
-    let sizes: Vec<(String, usize)> = cache
-        .raw_entries
-        .iter()
-        .map(|(path, value)| {
-            (
-                path.clone(),
-                serde_json::to_string(value)
-                    .map(|text| text.len())
-                    .unwrap_or(0),
-            )
-        })
-        .chain(cache.entries.iter().map(|(path, entry)| {
-            (
-                path.clone(),
-                serde_json::to_string(entry)
-                    .map(|text| text.len())
-                    .unwrap_or(0),
-            )
-        }))
-        .collect();
-    let mut by_age: Vec<(i64, String, usize)> = sizes
+    let mut by_age: Vec<(i64, String, usize)> = cache_paths_sized_once(cache)
         .into_iter()
-        .filter_map(|(path, bytes)| {
-            cached_entry_header(&path, cache).map(|header| (header.mod_time, path, bytes))
+        .map(|(path, bytes)| {
+            (
+                cached_entry_header(&path, cache).map_or(i64::MIN, |header| header.mod_time),
+                path,
+                bytes,
+            )
         })
         .collect();
     let total: usize = by_age.iter().map(|(_, _, bytes)| *bytes).sum();
@@ -713,6 +755,10 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
     doc.insert(
         "schema_version".to_string(),
         Value::Number(SESSION_CACHE_SCHEMA_VERSION.into()),
+    );
+    doc.insert(
+        "dir_listing_version".to_string(),
+        Value::Number(DIR_LISTING_WALK_VERSION.into()),
     );
     let mut entries = Map::new();
     for (path, value) in &cache.raw_entries {
@@ -1441,6 +1487,228 @@ mod tests {
         let before = cache.dirty;
         assert_eq!(enforce_byte_bound(&mut cache, usize::MAX), 0);
         assert_eq!(cache.dirty, before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounds_count_deduplicated_paths_once() {
+        // A11-2 (cycle 7): a decoded entry lives in both `entries` and
+        // `raw_entries` (see `cached_entry`). Chaining the two maps'
+        // keys counted such a path twice, so the entry bound wasted
+        // drop slots and under-dropped in one pass (the two oldest
+        // slots were the same path), and the byte bound summed both
+        // copies and over-evicted near the ceiling. Both bounds now
+        // walk the deduplicated union.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-union-bound-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let mut cache = SessionCache::default();
+        let mut paths = Vec::new();
+        for i in 0..4u64 {
+            let file = root.join(format!("session-{i}.jsonl"));
+            fs::write(&file, b"session").expect("write session file");
+            let stamp = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(2_000_000 + i * 1_000);
+            let handle = fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open file");
+            handle.set_modified(stamp).expect("set deterministic mtime");
+            drop(handle);
+            let session = Session {
+                name: format!("session-{i}"),
+                path: file.to_string_lossy().to_string(),
+                cwd: String::new(),
+                metrics: Metrics::default(),
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: Diagnostics::default(),
+            };
+            store_session(&file, &session, &mut cache).expect("store entry");
+            paths.push(file.to_string_lossy().to_string());
+        }
+        // Simulate a loaded cache: every decoded entry is mirrored in
+        // raw form exactly the way a load + re-decode leaves it.
+        cache.raw_entries = cache
+            .entries
+            .iter()
+            .map(|(path, entry)| {
+                (
+                    path.clone(),
+                    serde_json::to_value(entry).expect("serialize entry"),
+                )
+            })
+            .collect();
+
+        assert_eq!(cache.entry_count(), 4);
+        assert_eq!(
+            cache_paths_sized_once(&cache).len(),
+            4,
+            "the union helper must size each path once, not once per map copy"
+        );
+
+        let dropped = enforce_entry_bound(&mut cache, 2);
+        assert_eq!(dropped, 2, "two distinct paths drop, not two copies of one");
+        assert_eq!(cache.entry_count(), 2);
+        for path in &paths[..2] {
+            let key = cache_key(Path::new(path));
+            assert!(!cache.entries.contains_key(&key));
+            assert!(!cache.raw_entries.contains_key(&key));
+        }
+        for path in &paths[2..] {
+            let key = cache_key(Path::new(path));
+            assert!(cache.entries.contains_key(&key));
+        }
+
+        // Byte bound over the same duplicated state: the ceiling fits
+        // exactly the two newest distinct paths, so exactly those two
+        // survive — the pre-fix double-counted total evicted more.
+        let mut cache = SessionCache::default();
+        for (i, path) in paths.iter().enumerate() {
+            let file = PathBuf::from(path);
+            let session = Session {
+                name: format!("session-{i}"),
+                path: path.clone(),
+                cwd: String::new(),
+                metrics: Metrics::default(),
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: Diagnostics::default(),
+            };
+            store_session(&file, &session, &mut cache).expect("store entry");
+        }
+        cache.raw_entries = cache
+            .entries
+            .iter()
+            .map(|(path, entry)| {
+                (
+                    path.clone(),
+                    serde_json::to_value(entry).expect("serialize entry"),
+                )
+            })
+            .collect();
+        let size_of: std::collections::BTreeMap<String, usize> =
+            cache_paths_sized_once(&cache).into_iter().collect();
+        assert!(
+            size_of.values().all(|bytes| *bytes > 0),
+            "entries must be sized, not zeroed"
+        );
+        let total: usize = size_of.values().sum();
+        // `paths` was stored oldest-mtime first; the ceiling fits exactly
+        // the two newest distinct paths.
+        let oldest_two = size_of[&paths[0]] + size_of[&paths[1]];
+        let max = total - oldest_two;
+        let dropped = enforce_byte_bound(&mut cache, max);
+        assert_eq!(dropped, 2, "the two oldest distinct paths drop, exactly");
+        assert_eq!(cache.entry_count(), 2);
+        for path in &paths[..2] {
+            let key = cache_key(Path::new(path));
+            assert!(!cache.entries.contains_key(&key));
+            assert!(!cache.raw_entries.contains_key(&key));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn headerless_cache_entries_are_oldest_not_unevictable() {
+        // F5-5 (cycle-5 review, carried into the union form): a raw
+        // entry without a decodable header used to be skipped by the
+        // bounds entirely, so corrupt entries could pin the cache at
+        // its ceiling forever. They count as the oldest age instead.
+        let mut cache = SessionCache::default();
+        cache.raw_entries.insert(
+            "/gone/headerless-entry".to_string(),
+            serde_json::json!({"nonsense": true}),
+        );
+        cache.raw_entries.insert(
+            "/gone/dated-entry".to_string(),
+            serde_json::json!({"mod_time": 5, "size": 1, "session": {"Name": "dated"}}),
+        );
+        assert_eq!(cache.entry_count(), 2);
+        let dropped = enforce_entry_bound(&mut cache, 1);
+        assert_eq!(dropped, 1);
+        assert!(
+            !cache.raw_entries.contains_key("/gone/headerless-entry"),
+            "the headerless entry is the oldest and must be evictable"
+        );
+        assert!(cache.raw_entries.contains_key("/gone/dated-entry"));
+    }
+
+    #[test]
+    fn stale_dir_listings_from_the_pre_symlink_walker_are_dropped_once() {
+        // Cycle 7 (Codex #42135): listings written before symlinked
+        // child directories were followed silently hid those
+        // directories until each parent's mtime changed, because the
+        // cached replay never re-read the directory. A journal without
+        // the current `dir_listing_version` loses its listings once at
+        // load; a current one keeps them.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-listing-version-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("sessions.json");
+        // The listing key must be a live directory: load-time pruning
+        // evicts listings whose directory no longer exists.
+        let listed_dir = root.join("real");
+        fs::create_dir_all(&listed_dir).expect("create listed dir");
+        let listing = serde_json::json!({
+            "mod_time": 1,
+            "files": [],
+            "dirs": [],
+        });
+        let write_journal = |versioned: bool| {
+            let mut doc = serde_json::Map::new();
+            doc.insert(
+                "schema_version".to_string(),
+                serde_json::json!(SESSION_CACHE_SCHEMA_VERSION),
+            );
+            if versioned {
+                doc.insert(
+                    "dir_listing_version".to_string(),
+                    serde_json::json!(DIR_LISTING_WALK_VERSION),
+                );
+            }
+            doc.insert("entries".to_string(), serde_json::json!({}));
+            doc.insert(
+                "dirs".to_string(),
+                serde_json::json!({listed_dir.to_string_lossy().to_string(): listing}),
+            );
+            fs::write(
+                &journal,
+                serde_json::to_string(&doc).expect("serialize journal"),
+            )
+            .expect("write journal");
+        };
+
+        // Shared env lock (see lib.rs `test_env`): sibling-module tests
+        // (pricing, statusline) mutate the same variables.
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        write_journal(false);
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.dirs.len(),
+            0,
+            "unversioned listings from the pre-symlink walker must be dropped"
+        );
+        assert!(cache.dirty, "the one-time invalidation must persist");
+
+        write_journal(true);
+        let cache = load_session_cache();
+        assert_eq!(cache.dirs.len(), 1, "current-version listings survive");
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
         let _ = fs::remove_dir_all(root);
     }
 }

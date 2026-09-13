@@ -13,7 +13,7 @@ const PRICING_URL: &str =
 /// fully offline by default. Regenerate with `scripts/pricing/update-snapshot.sh`
 /// and keep `PRICING_SNAPSHOT_DATE` in sync with the date it prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-09-02";
+const PRICING_SNAPSHOT_DATE: &str = "2026-09-13";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -93,6 +93,34 @@ pub fn pricing_source() -> String {
     } else {
         format!("{source} + user overrides available")
     }
+}
+
+/// Model count in the bundled offline snapshot, parsed once, for
+/// provenance disclosure (cycle 7 R1: users should be able to see how
+/// old the offline catalog they are paying from actually is).
+pub fn bundled_snapshot_date() -> &'static str {
+    PRICING_SNAPSHOT_DATE
+}
+
+pub fn bundled_snapshot_model_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        serde_json::from_str::<serde_json::Value>(PRICING_SNAPSHOT_JSON)
+            .ok()
+            .and_then(|value| {
+                value["_snapshot"]["models"]
+                    .as_u64()
+                    .map(|models| models as usize)
+            })
+            .unwrap_or(0)
+    })
+}
+
+/// Whole days between today (UTC) and the bundled snapshot date, or
+/// `None` if the pinned date somehow fails to parse.
+pub fn bundled_snapshot_age_days() -> Option<i64> {
+    let date = chrono::NaiveDate::parse_from_str(PRICING_SNAPSHOT_DATE, "%Y-%m-%d").ok()?;
+    Some((chrono::Utc::now().date_naive() - date).num_days().max(0))
 }
 
 fn catalog_source(catalog: &PricingCatalog) -> String {
@@ -1204,9 +1232,11 @@ mod tests {
     /// (`cache re-read: NotFound` flakes under the combined CI test run).
     fn with_isolated_cache_env<T>(body: impl FnOnce() -> T) -> T {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // Shared crate-wide env lock (see lib.rs `test_env`): the
+        // session-cache and statusline tests mutate the same process
+        // environment from sibling modules.
         static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock_env();
         let prior_xdg = std::env::var_os("XDG_CACHE_HOME");
         let prior_home = std::env::var_os("HOME");
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);

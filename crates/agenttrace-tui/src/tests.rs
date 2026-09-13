@@ -1817,3 +1817,174 @@ fn file_mod_time_nanos_for_test(metadata: &fs::Metadata) -> i64 {
         .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
+
+#[test]
+fn delivery_worker_failures_surface_as_diagnostics_not_empty_states() {
+    // A11-4 (cycle 7): the delivery worker sent a bare DeliveryEvidence
+    // and `Disconnected` was treated as completion, so a failed or
+    // panicked worker rendered exactly like "no evidence" — an empty
+    // panel indistinguishable from a git-less workspace. The channel now
+    // carries a Result, panics are caught in the worker, and every
+    // failure mode lands in delivery_error with a rendered diagnostic.
+    let mut app = App::new(
+        vec![session("billing", "claude_code", "gpt-5", 45, 0.2, "bash")],
+        "test",
+        None,
+    );
+    app.run_command("delivery").expect("open delivery panel");
+    // Opening only switches the view; the worker spawns when the panel
+    // first renders.
+    let backend0 = TestBackend::new(140, 44);
+    let mut terminal0 = Terminal::new(backend0).expect("test terminal");
+    terminal0
+        .draw(|frame| render(frame, &mut app))
+        .expect("spawn delivery worker");
+    while app.governance_delivery_pending() {
+        app.poll_governance_delivery();
+    }
+    assert!(
+        app.governance
+            .as_ref()
+            .and_then(|snapshot| snapshot.delivery_error.as_ref())
+            .is_none(),
+        "a healthy worker must not set an error"
+    );
+    assert!(app
+        .governance
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.delivery.is_some()));
+
+    // Case 1: worker reports a failure through the channel.
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Err("delivery worker failed: boom".to_string()))
+        .expect("send failure");
+    drop(tx);
+    app.governance.as_mut().unwrap().delivery_pending = Some(rx);
+    assert!(app.poll_governance_delivery());
+    assert_eq!(
+        app.governance.as_ref().unwrap().delivery_error.as_deref(),
+        Some("delivery worker failed: boom")
+    );
+
+    // Case 2: worker dies without reporting (silent disconnect).
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    app.governance.as_mut().unwrap().delivery_pending = Some(rx);
+    assert!(app.poll_governance_delivery());
+    assert_eq!(
+        app.governance.as_ref().unwrap().delivery_error.as_deref(),
+        Some("delivery worker exited without evidence")
+    );
+
+    // The failed state renders a diagnostic with a retry hint.
+    let backend = TestBackend::new(140, 44);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render failed delivery panel");
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        rendered.contains("worker failed") || rendered.contains("exited without evidence"),
+        "the diagnostic must be visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("retry"),
+        "the panel must tell the user how to retry"
+    );
+
+    // Case 2b (review F4): re-entering the Delivery panel is the retry —
+    // it must clear the stale error and drop the evidence it was hiding,
+    // so the next render spawns a fresh worker and shows the scan in
+    // flight instead of the previous failure.
+    app.run_command("delivery").expect("retry delivery panel");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render retrying delivery panel");
+    assert!(
+        app.governance.as_ref().unwrap().delivery_error.is_none(),
+        "a retry must clear the stale delivery error"
+    );
+    assert!(
+        app.governance.as_ref().unwrap().delivery_pending.is_some(),
+        "a retry must spawn a fresh worker"
+    );
+    let retrying = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        !retrying.contains("worker failed") && !retrying.contains("exited without evidence"),
+        "stale error must not survive the retry: {retrying}"
+    );
+    // Drain the real worker so later cases start from a settled state.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.governance_delivery_pending() {
+        app.poll_governance_delivery();
+        if std::time::Instant::now() >= deadline {
+            panic!("retrying delivery worker did not settle");
+        }
+    }
+
+    // Case 3: a later success clears the error.
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok(agenttrace_core::delivery_evidence_with_git(&[])))
+        .expect("send success");
+    drop(tx);
+    app.governance.as_mut().unwrap().delivery_pending = Some(rx);
+    assert!(app.poll_governance_delivery());
+    assert!(
+        app.governance.as_ref().unwrap().delivery_error.is_none(),
+        "a successful retry clears the diagnostic"
+    );
+}
+
+#[test]
+fn efficiency_panel_renders_statusline_limits_and_cache_causes() {
+    // Candidate 53 (cycle 7): subscription limit pressure and
+    // prompt-cache miss causes come from the statusline capture journal,
+    // not transcripts; when captures exist the Efficiency panel surfaces
+    // them. With no journal the panel is unchanged.
+    let mut app = App::new(
+        vec![session("billing", "claude_code", "gpt-5", 45, 0.2, "bash")],
+        "test",
+        None,
+    );
+    app.run_command("efficiency")
+        .expect("open efficiency panel");
+    let backend = TestBackend::new(140, 44);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render efficiency panel");
+    let without = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        !without.contains("Subscription limits"),
+        "no journal means no statusline block: {without}"
+    );
+
+    let insights = agenttrace_core::statusline_insights(&[agenttrace_core::CapturedStatusline {
+        captured_at: 1_760_000_100,
+        payload: serde_json::json!({
+            "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "rate_limits": {
+                "five_hour": {"used_percentage": 84.0, "resets_at": 1760000000}
+            },
+            "prompt_cache": {
+                "hit_ratio": 0.9,
+                "misses": 4,
+                "last_miss_cause": {"causes": ["tools_changed"]},
+                "miss_causes": {"tools_changed": 2}
+            }
+        }),
+    }]);
+    app.governance.as_mut().unwrap().statusline = Some(insights);
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render efficiency panel with statusline insights");
+    let with = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        with.contains("Subscription limits"),
+        "limit pressure must render: {with}"
+    );
+    assert!(
+        with.contains("tools_changed"),
+        "cache-miss causes must render: {with}"
+    );
+}
