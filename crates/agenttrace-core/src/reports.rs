@@ -703,17 +703,30 @@ pub fn add_baseline_comparison(
     thresholds: BaselineThresholds,
 ) -> anyhow::Result<(String, BaselineBreaches)> {
     let mut report: Value = serde_json::from_str(report_json)?;
-    let baseline: Value = serde_json::from_str(&fs::read_to_string(baseline_path)?)?;
+    let baseline_text = fs::read_to_string(baseline_path)?;
+    let baseline: Value = serde_json::from_str(&baseline_text).map_err(|error| {
+        anyhow::anyhow!("baseline file is not valid JSON: {baseline_path}: {error}")
+    })?;
     let summary = report
         .get("summary")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // CU-26 (pass-11 F11-3): a baseline must be an agenttrace report.
+    // Accepting arbitrary JSON silently produced an all-zero baseline
+    // and a misleading regression verdict, so require the `summary`
+    // object the comparison reads.
     let base_summary = baseline
         .get("summary")
         .and_then(Value::as_object)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "baseline file is not an agenttrace report (missing \
+                 `summary` object): {baseline_path} — export one with \
+                 `agenttrace --overview -f json`"
+            )
+        })?;
 
     let duration_delta = delta_pct(
         number(&summary, "total_duration_seconds"),

@@ -37,7 +37,16 @@ jobs:
     name: Build release assets
     permissions:
       contents: read
-    runs-on: self-hosted
+    # CU-24 (pass-11 F11-2): every matrix leg must run on a runner that
+    # matches its `os:` key. The literal `self-hosted` scheduled all six
+    # legs on one machine, so the darwin/msvc targets could never build
+    # and the publish job (needs: [build, verify]) never ran. The
+    # operator's self-hosted-only policy is preserved by requiring BOTH
+    # labels: legs only ever schedule on self-hosted runners that carry
+    # the matching os label (label your fleet accordingly, or adjust the
+    # matrix os: values to your runner labels).
+    # scripts/ci/check-release-matrix-wiring.sh guards the wiring.
+    runs-on: ["self-hosted", "${{ matrix.os }}"]
     timeout-minutes: 30
     strategy:
       fail-fast: false

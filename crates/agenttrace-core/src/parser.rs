@@ -1322,7 +1322,11 @@ fn parse_oh_my_pi_jsonl(path: &str, raw: &str) -> anyhow::Result<Vec<Event>> {
         let typ = string(obj.get("type")).unwrap_or("");
         if !seen_header {
             if typ != "session" {
-                bail!("oh_my_pi: missing session header");
+                // Some producers write metadata lines (e.g. a `title`
+                // object) before the session header; skip them instead
+                // of rejecting the whole file. Ported from upstream
+                // commit 6848aa1 (PR #284).
+                continue;
             }
             if string(obj.get("id")).unwrap_or("").is_empty() {
                 bail!("oh_my_pi: invalid session header");

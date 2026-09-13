@@ -723,7 +723,6 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--baseline-max-duration-delta-pct"
             | "--baseline-max-cost-delta-pct"
             | "--baseline-max-token-delta-pct"
-            | "--no-baseline-gate"
             | "--lang"
             | "--range"
             | "--project"
@@ -1325,6 +1324,32 @@ mod tests {
             args,
             vec![
                 OsString::from("agenttrace"),
+                OsString::from("-f"),
+                OsString::from("json"),
+                OsString::from("session.jsonl"),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_flag_shim_treats_no_baseline_gate_as_a_boolean_flag() {
+        // F11-7 (pass 11): --no-baseline-gate is a boolean (main.rs Args),
+        // so the shim must not swallow the next flag as its "value" —
+        // previously it consumed `-f`, turning `json` into the positional
+        // and dropping whatever followed it.
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--no-baseline-gate"),
+            OsString::from("-f"),
+            OsString::from("json"),
+            OsString::from("session.jsonl"),
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("--no-baseline-gate"),
                 OsString::from("-f"),
                 OsString::from("json"),
                 OsString::from("session.jsonl"),

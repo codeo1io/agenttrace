@@ -66,6 +66,9 @@ jobs:
       - name: Release surface drift
         run: scripts/ci/check-release-surfaces.sh
 
+      - name: Release matrix wiring
+        run: scripts/ci/check-release-matrix-wiring.sh
+
       - name: Documented command smoke tests
         run: |
           AGENTTRACE_BIN=target/release/agenttrace \

@@ -1,0 +1,9 @@
+{"steps":[
+ {"type":"CORTEX_STEP_TYPE_USER_INPUT","metadata":{"createdAt":"2026-09-01T10:00:00Z"},"userInput":{"userResponse":"run the tests please"}},
+ {"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","metadata":{"createdAt":"2026-09-01T10:00:05Z"},"plannerResponse":{"response":"running tests","thinking":"hmm","toolCalls":[{"name":"Bash","argumentsJson":"{\"command\":\"make test\""}]}},
+ {"type":"CORTEX_STEP_TYPE_RUN_COMMAND","metadata":{"createdAt":"2026-09-01T10:00:10Z"},"runCommand":{"commandLine":"make test","exitCode":0}},
+ {"type":"CORTEX_STEP_TYPE_RUN_COMMAND","metadata":{"createdAt":"2026-09-01T10:00:20Z"},"runCommand":{"commandLine":"make lint","exitCode":0}},
+ {"type":"CORTEX_STEP_TYPE_RUN_COMMAND","metadata":{"createdAt":"2026-09-01T10:00:30Z"},"runCommand":{"commandLine":"make fmt","exitCode":0}},
+ {"type":"CORTEX_STEP_TYPE_RUN_COMMAND","metadata":{"createdAt":"2026-09-01T10:00:40Z"},"runCommand":{"commandLine":"make build","exitCode":2}},
+ {"type":"CORTEX_STEP_TYPE_VIEW_FILE","metadata":{"createdAt":"2026-09-01T10:00:50Z"},"viewFile":{"absolutePathUri":"file:///src/main.rs","startLine":1,"endLine":40}}
+]}

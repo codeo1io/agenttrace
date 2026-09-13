@@ -749,6 +749,16 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             metrics.gaps_sec.push(gap);
         }
     }
+    // Result-only sources (the Antigravity sidecar parser emits
+    // RUN_COMMAND/VIEW_FILE/ERROR_MESSAGE as tool results with no paired
+    // assistant call) still represent real tool invocations: keep the
+    // call count from falling below the observed outcomes so the
+    // paired-stream clamp below cannot erase successful results
+    // (CU-23, pass-11 F11-1).
+    let observed_outcomes = metrics.tool_calls_ok + metrics.tool_calls_fail;
+    if metrics.tool_calls_total < observed_outcomes {
+        metrics.tool_calls_total = observed_outcomes;
+    }
     let max_ok = metrics
         .tool_calls_total
         .saturating_sub(metrics.tool_calls_fail);
@@ -1629,6 +1639,45 @@ mod tests {
             BTreeMap::from([("unparseable_line".to_string(), 1)])
         );
         assert_eq!(session.metrics.tokens_input, 7);
+    }
+
+    #[test]
+    fn result_only_tool_outcomes_cannot_be_clamped_away() {
+        // CU-23 (pass-11 F11-1): result-only sources emit `tool` events
+        // with no paired assistant call. The old clamp ok<=total-fail
+        // with total=1 erased the four successful outcomes and reported
+        // a false 100% failure rate (health 40, gate exit 2).
+        let events: Vec<Event> = [
+            r#"{"role":"assistant","content":"running","tool_calls":[{"id":"t1","name":"Bash","args":"{}"}]}"#,
+            r#"{"role":"tool","content":"ok"}"#,
+            r#"{"role":"tool","content":"ok"}"#,
+            r#"{"role":"tool","content":"ok"}"#,
+            r#"{"role":"tool","is_error":true,"content":"exit 2"}"#,
+            r#"{"role":"tool","content":"viewed file"}"#,
+        ]
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("event parses"))
+        .collect();
+
+        let metrics = analyze(&events, "claude-sonnet-4-5");
+        assert_eq!(metrics.tool_calls_total, 5);
+        assert_eq!(metrics.tool_calls_ok, 4);
+        assert_eq!(metrics.tool_calls_fail, 1);
+
+        // A paired stream keeps its declared call count: the raise only
+        // ever lifts total up to the observed outcomes, never above.
+        let paired: Vec<Event> = [
+            r#"{"role":"assistant","tool_calls":[{"id":"a","name":"Bash","args":"{}"},{"id":"b","name":"Bash","args":"{}"},{"id":"c","name":"Bash","args":"{}"}]}"#,
+            r#"{"role":"tool","content":"ok"}"#,
+            r#"{"role":"tool","is_error":true,"content":"exit 1"}"#,
+        ]
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("event parses"))
+        .collect();
+        let metrics = analyze(&paired, "claude-sonnet-4-5");
+        assert_eq!(metrics.tool_calls_total, 3);
+        assert_eq!(metrics.tool_calls_ok, 1);
+        assert_eq!(metrics.tool_calls_fail, 1);
     }
 
     #[test]

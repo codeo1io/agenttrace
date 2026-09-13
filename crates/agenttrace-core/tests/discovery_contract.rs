@@ -1,8 +1,8 @@
 use agenttrace_core::{
     build_doctor_report, data_health, data_health_scoped, find_session_files,
     load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress, parse_file,
-    render_waste_report, search_sessions, session_cache_path, session_capability, total_tokens,
-    LoadOptions,
+    render_waste_report, search_sessions, session_cache_path, session_capability, tool_fail_rate,
+    total_tokens, LoadOptions,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -1684,6 +1684,63 @@ fn rust_parses_oh_my_pi_session_jsonl() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn rust_parses_oh_my_pi_jsonl_with_leading_title_line() {
+    // CU-25: upstream 6848aa1 (PR #284) — producers may write metadata
+    // lines (e.g. a `title` object) before the session header; the
+    // parser must skip them instead of rejecting the whole file. The
+    // same content ships as testdata/oh-my-pi-title-prefix.jsonl.
+    let root = temp_root("agenttrace-rust-oh-my-pi-title-prefix");
+    fs::create_dir_all(&root).expect("create oh-my-pi temp dir");
+    let session_path = root.join("session.jsonl");
+    fs::write(
+        &session_path,
+        r#"{"type":"title","title":"a session"}
+{"type":"session","id":"s1","cwd":"/w","timestamp":"2026-09-10T10:00:00Z"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-10T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-10T10:00:05Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hello"}],"usage":{"input":10,"output":5}}}
+"#,
+    )
+    .expect("write oh-my-pi session");
+
+    let parsed = parse_file(&session_path).expect("parse oh-my-pi session with title prefix");
+    assert_eq!(parsed.metrics.source_tool, "oh_my_pi");
+    assert_eq!(parsed.metrics.user_messages, 1);
+    assert_eq!(parsed.metrics.assistant_turns, 1);
+    assert_eq!(parsed.metrics.model_used, "claude-sonnet-4-5");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_accounts_antigravity_result_only_tool_outcomes() {
+    // CU-23 (pass-11 F11-1): the Antigravity sidecar emits tool results
+    // (RUN_COMMAND/VIEW_FILE/ERROR_MESSAGE) with no paired assistant
+    // call. analyze() used to clamp ok to total-fail with total counting
+    // only the single planner toolCall, erasing 4 successful results and
+    // reporting a false 100% failure rate. The same content ships as
+    // testdata/antigravity-mixed-outcomes.json.
+    let root = temp_root("agenttrace-rust-antigravity-mixed");
+    fs::create_dir_all(&root).expect("create antigravity temp dir");
+    let session_path = root.join("traj.json");
+    fs::write(&session_path, ANTIGRAVITY_MIXED_OUTCOMES).expect("write antigravity trajectory");
+
+    let parsed = parse_file(&session_path).expect("parse antigravity trajectory");
+    let metrics = &parsed.metrics;
+    assert_eq!(metrics.source_tool, "antigravity_cli");
+    // 1 paired planner call + 4 successful results + 1 failed result.
+    assert_eq!(metrics.tool_calls_total, 5);
+    assert_eq!(metrics.tool_calls_ok, 4);
+    assert_eq!(metrics.tool_calls_fail, 1);
+    // Truthful outcome rate: 20% failed, 80% succeeded.
+    assert_eq!(tool_fail_rate(&[parsed]), 20.0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+const ANTIGRAVITY_MIXED_OUTCOMES: &str =
+    include_str!("../../../testdata/antigravity-mixed-outcomes.json");
 
 #[test]
 fn rust_uses_pi_source_for_pi_session_path() {

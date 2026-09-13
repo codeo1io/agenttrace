@@ -193,6 +193,31 @@ copied from the producer's source). The local full-suite replication
 of the ci.yml `test` job matched the remote run exactly (213/213, same
 21-step ledger) — the replication is now the pre-push gate of record.
 
+Updated again 2026-09-14 (conductor run 58910360) after assessment pass 11
+and research pass 9, on HEAD `df3b621` (2026-09-07) with a clean tree and
+the 213/213 / fmt / clippy baseline re-verified. New sources folded in
+below: pass 11
+(`docs/reviews/2026-09-14-adversarial-repository-assessment-pass11.md`,
+findings F11-1–F11-8, none repeating passes 1–10) and research pass 9
+(`docs/research/2026-09-14-extensions-research-pass9.md`, new candidates
+53–54 plus strengthening notes on candidates 2/4/14/16/23/24/52).
+Headlines: F11-1 (HIGH) — Antigravity tool-success accounting erases
+successful RUN_COMMAND/VIEW_FILE results (the CU-19 parser's result-only
+stream meets the paired-call clamp), live-reproduced as a false 100%
+failure rate, health 40, and a `--max-tool-fail-rate` gate exit 2 on a
+~20%-failure session; F11-2 (HIGH) — the release build matrix's `os:`
+keys are wired to no `runs-on` (regression introduced by `6632014`,
+never restored by `bfa4f22` or `fbbf751`), so a tag push cannot produce
+the darwin/msvc assets and the publish job never runs. Research pass 9
+also found upstream active again (exactly one commit ahead of the fork:
+PR #284, an Oh My Pi leading-line fix whose absence reproduces locally),
+open upstream radar #236/#237 plus the promoted #103, and a stale
+upstream dependabot queue feeding candidate 23. Records correction:
+commits `fbbf751`/`c148ffc` (operator policy, 2026-09-03) restored
+`runs-on: self-hosted` and removed the CU-17 guard script — the cycle-6
+record below is annotated and the pass-9 portability entry re-opens with
+a portable-branch-only acceptance.
+
 ### Completed in cycle 1 (recorded 2026-09-02)
 
 Preserved history; each entry names the evidence that closed it, as
@@ -475,7 +500,14 @@ GitHub-hosted `ubuntu-latest`). Record:
   exits 0 on the shipped tree and exits 1 with a precise file:line on a
 deliberate contamination; the CI step itself is green in run 33675196174
   on `CARGO_HOME=/home/runner/.cargo`; the reconciliation shows upstream
-  `e005952` unmoved and zero upstream pushes or PRs.
+  `e005952` unmoved and zero upstream pushes or PRs. (Status change,
+  2026-09-14, pass 11: commits `fbbf751` ("ci: enforce self-hosted runners
+  only") and `c148ffc` ("ci: remove anti-self-hosted guard"), both
+  operator policy on 2026-09-03, restored `runs-on: self-hosted` on all
+  five workflow spots and deleted the guard script — this historical
+  record stands as written for cycle 6; the portability question re-opens
+  in the hardening lane under its pass-11 annotation, mitigated by
+  `branch.master.remote = fork`, re-verified 2026-09-14.)
 - **Gemini CLI `~/.gemini/tmp` discovery root** (candidate 50, first
   half). Closed with CU-18: `known_session_dirs()` gains the root with
   the existing chats/checkpoints gating; contract tests discover, parse
@@ -607,6 +639,14 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   load (pass-7 residual: crashed writers leak `*.tmp.<pid>.<seq>`
   orphans, `session_cache.rs:237`). Evidence: an interrupted-write
   fixture recovering with a visible warning; an orphan-sweep test.
+  Extended by pass 11 (F11-6): `sweep_orphaned_temps`
+  (`session_cache.rs:288-312`) matches any file whose name merely
+  contains `.tmp.` and is older than one hour, and the cache dir is
+  user-settable (`AGENTTRACE_SESSION_CACHE_DIR`), so pointing it at a
+  folder holding personal `*.tmp.*`-named files destroys them.
+  Additional acceptance: narrow the match to agenttrace's own
+  `<name>.json.tmp.<pid>.<seq>` pattern; a test asserting
+  look-alike names survive the sweep.
   Research pass 5 context:
   Claude Code deletes transcripts after 30 days by default
   (`desktopSessionCleanupPeriodDays`), so the preserved history is
@@ -734,7 +774,16 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   empty-directory error message ends with a dangling space (N7).
   Evidence: a CLI test asserting the early-return order; a test asserting
   the shim's truncation warning; a test asserting filter-only invocations
-  error; both message strings pinned.
+  error; both message strings pinned. Extended by pass 11 (F11-7, NIT):
+  `flag_takes_value` lists `--no-baseline-gate` as value-taking
+  (`main.rs:726`) although the flag is boolean (`main.rs:99`), making the
+  shim stop truncating earlier than Go semantics would; fold the list
+  fix into the P4-2 warning work and pin it with the same test.
+  (Status change, 2026-09-14, cycle 7: the list fix landed standalone
+  as a ride-along — `--no-baseline-gate` removed from
+  `flag_takes_value`, pinned by
+  `go_flag_shim_treats_no_baseline_gate_as_a_boolean_flag`; the P4-2
+  warning work itself remains open.)
 - **Delivery-evidence cost ceiling** (pass-2 N10). `--delivery-evidence`
   runs one synchronous `git log --all` per project root with no
   parallelism, timeout, or cap; measured 0.61s versus 0.011s for
@@ -863,7 +912,19 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   `git config branch.master.remote` prints `fork`; a grep shows zero
   `self-hosted` matches on the candidate branch; the reconciliation record
   shows upstream `e005952` unmoved. Status change, cycle 6: closed (CU-17 —
-  see Completed).
+  see Completed). Status change, pass 11 (re-opened, operator-scoped):
+  commits `fbbf751`/`c148ffc` (2026-09-03, operator policy "self-hosted
+  only") restored `runs-on: self-hosted` on all five workflow spots and
+  removed the guard script, so the zero-`self-hosted` acceptance no longer
+  holds on `master` by explicit operator decision rather than accident;
+  `branch.master.remote` still prints `fork` (re-verified 2026-09-14), so
+  the upstream-push hazard stays mitigated by tracking. Revised
+  acceptance under the standing policy: any upstream-bound PR is built
+  from a portable branch that carries zero `self-hosted` occurrences
+  (guard script re-applied on that branch or an equivalent CI check),
+  and the policy state is recorded here so the cycle-6 close stays
+  honest. Evidence: a grep over the portable branch showing zero
+  matches; the guard (or equivalent) green on that branch's CI.
 - **`--sample` disclosure must name the active ordering** (pass-9; the
   residual of the closed F8-1). The exclusion reason hard-codes
   "sampled newest {N} of {M}" (`main.rs:249-251` and `:292-294`), but the
@@ -914,7 +975,14 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   test constructing over-ceiling entries asserting the persisted size
   stays under the ceiling; a doctor run printing the bound. Status
   change, cycle 6: closed (CU-22 — see Completed; `MAX_SESSION_CACHE_BYTES`
-  = 64 MiB, enforced at save, doctor surfaces both bounds).
+  = 64 MiB, enforced at save, doctor surfaces both bounds). Residual,
+  pass 11 (F11-5): `enforce_byte_bound` sizes only `raw_entries` plus
+  `entries` (`session_cache.rs:652-706`) — the `dirs` map and other
+  fields are uncounted, so the on-disk file can exceed the nominal
+  bound (bounded but imprecise). Re-opened acceptance: include the
+  serialized `dirs` size in the total, or document the approximation
+  next to the doctor line; a test constructing a large `dirs` map pinning
+  the chosen behavior.
 - **Fork dependency-review false red** (cycle 6 CI observation, MEDIUM
   stewardship). The `Dependency Review` workflow fails on every fork PR
   — "Dependency review is not supported on this repository … ensure that
@@ -940,6 +1008,119 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   exclusively), or the race is documented as benign with a test pinning
   the worst case. Evidence: a concurrency test asserting a forced clear
   during an in-flight load cannot persist pre-clear entries.
+- **Antigravity tool-success accounting** (pass-11 F11-1, HIGH;
+  correctness and gate integrity — the open half of the CU-19 surface).
+  `parse_antigravity_trajectory` emits RUN_COMMAND/VIEW_FILE/ERROR_MESSAGE
+  steps as role-`tool` result events with no paired assistant call
+  (`parser.rs:483-517`); only PLANNER_RESPONSE `toolCalls` count as
+  calls, while `analyze()` clamps `tool_calls_ok` to
+  `total − fail` (paired-stream policy) without clamping failures — so
+  every successful Antigravity command is erased and failures
+  over-weight. Live repro on `/tmp/at-adv/traj.json` (three `exitCode: 0`
+  runs, one failure): `Tool calls: 1, Success: 0% (0/1)`, anomaly
+  `tool_failures high: 1/1 failed (100%)`, health 40, and
+  `--overview --max-tool-fail-rate 15` exits 2 on a ~20%-failure
+  session — a false CI-gate red. Acceptance: successful RUN_COMMAND and
+  VIEW_FILE steps count as ok outcomes (synthetic paired calls or
+  result-only accounting separated from the clamp), the mixed fixture
+  reports ~80% success with no HIGH anomaly and gate exit 0, and the
+  fixture lands as `testdata/` pinning the arithmetic; land with or
+  before any candidate-52 store decode so the new source cannot inherit
+  the bug. Evidence: the live before/after numbers on the fixture; a
+  regression test asserting the true 1/5 failure rate; `--doctor` and
+  JSON parity. (Status change, 2026-09-14, cycle 7 / CU-23:
+  implemented via result-only accounting — `analyze()` raises
+  `tool_calls_total` to `ok + fail` before the paired-stream clamp,
+  which still caps `ok` only — with fixture
+  `testdata/antigravity-mixed-outcomes.json` and two tests; live:
+  ok=4/fail=1/total=5, `tool_success_rate=80`, anomaly `1/5 failed
+  (20%)` at medium severity (no HIGH), gate exit 0 at a threshold
+  above the true rate and a truthful exit 2 at 15 showing `20.0%
+  exceeds 15.0%`. The original acceptance's "gate exit 0" was
+  threshold-underspecified; resolved against the fixture's true 20%
+  rate. Awaiting commit/review/shipping; the next cycle's assessment
+  carries those outcomes.)
+- **Release build-matrix runner wiring** (pass-11 F11-2, HIGH; release
+  infrastructure). `.github/workflows/release.yml:40` hardcodes
+  `runs-on: self-hosted` while the matrix at `:43-61` defines six `os:`
+  keys that no `runs-on` references (git archaeology: `e005952` used
+  `${{ matrix.os }}`, `6632014` replaced it with a literal,
+  `bfa4f22`/`fbbf751` never restored it — `git log -S "matrix.os"`
+  touches only the first two). All six legs therefore build on one
+  machine: on Linux the two `*-apple-darwin` and two `*-pc-windows-msvc`
+  targets cannot cross-compile, so a tag push (the repo carries release
+  tags and an active publish surface) fails the build job and the
+  publish job (`needs: [build, verify]`) never runs;
+  `check-release-surfaces.sh` greps strings and cannot catch it.
+  Acceptance: every matrix leg that declares an `os:` runs on a runner
+  matching it (self-hosted per-target labels or `${{ matrix.os }}`
+  equivalents under the operator's policy), plus a guard that fails when
+  a job's matrix defines `os:` while its `runs-on` does not reference
+  `matrix.os` (respecting the documented self-hosted exceptions).
+  Evidence: a dry-run/act or CI run showing all six legs scheduled on
+  distinct runners; the guard green on the shipped tree and red on an
+  injected unwired matrix; artifact names for all four targets present
+  on the next release tag. (Status change, 2026-09-14, cycle 7 / CU-24:
+  `runs-on: ["self-hosted", "${{ matrix.os }}"]` wires every leg under
+  the operator's self-hosted-only policy — both labels required; new
+  guard `scripts/ci/check-release-matrix-wiring.sh` runs as a ci.yml
+  step and is proven green on the shipped tree and red on injected
+  include-style and classic unwired matrices. The
+  legs-scheduled-on-distinct-runners and next-tag-artifacts evidence
+  remains PENDING — it needs a real Actions run and a tag push, both
+  outside this cycle's permitted phases, plus the operator labeling
+  their self-hosted fleet with the matrix `os:` values. See
+  `docs/stewardship/2026-09-14-cycle7-learnings.md`.)
+- **Baseline artifact must be an agenttrace report** (pass-11 F11-3;
+  robustness/DX residual of the CU-8 gate family).
+  `add_baseline_comparison` (`reports.rs:700-716`) accepts any JSON —
+  object or array — as a baseline, so a non-report file becomes an
+  all-zero baseline and yields a misleading regression verdict with exit
+  2 (live: `not-a-report.json` gate-fails with nonsense deltas instead
+  of a clear error). Acceptance: require the report schema (kind/version
+  marker or sessions-with-metrics shape) and fail with a named, actionable
+  error before any comparison; document the accepted shapes next to
+  `--baseline`. Evidence: tests for non-report JSON, an array-of-numbers
+  file, and a valid report; the live repro inverted to a clean error.
+  (Status change, 2026-09-14, cycle 7 / CU-26: implemented — the
+  baseline must parse as JSON and contain the `summary` object the
+  comparator reads (acceptance's "kind/version marker" narrowed to
+  the exact consumed shape); the named actionable error names the
+  export command; tests cover object/array/string/truncated inputs
+  plus the valid path; live inversion confirmed. Awaiting
+  commit/review/shipping.)
+- **One token estimator for utilization** (pass-11 F11-4, LOW;
+  consistency). `context_utilization` divides bytes by two
+  (`diagnostics.rs:771-800`) while `estimate_tokens_from_text`
+  (`lib.rs:582`) is CJK-aware, so CJK-heavy sessions misstate
+  `utilization_pct` and its risk level by up to ~2×; the same function
+  hardcodes a 131,072-token window fallback that candidate 4's
+  models.dev context-limit metadata should replace. Acceptance: the
+  history term flows through `estimate_tokens_from_text`, the window
+  comes from per-model metadata with the fixed fallback last, and a
+  CJK-heavy fixture pins utilization within tolerance of the estimator.
+  Evidence: a unit test comparing both paths on a CJK fixture; a report
+  showing per-model windows once candidate 4 lands.
+- **Oh My Pi leading non-session lines** (research pass 9; upstream PR
+  #284, merged 2026-09-11 as `6848aa1` — the single upstream commit the
+  fork lacks). Reproduces in the fork: an Oh My Pi JSONL whose first line
+  is a `type: "title"` object aborts with `Error: oh_my_pi: missing
+  session header` (`parser.rs:1325`); upstream skips lines until the
+  first `type: "session"` object. Acceptance: port `6848aa1`'s skip
+  loop (or equivalent) with the reproducer landed as a fixture
+  (three-line file: title, session header, one exchange), and a contract
+  note in the change description that the port tracks `6848aa1`.
+  Evidence: `/tmp/at-adv/omp.jsonl` parses to one session after the
+  port; the regression fixture green in CI. (Status change, 2026-09-14,
+  cycle 7 / CU-25: ported minimally at the leading-line arm only — the
+  identical bail string in the end-of-file arm is a different defect
+  class and stays; fixture `testdata/oh-my-pi-title-prefix.jsonl`
+  (title, session header, one exchange with nested `message` objects)
+  plus a contract test; the change description cites `6848aa1` in the
+  implementation record. Note: `/tmp/at-adv/omp.jsonl` itself uses
+  flat (non-nested) message lines, so post-port it surfaces the
+  pre-existing `no parseable events` class — the landed fixture is the
+  valid wire shape. Awaiting commit/review/shipping.)
 
 ### Capability lane (researched, prioritized)
 
@@ -975,7 +1156,11 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   percentage math against a known model ceiling. Strengthened by research
   pass 5: models.dev now lists 212 providers / 7,492 models (7,056 with
   cost) and ccusage adopted it as a pricing source (v20.0.18) — priority
-  raised; it is the ecosystem's default second source.
+  raised; it is the ecosystem's default second source. Strengthened by
+  research pass 9: the catalog's `api.json` also publishes per-model
+  context-window limits — fold F11-4's utilization fix (the hardcoded
+  131,072 fallback at `diagnostics.rs:780`) into this candidate so the
+  second source upgrades both pricing and window metadata at once.
 - **Upstream format canary** (research candidate 5). Acceptance: a
   quarantined, network-explicit CI workflow parses live upstream session
   samples and fails loudly on coverage or label drift; the default test
@@ -1011,7 +1196,11 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   cost, sessions, LOC, and tool decisions; traces beta), strengthening the
   ingest half's live-producer posture; and the dedicated conventions repo
   now marks many `gen_ai.*` attributes Stable while remaining tagless, so
-  the tag-gated pin stands.
+  the tag-gated pin stands. Research pass 9: re-checked the dedicated
+  repo's agent/framework spans page (`gen-ai-agent-spans.md` —
+  create/invoke agent, execute tool, plan) — still **Development**
+  status, no stable tag, so nothing changes: the pin stays tag-gated
+  and the agent-span shape is not adopted.
 - **Shareable baseline config and multi-machine merge** (research candidate
   7). Acceptance: a committed `.agenttrace.toml` carries gate thresholds,
   pricing overrides, and model aliases with defined precedence over flags;
@@ -1117,6 +1306,10 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   transcript-recorded `gitBranch` in `--delivery-evidence` over
   git-timestamp correlation, falling back with an explicit label.
   Evidence: fixtures with and without the field; the fallback labeled.
+  Strengthened by research pass 9: claude-code-cost ships per-project
+  and per-branch cost attribution off the same Claude-recorded branch
+  metadata — a second shipped implementation ranking the
+  transcript-recorded path over git correlation.
 - **Reconcile against Claude Code's own totals** (research candidate 17;
   the Claude sibling of "Trust upstream totals").
   `~/.claude/stats-cache.json` publishes `totalSessions`,
@@ -1190,7 +1383,11 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   in this environment, so the lane should add an advisory-scan CI job
   alongside the bumps. Research pass 8: upstream's dependabot queue
   still holds #278/#279 plus `actions/checkout` 6→7 (#259, open since
-  June) — fold all three.
+  June) — fold all three. Research pass 9: the queue is unchanged
+  (re-checked 2026-09-14) and upstream is active again (PR #284
+  merged 2026-09-11), so the merges are reachable again — target set
+  stays #279 (crossterm 0.29.0, rusqlite 0.40.2, clap 4.6.3, serde/
+  thiserror) plus #278/#259.
 - **Cost provenance for priced sessions** (research candidate 24,
   confidence 86%; implements the promotion path named in issue #103).
   The vendored snapshot collapses every provider of a model onto one bare
@@ -1206,7 +1403,14 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   `has_specific_price` coverage made honest. Evidence: the research-pass-4
   glm-4.7 reproducer prices at the chosen provider's rate with provenance
   fields present; the snapshot regenerated with `PRICING_SNAPSHOT_DATE`
-  kept in sync (see the hardening item above).
+  kept in sync (see the hardening item above). Strengthened by research
+  pass 9: upstream promoted #103 on 2026-07-19 with acceptance language
+  nearly identical to this candidate, and the community schema proposal
+  there adds `cost_provenance.{cost_source, pricing_catalog_source,
+  pricing_match_status, requested_model, matched_model, confidence}`
+  plus `token_provenance` — adopt that shape for the per-session object
+  (our `recent_sessions` still emits a scalar `cost`; upstream #280's
+  per-model `pricing_status`, which we share, is the model-level half).
 - **Gemini-family thinking tokens** (research candidate 25, confidence
   80%). `usageMetadata.thoughtsTokenCount` — billed at the output rate —
   is read by none of the three Gemini usage sites (`parser.rs:1779-1795`,
@@ -1259,7 +1463,12 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   the default; uniformity is the opt-in), a Remote Control session
   ignoring the selected model and running the machine default, and
   advisor-model sessions re-sending the full conversation uncached —
-  add a cache-miss-explosion fixture to the acceptance set.
+  add a cache-miss-explosion fixture to the acceptance set. Strengthened
+  by research pass 9: claude-code-cost attributes spend from *every*
+  `*.jsonl` under `~/.claude/projects` including subagent logs, and
+  upstream #103 cites Anthropic's `session-report` plugin (subagent/skill
+  attribution) — two shipped reference implementations to parity-check
+  the `by_sidechain` output against.
 - **Claude Code `modelPricing` ingestion — org-contracted rates** (research
   candidate 35, confidence high after docs confirmation; extends
   candidate 24). Since Claude Code v2.1.242 a `modelPricing` managed
@@ -1409,6 +1618,16 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   coverage. Evidence: a round-trip test on a real store capture; a
   discovery test proving the default JSON-only admission is unchanged.
   Prerequisite: a corpus — until one exists this stays parked.
+  Strengthened by research pass 9: the txcript format notes document the
+  store independently of agy — `conversations/<id>.db` with
+  `trajectory_meta` (trajectory_id; `cascade_id` = session id), `steps`
+  (one protobuf `gemini_coder.Step` per row: type tag, status,
+  CortexStepMetadata envelope, per-kind payload), and
+  `trajectory_metadata_blob` (workspace, branch, created-at) — two
+  independent descriptions agreeing lowers the reverse-engineering risk,
+  but the corpus prerequisite and the F11-1 accounting fix (which must
+  land first so the store source cannot inherit the clamp bug) still
+  gate this item.
 - **Pricing snapshot age disclosure and scheduled refresh** (research
   candidate 51, confidence high; serves open issue #103's honesty half).
   The bundled snapshot is dated `2026-09-02`
@@ -1423,6 +1642,45 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   policy) opening a PR rather than committing directly. Evidence: a test
   pinning the age computation against a fixed clock; a workflow file plus
   one opened refresh PR as the artifact.
+- **Calendar spend buckets and as-of-date pricing** (research candidate
+  53, confidence high; the display sibling of candidates 3 and 13,
+  validated twice over this pass). ccusage ships daily/weekly/monthly/
+  session reports across its 15-source matrix, and claude-code-cost
+  ships `/by-day`, `/by-week` (Monday-based), `/by-month` (UTC) views
+  plus per-project splits — while agenttrace offers `today|7d|30d|all`
+  only (`main.rs:833-835`). Separately, claude-code-cost prices every
+  response at the rate in effect on its date (bundled `ai-price-index`
+  dataset) and publishes the design argument: a catalog refresh must not
+  restate recorded history — whereas we price every historical session
+  at the current snapshot (`pricing.rs:16`, 2026-09-02), so each
+  `--update-pricing` silently restates history and breaks baselines
+  taken weeks apart. Acceptance: `--bucket day|week|month` tables over
+  the existing filtered session set (local-calendar aware, riding the
+  P3-2 fix) in text/JSON/Markdown; and an as-of-date pricing mode where
+  each session prices against the tier effective on its date, disclosed
+  in `data_health` as `pricing_basis: current|as-of-date`, with baseline
+  deltas stable across a catalog refresh under the as-of-date mode.
+  Evidence: a fixture priced under two snapshot dates asserting history
+  does not move when the catalog refreshes; a bucket test pinning
+  Monday-week and UTC-month boundaries; a parity note against ccusage's
+  day/week/month output on a shared corpus.
+- **Next-source coverage: Goose first, Amp explicitly legacy** (research
+  candidate 54, confidence medium until corpora exist). ccusage's source
+  matrix now reads Amp, Droid, Codebuff, Goose, Kilo, GitHub Copilot
+  CLI, Qwen, and Gemini — five we do not parse. Independent format
+  documentation (the txcript crate's published notes) ranks the
+  follow-ups: Amp's `~/.local/share/amp/threads/*.json` is a **legacy**
+  local store — current Amp versions are server-authoritative and
+  neither read nor write `threads/` (verified by version bisection) — a
+  weak target we should not claim; Goose sessions are the most
+  fixture-able next source (local session JSONL, documented layout);
+  Kilo/Droid/Codebuff stay census items until a corpus exists.
+  Acceptance: one new source per change unit, fixture-first (the
+  #236/#237 discipline — no docs-only support claims), README provider
+  table and `--doctor` updated in the same change, and the candidate-5
+  canary watch list extended with each new source. Evidence: a
+  synthetic-`HOME` discovery round trip per source; a hostile fixture
+  proving graceful degradation; no Amp claim landed.
 
 Candidates 41 (Windows-source leniency: BOM/UTF-16 plus the P7-1 lenient
 fallback) and 42 (baseline gate exit semantics) were filed in the
@@ -1445,11 +1703,51 @@ and 50 (CU-20 and CU-18/CU-19 — see Completed), files candidate 52
 (Antigravity store decode) and the fork dependency-review hygiene item in
 the hardening lane, and adds the F1-class prevention rule — contract
 fixtures must use wire-cased keys copied from the producer's source — to
-the cycle-6 records. Next-cycle shortlist, in dependency order: the fork
-dependency-review fix (unblocks clean merge signals for every later PR),
-ROADMAP/release-notes hygiene ride-alongs, then candidate 51 and the
+the cycle-6 records. Research pass 9 adds capability candidates 53
+(calendar spend buckets and as-of-date pricing) and 54 (next-source
+coverage: Goose first, Amp explicitly legacy) above, files the pass-11
+hardening set (F11-1 antigravity tool-success accounting, F11-2 release
+matrix runner wiring, F11-3 baseline artifact validation, F11-4 token
+estimator unification, plus the F11-5/6/7 residuals and the upstream
+PR #284 port), re-opens the pass-9 upstream-portability entry under the
+operator's self-hosted policy, and strengthens candidates 2/4/14/16/23/
+24/52 with the 2026-09-14 census (upstream active again, exactly one
+commit ahead: PR #284). Next-cycle shortlist, revised 2026-09-14 in
+dependency order: F11-1 (false gate reds poison every CI consumer),
+F11-2 (release tags currently cannot ship darwin/msvc assets), the PR
+#284 port (smallest change, unblocks merge tracking), then the standing
+items — the fork dependency-review fix, candidate 51, and the
 parse-size-cap/installer-checksum items deferred by the cycle-6
-prioritization.
+prioritization. Prioritize pass (2026-09-14, attempt
+`771eca89a7184b2d8ee16ec991244a05`) confirms that order as the
+selected cycle-7 batch — "truthful accounting and an unbroken release
+path": CU-23 (F11-1 accounting fix + mixed ok/fail fixture), CU-24
+(F11-2 matrix wiring + unwired-matrix guard), CU-25 (port `6848aa1` /
+PR #284 + regression fixture), CU-26 (F11-3 baseline validation), with
+F11-7 as a ride-along and F11-4's standalone half only if the cycle has
+room after full re-verification; the dependency wave (candidate 23),
+candidate 51, and candidate 53 stay deferred (API churn needs its own
+verification posture; 53 rides the still-open P3-2 calendar fix), and
+the fork dependency-review fix waits for a phase that may push. Full
+scoring matrix and rationale:
+`.conductor/prioritize/2026-09-14-cycle7-batch.md` (run-scoped; this
+paragraph is the durable record). Implementation pass (2026-09-14,
+attempt `0854910b02c8417199d2fa1d95ce8b62`) landed CU-23, CU-24, CU-25,
+CU-26, and the F11-7 ride-along in the run worktree with all local
+gates green (F11-4 standalone deferred, as the batch allowed); evidence:
+`.conductor/implement/2026-09-14-cycle7-implementation-record.md`
+(run-scoped). Compound pass (2026-09-14, attempt
+`e464ffa76d9e49d690dd785874b50f71`): targeted validation re-ran the
+full workspace suite 218/218 plus the workflow/script statics
+(digest-verified, zero post-implement changes); per-entry status
+annotations added above (implemented, pending runner-level CU-24
+evidence); reusable lessons and prevention rules recorded in
+`docs/stewardship/2026-09-14-cycle7-learnings.md`; next-cycle context:
+F11-4 estimator unification is now the top hardening remainder, the
+candidate-23 dependency wave (#279/#278/#272/#259) is the largest ready
+batch, the fork dependency-review fix still waits for a push-bearing
+phase, and candidate 53 still rides P3-2. Items close only when
+committed and recorded above.
 
 Items leave this section only when their acceptance criteria and evidence
 expectations are met and recorded in the Completed record above, and the

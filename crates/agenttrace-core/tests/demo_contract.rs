@@ -184,6 +184,55 @@ fn demo_baseline_comparison_is_stable_for_identical_report() {
 }
 
 #[test]
+fn baseline_comparison_rejects_non_report_json() {
+    // CU-26 (pass-11 F11-3): arbitrary JSON used to be accepted and
+    // silently compared against an all-zero baseline, producing a
+    // misleading regression verdict. Require an agenttrace report
+    // (a `summary` object).
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let thresholds = BaselineThresholds {
+        max_duration_delta_pct: 1.5,
+        max_cost_delta_pct: 2.5,
+        max_token_delta_pct: 3.5,
+    };
+
+    for (name, payload) in [
+        ("arbitrary object", "{\"foo\": 1}"),
+        ("array of numbers", "[1, 2, 3]"),
+        ("bare string", "\"not a report\""),
+        ("truncated json", "{\"summary\":"),
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "agenttrace-rust-baseline-reject-{}-{}.json",
+            name.replace(' ', "-"),
+            std::process::id()
+        ));
+        fs::write(&path, payload).expect("write bad baseline");
+        let err = add_baseline_comparison(&report, path.to_str().unwrap(), thresholds)
+            .expect_err("non-report baseline must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("baseline file"),
+            "{name}: unexpected error: {message}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    // A valid report baseline still compares.
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-rust-baseline-valid-{}.json",
+        std::process::id()
+    ));
+    fs::write(&path, &report).expect("write baseline");
+    let (_, breaches) = add_baseline_comparison(&report, path.to_str().unwrap(), thresholds)
+        .expect("report baseline compares");
+    assert!(!breaches.any());
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn demo_gate_fails_like_current_contract() {
     let sessions = demo_sessions().expect("demo sessions parse");
     let overview = compute_overview(&sessions);

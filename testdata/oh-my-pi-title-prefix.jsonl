@@ -1,0 +1,4 @@
+{"type":"title","title":"a session"}
+{"type":"session","id":"s1","cwd":"/w","timestamp":"2026-09-10T10:00:00Z"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-10T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-10T10:00:05Z","message":{"role":"assistant","provider":"anthropic","model":"claude-sonnet-4-5","content":[{"type":"text","text":"hello"}],"usage":{"input":10,"output":5}}}
