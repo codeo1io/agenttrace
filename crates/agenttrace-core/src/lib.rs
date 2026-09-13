@@ -11,6 +11,7 @@ mod reports;
 mod search;
 mod session_cache;
 mod sqlite_sessions;
+mod statusline;
 mod waste;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -66,6 +67,11 @@ pub use session_cache::{
     load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,
 };
 pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
+pub use statusline::{
+    load_statusline_insights, render_statusline_report, run_statusline_host,
+    statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
+    StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
+};
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language, WasteReport,
 };
@@ -1583,6 +1589,26 @@ fn severity_rank(severity: &str) -> i32 {
         "medium" => 2,
         "low" => 3,
         _ => 4,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_env {
+    /// Serializes every unit test that mutates process environment
+    /// variables (`HOME`, `XDG_*`, `AGENTTRACE_SESSION_CACHE_DIR`).
+    /// Per-module locks previously let the pricing, session-cache, and
+    /// statusline tests re-point each other's cache roots mid-flight
+    /// (observed as an intermittent `journal_roundtrip…` open failure
+    /// under the combined workspace run); one shared lock closes the
+    /// class. Poisoning is tolerated so one flaky assertion cannot
+    /// cascade.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        match ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 

@@ -154,7 +154,17 @@ struct GovernanceSnapshot {
     mcp: Option<McpGovernance>,
     context: Option<ContextTrend>,
     delivery: Option<DeliveryEvidence>,
-    delivery_pending: Option<Receiver<DeliveryEvidence>>,
+    delivery_pending: Option<Receiver<Result<DeliveryEvidence, String>>>,
+    /// Set when the background delivery worker failed or died: the
+    /// panel renders a diagnostic instead of the empty state, so a
+    /// worker failure is distinguishable from "no evidence"
+    /// (pass-11 A11-4, cycle 7).
+    delivery_error: Option<String>,
+    /// Claude Code statusline capture insights (candidate 53, cycle 7),
+    /// loaded once when the Efficiency panel first opens: the only
+    /// local source of subscription limit pressure and upstream
+    /// prompt-cache analytics. `None` = no captures on this machine.
+    statusline: Option<agenttrace_core::StatuslineInsights>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1469,6 +1479,19 @@ impl App {
     fn open_governance(&mut self, panel: GovernancePanel) {
         self.view = View::Governance(panel);
         self.scroll = 0;
+        if panel == GovernancePanel::Delivery {
+            if let Some(snapshot) = self.governance.as_mut() {
+                // Review F4 (cycle 7): re-entering the Delivery panel is
+                // the documented retry. A stale error must not survive
+                // it, and the pre-failure evidence it was hiding must not
+                // masquerade as a fresh scan — drop both so the next
+                // render spawns a new worker and shows the scan in
+                // flight. Successful, error-free states keep their cache.
+                if snapshot.delivery_error.take().is_some() {
+                    snapshot.delivery = None;
+                }
+            }
+        }
     }
 
     fn next_governance_panel(&mut self) {
@@ -1520,15 +1543,37 @@ impl App {
                 if snapshot.context.is_none() {
                     snapshot.context = Some(context_trends(&sessions));
                 }
+                if snapshot.statusline.is_none() {
+                    snapshot.statusline = agenttrace_core::load_statusline_insights();
+                }
             }
             GovernancePanel::Delivery => {
                 let (tx, rx) = mpsc::channel();
-                self.governance
-                    .as_mut()
-                    .expect("governance initialized")
-                    .delivery_pending = Some(rx);
+                let snapshot = self.governance.as_mut().expect("governance initialized");
+                // Review F4 (cycle 7): a retry re-spawns the worker; the
+                // stale error from the previous attempt must not survive
+                // the spawn, or the panel keeps showing "Evidence
+                // unavailable" while the retry is already running.
+                snapshot.delivery_error = None;
+                snapshot.delivery_pending = Some(rx);
                 thread::spawn(move || {
-                    let _ = tx.send(delivery_evidence_with_git(&sessions));
+                    // A11-4 (cycle 7): the channel carries a Result and
+                    // the worker catches its own panic, so a failed
+                    // worker surfaces as a diagnostic instead of a
+                    // silent disconnect that renders like "no
+                    // evidence".
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        delivery_evidence_with_git(&sessions)
+                    }))
+                    .map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(|value| (*value).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        format!("delivery worker failed: {message}")
+                    });
+                    let _ = tx.send(result);
                 });
             }
         }
@@ -1552,22 +1597,41 @@ impl App {
             return false;
         };
         match receiver.try_recv() {
-            Ok(delivery) => {
+            Ok(Ok(delivery)) => {
                 snapshot.delivery = Some(delivery);
+                snapshot.delivery_error = None;
+                true
+            }
+            Ok(Err(error)) => {
+                snapshot.delivery_error = Some(error);
                 true
             }
             Err(mpsc::TryRecvError::Empty) => {
                 snapshot.delivery_pending = Some(receiver);
                 false
             }
-            Err(mpsc::TryRecvError::Disconnected) => true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The worker died without reporting: a failure, not
+                // "no evidence" (A11-4).
+                snapshot.delivery_error =
+                    Some("delivery worker exited without evidence".to_string());
+                true
+            }
         }
     }
 }
 
 fn language_preference_path() -> Option<std::path::PathBuf> {
     #[cfg(test)]
-    let base = std::env::temp_dir().join(format!("agenttrace-tui-test-{}", std::process::id()));
+    // Keyed by thread id as well as process id: the test binary runs tests in
+    // parallel threads, and without the thread key one test toggling the
+    // language preference would race another test's `saved_language()` read
+    // (observed as ctrl_r_force_reload flaking under load).
+    let base = std::env::temp_dir().join(format!(
+        "agenttrace-tui-test-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     #[cfg(not(test))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)

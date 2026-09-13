@@ -122,6 +122,10 @@ agenttrace --context-trends --range 30d -f json
 
 # Correlate local Git commit timestamps with sessions (heuristic, read-only).
 agenttrace --delivery-evidence --range 30d -f json
+
+# Report subscription limit pressure and upstream prompt-cache miss
+# causes captured by the statusline hook (see "Statusline capture" below).
+agenttrace --statusline-report -f json
 ```
 
 `pricing-overrides.json` accepts `aliases` plus per-million-token `prices`:
@@ -151,6 +155,33 @@ agenttrace -f json sessions.jsonl    # -f json works
 it never filters aggregates, audit totals, or recommendations. Governance
 reports are unbounded by default — use `--sample N` for an explicitly
 disclosed bound.
+
+### Statusline capture
+
+Subscription limit windows (`5h`/`7d` usage and reset times) and Claude
+Code's prompt-cache analytics never appear in session transcripts. To capture
+them, register the bundled statusline command once in Claude Code's
+`settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "agenttrace statusline"
+  }
+}
+```
+
+Claude Code invokes the command on every prompt with a single-line JSON
+payload on stdin; agenttrace renders the status line and appends the raw
+payload to a local journal (`~/.cache/agenttrace/statusline.jsonl`, capped at
+10 MiB, oldest lines compacted away; set `AGENTTRACE_SESSION_CACHE_DIR` to
+relocate it). The command never fails the host — bad or empty input still
+exits 0 with a one-line fallback. Review what was captured with
+`agenttrace --statusline-report`, the Efficiency panel in the TUI, or
+`agenttrace --doctor` ("Statusline capture" line). See
+[docs/guides/statusline-capture.md](docs/guides/statusline-capture.md) for the
+schema and retention details.
 
 ## What you get
 

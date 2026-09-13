@@ -1054,7 +1054,10 @@ fn workspace_cards(app: &App, panel: GovernancePanel) -> Vec<(String, String, Co
         }
         GovernancePanel::Delivery => {
             let summary = governance.delivery.as_ref().map(|report| &report.summary);
-            let status = if governance.delivery_pending.is_some() {
+            let error = governance.delivery_error.as_deref();
+            let status = if let Some(_error) = error {
+                app.t("Evidence unavailable", "证据不可用")
+            } else if governance.delivery_pending.is_some() {
                 app.t("Scanning Git roots…", "正在扫描 Git root…")
             } else if summary.is_some() {
                 app.t("Evidence ready", "证据已就绪")
@@ -1065,7 +1068,9 @@ fn workspace_cards(app: &App, panel: GovernancePanel) -> Vec<(String, String, Co
                 (
                     label(app.t("Delivery status", "交付状态")),
                     status.to_string(),
-                    if summary.is_some() {
+                    if error.is_some() {
+                        Color::LightRed
+                    } else if summary.is_some() {
                         Color::LightGreen
                     } else {
                         Color::Yellow
@@ -1126,15 +1131,28 @@ pub(super) fn governance_text(app: &App, panel: GovernancePanel) -> String {
     let body = match panel {
         GovernancePanel::ActionCenter => action_center_text(governance, app.language),
         GovernancePanel::Efficiency => efficiency_text(governance, app.language),
-        GovernancePanel::Delivery => governance_loading_or(
-            governance
-                .delivery
-                .as_ref()
-                .map(|report| delivery_evidence_text(report, app.language)),
-            app.language,
-            "Correlating local Git commits in the background…",
-            "正在后台关联本地 Git 提交…",
-        ),
+        GovernancePanel::Delivery => match &governance.delivery_error {
+            Some(error) => format!(
+                "{}\n\n{error}\n\n{}",
+                app.t(
+                    "Delivery evidence worker failed; this panel has no evidence.",
+                    "交付证据工作线程失败；本面板暂无证据。"
+                ),
+                app.t(
+                    "Reopen the panel (press 7) to retry the background scan.",
+                    "重新打开本面板（按 7）可重试后台扫描。"
+                )
+            ),
+            None => governance_loading_or(
+                governance
+                    .delivery
+                    .as_ref()
+                    .map(|report| delivery_evidence_text(report, app.language)),
+                app.language,
+                "Correlating local Git commits in the background…",
+                "正在后台关联本地 Git 提交…",
+            ),
+        },
     };
     format!(
         "{}\n{}\n{}\n\n{body}",
@@ -1278,6 +1296,103 @@ fn efficiency_text(governance: &GovernanceSnapshot, language: Language) -> Strin
                 item.failed_calls,
                 item.invoked_sessions,
                 mcp_recommendation(item, language)
+            ));
+        }
+    }
+    if let Some(statusline) = governance.statusline.as_ref() {
+        lines.push(String::new());
+        lines.push(text(language, "Limits & prompt cache", "限额与提示缓存").to_string());
+        let percent = |value: Option<f64>| {
+            value
+                .map(|v| format!("{v:.0}%"))
+                .unwrap_or_else(|| "n/a".to_string())
+        };
+        let reset = |state: &Option<agenttrace_core::StatuslineRateLimitState>| {
+            state
+                .as_ref()
+                .and_then(|s| s.resets_at)
+                .map(|epoch| {
+                    chrono::DateTime::from_timestamp(epoch, 0)
+                        .map(|at| at.format("%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| epoch.to_string())
+                })
+                .unwrap_or_else(|| "n/a".to_string())
+        };
+        lines.push(format!(
+            "  {} 5h {} ({} {}) · 7d {} ({} {})",
+            text(language, "Subscription limits:", "订阅限额："),
+            percent(
+                statusline
+                    .five_hour
+                    .as_ref()
+                    .and_then(|s| s.used_percentage)
+            ),
+            text(language, "peak", "峰值"),
+            percent(statusline.five_hour_peak_used_percentage),
+            percent(
+                statusline
+                    .seven_day
+                    .as_ref()
+                    .and_then(|s| s.used_percentage)
+            ),
+            text(language, "peak", "峰值"),
+            percent(statusline.seven_day_peak_used_percentage)
+        ));
+        lines.push(format!(
+            "  {} {} · {} {}",
+            text(language, "resets", "重置"),
+            reset(&statusline.five_hour),
+            text(language, "/", "和"),
+            reset(&statusline.seven_day)
+        ));
+        for crossing in statusline.limit_crossings.iter().take(5) {
+            lines.push(format!(
+                "  {} {} {}: {} -> {}",
+                text(language, "reset crossed", "重置已过"),
+                crossing.window,
+                chrono::DateTime::from_timestamp(crossing.resets_at, 0)
+                    .map(|at| at.format("%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| crossing.resets_at.to_string()),
+                percent(crossing.used_percentage_before),
+                percent(crossing.used_percentage_after)
+            ));
+        }
+        for cache in statusline.session_caches.iter().take(5) {
+            let hit = cache
+                .hit_ratio
+                .map(|ratio| format!("{:.0}%", ratio * 100.0))
+                .unwrap_or_else(|| "n/a".to_string());
+            let misses = cache
+                .misses
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            let mut line = format!(
+                "  {} {}: {} {}={}",
+                text(language, "session", "会话"),
+                cache.session_id,
+                hit,
+                text(language, "misses", "未命中"),
+                misses
+            );
+            if !cache.last_miss_causes.is_empty() {
+                line.push_str(&format!(
+                    " ({} {})",
+                    text(language, "last miss", "最近未命中"),
+                    cache.last_miss_causes.join(", ")
+                ));
+            }
+            lines.push(line);
+        }
+        if !statusline.miss_causes.is_empty() {
+            let causes = statusline
+                .miss_causes
+                .iter()
+                .map(|(cause, count)| format!("{cause} x{count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "  {}: {causes}",
+                text(language, "miss causes", "未命中原因")
             ));
         }
     }

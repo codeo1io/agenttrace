@@ -69,6 +69,12 @@ struct Args {
     update_pricing: bool,
     #[arg(long = "test-match")]
     test_match: bool,
+    /// Report on the Claude Code statusline capture journal (candidate
+    /// 53, cycle 7): limit-pressure windows, reset crossings, and
+    /// per-session prompt-cache miss causes recorded by
+    /// `agenttrace statusline`.
+    #[arg(long = "statusline-report")]
+    statusline_report: bool,
     #[arg(long)]
     version: bool,
     #[arg(long)]
@@ -153,6 +159,13 @@ fn run() -> anyhow::Result<()> {
         write_stdout(&format!("agenttrace v{}\n", VERSION))?;
         return Ok(());
     }
+    // `agenttrace statusline` is a Claude Code statusLine host command
+    // (roadmap candidate 53, cycle 7), not a report action: it must run
+    // before action validation and never fail the host — the status
+    // line would otherwise hang or error on every prompt.
+    if args.path.as_deref() == Some("statusline") {
+        return agenttrace_core::run_statusline_host();
+    }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
     if args.sample == Some(0) {
@@ -207,6 +220,13 @@ fn run() -> anyhow::Result<()> {
 
     if args.list_models {
         write_stdout(&render_model_pricing_list())?;
+        return Ok(());
+    }
+
+    if args.statusline_report {
+        let out = agenttrace_core::render_statusline_report(&args.format)?;
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
         return Ok(());
     }
 
@@ -723,7 +743,6 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--baseline-max-duration-delta-pct"
             | "--baseline-max-cost-delta-pct"
             | "--baseline-max-token-delta-pct"
-            | "--no-baseline-gate"
             | "--lang"
             | "--range"
             | "--project"
@@ -1141,6 +1160,7 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
         args.doctor,
         args.list_models,
         args.test_match,
+        args.statusline_report,
         args.version,
         args.search
             .as_deref()
@@ -1357,6 +1377,58 @@ mod tests {
     }
 
     #[test]
+    fn go_flag_shim_keeps_boolean_no_baseline_gate_before_value_flags() {
+        // A11-5 (cycle-4 review F2, found twice): --no-baseline-gate is a
+        // boolean, but it sat in flag_takes_value, so the shim consumed
+        // the next token and silently dropped the flags after it — the
+        // documented CI recipe
+        // (--no-baseline-gate --baseline X --overview -f json) died with
+        // the misleading "--baseline requires --overview -f json".
+        // Leading placement: every later flag must survive the shim.
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--no-baseline-gate"),
+            OsString::from("--baseline"),
+            OsString::from("base.json"),
+            OsString::from("--overview"),
+            OsString::from("-f"),
+            OsString::from("json"),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("--no-baseline-gate"),
+                OsString::from("--baseline"),
+                OsString::from("base.json"),
+                OsString::from("--overview"),
+                OsString::from("-f"),
+                OsString::from("json"),
+            ]
+        );
+
+        // Trailing placement must keep working: the boolean ends the
+        // line without consuming anything.
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--overview"),
+            OsString::from("-f"),
+            OsString::from("json"),
+            OsString::from("--no-baseline-gate"),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("--overview"),
+                OsString::from("-f"),
+                OsString::from("json"),
+                OsString::from("--no-baseline-gate"),
+            ]
+        );
+    }
+
+    #[test]
     fn conflicting_report_actions_are_rejected() {
         let mut args = compare_args(None);
         args.sessions = true;
@@ -1456,6 +1528,7 @@ mod tests {
             latest: false,
             waste: false,
             list_models: false,
+            statusline_report: false,
             update_pricing: false,
             test_match: false,
             version: false,

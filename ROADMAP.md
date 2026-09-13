@@ -169,6 +169,60 @@ discovery gap (Gemini CLI `~/.gemini/tmp` and Antigravity
 while the formats parse fine) and re-censused the landscape (ccusage 18.3k★,
 codeburn 10.7k★, upstream master unmoved at `e005952` since the fork point).
 
+Updated again 2026-09-03 after cycle 6 and assessment pass 10. Cycle 6
+shipped CU-17..CU-22 as commit `bfa4f22` ("fix: restore portable CI
+runners, bill thinking tokens, and bound the cache by bytes"; stacks on
+`696206f`; 213/213 tests, fmt/clippy clean, and the fork PR #2 CI job
+"Test and build" green on the exact sha — run 33675196174 — including
+the first live pass of CU-17's portable-runner guard on a GitHub-hosted
+`ubuntu-latest`). Pass 10's adversarial review re-verified every
+cycle-6 claim live and found one required pre-commit fix (**F1**: the
+VIEW_FILE trajectory step used `absolutePathURI` while the wire key is
+`absolutePathUri` — wire-case mismatch silently dropped the step),
+which final validation reproduced, fixed (`parser.rs:517` wire-case
+primary with the wrong-case tolerated as an alias), and pinned with a
+unit test plus a wire-case contract fixture. Records:
+`docs/stewardship/2026-09-03-cycle6-{prioritization,
+stewardship-request,implementation-record,full-suite-validation,
+independent-review,final-validation,reconciliation}.md`. New context
+filed below: candidate 52 (the Antigravity SQLite/protobuf store decode
+that CU-19 deliberately did not fake), the fork dependency-review
+hygiene item (an environmental red check on every fork PR), and the
+F1-class prevention rule (contract fixtures must use wire-cased keys
+copied from the producer's source). The local full-suite replication
+of the ci.yml `test` job matched the remote run exactly (213/213, same
+21-step ledger) — the replication is now the pre-push gate of record.
+
+Updated 2026-09-14 after cycle 7 (trustworthy capture). Cycle 7
+shipped the hardening-first batch on top of `df3b621`: the Go-flag shim
+`--no-baseline-gate` misregistration (both lineages — cycle-4
+independent-review F2 and pass-11 A11-5 — closed by one fix), symlinked
+session-root discovery (Codex `#42135`; both walks follow symlinked
+child directories, cycles terminate, stored listings from the
+pre-symlink walker are invalidated by a `dir_listing_version` bump,
+doctor names link targets), the statusline capture surface (candidate
+53: `agenttrace statusline` host command, a bounded 10 MiB JSONL
+journal, `--statusline-report`, doctor section, TUI Efficiency block —
+subscription limit pressure and upstream prompt-cache analytics, the
+two most-repeated "cannot see this" admissions, now sourced),
+cache-bound accounting over the deduplicated key union with headerless
+entries correctly ordered oldest (A11-2, subsuming cycle 7 F5-5's
+headerless-entry semantics), TUI delivery-worker failures surfaced as
+diagnostics instead of empty states (A11-4), and installer parity
+(release checksum verification in `install.sh`, `chmod 0755`
+umask-independence). Ride-alongs: the pricing snapshot refreshed to
+2026-09-13 (2,458→2,755 chat models) with age disclosed in `--doctor`,
+the never-true `AGENTTRACE_TUI_REAL_DIR` CI gate now reads the
+repository variable, and dependency review skips fork PRs instead of
+painting them red. Local full-suite replication: 230/230 tests,
+fmt/clippy clean, and all ten `scripts/ci/check-*.sh` green against the
+release build. Records:
+`docs/stewardship/2026-09-14-cycle7-*.md` and
+`docs/decisions/2026-09-14-cycle-7-batch-selection.md`. Statusline
+fixtures are schema-faithful to the documented payload contract, not
+recordings of a real host — disclosed in
+`docs/guides/statusline-capture.md`.
+
 ### Completed in cycle 1 (recorded 2026-09-02)
 
 Preserved history; each entry names the evidence that closed it, as
@@ -428,6 +482,80 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   cycle 4: all three residuals closed (CU-10 for the lookbehind and
   the schema bump, CU-9 for the sweep — see Completed).
 
+### Completed in cycle 6 (recorded 2026-09-03)
+
+Cycle 6 is commit `bfa4f22` (parent `696206f`; fork branch
+`fix/portable-runners-thinking-tokens-cache-bytes`, fork PR #2),
+verified 213/213 tests, fmt clean, the CI clippy invocation clean, and
+independently re-verified by pass-10 review plus final validation
+(including a release-mode test run and a PTY TUI smoke). The fork CI
+"Test and build" job passed on the exact pushed sha (run 33675196174,
+GitHub-hosted `ubuntu-latest`). Record:
+`docs/stewardship/2026-09-03-cycle6-implementation-record.md`.
+
+- **Upstream-portable branch and CI hygiene** (pass-9, CRITICAL). Closed
+  with CU-17: all five `runs-on: self-hosted` occurrences (ci.yml:21,
+  dependency-review.yml:16, release.yml:13/40/117 — commit `6632014`'s
+  contamination, the exact cause upstream PR #282 was closed for) are
+  reverted to `ubuntu-latest`; new guard
+  `scripts/ci/check-no-self-hosted.sh` (narrow `runs-on:.*self-hosted`
+  pattern, file:line output) runs as a CI step in ci.yml; and local
+  `master`'s tracking was repointed to the fork (`branch.master.remote
+  = fork`, environment-only config, never committed). Evidence: the guard
+  exits 0 on the shipped tree and exits 1 with a precise file:line on a
+deliberate contamination; the CI step itself is green in run 33675196174
+  on `CARGO_HOME=/home/runner/.cargo`; the reconciliation shows upstream
+  `e005952` unmoved and zero upstream pushes or PRs.
+- **Gemini CLI `~/.gemini/tmp` discovery root** (candidate 50, first
+  half). Closed with CU-18: `known_session_dirs()` gains the root with
+  the existing chats/checkpoints gating; contract tests discover, parse
+  (`gemini_cli`), and flow `thoughtsTokenCount` into the CU-20 breakdown
+  end to end; the new fixture `testdata/gemini-thoughts-checkpoint.json`
+  pins the shape. The README's "reads … Gemini CLI …" claim is live
+  again.
+- **Antigravity conversations root + trajectory sidecars** (candidate 50,
+  second half). Closed with CU-19: `~/.gemini/antigravity-cli/
+  conversations/` is a known session dir; new parser
+  `parse_antigravity_trajectory` (dispatched from the single-object
+  branch of `parse_raw_session`, `parser.rs:403`) sniffs
+  `CORTEX_STEP_TYPE_*` + `metadata.createdAt` (both required) and maps
+  USER_INPUT/PLANNER_RESPONSE (thinking → reasoning, toolCalls parsed)/
+  RUN_COMMAND (non-zero exitCode → failed)/ERROR_MESSAGE/VIEW_FILE
+  (line ranges). Admission stays JSON-only — `.db`/`.pb` never enter
+  discovery (contract-asserted); the store's real shape was documented
+  from the agy reference implementation (`internal/daemon/types.go`),
+  not invented. Includes the F1 fix: the VIEW_FILE wire key is
+  `absolutePathUri` (producer-verified) with the wrong-case spelling
+  tolerated as an alias — pinned by a wire-case contract fixture that
+  failed loudly before the fix. Residual, filed as candidate 52: full
+  SQLite/protobuf store decode.
+- **Gemini-family thinking tokens** (candidate 25). Closed with CU-20:
+  `thoughtsTokenCount` is billed into output and surfaced as
+  `tokens_reasoning` (serde-default additive field; schema stays 17) with
+  `reasoning_share_pct` in `--audit`/overview; gemini-3.x fixtures landed
+  (`testdata/gemini-thoughts-checkpoint.json` plus contract fixtures);
+  live audit shows reasoning 40 / share 50.0 on the fixture corpus. The
+  changelog note that baselines shift is covered by this roadmap record
+  and the release-notes naming below.
+- **`--sample` disclosure names the active view** (pass-9; F8-1
+  residual). Closed with CU-21: the exclusion reason renders the active
+  sort/order (default view discloses `--sort recent --order desc`),
+  verified live in both the single-view and `--compare` twin paths
+  (`main.rs:251`/:294) and pinned by the extended
+  `governance_sampling_is_explicit_and_disclosed` CLI test including
+  the previously unpinned `--compare` string.
+- **Session-cache byte ceiling** (pass-9; F8-3 follow-on). Closed with
+  CU-22: `MAX_SESSION_CACHE_BYTES = 64 MiB` enforced at save via
+  `enforce_byte_bound` (oldest-source-mtime first, same policy as the
+  count bound), surfaced in `--doctor` alongside the entry bound.
+  Evidence: a unit test constructing over-ceiling entries asserts the
+  persisted size stays under the ceiling; the doctor output prints the
+  bound.
+
+Release-notes naming: "restore portable CI runners, bill thinking
+tokens, and bound the cache by bytes" is the commit subject on fork PR
+#2, and the per-CU detail lives in the PR body and the cycle-6 records.
+
 ### Hardening lane
 
 - **Local-calendar day windows** (pass-3 P3-2). `--range today` and its
@@ -536,7 +664,11 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   exercises the declared MSRV. Evidence: per-OS directory-resolution
   unit tests including a `HOME`-unset case asserting the Windows fallback
   chain; a checksum test vector; a CI MSRV job that fails when the
-  toolchain drops below `rust-version`.
+  toolchain drops below `rust-version`. Status note, pass 11: re-verified
+  live (`env -u HOME … --overview` → `Error: No session files found in `;
+  `--doctor` lists an empty Providers section with no hint that path
+  resolution failed); Windows usage widgets (`HP-AI-Usage`, `toki`) in
+  the 2026-09 ecosystem census confirm the demand pocket.
 - **No silent data loss** (assessment F16/F18, pass-2 N7, research
   candidate 6). Acceptance: skipped files and unparseable timestamps are
   counted with reasons and surfaced in `data_health`; SQLite-backed
@@ -636,7 +768,18 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   empty-directory error message ends with a dangling space (N7).
   Evidence: a CLI test asserting the early-return order; a test asserting
   the shim's truncation warning; a test asserting filter-only invocations
-  error; both message strings pinned.
+  error; both message strings pinned. Status note, pass 11 (A11-1):
+  cycle-4 independent-review F2 — the same shim misregistering
+  `--no-baseline-gate` as a value flag — was dispositioned for this
+  roadmap but never filed here while cycle 5 fixed the identical class
+  for `--sample`; it is now filed as its own hardening item below
+  ("Go-flag shim `--no-baseline-gate` misregistration"), and this
+  item's P4-2 truncation-warning acceptance should land with it.
+  Status note, cycle 7 (2026-09-14): the misregistration item below is
+  closed, but its companion P4-2 truncation warning did NOT land with
+  it — the shim still silently discards post-positional arguments
+  (verified by the cycle-7 entrypoints test, which relies on that
+  silence); P4-2/P4-3/N7 remain open here as stated.
 - **Delivery-evidence cost ceiling** (pass-2 N10). `--delivery-evidence`
   runs one synchronous `git log --all` per project root with no
   parallelism, timeout, or cap; measured 0.61s versus 0.011s for
@@ -644,7 +787,11 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   queries run concurrently under a bounded pool with a timeout, or are
   replaced by upstream-stored summary columns where the provider offers
   them (capability candidate 8). Evidence: a timing assertion on a
-  multi-root fixture; a timeout test with a stubbed slow git.
+  multi-root fixture; a timeout test with a stubbed slow git. Status
+  note, pass 11: re-verified unchanged at df3b621 (`governance.rs:779-789`,
+  serial `.output()` with no timeout over untrusted session-derived
+  roots); the TUI Delivery panel shares this path — see the
+  delivery-worker error-surfacing item below.
 - **Plumb or delete the SQLite `since` push-down** (pass-7 P7-4). The
   `since` parameter on the SQLite ingestion path is `None` at both call
   sites (`sqlite_sessions.rs:164`, `:232`), so the SQL time push-down
@@ -764,7 +911,8 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   rule 2 and rule 4 (operator approval before any upstream PR). Evidence:
   `git config branch.master.remote` prints `fork`; a grep shows zero
   `self-hosted` matches on the candidate branch; the reconciliation record
-  shows upstream `e005952` unmoved.
+  shows upstream `e005952` unmoved. Status change, cycle 6: closed (CU-17 —
+  see Completed).
 - **`--sample` disclosure must name the active ordering** (pass-9; the
   residual of the closed F8-1). The exclusion reason hard-codes
   "sampled newest {N} of {M}" (`main.rs:249-251` and `:292-294`), but the
@@ -773,7 +921,8 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   Acceptance: the reason names the active ordering (for example "sampled
   first N by sort order (name)") or `--sample` is rejected for non-time
   sorts. Evidence: a CLI test running `--audit --sort name --sample N`
-  asserting the reason string matches the sort key.
+  asserting the reason string matches the sort key. Status change, cycle
+  6: closed (CU-21 — see Completed).
 - **Untrusted git-root selection and unmemoized project resolution**
   (pass-9; extends the open N10 cost-ceiling item with a
   privacy/robustness angle). `resolve_project` walks up from the
@@ -812,7 +961,32 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   at save (evicting oldest-source-mtime entries first, same policy as the
   count bound) with the limit surfaced in `--doctor`. Evidence: a unit
   test constructing over-ceiling entries asserting the persisted size
-  stays under the ceiling; a doctor run printing the bound.
+  stays under the ceiling; a doctor run printing the bound. Status
+  change, cycle 6: closed (CU-22 — see Completed; `MAX_SESSION_CACHE_BYTES`
+  = 64 MiB, enforced at save, doctor surfaces both bounds).
+- **Fork dependency-review false red** (cycle 6 CI observation, MEDIUM
+  stewardship). The `Dependency Review` workflow fails on every fork PR
+  — "Dependency review is not supported on this repository … ensure that
+  Dependency graph is enabled" — including PR #1 (pre-existing since
+  2026-09-02) and PR #2 (run 33675196248). The check is non-required
+  (fork `master` has no branch protection), but it taints
+  `mergeStateStatus` to UNSTABLE and trains reviewers to ignore red
+  checks. Acceptance: either the workflow becomes fork-tolerant (for
+  example `continue-on-error` or an early clean exit when dependency
+  review is unsupported, without weakening the upstream check) or the
+  operator enables the dependency graph in fork
+  `settings/security_analysis`; the choice should be operator-informed
+  since it trades signal for noise. Evidence: a green (or cleanly
+  skipped) dependency-review run on a fork PR, with the upstream-run
+  behavior provably unchanged. Status note, cycle 7 (2026-09-14): the
+  workflow half landed — the review step now early-exits with an
+  explanatory note when `github.event.pull_request.head.repo.fork` is
+  true, leaving repo-owned runs byte-identical; the never-true
+  `AGENTTRACE_TUI_REAL_DIR` CI gate (pass-11 A11-8) was fixed in the
+  same pass (reads the repository variable and forwards it). The
+  run-level evidence half stays open: no fork PR exists yet to observe
+  a cleanly skipped run, and CI execution is outside this cycle's
+  gate.
 - **TUI force-reload cache race** (pass-9, INFO). The background loader
   thread owns the session cache while the main thread can clear it on a
   force reload (`app.rs:881-951`); reloads are guarded by `pending_load`,
@@ -823,6 +997,155 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   exclusively), or the race is documented as benign with a test pinning
   the worst case. Evidence: a concurrency test asserting a forced clear
   during an in-flight load cannot persist pre-clear entries.
+- **Go-flag shim `--no-baseline-gate` misregistration** (pass-11 A11-5;
+  cycle-4 independent-review F2 — now filed, closing the A11-1 tracking
+  gap). `flag_takes_value` (`main.rs:707`, entry at `:726`) lists the
+  boolean `--no-baseline-gate` (defined at `main.rs:99-100`) as
+  value-taking, so any placement before other flags silently drops
+  them. Live at df3b621: `--no-baseline-gate -f json --overview` drops
+  both flags and dies with "stdout is not a terminal"; and
+  `--no-baseline-gate --baseline X --overview -f json` exits 1 with the
+  misleading `Error: --baseline requires --overview -f json` — while
+  `docs/guides/ci-integration.md:124-127` tells users to add the flag
+  to exactly that command. Cycle 5 fixed the identical class for
+  `--sample` with a shim unit test; this original instance stayed live
+  because the cycle-4 review's F2 never reached this roadmap. Acceptance:
+  the flag is removed from `flag_takes_value`; the shim unit test covers
+  value-flag/bool-flag adjacency; CLI tests pin leading and trailing
+  placements of `--no-baseline-gate` alongside `--baseline`, `--overview`,
+  and `-f` in both orders; the `--baseline requires` error can no longer
+  fire for a command line that actually passes those flags. Evidence: the
+  pass-11 reproducers inverted (both orderings produce reports); this
+  entry itself is the A11-1 traceability repair.
+  **Closed in cycle 7 (2026-09-14), citing both lineages** — the fix
+  (`main.rs` `flag_takes_value`) removes the flag, shim unit tests pin
+  bool-flag adjacency in both orders, and the end-to-end entrypoints
+  test `no_baseline_gate_is_a_boolean_not_a_value_flag` shows the
+  post-positional `--overview` being ignored per Go semantics while the
+  session list prints; the pass-11 reproducers now produce reports in
+  both orderings. The cycle-4 F2 and pass-11 A11-5 accounts are closed
+  by this one entry and fix.
+- **Cache-bound accounting over the deduplicated key union** (pass-11
+  A11-2; the over-counting sibling of cycle-6 IR F2's under-count).
+  `enforce_byte_bound` (`session_cache.rs:652-695`) sizes eviction from
+  both `raw_entries` and `entries`, but a path decoded by `cached_entry`
+  (`session_cache.rs:549-564`) sits in both maps, so saves after cache
+  hits count it twice — near the 64 MiB bound the loop subtracts one copy
+  per drop (`:691-695`) and can evict up to ~2× the intended amount
+  (near-total eviction as true size approaches the bound);
+  `enforce_entry_bound` (`:617-648`) wastes drop slots on duplicate paths
+  and under-drops in a single pass. Acceptance: both bounds iterate the
+  deduplicated union of keys, sizing each path once (the larger of
+  raw/decoded), eviction reaches the bound in one pass, and the doctor
+  "hard bounds" wording stays truthful in both directions. Evidence:
+  unit tests with a cache whose paths exist in both maps, asserting exact
+  post-eviction membership and persisted size; the pass-11 double-count
+  trace (which paths overlap and when) as the failing-case fixture
+  design.
+  **Closed in cycle 7 (2026-09-14).** `cache_paths_sized_once` builds
+  the BTreeMap union (size = max of raw/decoded), both bounds evict
+  from it in one pass, and headerless entries order oldest
+  (`map_or(i64::MIN, |h| h.mod_time)`), building on — not reverting —
+  the F5-5 headerless-entry semantics. Tests:
+  `bounds_count_deduplicated_paths_once`,
+  `headerless_cache_entries_are_oldest_not_unevictable`,
+  `stale_dir_listings_from_the_pre_symlink_walker_are_dropped_once`.
+- **Installer mode and checksum parity** (pass-11 A11-3; completes the
+  install.sh half of the platform-parity checksum acceptance, P5-6).
+  install.sh installs the binary as mode 0711 — `mktemp` creates 0600,
+  `install.sh:53-54` only runs `chmod +x`, and the `mv` at `:66`
+  preserves it (verified live: `-rwx--x--x`) — while the npm channel
+  installs 0o755, so group/other cannot read the binary (shared
+  `/usr/local/bin` and NFS/overlay installs degraded). Acceptance:
+  install.sh sets mode 0755 before the move and verifies a published
+  SHA-256 for the downloaded asset the way npm's installer does,
+  refusing on mismatch. Evidence: a fresh-install log showing
+  `-rwxr-xr-x`; a negative test where a tampered checksum aborts the
+  install before execution.
+  **Closed in cycle 7 (2026-09-14).** `install.sh` runs
+  `chmod 0755` before the move (umask-independent) and verifies the
+  `${RELEASE_URL}.sha256` sidecar release.yml already publishes —
+  hard-failing on mismatch, warning only when the sidecar is absent
+  (older releases) or no sha256 tool exists. Live evidence via a
+  stubbed-`curl` release harness: fresh install under `umask 077`
+  yields `-rwxr-xr-x` and executes; a tampered sidecar aborts with the
+  expected/actual hashes and installs nothing; an absent sidecar warns
+  and proceeds.
+- **TUI delivery-worker error surfacing** (pass-11 A11-4). The
+  governance Delivery panel's worker is spawned as
+  `thread::spawn(move || { let _ = tx.send(delivery_evidence_with_git(&sessions)); })`
+  (`app.rs:1513-1521`) and `poll_governance_delivery` (`:1536-1553`)
+  treats `Disconnected` as completion, leaving `delivery = None` — a
+  failed or torn-down worker renders the same empty panel as a project
+  without git history, with no diagnostic. Acceptance: the channel
+  carries a `Result`/error variant rendered as a diagnostic line in the
+  panel (worker failure is distinguishable from no evidence), with
+  stderr/trace visibility for the failure. Evidence: a test injecting a
+  failing worker asserting the diagnostic line; normal-path rendering
+  unchanged. **Closed in cycle 7 (2026-09-14).** The channel carries
+  `Result<DeliveryEvidence, String>`, the worker wraps
+  `delivery_evidence_with_git` in `catch_unwind` (panics map to
+  "delivery worker failed: {message}"), `Disconnected` sets "delivery
+  worker exited without evidence", success clears the error, and the
+  panel renders "Evidence unavailable" in LightRed with the message and
+  a retry hint. Test:
+  `delivery_worker_failures_surface_as_diagnostics_not_empty_states`
+  covers Err, silent disconnect, rendered diagnostic, and the
+  successful-retry reset.
+- **Symlinked session-root discovery** (research pass 9, from Codex
+  `#42135`; the discovery half of candidate 54). Discovery walks known
+  dirs with `fs::read_dir` and tests `entry.file_type().is_dir()`
+  (`discovery.rs:379-391`), which is false for symlinks, so a symlinked
+  session root is skipped entirely — and Codex 0.153.0+ officially
+  supports symlinked session roots, making those sessions silently
+  invisible. Acceptance: top-level known-session directories resolve
+  through symlinks (loop-guarded, bounded depth), a symlinked-root
+  fixture is discovered, and doctor names symlinked roots it followed.
+  Evidence: a discovery test with a symlinked known dir; a doctor run
+  showing the resolved path.
+  **Closed in cycle 7 (2026-09-14).** Both walks resolve symlinked
+  child directories (`entry_is_dir_entry` follows the link once), a
+  canonical-target visit set terminates cycles (self- and parent-links
+  live-tested in `/tmp/symprobe`: 2 files found, 73ms), stored
+  directory listings from the pre-symlink walker are dropped via a
+  `dir_listing_version` doc bump on load (stale-walker listings
+  retired once, pinned by test), and `--doctor` renders
+  `path (symlink -> target)`. Contract tests:
+  `symlinked_child_directories_are_discovered_and_cycles_terminate`,
+  `..._resolved_through_the_cached_walk`,
+  `doctor_names_symlinked_session_roots_instead_of_silent_following`.
+- **Statusline journal concurrent-append race** (cycle-7 review F3;
+  `statusline.rs` `append_statusline_capture` +
+  `compact_statusline_capture_under`). Two concurrent `agenttrace
+  statusline` hosts (multiple Claude Code panes is the normal case)
+  racing across the 10 MiB retention bound can silently drop the
+  line one process appends between the other's `read_to_string` and
+  `fs::rename` — bounded (≤1 line per race), never corrupting
+  (temp+rename is crash-safe), but the loss is silent. Acceptance:
+  the append+compact window holds an exclusive lock on the journal
+  (or re-applies the post-read tail after rename), and a
+  concurrency test demonstrates both processes' lines surviving a
+  compaction race. Evidence: test output plus a two-process live
+  probe against a forced-small bound.
+- **Discovery walk I/O budget for symlink descent** (cycle-7 review
+  F5; `discovery.rs` `entry_is_dir_entry`). Cycle 7 made symlinked
+  session roots walkable and correct (cycles terminate), but a root
+  containing a symlink to `/` or a huge tree is now walked with no
+  per-walk entry/I/O budget — bounded only by
+  `max_session_dir_depth` and the canonical-visit set. Acceptance: a
+  documented per-walk budget (entries visited and/or bytes read)
+  with a named diagnostic when exceeded, plus a test with a symlink
+  to a synthetic wide tree proving the walk stops at the budget
+  instead of grazing the filesystem.
+- **Doctor output portability for path pinning** (cycle-7 review F7;
+  `doctor.rs` statusline section). `--doctor` (including
+  `--doctor --demo`) prints machine-local absolute cache paths
+  (`/home/<user>/.cache/agenttrace/statusline.jsonl`) — pre-existing
+  behavior, currently unpinned by the deterministic-output checks,
+  but any future doctor-output pinning must either
+  path-normalize or exclude those lines. Acceptance: a decision
+  recorded here (normalize vs exclude) before any doctor pin is
+  added to `scripts/ci/check-deterministic-output.sh`.
 
 ### Capability lane (researched, prioritized)
 
@@ -1099,7 +1422,7 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   into output with a reasoning breakdown, gemini-3.x fixtures, reasoning
   share in `--audit`, and a changelog note that baselines shift.
   Evidence: a fixture with `thoughtsTokenCount` asserting the output
-  includes it.
+  includes it. Status change, cycle 6: closed (CU-20 — see Completed).
 - **Qwen Code dual-output transcripts** (research candidate 26,
   confidence 62%; radar issue #237). Qwen Code documents Dual Output
   `--json-file` as "a canonical machine-readable transcript" and changed
@@ -1238,7 +1561,14 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   `cost_basis: flat|tiered|estimated` (also serving open issue #103).
   Evidence: rate-table tests per tier family; a >272k-context session
   priced at the tiered rate; a report showing `cost_basis`
-  provenance.
+  provenance. Status change, research pass 9: the catalog's tiering went
+  mainstream — quantified 2026-09-14, LiteLLM carries 3,923 keys (+11.5%
+  in 12 days) with context-tiered *base* input/output on 101/81 models
+  (`input_cost_per_token_above_200k_tokens`), priority service tiers on
+  ~115, `above_1hr` cache writes on 147, flex variants on ~45, and
+  reasoning output on 72; models.dev independently models tiers on 453
+  models and `context_over_200k` cost on 397. Candidate 56 below widens
+  this item's scope to those families.
 - **Codex zstd rollout handling** (research candidate 44, confidence
   high; the first live catch for candidate 5's canary). Codex merged
   zstd-compressed rollout session files on 2026-08-28 (openai/codex PR
@@ -1253,7 +1583,12 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   error (or parsing, in the full cut); a canary test pinning the
   behavior. Status change, cycle 5: the minimum acceptance is met (CU-16 —
   see Completed; zstd magic sniffed with a named, actionable error); the
-  full decode cut remains this item's open half.
+  full decode cut remains this item's open half. Status change, research
+  pass 9: compression shipped in stable 0.153.0 (2026-09-03) and was
+  extended to shared lineages (`#42039`), with `codex exec resume`
+  handling compressed rollouts (`#42135`); the same release made
+  symlinked session roots official and persisted response token usage
+  in rollout history (`#41912`) — both filed as candidate 54 below.
 - **Gemini CLI and Antigravity conversations discovery roots** (research
   candidate 50, confidence 100% — verified live; upstream radar #236).
   Auto-discovery finds neither `~/.gemini/tmp` (Gemini CLI's session
@@ -1275,7 +1610,23 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   come from or be validated against a real `conversations/` file, since
   the committed fixture covers the brain/log shape. Evidence: the
   synthetic-`HOME` reproducer inverted (found > 0 for both roots); unit
-  tests pinning the root list; the fixture round trip.
+  tests pinning the root list; the fixture round trip. Status change,
+  cycle 6: closed (CU-18/CU-19 — see Completed; the pass-9 acceptance is
+  met for the documented JSON sidecar surface, and the full
+  SQLite/protobuf store decode is filed as candidate 52 below).
+- **Antigravity SQLite/protobuf store decode** (candidate 52, cycle 6;
+  the open half of candidate 50). CU-19 admitted only the documented
+  JSON `<uuid>.trajectory.json` sidecars; the real conversation store is
+  an undocumented SQLite `.db` (`user_version=1`, 7 tables) whose blobs
+  are protobuf `.pb`, documented so far only via the agy reference
+  implementation (`internal/daemon/types.go`; agy 1.1.23) — gstack
+  #1977. Acceptance: schema reverse-engineered against a real corpus
+  (at least one real `conversations/` directory, not synthetic), decode
+  gated behind a feature flag with `.db`/`.pb` still rejected by
+  default, and a provenance line disclosing sidecar-versus-store
+  coverage. Evidence: a round-trip test on a real store capture; a
+  discovery test proving the default JSON-only admission is unchanged.
+  Prerequisite: a corpus — until one exists this stays parked.
 - **Pricing snapshot age disclosure and scheduled refresh** (research
   candidate 51, confidence high; serves open issue #103's honesty half).
   The bundled snapshot is dated `2026-09-02`
@@ -1289,7 +1640,122 @@ Record: `docs/stewardship/2026-09-03-cycle5-implementation-record.md`
   scheduled quarantined workflow (network-explicit, like the canary
   policy) opening a PR rather than committing directly. Evidence: a test
   pinning the age computation against a fixed clock; a workflow file plus
-  one opened refresh PR as the artifact.
+  one opened refresh PR as the artifact. Status note, research pass 9:
+  the staleness widened — the catalog grew 3,518 → 3,923 keys in the 12
+  days since the 2026-09-02 snapshot. Status note, cycle 7
+  (2026-09-14): the local half landed — snapshot refreshed to 2026-09-13
+  (2,458 → 2,755 chat models; the pass-9 3,923 figure counts all
+  catalog keys including non-chat/unpriced entries) and `--doctor`
+  now carries "Pricing snapshot: LiteLLM snapshot <date> (bundled, N
+  models, M days old)". The `data_health` line and the scheduled
+  quarantined workflow (network-explicit, PR-opening) remain this
+  item's open half.
+- **Statusline capture mode — `agenttrace statusline`** (research pass 9
+  candidate 53, confidence high; serves candidates 3, 9, 10, and the
+  17/33/24 reconciliation anchors). Claude Code's statusline input JSON
+  (code.claude.com/docs/en/statusline; fields gated at v2.1.251+) now
+  carries the two inputs this roadmap says agenttrace cannot see:
+  `rate_limits.five_hour/seven_day.used_percentage` plus `resets_at`
+  (subscription limit pressure) and an authoritative `prompt_cache`
+  block (`warm`, `ttl`, `expires_at`, `requests`, `misses`,
+  `expected_rebuilds`, `hit_ratio`, `cache_write_tokens`,
+  `miss_recache_tokens`, `last_miss_cause.causes` such as
+  `tools_changed`, `miss_causes`, `recache_tokens_if_cold`), plus
+  `exceeds_200k_tokens`, `context_window.used_percentage`, and
+  `cost.total_cost_usd` documented as list-price-unless-`modelPricing`.
+  agenttrace has no statusline surface (grep-verified); three statusline
+  tools and a dozen limit widgets consuming this payload appeared in 11
+  days (research pass 9 §1.6). Acceptance: a `statusline` subcommand
+  that never fails the host (timeout-safe, errors to stderr only),
+  emitting a one-line status while teeing the raw payload to a bounded,
+  documented-retention local JSONL; discovery ingests the capture keyed
+  by `session_id` with overlap dedup; limit-pressure windows
+  (`resets_at` crossings) and per-session cache-miss causes appear in
+  reports and the TUI. Evidence: fixtures recorded from a real
+  v2.1.251+ session; a payload→report field test; the doc URL as the
+  schema contract.
+  **Closed in cycle 7 (2026-09-14)** — the surface landed as shipped in
+  this cycle's implementation record; one deviation from the stated
+  evidence bar, disclosed: fixtures are schema-faithful to the
+  documented payload contract (code.claude.com/docs/en/statusline),
+  not recordings of a real v2.1.251+ host (none available locally;
+  see `docs/guides/statusline-capture.md` "Honesty notes"). Live
+  host-contract verification: valid payload → one-line render, exit 0,
+  empty stderr; invalid JSON → `agenttrace` fallback line, stderr
+  diagnostic, exit 0; empty stdin → exit 0; journal honors
+  `AGENTTRACE_SESSION_CACHE_DIR`, 10 MiB bound with newest-lines
+  compaction; `--statusline-report` text+json verified live with
+  dedup disclosure; the entrypoints test
+  `statusline_host_mode_never_fails_the_host` pins the whole contract.
+- **Codex 0.153+ rollout hardening** (research pass 9 candidate 54,
+  confidence high; extends candidates 5/44). Stable 0.153.0 (2026-09-03)
+  shipped rollout compression including shared lineages (`#42039`),
+  made symlinked session roots official (`#42135`), and persists
+  response token usage in rollout history (`#41912`) — while the parser
+  reads usage only via `event_msg`/`token_count`
+  (`parser.rs:2131`, `:2244`). Acceptance: symlinked known dirs resolve
+  (filed as the hardening item above); token totals from a real 0.153+
+  rollout match `codex exec`'s own accounting, or the delta is explained
+  and disclosed; the zstd named-error path (CU-16) stays pinned.
+  Evidence: a 0.153+ rollout fixture; a symlinked-root discovery test;
+  the three PR links.
+- **OTel GenAI exporter pilot** (research pass 9 candidate 55; extends
+  candidate 2). GenAI semantic conventions moved to a dedicated repo
+  (`open-telemetry/semantic-conventions-genai`; spans, metrics, and
+  events for GenAI clients and MCP, provider conventions, Python
+  reference implementations; still no tags). Acceptance: an experimental
+  `--export-otel` emits spans/metrics for parsed sessions with field
+  names generated from the upstream YAML (drift-checked, not
+  hand-copied), labeled experimental until a tag exists; an OTLP file
+  round-trip that a collector accepts. Evidence: the generated-constants
+  build step and its drift check; a collector round-trip artifact.
+- **Tier- and service-tier pricing `Price` v2** (research pass 9
+  candidate 56; widens candidate 43, which keeps its cache-tier
+  acceptance). Quantified 2026-09-14: context-tiered *base*
+  input/output pricing on 101/81 models, priority service tiers on ~115,
+  `above_1hr` cache writes on 147, flex on ~45, reasoning output on 72
+  (LiteLLM, 3,923 keys, +11.5% in 12 days); models.dev independently
+  carries tiers on 453 models, `context_over_200k` cost on 397,
+  reasoning on 151; Claude Code now compacts near the 1M-token limit and
+  exposes `exceeds_200k_tokens`, so >200k contexts are routine.
+  Acceptance: `Price` v2 represents duration-tiered cache writes,
+  context-tiered base prices, priority/flex service tiers, and reasoning
+  output — with an explicit fallback to today's flat rate when a
+  session's tier is unknown, and a disclosure of which tiers applied
+  (extending candidate 15's `cost_basis`); totals for tier-free corpora
+  are bit-identical to today. Evidence: rate-table tests per tier
+  family; a >200k-context fixture priced at the tiered rate with the
+  disclosure; a before/after comparison on the operator corpus.
+- **`agenttrace mcp` against the stateless 2026-07-28 spec** (research
+  pass 9 candidate 57; reshapes candidate 19). MCP revision 2026-07-28
+  removed the initialize handshake (stateless requests carrying version
+  and capabilities in `_meta`), added `server/discover`, `resultType`,
+  and mandatory `CacheableResult` (`ttlMs`/`cacheScope`) on list
+  endpoints; OTel `traceparent`/`tracestate`/`baggage` in `_meta` are
+  now documented. Precedent: `agentic-usage-hub` ships usage analytics
+  over MCP. Acceptance: a stateless server exposing
+  sessions/overview/waste queries with `ttlMs` hints, specced against
+  2026-07-28 with a documented 2025-11-25 fallback posture via
+  `server/discover`; an end-to-end test with an MCP client. Evidence:
+  the spec changelog links; the working server artifact and client
+  transcript.
+- **Hermes plugin-manager channel for the skill surface** (research pass
+  9 candidate 58; de-risks candidate 37). `hermes plugins install
+  VasiHemanth/tokentelemetry-hermes-plugin` (competitor README,
+  fetched) proves the Hermes plugin manager installs analytics tools
+  from GitHub repos; agenttrace already ships `skills/`. Acceptance:
+  `hermes plugins install <agenttrace-skill-repo>` works end to end,
+  the skill wraps documented CLI commands only, and versioning follows
+  the CHANGELOG gate (`check-plugin-version.sh`). Evidence: the recorded
+  install and a wrapped-command session; the skill repo artifact.
+- **Antigravity store decode via a second public reference** (research
+  pass 9 candidate 59; relaxes candidate 52's corpus prerequisite).
+  TokenTelemetry (353★, Python) marks Antigravity "fully supported" and
+  ships `backend/test_antigravity_cli.py` — a public second reference
+  beside agy's `internal/daemon/types.go`. Acceptance: unchanged from
+  candidate 52 plus parsed totals agreeing with tokentelemetry on a
+  shared fixture; still feature-gated off by default. Evidence: a
+  cross-implementation agreement artifact; both reference links.
 
 Candidates 41 (Windows-source leniency: BOM/UTF-16 plus the P7-1 lenient
 fallback) and 42 (baseline gate exit semantics) were filed in the
@@ -1307,7 +1773,77 @@ files pass-9 hardening items (upstream-portable branch and CI hygiene,
 Hermes tool-failure signal, cache byte ceiling, TUI reload race) in the
 hardening lane, and strengthens candidates 2/3/19/23/26 with the
 current census (ccusage 18.3k★, codeburn 10.7k★, upstream master
-unmoved at `e005952` since the fork point).
+unmoved at `e005952` since the fork point). Cycle 6 closes candidates 25
+and 50 (CU-20 and CU-18/CU-19 — see Completed), files candidate 52
+(Antigravity store decode) and the fork dependency-review hygiene item in
+the hardening lane, and adds the F1-class prevention rule — contract
+fixtures must use wire-cased keys copied from the producer's source — to
+the cycle-6 records. Next-cycle shortlist, in dependency order: the fork
+dependency-review fix (unblocks clean merge signals for every later PR),
+ROADMAP/release-notes hygiene ride-alongs, then candidate 51 and the
+parse-size-cap/installer-checksum items deferred by the cycle-6
+prioritization. Research pass 9 adds capability candidates 53–59 above
+and hardening items under pass-11 finding IDs (the shim misregistration
+and its tracking repair, cache-bound dedup, installer mode and
+checksum, TUI delivery errors, symlinked roots). Next-cycle shortlist,
+research pass 9 priority read: candidate 53 (statusline capture — one
+mechanism serving candidates 3/9/10/17), candidate 54 (Codex 0.153
+hardening including the live symlinked-root discovery loss), the
+`--no-baseline-gate` shim fix (cheapest user-visible correctness win),
+candidate 56 (tier/service-tier `Price` v2), then candidate 58 (Hermes
+plugin channel) — ahead of the previously queued candidate 51 and the
+parse-size-cap/installer items.
+
+Cycle 7 compound update (2026-09-14, pre-review — review and shipping
+outcomes are carried forward by the next cycle's assessment, not recorded
+here). The trustworthy-capture batch landed as selected: candidate 53
+(statusline capture) and the symlinked-root half of candidate 54 are
+implemented with tests, the shim misregistration is closed under both
+lineages, cache-bound dedup, TUI delivery diagnostics, and installer
+mode/checksum parity landed, and the R1 snapshot-age and R2 CI-gate
+ride-alongs are in. Validation (implementation phase and the independent
+targeted-tests pass) each recorded 230/230 workspace tests, clippy and fmt
+clean, and all ten `scripts/ci/check-*.sh` green against the release
+build. Cycle 7 also paid for two new prevention rules, now durable in
+`docs/maintainers/test-flake-prevention.md`: env-mutating tests serialize
+on the shared `test_env::lock_env()` mutex with save/restore (the
+~1-in-6 torn-tail journal flake was an env-var race among three suites,
+initially misattributed), and `#[cfg(test)]` isolation paths are keyed by
+thread id as well as process id (the ~1-in-50 `ctrl_r` force-reload
+language-preference race, found only under artificial CPU load during
+targeted tests). Post-cycle-7 shortlist for cycle 8, in dependency order:
+P4-2 truncation-warning acceptance (explicitly not landed this cycle),
+R1's scheduled pricing-refresh workflow plus R2's fork-PR run evidence
+(the local doctor line and the gate fixes landed; the workflow halves are
+open), A11-7 delivery-evidence cost-ceiling re-verification, candidate
+54's zstd shared-history remainder (`#42039`), then candidates 55–59 in
+research-pass-9 order (OTel GenAI pilot, tier `Price` v2, stateless MCP
+server, Hermes plugin channel, Antigravity reference). The next cycle's
+assessment must also carry forward the canonical-checkout reconciliation
+recorded in the cycle-7 stewardship request: `/work/projects/agenttrace`
+carries validated-but-uncommitted prior-cycle work (7 modified, 17
+untracked paths) whose F5-5 semantics this cycle subsumed rather than
+reverted, and the cycle-7 batch itself awaits review before any of its
+closures count as shipped.
+
+Cycle 7 independent review (2026-09-14, `docs/reviews/
+2026-09-14-cycle7-independent-review.md`) returned PASS WITH FINDINGS;
+the review-fix pass closed the three actionable ones the same day: F1
+(statusline rendered raw control characters from user-authored session
+names — newlines broke the one-line contract, ESC/OSC sequences reached
+the host terminal; now replaced with U+FFFD, hostile-fixture test in
+both name paths), F2 (stdout write failure panicked with exit 101,
+falsifying "never fails the host"; the line and the stderr diagnostics
+now write-and-ignore, pinned by an end-to-end `/dev/full` test), and F4
+(delivery retry kept the stale error while the retry ran; re-entering
+the panel now clears the error and the pre-failure evidence it was
+hiding, and the retry renders the scan in flight — the review-fix also
+found the retry could not respawn at all after a success→failure
+transition, so the fix is in `open_governance`, not just the spawn
+arm). F3 (journal concurrent-append race), F5 (walk I/O budget), and
+F7 (doctor path portability) are filed in the hardening lane above
+under review IDs; F6's threat-model boundary sentence was added to
+`docs/maintainers/distribution.md`.
 
 Items leave this section only when their acceptance criteria and evidence
 expectations are met and recorded in the Completed record above, and the
