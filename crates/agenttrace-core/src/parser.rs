@@ -1321,6 +1321,12 @@ fn parse_oh_my_pi_jsonl(path: &str, raw: &str) -> anyhow::Result<Vec<Event>> {
     for obj in jsonl_objects(raw) {
         let typ = string(obj.get("type")).unwrap_or("");
         if !seen_header {
+            // Older/newer Oh My Pi versions prepend non-session lines (e.g.
+            // {"type":"title",...}) before the session header; the sniffing
+            // function `is_oh_my_pi_jsonl` already accepts them via `.any()`,
+            // so skip anything until the first `type == "session"` object
+            // instead of bailing. A file with no session header at all still
+            // fails with the original error.
             if typ != "session" {
                 // Some producers write metadata lines (e.g. a `title`
                 // object) before the session header; skip them instead
