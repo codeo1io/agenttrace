@@ -43,22 +43,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # (cross-compile target — runs on the self-hosted pool)
             target: x86_64-unknown-linux-gnu
             asset: agenttrace-linux-amd64
-          - os: ubuntu-latest
+          # (cross-compile target — runs on the self-hosted pool)
             target: aarch64-unknown-linux-gnu
             asset: agenttrace-linux-arm64
-          - os: macos-15-intel
+          # (cross-compile target — runs on the self-hosted pool)
             target: x86_64-apple-darwin
             asset: agenttrace-darwin-amd64
-          - os: macos-14
+          # (cross-compile target — runs on the self-hosted pool)
             target: aarch64-apple-darwin
             asset: agenttrace-darwin-arm64
-          - os: windows-latest
+          # (cross-compile target — runs on the self-hosted pool)
             target: x86_64-pc-windows-msvc
             asset: agenttrace-windows-amd64.exe
-          - os: windows-latest
+          # (cross-compile target — runs on the self-hosted pool)
             target: aarch64-pc-windows-msvc
             asset: agenttrace-windows-arm64.exe
 
