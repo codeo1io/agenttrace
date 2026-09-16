@@ -1,7 +1,11 @@
 name: Dependency Review
 
 on:
-  pull_request:
+  # The dependency-review action needs the repository Dependency graph,
+  # which is disabled on this fork (settings/security_analysis — no API
+  # toggle exists). Manual-only until the graph is enabled; the lockfile
+  # scan in ci.yml (cargo audit + cargo deny) covers the same ground.
+  workflow_dispatch:
 
 permissions:
   contents: read
