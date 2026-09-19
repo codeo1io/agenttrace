@@ -2463,3 +2463,128 @@ fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn symlinked_child_directories_are_discovered_and_cycles_terminate() {
+    // Codex #42135 (cycle 7; pass-11 A11-5 re-verified): the walk tested
+    // `entry.file_type().is_dir()`, which is false for symlinks, so a
+    // symlinked child directory under a session root was skipped
+    // entirely while a symlinked top-level root worked (is_dir follows
+    // links). Sessions under the linked child silently vanished. The
+    // walk must follow symlinked children and survive link cycles
+    // (self-links, parent-links) without hanging.
+    let root = temp_root("agenttrace-symlink-children");
+    let home = root.join("home");
+    let projects = home.join(".claude").join("projects");
+    let real = projects.join("real-proj");
+    let elsewhere = root.join("elsewhere").join("actual");
+    fs::create_dir_all(&real).expect("create real project dir");
+    fs::create_dir_all(&elsewhere).expect("create linked project dir");
+    fs::write(real.join("session-real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    fs::write(elsewhere.join("session-linked.jsonl"), SAMPLE_JSONL).expect("write linked session");
+    // The linked child directory is a symlink to a project outside the
+    // session root.
+    std::os::unix::fs::symlink(&elsewhere, projects.join("linked-proj"))
+        .expect("symlink project dir");
+    // Cycles: a self-link and a link back to the walked root.
+    std::os::unix::fs::symlink(&real, real.join("self")).expect("symlink self-loop");
+    std::os::unix::fs::symlink(&projects, elsewhere.join("parent-cycle"))
+        .expect("symlink parent loop");
+
+    with_home(&home, || {
+        let files = find_session_files(Some(&projects));
+        let names: Vec<String> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "session-real.jsonl"),
+            "the plain child directory is found: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "session-linked.jsonl"),
+            "the symlinked child directory must be followed (Codex #42135): {names:?}"
+        );
+        assert_eq!(
+            files.len(),
+            2,
+            "the cycle links must not duplicate or loop the walk: {names:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn symlinked_child_directories_are_resolved_through_the_cached_walk() {
+    // The cached walk replays stored directory listings; it must follow
+    // symlinked children on a cold cache and keep finding them on the
+    // warm replay (the listing version bump retires pre-fix listings).
+    let root = temp_root("agenttrace-symlink-cached");
+    let home = root.join("home");
+    let cache = home.join("cache");
+    let projects = home.join(".claude").join("projects");
+    let elsewhere = root.join("elsewhere").join("actual");
+    fs::create_dir_all(projects.join("real-proj")).expect("create real project dir");
+    fs::create_dir_all(&elsewhere).expect("create linked project dir");
+    fs::write(
+        projects.join("real-proj").join("session-real.jsonl"),
+        SAMPLE_JSONL,
+    )
+    .expect("write real session");
+    fs::write(elsewhere.join("session-linked.jsonl"), SAMPLE_JSONL).expect("write linked session");
+    std::os::unix::fs::symlink(&elsewhere, projects.join("linked-proj"))
+        .expect("symlink project dir");
+
+    with_home_and_cache(&home, &cache, || {
+        let cold = find_session_files(Some(&projects));
+        assert_eq!(
+            cold.len(),
+            2,
+            "cold cached walk follows the symlinked child: {cold:?}"
+        );
+        let warm = find_session_files(Some(&projects));
+        assert_eq!(
+            warm.len(),
+            2,
+            "warm replay of the stored listing keeps the symlinked child: {warm:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn doctor_names_symlinked_session_roots_instead_of_silent_following() {
+    // Doctor disclosure (cycle 7): a session root that is itself a
+    // symlink must be rendered as `path (symlink -> target)`, so a moved
+    // or networked root is visible instead of implied.
+    let root = temp_root("agenttrace-doctor-symlink");
+    let home = root.join("home");
+    let real_root = root.join("real-projects");
+    fs::create_dir_all(home.join(".claude")).expect("create claude dir");
+    fs::create_dir_all(&real_root).expect("create real projects dir");
+    std::os::unix::fs::symlink(&real_root, home.join(".claude").join("projects"))
+        .expect("symlink projects root");
+
+    with_home(&home, || {
+        let report = build_doctor_report(None, false);
+        let claude = report
+            .directories
+            .iter()
+            .find(|dir| dir.path.ends_with(".claude/projects"))
+            .expect("claude projects row exists");
+        assert_eq!(
+            claude.symlink_target.as_deref(),
+            Some(real_root.to_string_lossy().as_ref()),
+            "doctor must name the symlink target"
+        );
+        let text = format!("{:?}", report);
+        assert!(
+            text.contains("symlink_target"),
+            "serialized doctor keeps the field"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}

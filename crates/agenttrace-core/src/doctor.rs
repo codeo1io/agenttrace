@@ -5,6 +5,7 @@ use crate::{
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
@@ -23,7 +24,25 @@ pub struct DoctorReport {
     pub sessions: usize,
     pub session_files: usize,
     pub directories: Vec<DoctorDirReport>,
+    /// Statusline capture journal (candidate 53, cycle 7): present when
+    /// `agenttrace statusline` has been configured as the statusLine
+    /// command; the journal is the only local source of subscription
+    /// limit pressure and upstream prompt-cache analytics.
+    pub statusline: DoctorStatuslineReport,
+    /// Offline pricing catalog provenance (cycle 7 R1): the bundled
+    /// snapshot's date, model count, and age, so reports can disclose
+    /// how current the prices behind `cost_estimated` are.
+    pub pricing: String,
     pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorStatuslineReport {
+    pub path: String,
+    pub exists: bool,
+    pub captures: usize,
+    pub sessions: usize,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +54,11 @@ pub struct DoctorDirReport {
     pub parsed: usize,
     pub failed: usize,
     pub cache_hits: usize,
+    /// Present when the provider directory is itself a symlink, so the
+    /// doctor names the link it follows instead of implying a plain
+    /// directory (cycle 7, Codex `#42135`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failure_samples: Vec<String>,
 }
@@ -103,10 +127,40 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
         directories: doctor_directories(dir, &files, &sqlite_sessions),
+        statusline: doctor_statusline_report(demo),
+        pricing: format!(
+            "LiteLLM snapshot {} (bundled, {} models, {} days old)",
+            crate::pricing::bundled_snapshot_date(),
+            crate::pricing::bundled_snapshot_model_count(),
+            crate::pricing::bundled_snapshot_age_days().unwrap_or(-1)
+        ),
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
     report
+}
+
+fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
+    let path = crate::statusline::statusline_capture_path();
+    if demo {
+        return DoctorStatuslineReport {
+            path: path.to_string_lossy().to_string(),
+            exists: false,
+            captures: 0,
+            sessions: 0,
+            bytes: 0,
+        };
+    }
+    let stats = crate::statusline::statusline_journal_stats(&path);
+    let captures = crate::statusline::read_statusline_captures(&path);
+    let sessions = crate::statusline::statusline_insights(&captures).sessions;
+    DoctorStatuslineReport {
+        path: stats.path,
+        exists: stats.exists,
+        captures: stats.lines,
+        sessions,
+        bytes: stats.bytes,
+    }
 }
 
 fn find_reportable_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
@@ -191,8 +245,22 @@ fn doctor_dir_report(
         parsed,
         failed: files.len().saturating_sub(parsed),
         cache_hits,
+        symlink_target: symlink_target_of(path),
         failure_samples,
     }
+}
+
+/// Names the link when `path` is a symlink, so symlinked session roots
+/// are disclosed rather than silently followed (cycle 7, Codex
+/// `#42135`).
+fn symlink_target_of(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_symlink() {
+        return None;
+    }
+    fs::read_link(path)
+        .ok()
+        .map(|target| target.to_string_lossy().to_string())
 }
 
 fn doctor_sqlite_directories(sessions: &[Session]) -> Vec<DoctorDirReport> {
@@ -235,6 +303,7 @@ fn doctor_sqlite_directories(sessions: &[Session]) -> Vec<DoctorDirReport> {
             parsed: files,
             failed: 0,
             cache_hits: 0,
+            symlink_target: symlink_target_of(&path),
             failure_samples: Vec::new(),
         });
     }
@@ -282,12 +351,29 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first)\n",
         report.cache_size_bytes, report.cache_limits
     ));
+    let statusline_state = if report.statusline.exists {
+        format!(
+            "{} captures, {} distinct sessions, {} bytes",
+            report.statusline.captures, report.statusline.sessions, report.statusline.bytes
+        )
+    } else {
+        "no captures (configure statusLine to `agenttrace statusline`)".to_string()
+    };
+    out.push_str(&format!(
+        "Statusline capture: {}\n  {}\n",
+        report.statusline.path, statusline_state
+    ));
+    out.push_str(&format!("Pricing snapshot: {}\n", report.pricing));
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
         let status = if dir.exists { "found" } else { "missing" };
+        let symlink = match &dir.symlink_target {
+            Some(target) => format!(" (symlink -> {target})"),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}\n",
-            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path
+            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}\n",
+            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));

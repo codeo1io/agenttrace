@@ -17,7 +17,7 @@ install.sh
 install.ps1
 ```
 
-These scripts remain at repository root because users invoke them through stable raw-GitHub URLs.
+These scripts remain at repository root because users invoke them through stable raw-GitHub URLs. `install.sh` verifies the downloaded asset against the release's `.sha256` sidecar when both are present — a mismatch aborts the install, a missing sidecar or missing checksum tool only warns. That check protects against corrupted mirrors and asset drift; since the asset and its sidecar share one origin and channel, it is not a defense against a compromised release origin.
 
 ## Homebrew
 

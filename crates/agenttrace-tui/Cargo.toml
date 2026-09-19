@@ -19,3 +19,6 @@ chrono.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 unicode-width = "0.2"
+
+[dev-dependencies]
+serde_json.workspace = true

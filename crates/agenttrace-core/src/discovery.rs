@@ -307,7 +307,8 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
-    walk_session_files(dir, 0, max_depth, &mut items);
+    let mut visited = SymlinkTargets::new(dir);
+    walk_session_files(dir, 0, max_depth, &mut items, &mut visited);
     items.sort_by_key(|item| Reverse(item.1));
     items.into_iter().map(|item| item.0).collect()
 }
@@ -344,8 +345,53 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
-    walk_session_files_cached(dir, 0, max_depth, cache, &mut items);
+    let mut visited = SymlinkTargets::new(dir);
+    walk_session_files_cached(dir, 0, max_depth, cache, &mut items, &mut visited);
     sort_paths_by_cache(items, cache)
+}
+
+/// Loop guard for symlinked session directories (Codex `#42135`):
+/// the walk records the canonical target of every directory it
+/// descends and refuses to revisit one, so a cycle of symlinks cannot
+/// make discovery spin (depth bounds the walk; this bounds revisits).
+struct SymlinkTargets(HashSet<PathBuf>);
+
+impl SymlinkTargets {
+    fn new(root: &Path) -> Self {
+        let mut seen = HashSet::new();
+        if let Ok(canonical) = fs::canonicalize(root) {
+            seen.insert(canonical);
+        }
+        SymlinkTargets(seen)
+    }
+
+    /// Returns true when the directory's canonical target has not been
+    /// visited yet, recording it.
+    fn admit(&mut self, dir: &Path) -> bool {
+        match fs::canonicalize(dir) {
+            Ok(canonical) => self.0.insert(canonical),
+            // Unresolvable path: admit it; the walk's depth bound keeps
+            // a degenerate case finite.
+            Err(_) => true,
+        }
+    }
+}
+
+/// `entry.file_type()` reports the link itself, not its target, so a
+/// symlinked session directory (officially supported by Codex 0.153+,
+/// `openai/codex` `#42135`, and common in dotfile-managed homes) used to
+/// be silently skipped. Resolve the link once: a symlink to a directory
+/// is descended, anything else falls through to the file rules.
+fn entry_is_dir_entry(file_type: &fs::FileType, path: &Path) -> bool {
+    if file_type.is_dir() {
+        return true;
+    }
+    if file_type.is_symlink() {
+        return fs::metadata(path)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+    }
+    false
 }
 
 fn walk_session_files_cached(
@@ -354,6 +400,7 @@ fn walk_session_files_cached(
     max_depth: usize,
     cache: &mut SessionCache,
     items: &mut Vec<PathBuf>,
+    visited: &mut SymlinkTargets,
 ) {
     if depth > max_depth {
         return;
@@ -371,7 +418,9 @@ fn walk_session_files_cached(
     if let Some(listing) = cached_dir_listing(dir, cache) {
         items.extend(listing.files);
         for child in listing.dirs {
-            walk_session_files_cached(&child, depth + 1, max_depth, cache, items);
+            if visited.admit(&child) {
+                walk_session_files_cached(&child, depth + 1, max_depth, cache, items, visited);
+            }
         }
         return;
     }
@@ -386,7 +435,7 @@ fn walk_session_files_cached(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if file_type.is_dir() {
+        if entry_is_dir_entry(&file_type, &path) {
             if is_open_code_storage_skipped_dir(&path) {
                 continue;
             }
@@ -395,6 +444,9 @@ fn walk_session_files_cached(
             }
             if is_cline_task_dir(&path) {
                 files.push(path);
+                continue;
+            }
+            if !visited.admit(&path) {
                 continue;
             }
             dirs.push(path);
@@ -422,7 +474,7 @@ fn walk_session_files_cached(
 
     items.extend(files);
     for child in dirs {
-        walk_session_files_cached(&child, depth + 1, max_depth, cache, items);
+        walk_session_files_cached(&child, depth + 1, max_depth, cache, items, visited);
     }
 }
 
@@ -431,6 +483,7 @@ fn walk_session_files(
     depth: usize,
     max_depth: usize,
     items: &mut Vec<(PathBuf, SystemTime)>,
+    visited: &mut SymlinkTargets,
 ) {
     if depth > max_depth {
         return;
@@ -443,7 +496,7 @@ fn walk_session_files(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if file_type.is_dir() {
+        if entry_is_dir_entry(&file_type, &path) {
             if is_open_code_storage_skipped_dir(&path) {
                 continue;
             }
@@ -454,7 +507,10 @@ fn walk_session_files(
                 items.push((path, entry_mod_time(&entry)));
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items);
+            if !visited.admit(&path) {
+                continue;
+            }
+            walk_session_files(&path, depth + 1, max_depth, items, visited);
             continue;
         }
         let name = entry.file_name();

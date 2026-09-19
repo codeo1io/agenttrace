@@ -144,7 +144,16 @@ jobs:
             scripts/ci/check-rust-real-cli-smoke.sh
 
       - name: Rust TUI real-data smoke
-        if: env.AGENTTRACE_TUI_REAL_DIR != ''
+        # Pass-11 A11-8 (N5/P4-5), fixed in cycle 7: this gate used to read
+        # `env.AGENTTRACE_TUI_REAL_DIR != ''`, which is set nowhere in the
+        # workflow, the job, or the step — a never-true condition that
+        # silently disabled the PTY smoke. The gate is now the repository
+        # variable of the same name: opt in by setting
+        # AGENTTRACE_TUI_REAL_DIR in repo settings, and the step forwards
+        # it to the script.
+        if: vars.AGENTTRACE_TUI_REAL_DIR != ''
+        env:
+          AGENTTRACE_TUI_REAL_DIR: ${{ vars.AGENTTRACE_TUI_REAL_DIR }}
         run: |
           AGENTTRACE_BIN=target/release/agenttrace \
             scripts/ci/check-rust-tui-real-smoke.sh
