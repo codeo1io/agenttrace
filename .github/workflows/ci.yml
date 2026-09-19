@@ -23,6 +23,12 @@ jobs:
     # on push(master), the nightly schedule, and dispatch — never on
     # pull_request. The single job used to take 560s per PR (run
     # 35105368113), dominated by the 291s release build.
+    # PR-only (2026-09-19b): on master the two jobs serialize on the single
+    # self-hosted runner (run 35458293806: 17:30 run start, Lint didn't get
+    # the runner until 18:07 — 38min wall for 9min of work). `full` covers
+    # fmt+clippy on non-PR refs via its own check step, so lint stays the
+    # PR gate only.
+    if: github.event_name == 'pull_request'
     name: Lint
     runs-on: self-hosted
     timeout-minutes: 15
@@ -85,6 +91,12 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
 
       - name: Rust tests
         run: cargo test -p agenttrace-core -p agenttrace-tui -p agenttrace
