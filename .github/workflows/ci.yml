@@ -16,7 +16,64 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
+    # PR fast lane (2026-09-19): fmt + clippy only — the compile-check
+    # surface, ~2min warm on the persisted cargo target. Everything else
+    # (tests, release build, the smoke scripts) moved to `full`, which runs
+    # on push(master), the nightly schedule, and dispatch — never on
+    # pull_request. The single job used to take 560s per PR (run
+    # 35105368113), dominated by the 291s release build.
+    name: Lint
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+
+
+      # Self-hosted cargo target persistence: branch checkouts invalidate the
+      # workspace target dir; a lockfile-keyed tarball under the runner's
+      # persistent tool dir restores a warm tree so clippy/checks hit the
+      # incremental cache (2026-09-19: clippy alone was 2m36s cold on run
+      # measured; target dir is 369M).
+      - name: Restore cargo target
+        run: |
+          KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
+          CACHE_DIR="$RUNNER_TOOL_CACHE/../cargo-cache"
+          mkdir -p "$CACHE_DIR"
+          if [ -f "$CACHE_DIR/$KEY.tar" ]; then
+            mkdir -p target
+            tar -xf "$CACHE_DIR/$KEY.tar" -C .
+            echo "restored from $KEY"
+          else
+            echo "no cache for $KEY"
+          fi
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+
+      - name: Save cargo target
+        run: |
+          KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
+          CACHE_DIR="$RUNNER_TOOL_CACHE/../cargo-cache"
+          mkdir -p "$CACHE_DIR"
+          tar -cf "$CACHE_DIR/$KEY.tar" target
+          ls -t "$CACHE_DIR"/*.tar 2>/dev/null | tail -n +4 | xargs -r rm -f
+
+  full:
+    # Full verification: everything beyond the lint surface — tests, the
+    # release build, and all smoke scripts. Runs on push(master), nightly
+    # schedule, and dispatch; NOT on pull_request (the `lint` job is the PR
+    # gate). Artifacts upload unchanged.
+    if: github.event_name != 'pull_request'
     name: Test and build
     runs-on: self-hosted
     timeout-minutes: 30
@@ -28,13 +85,6 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-
-      - name: Check Rust formatting
-        run: cargo fmt --check
-
-
-      - name: Clippy
-        run: cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
 
       - name: Rust tests
         run: cargo test -p agenttrace-core -p agenttrace-tui -p agenttrace
