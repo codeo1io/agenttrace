@@ -35,11 +35,38 @@ jobs:
         with:
           toolchain: stable
 
+
+      # Self-hosted cargo target persistence: branch checkouts invalidate the
+      # workspace target dir; a lockfile-keyed tarball under the runner's
+      # persistent tool dir restores a warm tree so clippy/checks hit the
+      # incremental cache (2026-09-19: clippy alone was 2m36s cold on run
+      # measured; target dir is 369M).
+      - name: Restore cargo target
+        run: |
+          KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
+          CACHE_DIR="$RUNNER_TOOL_CACHE/../cargo-cache"
+          mkdir -p "$CACHE_DIR"
+          if [ -f "$CACHE_DIR/$KEY.tar" ]; then
+            mkdir -p target
+            tar -xf "$CACHE_DIR/$KEY.tar" -C .
+            echo "restored from $KEY"
+          else
+            echo "no cache for $KEY"
+          fi
+
       - name: Check Rust formatting
         run: cargo fmt --check
 
       - name: Clippy
         run: cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+
+      - name: Save cargo target
+        run: |
+          KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
+          CACHE_DIR="$RUNNER_TOOL_CACHE/../cargo-cache"
+          mkdir -p "$CACHE_DIR"
+          tar -cf "$CACHE_DIR/$KEY.tar" target
+          ls -t "$CACHE_DIR"/*.tar 2>/dev/null | tail -n +4 | xargs -r rm -f
 
   full:
     # Full verification: everything beyond the lint surface — tests, the
