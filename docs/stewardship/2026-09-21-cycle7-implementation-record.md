@@ -146,13 +146,17 @@ flags, so `agenttrace --no-baseline-gate --overview` swallowed
 - `go_flag_shim_does_not_swallow_the_flag_after_no_baseline_gate` —
   behavioral pin that the flag after `--no-baseline-gate` survives.
 
-## CU-28 — workspace publish metadata
+## CU-28 — workspace publish metadata (reverted at CI)
 
-`Cargo.toml:15-16` `repository`/`homepage` now name
-`https://github.com/codeo1io/agenttrace` (the remote that actually
-publishes), closing the crates.io/docs.rs wrong-home clause of the
-hygiene item. Attribution to the upstream origin stays in README/docs,
-which is intentional and unchanged.
+`f8f5303` repointed `Cargo.toml:15-16` `repository`/`homepage` to
+`https://github.com/codeo1io/agenttrace`. CI (run 35576006780, step
+`Validate Cargo manifests`) rejected it: `scripts/ci/check-cargo-manifests.sh`,
+inherited from upstream (`e005952`, upstream #281), pins all three crates'
+metadata to `luoyuctl/agenttrace`. Reverted rather than editing the guard —
+the guard is upstream's crates.io contract, and whether fork crates should
+ever carry fork metadata is a steward-level policy question (same family as
+the deferred fork dependency-review item), filed for a later cycle.
+So the shipped state keeps the upstream URLs.
 
 ## Changed files
 

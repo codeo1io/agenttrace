@@ -556,6 +556,25 @@ suite green, `cargo fmt --check` clean, and `cargo clippy --workspace
 --all-targets` warning-free on the exact tree described here. Record:
 `docs/stewardship/2026-09-21-cycle7-implementation-record.md`.
 
+Base-ship record (added by the run-314df0f8 compounding, 2026-09-21):
+the base `df3b621` and its parent `318df83` are themselves a shipped
+campaign — fork PR #3, "fix: bound TUI test wait loops by deadline and
+record cycle-6 closures" (`318df83` rewrites the TUI test wait loops
+`wait_for_pending_load`, `wait_for_progress`, and the governance-
+delivery loop to bound every wait by deadline instead of a fixed
+iteration count — 40/40 `agenttrace-tui` tests green twice on the
+rewritten loops; `df3b621` records the cycle-6 closures and pass-10
+findings in this roadmap). CI on the pushed pair: the fork has no
+branch-protection required checks, so the ci.yml "Test and build" job
+is the repo-authoritative gate; it passed at `df3b621` (run
+34153433111) and again at the branch's remote head `0f8c8616` (run
+34769484460). The red "Dependency review" check is the standing
+environmental false red, not code (see the fork dependency-review
+hygiene item in the hardening lane). The pair subsequently reached
+fork master through PR #4's lineage (merged 2026-09-20), which makes
+PR #3 superseded as a merge vehicle — closing it is a cycle-8
+housekeeping item, not a merge.
+
 - **Cycle-5-review remediation F5-1..F5-5 landed** (CU-24; this also
   repairs a stewardship gap — the review's disposition to file
   F5-1/F5-2 was never executed, so a complete, suite-green fix sat
@@ -596,10 +615,13 @@ suite green, `cargo fmt --check` clean, and `cargo clippy --workspace
   the shim's value-flag set matches clap's definitions (every boolean
   flag arity-0, every value flag arity-1) and a behavioral test that
   `--no-baseline-gate --overview` keeps `--overview` as a flag.
-- **Workspace publish metadata** (CU-28). `Cargo.toml:15-16`
-  `repository`/`homepage` now name `codeo1io/agenttrace` — the remote
-  that actually publishes — closing the crates.io/docs.rs wrong-home
-  clause of the hygiene item.
+- **Workspace publish metadata** (CU-28, reverted at CI). The repoint
+  of `Cargo.toml:15-16` to `codeo1io/agenttrace` was withdrawn:
+  `scripts/ci/check-cargo-manifests.sh` (inherited from upstream,
+  `e005952`) pins `repository`/`homepage` to `luoyuctl/agenttrace`, and
+  the guard is upstream's crates.io contract, not ours to edit silently.
+  Fork-metadata policy joins the deferred fork dependency-review item as
+  an open steward question.
 
 Lessons and prevention rules compounded from this cycle (durable;
 full context in `docs/stewardship/2026-09-21-cycle7-learnings.md`):
@@ -1617,7 +1639,34 @@ Hermes `state.db` tool_calls_ok schema research (data-shape question,
 not code), the fork dependency-review fix at the PR/CI stage, then
 research spikes for candidates 53 (ACP stores) and 54 (VS Code agent
 debug logs), with candidate 51 and the parse-size-cap and
-installer-checksum items still queued behind them.
+installer-checksum items still queued behind them. The run-314df0f8
+compounding (2026-09-21, later the same day) adds the base-ship
+record above, one prevention rule, and one gating discovery for
+cycle 8. Prevention rule: test wait loops bound waits by deadline,
+never by fixed iteration counts — a fixed count is a load guess that
+flakes on slow or contended runners; every wait states its timeout
+and fails naming the deadline (`318df83` is the reference rewrite).
+Gating discovery: the local tree and fork master diverged past the
+open PR #3. Master `a48c1ba` (via PR #4, merged 2026-09-20) already
+carries this run's `318df83`+`df3b621`, the upstream pair `a34dea2`+
+`6848aa1`, and a second cycle-7 batch `9fe9610` (the 2026-09-14
+stewardship records); PRs #6–#8 reworked CI and PR #9 replaced the
+roadmap with a fleet-sync version carrying no cycle records. The
+local branch holds six unpushed 2026-09-21 cycle-7 commits
+(`3a7dd60..5e7f7b4`, merge-base with master `df3b621`). Census so
+far: the `3718e77` hand-port and `9ad11b7`'s shim classification are
+redundant on master (`6848aa1` merged; the shim already treats
+`--no-baseline-gate` as boolean), while `5383d5b` (parser saturating
+12-vs-7) is still needed (`f8f5303` was withdrawn at CI: the manifest
+check pins metadata to upstream); the F5 set needs the census. Cycle 8
+must, before any new work: re-census every local fix against master
+`a48c1ba`, re-land
+the still-needed ones there, drop the redundant ports, reconcile the
+roadmap fork (campaign cycle records versus the fleet-sync version),
+close PR #3 as superseded, and re-run the full gates and drift census
+on the result. That reconciliation precedes the Windows
+HOME/USERPROFILE headliner in dependency order: it gates the merge
+signal for every queued item.
 
 Items leave this section only when their acceptance criteria and evidence
 expectations are met and recorded in the Completed record above, and the
