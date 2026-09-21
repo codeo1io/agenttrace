@@ -750,7 +750,6 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--baseline-max-duration-delta-pct"
             | "--baseline-max-cost-delta-pct"
             | "--baseline-max-token-delta-pct"
-            | "--no-baseline-gate"
             | "--lang"
             | "--range"
             | "--project"
@@ -1377,6 +1376,66 @@ mod tests {
                 OsString::from("agenttrace"),
                 OsString::from("--sample"),
                 OsString::from("20"),
+                OsString::from("-f"),
+                OsString::from("json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn go_flag_shim_matches_clap_flag_arity() {
+        // CU-27 contract, clap-derived: every flag the Args struct
+        // defines must carry the same arity in the Go-compatible shim
+        // as in clap itself — booleans (SetTrue/Help/Version actions)
+        // arity-0, value flags (Set/Append actions) arity-1. Before
+        // CU-27 the shim listed --no-baseline-gate as a value flag, so
+        // `--no-baseline-gate --overview` silently swallowed --overview
+        // as its "value" and the action was lost. F7-1 (cycle-7 review):
+        // the first version of this test pinned two hand-copied snapshot
+        // lists, so a NEW clap flag the shim missed passed silently;
+        // deriving from Args::command() makes that impossible — adding a
+        // flag without updating the shim fails this test by name.
+        use clap::{ArgAction, CommandFactory};
+        for arg in Args::command().get_arguments() {
+            let takes_value = matches!(arg.get_action(), ArgAction::Set | ArgAction::Append);
+            if let Some(long) = arg.get_long() {
+                let flag = format!("--{long}");
+                assert_eq!(
+                    flag_takes_value(&OsString::from(&flag)),
+                    takes_value,
+                    "shim arity for {flag} must match clap"
+                );
+            }
+            if let Some(short) = arg.get_short() {
+                let flag = format!("-{short}");
+                assert_eq!(
+                    flag_takes_value(&OsString::from(&flag)),
+                    takes_value,
+                    "shim arity for {flag} must match clap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_flag_shim_does_not_swallow_the_flag_after_no_baseline_gate() {
+        // CU-27 behavioral pin: --no-baseline-gate is boolean; the flag
+        // after it must survive the shim as a flag.
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--demo"),
+            OsString::from("--no-baseline-gate"),
+            OsString::from("--overview"),
+            OsString::from("-f"),
+            OsString::from("json"),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("--demo"),
+                OsString::from("--no-baseline-gate"),
+                OsString::from("--overview"),
                 OsString::from("-f"),
                 OsString::from("json"),
             ]
