@@ -57,6 +57,10 @@ fn explorer_navigation_reaches_views_details_and_overlays() {
 
 #[test]
 fn explorer_footer_shows_language_shortcut_in_list_and_detail() {
+    // This test ends with the language toggled to Chinese, which persists
+    // to the shared preference file; pin so the state is restored and no
+    // parallel `App::new_loading` construction localizes.
+    let _pinned = pin_english_language();
     let mut app = App::new(
         vec![session("language", "codex_cli", "gpt-5", 90, 0.1, "rg")],
         "test",
@@ -878,6 +882,9 @@ fn overview_enter_opens_first_inspect_item() {
 
 #[test]
 fn language_defaults_to_english_and_l_toggles_chinese() {
+    // The `l` toggle persists to the shared preference file mid-test;
+    // pin so the window cannot localize a parallel construction.
+    let _pinned = pin_english_language();
     let mut app = App::new(
         vec![session("critical", "claude_code", "m", 35, 0.20, "bash")],
         "test",
@@ -1587,7 +1594,38 @@ fn renders_no_visible_sessions_state_for_empty_filter_result() {
 }
 
 #[test]
+fn pinned_english_language_beats_persisted_chinese_preference() {
+    // Reproduces the flake's on-disk precondition deterministically: a
+    // language-toggle test has persisted "zh" to the shared preference
+    // file. `App::new_loading` restores the saved language, so without
+    // isolation its construction-time status is localized (Chinese) and
+    // English-substring assertions fail. The English pin must win.
+    force_language_preference(b"zh\n");
+    let root = std::env::temp_dir().join(format!("agenttrace-tui-langpin-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let sessions_dir = root.join("sessions");
+    let cache_dir = root.join("cache");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    let _pinned = pin_english_language();
+    with_session_cache_dir_for_test(&cache_dir, || {
+        let app = App::new_loading("test", sessions_dir.to_string_lossy().to_string());
+        assert!(app.status.contains("discovering session files"));
+    });
+    // Drop the pin (releasing the lock and restoring the pre-pin file)
+    // before forcing a clean preference; forcing while pinned would
+    // self-deadlock on the shared lock.
+    drop(_pinned);
+    force_language_preference(b"en\n");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn ctrl_r_force_reload_clears_session_cache_before_loading() {
+    // `App::new_loading` restores the shared language preference at
+    // construction; pin English so the English-substring assertions on
+    // the construction-time status are deterministic (this is the test
+    // that flaked ~1-in-6 full-suite runs before the pin existed).
+    let _pinned = pin_english_language();
     let root = std::env::temp_dir().join(format!(
         "agenttrace-rust-tui-force-reload-{}",
         std::process::id()
@@ -1786,6 +1824,73 @@ fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: 
         health,
         tool_warnings: Vec::new(),
         diagnostics: agenttrace_core::Diagnostics::default(),
+    }
+}
+
+fn language_preference_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The TUI persists the language preference to a file that is only
+/// pid-scoped under `cfg(test)` (`language_preference_path`), so every
+/// test in this binary shares one preference. Tests that toggle the
+/// language leave "zh" behind; any `App::new_loading` constructed by a
+/// parallel test then localizes its construction-time status into
+/// Chinese, which surfaced as an intermittent failure of
+/// `assert!(app.status.contains("discovering session files"))` in
+/// `ctrl_r_force_reload_clears_session_cache_before_loading`. Holding
+/// this guard serializes preference access, forces the given bytes for
+/// its lifetime, and restores the prior content on drop so nothing
+/// leaks between tests.
+struct PinnedLanguageGuard {
+    previous: Option<Vec<u8>>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn pin_language(bytes: &[u8]) -> PinnedLanguageGuard {
+    let _lock = language_preference_lock();
+    let path = language_preference_path().expect("test language preference path");
+    let previous = fs::read(&path).ok();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&path, bytes).expect("write pinned language preference");
+    PinnedLanguageGuard { previous, _lock }
+}
+
+fn pin_english_language() -> PinnedLanguageGuard {
+    pin_language(b"en\n")
+}
+
+/// Write the shared preference under the lock WITHOUT restoring the
+/// prior content — used to stage the exact on-disk precondition of the
+/// flake inside a test.
+fn force_language_preference(bytes: &[u8]) {
+    let _lock = language_preference_lock();
+    let path = language_preference_path().expect("test language preference path");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&path, bytes).expect("write forced language preference");
+}
+
+impl Drop for PinnedLanguageGuard {
+    fn drop(&mut self) {
+        // Drop::drop runs before field drops, so the restore below still
+        // happens under the lock held by `_lock`.
+        let path = language_preference_path().expect("test language preference path");
+        match self.previous.take() {
+            Some(bytes) => {
+                let _ = fs::write(&path, bytes);
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 }
 

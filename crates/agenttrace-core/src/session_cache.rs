@@ -627,7 +627,15 @@ fn enforce_entry_bound(cache: &mut SessionCache, max: usize) -> usize {
         .collect();
     let mut by_age: Vec<(i64, String)> = paths
         .into_iter()
-        .filter_map(|path| cached_entry_header(&path, cache).map(|header| (header.mod_time, path)))
+        .map(|path| {
+            // F5-5 (cycle-5 review): a headerless entry (no decodable
+            // mod_time) is undatable, not unevictable — map it to the
+            // oldest age so the bound is total, not best-effort.
+            (
+                cached_entry_header(&path, cache).map_or(i64::MIN, |header| header.mod_time),
+                path,
+            )
+        })
         .collect();
     by_age.sort_unstable();
     let drop = total - max;
@@ -672,8 +680,15 @@ fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
         .collect();
     let mut by_age: Vec<(i64, String, usize)> = sizes
         .into_iter()
-        .filter_map(|(path, bytes)| {
-            cached_entry_header(&path, cache).map(|header| (header.mod_time, path, bytes))
+        .map(|(path, bytes)| {
+            // F5-5: same rule as `enforce_entry_bound` — headerless
+            // entries count as the oldest so the byte ceiling cannot be
+            // defeated by undatable entries.
+            (
+                cached_entry_header(&path, cache).map_or(i64::MIN, |header| header.mod_time),
+                path,
+                bytes,
+            )
         })
         .collect();
     let total: usize = by_age.iter().map(|(_, _, bytes)| *bytes).sum();
@@ -1441,6 +1456,137 @@ mod tests {
         let before = cache.dirty;
         assert_eq!(enforce_byte_bound(&mut cache, usize::MAX), 0);
         assert_eq!(cache.dirty, before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn entry_bound_evicts_headerless_entries_too() {
+        // F5-5 (cycle-5 review): entries with no decodable header used
+        // to be invisible to `enforce_entry_bound`, so a cache dominated
+        // by them could exceed the ceiling with nothing evictable. They
+        // are undatable, not unevictable — they count as the oldest and
+        // drop first, making the bound total instead of best-effort.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-headerless-bound-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let mut cache = SessionCache::default();
+
+        // One dated entry (current writer shape).
+        let dated = root.join("dated.jsonl");
+        fs::write(&dated, b"session").expect("write dated file");
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let handle = fs::File::options()
+            .write(true)
+            .open(&dated)
+            .expect("open dated file");
+        handle.set_modified(stamp).expect("set deterministic mtime");
+        drop(handle);
+        let session = Session {
+            name: "dated".to_string(),
+            path: dated.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_session(&dated, &session, &mut cache).expect("store dated entry");
+
+        // Two headerless raw entries (legacy shape: no mod_time/size to
+        // decode), which the old filter_map silently skipped.
+        let mut headerless_keys = Vec::new();
+        for name in ["legacy-a", "legacy-b"] {
+            let legacy = root.join(format!("{name}.jsonl"));
+            fs::write(&legacy, b"session").expect("write legacy file");
+            let key = cache_key(&legacy);
+            cache.raw_entries.insert(
+                key.clone(),
+                serde_json::json!({ "session": { "Name": name } }),
+            );
+            headerless_keys.push(key);
+        }
+        assert_eq!(cache.entry_count(), 3);
+
+        let dropped = enforce_entry_bound(&mut cache, 1);
+        assert_eq!(dropped, 2, "both headerless entries drop");
+        assert_eq!(cache.entry_count(), 1, "the bound is now total");
+        assert!(
+            cache.entries.contains_key(&cache_key(&dated)),
+            "the dated entry survives; undatable entries evict first"
+        );
+        assert!(
+            headerless_keys
+                .iter()
+                .all(|key| !cache.raw_entries.contains_key(key)),
+            "no headerless entry survives the bound"
+        );
+        assert!(cache.dirty, "eviction must persist through the next save");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn byte_bound_evicts_headerless_entries_too() {
+        // F5-5 twin: undatable entries must not shield their serialized
+        // bytes from the ceiling either — same oldest-first rule.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-headerless-bytes-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let mut cache = SessionCache::default();
+
+        let dated = root.join("dated.jsonl");
+        fs::write(&dated, b"session").expect("write dated file");
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let handle = fs::File::options()
+            .write(true)
+            .open(&dated)
+            .expect("open dated file");
+        handle.set_modified(stamp).expect("set deterministic mtime");
+        drop(handle);
+        let session = Session {
+            name: "dated".to_string(),
+            path: dated.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_session(&dated, &session, &mut cache).expect("store dated entry");
+
+        // A headerless raw entry large enough that only dropping it fits.
+        let legacy = root.join("legacy.jsonl");
+        fs::write(&legacy, b"session").expect("write legacy file");
+        let headerless_key = cache_key(&legacy);
+        let headerless_bytes = 4_096;
+        cache.raw_entries.insert(
+            headerless_key.clone(),
+            serde_json::json!({ "padding": "x".repeat(headerless_bytes) }),
+        );
+        let dated_bytes = serde_json::to_string(&cache.entries[&cache_key(&dated)])
+            .expect("serialize dated entry")
+            .len();
+        let max = dated_bytes + 1;
+        assert!(
+            dated_bytes + headerless_bytes + 64 > max,
+            "fixture must exceed the ceiling"
+        );
+
+        let dropped = enforce_byte_bound(&mut cache, max);
+        assert_eq!(dropped, 1, "the undatable entry drops, not the dated one");
+        assert!(!cache.raw_entries.contains_key(&headerless_key));
+        assert!(
+            cache.entries.contains_key(&cache_key(&dated)),
+            "the dated entry survives within the ceiling"
+        );
+        assert!(cache.dirty);
         let _ = fs::remove_dir_all(root);
     }
 }

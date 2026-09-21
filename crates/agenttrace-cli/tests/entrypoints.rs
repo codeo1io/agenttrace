@@ -273,6 +273,43 @@ fn governance_sampling_is_explicit_and_disclosed() {
         zero.status
     );
 
+    // F5-3 (cycle-5 review): --sample on a non-governance action used
+    // to be accepted and silently ignored — the flag-hygiene defect
+    // this cycle documents. It must be rejected loudly instead.
+    let ignored = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-f", "json", "--sample", "5"])
+        .output()
+        .expect("run overview with sample");
+    assert_eq!(
+        ignored.status.code(),
+        Some(1),
+        "--sample outside governance-class actions must exit nonzero, got {:?}",
+        ignored.status
+    );
+    let ignored_stderr = String::from_utf8_lossy(&ignored.stderr);
+    assert!(
+        ignored_stderr.contains("--sample only applies to governance-class actions"),
+        "stderr must name the rejection: {ignored_stderr}"
+    );
+
+    // F5-4 (cycle-5 review): text --compare used to stop at
+    // "(auditing N of M)" while the JSON carried the reason; both
+    // formats now disclose the same coverage depth.
+    let compare_text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--compare", "--sample", "2"])
+        .output()
+        .expect("run text compare");
+    assert!(compare_text.status.success());
+    let compare_stdout = String::from_utf8_lossy(&compare_text.stdout);
+    assert!(
+        compare_stdout.contains("(auditing 2 of 3 sessions); "),
+        "text compare must carry the exclusion reason: {compare_stdout}"
+    );
+    assert!(
+        compare_stdout.contains("sampled first 2"),
+        "text compare reason must match the JSON disclosure: {compare_stdout}"
+    );
+
     let recommend = run_json(&["--demo", "--recommend", "-f", "json"]);
     assert_eq!(recommend["audited_sessions"], 3);
     assert!(

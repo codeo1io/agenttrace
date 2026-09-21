@@ -158,6 +158,21 @@ fn run() -> anyhow::Result<()> {
     if args.sample == Some(0) {
         bail!("--sample must be at least 1");
     }
+    // F5-3 (cycle-5 review): a flag that silently does nothing is the
+    // hygiene defect this cycle documented in the README, so --sample
+    // on a non-governance action is rejected loudly instead of ignored.
+    if args.sample.is_some()
+        && !(args.audit
+            || args.recommend
+            || args.mcp_governance
+            || args.context_trends
+            || args.delivery_evidence
+            || args.compare)
+    {
+        bail!(
+            "--sample only applies to governance-class actions (--audit, --recommend, --mcp-governance, --context-trends, --delivery-evidence, --compare)"
+        );
+    }
     if matches!(args.format.as_str(), "markdown" | "md" | "html")
         && !(args.overview
             || args.audit
@@ -309,10 +324,13 @@ fn run() -> anyhow::Result<()> {
             serde_json::to_string_pretty(&value)?
         } else {
             let mut out = String::new();
-            out.push_str(&format!(
-                "(auditing {} of {} sessions)\n",
+            // F5-4 (cycle-5 review): the text compare path used to stop
+            // at "(auditing N of M)" while the JSON carried the reason;
+            // both formats now disclose the same coverage depth.
+            out.push_str(&audit_coverage_line(
                 sessions.len(),
-                total_sessions
+                total_sessions,
+                excluded_reason.as_deref(),
             ));
             out.push_str(&agenttrace_core::report_compare_with_language(
                 &sessions,
@@ -583,16 +601,25 @@ fn audit_coverage_phrase(value: &serde_json::Value) -> String {
     let audited = value.get("audited_sessions").and_then(|item| item.as_u64());
     let total = value.get("total_sessions").and_then(|item| item.as_u64());
     match (audited, total) {
-        (Some(audited), Some(total)) => {
-            let mut phrase = format!("(auditing {audited} of {total} sessions)");
-            if let Some(reason) = value.get("excluded_reason").and_then(|item| item.as_str()) {
-                phrase.push_str(&format!("; {reason}"));
-            }
-            phrase.push('\n');
-            phrase
-        }
+        (Some(audited), Some(total)) => audit_coverage_line(
+            audited as usize,
+            total as usize,
+            value.get("excluded_reason").and_then(|item| item.as_str()),
+        ),
         _ => String::new(),
     }
+}
+
+/// The human-readable coverage line shared by the governance-class and
+/// `--compare` text paths: "(auditing N of M sessions)" plus the
+/// exclusion reason when one exists (F5-4 — one contract, one depth).
+fn audit_coverage_line(audited: usize, total: usize, reason: Option<&str>) -> String {
+    let mut phrase = format!("(auditing {audited} of {total} sessions)");
+    if let Some(reason) = reason {
+        phrase.push_str(&format!("; {reason}"));
+    }
+    phrase.push('\n');
+    phrase
 }
 
 fn attach_audit_coverage(

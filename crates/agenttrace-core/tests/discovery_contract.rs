@@ -458,12 +458,24 @@ fn unicode_escape_hostile_file_does_not_kill_directory_scans() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("testdata/generated/adversarial");
-    let sessions = load_sessions_from_dir(Some(&dir));
-    assert!(
-        sessions.len() >= 3,
-        "clean neighbors must survive a hostile unicode file, got {}",
-        sessions.len()
-    );
+    // Run 5d025d55 open observation (cache_hits 0 vs 2 at :999): this
+    // walk used to run WITHOUT a cache guard, so under parallel test
+    // execution its end-of-load `save_session_cache` either landed in
+    // whatever guarded test currently held AGENTTRACE_SESSION_CACHE_DIR
+    // (clobbering that test's entries between its two loads — the
+    // observed flake) or, with no holder, in the operator's real cache.
+    // Pinned to an isolated cache like every other loader test here.
+    let root = temp_root("agenttrace-unicode-hostile-cache");
+    fs::create_dir_all(&root).expect("create hostile-scan root");
+    with_session_cache(&root.join("cache"), || {
+        let sessions = load_sessions_from_dir(Some(&dir));
+        assert!(
+            sessions.len() >= 3,
+            "clean neighbors must survive a hostile unicode file, got {}",
+            sessions.len()
+        );
+    });
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -477,29 +489,37 @@ fn generated_adversarial_corpus_stays_bounded_and_non_negative() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("testdata/generated/adversarial");
-    let sessions = load_sessions_from_dir(Some(&dir));
-    assert!(
-        sessions.len() >= 3,
-        "expected the adversarial corpus to yield sessions, got {}",
-        sessions.len()
-    );
-    let mut grand_total = 0i64;
-    for session in &sessions {
-        let tokens = total_tokens(session);
+    // Same isolation fix as the unicode-hostile scan above (run 5d025d55
+    // open observation): the walk must not save into a concurrently held
+    // guarded cache or the operator's ambient one.
+    let root = temp_root("agenttrace-adversarial-bounded-cache");
+    fs::create_dir_all(&root).expect("create adversarial-bounded root");
+    with_session_cache(&root.join("cache"), || {
+        let sessions = load_sessions_from_dir(Some(&dir));
         assert!(
-            tokens >= 0,
-            "session {} reported negative tokens {tokens}",
-            session.name
+            sessions.len() >= 3,
+            "expected the adversarial corpus to yield sessions, got {}",
+            sessions.len()
         );
-        assert!(session.metrics.cost_estimated.is_finite());
-        assert!(session.metrics.cost_estimated >= 0.0);
-        grand_total = grand_total.saturating_add(tokens);
-    }
-    assert_eq!(
-        grand_total,
-        i64::MAX,
-        "saturated sessions must pin the ceiling"
-    );
+        let mut grand_total = 0i64;
+        for session in &sessions {
+            let tokens = total_tokens(session);
+            assert!(
+                tokens >= 0,
+                "session {} reported negative tokens {tokens}",
+                session.name
+            );
+            assert!(session.metrics.cost_estimated.is_finite());
+            assert!(session.metrics.cost_estimated >= 0.0);
+            grand_total = grand_total.saturating_add(tokens);
+        }
+        assert_eq!(
+            grand_total,
+            i64::MAX,
+            "saturated sessions must pin the ceiling"
+        );
+    });
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2354,6 +2374,53 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
         assert_eq!(health_day.skipped, 0, "out-of-range is not a parse failure");
     });
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn data_health_out_of_scope_counts_sources_not_sessions() {
+    // F5-2 (cycle-5 review): `discovered`/`parse_failures` count source
+    // files while `parsed` counts sessions, and SQLite/.db sources
+    // contribute several sessions per file — the shipped subtraction
+    // mixed the units, so a ranged mixed-corpus run reported 0 hidden
+    // files while ~200 were out of scope (live: 364 files, 572 sessions
+    // from 161 sources at --range 7d). The out-of-scope remainder must
+    // be counted in in-scope SOURCES.
+    let session = |name: &str, path: &str| agenttrace_core::Session {
+        name: name.to_string(),
+        path: path.to_string(),
+        cwd: String::new(),
+        metrics: agenttrace_core::Metrics::default(),
+        anomalies: Vec::new(),
+        health: 100,
+        tool_warnings: Vec::new(),
+        diagnostics: agenttrace_core::Diagnostics::default(),
+    };
+    // One .db source yields three sessions; one .jsonl yields one —
+    // the mixed-corpus shape the live reproducer exposed.
+    let sessions = vec![
+        session("db-a", "corpus/opencode.db"),
+        session("db-b", "corpus/opencode.db"),
+        session("db-c", "corpus/opencode.db"),
+        session("recent", "corpus/recent.jsonl"),
+    ];
+    // 5 discovered files: 2 in scope + 1 unparseable + 2 out of range.
+    let health = data_health_scoped(&sessions, 5, 1, 0);
+    assert_eq!(health.parsed, 4, "parsed still counts sessions");
+    assert_eq!(health.skipped, 1, "parse failures stay in the file unit");
+    assert_eq!(
+        health.out_of_scope, 2,
+        "5 files - 2 in-scope sources - 1 failed file; the old session-unit math reported 0"
+    );
+    // The one-file-one-session shape (the cycle-5 test corpus) is
+    // unchanged by the unit fix.
+    let single = vec![
+        session("a", "a.jsonl"),
+        session("b", "b.jsonl"),
+        session("c", "c.jsonl"),
+    ];
+    let health_single = data_health_scoped(&single, 3, 0, 0);
+    assert_eq!(health_single.parsed, 3);
+    assert_eq!(health_single.out_of_scope, 0);
 }
 
 #[test]

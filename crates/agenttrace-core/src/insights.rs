@@ -107,13 +107,15 @@ pub struct SourceScope {
 pub struct DataHealth {
     pub discovered: usize,
     pub parsed: usize,
-    /// Sessions that failed to parse (loader `skipped`); never counts
-    /// sessions merely excluded by range/filters.
+    /// Source files that failed to parse (loader `skipped`); never
+    /// counts sources merely excluded by range/filters.
     pub skipped: usize,
-    /// Sessions the loader discovered but the report scope excludes
-    /// (time range, project/source/model filters). Separate from
-    /// `skipped` so "Parse coverage N/M" is true for every range
-    /// (pass-8 F8-2).
+    /// Source files the loader discovered but the report scope
+    /// excludes (time range, project/source/model filters) — counted
+    /// as discovered minus in-scope sources minus failed files, all in
+    /// the file unit; `parsed` is the only session-unit field
+    /// (cycle-5 review F5-2). Separate from `skipped` so "Parse
+    /// coverage N/M" is true for every range (pass-8 F8-2).
     pub out_of_scope: usize,
     pub cache_hits: usize,
     pub unknown_sources: usize,
@@ -324,8 +326,19 @@ pub fn data_health_scoped(
     parse_failures: usize,
     cache_hits: usize,
 ) -> DataHealth {
-    let parsed = sessions.len();
-    let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
+    // F5-2 (cycle-5 review): `discovered` and `parse_failures` count
+    // source FILES while `parsed` counts SESSIONS, and SQLite/.db
+    // sources contribute many sessions per file — subtracting sessions
+    // from files let a ranged run on a mixed corpus report 0 hidden
+    // files while ~200 were out of scope. Count in-scope SOURCES
+    // (distinct session paths) so the subtraction stays in one unit.
+    let in_scope_sources = {
+        let mut paths: Vec<&str> = sessions.iter().map(|s| s.path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        paths.len()
+    };
+    let out_of_scope = discovered.saturating_sub(in_scope_sources + parse_failures);
     data_health_from_parts(
         sessions,
         discovered,
