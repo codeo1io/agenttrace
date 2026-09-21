@@ -1471,6 +1471,32 @@ fn rust_codex_rollout_clamps_negative_uncached_input_like_go() {
 }
 
 #[test]
+fn rust_codex_rollout_i64_extreme_token_counts_parse_without_panicking() {
+    // Cycle-7 CU-26 acceptance: an i64::MAX fixture parses without panic in
+    // debug builds and the accumulated totals saturate instead of wrapping.
+    let root = temp_root("agenttrace-rust-codex-i64-extreme");
+    fs::create_dir_all(&root).expect("create codex temp dir");
+    let session_path = root.join("rollout.jsonl");
+    fs::write(
+        &session_path,
+        r#"{"timestamp":"2026-05-03T10:00:00Z","type":"session_meta","payload":{"model":"gpt-5.5"}}
+{"timestamp":"2026-05-03T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":9223372036854775807,"cached_input_tokens":100,"output_tokens":9223372036854775807,"reasoning_output_tokens":9223372036854775807}}}}
+{"timestamp":"2026-05-03T10:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+"#,
+    )
+    .expect("write codex rollout");
+
+    let parsed = parse_file(&session_path).expect("parse codex rollout with extreme counts");
+    let metrics = &parsed.metrics;
+    assert_eq!(metrics.source_tool, "codex_cli");
+    assert_eq!(metrics.tokens_input, i64::MAX - 100);
+    assert_eq!(metrics.tokens_cache_r, 100);
+    assert_eq!(metrics.tokens_output, i64::MAX);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_claude_code_jsonl_deduplicates_assistant_usage_snapshots() {
     let root = temp_root("agenttrace-rust-claude-usage-dedupe");
     fs::create_dir_all(&root).expect("create claude temp dir");

@@ -2274,9 +2274,14 @@ fn codex_token_count_usage(
         .get("cache_creation_input_tokens")
         .copied()
         .unwrap_or(0);
-    let input = (counts.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-    let output = counts.get("output_tokens").copied().unwrap_or(0)
-        + counts.get("reasoning_output_tokens").copied().unwrap_or(0);
+    let input = (counts.get("input_tokens").copied().unwrap_or(0))
+        .saturating_sub(cache_read)
+        .max(0);
+    let output = counts
+        .get("output_tokens")
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(counts.get("reasoning_output_tokens").copied().unwrap_or(0));
 
     let mut usage = BTreeMap::new();
     usage.insert("input_tokens".to_string(), input);
@@ -2322,7 +2327,11 @@ fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage 
     ]
     .iter()
     .filter_map(|key| {
-        let delta = cur.get(*key).copied().unwrap_or(0) - prev.get(*key).copied().unwrap_or(0);
+        let delta = cur
+            .get(*key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(prev.get(*key).copied().unwrap_or(0));
         (delta > 0).then(|| ((*key).to_string(), delta))
     })
     .collect()
@@ -3429,13 +3438,15 @@ fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -
 
 fn add_usage(dst: &mut BTreeMap<String, i64>, src: &BTreeMap<String, i64>) {
     for (key, value) in src {
-        *dst.entry(key.clone()).or_insert(0) += value;
+        let entry = dst.entry(key.clone()).or_insert(0);
+        *entry = entry.saturating_add(*value);
     }
 }
 
 fn add_usage_value(usage: &mut BTreeMap<String, i64>, key: &str, raw: Option<&Value>) {
     if let Some(value) = raw.and_then(number_as_i64).filter(|value| *value > 0) {
-        *usage.entry(key.to_string()).or_insert(0) += value;
+        let entry = usage.entry(key.to_string()).or_insert(0);
+        *entry = entry.saturating_add(value);
     }
 }
 
@@ -4809,5 +4820,55 @@ mod tests {
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
+
+    #[test]
+    fn token_accounting_saturates_instead_of_overflowing() {
+        // Cycle-7 CU-26: token maps are adversarial input; subtraction and
+        // accumulation must saturate rather than overflow-panic in debug
+        // builds (the pre-fix `cur - prev` and `+=` would panic on
+        // i64-extreme values).
+        let mut cur = BTreeMap::new();
+        cur.insert("input_tokens".to_string(), i64::MAX);
+        let mut prev = BTreeMap::new();
+        prev.insert("input_tokens".to_string(), i64::MIN);
+        let delta = token_usage_delta(&cur, Some(&prev));
+        assert_eq!(delta.get("input_tokens"), Some(&i64::MAX));
+
+        let mut dst = BTreeMap::new();
+        dst.insert("output_tokens".to_string(), i64::MAX);
+        let mut src = BTreeMap::new();
+        src.insert("output_tokens".to_string(), i64::MAX);
+        add_usage(&mut dst, &src);
+        assert_eq!(dst.get("output_tokens"), Some(&i64::MAX));
+
+        let mut usage = BTreeMap::new();
+        usage.insert("cache_read_input_tokens".to_string(), i64::MAX);
+        add_usage_value(
+            &mut usage,
+            "cache_read_input_tokens",
+            Some(&serde_json::json!(i64::MAX)),
+        );
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&i64::MAX));
+    }
+
+    #[test]
+    fn codex_token_count_usage_saturates_extreme_counts() {
+        // Cycle-7 CU-26: output + reasoning at i64 extremes previously
+        // overflow-panicked in debug builds; it must saturate instead.
+        let info = serde_json::json!({
+            "total_token_usage": {
+                "input_tokens": i64::MAX,
+                "cached_input_tokens": 100,
+                "output_tokens": i64::MAX,
+                "reasoning_output_tokens": i64::MAX
+            }
+        });
+        let (usage, next_total) =
+            codex_token_count_usage(Some(&info), None).expect("extreme counts still yield usage");
+        assert_eq!(usage.get("input_tokens"), Some(&(i64::MAX - 100)));
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&100));
+        assert_eq!(usage.get("output_tokens"), Some(&i64::MAX));
+        assert!(next_total.is_some());
     }
 }
