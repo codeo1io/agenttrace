@@ -1746,6 +1746,58 @@ fn rust_rejects_oh_my_pi_session_with_invalid_header() {
 }
 
 #[test]
+fn rust_parses_oh_my_pi_session_with_leading_title_line() {
+    // Upstream #284 (6848aa1), ported in cycle 7: newer Oh My Pi versions
+    // prepend non-session lines (e.g. {"type":"title",...}) before the
+    // session header; parsing must skip them instead of bailing with
+    // "oh_my_pi: missing session header".
+    let root = temp_root("agenttrace-rust-oh-my-pi-title");
+    fs::create_dir_all(&root).expect("create oh-my-pi temp dir");
+    let session_path = root.join("session.jsonl");
+    fs::write(
+        &session_path,
+        r#"{"type":"title","title":"Fix the flaky deadline test","timestamp":1771237200000}
+{"type":"session","version":3,"id":"1f9d2a6b9c0d1234","timestamp":"2026-02-16T10:20:30.000Z","cwd":"/work/pi"}
+{"type":"message","id":"u1","parentId":null,"timestamp":"2026-02-16T10:21:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Inspect the failing test"}],"timestamp":1771237260000}}
+"#,
+    )
+    .expect("write oh-my-pi session with leading title");
+
+    let parsed = parse_file(&session_path).expect("parse oh-my-pi session with leading title");
+    let metrics = &parsed.metrics;
+    assert_eq!(metrics.source_tool, "oh_my_pi");
+    assert_eq!(metrics.user_messages, 1);
+    // The leading title line itself must not surface as a user turn.
+    assert_eq!(metrics.assistant_turns, 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_headerless_oh_my_pi_style_file_falls_back_to_generic() {
+    // A file with no `type == "session"` object anywhere is not sniffed as
+    // Oh My Pi (the dispatcher requires a real session header), so it falls
+    // back to the generic parser instead of erroring — the cycle-7 port of
+    // upstream #284 only relaxes the *leading-lines* case, never the
+    // sniffer's header requirement.
+    let root = temp_root("agenttrace-rust-oh-my-pi-no-header");
+    fs::create_dir_all(&root).expect("create oh-my-pi temp dir");
+    let session_path = root.join("headerless.jsonl");
+    fs::write(
+        &session_path,
+        r#"{"type":"title","title":"no session here","timestamp":1771237200000}
+{"type":"message","message":{"role":"user","content":"hello"}}
+"#,
+    )
+    .expect("write headerless oh-my-pi style file");
+
+    let parsed = parse_file(&session_path).expect("headerless file parses via generic path");
+    assert_eq!(parsed.metrics.source_tool, "generic");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_discovers_pi_session_files() {
     let root = temp_root("agenttrace-rust-pi-discovery");
     let home = root.join("home");
