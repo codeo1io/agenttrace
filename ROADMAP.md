@@ -193,6 +193,27 @@ copied from the producer's source). The local full-suite replication
 of the ci.yml `test` job matched the remote run exactly (213/213, same
 21-step ledger) — the replication is now the pre-push gate of record.
 
+Updated again 2026-09-21 after the cycle-7 assess and research passes
+(run 4e6ff52433d44aff92a85afa14400a58). Baseline this pass: HEAD
+`df3b621` with the uncommitted cycle-7-start tree; the workspace builds
+clean and the assess pass re-reviewed the ~33k-line core/CLI/TUI set
+live. New context filed below: the first upstream drift event since the
+fork point — upstream master moved past `e005952` with `a34dea2`
+(PR #283, 2026-09-06, TUI navigation/feedback/loading progress) and
+`6848aa1` (PR #284, 2026-09-11, skip leading non-session lines in Oh
+My Pi JSONL; our `parser.rs:1325`/`:1400` still hard-bail) — plus two
+fresh assess findings folded into the hardening lane (the
+`flag_takes_value` boolean misclassification in the Go-flag shim and
+the parser-arithmetic saturating remainder) and two new research
+candidates (53 ACP probe, 54 VS Code agent debug-log probe).
+Re-confirmed still present at this HEAD: the `HOME`-only platform gap
+and the Hermes `tool_calls_ok` fabrication. Raw research notes that
+cited upstream #267 as the Qwen radar and #47 as Windows demand were
+re-checked against the tracker and corrected: #267 is a closed
+documentation issue and #47 is the closed "VS Code Agent Debug Logs"
+radar (which feeds candidate 54); the live Qwen radar remains #237 as
+already cited by candidate 26.
+
 ### Completed in cycle 1 (recorded 2026-09-02)
 
 Preserved history; each entry names the evidence that closed it, as
@@ -526,6 +547,90 @@ Release-notes naming: "restore portable CI runners, bill thinking
 tokens, and bound the cache by bytes" is the commit subject on fork PR
 #2, and the per-CU detail lives in the PR body and the cycle-6 records.
 
+### Completed in cycle 7 (recorded 2026-09-21)
+
+Cycle 7 lands on the uncommitted base `df3b621` (branch
+`fix/tui-deadline-test-waits`); the commit itself follows this run's
+commit gate, so the sha is recorded there. Verified: the full workspace
+suite green, `cargo fmt --check` clean, and `cargo clippy --workspace
+--all-targets` warning-free on the exact tree described here. Record:
+`docs/stewardship/2026-09-21-cycle7-implementation-record.md`.
+
+- **Cycle-5-review remediation F5-1..F5-5 landed** (CU-24; this also
+  repairs a stewardship gap — the review's disposition to file
+  F5-1/F5-2 was never executed, so a complete, suite-green fix sat
+  unrecorded). F5-1 sampling disclosure names the active view
+  (`main.rs:262-267`); F5-2 out-of-scope counting is per source unit,
+  not per session (`insights.rs` `data_health_scoped`); F5-3 `--sample`
+  outside governance-class actions is rejected (`main.rs:161-175`);
+  F5-4 the text compare path carries the same sampled-exclusion reason
+  (`main.rs:617-626`); F5-5 headerless cache entries are evictable
+  (`session_cache.rs`, `map_or(i64::MIN)`). The review's test gap
+  (non-default `--sort` with `--sample`) is closed by the pinned
+  `--sort cost --order asc` case. Riders: the run-5d025d55 cache
+  isolation flake fix and the TUI language-preference isolation tests.
+  F5-6/F5-7 remain recorded decisions, restated in the cycle-7 record.
+- **Upstream drift port: Oh My Pi leading non-session lines** (CU-25;
+  upstream `6848aa1`, PR #284). `parse_oh_my_pi_jsonl` now skips
+  leading non-`session` objects instead of hard-bailing
+  ("oh_my_pi: missing session header"), matching upstream semantics;
+  the post-loop no-header guard stays. Evidence: a title-led fixture
+  parses to an `oh_my_pi` session; a header-less file still fails the
+  sniffer and falls back to generic (dispatch boundary pinned); the
+  drift census in the cycle-7 record names both upstream commits —
+  `6848aa1` ported, `a34dea2` (TUI) consciously declined with reason
+  (the fork TUI has diverged; blind port risks regression for no
+  measured gain).
+- **Saturating arithmetic — parser accounting remainder** (CU-26;
+  closes the audit list this item demanded). `token_usage_delta`
+  subtraction, `add_usage`/`add_usage_value` accumulation, and the
+  `codex_token_count_usage` output+reasoning sum and uncached-input
+  subtraction all saturate; the audit in the cycle-7 record shows no
+  bare `+=`/`-` on token counters survives outside the audited list.
+  Evidence: unit tests pinning `i64::MAX`/`i64::MIN` behavior per
+  function, plus a codex fixture whose token fields are `i64::MAX`
+  parsing without panic in a debug build with saturated totals.
+- **Go-flag shim boolean misclassification** (CU-27). `--no-baseline-gate`
+  is removed from `flag_takes_value`'s value list (`main.rs`), so it
+  no longer swallows the next flag. Evidence: a contract test asserting
+  the shim's value-flag set matches clap's definitions (every boolean
+  flag arity-0, every value flag arity-1) and a behavioral test that
+  `--no-baseline-gate --overview` keeps `--overview` as a flag.
+- **Workspace publish metadata** (CU-28). `Cargo.toml:15-16`
+  `repository`/`homepage` now name `codeo1io/agenttrace` — the remote
+  that actually publishes — closing the crates.io/docs.rs wrong-home
+  clause of the hygiene item.
+
+Lessons and prevention rules compounded from this cycle (durable;
+full context in `docs/stewardship/2026-09-21-cycle7-learnings.md`):
+
+1. **A disposition is not done until it is filed.** The cycle-5
+   review's decision to file F5-1/F5-2 was never executed, so a
+   complete, suite-green remediation sat unrecorded for 18 days and
+   was nearly duplicated. Rule: every review disposition lands as a
+   roadmap entry in the same cycle that records it.
+2. **Pin duplicated truth with contract tests.** The Go-flag shim's
+   hand-maintained value-flag table drifted from clap (one boolean
+   misclassified, silently swallowing the next flag). Rule: any
+   hand-maintained copy of a declarative source carries a contract
+   test that fails by name on drift (the F1-class lesson, restated:
+   wire-cased fixtures from the producer's source, arity tables from
+   clap's).
+3. **Records copy exact identifiers.** The cycle-7 record
+   paraphrased three test names; the targeted-tests pass caught the
+   drift because name-exact filters matched nothing. Rule: test names
+   in records come from `cargo test -- --list`, never from prose
+   memory.
+4. **Every upstream re-sync carries a drift census.** Ported:
+   `6848aa1` (parser correctness — port promptly). Declined with
+   reason: `a34dea2` (TUI; the fork diverged). Rule: port-or-decline
+   each upstream commit explicitly in the record; silence is not a
+   census.
+
+Release-notes naming: "land the F5 truth-telling debt, hold parser
+parity with upstream" is the cycle-7 batch title; per-CU detail lives
+in the cycle-7 record and the commit body.
+
 ### Hardening lane
 
 - **Local-calendar day windows** (pass-3 P3-2). `--range today` and its
@@ -622,7 +727,9 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   `HOME`-only (`discovery.rs:51-53`, `sqlite_sessions.rs:47`/`:61`), so a
   stock Windows install discovers zero sessions and `--overview` errors
   with "No session files found in" — the larger sibling of the cache-dir
-  gap. Acceptance: one shared resolver tries `HOME`, then `USERPROFILE`,
+  gap. Re-confirmed still present at HEAD `df3b621` by the cycle-7
+  assess pass (2026-09-21). Acceptance: one shared resolver tries
+  `HOME`, then `USERPROFILE`,
   then `HOMEDRIVE`+`HOMEPATH` and serves discovery, the SQLite sources,
   cache directories, and the history path (a fourth, differently-shaped
   resolver found by P4-7 in `history.rs:25-34`); the hand-rolled
@@ -731,10 +838,13 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   with `-`); filter-only invocations silently launch the full-screen TUI
   (P4-3 — error or scope the default action when `--range`, `--project`,
   `--source`, or `--model-filter` appears without an action); the
-  empty-directory error message ends with a dangling space (N7).
-  Evidence: a CLI test asserting the early-return order; a test asserting
-  the shim's truncation warning; a test asserting filter-only invocations
-  error; both message strings pinned.
+  empty-directory error message ends with a dangling space (N7). The
+  cycle-7 amendment (Go-flag shim misclassifying the boolean
+  `--no-baseline-gate` as a value flag) is closed in cycle 7 (CU-27,
+  clap-derived contract test — see Completed). Evidence: a CLI test
+  asserting the early-return order; a test asserting the shim's
+  truncation warning; a test asserting filter-only invocations error;
+  both message strings pinned.
 - **Delivery-evidence cost ceiling** (pass-2 N10). `--delivery-evidence`
   runs one synchronous `git log --all` per project root with no
   parallelism, timeout, or cap; measured 0.61s versus 0.011s for
@@ -788,6 +898,23 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   separately so "Parse coverage N/M" is true for every range.
   Evidence: a ranged-versus-all test asserting `discovered` is
   range-independent. Status change, cycle 5: closed (CU-12 — see Completed).
+- **Legacy `data_health` unit hygiene** (cycle-7 review F7-4, LOW;
+  pre-existing residual of the closed CU-12). The legacy
+  `data_health(discovered, parsed)` path keeps the unit-conflating
+  subtraction `skipped = discovered.saturating_sub(parsed)`
+  (`insights.rs:306-314`): file-unit `discovered` minus session-unit
+  `parsed`. Every current call site defuses it (the CLI passes
+  `sessions.len()` as `discovered`; the TUI reconstructs
+  `discovered = sessions.len() + skipped`), but the TUI's
+  reconstructed denominator overcounts sources when multi-session
+  (.db) files coexist with skipped files, and any future caller
+  passing a real file count reintroduces the CU-12 bug. Acceptance:
+  coverage accounting shares one unit across both `data_health`
+  paths (source-unit, like `data_health_scoped`), or the legacy path
+  is deleted with call sites unified on the scoped variant. Evidence:
+  a contract test with one multi-session (.db) source plus one
+  skipped file asserting the coverage phrase and skipped count are
+  unit-consistent.
 - **Session-cache eviction** (pass-8 F8-3; research candidate 47; the
   still-open acceptance of "Cache and history durability"). The
   session cache never evicts entries whose files are gone —
@@ -839,11 +966,13 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   (`parser.rs:20-34`); and installer checksums are inconsistent — npm
   verifies `.sha256` (`npm/scripts/install.js:78-104`) while
   `install.sh` applies only a ≥1 MB size floor (`install.sh:44-58`),
-  both same-origin. Acceptance: carryovers committed or gitignored;
-  roadmap slimmed to living work with history under `docs/`;
-  `builtin_pricing` behind a `OnceLock`; both installers verify a
-  checksum. Evidence: `git status --short` free of pre-existing
-  carryovers; a checksum test vector for each installer.
+  both same-origin. Cycle-7 assess had also flagged the publish
+  metadata mismatch, closed the same day (CU-28 — see Completed).
+  Acceptance: carryovers committed or gitignored; roadmap slimmed
+  to living work with history under `docs/`; `builtin_pricing`
+  behind a `OnceLock`; both installers verify a checksum. Evidence:
+  `git status --short` free of pre-existing carryovers; a checksum
+  test vector for each installer.
 - **Upstream-portable branch and CI hygiene** (pass-9, CRITICAL
   stewardship; evidence from upstream, not just local review). Commit
   `6632014` committed `runs-on: self-hosted` into `ci.yml:21`,
@@ -896,7 +1025,8 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   Ingestion sets `tool_calls_ok = tool_call_count` and never records
   failures (`sqlite_sessions.rs:180-196`), so every Hermes session reports
   a 0% tool fail-rate and optimistic health while file-backed providers
-  surface real failures. Acceptance: the reader extracts a real failure
+  surface real failures. Re-confirmed at HEAD `df3b621` by the cycle-7
+  assess pass. Acceptance: the reader extracts a real failure
   signal from `state.db` where the schema offers one (schema research
   first: error/status columns on the message or event tables), with
   provenance disclosing "failures unrecorded" for schemas that lack it.
@@ -1190,7 +1320,9 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   in this environment, so the lane should add an advisory-scan CI job
   alongside the bumps. Research pass 8: upstream's dependabot queue
   still holds #278/#279 plus `actions/checkout` 6→7 (#259, open since
-  June) — fold all three.
+  June) — fold all three. Cycle-7 census (2026-09-21): #278 is
+  `actions/attest-build-provenance` 4.1.1→4.2.2 and #279 is a
+  seven-package cargo-group bump; both still open.
 - **Cost provenance for priced sessions** (research candidate 24,
   confidence 86%; implements the promotion path named in issue #103).
   The vendored snapshot collapses every provider of a model onto one bare
@@ -1423,6 +1555,29 @@ tokens, and bound the cache by bytes" is the commit subject on fork PR
   policy) opening a PR rather than committing directly. Evidence: a test
   pinning the age computation against a fixed clock; a workflow file plus
   one opened refresh PR as the artifact.
+- **Agent Client Protocol (ACP) session-source probe** (research
+  candidate 53, cycle 7; confidence medium). ACP v1.0.0 (published
+  2025-06, agentclientprotocol.com; Zed-editor stewardship) fixes the
+  editor↔agent JSON-RPC surface (session/turn events, tool calls,
+  permission requests); agents speaking it may persist local session
+  logs, and no tool in the census (ccusage, codeburn, tare, ai-cli-cost,
+  ccseva) parses them. Acceptance: a spike doc recording whether at
+  least one ACP-speaking agent persists local session logs carrying
+  token or cost data; if yes, a discovery root plus parser with
+  wire-cased contract fixtures (the F1-class rule); if no, a dated
+  negative finding parked for the next census. Evidence: the spike doc
+  under `docs/research/` plus fixture tests or the recorded negative.
+- **VS Code agent debug-log session source probe** (research candidate
+  54, cycle 7; confidence medium; demand signal: upstream radar issue
+  #47 "[Radar] Track VS Code Agent Debug Logs as session evidence
+  signal", closed upstream — the demand is recorded even though the
+  upstream lane is not carrying it). VS Code Copilot agent modes write
+  session/debug logs under user-profile paths and none of the censused
+  tools parse them. Acceptance: same spike discipline as candidate 53 —
+  a doc naming the on-disk locations and whether token/cost/tool data
+  is present; a discovery root plus parser with fixtures, or a dated
+  negative finding. Evidence: the spike doc; fixture tests or the
+  recorded negative.
 
 Candidates 41 (Windows-source leniency: BOM/UTF-16 plus the P7-1 lenient
 fallback) and 42 (baseline gate exit semantics) were filed in the
@@ -1449,7 +1604,20 @@ the cycle-6 records. Next-cycle shortlist, in dependency order: the fork
 dependency-review fix (unblocks clean merge signals for every later PR),
 ROADMAP/release-notes hygiene ride-alongs, then candidate 51 and the
 parse-size-cap/installer-checksum items deferred by the cycle-6
-prioritization.
+prioritization. Cycle 7 (2026-09-21) added two hardening items and
+capability candidates 53–54 above; both hardening items landed the
+same day (see Completed in cycle 7), the drift census declining
+`a34dea2` (TUI) with reason while porting `6848aa1`, and the cycle-8
+headliner remains the Windows HOME/USERPROFILE resolver. The cycle-7
+compounding adds the four prevention rules above (file dispositions at
+decision time, contract-pin duplicated truth, exact identifiers in
+records, drift census per re-sync) and sets the cycle-8 shortlist in
+dependency order: the Windows HOME/USERPROFILE resolver (headliner),
+Hermes `state.db` tool_calls_ok schema research (data-shape question,
+not code), the fork dependency-review fix at the PR/CI stage, then
+research spikes for candidates 53 (ACP stores) and 54 (VS Code agent
+debug logs), with candidate 51 and the parse-size-cap and
+installer-checksum items still queued behind them.
 
 Items leave this section only when their acceptance criteria and evidence
 expectations are met and recorded in the Completed record above, and the
