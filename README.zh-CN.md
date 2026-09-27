@@ -96,6 +96,10 @@ cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
+预编译二进制与当前主机不兼容时（例如基于更新版本 libc 构建）不会
+被静默安装：安装器会报告加载器的错误信息，install.sh 会自动回退到
+从源码构建。
+
 ## Quickstart
 
 ```bash
