@@ -14,6 +14,7 @@ const { join } = require("node:path");
 const { pipeline } = require("node:stream/promises");
 const { get } = require("node:https");
 const { createHash } = require("node:crypto");
+const { verifyRuntime } = require("./verify-runtime");
 
 const PACKAGE_VERSION = require("../package.json").version;
 const REPOSITORY = "luoyuctl/agenttrace";
@@ -106,6 +107,17 @@ async function main() {
 		renameSync(temporaryBinary, destination);
 		if (platform !== "win32") {
 			chmodSync(destination, 0o755);
+		}
+		// A checksum-valid download can still be incompatible with this host
+		// (e.g. built against a newer glibc), so prove the binary actually runs
+		// before declaring success — never leave a broken binary behind.
+		const verification = verifyRuntime(destination);
+		if (!verification.ok) {
+			rmSync(destination, { force: true });
+			fail(
+				`downloaded binary is incompatible with this host and does not run: ${verification.stderrTail}. ` +
+						"Install Rust (https://rustup.rs) and build from source instead, see the repository README",
+			);
 		}
 	} finally {
 		rmSync(temporaryBinary, { force: true });

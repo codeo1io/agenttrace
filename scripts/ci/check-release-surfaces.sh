@@ -22,6 +22,16 @@ grep -q "cargo build --release -p agenttrace" install.sh ||
 	fail "install.sh source-build fallback must use cargo"
 grep -q "cargo build --release -p agenttrace" install.ps1 ||
 	fail "install.ps1 source-build fallback must use cargo"
+grep -q -- '--version' install.sh ||
+	fail "install.sh must verify the downloaded binary runs before installing it"
+grep -q "AGENTTRACE_SKIP_SOURCE_BUILD" install.sh ||
+	fail "install.sh must expose a source-build skip knob for offline verification"
+grep -q "Falling back to building from source" install.sh ||
+	fail "install.sh must fall back to a cargo source build when the prebuilt binary is incompatible"
+grep -q -- '--version' install.ps1 ||
+	fail "install.ps1 must verify the installed binary runs"
+grep -q "verifyRuntime" npm/scripts/install.js ||
+	fail "npm installer must verify the installed binary runs"
 grep -q "cargo install" README.md ||
 	fail "README install paths must include cargo install"
 grep -q "cargo install" README.zh-CN.md ||
