@@ -66,6 +66,11 @@ jobs:
       - name: Release surface drift
         run: scripts/ci/check-release-surfaces.sh
 
+      - name: Install runtime verification
+        run: |
+          AGENTTRACE_BIN=target/release/agenttrace \
+            scripts/ci/check-install-runtime.sh
+
       - name: Documented command smoke tests
         run: |
           AGENTTRACE_BIN=target/release/agenttrace \
@@ -108,4 +113,6 @@ jobs:
         run: scripts/ci/check-plugin-version.sh
 
       - name: Validate helper scripts
-        run: bash -n scripts/record-demo.sh scripts/ci/*.sh
+        run: |
+          bash -n scripts/record-demo.sh scripts/ci/*.sh
+          sh -n install.sh

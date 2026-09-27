@@ -53,6 +53,23 @@ try {
     Write-Host "   Binary size: $size bytes"
 
     Move-Item -Force $tmp $DEST
+
+    # Runtime verification: a downloaded artifact must prove it runs on THIS
+    # host before the install is declared successful. Release binaries built
+    # against a newer toolchain (for example a newer libc) fail here, loudly,
+    # instead of installing silently broken (Maestro finding 47fa1154 pinned
+    # this exact failure shape on the Linux installer).
+    $probe = & $DEST --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "❌ Installed agenttrace binary does not run on this host:" -ForegroundColor Red
+        $probe | Select-Object -Last 3 | ForEach-Object { Write-Host "   $_" }
+        Remove-Item -Force $DEST
+        Write-Host "   Usually the release binary was built against a newer system"
+        Write-Host "   library than this host provides, or the architecture does not match."
+        Write-Host "   Build from source: git clone https://github.com/$REPO.git && cd agenttrace && cargo build --release -p agenttrace"
+        exit 1
+    }
+    Write-Host "   $($probe | Select-Object -First 1)"
     Write-Host "✅ Installed to $DEST" -ForegroundColor Green
 } catch {
     Write-Host "❌ Download failed: $_" -ForegroundColor Red

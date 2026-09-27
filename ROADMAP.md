@@ -653,6 +653,56 @@ Release-notes naming: "land the F5 truth-telling debt, hold parser
 parity with upstream" is the cycle-7 batch title; per-CU detail lives
 in the cycle-7 record and the commit body.
 
+### Completed in the maestro installed-runtime remediation (recorded
+2026-09-27)
+
+Run 3988bfe52ff448cfbea6568ab51c7fd6 — Maestro A4 structural
+remediation, finding 47fa1154 (installed runtime missing, non-
+executable, or incompatible with host; prevention REQUIRED), incident
+eb79e151. Base fork master `0d88e19`; the landing commit follows the
+run's commit gate, so its sha is recorded there. Verified on the
+combined implement-1/implement-2 tree: `check-release-surfaces.sh`
+clean (existing assertions plus the five new install-verification
+pins), `check-install-runtime.sh` green (offline stubs A–D plus the
+glibc guard on a host-built binary at GLIBC_2.34), the same guard
+deliberately failing against the finding's byte-identical upstream
+artifact (GLIBC_2.39), `sh -n install.sh`, `bash -n scripts/ci/*.sh`,
+the npm suite 4/4, and `cargo test -p agenttrace --test entrypoints`
+7/7 including the new `help_exits_zero` probe.
+
+- **Install surfaces must prove the runtime they install.** Root
+  cause, reproduced end to end: Maestro's installed-runtime observer
+  runs `/home/agent/.local/bin/agenttrace --help` and requires rc 0;
+  the installed binary — sha256 `e44f520b…`, byte-identical to
+  upstream release v0.8.1's `agenttrace-linux-amd64` — was built on
+  ubuntu-latest (glibc 2.39) and cannot load on an Ubuntu 22.04 host
+  (glibc 2.35), so 35 consecutive evaluations failed with
+  "GLIBC_2.39 not found" while `install.sh` reported success. Closed
+  with: verify-then-install in `install.sh` — the temp download is
+  probed with `--version` before `mv` to DEST, failure prints the
+  binary's own loader stderr and falls back to a depth-1 clone plus
+  `cargo build --release -p agenttrace`, and the installed DEST is
+  confirmed once more post-move; the same probe in `install.ps1`
+  (error tail, remove, source-build guidance) and in the npm
+  installer (`npm/scripts/verify-runtime.js`, never leaves a broken
+  binary behind). Pinned by `scripts/ci/check-install-runtime.sh`
+  (file:// stubs drive the real install.sh through accept / reject
+  with the loader error / no-toolchain / fallback-build paths, plus
+  a glibc-baseline guard against the 2.35 floor) wired into ci.yml
+  after "Release surface drift" and into check-rust-release-local.sh
+  behind `AGENTTRACE_BIN`, by additive `check-release-surfaces.sh`
+  assertions on the verification code paths, and by the
+  `help_exits_zero` entrypoints test. Deferred upstream, not
+  fork-local: release-artifact baseline builds (musl/older-glibc
+  targets in release.yml) — the breaking artifact is upstream's
+  v0.8.1, the fork publishes no releases (0.0.0-dev), and rewriting
+  the inherited release workflow would break the parity principle.
+  Implementation record: CHANGELOG "Unreleased".
+
+Release-notes naming: "verify install-time runtime compatibility and
+fall back to a source build" is the remediation subject; per-file
+detail lives in the CHANGELOG entries and this record.
+
 ### Hardening lane
 
 - **Local-calendar day windows** (pass-3 P3-2). `--range today` and its
