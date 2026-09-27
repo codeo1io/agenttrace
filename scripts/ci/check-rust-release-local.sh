@@ -33,6 +33,7 @@ run scripts/ci/check-cargo-manifests.sh
 
 [[ -x "$bin" ]] || fail "release binary is not executable: $bin"
 run "$bin" --version
+run_env AGENTTRACE_BIN="$bin" scripts/ci/check-install-runtime.sh
 run cargo test -p agenttrace --test entrypoints
 
 run_env AGENTTRACE_BIN="$bin" AGENTTRACE_CI_OUT="$out_dir/contracts" \

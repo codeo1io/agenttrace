@@ -91,6 +91,10 @@ cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
 ```
 
+A prebuilt binary that cannot run on this host (for example, one built
+against a newer libc) is never installed silently: the installer reports
+the loader's error, and `install.sh` falls back to a source build.
+
 ## Quickstart
 
 ```bash
