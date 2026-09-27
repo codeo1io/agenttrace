@@ -1,0 +1,9 @@
+{"step":1,"ts":"2026-09-29T00:00:00Z","summary":"Read save/sizing/snapshot/sweep internals; confirmed per-DB fingerprint check exists","touched":["crates/agenttrace-core/src/session_cache.rs"]}
+{"step":2,"ts":"2026-09-29T00:00:00Z","summary":"CU-30: per-DB sqlite_snapshot_path(name,database) + FNV-1a hash + SQLITE_SNAPSHOT_SCHEMA_VERSION 6->7","touched":["crates/agenttrace-core/src/session_cache.rs"]}
+{"step":3,"ts":"2026-09-29T00:00:00Z","summary":"CU-35: classify_snapshot_file generations, clear_session_cache_in full sweep, sweep_legacy_snapshots on load","touched":["crates/agenttrace-core/src/session_cache.rs"]}
+{"step":4,"ts":"2026-09-29T00:00:00Z","summary":"CU-31: single sizing pass feeds enforce_entry_bound_with/enforce_byte_bound_with in save","touched":["crates/agenttrace-core/src/session_cache.rs"]}
+{"step":5,"ts":"2026-09-29T00:00:00Z","summary":"Added 4 tests (per-DB names, clear generations, legacy sweep, combined-bounds equivalence); schema-six test bumped to seven","touched":["crates/agenttrace-core/src/session_cache.rs"]}
+{"step":6,"ts":"2026-09-29T00:00:00Z","summary":"Live run1: 30->13 cache files, 11 per-DB v7 snapshots; run2 still rewrote all -> investigated","touched":[]}
+{"step":7,"ts":"2026-09-29T00:00:00Z","summary":"Root cause: reads bump -wal/-shm mtimes -> snapshot self-invalidation; fixed wal_size-only fingerprint, shm dropped","touched":["crates/agenttrace-core/src/session_cache.rs"]}
+{"step":8,"ts":"2026-09-29T00:00:00Z","summary":"Read-invalidation regression test added; clippy clean; 92 core lib tests green","touched":["crates/agenttrace-core/src/session_cache.rs"]}
+{"step":9,"ts":"2026-09-29T00:00:00Z","summary":"Final live acceptance: --clear-cache 30->1; two runs: only live-written ~/.hermes/state.db rewrites; 10/11 byte-stable","touched":[]}
