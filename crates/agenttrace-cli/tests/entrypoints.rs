@@ -54,6 +54,30 @@ fn cli_version_wins_over_action_validation() {
 }
 
 #[test]
+fn help_exits_zero() {
+    // Maestro finding 47fa1154 (run 3988bfe5): the installed-runtime probe
+    // runs `agenttrace --help` and requires exit code 0. A release binary
+    // built on a newer distro (GLIBC_2.39) failed that probe from the
+    // loader on Ubuntu 22.04 after a silent install. Pin the probe contract
+    // at the source: the built CLI must answer --help with rc 0 and
+    // non-empty stdout, next to the --version contract above.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--help")
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "--help must exit 0 (installed-runtime probe contract), got {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.is_empty(),
+        "--help must print usage to stdout, got {stdout:?}"
+    );
+}
+
+#[test]
 fn baseline_regression_gates_the_exit_code_and_opt_out_flags_work() {
     // Pass-7 P7-3: `--baseline-max-*-delta-pct` used to leave the breach
     // booleans buried in the JSON while the process exited 0 — a gate
