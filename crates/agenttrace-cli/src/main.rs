@@ -8,9 +8,9 @@ use agenttrace_core::{
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
     report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, search_sessions, session_capability, tool_fail_rate, total_tokens,
-    update_pricing, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
-    TimeRange, VERSION,
+    report_text_with_language, search_sessions, session_capability, session_file_skips,
+    tool_fail_rate, total_tokens, update_pricing, BaselineThresholds, LoadOptions, LoadReport,
+    ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -797,6 +797,34 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
     load_sessions_report(args).map(|(sessions, _)| sessions)
 }
 
+/// Names discovery collect-time refusals on stderr, bounded to three
+/// samples (rm-056): without this, a FIFO or oversized session file
+/// was silently absent from every report and the user had no way to
+/// know. Full list: `agenttrace --doctor`.
+fn report_discovery_skips() {
+    let skips = session_file_skips();
+    if skips.is_empty() {
+        return;
+    }
+    let shown: Vec<String> = skips
+        .iter()
+        .take(3)
+        .map(|skip| format!("{} ({})", skip.path.display(), skip.reason.describe()))
+        .collect();
+    let hidden = skips.len() - shown.len();
+    let suffix = if hidden > 0 {
+        format!(", +{hidden} more")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "Note: skipped {} file(s) that are not regular session files or exceed the size cap (details: `agenttrace --doctor`){}: {}",
+        skips.len(),
+        suffix,
+        shown.join(", ")
+    );
+}
+
 fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
     if args.demo {
         return Ok((prepare_explicit_sessions(demo_sessions()?, args)?, None));
@@ -837,6 +865,10 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         },
     );
     let sessions = report.sessions.clone();
+    // rm-056: files refused at collect time (FIFOs, oversized) must not
+    // vanish silently — name them on stderr (bounded), with
+    // `agenttrace --doctor` for the full list.
+    report_discovery_skips();
     if sessions.is_empty() {
         if report.discovered == 0 {
             bail!(

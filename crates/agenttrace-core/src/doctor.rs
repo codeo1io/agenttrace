@@ -23,6 +23,13 @@ pub struct DoctorReport {
     pub cache_limits: String,
     pub sessions: usize,
     pub session_files: usize,
+    /// Discovery collect-time refusals (rm-056): files that matched a
+    /// session-file name but are not regular files (FIFOs, sockets,
+    /// devices) or exceed the size cap. Named so the doctor can say
+    /// WHY a file is missing instead of hanging or dropping it
+    /// silently.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_session_files: Vec<String>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -126,6 +133,12 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         ),
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
+        skipped_session_files: crate::discovery::session_file_skips()
+            .iter()
+            .map(|skip| {
+                format!("{} ({})", skip.path.display(), skip.reason.describe())
+            })
+            .collect(),
         directories: doctor_directories(dir, &files, &sqlite_sessions),
         statusline: doctor_statusline_report(demo),
         pricing: format!(
@@ -323,6 +336,12 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
         "Ready: run `agenttrace` for the TUI or `agenttrace --overview -f json` for automation."
             .to_string(),
     ];
+    if !report.skipped_session_files.is_empty() {
+        recommendations.push(format!(
+            "{} discovered file(s) were skipped (not regular files or over AGENTTRACE_MAX_SESSION_FILE_BYTES); see the skipped list above.",
+            report.skipped_session_files.len()
+        ));
+    }
     if demo {
         recommendations.push(
             "Demo sessions use a temporary directory, so cache reuse is not expected in this mode."
@@ -364,6 +383,15 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.statusline.path, statusline_state
     ));
     out.push_str(&format!("Pricing snapshot: {}\n", report.pricing));
+    if !report.skipped_session_files.is_empty() {
+        out.push_str(&format!(
+            "Skipped at discovery: {} file(s) not regular or over the size cap\n",
+            report.skipped_session_files.len()
+        ));
+        for sample in &report.skipped_session_files {
+            out.push_str(&format!("  skipped: {sample}\n"));
+        }
+    }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
         let status = if dir.exists { "found" } else { "missing" };

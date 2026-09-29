@@ -2588,3 +2588,170 @@ fn doctor_names_symlinked_session_roots_instead_of_silent_following() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+// ---------------------------------------------------------------------------
+// rm-055 / rm-056 (run 83642957d130, cycle 1): alias-root dedupe by
+// canonical path, and collect-time admission of discovered session
+// files (regular + size-capped).
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn alias_root_symlink_reports_each_session_once() {
+    // rm-055 (assess F1): a dotfile-managed home presents one session
+    // directory under two known roots (`~/.pi` symlinked to
+    // `~/.config/pi`). Discovery keyed root admission and cross-root
+    // dedupe on the exact path string, so both spellings were admitted
+    // and every session was discovered, parsed, and costed once per
+    // spelling (live: 2 Sessions, $0.0012 instead of 1 / $0.0006).
+    let root = temp_root("agenttrace-alias-root");
+    let home = root.join("home");
+    let real = home.join(".config/pi/agent/sessions");
+    fs::create_dir_all(&real).expect("create sessions dir");
+    let session_file = real.join("aaa11111-2222-3333-4444-555566667777.jsonl");
+    fs::write(&session_file, SAMPLE_JSONL).expect("write session");
+    std::os::unix::fs::symlink(home.join(".config/pi"), home.join(".pi"))
+        .expect("symlink alias root");
+
+    with_home(&home, || {
+        agenttrace_core::clear_session_file_skips();
+        let report = load_sessions_with_options(None, &LoadOptions::default());
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "alias spellings must collapse: {:?}",
+            report
+                .sessions
+                .iter()
+                .map(|session| session.path.clone())
+                .collect::<Vec<_>>()
+        );
+        let reference =
+            parse_file(&session_file).expect("parse the single real session file");
+        assert_eq!(
+            report.sessions[0].metrics.cost_estimated,
+            reference.metrics.cost_estimated,
+            "the surviving session is costed once, not twice"
+        );
+        // Both roots exist on disk; exactly one spelling may be admitted.
+        let dirs = agenttrace_core::discover_session_dirs();
+        let session_roots: Vec<_> = dirs
+            .iter()
+            .filter(|dir| dir.ends_with("agent/sessions"))
+            .collect();
+        assert_eq!(
+            session_roots.len(),
+            1,
+            "one alias spelling admitted, got {session_roots:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_matching_a_session_name_is_refused_not_hung() {
+    // rm-056 (assess F2): a FIFO named *.jsonl inside a discovered dir
+    // used to reach parse_file's unguarded fs::read and hang the whole
+    // run on open() — `--overview`, `--doctor`, and `--doctor -d` all
+    // hit timeout exit 124. It must be refused at collect time with a
+    // NAMED skip (surfaced by doctor and the CLI load note), and the
+    // parser must refuse it directly as defense in depth.
+    let root = temp_root("agenttrace-fifo-skip");
+    let home = root.join("home");
+    let dir = home.join(".claude/projects/proj");
+    fs::create_dir_all(&dir).expect("create project dir");
+    fs::write(dir.join("good.jsonl"), SAMPLE_JSONL).expect("write good session");
+    let fifo = dir.join("hang.jsonl");
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("spawn mkfifo (POSIX fixture)");
+    assert!(mkfifo.success(), "mkfifo must create the fixture");
+
+    with_home(&home, || {
+        agenttrace_core::clear_session_file_skips();
+        let report = load_sessions_with_options(None, &LoadOptions::default());
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "the regular session parses; the FIFO is skipped, not hung on"
+        );
+        let skips = agenttrace_core::session_file_skips();
+        assert!(
+            skips
+                .iter()
+                .any(|skip| skip.path == fifo
+                    && skip.reason == agenttrace_core::SessionFileSkipReason::NotRegularFile),
+            "a named skip is recorded: {skips:?}"
+        );
+        // Doctor discloses the refusal by name.
+        let doctor = build_doctor_report(None, false);
+        assert!(
+            doctor
+                .skipped_session_files
+                .iter()
+                .any(|row| row.contains("hang.jsonl")),
+            "doctor names the skipped FIFO: {:?}",
+            doctor.skipped_session_files
+        );
+        // Defense in depth: parse_file refuses the FIFO fast (stat, not
+        // open) with a named error.
+        let direct = parse_file(&fifo);
+        let message = direct.expect_err("parse_file must refuse a FIFO").to_string();
+        assert!(
+            message.contains("not a regular file"),
+            "the error names the refusal: {message}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn oversized_session_file_is_refused_at_collect_time() {
+    // rm-056: the same admission predicate bounds file size (closing
+    // the cycle-5 provisional max-size item); the cap is configurable
+    // via AGENTTRACE_MAX_SESSION_FILE_BYTES.
+    let root = temp_root("agenttrace-oversize-skip");
+    let home = root.join("home");
+    let dir = home.join(".claude/projects/proj");
+    fs::create_dir_all(&dir).expect("create project dir");
+    fs::write(dir.join("big.jsonl"), SAMPLE_JSONL).expect("write session over the test cap");
+
+    with_home(&home, || {
+        let prior = std::env::var_os("AGENTTRACE_MAX_SESSION_FILE_BYTES");
+        std::env::set_var("AGENTTRACE_MAX_SESSION_FILE_BYTES", "64");
+        agenttrace_core::clear_session_file_skips();
+        let report = load_sessions_with_options(None, &LoadOptions::default());
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_MAX_SESSION_FILE_BYTES", value),
+            None => std::env::remove_var("AGENTTRACE_MAX_SESSION_FILE_BYTES"),
+        }
+        assert!(
+            report.sessions.is_empty(),
+            "the oversized file must not be read"
+        );
+        let skips = agenttrace_core::session_file_skips();
+        assert!(
+            skips.iter().any(|skip| skip.path.ends_with("big.jsonl")
+                && matches!(
+                    skip.reason,
+                    agenttrace_core::SessionFileSkipReason::Oversized { .. }
+                )),
+            "a named oversized skip is recorded: {skips:?}"
+        );
+        // The direct parse refusal names the cap and the escape hatch.
+        let direct = parse_file(&dir.join("big.jsonl"));
+        let message = direct
+            .expect_err("parse_file must refuse an oversized file")
+            .to_string();
+        assert!(
+            message.contains("AGENTTRACE_MAX_SESSION_FILE_BYTES"),
+            "the error names the cap escape hatch: {message}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}

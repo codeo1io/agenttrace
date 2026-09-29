@@ -18,6 +18,31 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             }
         }
     }
+    // rm-056: refuse non-regular files BEFORE `fs::read` opens them. A
+    // FIFO or socket matching a session-file name used to reach this
+    // read (discovery had no file-type check) and hang the whole run on
+    // open() — a FIFO's open blocks until a writer appears. Discovery
+    // now refuses them at collect time; this guard covers positional
+    // paths, stale cached listings, and direct library callers. The
+    // size cap keeps one pathological file from being read whole into
+    // memory (bounded at discovery by the same predicate).
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("stat session file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "session file {} is not a regular file; special files (FIFOs, sockets, devices) are refused — discovery skips them with a named reason",
+            path.display()
+        );
+    }
+    let max_file_bytes = crate::discovery::max_session_file_bytes();
+    if metadata.len() > max_file_bytes {
+        bail!(
+            "session file {} is {} bytes, over the {}-byte cap (raise AGENTTRACE_MAX_SESSION_FILE_BYTES to read it)",
+            path.display(),
+            metadata.len(),
+            max_file_bytes
+        );
+    }
     let raw =
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
     // Windows tooling (notably PowerShell 5.1's `>` redirection) writes

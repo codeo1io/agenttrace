@@ -11,6 +11,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,13 +145,28 @@ pub fn discover_session_dirs() -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut dirs = Vec::new();
     for candidate in known_session_dirs() {
-        if candidate.path.is_dir() && seen.insert(candidate.path.clone()) {
+        if !candidate.path.is_dir() {
+            continue;
+        }
+        // Admit roots by canonical target, not path spelling (rm-055): a
+        // dotfile-managed home (`~/.pi -> ~/.config/pi`) presents one
+        // directory as two known roots; keying admission on the exact
+        // string admitted both, and every session under them was
+        // discovered, parsed, and costed once per spelling (live: 2
+        // Sessions / $0.0012 where the truth was 1 / $0.0006). The first
+        // known spelling wins, deterministically. Unresolvable paths
+        // fall back to the spelling, mirroring `SymlinkTargets::admit`.
+        let key = fs::canonicalize(&candidate.path).unwrap_or_else(|_| candidate.path.clone());
+        if seen.insert(key) {
             dirs.push(candidate.path);
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join(".aider.chat.history.md").is_file() && seen.insert(cwd.clone()) {
-            dirs.push(cwd);
+        if cwd.join(".aider.chat.history.md").is_file() {
+            let key = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+            if seen.insert(key) {
+                dirs.push(cwd);
+            }
         }
     }
     dirs
@@ -167,6 +183,11 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     for dir in discover_session_dirs() {
         all.extend(collect_session_files(&dir));
     }
+    // Cross-root dedupe keys on canonical identity (rm-055): distinct
+    // admitted roots can still reach one file through an interior
+    // symlink, and two spellings of one file used to count twice.
+    let mut seen = HashSet::new();
+    all.retain(|path| seen.insert(canonical_file_key(path)));
     sort_paths_by_mod_time(all)
 }
 
@@ -313,6 +334,119 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
     items.into_iter().map(|item| item.0).collect()
 }
 
+/// Default per-file cap for discovered session files: far above any
+/// real session journal observed (tens of MiB) while still bounding
+/// `fs::read` on pathological files. Raise or lower it with
+/// `AGENTTRACE_MAX_SESSION_FILE_BYTES`.
+pub const DEFAULT_MAX_SESSION_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Configurable ceiling for a single discovered session file
+/// (rm-056). Unset, non-numeric, or zero values fall back to the
+/// default.
+pub fn max_session_file_bytes() -> u64 {
+    std::env::var_os("AGENTTRACE_MAX_SESSION_FILE_BYTES")
+        .and_then(|value| value.to_str().and_then(|raw| raw.parse::<u64>().ok()))
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_MAX_SESSION_FILE_BYTES)
+}
+
+/// Why a file that matched a session-file name was refused at collect
+/// time (rm-056). Named so doctor and load diagnostics can say WHY a
+/// file is missing instead of the old behavior: a FIFO matching a
+/// session name reached `parse_file`'s unguarded `fs::read` and hung
+/// the whole run on open() (live: `--overview`, `--doctor`, and
+/// `--doctor -d` all hit timeout exit 124); oversized files were read
+/// whole into memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionFileSkipReason {
+    /// FIFOs, sockets, devices — anything `fs::read` would open with
+    /// hang semantics (a FIFO's open blocks until a writer appears).
+    NotRegularFile,
+    /// Over the configurable byte cap; reading it whole would balloon
+    /// memory for one pathological file.
+    Oversized { size: u64, max: u64 },
+}
+
+impl SessionFileSkipReason {
+    /// Short human phrasing for doctor rows and load notes.
+    pub fn describe(&self) -> String {
+        match self {
+            SessionFileSkipReason::NotRegularFile => "not a regular file".to_string(),
+            SessionFileSkipReason::Oversized { size, max } => {
+                format!("{size} bytes over the {max}-byte cap")
+            }
+        }
+    }
+}
+
+/// One recorded collect-time refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionFileSkip {
+    pub path: PathBuf,
+    pub reason: SessionFileSkipReason,
+}
+
+/// Bounded process-wide journal of collect-time refusals; doctor and
+/// the CLI load path read it to disclose skips instead of dropping
+/// files silently.
+const MAX_RECORDED_SKIPS: usize = 64;
+
+fn skip_journal() -> &'static Mutex<Vec<SessionFileSkip>> {
+    static SKIPS: OnceLock<Mutex<Vec<SessionFileSkip>>> = OnceLock::new();
+    SKIPS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Records a refusal (deduplicated, bounded).
+pub fn record_session_file_skip(path: &Path, reason: SessionFileSkipReason) {
+    let skip = SessionFileSkip {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let mut journal = match skip_journal().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if journal.len() >= MAX_RECORDED_SKIPS || journal.contains(&skip) {
+        return;
+    }
+    journal.push(skip);
+}
+
+/// Collect-time refusals recorded so far in this process, in
+/// discovery order.
+pub fn session_file_skips() -> Vec<SessionFileSkip> {
+    match skip_journal().lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Clears the skip journal (test hygiene between isolated loads).
+pub fn clear_session_file_skips() {
+    match skip_journal().lock() {
+        Ok(mut guard) => guard.clear(),
+        Err(poisoned) => poisoned.into_inner().clear(),
+    }
+}
+
+/// Collect-time admission predicate for a candidate session file
+/// (rm-056): a session file must be a regular file after symlink
+/// resolution (a symlink to a real file is fine) and under the
+/// configurable size cap. `None` admits; `Some(reason)` refuses.
+fn session_file_admission(metadata: &fs::Metadata) -> Option<SessionFileSkipReason> {
+    if !metadata.is_file() {
+        return Some(SessionFileSkipReason::NotRegularFile);
+    }
+    let max = max_session_file_bytes();
+    if metadata.len() > max {
+        return Some(SessionFileSkipReason::Oversized {
+            size: metadata.len(),
+            max,
+        });
+    }
+    None
+}
+
 pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
@@ -331,12 +465,21 @@ pub(crate) fn find_session_files_cached(
             continue;
         }
         for path in collect_session_files_cached(&dir, cache) {
-            if seen.insert(path.clone()) {
+            // Cross-root dedupe by canonical identity, not spelling
+            // (rm-055): the aliased file is parsed and costed once.
+            if seen.insert(canonical_file_key(&path)) {
                 all.push(path);
             }
         }
     }
     sort_paths_by_cache(all, cache)
+}
+
+/// Canonical identity for a discovered session file (rm-055): two
+/// spellings of one file (alias roots, interior symlinks) collapse to
+/// one key; an unresolvable path falls back to its spelling.
+fn canonical_file_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {
@@ -466,6 +609,17 @@ fn walk_session_files_cached(
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
             continue;
         }
+        // rm-056: stat once and admit or refuse BEFORE the listing cache
+        // learns the file, so a FIFO or oversized file matching a session
+        // name never reaches `parse_file`'s `fs::read` (which hung the
+        // whole run on a FIFO's open) and never enters the cache either.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if let Some(reason) = session_file_admission(&metadata) {
+            record_session_file_skip(&path, reason);
+            continue;
+        }
         files.push(path);
     }
     files.sort();
@@ -527,7 +681,19 @@ fn walk_session_files(
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
             continue;
         }
-        items.push((path, entry_mod_time(&entry)));
+        // rm-056: same admission predicate on the uncached walk; the
+        // metadata needed for the sort key doubles as the stat.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if let Some(reason) = session_file_admission(&metadata) {
+            record_session_file_skip(&path, reason);
+            continue;
+        }
+        items.push((
+            path,
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
     }
 }
 
@@ -556,6 +722,15 @@ fn sort_paths_by_cache(paths: Vec<PathBuf>, cache: &mut SessionCache) -> Vec<Pat
                 continue;
             }
         };
+        // rm-056: re-apply the admission predicate on the metadata this
+        // sort already fetches, so listings replayed from a cache written
+        // with a larger cap (or by a pre-rm-056 binary) cannot feed a
+        // FIFO or oversized file back into the parse loop.
+        if let Some(reason) = session_file_admission(&metadata) {
+            record_session_file_skip(&path, reason);
+            delete_cached_session(&path, cache);
+            continue;
+        }
         let time = cached_file_mod_time_if_fresh(&path, &metadata, cache)
             .map(time_from_unix_nanos)
             .unwrap_or_else(|| metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));

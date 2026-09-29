@@ -58,6 +58,12 @@ pub fn merge_preserved_history(live: &mut Vec<Session>) {
         .iter()
         .map(session_id)
         .collect::<std::collections::BTreeSet<_>>();
+    // Records preserved before rm-055 are keyed by the raw path
+    // spelling; suppress those ids too so switching to canonical ids
+    // does not resurrect old records next to their still-live sessions.
+    for session in live.iter() {
+        seen.insert(legacy_session_id(session));
+    }
     for record in load_records().into_values() {
         if seen.insert(record.id.clone()) {
             live.push(record.into_session());
@@ -101,6 +107,32 @@ fn decode_records(raw: &[u8]) -> BTreeMap<String, DerivedSession> {
 }
 
 fn session_id(session: &Session) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // rm-055: hash the CANONICAL path. Aliased roots (`~/.pi ->
+    // ~/.config/pi`) reach one file through several spellings, and the
+    // raw spelling forked derived-history identity per alias.
+    canonical_identity_path(&session.path).hash(&mut hasher);
+    session.metrics.session_start.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Canonical form of a session path for identity purposes (rm-055):
+/// alias spellings of one file collapse to one id. `history:`
+/// pseudo-paths and files that cannot be resolved hash as-is.
+fn canonical_identity_path(path: &str) -> String {
+    if path.starts_with("history:") {
+        return path.to_string();
+    }
+    std::fs::canonicalize(path)
+        .map(|canonical| canonical.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Identity as computed before rm-055 (raw path spelling). Used only to
+/// suppress records keyed the old way, so canonicalization cannot fork
+/// a still-live session into a live session plus a phantom history
+/// entry for every existing user of derived history.
+fn legacy_session_id(session: &Session) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     session.path.hash(&mut hasher);
     session.metrics.session_start.hash(&mut hasher);
@@ -231,6 +263,163 @@ mod tests {
         assert!(!path.exists(), "torn history must not be re-read in place");
         let preserved = std::fs::read(&quarantine).expect("quarantine preserves bytes");
         assert_eq!(preserved, b"{\"torn\": ");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -------------------------------------------------------------------
+    // rm-055 (run 83642957d130 cycle 1): history identity across alias
+    // spellings of one session file.
+    // -------------------------------------------------------------------
+
+    fn alias_fixture() -> (std::path::PathBuf, Session) {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-alias-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let real = root.join(".config/pi/agent/sessions");
+        std::fs::create_dir_all(&real).expect("create sessions dir");
+        let file = real.join("aaa11111-2222-3333-4444-555566667777.jsonl");
+        std::fs::write(&file, "{}\n").expect("write session file");
+        std::os::unix::fs::symlink(root.join(".config/pi"), root.join(".pi"))
+            .expect("symlink alias root");
+        let session = Session {
+            name: "alias root session".to_string(),
+            path: file.to_string_lossy().into_owned(),
+            cwd: "/work/project".to_string(),
+            metrics: Metrics {
+                source_tool: "pi".to_string(),
+                model_used: "qwen3-coder".to_string(),
+                session_start: "2026-10-01T00:00:00Z".to_string(),
+                cost_estimated: 0.01,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 95,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        (root, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_identity_is_stable_across_alias_spellings() {
+        // `~/.pi -> ~/.config/pi` presents one file through two
+        // spellings; the id fed the derived-history key used to fork per
+        // spelling (rm-055, assess F1).
+        let (root, via_real) = alias_fixture();
+        let mut via_alias = via_real.clone();
+        via_alias.path = root
+            .join(".pi/agent/sessions/aaa11111-2222-3333-4444-555566667777.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            session_id(&via_real),
+            session_id(&via_alias),
+            "canonical identity: one file, one history id"
+        );
+        // Both spellings preserve to ONE record.
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+        preserve_derived_history(&[via_real.clone()]).expect("preserve real spelling");
+        preserve_derived_history(&[via_alias.clone()]).expect("preserve alias spelling");
+        let records = load_records();
+        assert_eq!(
+            records.len(),
+            1,
+            "two spellings, one record (ids keyed canonically)"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_suppresses_records_keyed_by_the_legacy_spelling() {
+        // Rollout guard for the rm-055 id change: records preserved by
+        // older binaries are keyed by the RAW path spelling. Without
+        // suppression, every still-live previously-preserved session
+        // would come back as a live session PLUS a phantom history twin.
+        let (root, mut live) = alias_fixture();
+        live.path = root
+            .join(".pi/agent/sessions/aaa11111-2222-3333-4444-555566667777.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let legacy = DerivedSession {
+            id: legacy_session_id(&live),
+            project: "old".to_string(),
+            source: "pi".to_string(),
+            model: "qwen3-coder".to_string(),
+            start: live.metrics.session_start.clone(),
+            end: String::new(),
+            duration: 0.0,
+            input: 0,
+            output: 0,
+            cache_write: 0,
+            cache_read: 0,
+            cost: 0.0,
+            health: 100,
+            anomalies: Vec::new(),
+        };
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+        std::fs::write(
+            &root.join("history.json"),
+            serde_json::to_vec(&BTreeMap::from([(legacy.id.clone(), legacy)]))
+                .expect("serialize legacy records"),
+        )
+        .expect("seed a legacy record");
+
+        let mut sessions = vec![live.clone()];
+        merge_preserved_history(&mut sessions);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the legacy record for a still-live session must not re-enter as history"
+        );
+        // A record for a GONE session (no live twin) still merges in.
+        let gone = DerivedSession {
+            id: "deadbeefcafe0123".to_string(),
+            project: "gone".to_string(),
+            source: "pi".to_string(),
+            model: String::new(),
+            start: "2026-01-01T00:00:00Z".to_string(),
+            end: String::new(),
+            duration: 0.0,
+            input: 0,
+            output: 0,
+            cache_write: 0,
+            cache_read: 0,
+            cost: 0.0,
+            health: 100,
+            anomalies: Vec::new(),
+        };
+        let mut map = load_records();
+        map.insert(gone.id.clone(), gone.clone());
+        std::fs::write(
+            &root.join("history.json"),
+            serde_json::to_vec(&map).expect("serialize records"),
+        )
+            .expect("seed legacy + gone records");
+        let mut sessions = vec![live.clone()];
+        merge_preserved_history(&mut sessions);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "gone-session history survives the canonical id change"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+        }
+        drop(_env);
         let _ = std::fs::remove_dir_all(root);
     }
 }

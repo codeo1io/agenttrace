@@ -29,10 +29,12 @@ pub use diagnostics::{
 };
 
 pub use discovery::{
-    collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
-    load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
-    KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
+    clear_session_file_skips, collect_session_files, discover_session_dirs, find_session_files,
+    known_session_dirs, load_sessions_from_dir, load_sessions_with_options,
+    load_sessions_with_progress, load_sessions_with_progress_from_cache,
+    load_sessions_with_progress_from_cache_mode, max_session_file_bytes, session_file_skips,
+    KnownSessionDir, LoadOptions, LoadProgress, LoadReport, SessionFileSkip,
+    SessionFileSkipReason, DEFAULT_MAX_SESSION_FILE_BYTES,
 };
 pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
 pub use governance::{

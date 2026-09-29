@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Retention bound for the capture journal: when the file crosses this
 /// size the oldest lines are dropped until it fits half of it. Ten MiB
@@ -269,9 +270,24 @@ fn sanitize_line_segment(segment: &str) -> String {
         .collect()
 }
 
-/// Appends one capture to the journal, compacting it first when the
-/// retention bound is crossed. Errors are the caller's business (the
-/// host entry point turns them into stderr notes).
+/// Appends one capture to the journal, compacting it when the retention
+/// bound is crossed. Errors are the caller's business (the host entry
+/// point turns them into stderr notes).
+///
+/// rm-057: append and compaction share one descriptor and one advisory
+/// lock, so concurrent statusline hosts (one per Claude Code window)
+/// serialize on the journal instead of racing — the old fixed temp path
+/// made two hosts fail the same rename (`capture failed (No such file
+/// or directory)`, 15/16 hosts in the live 16-way race) and the
+/// read-then-rename window dropped newest appends (7/16 payloads lost).
+/// rm-057: append and compaction share one advisory lock and validate
+/// that the append descriptor still refers to the journal's current
+/// inode, so concurrent statusline hosts (one per Claude Code window)
+/// serialize instead of racing — the old fixed temp path made two hosts
+/// fail the same rename (`capture failed (No such file or directory)`,
+/// 15/16 hosts in the live 16-way race), the read-then-rename window
+/// dropped newest appends (7/16 payloads lost), and a descriptor opened
+/// before another host's rename appended to the orphaned inode.
 pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
     let path = statusline_capture_path();
     if let Some(parent) = path.parent() {
@@ -282,27 +298,165 @@ pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
         payload: payload.clone(),
     })
     .unwrap_or_else(|_| "{}".to_string());
+    for _ in 0..8 {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
+        let _lock = JournalLock::acquire(&file);
+        // A compaction renames a NEW inode into place; a descriptor
+        // opened before that rename would append to the orphaned inode
+        // and silently lose the capture. Under the lock no mutator can
+        // rename between this check and the append, so a matching
+        // descriptor is safe to write through.
+        if !descriptor_matches_path(&file, &path) {
+            continue;
+        }
+        writeln!(file, "{line}")?;
+        // Exact size after the write (the old pre-write estimate raced
+        // with concurrent appends); compaction reads through the same
+        // locked descriptor.
+        if file.metadata()?.len() > STATUSLINE_CAPTURE_MAX_BYTES {
+            compact_statusline_capture_through(
+                &mut file,
+                &path,
+                STATUSLINE_CAPTURE_MAX_BYTES / 2,
+            )?;
+        }
+        return Ok(());
+    }
+    // Eight stale descriptors in a row means the journal is being
+    // rewritten faster than this host can append; the capture is still
+    // written rather than silently dropped.
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    let size_after_append = file.metadata()?.len() + line.len() as u64 + 1;
     writeln!(file, "{line}")?;
-    if size_after_append > STATUSLINE_CAPTURE_MAX_BYTES {
-        compact_statusline_capture(&path)?;
-    }
     Ok(())
 }
 
-/// Retention: drop oldest whole lines until the journal fits half the
-/// bound. Rewritten through a temp file + rename so a crash mid-compaction
-/// cannot truncate the journal to zero.
-fn compact_statusline_capture(path: &Path) -> io::Result<()> {
-    compact_statusline_capture_under(path, STATUSLINE_CAPTURE_MAX_BYTES / 2)
+/// True when `file` refers to the inode the path currently resolves to
+/// (rm-057). Renaming a fresh journal into place orphans descriptors
+/// opened on the old one.
+#[cfg(unix)]
+fn descriptor_matches_path(file: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(descriptor), Ok(current)) => {
+            descriptor.dev() == current.dev() && descriptor.ino() == current.ino()
+        }
+        _ => false,
+    }
 }
 
+/// No stable cross-platform inode identity: assume the descriptor is
+/// current (matches the pre-rm-057 behavior on non-unix hosts).
+#[cfg(not(unix))]
+fn descriptor_matches_path(_file: &fs::File, _path: &Path) -> bool {
+    true
+}
+
+/// Best-effort advisory lock on the journal (rm-057). The host-safety
+/// contract forbids blocking forever, so the wait is bounded; any
+/// failure — unsupported filesystem, foreign error kind — degrades to
+/// running unlocked, where the unique temp path and the compaction
+/// tail re-check still keep the journal safe.
+struct JournalLock {
+    holder: Option<fs::File>,
+}
+
+impl JournalLock {
+    fn acquire(file: &fs::File) -> Self {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    // Hold the lock on a cloned descriptor: the lock
+                    // belongs to the open file description and the clone
+                    // shares it, so Drop can unlock without borrowing
+                    // `file`.
+                    return match file.try_clone() {
+                        Ok(holder) => JournalLock {
+                            holder: Some(holder),
+                        },
+                        Err(_) => {
+                            let _ = file.unlock();
+                            JournalLock { holder: None }
+                        }
+                    };
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    // Held by another statusline host; bounded wait, then
+                    // proceed unlocked (the host contract forbids
+                    // blocking forever).
+                    if Instant::now() >= deadline {
+                        return JournalLock { holder: None };
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(fs::TryLockError::Error(_)) => return JournalLock { holder: None },
+            }
+        }
+    }
+}
+
+impl Drop for JournalLock {
+    fn drop(&mut self) {
+        if let Some(holder) = self.holder.take() {
+            let _ = holder.unlock();
+        }
+    }
+}
+
+/// Retention: drop oldest whole lines until the journal fits
+/// `keep_under`, restoring the documented contract (compaction drops
+/// whole OLDEST lines — never newest appends). Rewritten through a
+/// unique temp + rename so a crash mid-compaction cannot truncate the
+/// journal and two compacting hosts cannot collide on one temp
+/// (rm-057, reusing session_cache's `unique_temp_path` pattern).
+/// Path-based compaction entry: opens the journal, takes the advisory
+/// lock, and runs the compaction core. Used by tests as the "another
+/// host compacts" actor.
+#[cfg(test)]
 fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<()> {
-    let raw = fs::read_to_string(path)?;
+    let mut file = fs::OpenOptions::new().read(true).open(path)?;
+    let _lock = JournalLock::acquire(&file);
+    compact_statusline_capture_through(&mut file, path, keep_under)
+}
+
+/// Compaction core on the locked journal descriptor: it reads the
+/// exact inode the rename will replace, re-checks the tail before
+/// renaming so appends that slipped in without the lock are merged
+/// rather than dropped, then renames a unique temp over the path.
+fn compact_statusline_capture_through(
+    file: &mut fs::File,
+    path: &Path,
+    keep_under: u64,
+) -> io::Result<()> {
+    let (kept, mut observed) = kept_lines_under(file, keep_under)?;
+    let temp = crate::session_cache::unique_temp_path(path);
+    {
+        let mut out = fs::File::create(&temp)?;
+        for line in &kept {
+            writeln!(out, "{line}")?;
+        }
+        out.flush()?;
+    }
+    merge_journal_tail(file, &temp, &mut observed);
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
+/// Newest whole lines fitting `keep_under` (at least one), read
+/// through the locked descriptor. Also returns how many bytes of the
+/// inode were consumed, for the tail re-check.
+fn kept_lines_under(file: &mut fs::File, keep_under: u64) -> io::Result<(Vec<String>, u64)> {
+    let mut raw = String::new();
+    file.seek(io::SeekFrom::Start(0))?;
+    file.read_to_string(&mut raw)?;
+    let observed = raw.len() as u64;
     let mut kept: Vec<&str> = Vec::new();
     let mut kept_bytes = 0u64;
     for line in raw.lines().rev() {
@@ -314,16 +468,42 @@ fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<
         kept.push(line);
     }
     kept.reverse();
-    let temp = path.with_extension("jsonl.compact");
-    {
-        let mut file = fs::File::create(&temp)?;
-        for line in kept {
-            writeln!(file, "{line}")?;
+    Ok((kept.into_iter().map(str::to_string).collect(), observed))
+}
+
+/// Tail re-check (rm-057): merge lines appended to the journal after
+/// the compaction read into the temp before renaming, so no capture is
+/// dropped. Only complete lines are re-applied (a torn line from a
+/// mid-write host stays dropped, matching the journal's
+/// tolerated-torn-tail read contract). Bounded — a permanently hot
+/// journal leaves the rest to the next append/compaction cycle. Best
+/// effort: an error stops the merge and never fails the capture.
+fn merge_journal_tail(file: &mut fs::File, temp: &Path, observed: &mut u64) {
+    for _ in 0..8 {
+        let Ok(len) = file.metadata().map(|metadata| metadata.len()) else {
+            return;
+        };
+        if len <= *observed {
+            return;
         }
-        file.flush()?;
+        let mut delta = String::new();
+        if file.seek(io::SeekFrom::Start(*observed)).is_err()
+            || file.read_to_string(&mut delta).is_err()
+        {
+            return;
+        }
+        let Some(end) = delta.rfind('\n') else {
+            return;
+        };
+        let complete = &delta[..=end];
+        let Ok(mut out) = fs::OpenOptions::new().append(true).open(temp) else {
+            return;
+        };
+        if out.write_all(complete.as_bytes()).is_err() {
+            return;
+        }
+        *observed += complete.len() as u64;
     }
-    fs::rename(&temp, path)?;
-    Ok(())
 }
 
 /// Reads the journal, skipping malformed lines (a torn tail line from a
@@ -845,6 +1025,94 @@ mod tests {
             newest.contains("\"captured_at\":39"),
             "the newest line survives compaction: {newest}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_hosts_never_lose_appends_or_fail_the_capture() {
+        // rm-057 regression: the live 16-way race (assess F3, 10.6 MiB
+        // journal, 16 concurrent `agenttrace statusline` hosts) lost
+        // 7/16 payloads and 15/16 hosts printed `capture failed (No
+        // such file or directory)` — two hosts shared one fixed compaction
+        // temp (both rename it; one gets ENOENT), and the
+        // read-then-rename window dropped newest appends. Here 8 writer
+        // threads append unique markers while a compactor thread
+        // rewrites the journal; `keep_under` fits every marker, so NO
+        // marker may legitimately be dropped, and no append may fail.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        // Padding so the compactor always has real rewrite work.
+        let mut seed = String::new();
+        for i in 0..2_000 {
+            seed.push_str(&format!(
+                "{{\"captured_at\":{i},\"payload\":{{\"filler\":\"{}\"}}}}\n",
+                "p".repeat(80)
+            ));
+        }
+        fs::write(&journal, &seed).expect("seed journal");
+        const WRITERS: usize = 8;
+        const PAYLOADS: usize = 25;
+        let keep_under = 4 * 1024 * 1024u64; // fits all markers + padding
+        let compactor_journal = journal.clone();
+        let compactor = std::thread::spawn(move || {
+            for _ in 0..400 {
+                compact_statusline_capture_under(&compactor_journal, keep_under)
+                    .expect("compaction never fails");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                std::thread::spawn(move || {
+                    for payload in 0..PAYLOADS {
+                        let marker = format!("rm057-w{writer}-p{payload}");
+                        let payload = serde_json::json!({
+                            "session_id": marker,
+                            "session_name": marker,
+                            "filler": "f".repeat(96),
+                        });
+                        append_statusline_capture(&payload)
+                            .expect("append never fails the capture");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("writer thread finishes");
+        }
+        compactor.join().expect("compactor finishes");
+        let raw = fs::read_to_string(&journal).expect("read journal");
+        for writer in 0..WRITERS {
+            for payload in 0..PAYLOADS {
+                let marker = format!("rm057-w{writer}-p{payload}");
+                assert!(
+                    raw.contains(&marker),
+                    "every payload must survive concurrent compaction: {marker}"
+                );
+            }
+        }
+        // Unique temp paths: no shared `.jsonl.compact` leftovers (a
+        // crashed host could leave one; none crashed here).
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .expect("read root")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("compact") || name.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files renamed away: {leftovers:?}");
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
         let _ = fs::remove_dir_all(root);
     }
 
