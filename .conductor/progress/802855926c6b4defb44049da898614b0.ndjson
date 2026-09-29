@@ -1,0 +1,4 @@
+{"step":1,"ts":"2026-09-29T00:00:00Z","summary":"Tree check: only session_cache.rs modified; workspace members confirmed; dispatching verbatim full_command","touched":[]}
+{"step":2,"ts":"2026-09-29T00:00:00Z","summary":"Ran full_command verbatim (gate wrapper, workspace cargo test): exit 0","touched":[]}
+{"step":3,"ts":"2026-09-29T00:00:00Z","summary":"9 suites all ok: 14+10+2 CLI, 92 core lib, 7 demo, 70 discovery, 45 TUI, 2 empty doctest = 240 passed / 0 failed","touched":[]}
+{"step":4,"ts":"2026-09-29T00:00:00Z","summary":"No regressions to fix; no executable change this turn -> dispatch digest copied verbatim","touched":[]}

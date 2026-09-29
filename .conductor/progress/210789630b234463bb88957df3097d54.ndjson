@@ -1,0 +1,3 @@
+{"step":1,"ts":"2026-09-29T04:09:50Z","summary":"re-verified CU-30 fix surface (sqlite_snapshot_path session_cache.rs:334 ignores DB identity); scored 9 candidates","touched":[]}
+{"step":2,"ts":"2026-09-29T04:09:50Z","summary":"selected batch CU-30+CU-35+CU-31 (cache truthfulness); wrote prioritization record to spool with matrix + re-entry criteria","touched":["delegate/prioritize-21078963/2026-09-29-cycle1-prioritization.md"]}
+{"step":3,"ts":"2026-09-29T04:10:46Z","summary":"phase_result written: batch CU-30+35+31 selected with rationale; tree clean","touched":["/home/agent/.hermes/conductor-delegate-spool-infra-deploy/delegate/210789630b234463bb88957df3097d54.json"]}

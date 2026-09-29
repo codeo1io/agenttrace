@@ -1,0 +1,5 @@
+{"step":1,"ts":"2026-09-29T00:00:00Z","summary":"Read house templates: cycle-7 implementation record, CHANGELOG Unreleased style, managed ROADMAP render","touched":[]}
+{"step":2,"ts":"2026-09-29T00:00:00Z","summary":"Wrote cycle-1 implementation record (spool): batch table, wal/shm root cause, 5 prevention rules, next-cycle context","touched":["delegate/compound-60fb188f/2026-09-29-cycle1-implementation-record.md"]}
+{"step":3,"ts":"2026-09-29T00:00:00Z","summary":"Built ROADMAP v2: CU-30/31/35 removed (closed, house rule), CU-32/33/34/36/37 + Radar retained; 0 stale refs","touched":["delegate/compound-60fb188f/ROADMAP.post-cycle1.md"]}
+{"step":4,"ts":"2026-09-29T00:00:00Z","summary":"CHANGELOG v2: 2 Fixed + 1 Changed cycle-1 bullets under Unreleased","touched":["delegate/compound-60fb188f/compound-cycle1.patch"]}
+{"step":5,"ts":"2026-09-29T00:00:00Z","summary":"compound-cycle1.patch (257 lines, 233 +) superseding roadmap.patch: git apply --check CLEAN; tree still only session_cache.rs modified","touched":[]}
