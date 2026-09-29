@@ -13,7 +13,7 @@ const PRICING_URL: &str =
 /// fully offline by default. Regenerate with `scripts/pricing/update-snapshot.sh`
 /// and keep `PRICING_SNAPSHOT_DATE` in sync with the date it prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-09-13";
+const PRICING_SNAPSHOT_DATE: &str = "2026-09-29";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -124,16 +124,24 @@ pub fn bundled_snapshot_age_days() -> Option<i64> {
 }
 
 fn catalog_source(catalog: &PricingCatalog) -> String {
-    // Labels are deliberately clock-free: identical inputs must produce
-    // byte-identical reports (see scripts/ci/check-deterministic-output.sh).
-    // The previous labels embedded cache/fetch timestamps.
+    // Labels stay free of sub-day clocks: identical inputs must produce
+    // byte-identical reports within a UTC day (see
+    // scripts/ci/check-deterministic-output.sh). The previous labels
+    // embedded cache/fetch timestamps. The bundled-snapshot age is
+    // day-granular and is disclosed so a stale bundled catalog can be
+    // seen directly on the source line (CU-40), not just via `doctor`.
     match catalog.source.as_str() {
         "cache" => "LiteLLM (cached catalog)".to_string(),
         "cache(stale)" => {
             "LiteLLM (cached catalog, stale; run --update-pricing to refresh)".to_string()
         }
         "remote" => "LiteLLM (just refreshed)".to_string(),
-        "snapshot" => format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)"),
+        "snapshot" => match bundled_snapshot_age_days() {
+            Some(age) if age > 0 => format!(
+                "LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled, {age} days old)"
+            ),
+            _ => format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)"),
+        },
         _ => "built-in fallback (run --update-pricing for the latest catalog)".to_string(),
     }
 }
@@ -441,7 +449,13 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
         };
-        if model.mode != "chat" || (model.input_cost == 0.0 && model.output_cost == 0.0) {
+        // Zero-priced chat rows are genuinely free models (e.g. the zai
+        // flash tier in the live LiteLLM catalog), not placeholder noise:
+        // keep them so free models price at 0 instead of silently falling
+        // back to default pricing and over-reporting cost. A zero-priced
+        // row still loses the tie-break below against a priced row of the
+        // same normalized name and provider-priority class.
+        if model.mode != "chat" {
             continue;
         }
         let normalized = normalize_model(&key);
@@ -467,11 +481,23 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
             continue;
         }
         let priority = provider_priority(&model.provider);
-        match selected.get(&normalized) {
-            Some((existing, _)) if *existing >= priority => {}
-            _ => {
-                selected.insert(normalized, (priority, price));
+        let zero_priced = price.input == 0.0 && price.output == 0.0;
+        // Collision resolution is provider-priority-driven: a strictly
+        // higher provider tier always wins, and on an equal tier a priced
+        // row displaces a zero-priced incumbent. First-seen order only
+        // decides otherwise-identical ties.
+        let incumbent = selected.get(&normalized);
+        let keep_incumbent = match incumbent {
+            Some((existing, existing_price)) => {
+                let existing_zero =
+                    existing_price.input == 0.0 && existing_price.output == 0.0;
+                *existing > priority
+                    || (*existing == priority && !(existing_zero && !zero_priced))
             }
+            None => false,
+        };
+        if !keep_incumbent {
+            selected.insert(normalized, (priority, price));
         }
     }
     selected
@@ -482,7 +508,10 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
 
 fn provider_priority(provider: &str) -> i32 {
     match provider {
-        "anthropic" | "openai" | "deepseek" | "gemini" | "xai" | "mistral" => 10,
+        // First-party vendor tiers rank above aggregators so an exact
+        // model match resolves to the vendor row (zai owns GLM pricing;
+        // reseller rows like openrouter/z-ai/* must never override it).
+        "anthropic" | "openai" | "deepseek" | "gemini" | "xai" | "mistral" | "zai" => 10,
         "cohere" => 9,
         "openrouter" => 8,
         "vercel_ai_gateway" => 7,
@@ -1321,7 +1350,12 @@ mod tests {
         );
         assert_eq!(
             catalog_source(&catalog("snapshot")),
-            format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)")
+            match bundled_snapshot_age_days() {
+                Some(age) if age > 0 => format!(
+                    "LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled, {age} days old)"
+                ),
+                _ => format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)"),
+            }
         );
         assert_eq!(
             catalog_source(&catalog("builtin")),
@@ -1406,6 +1440,118 @@ mod tests {
         assert!(
             !catalog.contains_key("poisoned-model"),
             "entries whose scaled price is non-finite are dropped"
+        );
+    }
+
+    #[test]
+    fn litellm_first_party_zai_outranks_reseller_rows() {
+        // CU-40: GLM pricing is first-party zai data; the openrouter
+        // reseller row (cheaper cache-read) must never win the bare-key
+        // collision regardless of catalog order, or cache-read costs are
+        // understated (~46% for glm-5.3 on the 2026-09-13 snapshot).
+        let reseller_first = serde_json::json!({
+            "openrouter/z-ai/glm-5.3": {
+                "input_cost_per_token": 0.0000014,
+                "output_cost_per_token": 0.0000044,
+                "cache_read_input_token_cost": 0.00000014,
+                "mode": "chat",
+                "litellm_provider": "openrouter"
+            },
+            "zai/glm-5.3": {
+                "input_cost_per_token": 0.0000014,
+                "output_cost_per_token": 0.0000044,
+                "cache_read_input_token_cost": 0.00000026,
+                "mode": "chat",
+                "litellm_provider": "zai"
+            }
+        });
+        let catalog = convert_litellm(
+            serde_json::to_vec(&reseller_first)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let price = catalog
+            .get("glm-5.3")
+            .expect("bare glm-5.3 key resolves after normalization");
+        assert_eq!(price.cr, 0.26, "first-party zai cache-read rate wins");
+
+        let first_party_first = serde_json::json!({
+            "zai/glm-5.3": {
+                "input_cost_per_token": 0.0000014,
+                "output_cost_per_token": 0.0000044,
+                "cache_read_input_token_cost": 0.00000026,
+                "mode": "chat",
+                "litellm_provider": "zai"
+            },
+            "openrouter/z-ai/glm-5.3": {
+                "input_cost_per_token": 0.0000014,
+                "output_cost_per_token": 0.0000044,
+                "cache_read_input_token_cost": 0.00000014,
+                "mode": "chat",
+                "litellm_provider": "openrouter"
+            }
+        });
+        let catalog = convert_litellm(
+            serde_json::to_vec(&first_party_first)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        assert_eq!(
+            catalog["glm-5.3"].cr,
+            0.26,
+            "resolution is priority-driven, not catalog-order-driven"
+        );
+    }
+
+    #[test]
+    fn zero_priced_chat_rows_are_kept_not_dropped_to_fallback() {
+        // CU-40: the live LiteLLM catalog lists genuinely free chat
+        // models (zai/glm-4.7-flash, zai/glm-4.5-flash). convert_litellm
+        // used to drop all zero-priced rows, so those models silently
+        // fell back to default pricing and over-reported cost.
+        let raw = serde_json::json!({
+            "zai/glm-4.7-flash": {
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+                "mode": "chat",
+                "litellm_provider": "zai"
+            }
+        });
+        let catalog = convert_litellm(
+            serde_json::to_vec(&raw).expect("serialize catalog").as_slice(),
+        );
+        let price = catalog
+            .get("glm-4.7-flash")
+            .expect("free chat model is retained at 0, not dropped");
+        assert_eq!((price.input, price.output, price.cr), (0.0, 0.0, 0.0));
+
+        // A priced row of the same normalized name at the same provider
+        // tier still displaces the zero-priced incumbent (tie-break is
+        // provider-priority-driven, with priced > free on equal tiers).
+        let with_paid_twin = serde_json::json!({
+            "zai/glm-4.7-flash": {
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+                "mode": "chat",
+                "litellm_provider": "zai"
+            },
+            "paid/glm-4.7-flash": {
+                "input_cost_per_token": 0.0000002,
+                "output_cost_per_token": 0.0000008,
+                "mode": "chat",
+                "litellm_provider": "zai"
+            }
+        });
+        let catalog = convert_litellm(
+            serde_json::to_vec(&with_paid_twin)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let picked = &catalog["glm-4.7-flash"];
+        assert!(
+            (picked.input - 0.2).abs() < 1e-9 && (picked.output - 0.8).abs() < 1e-9,
+            "equal-tier priced row displaces the zero-priced incumbent: {:?}",
+            picked
         );
     }
 }

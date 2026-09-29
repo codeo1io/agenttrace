@@ -10,7 +10,7 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 17;
 // titles replaced by first-user-message names) shipped while this stayed
 // at 5, so v5 snapshots can carry stale names under new semantics. The
 // version check regenerates them on next use.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 6;
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -76,8 +76,10 @@ struct FileFingerprint {
 struct SqliteSnapshot {
     schema_version: i64,
     database: FileFingerprint,
-    wal: Option<FileFingerprint>,
-    shm: Option<FileFingerprint>,
+    /// WAL size only (CU-30): the WAL grows monotonically as writers
+    /// append frames and is truncated on checkpoint — which itself bumps
+    /// the main-database mtime — so size alone detects every real write.
+    wal_size: Option<i64>,
     sessions: Vec<GoSession>,
 }
 
@@ -207,24 +209,139 @@ pub fn session_cache_path() -> PathBuf {
     user_cache_dir().join("agenttrace").join("sessions.json")
 }
 
-pub fn clear_session_cache() -> anyhow::Result<()> {
-    let cache = session_cache_path();
-    for path in [
-        cache.clone(),
-        cache.with_file_name("hermes-sqlite.json"),
-        cache.with_file_name("opencode-sqlite.json"),
-    ] {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+/// Which agenttrace generation a cache-directory file name belongs to
+/// (CU-35). `Current` is the per-database v7 scheme from CU-30;
+/// `LegacyShared` is the pre-CU-30 one-file-per-provider name;
+/// `LegacyHashed` covers both old hash schemes (`<name>-sqlite-<hex>.json`
+/// and `sqlite-<name>-<hex>.json`). Anything else is `Foreign` and is
+/// never touched.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SnapshotGeneration {
+    Current,
+    LegacyShared,
+    LegacyHashed,
+    Foreign,
+}
+
+/// Classifies a cache-directory file name into snapshot generations.
+/// The deletion boundary is heuristic BY DESIGN (cycle-1 review): any
+/// `<x>-sqlite.json`, `<x>-sqlite-<y>.json`, or `sqlite-<x>-<y>.json`
+/// inside the agenttrace-owned XDG cache directory is a legacy snapshot
+/// and is swept — a foreign file whose name merely contains a `-sqlite-`
+/// segment goes with it. That keeps the sweeper provider-agnostic across
+/// every naming scheme without hardcoding provider lists; the directory
+/// is agenttrace-owned cache state, not user storage. If the cache dir
+/// is ever shared or user-populated, tighten this to exact provider
+/// names.
+fn classify_snapshot_file(file_name: &str) -> SnapshotGeneration {
+    let stem = file_name.strip_suffix(".json").unwrap_or(file_name);
+    let parts: Vec<&str> = stem.split('-').collect();
+    // Current (CU-30): <name...> "sqlite" "v<digits>" <16 hex>
+    if parts.len() >= 4
+        && parts[parts.len() - 3] == "sqlite"
+        && parts[parts.len() - 2]
+            .strip_prefix('v')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        && parts[parts.len() - 1].len() == 16
+        && parts[parts.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        return SnapshotGeneration::Current;
+    }
+    // Shared-file era: <name...> "sqlite" (`hermes-sqlite.json`).
+    if parts.len() >= 2 && parts[parts.len() - 1] == "sqlite" {
+        return SnapshotGeneration::LegacyShared;
+    }
+    // Hashed eras: <name...> "sqlite" <hash> and "sqlite" <name...> <hash>
+    // (`hermes-sqlite-<hash>.json`, `sqlite-hermes-<hash>.json`).
+    if parts.len() >= 3 && (parts[parts.len() - 2] == "sqlite" || parts[0] == "sqlite") {
+        return SnapshotGeneration::LegacyHashed;
+    }
+    SnapshotGeneration::Foreign
+}
+
+/// Removes every snapshot file in `dir` regardless of generation plus
+/// the main `sessions.json` and orphaned temps (CU-35): `--clear-cache`
+/// used to delete a hardcoded three-file list while 28+ files from
+/// earlier naming schemes survived forever. Returns how many files were
+/// removed. A missing directory is a no-op success (clearing an empty
+/// cache clears nothing); every other error is surfaced — a clear that
+/// cannot list or delete must not let the CLI print "Session cache
+/// cleared." anyway (cycle-1 review).
+fn clear_session_cache_in(dir: &Path) -> anyhow::Result<usize> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "reading cache directory {}: {error}",
+                dir.display()
+            ))
+        }
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_str() == Some("sessions.json") {
+            removed += usize::from(remove_cache_file(&path)?);
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if classify_snapshot_file(name) == SnapshotGeneration::Foreign {
+            continue;
+        }
+        removed += usize::from(remove_cache_file(&path)?);
+    }
+    Ok(removed + sweep_orphaned_temps(&dir.join("sessions.json"), std::time::Duration::ZERO))
+}
+
+/// Removes one cache file, treating an already-absent file as not
+/// removed (a race with another clear is fine) and surfacing every
+/// other error.
+fn remove_cache_file(path: &Path) -> anyhow::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(anyhow::anyhow!("removing {}: {error}", path.display())),
+    }
+}
+
+/// Sweeps legacy-generation snapshot files (`LegacyShared`/`LegacyHashed`)
+/// from `dir`, leaving the current per-database generation untouched
+/// (CU-35). No code path reads the legacy names anymore — CU-30's loader
+/// only ever asks for `-v7-` paths — so they are pure disk debris once the
+/// scheme rolls over. Returns how many were removed.
+fn sweep_legacy_snapshots(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if matches!(
+            classify_snapshot_file(name),
+            SnapshotGeneration::LegacyShared | SnapshotGeneration::LegacyHashed
+        ) {
+            removed += usize::from(fs::remove_file(entry.path()).is_ok());
         }
     }
-    Ok(())
+    removed
+}
+
+pub fn clear_session_cache() -> anyhow::Result<()> {
+    let cache = session_cache_path();
+    clear_session_cache_in(cache.parent().unwrap_or(Path::new("."))).map(|_| ())
 }
 
 pub(crate) fn load_sqlite_snapshot(database: &Path, name: &str) -> Option<Vec<Session>> {
-    load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name))
+    load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name, database))
 }
 
 fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Vec<Session>> {
@@ -232,8 +349,7 @@ fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Ve
     let snapshot = serde_json::from_slice::<SqliteSnapshot>(&raw).ok()?;
     if snapshot.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION
         || snapshot.database != file_fingerprint(database)?
-        || snapshot.wal != file_fingerprint(&sqlite_wal_path(database))
-        || snapshot.shm != file_fingerprint(&sqlite_shm_path(database))
+        || snapshot.wal_size != file_size(&sqlite_wal_path(database))
     {
         return None;
     }
@@ -251,7 +367,7 @@ pub(crate) fn store_sqlite_snapshot(
     name: &str,
     sessions: &[Session],
 ) -> anyhow::Result<()> {
-    store_sqlite_snapshot_at(database, &sqlite_snapshot_path(name), sessions)
+    store_sqlite_snapshot_at(database, &sqlite_snapshot_path(name, database), sessions)
 }
 
 fn store_sqlite_snapshot_at(
@@ -265,8 +381,7 @@ fn store_sqlite_snapshot_at(
     let snapshot = SqliteSnapshot {
         schema_version: SQLITE_SNAPSHOT_SCHEMA_VERSION,
         database: file_fingerprint(database).ok_or_else(|| anyhow::anyhow!("database missing"))?,
-        wal: file_fingerprint(&sqlite_wal_path(database)),
-        shm: file_fingerprint(&sqlite_shm_path(database)),
+        wal_size: file_size(&sqlite_wal_path(database)),
         sessions: sessions.iter().map(GoSession::from_session).collect(),
     };
     let tmp = unique_temp_path(path);
@@ -331,16 +446,45 @@ pub(crate) fn sweep_orphaned_temps(path: &Path, max_age: std::time::Duration) ->
     removed
 }
 
-fn sqlite_snapshot_path(name: &str) -> PathBuf {
-    session_cache_path().with_file_name(format!("{name}-sqlite.json"))
+/// Stable 64-bit FNV-1a over the canonical database path, hex-encoded.
+/// Deliberately NOT `DefaultHasher`: the hash lands in cache FILE NAMES,
+/// which must never change across Rust releases or the snapshots orphan
+/// themselves again (CU-30; the same trap history IDs fell into, CU-34).
+fn fnv1a64_hex(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Per-database snapshot path (CU-30): `<name>-sqlite-v<ver>-<hash>.json`.
+/// The version marker plus the database-path hash make every generation
+/// and every database file-distinct: ten profile DBs no longer share (and
+/// thrash) one `hermes-sqlite.json`. The `-v<ver>-` marker also lets the
+/// sweeper tell the current generation from the two legacy hash schemes
+/// (`<name>-sqlite-<hash>.json`, `sqlite-<name>-<hash>.json`), whose hex
+/// tails can never start with `v`.
+fn sqlite_snapshot_path(name: &str, database: &Path) -> PathBuf {
+    session_cache_path().with_file_name(format!(
+        "{name}-sqlite-v{SQLITE_SNAPSHOT_SCHEMA_VERSION}-{}.json",
+        fnv1a64_hex(database)
+    ))
 }
 
 fn sqlite_wal_path(database: &Path) -> PathBuf {
     PathBuf::from(format!("{}-wal", database.to_string_lossy()))
 }
 
-fn sqlite_shm_path(database: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-shm", database.to_string_lossy()))
+/// Size-only probe used for the WAL fingerprint. Never the mtime: a
+/// pure SQLite READ updates `-wal`/`-shm` timestamps (lock recovery,
+/// shared-memory index maintenance) without changing a single session
+/// row, which used to invalidate every snapshot on every run (CU-30).
+fn file_size(path: &Path) -> Option<i64> {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.len() as i64)
 }
 
 fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
@@ -354,6 +498,9 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
 pub fn load_session_cache() -> SessionCache {
     let path = session_cache_path();
     sweep_orphaned_temps(&path, ORPHAN_TEMP_MAX_AGE);
+    if let Some(dir) = path.parent() {
+        sweep_legacy_snapshots(dir);
+    }
     let Ok(raw) = fs::read_to_string(&path) else {
         return SessionCache {
             path,
@@ -1128,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_is_invalidated_by_database_wal_or_shm_changes() {
+    fn sqlite_snapshot_is_invalidated_by_database_or_wal_changes_not_by_reads() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-cache-{}-{:?}",
             std::process::id(),
@@ -1175,13 +1322,35 @@ mod tests {
             }],
         )
         .expect("store snapshot with wal");
-        fs::write(sqlite_shm_path(&database), b"shm").expect("write shm");
+        // CU-30: a pure SQLite read refreshes `-wal`/`-shm` timestamps
+        // (and creates `-shm`) without touching a single session row —
+        // mtime-based wal/shm fingerprints used to invalidate every
+        // snapshot on every run, so back-to-back invocations re-queried
+        // every database and rewrote every snapshot forever.
+        let read_touched = std::time::SystemTime::now();
+        for sidecar in [
+            sqlite_wal_path(&database),
+            database.with_extension("db-shm"),
+        ] {
+            fs::write(&sidecar, b"wal").expect("write sidecar");
+            let handle = fs::File::options()
+                .write(true)
+                .open(&sidecar)
+                .expect("open sidecar");
+            handle.set_modified(read_touched).expect("set mtime");
+        }
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_some(),
+            "same-size wal and any shm must not invalidate the snapshot"
+        );
+        // A real write grows the WAL — that must invalidate.
+        fs::write(sqlite_wal_path(&database), b"wal-plus-frames").expect("grow wal");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn sqlite_snapshot_schema_six_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1214,10 +1383,12 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version six (cycle-4 CU-10): cycle 3 shipped the placeholder-name
-        // rewrite while the version stayed at five, so v5 snapshots can
-        // carry stale names under new semantics and must regenerate.
-        assert_eq!(doc["schema_version"], 6);
+        // Version seven (cycle-1 CU-30): the per-database snapshot names
+        // rolled over, so v6 (shared-name era) and v5 snapshots must
+        // regenerate even if a legacy file happens to collide with a new
+        // name. Six (cycle-4 CU-10) kept the provenance/delta payload that
+        // this test round-trips.
+        assert_eq!(doc["schema_version"], 7);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1228,11 +1399,22 @@ mod tests {
             Some(&serde_json::Value::from(720)),
             "the stored-versus-derived delta must survive the snapshot cache"
         );
-        let loaded = load_sqlite_snapshot_from(&database, &snapshot).expect("schema six cache hit");
+        let loaded =
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
+        old["schema_version"] = serde_json::Value::from(6);
+        fs::write(
+            &snapshot,
+            serde_json::to_vec(&old).expect("schema six json"),
+        )
+        .expect("write old snapshot");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_none(),
+            "shared-name-era v6 snapshots must not be served under the v7 key"
+        );
         old["schema_version"] = serde_json::Value::from(5);
         fs::write(
             &snapshot,
@@ -1710,5 +1892,139 @@ mod tests {
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_snapshot_names_are_per_database_and_stable() {
+        // CU-30: every Hermes profile database used to share one
+        // `hermes-sqlite.json`, so on a ten-database host nine of ten
+        // loads missed and every run rewrote the file (leaving it holding
+        // the last empty profile's `sessions: []`). The snapshot name must
+        // differ per database, stay stable across calls and releases, and
+        // carry the version marker the sweeper keys on.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-sqlite-name-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let main_db = root.join("state.db");
+        let profile_db = root.join("profiles").join("work").join("state.db");
+        let main_path = sqlite_snapshot_path("hermes", &main_db);
+        let profile_path = sqlite_snapshot_path("hermes", &profile_db);
+        assert_ne!(
+            main_path, profile_path,
+            "each database must own its snapshot file"
+        );
+        assert_eq!(main_path, sqlite_snapshot_path("hermes", &main_db));
+        let name = main_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("snapshot file name");
+        assert_eq!(
+            classify_snapshot_file(name),
+            SnapshotGeneration::Current,
+            "the generated name must classify as the current generation"
+        );
+        assert!(
+            name.starts_with(&format!("hermes-sqlite-v{SQLITE_SNAPSHOT_SCHEMA_VERSION}-")),
+            "name carries provider, marker, and version: {name}"
+        );
+        // The hash must be FNV-1a of the path — stable forever, unlike
+        // `DefaultHasher`, whose seeds change across Rust releases.
+        assert!(
+            name.ends_with(&format!("-{}.json", fnv1a64_hex(&main_db))),
+            "the database identity must be the stable hash"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clear_cache_removes_every_generation_and_leaves_foreign_files() {
+        // CU-35: `--clear-cache` used to remove a hardcoded three-file
+        // list while 28+ snapshots from earlier naming schemes survived
+        // forever. Clearing must remove every agenttrace-owned file in
+        // the cache directory — current per-DB generation, both legacy
+        // hash schemes, the shared-name era, and orphaned temps — and
+        // leave anything it does not own alone. A second clear is a
+        // no-op.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-clear-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let agenttrace_files = [
+            "sessions.json",
+            "hermes-sqlite.json",
+            "opencode-sqlite.json",
+            "hermes-sqlite-v7-0123456789abcdef.json",
+            "hermes-sqlite-deadbeefdeadbeef.json",
+            "sqlite-hermes-0123456789abcdef.json",
+            "sessions.json.tmp.4242.0",
+        ];
+        for name in agenttrace_files {
+            fs::write(root.join(name), b"{}").expect("write cache file");
+        }
+        fs::write(root.join("foreign.json"), b"{}").expect("write foreign file");
+        let removed = clear_session_cache_in(&root).expect("clear succeeds");
+        assert_eq!(removed, agenttrace_files.len(), "every generation clears");
+        assert!(root.join("foreign.json").exists(), "foreign files survive");
+        assert_eq!(
+            clear_session_cache_in(&root).expect("second clear succeeds"),
+            0,
+            "a second clear is a no-op"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_snapshot_sweep_spares_the_current_generation() {
+        // CU-35: the on-load sweep reclaims the legacy generations — no
+        // code path reads them once CU-30's loader only asks for `-v7-`
+        // names — but must never touch the live per-database snapshots.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-legacy-sweep-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        for name in [
+            "hermes-sqlite.json",
+            "hermes-sqlite-deadbeefdeadbeef.json",
+            "sqlite-hermes-0123456789abcdef.json",
+            "opencode-sqlite.json",
+        ] {
+            fs::write(root.join(name), b"{}").expect("write legacy file");
+        }
+        let current = root.join("hermes-sqlite-v7-0123456789abcdef.json");
+        fs::write(&current, b"{}").expect("write current file");
+        fs::write(root.join("foreign.json"), b"{}").expect("write foreign file");
+        assert_eq!(sweep_legacy_snapshots(&root), 4);
+        assert!(current.exists(), "the current generation is untouched");
+        assert!(root.join("foreign.json").exists());
+        assert_eq!(sweep_legacy_snapshots(&root), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clear_cache_surfaces_unexpected_errors() {
+        // Cycle-1 review: a clear whose directory cannot even be listed
+        // used to report success and let the CLI print "Session cache
+        // cleared." anyway. A missing directory stays a no-op success
+        // (pinned by the second-clear assertion in the generation test);
+        // every other error is surfaced to the caller.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-clear-error-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(&root, b"not a directory").expect("write blocking file");
+        let error = clear_session_cache_in(&root).expect_err("must not lie");
+        assert!(
+            error.to_string().contains("reading cache directory"),
+            "error names the failed step: {error}"
+        );
+        let _ = fs::remove_file(&root);
     }
 }
