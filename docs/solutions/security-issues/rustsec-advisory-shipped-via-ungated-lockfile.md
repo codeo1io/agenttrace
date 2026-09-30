@@ -52,7 +52,7 @@ rustls has a single reverse-dependency path into this workspace, so a lockfile-o
 - Run `cargo deny check --all-features` locally whenever Cargo.lock changes; treat an advisories finding as release-blocking, not informational.
 - The CI deny job re-checks every push and PR — a newly published RUSTSEC now fails the build instead of riding into a release.
 - Watch upstream supply-chain commits: this advisory was patched upstream hours before the fork noticed. Diffing the fork's Cargo.lock against upstream master after their hardening merges is a cheap early-warning signal.
-- OpenSSF Scorecard was deliberately deferred, not skipped silently: the fork's GitHub remote is private and Scorecard only scores public repositories, so a scorecard lane would fail CI today. Revisit if the repository becomes public.
+- OpenSSF Scorecard was deferred while the fork's GitHub remote was believed private (Scorecard only scores public repositories) — that belief was wrong: codeo1io/agenttrace is public, verified live 2026-09-30 via `gh repo view --json visibility,isPrivate` (corrected under rm-026, cycle 1, alongside this doc and the deny.toml note). The scorecard lane now lives in `.github/workflows/scorecard.yml`.
 
 ## Related Issues
 

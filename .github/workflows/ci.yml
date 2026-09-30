@@ -64,7 +64,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+        run: cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+
+      - name: Lockfile enforcement (cargo --locked)
+        run: scripts/ci/check-locked-cargo.sh
 
       - name: Save cargo target
         run: |
@@ -96,16 +99,16 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+        run: cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
 
       - name: Rust tests
-        run: cargo test -p agenttrace-core -p agenttrace-tui -p agenttrace
+        run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
 
       - name: Build CLI
-        run: cargo build --release -p agenttrace
+        run: cargo build --release --locked -p agenttrace
 
       - name: Single binary CLI and TUI entrypoints
-        run: cargo test -p agenttrace --test entrypoints
+        run: cargo test --locked -p agenttrace --test entrypoints
 
       - name: Demo and report output contract
         run: |
@@ -187,6 +190,9 @@ jobs:
         run: |
           bash -n scripts/record-demo.sh scripts/ci/*.sh
           sh -n install.sh
+
+      - name: Lockfile enforcement (cargo --locked)
+        run: scripts/ci/check-locked-cargo.sh
 
   deny:
     # rm-010, cycle 1 ("Trusted transport, gated supply chain"): dependency

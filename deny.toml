@@ -3,9 +3,11 @@
 # (merged 2026-09-30), adapted verbatim: the fork's dependency tree is the
 # upstream tree at the fork point, so the license allow-list fits as-is.
 # The CI lane lives in .github/workflows/ci.yml (`deny` job).
-# OpenSSF Scorecard is deliberately NOT added: the fork remote is private
-# (codeo1io/agenttrace) and Scorecard only scores public repositories —
-# add .github/workflows/scorecard.yml when the repo goes public.
+# OpenSSF Scorecard IS enabled (rm-026, cycle 1 — "Truthful posture,
+# enforced gates"): the earlier "remote is private" rationale was false —
+# codeo1io/agenttrace is public (verified live 2026-09-30 via
+# `gh repo view --json visibility,isPrivate`), so the lane lives in
+# .github/workflows/scorecard.yml.
 
 [graph]
 all-features = true
