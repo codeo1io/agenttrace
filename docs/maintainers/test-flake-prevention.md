@@ -23,6 +23,20 @@ serialization. The fix (`#[cfg(test)] pub(crate) mod test_env` in
 consecutive full runs, and the class re-appeared the moment a fourth suite
 joined the race — which is exactly why the rule is a lock, not a comment.
 
+Case study (2026-10-01, campaign 2962e401 cycle 1 — the second-binary form):
+`agenttrace-tui`'s helper `with_session_cache_dir_for_test` (`src/tests.rs`)
+mutated `AGENTTRACE_SESSION_CACHE_DIR` with no lock — core's `lock_env()`
+cannot help across crate boundaries because lib tests run as separate
+binaries/processes. With a second user added to the helper, two tests
+corrupted each other in both directions within one run: one read the other's
+empty scratch root and asserted 0 sessions where it had written 1, while the
+other was restored back to the REAL home cache mid-render and asserted on
+host state. The fix is the same rule in the second binary: a per-process
+`static SESSION_CACHE_DIR_TEST_LOCK: Mutex<()>` acquired inside the helper
+and released only after the env restore. 6/6 consecutive full `--lib` runs
+green, plus the workspace gate (271 tests) — and any future env-mutating
+helper in this crate must go through the same lock, not add a third one.
+
 ## Rule 2 — Test-isolation paths are keyed by thread, not just process
 
 `cargo test` runs tests as parallel threads of one binary. A `#[cfg(test)]`
@@ -66,3 +80,26 @@ schema-faithful to the producer's documented payload while being disclosed as
 fixtures, not recordings — see `docs/guides/statusline-capture.md` for the
 worked example. A test that passes by under-claiming is preferable to one
 that passes by inventing evidence.
+
+## Rule 6 — Absence-asserting tests pin host state; borrowed hermeticity is a flake
+
+A test that asserts the ABSENCE of output derived from host-stateful files
+(`~/.cache/agenttrace/statusline.jsonl`, `sessions.json`, `pricing.json`) is
+hermetic only if it points the state-dir env var at a scratch root itself.
+Passing because a concurrently running env-mutating test (Rule 1 class)
+happened to redirect the process env is **borrowed hermeticity**: the suite's
+verdict then depends on thread scheduling alone, and a byte-identical tree
+can score red one day and green the next on host state nobody changed.
+
+Case study (2026-10-01, campaign 2962e401 cycle 1):
+`efficiency_panel_renders_statusline_limits_and_cache_causes` asserted "no
+journal means no statusline block" while the app lazily loads the REAL
+journal on the first Efficiency render (`app.rs`, `ensure_governance` →
+`load_statusline_insights()`). On a host that runs the statusline hook the
+single test was deterministically red (rc=101); the full workspace suite
+scored rc=101 and rc=0 on a byte-identical tree a day apart, purely on
+whether the concurrent `ctrl_r_force_reload` test held
+`AGENTTRACE_SESSION_CACHE_DIR` on its scratch root at render time. Pinned by
+wrapping the test in `with_session_cache_dir_for_test` with an empty scratch
+root (Rule 1's lock then applies), verified single-test-alone green with the
+real home present and 271/271 at the workspace gate.

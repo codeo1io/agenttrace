@@ -119,6 +119,14 @@ pub struct DataHealth {
     pub unknown_sources: usize,
     pub unknown_models: usize,
     pub fallback_pricing: usize,
+    /// rm-078 split of `fallback_pricing`: sessions priced by a
+    /// neighboring built-in entry (a silent approximation, e.g.
+    /// `glm-5.2` at the built-in `glm-5` rate) instead of a real catalog
+    /// entry. The rest of `fallback_pricing` is `pricing_default`.
+    pub pricing_approximated: usize,
+    /// rm-078 split of `fallback_pricing`: sessions with no key anywhere,
+    /// priced at the plain default rate.
+    pub pricing_default: usize,
     pub latest_session_at: String,
     pub confidence: String,
     pub with_tokens: usize,
@@ -401,6 +409,30 @@ pub fn data_health_scoped(
     )
 }
 
+/// rm-078: count `fallback_pricing` sessions by how the pricing ladder
+/// actually served them — a neighboring built-in entry (approximation)
+/// versus the plain default rate. The status classifier is injected so
+/// the arithmetic is testable against a stub: the real ladder consults
+/// the process-wide catalog, which serves whatever cache/override state
+/// the host has, and a live catalog can normalize to any built-in key
+/// (e.g. `baseten/zai-org/GLM-5` → `glm-5`), re-classifying a builtin
+/// approximation as a catalog hit on that host.
+fn pricing_fallback_split<'a>(
+    sessions: &'a [Session],
+    lookup_status: impl Fn(&'a str) -> pricing::PriceMatchStatus,
+) -> (usize, usize) {
+    let mut approximated = 0;
+    let mut defaulted = 0;
+    for session in sessions {
+        match lookup_status(&session.metrics.model_used) {
+            pricing::PriceMatchStatus::BuiltinVariant => approximated += 1,
+            pricing::PriceMatchStatus::Default => defaulted += 1,
+            _ => {}
+        }
+    }
+    (approximated, defaulted)
+}
+
 fn data_health_from_parts(
     sessions: &[Session],
     discovered: usize,
@@ -421,6 +453,15 @@ fn data_health_from_parts(
         .iter()
         .filter(|s| !pricing::has_specific_price(&s.metrics.model_used))
         .count();
+    // rm-078: a silent approximation (neighboring built-in entry) and a
+    // plain default-rate session used to share one undifferentiated
+    // bucket; split them by lookup status so approximation is countable
+    // instead of guessed at. `fallback_pricing` (above) counts sessions
+    // the catalog ladder cannot price at all, and the pricing ladder
+    // then serves every one of those from either a neighboring built-in
+    // entry (approximated) or the default rate — so the split is exact.
+    let (pricing_approximated, pricing_default) =
+        pricing_fallback_split(sessions, |model| pricing::lookup_price_match(model).status);
     let stored_totals_sessions = sessions
         .iter()
         .filter(|s| s.metrics.provenance.tokens == "stored_session_totals")
@@ -451,6 +492,8 @@ fn data_health_from_parts(
         unknown_sources,
         unknown_models,
         fallback_pricing,
+        pricing_approximated,
+        pricing_default,
         latest_session_at: sessions
             .iter()
             .filter_map(|s| parse_ts(&s.metrics.session_start))
@@ -565,5 +608,62 @@ mod tests {
         let missing = resolve_project(&session_at("", "/nowhere/projects/-gone-dir/s.jsonl"));
         assert_eq!(missing.display_name, "unknown");
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// rm-078: `fallback_pricing` splits into approximation (a
+    /// neighboring built-in entry) versus the plain default rate. The
+    /// classifier is stubbed because the real ladder is host-state
+    /// dependent: a refreshed pricing cache can normalize to any
+    /// built-in key (`baseten/zai-org/GLM-5` → `glm-5` in the live
+    /// 2026-10-01 catalog), which would re-classify a builtin
+    /// approximation as a catalog variant hit on that host.
+    #[test]
+    fn data_health_splits_fallback_pricing_into_approximated_and_default() {
+        let mut approximated = session_at("", "/x.jsonl");
+        approximated.metrics.model_used = "glm-5-9".to_string();
+        let mut defaulted = session_at("", "/y.jsonl");
+        defaulted.metrics.model_used = "zz-not-a-real-model".to_string();
+        let mut catalog_hit = session_at("", "/z.jsonl");
+        catalog_hit.metrics.model_used = "gpt-4.1".to_string();
+        let sessions = vec![approximated, defaulted, catalog_hit];
+
+        let (approx, default) = pricing_fallback_split(&sessions, |model| {
+            match model {
+                // Widens to the built-in glm-5 entry: approximation.
+                "glm-5-9" => pricing::PriceMatchStatus::BuiltinVariant,
+                // No key anywhere: plain default rate.
+                "zz-not-a-real-model" => pricing::PriceMatchStatus::Default,
+                // Exact catalog key: not a fallback at all.
+                _ => pricing::PriceMatchStatus::Exact,
+            }
+        });
+
+        assert_eq!(approx, 1, "builtin-variant session");
+        assert_eq!(default, 1, "default-rate session");
+    }
+
+    /// rm-078 wiring: the real ladder feeds the split, and every session
+    /// `has_specific_price` rejects is served by either a neighboring
+    /// built-in entry or the default rate — `pricing_approximated +
+    /// pricing_default == fallback_pricing` exactly. The probe model
+    /// is deliberately not a real model name, so no LiteLLM catalog
+    /// (bundled snapshot or any refreshed cache) can ever contain it
+    /// and the classification is stable on every host.
+    #[test]
+    fn data_health_pricing_split_is_wired_and_exhaustive_on_the_real_ladder() {
+        let mut defaulted = session_at("", "/y.jsonl");
+        defaulted.metrics.model_used = "zz-not-a-real-model".to_string();
+        let sessions = vec![defaulted];
+
+        let health = data_health(&sessions, sessions.len(), 0);
+
+        assert_eq!(health.pricing_default, 1);
+        assert_eq!(health.pricing_approximated, 0);
+        assert_eq!(health.fallback_pricing, 1);
+        assert_eq!(
+            health.pricing_approximated + health.pricing_default,
+            health.fallback_pricing,
+            "every catalog-miss session is priced by either a neighboring built-in entry or the default rate"
+        );
     }
 }

@@ -1951,7 +1951,19 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 // Deliberately exclude titles, paths, arguments and log excerpts from clipboard output.
 fn share_summary(session: &Session) -> String {
-    format!("AgentTrace\nHealth: {}\nEstimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, session.metrics.cost_estimated, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
+    // Name the key that actually priced the session when it differs from
+    // the recorded model string (rm-078). SQLite multi-model aggregates
+    // have no single truthful key, so they stay unannotated.
+    let model = session.metrics.model_used.as_str();
+    let model_line = if model.is_empty() || model == "multiple" {
+        String::new()
+    } else {
+        format!(
+            "Model: {model}{}\n",
+            agenttrace_core::priced_via_phrase(model, false)
+        )
+    };
+    format!("AgentTrace\nHealth: {}\n{model_line}Estimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, session.metrics.cost_estimated, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
 }
 
 fn copy_summary(summary: &str) -> anyhow::Result<()> {

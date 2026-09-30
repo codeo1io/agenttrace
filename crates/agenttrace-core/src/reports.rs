@@ -283,11 +283,12 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         format_tokens(total_tokens)
     ));
     out.push_str(&format!(
-        "  {}: {:>12}  ({}: {})\n\n",
+        "  {}: {:>12}  ({}: {}{})\n\n",
         language.t("Estimated cost", "估算成本"),
         format_cost(metrics.cost_estimated),
         language.t("model", "模型"),
-        metrics.model_used
+        metrics.model_used,
+        priced_via_annotation(&metrics.model_used, language)
     ));
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
@@ -2533,6 +2534,19 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 /// Out-of-scope files are disclosed, never folded into the denominator;
 /// when nothing is out of scope the phrase stays byte-identical to the
 /// pre-cycle-5 rendering (the --demo golden depends on it).
+/// The `model:` value on per-session cost lines names the key that
+/// actually priced the session when it differs from the recorded model
+/// string (rm-078): `glm-5.2 (priced via builtin glm-5)` instead of a
+/// silent approximation. SQLite aggregates over several models have no
+/// single truthful key, so they stay unannotated (the cost audit already
+/// labels them `aggregate_estimate`).
+fn priced_via_annotation(model: &str, language: ReportLanguage) -> String {
+    if model.is_empty() || model == "multiple" {
+        return String::new();
+    }
+    crate::pricing::priced_via_phrase(model, language == ReportLanguage::Zh)
+}
+
 fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
     let base = if health.parsed > health.discovered {
         format!(
