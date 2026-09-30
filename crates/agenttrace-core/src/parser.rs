@@ -117,8 +117,18 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if parsed_value.is_none() {
-        if let Some(events) = parse_codex_rollout_jsonl(raw) {
-            return session_from_events(name, path, events);
+        if let Some((events, ignorable_lines)) = parse_codex_rollout_jsonl(raw) {
+            let mut session = session_from_events(name, path, events)?;
+            // rm-047: make the fast-path skips visible in parse
+            // diagnostics instead of discarding them silently.
+            if ignorable_lines > 0 {
+                *session
+                    .metrics
+                    .line_skips
+                    .entry("codex_ignorable_line".to_string())
+                    .or_insert(0) += ignorable_lines;
+            }
+            return Ok(session);
         }
     }
     let objs = jsonl_objects(raw).collect::<Vec<_>>();
@@ -2084,14 +2094,24 @@ fn qwen_model_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     non_empty_usage(usage)
 }
 
-fn parse_codex_rollout_jsonl(raw: &str) -> Option<Vec<Event>> {
+fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, usize)> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_codex = false;
     let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
+    // rm-047: the head-probe fast path used to discard lines invisibly;
+    // count every skip so parse diagnostics can surface it.
+    let mut ignorable_lines = 0usize;
     let lines = raw
         .lines()
-        .filter(|line| !codex_line_is_ignorable(line))
+        .filter(|line| {
+            if codex_line_is_ignorable(line) {
+                ignorable_lines += 1;
+                false
+            } else {
+                true
+            }
+        })
         .filter_map(|line| parse_jsonl_value_lenient(line.trim()))
         .filter_map(|value| match value {
             Value::Object(obj) => Some(obj),
@@ -2250,7 +2270,7 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<Vec<Event>> {
         }
     }
     if saw_codex {
-        non_empty(events)
+        non_empty(events).map(|events| (events, ignorable_lines))
     } else {
         None
     }
@@ -2262,12 +2282,35 @@ fn codex_line_is_ignorable(line: &str) -> bool {
     let Some(head) = line.get(..line.len().min(160)) else {
         return false;
     };
-    if head.contains(r#""type":"compacted""#) {
+    if json_key_present(head, r#""type":"compacted""#) {
         return true;
     }
-    head.contains(r#""type":"event_msg""#)
-        && !head.contains(r#""type":"token_count""#)
-        && !line.contains(r#""payload":{"type":"token_count""#)
+    // The usage-bearing token_count event is the one event_msg worth
+    // keeping: rescue it whenever its marker appears anywhere in the
+    // line at a key boundary. The old negative required exact
+    // `"payload":{"type":"token_count"` adjacency inside the first 160
+    // bytes, so reordered payload keys or a marker past the window
+    // silently dropped the session's only usage record (rm-047).
+    json_key_present(head, r#""type":"event_msg""#)
+        && !json_key_present(line, r#""type":"token_count""#)
+}
+
+/// True when `needle` occurs in `line` at a JSON key position (the byte
+/// before it is `{` or `,`). Valid JSON cannot place the raw needle
+/// inside a string value — its quotes would have to be escaped — so this
+/// anchors the skip decision against lenient-parsed or corrupt lines.
+fn json_key_present(line: &str, needle: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(at) = line[from..].find(needle) {
+        let start = from + at;
+        let anchored = start == 0 || matches!(bytes[start - 1], b'{' | b',');
+        if anchored {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 fn codex_token_count_usage(
@@ -3463,13 +3506,19 @@ fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -
 
 fn add_usage(dst: &mut BTreeMap<String, i64>, src: &BTreeMap<String, i64>) {
     for (key, value) in src {
-        *dst.entry(key.clone()).or_insert(0) += value;
+        let slot = dst.entry(key.clone()).or_insert(0);
+        // rm-046: hostile journals can repeat i64::MAX-sized counts;
+        // plain `+=` panics in debug and wraps negative in release,
+        // where the >0 consumers silently drop the total.
+        *slot = (*slot).saturating_add(*value);
     }
 }
 
 fn add_usage_value(usage: &mut BTreeMap<String, i64>, key: &str, raw: Option<&Value>) {
     if let Some(value) = raw.and_then(number_as_i64).filter(|value| *value > 0) {
-        *usage.entry(key.to_string()).or_insert(0) += value;
+        let slot = usage.entry(key.to_string()).or_insert(0);
+        // rm-046: see add_usage — clamp instead of panicking/wrapping.
+        *slot = (*slot).saturating_add(value);
     }
 }
 
@@ -4519,6 +4568,109 @@ mod tests {
         assert_eq!(session.metrics.tokens_cache_r, 480);
         assert_eq!(session.metrics.tokens_output, 590);
         assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+    }
+
+    #[test]
+    fn token_accumulation_saturates_instead_of_wrapping() {
+        // rm-046: hostile journals can repeat i64::MAX-sized counts across
+        // messages. The map-merge sites used plain `+=`, which panics in
+        // debug builds and wraps negative in release, where the >0
+        // consumers then silently dropped the totals — a 5 + MAX journal
+        // reported input 0.
+        let mut usage = BTreeMap::new();
+        add_usage_value(&mut usage, "input_tokens", Some(&serde_json::json!(5)));
+        add_usage_value(
+            &mut usage,
+            "input_tokens",
+            Some(&serde_json::json!(i64::MAX)),
+        );
+        add_usage_value(
+            &mut usage,
+            "input_tokens",
+            Some(&serde_json::json!(i64::MAX)),
+        );
+        assert_eq!(
+            usage.get("input_tokens").copied(),
+            Some(i64::MAX),
+            "accumulation clamps at i64::MAX instead of panicking or wrapping"
+        );
+
+        let mut left = BTreeMap::from([("output_tokens".to_string(), i64::MAX)]);
+        let right = BTreeMap::from([("output_tokens".to_string(), 1)]);
+        add_usage(&mut left, &right);
+        assert_eq!(left.get("output_tokens").copied(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn codex_ignorable_probe_rescues_token_count_beyond_the_head_window() {
+        // rm-047: the negative needle required exact
+        // `"payload":{"type":"token_count"}` adjacency inside the first
+        // 160 bytes, so a real token_count event with reordered payload
+        // keys (or a type marker past the window) was dropped as
+        // ignorable event_msg noise — silently losing the session's only
+        // usage record.
+        let noise = r#"{"timestamp":"2026-09-30T01:00:00Z","type":"event_msg","payload":{"type":"agent_message_delta","delta":"hi"}}"#;
+        assert!(codex_line_is_ignorable(noise));
+        let compacted = r#"{"timestamp":"2026-09-30T01:00:00Z","type":"compacted","payload":{}}"#;
+        assert!(codex_line_is_ignorable(compacted));
+
+        // Same event, payload keys reordered and padded past the window.
+        let rescued = format!(
+            r#"{{"timestamp":"2026-09-30T01:00:00Z","type":"event_msg","payload":{{"padding":"{}","type":"token_count"}}}}"#,
+            "p".repeat(200)
+        );
+        assert!(
+            !codex_line_is_ignorable(&rescued),
+            "token_count marker beyond the head window must be rescued by the whole-line scan"
+        );
+
+        // Escaped marker text inside a JSON value never matches the raw
+        // needle; the scan must keep skipping these.
+        let quoted = r#"{"timestamp":"2026-09-30T01:00:00Z","type":"event_msg","payload":{"type":"agent_message_delta","delta":"\"type\":\"token_count\""}}"#;
+        assert!(codex_line_is_ignorable(quoted));
+
+        // Corrupt (non-JSON) quoting puts the raw needle mid-value: the
+        // key-boundary anchor must not treat it as the token_count key.
+        let corrupt = r#"{"timestamp":"2026-09-30T01:00:00Z","type":"event_msg","payload":{"delta":"seen "type":"token_count" inline"}}"#;
+        assert!(codex_line_is_ignorable(corrupt));
+    }
+
+    #[test]
+    fn codex_ignorable_skips_are_counted_in_parse_diagnostics() {
+        // rm-047: the head-probe fast path used to discard event_msg and
+        // compacted lines with no trace; parse diagnostics now count them.
+        let meta = serde_json::json!({
+            "timestamp": "2026-09-30T01:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/probe", "model": "gpt-5.3-codex"}
+        })
+        .to_string();
+        let noise = |second: usize| {
+            serde_json::json!({
+                "timestamp": format!("2026-09-30T01:00:{second:02}Z"),
+                "type": "event_msg",
+                "payload": {"type": "agent_message_delta", "delta": "chatter"}
+            })
+            .to_string()
+        };
+        let token_count = serde_json::json!({
+            "timestamp": "2026-09-30T01:00:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 40, "reasoning_output_tokens": 0}}
+            }
+        })
+        .to_string();
+        let raw = [meta, noise(1), noise(2), token_count].join("\n");
+        let session =
+            parse_raw_session("codex", "rollout.jsonl", &raw).expect("codex rollout parses");
+        assert_eq!(session.metrics.tokens_input, 100);
+        assert_eq!(
+            session.metrics.line_skips.get("codex_ignorable_line"),
+            Some(&2),
+            "skipped codex chatter is visible in parse diagnostics"
+        );
     }
 
     #[test]

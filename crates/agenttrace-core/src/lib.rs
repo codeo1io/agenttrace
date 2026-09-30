@@ -844,7 +844,23 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             + metrics.tokens_cache_w as f64 / 1e6 * price.cw
             + metrics.tokens_cache_r as f64 / 1e6 * price.cr,
     );
-    metrics.provenance.cost = "calculated_from_tokens".to_string();
+    // rm-046: a class pinned at i64::MAX means accumulation saturated —
+    // the total is a clamp, not an exact sum, and the provenance must
+    // say so instead of claiming precise arithmetic.
+    metrics.provenance.cost = if [
+        metrics.tokens_input,
+        metrics.tokens_output,
+        metrics.tokens_reasoning,
+        metrics.tokens_cache_w,
+        metrics.tokens_cache_r,
+    ]
+    .contains(&i64::MAX)
+    {
+        "calculated_from_tokens_clamped"
+    } else {
+        "calculated_from_tokens"
+    }
+    .to_string();
     metrics
 }
 
@@ -1803,6 +1819,49 @@ mod tests {
         assert_eq!(total_tokens(&session), i64::MAX);
         assert!(session.metrics.cost_estimated.is_finite());
         assert!(session.metrics.cost_estimated >= 0.0);
+    }
+
+    #[test]
+    fn clamped_token_totals_flag_the_cost_provenance() {
+        // rm-046: a class pinned at i64::MAX means accumulation
+        // saturated — the total is a clamp, not an exact sum, and the
+        // cost provenance must say so instead of claiming precise
+        // arithmetic.
+        let saturated = session_from_events(
+            "clamp",
+            "clamp.jsonl",
+            vec![
+                Event {
+                    role: "session_meta".to_string(),
+                    usage: BTreeMap::from([("input_tokens".to_string(), i64::MAX)]),
+                    ..Event::default()
+                },
+                Event {
+                    role: "session_meta".to_string(),
+                    usage: BTreeMap::from([("input_tokens".to_string(), i64::MAX)]),
+                    ..Event::default()
+                },
+            ],
+        )
+        .expect("session");
+        assert_eq!(saturated.metrics.tokens_input, i64::MAX);
+        assert_eq!(
+            saturated.metrics.provenance.cost, "calculated_from_tokens_clamped",
+            "a clamped total must flag itself in cost provenance"
+        );
+        assert!(saturated.metrics.cost_estimated.is_finite());
+
+        let exact = session_from_events(
+            "exact",
+            "exact.jsonl",
+            vec![Event {
+                role: "session_meta".to_string(),
+                usage: BTreeMap::from([("input_tokens".to_string(), 7)]),
+                ..Event::default()
+            }],
+        )
+        .expect("session");
+        assert_eq!(exact.metrics.provenance.cost, "calculated_from_tokens");
     }
 
     #[test]
