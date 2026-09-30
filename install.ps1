@@ -52,6 +52,26 @@ try {
     $size = (Get-Item $tmp).Length
     Write-Host "   Binary size: $size bytes"
 
+    # rm-005: integrity gate. install.sh and npm/scripts/install.js both
+    # verify the .sha256 sidecar before installing; this channel had no
+    # check at all. Missing sidecar, malformed digest, or mismatch means
+    # the install is refused before anything reaches $DEST. The sidecar is
+    # published by the release workflow next to every asset (including the
+    # windows ones), so its absence from a fetched URL is itself a red
+    # flag, not a condition to tolerate.
+    $sidecarUrl = "$url.sha256"
+    $sidecarTmp = [System.IO.Path]::GetTempFileName()
+    Invoke-WebRequest -Uri $sidecarUrl -OutFile $sidecarTmp
+    $expected = ((Get-Content $sidecarTmp -Raw).Trim() -split '\s+')[0]
+    if (-not $expected -or $expected -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "Checksum sidecar ($sidecarUrl) did not contain a SHA-256 digest"
+    }
+    $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash
+    if ($actual -ne $expected) {
+        throw "SHA-256 mismatch: expected $expected, got $actual"
+    }
+    Write-Host "   SHA-256 verified ($($actual.ToLower()))"
+
     Move-Item -Force $tmp $DEST
 
     # Runtime verification: a downloaded artifact must prove it runs on THIS
@@ -76,6 +96,7 @@ try {
     exit 1
 } finally {
     if (Test-Path $tmp) { Remove-Item $tmp -Force }
+    if (Test-Path $sidecarTmp) { Remove-Item $sidecarTmp -Force }
 }
 
 # PATH check

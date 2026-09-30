@@ -1617,6 +1617,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn all_three_installers_verify_sha256_sidecars() {
+        // rm-005: every distribution channel (shell, PowerShell, npm)
+        // must verify the .sha256 sidecar before placing a binary --
+        // parity across channels is the acceptance criterion, not just
+        // the PowerShell fix in isolation.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+        let ps1 =
+            std::fs::read_to_string(format!("{root}install.ps1")).expect("install.ps1 readable");
+        let sh =
+            std::fs::read_to_string(format!("{root}install.sh")).expect("install.sh readable");
+        let js = std::fs::read_to_string(format!("{root}npm/scripts/install.js"))
+            .expect("npm/scripts/install.js readable");
+        assert!(ps1.contains(".sha256"), "install.ps1 must fetch the sidecar");
+        assert!(
+            ps1.contains("Get-FileHash"),
+            "install.ps1 must hash the downloaded artifact"
+        );
+        assert!(
+            ps1.contains("SHA-256 mismatch"),
+            "install.ps1 must refuse to install on mismatch"
+        );
+        assert!(
+            sh.contains(".sha256") && sh.contains("sha256sum"),
+            "install.sh sidecar verification must stay in place"
+        );
+        assert!(
+            js.contains(".sha256") && js.contains("createHash"),
+            "npm installer sidecar verification must stay in place"
+        );
+    }
+
+    #[test]
     fn event_typed_and_string_usage_coerce_instead_of_dropping_the_event() {
         // Pass-7 P7-1: strict `BTreeMap<String, i64>` usage rejected the
         // shapes real agents write, and the generic fallback then dropped

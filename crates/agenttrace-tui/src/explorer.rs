@@ -1271,7 +1271,7 @@ fn tools_preview(session: &Session, language: Language) -> String {
                 "{:>7}  {}{}",
                 format_duration(item.p95_sec),
                 item.tool_name,
-                if item.timeouts > 0 { "  timeout" } else { "" }
+                if item.unmatched > 0 { "  unmatched" } else { "" }
             )
         })
         .collect::<Vec<_>>()

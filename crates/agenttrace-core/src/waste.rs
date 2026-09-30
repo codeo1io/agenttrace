@@ -44,6 +44,10 @@ pub struct WasteReport {
     waste_level: &'static str,
     total_wasted: f64,
     loop_percent: f64,
+    /// Session-level estimated cost that the per-tool figures are
+    /// allocated from. Per-tool "cost" is an allocated share, never
+    /// measured per-tool spend (rm-004).
+    session_cost: f64,
     summary: String,
     top_actions: Vec<String>,
 }
@@ -51,7 +55,19 @@ pub struct WasteReport {
 pub fn compute_waste_report(session: &Session) -> WasteReport {
     let cache = analyze_cache_efficiency(&session.metrics);
     let bloat = analyze_tool_bloat(&session.metrics);
-    let mut stuck = detect_stuck_from_metrics(&session.metrics);
+    // diagnostics.stuck_patterns is the canonical stuck list. The
+    // metrics seed tests the SAME long-gap condition (>=3 gaps over
+    // 120s), so it is skipped whenever diagnostics already reported
+    // it — one stuck event must never be scored twice (rm-004).
+    let mut stuck = Vec::new();
+    let diagnostics_has_long_gaps = session
+        .diagnostics
+        .stuck_patterns
+        .iter()
+        .any(|item| item.pattern == "long_gaps");
+    if !diagnostics_has_long_gaps {
+        stuck.extend(detect_stuck_from_metrics(&session.metrics));
+    }
     stuck.extend(
         session
             .diagnostics
@@ -158,6 +174,7 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         waste_level,
         total_wasted,
         loop_percent,
+        session_cost: session.metrics.cost_estimated.max(0.0),
         summary,
         top_actions,
     }
@@ -220,11 +237,12 @@ fn analyze_tool_bloat(metrics: &Metrics) -> ToolBloatAnalysis {
     } else {
         0.0
     };
-    let avg_cost_per_turn = if metrics.assistant_turns > 0 && metrics.cost_estimated > 0.0 {
-        metrics.cost_estimated / metrics.assistant_turns as f64
-    } else {
-        0.0
-    };
+    let total_tool_calls = metrics.tool_usage.values().sum::<usize>() as f64;
+    // Per-tool "cost" is an ALLOCATED share of the session cost by
+    // call count — the trace prices sessions, not tools. Shares now sum
+    // to at most the session cost; the old avg-cost-per-turn * calls
+    // product could exceed the entire session's spend (rm-004).
+    let session_cost = metrics.cost_estimated.max(0.0);
     let (bloat_score, bloat_level) = if tools_per_turn > 5.0 {
         (90, "severe")
     } else if tools_per_turn > 3.0 {
@@ -242,7 +260,11 @@ fn analyze_tool_bloat(metrics: &Metrics) -> ToolBloatAnalysis {
         .map(|(tool_name, call_count)| ToolBloatItem {
             tool_name: tool_name.clone(),
             call_count: *call_count,
-            total_cost: avg_cost_per_turn * *call_count as f64,
+            total_cost: if total_tool_calls > 0.0 && session_cost > 0.0 {
+                session_cost * (*call_count as f64 / total_tool_calls)
+            } else {
+                0.0
+            },
             is_redundant: *call_count > metrics.assistant_turns && metrics.assistant_turns > 0,
         })
         .collect();
@@ -324,17 +346,29 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         report.bloat.tools_per_turn,
         t(language, "tools/turn", "工具/轮")
     ));
+    out.push_str(t(
+        language,
+        "  (cost = call-count allocated share of session cost)\n",
+        "  (成本 = 按调用次数分摊的会话成本份额)\n",
+    ));
     for item in &report.bloat.top_bloat {
         let redundant = if item.is_redundant {
             t(language, " *redundant", " *冗余")
         } else {
             ""
         };
+        let share = if report.session_cost > 0.0 {
+            item.total_cost / report.session_cost * 100.0
+        } else {
+            0.0
+        };
         out.push_str(&format!(
-            "    {:<25} {:>3}x {}{}\n",
+            "    {:<25} {:>3}x ~{} ({:.0}% {}){}\n",
             item.tool_name,
             item.call_count,
             format_cost(item.total_cost),
+            share,
+            t(language, "of session", "占会话"),
             redundant
         ));
     }
@@ -535,5 +569,83 @@ mod tests {
         assert!(report.contains("浪费分析"));
         assert!(report.contains("建议动作"));
         assert!(!report.contains("Waste Analysis"));
+    }
+
+    #[test]
+    fn stuck_long_gaps_scored_once() {
+        // rm-004 golden: diagnostics.stuck_patterns owns the long-gap
+        // condition; the metrics seed must not stack a second entry for
+        // the same evidence on top of it.
+        let session = Session {
+            name: "s".to_string(),
+            path: "/tmp/s".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                gaps_sec: vec![130.0, 140.0, 150.0],
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics {
+                stuck_patterns: vec![crate::StuckPattern {
+                    pattern: "long_gaps".to_string(),
+                    description: "3 gaps exceed 120s".to_string(),
+                    severity: "critical".to_string(),
+                }],
+                ..crate::Diagnostics::default()
+            },
+        };
+        let report = compute_waste_report(&session);
+        assert_eq!(report.stuck.len(), 1);
+    }
+
+    #[test]
+    fn per_tool_cost_is_allocated_share_of_session_cost() {
+        // rm-004 golden: per-tool "cost" is a call-count allocated share
+        // of the session cost -- shares never exceed the session total and
+        // sum back to it. (Old code: avg_cost_per_turn * calls = $30 of
+        // "bash" on a $10 session.)
+        use std::collections::BTreeMap;
+        let session = Session {
+            name: "s".to_string(),
+            path: "/tmp/s".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                assistant_turns: 10,
+                cost_estimated: 10.0,
+                tool_usage: BTreeMap::from([
+                    ("read".to_string(), 30),
+                    ("write".to_string(), 10),
+                ]),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        assert!((report.session_cost - 10.0).abs() < 1e-9);
+        let read = report
+            .bloat
+            .top_bloat
+            .iter()
+            .find(|item| item.tool_name == "read")
+            .expect("read present");
+        let write = report
+            .bloat
+            .top_bloat
+            .iter()
+            .find(|item| item.tool_name == "write")
+            .expect("write present");
+        assert!((read.total_cost - 7.5).abs() < 1e-9);
+        assert!((write.total_cost - 2.5).abs() < 1e-9);
+        let sum: f64 = report.bloat.top_bloat.iter().map(|item| item.total_cost).sum();
+        assert!((sum - 10.0).abs() < 1e-9);
+        assert!(read.total_cost <= report.session_cost);
+        let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
+        assert!(rendered.contains("allocated share of session cost"));
+        assert!(rendered.contains("75% of session"));
     }
 }
