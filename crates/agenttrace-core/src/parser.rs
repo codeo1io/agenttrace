@@ -2254,7 +2254,14 @@ fn codex_token_count_usage(
     let info = raw_info?.as_object()?;
     let total = token_usage_map(info.get("total_token_usage"));
     let (counts, next_total) = if !total.is_empty() {
-        (token_usage_delta(&total, prev_total), Some(total))
+        // Codex can rewind `total_token_usage` after compaction; keep a per-key
+        // high-water mark so a rewind never resets the delta baseline and the
+        // tokens already reported before it are never counted twice (CU-39,
+        // port of upstream PR #286 semantics).
+        (
+            token_usage_delta(&total, prev_total),
+            Some(token_usage_high_water(&total, prev_total)),
+        )
     } else {
         (
             token_usage_map(info.get("last_token_usage")),
@@ -2305,6 +2312,21 @@ fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
             .map(|value| ((*key).to_string(), value))
     })
     .collect()
+}
+
+fn token_usage_high_water(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
+    // Per-key maximum of the reported cumulative total and the stored baseline:
+    // cumulative usage never truly decreases, so a smaller report is treated as
+    // a rewind artifact (compaction) rather than a new baseline.
+    let Some(prev) = prev else {
+        return cur.clone();
+    };
+    let mut merged = prev.clone();
+    for (key, value) in cur {
+        let high = (*merged.get(key).unwrap_or(&0)).max(*value);
+        merged.insert(key.clone(), high);
+    }
+    merged
 }
 
 fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
@@ -4426,6 +4448,66 @@ fn session_name(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn codex_rewound_total_token_usage_never_double_counts() {
+        // CU-39 (port of upstream PR #286 semantics): after compaction Codex
+        // rewinds `total_token_usage`; the delta baseline must hold a per-key
+        // high-water mark or every token reported after the rewind is counted
+        // a second time on top of the pre-rewind session total.
+        let token_count = |ts: &str, input: i64, output: i64| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": input, "output_tokens": output}}
+                }
+            })
+            .to_string()
+        };
+        let mut raw = serde_json::json!({
+            "timestamp": "2026-09-30T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"model": "gpt-5", "cwd": "/tmp"}
+        })
+        .to_string();
+        raw.push('\n');
+        raw.push_str(&token_count("2026-09-30T00:00:01Z", 100, 50));
+        raw.push('\n');
+        raw.push_str(&token_count("2026-09-30T00:00:02Z", 180, 90));
+        raw.push('\n');
+        // Partial rewind after compaction: input's cumulative drops below
+        // the baseline while output still grows. The event is real (the
+        // output delta emits), so the baseline IS stored — and it must keep
+        // input's high water or input double-counts on every later report.
+        raw.push_str(&token_count("2026-09-30T00:00:03Z", 60, 120));
+        raw.push('\n');
+        // Recovery past the old input mark adds only the real growth.
+        raw.push_str(&token_count("2026-09-30T00:00:04Z", 220, 150));
+        raw.push('\n');
+
+        let events = parse_codex_rollout_jsonl(&raw).expect("rollout parses");
+        let mut input = 0i64;
+        let mut output = 0i64;
+        let mut usage_events = 0usize;
+        for event in &events {
+            if event.usage.is_empty() {
+                continue;
+            }
+            usage_events += 1;
+            input += event.usage.get("input_tokens").copied().unwrap_or(0);
+            output += event.usage.get("output_tokens").copied().unwrap_or(0);
+        }
+        // High-water semantics: four real events, but input's total must
+        // equal the high-water cumulative (220), not 100+80+160=340.
+        assert_eq!(usage_events, 4, "the partial-rewind event itself must still emit");
+        assert_eq!(
+            (input, output),
+            (220, 150),
+            "session total must equal the high-water cumulative, not a double count"
+        );
+    }
 
     #[test]
     fn bom_is_stripped_once_at_offset_zero_and_nowhere_else() {

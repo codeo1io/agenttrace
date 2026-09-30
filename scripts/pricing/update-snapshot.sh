@@ -25,10 +25,11 @@ for key, value in data.items():
         continue
     if value.get("mode") != "chat":
         continue
+    # Zero-priced chat rows are genuinely free models (zai flash tier in
+    # the live catalog), not placeholder noise: vendor them so free models
+    # price at 0 instead of falling back to default pricing (CU-40).
     inp = value.get("input_cost_per_token") or 0
     outp = value.get("output_cost_per_token") or 0
-    if inp == 0 and outp == 0:
-        continue
     keep[key] = {
         "input_cost_per_token": inp,
         "output_cost_per_token": outp,
