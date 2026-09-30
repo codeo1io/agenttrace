@@ -13,6 +13,8 @@
 
 ## Open items
 
+> **compound c1 (2026-09-30, run 0a279c44, pre-review):** cycle-1 batch "Trustworthy token accounting on hostile journals" = rm-046 + rm-047 implemented at HEAD 9d88b36 (uncommitted worktree state, review/shipping pending). Recorded outcomes: core-lib red 99/4 → green 103/0; targeted gate RC=0 (envelope result-430870-326193046.json) and full gate RC=0 (envelope result-493778-326216181.json), each 268 passed / 0 failed / 0 ignored across 10 suites; declared digest validation:v1:155d1e3d82ccd7bc7369ace33562cface32567490ee3cde875121137d0a6c738 at base 9d88b36 re-derived byte-exact pre- and post-gate. Cycle context compounded to docs/stewardship/2026-09-30-cycle1-implementation-record-run0a279c44.md, docs/reviews/2026-09-30-adversarial-repository-assessment-pass12.md, docs/research/2026-09-30-extensions-research-pass10.md; prevention rule for the roadmap id-collision class in docs/solutions/workflow-issues/roadmap-campaign-id-collision-at-integration.md. Cycle-2 leads: rm-051 (clean, offline gate scripts/ci/check-install-runtime.sh exists), rm-020 (per-model pricing anchor), rm-053 (conformance harness; its first case is now the landed rm-046 overflow test).
+
 ### Add test coverage for 1 untested module(s)
 - id: `rm-002` | track: reliability | priority: 83.0 | status: done
 - signals: reliability.no_tests:scripts/fixtures/make-adversarial-sqlite.py
@@ -177,6 +179,7 @@
 - acceptance: Analysis accumulates a per-model token ledger keyed on per-event model_used; session cost is the sum over models of lookup_price(model) x that model's tokens; report --overview, JSON output, and the TUI session detail view render a per-model breakdown (model, tokens in/out, rate source, cost); provenance.cost becomes a per-model enumeration or an explicit mixed-model marker; a golden test pins a two-model fixture's expected per-model costs; the sqlite_sessions.rs multi-model acknowledgment test is updated to assert the new exact behavior
 - evidence: Anchors re-verified at HEAD 90a4ef5: lib.rs:509-521 retains one model string per session (per-event model_used captured at :147/:344 is discarded at pricing time), lib.rs:596-601 does one lookup_price, lib.rs:763-772 applies that single price to all tokens and stamps provenance.cost=calculated_from_tokens at :770; sqlite_sessions.rs:857 test admits the analogous imprecision on the SQLite path. Research PE-1 (pass 8, 92% confidence): no competitor prices multi-model sessions per-model (ccusage 18,811 stars, tokenmaxxing both apply one rate), making this both the residual correctness defect (assess AR2-1) and a differentiating capability
 - next-cycle anchor (compound c1): top unselected alternate — deferred value-based on merge contention (render surface overlaps 02993de2's staged report_overview_* edits), not on value; becomes the top cycle-2 anchor once that merge lands, with rm-021 riding its per-model ledger
+- cycle-1 selection note (2026-09-30, run 0a279c44): passed over again, now solely on effort (M-L across ledger+report/JSON/TUI+goldens) and fresh render-surface churn — the contention is gone (both merges landed); cycle-2 anchor status reaffirmed
 
 ### Stamp pricing provenance into every artifact
 
@@ -252,79 +255,144 @@
 
 <!-- New items 2026-09-30 (run 88feec46 assess attempt 6c039674 + research attempt b31b51bd): numbered rm-012+ to stay disjoint from sibling campaign cc2f32d5's rm-003..rm-008 and this fork's own rm-001/rm-002/rm-009..rm-011 -->
 <!-- ID-collision record (commit gate 2026-09-30, review P2 of attempt c429ef80): campaign-local rm-012..rm-019 COLLIDE with distinct integrated items on origin/master ad503da (run 02993de2 / PR #16 renumber, campaign e7206fe5, landed while this campaign ran). Disposition per the PR #16 precedent: renumber this campaign's block at integration to the next free contiguous range above all landed AND claimed IDs at that time (today: master up to rm-019; open PR #17 claims rm-017..rm-024 stale-low; run cbe30a9c's tree claims rm-025..rm-033) and record the old>new mapping here; all phase artifacts, the independent review, and the commit message use the campaign-local IDs -->
+<!-- RENUMBER EXECUTED (2026-09-30, run 0a279c44 roadmap phase, campaign 47e4432e cycle 1, attempt 8f3fe81a): integration (merge 9d88b36) landed without applying the disposition above, leaving rm-012..rm-023 doubly-defined with the first-block items. Per that record, this block renumbered rm-012>rm-034, rm-013>rm-035, rm-014>rm-036, rm-015>rm-037, rm-016>rm-038, rm-017>rm-039, rm-018>rm-040, rm-019>rm-041, rm-020>rm-042, rm-021>rm-043, rm-022>rm-044, rm-023>rm-045 — ceiling above all landed (rm-027) and claimed ranges (cbe30a9c tree rm-025..rm-033; run-304846327112 branch rm-026..rm-032; open PR #19 carries campaign-local rm-012..rm-023 to be renumbered at its own integration). Item bodies verbatim; block-internal cross-references updated (rm-013→rm-035 in the parse-once notes, rm-016→rm-038 in the statusline-schema pair note). Historical phase artifacts (docs/stewardship/2026-09-30-cycle1-prioritization.md, docs/solutions/*) retain campaign-local IDs per the convention above; translate via this mapping. -->
 
 ### Sanitize statusline report output (terminal control injection from journal payloads)
-- id: `rm-012` | track: reliability | priority: 89.0 | status: done
+- id: `rm-034` | track: reliability | priority: 89.0 | status: done
 - signals: security.terminal_injection:crates/agenttrace-core/src/statusline.rs::L615+L628+L636-644 (report path prints journal-derived session_id and miss_cause strings raw; the render path sanitizes the same class at L263-268 sanitize_line_segment; ingestion stores hostile payloads verbatim at L275 append_statusline_capture; live repro 2026-09-30: crafted journal payload emitted raw ANSI SGR + OSC-52 through `agenttrace --statusline-report`)
 - acceptance: every string printed by --statusline-report passes the same control-character sanitization as the render path (shared helper), locked by a regression test asserting ESC/OSC sequences appear sanitized in report output; TUI panel stays numeric-only
 - evidence: cargo test green including the new injection regression test; live repro re-run shows no raw ESC bytes in report output (cat -v); conductor validation digest validation:v1:<sha> recorded in the shipping PR — compound-c1 (2026-09-30, run 88feec46): implemented uncommitted at 7bb4dcb — all three report print sites route through the shared sanitizer (statusline.rs:619/:632/:645 over sanitize_line_segment:265); regression test statusline_report_sanitizes_journal_derived_strings (statusline.rs:909); targeted+full gates green 238/0, digest validation:v1:9c9a1d4d5e3067b03657b0b4984c45be5b0358487a19497c64241c6224082088; live cat -v re-run shows U+FFFD and zero raw ESC; learning recorded at docs/solutions/security-issues/terminal-injection-through-journal-derived-statusline-strings.md; done-flip reserved for the commit gate — flipped 2026-09-30 (commit gate, run 88feec46 cycle 1)
 
 ### Fix Codex token double-counting after compaction (adopt upstream #286 high-water fix)
-- id: `rm-013` | track: reliability | priority: 88.0 | status: done
+- id: `rm-035` | track: reliability | priority: 88.0 | status: done
 - signals: correctness.double_count:crates/agenttrace-core/src/parser.rs::L2257 (codex_token_count_usage computes token_usage_delta(&total, prev_total) on the raw cumulative total; when Codex rewinds total_token_usage after compaction and climbs back, the rebound is re-counted; upstream fix be25c4c "Track Codex cumulative token high-water mark so rewound totals are not re-counted" merged 2026-09-30 and present in the local git object store; our fork point 6848aa1 predates it)
 - acceptance: token accounting tracks a cumulative high-water mark so rewinds never double-count; a fixture with rewind+rebound yields exactly the sum of true per-event deltas; estimated Codex costs are unaffected by compaction events
 - evidence: new regression test with a rewound-then-risen total_token_usage fixture asserting single-counted tokens; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR — compound-c1 (2026-09-30, run 88feec46): be25c4c's high-water hunk transplanted hunk-level (token_usage_high_water at parser.rs:2313 feeding the codex_token_count_usage call at parser.rs:2258), never the 11-file wave; regression test codex_total_usage_rewind_after_compaction_is_single_counted (parser.rs:4443) asserts single-counted 620 input/590 output/480 cache-read vs 870/630 pre-fix, proven by a revert-production-hunk discrimination re-run; targeted+full gates green 238/0, digest validation:v1:9c9a1d4d5e3067b03657b0b4984c45be5b0358487a19497c64241c6224082088; done-flip reserved for the commit gate — flipped 2026-09-30 (commit gate, run 88feec46 cycle 1)
 
 ### Parse JSONL once across format probes
-- id: `rm-014` | track: reliability | priority: 80.0 | status: candidate
+- id: `rm-036` | track: reliability | priority: 80.0 | status: candidate
 - signals: performance.reparse:crates/agenttrace-core/src/parser.rs (parse_raw_session probes each candidate format by re-parsing the raw JSONL text per probe; upstream be25c4c refactored the same chain to parse objects once and probe the parsed form as part of its +1249/-369 wave)
 - acceptance: format detection parses the source text once and shares the parsed objects across all probes; unknown-format files show a single parse pass; existing parser golden behavior unchanged
 - evidence: cargo test green (existing parser goldens); instrumentation or benchmark note documenting single-pass detection on a mixed corpus; conductor validation digest validation:v1:<sha> recorded in the shipping PR
-- notes: compound-c1 sequencing held — deliberately behind rm-013 so the parse-once refactor could not muddy the rewind fixture's baseline; when implementing, transplant the be25c4c probe-refactor hunks hunk-level (never the whole 11-file wave) and prove with a revert-production-hunk discrimination re-run, the pattern rm-013 used
+- notes: compound-c1 sequencing held — deliberately behind rm-035 so the parse-once refactor could not muddy the rewind fixture's baseline; when implementing, transplant the be25c4c probe-refactor hunks hunk-level (never the whole 11-file wave) and prove with a revert-production-hunk discrimination re-run, the pattern rm-035 used
 
 ### Catch up statusline schema: spend_limit window + structured repo identity
-- id: `rm-015` | track: customer-experience | priority: 78.0 | status: candidate
+- id: `rm-037` | track: customer-experience | priority: 78.0 | status: candidate
 - signals: contract.gap:crates/agenttrace-core/src/statusline.rs::L215+L405-502 (only five_hour/seven_day rate-limit windows modeled; live Claude Code statusline docs 2026-09-30 additionally document rate_limits.spend_limit.used_percentage/resets_at, silently dropped), contract.gap:workspace.repo.{host,owner,name}+workspace.git_worktree+added_dirs+session_name+effort.level+exceeds_200k_tokens (documented fields absent from the payload model; repo identity would also feed insights attribution and reduce resolve_project filesystem walks)
 - acceptance: spend_limit parsed and rendered alongside the two existing windows and recorded in journal insights when present; workspace.repo identity captured into the journal record and used by insights attribution when available; payload model tolerates unknown future fields without error
 - evidence: statusline unit tests with a fixture carrying spend_limit and workspace.repo; round-trip journal entry showing the new fields; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
-- notes: compound-c1 disposition — named the cycle-2 pair with rm-016 per the prioritize record (run 88feec46 attempt 51899064)
+- notes: compound-c1 disposition — named the cycle-2 pair with rm-038 per the prioritize record (run 88feec46 attempt 51899064)
 
 ### Memoize session project identity in TUI hot paths
-- id: `rm-016` | track: reliability | priority: 77.0 | status: candidate
+- id: `rm-038` | track: reliability | priority: 77.0 | status: candidate
 - signals: performance.hot_walk:crates/agenttrace-tui/src/app.rs::L1427-1429 (filter predicate calls resolve_project -> parent-dir git-root walk per session per refresh), performance.hot_walk:crates/agenttrace-tui/src/explorer.rs::L556-559+L568 (sort comparator and retain walk per element, O(n log n) walks), performance.hot_walk:crates/agenttrace-tui/src/filters.rs::L251-253 (label lookup per render); walk implementation crates/agenttrace-core/src/insights.rs::L148-184 with no cache
 - acceptance: resolve_project results memoized per session identity and populated at load; TUI filter/sort/label paths perform zero additional filesystem walks after initial resolution; behavior identical for sessions outside git repos
 - evidence: instrumentation or test demonstrating walk count independent of sort/refresh; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- notes: cross-campaign corroboration (2026-09-30, run 0a279c44 assess): additional unmemoized is_dir probes sit on the same hot paths at insights.rs:231/:278/:281 — fold them into this item's memoization pass
 
 ### Remove dead self-hosted cache steps from hosted-runner CI lanes
-- id: `rm-017` | track: reliability | priority: 74.0 | status: candidate
+- id: `rm-039` | track: reliability | priority: 74.0 | status: candidate
 - signals: ci.dead_step:.github/workflows/ci.yml::L44-63+L69-78 (Restore/Save cargo-target tar steps with self-hosted persistence comments run on ubuntu-latest since 6ba55ea #11 2026-09-22; the 369M target tar is written to a path no later hosted job can restore), docs.drift:.github/workflows/dependency-review.yml::L7 (comment claims ci.yml runs "cargo audit + cargo deny"; only cargo-deny exists)
 - acceptance: lint lane uses actions/cache keyed on Cargo.lock (or the dead steps are deleted) so PR wall-time no longer includes a dead 369M tar; dependency-review comment names exactly the gates that exist
 - evidence: CI run on the changed workflow shows the lint lane green without the tar step; grep shows no stale self-hosted persistence comments; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Fix --range today UTC boundary
-- id: `rm-018` | track: reliability | priority: 72.0 | status: candidate
+- id: `rm-040` | track: reliability | priority: 72.0 | status: candidate
 - signals: correctness.timezone:crates/agenttrace-core/src/insights.rs::L65-70 (Today range computes UTC midnight boundaries rather than the user's local day)
 - acceptance: today range anchors to local midnight with documented timezone handling; a test pinning the boundary around a fixed offset passes
 - evidence: new unit test for the local-day boundary; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Harden discovery-cache keys and listing freshness
-- id: `rm-019` | track: reliability | priority: 73.0 | status: candidate
+- id: `rm-041` | track: reliability | priority: 73.0 | status: candidate
 - signals: reliability.lossy_key:crates/agenttrace-core/src/session_cache.rs::L1031-1033 (cache keys built via to_string_lossy: non-UTF-8 paths vanish from cached discovery or collide), reliability.stale_listing:crates/agenttrace-core/src/session_cache.rs::L513 (directory-listing freshness keyed on mtime alone; same-tick creates after store stay invisible until the next mtime change)
 - acceptance: cache keys encode paths losslessly (OsStr bytes); listing freshness detects same-tick changes (size/inode or forced rescan); regression tests cover both cases
 - evidence: new tests for non-UTF-8 path round-trip and same-tick create visibility; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Add transcript-derived 5-hour billing block analytics
-- id: `rm-020` | track: customer-experience | priority: 76.0 | status: candidate
+- id: `rm-042` | track: customer-experience | priority: 76.0 | status: candidate
 - signals: user_need.ccusage_blocks (ccusage/ccusage 18,813 stars; blocks report groups usage into 5-hour billing windows with active-block burn rate and projections — fetched live 2026-09-30), capability.gap (our rate-limit visibility exists only via the opt-in statusline journal; CLI-only users have no 5h window view derived from local transcripts)
 - acceptance: a blocks command/report groups transcript usage into 5-hour windows aligned to first use, reports per-block cost and token totals by model, and marks the active block with its current burn rate; works with no statusline configured
 - evidence: golden test on a synthetic transcript corpus asserting block boundaries and totals; report rendered for a fixture corpus; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Unify crossterm on 0.29
-- id: `rm-021` | track: reliability | priority: 75.0 | status: candidate
+- id: `rm-043` | track: reliability | priority: 75.0 | status: candidate
 - signals: deps.duplicate:cargo tree -i crossterm (0.28.1 direct plus 0.29.0 via ratatui 0.30.2 -> ratatui-crossterm 0.1.2; two copies compiled into every binary; crossterm 0.29.0 is latest per crates.io 2026-09-30)
 - acceptance: a single crossterm version in the dependency graph; TUI behavior unchanged (full tui test suite green); no new advisories introduced
 - evidence: cargo tree -i crossterm shows one version; cargo test green; cargo-deny advisories ok; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Refresh ureq and rusqlite majors
-- id: `rm-022` | track: reliability | priority: 71.0 | status: candidate
+- id: `rm-044` | track: reliability | priority: 71.0 | status: candidate
 - signals: deps.stale:ureq 2.12.1 (ureq 3.4.2 current per crates.io 2026-09-30; our rustls RUSTSEC exposure rode the ureq 2.x graph), deps.stale:rusqlite 0.32 (0.40.2 current per crates.io 2026-09-30)
 - acceptance: pricing transport migrated to ureq 3.x with identical request behavior locked by existing pricing-fetch tests; hermes/opencode sqlite reads migrated to current rusqlite with golden db fixtures passing
 - evidence: cargo test green including pricing and sqlite fixture suites; cargo-deny advisories ok; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 ### Adopt upstream release-engineering wave (crt-static, git-cliff CHANGELOG, republish workflows)
-- id: `rm-023` | track: reliability | priority: 70.0 | status: candidate
+- id: `rm-045` | track: reliability | priority: 70.0 | status: candidate
 - signals: release.gap (upstream #285 .cargo/config.toml crt-static MSVC builds merged 2026-09-30 while this fork has no .cargo/config.toml, so Windows users need the VC redistributable; #289 git-cliff automated CHANGELOG addresses the hand-maintained Unreleased section; #291/#292 republish plus pinned wingetcreate harden the distribution channels)
 - acceptance: Windows release binaries link the static CRT (no VC redist requirement, verified by dumpbin or a CI artifact check); CHANGELOG generated by git-cliff with existing history preserved as prior context; release republish steps pinned and exercised once
 - evidence: release CI artifacts built with crt-static; generated CHANGELOG diff reviewed against current hand-maintained entries; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- notes: roadmap correction (2026-09-30, run 0a279c44, re-verified at HEAD 9d88b36): .cargo/config.toml with crt-static for both MSVC targets IS present in this tree — the "no .cargo/config.toml" signal above is stale (written pre-merge); remaining scope is git-cliff CHANGELOG generation and the pinned-republish/wingetcreate hardening only
+
+<!-- New items 2026-09-30 (run 0a279c44 assess attempt fcd470bd + research attempt 75f3f367, campaign 47e4432e cycle 1): numbered rm-046+ — above the post-renumber ceiling rm-045 and all known in-flight claims (cbe30a9c tree rm-025..rm-033; run-304846327112 branch rm-026..rm-032; open PR #19 carrying campaign-local rm-012..rm-023, to renumber at its own integration). Every signal below was re-verified at HEAD 9d88b36 in THIS worktree before writing: a grounding pass in the earlier assess/research phases had read some file inventories from the shared /work/projects/agenttrace checkout, which a sibling campaign keeps on the ci/glibc-baseline lineage (deny.toml present here, rustls already 0.23.45 here, .cargo/config.toml present here) — the roadmap reflects this tree, not that one. -->
+
+### Saturate token accumulation (i64 overflow panics debug builds, silently corrupts release)
+- id: `rm-046` | track: correctness | priority: 87.0 | status: implemented
+- compound c1 2026-09-30: implemented (pre-review) at HEAD 9d88b36 — parser.rs add_usage/add_usage_value saturating_add; lib.rs provenance.cost = "calculated_from_tokens_clamped" when any token class sits at i64::MAX. Recorded outcomes: red→green core-lib 99/4→103/0 (live adversarial fixture /tmp/at-adv/opencode: debug panic gone, release no longer wraps); targeted 268/0 (result-430870-326193046.json); full 268/0 (result-493778-326216181.json). Flip to done only after the shipping gate.
+- signals: correctness.overflow:crates/agenttrace-core/src/parser.rs::L3466+L3472 (add_usage :3464 and add_usage_value :3470 accumulate token maps with plain `+=`; live in-tree repro 2026-09-30 at HEAD 9d88b36: crafted 2-event opencode journal carrying input=i64::MAX per event — target/debug/agenttrace panics `attempt to add with overflow` at parser.rs:3472; target/release on the same fixture wraps negative, the `>0` filters then drop the tokens, and the report prints tokens.input=0 — a silent UNDER-count, the mirror image of the over-count class AgentMeasure's 2026-09 audit documents across ~110 usage tools)
+- acceptance: every token-map merge site (add_usage, add_usage_value, add_opencode_tokens) uses saturating or checked arithmetic; an adversarial fixture with two i64::MAX inputs parses without panic in debug builds and reports clamped totals with an explicit saturation marker in cost provenance; release cost math on the same fixture stays bounded and flagged; regression test token_accumulation_saturates_not_wraps pins the fixture
+- evidence: cargo test green including the new regression test; live repro re-run at the shipping HEAD shows debug no-panic and release clamped+flagged output; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- notes: cycle-1 SELECTION (2026-09-30, run 0a279c44 prioritize attempt 21cd5f95, campaign 47e4432e): selected with rm-047 as the cycle-1 batch "Trustworthy token accounting on hostile journals" — the only open candidates with live in-tree failing evidence at this HEAD; full scoring and rejected-alternative rationale at /tmp/at-c1-prioritization/2026-09-30-cycle1-prioritization.md
+
+### Codex head-classification probes bytes and substrings, not parsed JSON
+- id: `rm-047` | track: correctness | priority: 73.0 | status: implemented
+- compound c1 2026-09-30: implemented (pre-review) at HEAD 9d88b36 — json_key_present() key-boundary anchoring, whole-line token_count rescue, skips counted in Metrics.line_skips["codex_ignorable_line"] (existing field, additive serialization, no schema/cache churn). Recorded outcomes: red→green with rm-046 (99/4→103/0); live rescue verified beyond the 160-byte head window (input 100/output 40 where the old probe dropped the usage line; line_skips {codex_ignorable_line: 3}). Flip to done only after the shipping gate.
+- signals: correctness.head_probe:crates/agenttrace-core/src/parser.rs::L2262-2269 (codex line classification slices the first 160 BYTES and substring-matches `"type":"compacted"` / `"type":"event_msg"` — lines whose leading bytes merely QUOTE those substrings inside string content, or whose multi-byte UTF-8 shifts the byte window, are misrouted or dropped with no skip accounting)
+- acceptance: classification parses the leading JSON object and switches on the parsed `type` field (or anchors matches to field boundaries); a fixture whose content quotes the marker substrings is classified by its true type; skip decisions are counted in parse diagnostics
+- evidence: new parser fixture with quoting lines asserting true-type classification and a correct skip count; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- notes: cycle-1 SELECTION (2026-09-30, run 0a279c44 prioritize attempt 21cd5f95, campaign 47e4432e): paired with rm-046 in the cycle-1 batch — same file, same adversarial-fixture corpus, one review surface; red-to-green order records the panic repro as the first failing test
+
+### Upstream drift report trusts FETCH_HEAD without disclosing its age
+- id: `rm-048` | track: upstream-sync | priority: 67.0 | status: candidate
+- signals: reliability.stale_ref:crates/agenttrace-cli/src/upstream.rs::L294-301 (freshness falls back to FETCH_HEAD mtime and reports nothing when neither ref exists; a stale FETCH_HEAD lets the report assert freshness it cannot prove — no age disclosure)
+- acceptance: FETCH_HEAD-derived answers carry the ref's age and a downgraded authority; when no fresh-enough ref exists the report prints an explicit stale/unknown marker instead of an unqualified value
+- evidence: unit tests over fixture refs of varying mtime asserting the age label; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+### Archived and relocated projects collapse into one "unknown" attribution bucket
+- id: `rm-049` | track: correctness | priority: 66.0 | status: candidate
+- signals: correctness.attribution_collapse:crates/agenttrace-core/src/insights.rs::L178-179+L192 (project identity falls back to a single shared id/display_name "unknown"; sessions from distinct archived or moved projects merge into one bucket and insights/leaderboards attribute them jointly)
+- acceptance: fallback identities are disambiguated (parent-dir or path-hash suffix) so distinct unknown projects never merge; genuinely unidentifiable sessions keep a single explicit bucket or have it explicitly retired; tests pin two distinct non-git directories yielding distinct buckets
+- evidence: new insights tests over two fixture non-git trees; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+### Pricing HTTP response body read is unbounded
+- id: `rm-050` | track: reliability | priority: 64.0 | status: candidate
+- signals: reliability.unbounded_read:crates/agenttrace-core/src/pricing.rs::L348 (override/network pricing path converts the entire response via .into_string() with no size cap — an oversized or hostile body becomes unbounded memory in a diagnostics tool)
+- acceptance: body read is capped at a documented limit with a clear error on breach; cap and error path covered by a truncated-body fixture test
+- evidence: new test asserting the cap error; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+### install.sh source-build fallback clones the unpinned default branch
+- id: `rm-051` | track: security | priority: 78.0 | status: candidate
+- signals: supply_chain.unpinned_fallback:install.sh::L118 (after a failed runtime verify the installer falls back to `git clone --depth 1 https://github.com/${REPO}.git` and builds whatever the default branch holds — no ref pin, no checksum, nothing recorded; the verified-binary path's sidecar-hash story does not cover this branch; research pass 10 candidate 63)
+- acceptance: the fallback clones a pinned ref (tag or recorded commit) with the pin echoed to the user and written to the install receipt; an unpinned clone is never executed; an unresolvable pin aborts with a clear message
+- evidence: script test or recorded run showing the fallback cloning the pinned ref and the receipt recording it; sh -n clean; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- notes: cycle-1 selection note (2026-09-30, run 0a279c44): alternate-2 — isolated from the selected theme; clean cycle-2 lead paired with rm-045's remaining git-cliff/republish scope and rm-017's distribution move (scripts/ci/check-install-runtime.sh already in-tree as its offline gate)
+
+### Upstream-status labels conflate absent-probe with registry failure and rank unknown authority as least-fresh
+- id: `rm-052` | track: upstream-sync | priority: 58.0 | status: candidate
+- signals: truthfulness.labels:crates/agenttrace-cli/src/upstream.rs::L157 ("unavailable (registry probe failed or curl absent)" merges tool-absent with endpoint failure with bad payload; authority ranking treats an unknown source as least trustworthy even when it is the only fresh one)
+- acceptance: npm channel state distinguishes curl-absent from HTTP failure from unparseable payload; authority ranking presents unknown explicitly rather than as least-fresh; JSON schema changes additive only
+- evidence: unit tests per channel-state branch; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+### Token-accounting conformance harness in CI
+- id: `rm-053` | track: reliability | priority: 84.0 | status: candidate
+- signals: capability.gap:no token-accounting conformance harness anywhere in .github/ or scripts/ (grep-verified 2026-09-30 at HEAD 9d88b36); external yardstick exists: AgentMeasure's 2026-09 audit of ~110 usage tools (github.com/roy-tong/AgentMeasure, campaigns/audit-report-2026-09.md) documents five recurring billing-bug classes (re-emitted/resumed events double-counted, cache-tokens priced as input, price-table drift vs vendor consoles, resume/fork lineage loss, overflow/clamp handling) and ships a conformance pack plus a GitHub Action; this fork's rm-046 live repro proves it is not immune to the class
+- acceptance: a conformance job runs a checked-in fixture pack derived from the five audited classes against parser+pricing and fails on any silent double-count, mis-price, or unprovable total; at minimum the overflow/clamp and re-emitted-event classes are represented by fixtures at landing; the job gates PRs touching parser.rs or pricing.rs
+- evidence: conformance job green on CI with the fixture pack in-tree; the rm-046 adversarial fixture imported as the first conformance case; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- notes: cycle-1 selection note (2026-09-30, run 0a279c44): deliberate sequencing, not a value deferral — the acceptance's first conformance case IS rm-046's fixture, so rm-046 lands first; this is the cycle-2 strategic lead
+
+### Render UNPROVABLE — not zero — where evidence is absent
+- id: `rm-054` | track: customer-experience | priority: 62.0 | status: candidate
+- signals: truthfulness.zero_evidence: data-health and governance surfaces (crates/agenttrace-core/src/diagnostics.rs data_health*, report renderers) print numeric zeros where the underlying evidence was never captured; external design principle: AgentMeasure's audit treats UNPROVABLE as a first-class outcome distinct from zero (research pass 10 candidate 64; capability candidate — no defect anchor yet)
+- acceptance: surfaces whose inputs are absent render an explicit UNPROVABLE (or equivalent) marker in text plus an additive JSON field; no numeric zero is printed where evidence was never captured; golden tests pin both branches
+- evidence: golden tests for the unknown branch on a fixture corpus lacking the input evidence; docs updated for the marker; conductor validation digest validation:v1:<sha> recorded in the shipping PR
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->
