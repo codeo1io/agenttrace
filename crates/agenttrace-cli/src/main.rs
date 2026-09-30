@@ -382,9 +382,27 @@ fn run() -> anyhow::Result<()> {
         let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
         let session =
             latest_session(&sessions).context("No sessions match the requested filters")?;
-        let out = match args.format.as_str() {
-            "json" => report_json_with_language(session, language),
-            _ => report_text_with_language(session, language),
+        // rm-080: `--latest` renders ONE record selected from every
+        // session the filters matched, and now says so — same fields as
+        // the list views. (`--path` names its session explicitly; no
+        // selection happened, so no coverage line there.)
+        let out = if args.latest {
+            match args.format.as_str() {
+                "json" => latest_with_coverage_json(
+                    report_json_with_language(session, language),
+                    sessions.len(),
+                ),
+                _ => format!(
+                    "(latest of {} matching sessions)\n{}",
+                    sessions.len(),
+                    report_text_with_language(session, language)
+                ),
+            }
+        } else {
+            match args.format.as_str() {
+                "json" => report_json_with_language(session, language),
+                _ => report_text_with_language(session, language),
+            }
         };
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
@@ -1064,13 +1082,27 @@ fn matches_number(value: f64, filter: &str) -> bool {
 }
 
 fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
-    let sessions = sessions.iter().take(limit).collect::<Vec<_>>();
+    // rm-080: `--limit` bounds this view, and the bound is disclosed in
+    // BOTH arms — a trailing N-of-M line in text, `total_matches` +
+    // `truncated` fields in JSON (the same field names the search-JSON
+    // disclosure lane uses). The old bare array silently claimed to be
+    // the whole match set; it never said 20-of-25.
+    let total_matches = sessions.len();
+    let truncated = total_matches > limit;
+    let shown = sessions.iter().take(limit).collect::<Vec<_>>();
     if format == "json" {
-        return serde_json::to_string_pretty(&sessions).expect("sessions serialize");
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "count": shown.len(),
+            "sessions": shown,
+            "total_matches": total_matches,
+            "truncated": truncated,
+        }))
+        .expect("sessions serialize");
     }
+    let shown_count = shown.len();
     let mut lines =
         vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
-    lines.extend(sessions.into_iter().map(|session| {
+    lines.extend(shown.into_iter().map(|session| {
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
             session.name,
@@ -1084,7 +1116,26 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             session.anomalies.len()
         )
     }));
+    if truncated {
+        lines.push(format!(
+            "# showing {shown_count} of {total_matches} matching sessions (--limit {limit}; raise --limit for the full view)"
+        ));
+    }
     lines.join("\n")
+}
+
+/// rm-080: `--latest` is a bounded view — one record selected from the
+/// full match set. The JSON arm gains the same disclosure fields the
+/// list views carry (additively — every existing report key stays at
+/// the top level, alongside `total_matches` and `truncated`).
+fn latest_with_coverage_json(report: String, total_matches: usize) -> String {
+    let mut value =
+        serde_json::from_str::<serde_json::Value>(&report).expect("session report is JSON");
+    if let Some(object) = value.as_object_mut() {
+        object.insert("total_matches".to_string(), total_matches.into());
+        object.insert("truncated".to_string(), false.into());
+    }
+    serde_json::to_string_pretty(&value).expect("session report serializes")
 }
 
 fn render_diagnostics(
@@ -1503,6 +1554,108 @@ mod tests {
         assert!(err.to_string().contains("No sessions match"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn twenty_five_sessions() -> Vec<Session> {
+        // Assess F3 live-repro shape: 25 matched sessions against the
+        // default --limit 20 used to render exactly 20 rows / a bare
+        // 20-entry JSON array with no hint anything was held back.
+        (0..25)
+            .map(|index| session(&format!("s{index:02}"), "", "2026-01-01T00:00:00Z"))
+            .collect()
+    }
+
+    #[test]
+    fn session_list_text_discloses_truncation_with_n_of_m_line() {
+        let sessions = twenty_five_sessions();
+        let text = render_session_list(&sessions, "text", 20);
+        assert_eq!(
+            text.lines().count(),
+            22,
+            "header + 20 shown rows + the disclosure trailer"
+        );
+        assert!(
+            text.contains("# showing 20 of 25 matching sessions (--limit 20"),
+            "the trailer must name both counts and the cap: {text}"
+        );
+        // No truncation → no trailer; the table itself is unchanged.
+        let full = render_session_list(&sessions, "text", 50);
+        assert_eq!(full.lines().count(), 26);
+        assert!(!full.contains("# showing"));
+    }
+
+    #[test]
+    fn session_list_json_discloses_total_matches_and_truncated() {
+        let sessions = twenty_five_sessions();
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&render_session_list(&sessions, "json", 20))
+                .expect("sessions JSON parses");
+        assert_eq!(payload["total_matches"], 25);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["count"], 20);
+        assert_eq!(payload["sessions"].as_array().map(Vec::len), Some(20));
+        assert_eq!(payload["sessions"][0]["name"], "s00");
+        // No truncation → truncated=false, the whole match set present.
+        let full =
+            serde_json::from_str::<serde_json::Value>(&render_session_list(&sessions, "json", 50))
+                .expect("full sessions JSON parses");
+        assert_eq!(full["truncated"], false);
+        assert_eq!(full["total_matches"], 25);
+        assert_eq!(full["count"], 25);
+        assert_eq!(full["sessions"].as_array().map(Vec::len), Some(25));
+    }
+
+    #[test]
+    fn latest_view_discloses_match_count_in_both_arms() {
+        let sessions = twenty_five_sessions();
+        let report = report_json_with_language(&sessions[0], ReportLanguage::En);
+        let covered = latest_with_coverage_json(report.clone(), sessions.len());
+        let payload = serde_json::from_str::<serde_json::Value>(&covered)
+            .expect("covered latest report parses");
+        assert_eq!(payload["total_matches"], 25);
+        assert_eq!(payload["truncated"], false);
+        // Coverage is additive: every original report key survives.
+        let original =
+            serde_json::from_str::<serde_json::Value>(&report).expect("latest report parses");
+        for (key, value) in original.as_object().expect("report is an object") {
+            assert_eq!(&payload[key], value, "key {key} must survive coverage");
+        }
+        // Text arm carries the same disclosure as a leading line,
+        // mirroring the compare view's "(auditing N of M sessions)".
+        let text = format!(
+            "(latest of {} matching sessions)\n{}",
+            sessions.len(),
+            report_text_with_language(&sessions[0], ReportLanguage::En)
+        );
+        assert!(text.starts_with("(latest of 25 matching sessions)"));
+    }
+
+    #[test]
+    fn audit_coverage_fields_are_pinned_for_bounded_views() {
+        // rm-080 pins the bounded-audit disclosure contract
+        // (--delivery-evidence / --compare --sample ...): the coverage
+        // fields ride along in every format and never clobber the
+        // report body.
+        let payload = serde_json::json!({"sessions": [1, 2, 3]});
+        let covered = attach_audit_coverage(
+            payload.clone(),
+            3,
+            25,
+            Some("--sample 3 of 25 matching sessions".to_string()),
+        );
+        assert_eq!(covered["audited_sessions"], 3);
+        assert_eq!(covered["total_sessions"], 25);
+        assert_eq!(
+            covered["excluded_reason"],
+            "--sample 3 of 25 matching sessions"
+        );
+        assert_eq!(covered["sessions"].as_array().map(Vec::len), Some(3));
+        // Non-object reports (a bare array) are wrapped, not lost.
+        let wrapped = attach_audit_coverage(serde_json::json!([1, 2]), 2, 9, None);
+        assert_eq!(wrapped["report"].as_array().map(Vec::len), Some(2));
+        assert_eq!(wrapped["audited_sessions"], 2);
+        assert_eq!(wrapped["total_sessions"], 9);
+        assert!(wrapped["excluded_reason"].is_null());
     }
 
     fn temp_session_file(prefix: &str, content: &str) -> String {

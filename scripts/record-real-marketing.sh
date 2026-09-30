@@ -29,13 +29,19 @@ export PATH="$tmpdir:$PATH"
 
 rm -rf "$snapshot"
 mkdir -p "$snapshot"
+# rm-080: --sessions JSON is a disclosed view object
+# ({count, sessions, total_matches, truncated}), not a bare array.
 "$tmpdir/agenttrace-bin" --sessions -f json --limit 500 >"$tmpdir/sessions.json"
 node - "$tmpdir/sessions.json" "$snapshot" <<'NODE'
 const fs = require("fs");
 const path = require("path");
 const [input, output] = process.argv.slice(2);
-const sessions = JSON.parse(fs.readFileSync(input, "utf8"));
-for (const [index, session] of sessions.entries()) {
+const payload = JSON.parse(fs.readFileSync(input, "utf8"));
+if (payload.truncated) {
+  console.error(`Refusing to record a truncated view: ${payload.count} of ${payload.total_matches} matching sessions (raise --limit).`);
+  process.exit(1);
+}
+for (const [index, session] of payload.sessions.entries()) {
   const metrics = session.metrics;
   const source = metrics.source_tool || "generic";
   const events = [
