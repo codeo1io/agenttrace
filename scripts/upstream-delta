@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Standing fork-vs-upstream delta report (cycle-1 rm-009, CU-1).
+#
+# Reports how far this fork has drifted from upstream agenttrace
+# (luoyuctl/agenttrace): commits ahead/behind, the last sync point,
+# upstream commits not yet ported, upstream releases published since
+# the last sync, and the files that diverged.
+#
+# Usage:
+#   scripts/upstream-delta                 # report against upstream/master
+#   scripts/upstream-delta --fetch         # git fetch upstream first
+#   scripts/upstream-delta --json          # machine-readable single-line JSON
+#
+# The upstream remote is fetch-only by design (pushurl is disabled); this
+# script never mutates anything but the remote-tracking refs (with --fetch).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
+UPSTREAM_REF="${UPSTREAM_REF:-master}"
+
+die() { echo "upstream-delta: $*" >&2; exit 1; }
+
+FETCH=0; JSON=0
+for arg in "$@"; do
+  case "$arg" in
+    --fetch) FETCH=1 ;;
+    --json)  JSON=1 ;;
+    *) die "unknown argument: $arg" ;;
+  esac
+done
+
+git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1 \
+  || die "no '$UPSTREAM_REMOTE' remote configured (git remote add $UPSTREAM_REMOTE <url>)"
+[ "$FETCH" = 1 ] && git fetch "$UPSTREAM_REMOTE" --quiet
+
+BASE="$(git merge-base HEAD "$UPSTREAM_REMOTE/$UPSTREAM_REF")" \
+  || die "no common history with $UPSTREAM_REMOTE/$UPSTREAM_REF"
+HEAD_SHA="$(git rev-parse HEAD)"
+BASE_SHA="$BASE"
+AHEAD=$(git rev-list --count "$BASE..HEAD")
+BEHIND=$(git rev-list --count "HEAD..$UPSTREAM_REMOTE/$UPSTREAM_REF")
+BASE_DATE=$(git show -s --format=%cs "$BASE")
+BASE_SUBJECT=$(git show -s --format=%s "$BASE")
+DIVERGED=$(git diff --name-only "$UPSTREAM_REMOTE/$UPSTREAM_REF"..."HEAD" | wc -l)
+# Upstream tags reachable from upstream/master but not from HEAD =
+# releases published upstream that this fork does not contain.
+NEW_RELEASES=$(git tag --merged "$UPSTREAM_REMOTE/$UPSTREAM_REF" --no-merged HEAD | wc -l)
+NEW_RELEASE_LIST=$(git tag --merged "$UPSTREAM_REMOTE/$UPSTREAM_REF" --no-merged HEAD | tr '\n' ' ')
+
+if [ "$JSON" = 1 ]; then
+  printf '{"upstream":"%s/%s","base":"%s","base_date":"%s","ahead":%s,"behind":%s,"diverged_files":%s,"new_upstream_releases":%s,"new_upstream_release_list":"%s"}\n' \
+    "$UPSTREAM_REMOTE" "$UPSTREAM_REF" "${BASE_SHA:0:12}" "$BASE_DATE" \
+    "$AHEAD" "$BEHIND" "$DIVERGED" "$NEW_RELEASES" "$NEW_RELEASE_LIST"
+  exit 0
+fi
+
+echo "agenttrace fork ⇄ upstream delta"
+echo "  upstream:        $UPSTREAM_REMOTE/$UPSTREAM_REF"
+echo "  last sync:       ${BASE_SHA:0:12} ($BASE_DATE) — $BASE_SUBJECT"
+echo "  fork ahead:      $AHEAD commit(s)"
+echo "  fork behind:     $BEHIND commit(s)"
+echo "  diverged files:  $DIVERGED"
+echo "  new releases:    $NEW_RELEASES${NEW_RELEASE_LIST:+  ($NEW_RELEASE_LIST)}"
+if [ "$BEHIND" -gt 0 ]; then
+  echo
+  echo "Unported upstream commits (oldest first):"
+  git log --oneline --reverse "HEAD..$UPSTREAM_REMOTE/$UPSTREAM_REF"
+fi

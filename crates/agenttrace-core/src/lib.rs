@@ -548,16 +548,18 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
 /// Shared by the JSONL path (per-event) and the SQLite path (first user
 /// message text) so both name sessions identically.
 pub(crate) fn display_title_from_text(text: &str) -> Option<String> {
-    let mut text = text.trim();
+    let text = text.trim();
     if text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
         || text.starts_with("Another language model started")
     {
         return None;
     }
-    if let Some((_, request)) = text.split_once("## My request for Codex:") {
-        text = request.trim();
-    }
+    // Upstream v0.9.0 (#286) title cleaning: strip injected wrapper tags
+    // (goal_context/user_query/...), "My request for Codex" wrappers, and
+    // boilerplate prefixes before rendering. Composed here on top of the
+    // fork's suppression list so both lineages' fixes hold.
+    let text = clean_user_request(text)?;
     let title = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (!title.is_empty()).then(|| {
         let mut chars = title.chars();
@@ -593,6 +595,81 @@ fn estimate_tokens_from_text(text: &str) -> i64 {
         scaled = scaled.saturating_add(if ch.is_ascii() { 1 } else { 4 });
     }
     (scaled / 4) as i64
+}
+
+const BOILERPLATE_USER_PREFIXES: &[&str] = &[
+    "# AGENTS.md instructions",
+    "Another language model started",
+    "Recommended: install companion packages",
+    "Caveat: The messages below were generated",
+];
+
+// Harness-injected wrappers carry no user intent; the goal wrapper is the exception.
+const INJECTED_TAGS: &[&str] = &[
+    "system-reminder",
+    "user_action",
+    "codex_internal_context",
+    "environment_context",
+    "turn_aborted",
+    "recommended_plugins",
+    "user_instructions",
+    "image",
+    "local-command-stdout",
+    "local-command-caveat",
+    "command-name",
+    "command-message",
+    "command-args",
+];
+
+const REQUEST_WRAPPER_TAGS: &[&str] = &["user_query", "USER_REQUEST", "teammate-message"];
+
+fn clean_user_request(content: &str) -> Option<&str> {
+    let mut text = content.trim();
+    if let Some((_, request)) = text.split_once("## My request for Codex:") {
+        text = request.trim();
+    }
+    while let Some(tag) = leading_tag_name(text) {
+        let close = format!("</{tag}>");
+        if tag == "goal_context" {
+            return tag_body(text, "objective").map(str::trim);
+        }
+        if REQUEST_WRAPPER_TAGS.contains(&tag) {
+            let body = text.find('>').map_or("", |end| &text[end + 1..]);
+            text = body.split(close.as_str()).next().unwrap_or_default().trim();
+            continue;
+        }
+        if !INJECTED_TAGS.contains(&tag) {
+            break;
+        }
+        text = match text.find(&close) {
+            Some(end) => text[end + close.len()..].trim_start(),
+            None => text
+                .find('>')
+                .map_or("", |end| text[end + 1..].trim_start()),
+        };
+    }
+    if text.is_empty()
+        || BOILERPLATE_USER_PREFIXES
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+    {
+        return None;
+    }
+    Some(text)
+}
+
+fn leading_tag_name(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('<')?;
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))?;
+    (end > 0).then(|| &rest[..end])
+}
+
+fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(&text[start..end])
 }
 
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
@@ -1230,6 +1307,7 @@ pub fn format_cost(value: f64) -> String {
     if !value.is_finite() {
         return "$0.0000".to_string();
     }
+    let value = value + 0.0;
     let abs = value.abs();
     if abs >= 999_950_000_000.0 {
         format!("${:.1}T", value / 1_000_000_000_000.0)
@@ -1474,7 +1552,9 @@ pub(crate) fn classify_tool_authority(tool_call: &ToolCall) -> String {
         "test_or_build".to_string()
     } else if contains_any(
         &name,
-        &["read", "view", "list", "grep", "rg", "find", "cat", "ls"],
+        &[
+            "read", "view", "list", "grep", "rg", "find", "cat", "ls", "glob", "search",
+        ],
     ) {
         "read_only_files".to_string()
     } else {
@@ -1570,15 +1650,15 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
 
 fn authority_rank(category: &str) -> i32 {
     match category {
-        "read_only_files" => 1,
-        "test_or_build" => 2,
-        "write_files" => 3,
-        "package_install" => 4,
-        "network_access" => 5,
-        "shell_exec" => 6,
-        "git_write" => 7,
-        "external_publish" => 8,
-        "unknown_authority" => 9,
+        "unknown_authority" => 1,
+        "read_only_files" => 2,
+        "test_or_build" => 3,
+        "write_files" => 4,
+        "package_install" => 5,
+        "network_access" => 6,
+        "shell_exec" => 7,
+        "git_write" => 8,
+        "external_publish" => 9,
         _ => 0,
     }
 }
@@ -1724,6 +1804,53 @@ mod tests {
         .expect("build session");
 
         assert_eq!(session.name, "修复全局 Token 展示格式");
+    }
+
+    #[test]
+    fn session_name_skips_injected_wrappers() {
+        let user = |content: &str| Event {
+            role: "user".to_string(),
+            content: content.to_string(),
+            ..Event::default()
+        };
+        let cases = [
+            (
+                vec![user("<system-reminder>\nworktree\n</system-reminder>\n\n搜索最近3天ai新闻")],
+                "搜索最近3天ai新闻",
+            ),
+            (
+                vec![
+                    user("<turn_aborted>\nThe user interrupted.\n</turn_aborted>"),
+                    user("继续修复"),
+                ],
+                "继续修复",
+            ),
+            (
+                vec![user("<system-reminder data-role=\"user-context\">\nOS\n</system-reminder>\n<user_query>帮我领个优惠券</user_query>")],
+                "帮我领个优惠券",
+            ),
+            (
+                vec![user("<teammate-message teammate_id=\"lead\" summary=\"x\">\n第二轮分析\n</teammate-message>")],
+                "第二轮分析",
+            ),
+            (
+                vec![user("<goal_context>\nContinue.\n<objective>\n回测最近任务\n</objective>\nmore\n</goal_context>")],
+                "回测最近任务",
+            ),
+            (
+                vec![
+                    user("<image name=[Image #1] path=\"/tmp/a.png\">"),
+                    user("Recommended: install companion packages for pi-subagents."),
+                    user("看下这个报错"),
+                ],
+                "看下这个报错",
+            ),
+        ];
+        for (events, want) in cases {
+            let session =
+                session_from_events("fallback", "s.jsonl", events).expect("build session");
+            assert_eq!(session.name, want);
+        }
     }
 
     #[test]
@@ -2204,7 +2331,7 @@ mod tests {
         }
         assert_eq!(
             higher_tool_authority("shell_exec", "unknown_authority"),
-            "unknown_authority"
+            "shell_exec"
         );
         assert!(is_high_authority_category("write_files"));
         assert!(!is_high_authority_category("read_only_files"));

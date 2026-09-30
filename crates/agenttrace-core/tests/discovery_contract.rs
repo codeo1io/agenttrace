@@ -894,7 +894,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(17)
+            Some(20)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1060,7 +1060,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(17)
+            Some(20)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1397,6 +1397,64 @@ fn rust_codex_rollout_token_counts_use_turn_context_model() {
     assert_eq!(metrics.tokens_output, 190);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_codex_rollout_ignores_rewound_cumulative_totals() {
+    let root = temp_root("agenttrace-rust-codex-token-rewind");
+    fs::create_dir_all(&root).expect("create codex temp dir");
+    let session_path = root.join("rollout.jsonl");
+    fs::write(
+        &session_path,
+        r#"{"timestamp":"2026-05-03T10:00:00Z","type":"session_meta","payload":{"model_provider":"openai"}}
+{"timestamp":"2026-05-03T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.4"}}
+{"timestamp":"2026-05-03T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":100}}}}
+{"timestamp":"2026-05-03T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"output_tokens":120}}}}
+{"timestamp":"2026-05-03T10:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":100}}}}
+{"timestamp":"2026-05-03T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"output_tokens":120}}}}
+{"timestamp":"2026-05-03T10:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"output_tokens":150}}}}
+"#,
+    )
+    .expect("write codex rollout");
+
+    let metrics = parse_file(&session_path)
+        .expect("parse codex rollout")
+        .metrics;
+    assert_eq!(metrics.tokens_input, 1500);
+    assert_eq!(metrics.tokens_output, 150);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_codex_rollout_skips_bulky_events_but_keeps_token_counts() {
+    let root = temp_root("agenttrace-rust-codex-skip-bulky");
+    fs::create_dir_all(&root).expect("create codex temp dir");
+    let session_path = root.join("rollout.jsonl");
+    let big_output = "x".repeat(4096);
+    fs::write(
+        &session_path,
+        format!(
+            r#"{{"timestamp":"2026-05-03T10:00:00Z","type":"session_meta","payload":{{"model":"gpt-5.4"}}}}
+{{"timestamp":"2026-05-03T10:00:01Z","type":"event_msg","payload":{{"type":"item_completed","output":"{big_output}"}}}}
+{{"timestamp":"2026-05-03T10:00:02Z","type":"compacted","payload":{{"message":"{big_output}"}}}}
+{{"timestamp":"2026-05-03T10:00:03Z","ordinal":7,"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":900,"output_tokens":90}}}}}}}}
+{{"timestamp":"2026-05-03T10:00:04Z","type":"response_item","payload":{{"type":"function_call","call_id":"c1","name":"shell","arguments":"{{}}"}}}}
+{{"timestamp":"2026-05-03T10:00:05Z","type":"response_item","payload":{{"type":"function_call_output","call_id":"c1","output":"ok"}}}}
+"#
+        ),
+    )
+    .expect("write codex rollout");
+
+    let metrics = parse_file(&session_path)
+        .expect("parse codex rollout")
+        .metrics;
+    assert_eq!(metrics.source_tool, "codex_cli");
+    assert_eq!(metrics.tokens_input, 900);
+    assert_eq!(metrics.tokens_output, 90);
+    assert_eq!(metrics.tool_calls_total, 1);
 
     let _ = fs::remove_dir_all(root);
 }

@@ -5,7 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 17;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 20;
+// Fork-merge bump (cycle-1 rm-009, v0.9.0 port): upstream #286 moved the
+// schema 17 -> 19 (loop_fingerprints diagnostics model); the fork had
+// independently evolved 17 with its own fields (byte bound, walk v2).
+// The merged schema is neither lineage, so 20 invalidates every legacy
+// snapshot family once: fork-17 snapshots lack the new diagnostics
+// model; upstream-19 snapshots lack the fork-only cache semantics.
 // Bumped 5 → 6 (cycle-4 CU-10): cycle 3's naming change (placeholder
 // titles replaced by first-user-message names) shipped while this stayed
 // at 5, so v5 snapshots can carry stale names under new semantics. The
