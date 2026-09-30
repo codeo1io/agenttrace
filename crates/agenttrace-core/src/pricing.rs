@@ -360,7 +360,7 @@ fn download_pricing(timeout: Duration) -> anyhow::Result<(String, BTreeMap<Strin
     Ok((raw, entries))
 }
 
-fn read_body_capped(mut reader: impl Read, cap: u64) -> anyhow::Result<Vec<u8>> {
+fn read_body_capped(reader: impl Read, cap: u64) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
         .take(cap + 1)
