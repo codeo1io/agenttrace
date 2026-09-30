@@ -63,7 +63,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 17 and the SQLite snapshot is schema 6 because
+The session cache is schema 20 and the SQLite snapshot is schema 6 because
 both now persist provenance. Older versions are discarded and rebuilt on the
 next load; the migration is read-only and does not modify source session
 files. Cache entries whose source file has disappeared are pruned the next
