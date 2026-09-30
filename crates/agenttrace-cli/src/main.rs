@@ -3,9 +3,9 @@ use agenttrace_core::{
     data_health, data_health_scoped, delivery_evidence_with_git, demo_sessions,
     evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
     load_sessions_with_options, mcp_governance, parse_file, predict_cost_anomaly,
-    pricing_cache_path, recommendations, render_doctor_report, render_model_pricing_list,
-    render_test_match, render_waste_report_with_language, report_compare_json,
-    report_json_with_language, report_overview_html_with_context,
+    pricing_cache_path, recommendations, render::sanitize_line_segment, render_doctor_report,
+    render_model_pricing_list, render_test_match, render_waste_report_with_language,
+    report_compare_json, report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
     report_overview_text_with_context, report_search_json, report_search_text,
     report_text_with_language, search_sessions, session_capability, tool_fail_rate, total_tokens,
@@ -33,7 +33,7 @@ struct Args {
         value_parser = ["text", "json", "markdown", "md", "html"]
     )]
     format: String,
-    #[arg(short = 'd')]
+    #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
     #[arg(long)]
     compare: bool,
@@ -55,9 +55,9 @@ struct Args {
     diagnostics: bool,
     #[arg(long)]
     inspect: Option<usize>,
-    #[arg(short = 'm', default_value = "default")]
+    #[arg(short = 'm', long = "model", default_value = "default")]
     model: String,
-    #[arg(short = 'o')]
+    #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
     #[arg(long)]
     latest: bool,
@@ -150,7 +150,9 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let args = Args::parse_from(go_flag_compatible_args(std::env::args_os()));
+    let raw: Vec<OsString> = std::env::args_os().collect();
+    let shimmed = go_flag_compatible_args(raw.clone());
+    let args = Args::parse_from(shimmed.clone());
     // --version must win over argument validation, including action
     // validation: `--lang fr --version` used to fail in report_language()
     // and `--overview --version` in validate_primary_action() before the
@@ -171,14 +173,14 @@ fn run() -> anyhow::Result<()> {
     if args.sample == Some(0) {
         bail!("--sample must be at least 1");
     }
-    if matches!(args.format.as_str(), "markdown" | "md" | "html")
-        && !(args.overview
-            || args.audit
-            || args.recommend
-            || args.mcp_governance
-            || args.context_trends
-            || args.delivery_evidence)
-    {
+    if markdown_format_requires_report_action(&args) {
+        if let Some(flag) = dropped_report_action_flag(&raw, &shimmed) {
+            bail!(
+                "markdown and html formats require --overview or a governance report action \
+                 (note: {flag} was given after the session path, where the Go-compatible parser \
+                 drops it — place {flag} before the path)"
+            );
+        }
         bail!("markdown and html formats require --overview or a governance report action");
     }
 
@@ -684,6 +686,47 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// rm-035: markdown/html renderers are multi-session surfaces
+/// (overview/governance reports); a bare `--format markdown` next to a
+/// single-session action used to silently render the wrong report. A
+/// predicate (not an inline `if`) so the golden test can pin the guard
+/// across every argument order.
+fn markdown_format_requires_report_action(args: &Args) -> bool {
+    matches!(args.format.as_str(), "markdown" | "md" | "html")
+        && !(args.overview
+            || args.audit
+            || args.recommend
+            || args.mcp_governance
+            || args.context_trends
+            || args.delivery_evidence)
+}
+
+/// Boolean report-action flags that the Go-compatible shim silently
+/// drops when they appear after the first positional path (Go's flag
+/// package stops parsing there, mirroring `go_flag_compatible_args`).
+/// The markdown/html guard uses this to name the placement problem
+/// instead of implying no report action was requested (review
+/// 14f25886 finding 4: `agenttrace session.jsonl --audit --format
+/// markdown` used to fail with the generic guard message even though
+/// an audit was requested — just on the wrong side of the path).
+fn dropped_report_action_flag(raw: &[OsString], shimmed: &[OsString]) -> Option<String> {
+    const REPORT_ACTION_FLAGS: [&str; 6] = [
+        "--overview",
+        "--audit",
+        "--recommend",
+        "--mcp-governance",
+        "--context-trends",
+        "--delivery-evidence",
+    ];
+    for flag in REPORT_ACTION_FLAGS {
+        let flag = OsString::from(flag);
+        if raw.contains(&flag) && !shimmed.contains(&flag) {
+            return Some(flag.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 fn go_flag_compatible_args<I>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = OsString>,
@@ -695,6 +738,7 @@ where
     }
 
     let mut expecting_value = false;
+    let mut positional_seen = false;
     while let Some(arg) = args.next() {
         if expecting_value {
             out.push(arg);
@@ -709,8 +753,22 @@ where
             break;
         }
         if is_go_flag_positional(&arg) {
-            out.push(arg);
-            break;
+            // rm-035: Go's flag package stops parsing at the first
+            // positional, but silently discarding a KNOWN value flag
+            // after the session path (`agenttrace session.jsonl
+            // --format json`) produced the text report with exit 0 and
+            // bypassed the markdown/html guard. Known flags are hoisted
+            // so clap still sees them; extra positionals and
+            // unrecognized tokens stay dropped (the upstream-compat
+            // tolerance this shim exists for).
+            if !positional_seen {
+                out.push(arg);
+                positional_seen = true;
+            }
+            continue;
+        }
+        if positional_seen && !is_known_value_flag(&arg) {
+            continue;
         }
         expecting_value = flag_takes_value(&arg);
         out.push(arg);
@@ -724,6 +782,16 @@ fn is_go_flag_positional(arg: &OsString) -> bool {
     text == "-" || !text.starts_with('-')
 }
 
+/// True when the token names a flag the shim recognizes as
+/// value-bearing, accepting both `--format json` and `--format=json`
+/// spellings. Used after the positional path to decide between hoisting
+/// (known flag) and dropping (unknown token, Go-flag tolerance).
+fn is_known_value_flag(arg: &OsString) -> bool {
+    let text = arg.to_string_lossy();
+    let name = text.split('=').next().unwrap_or(text.as_ref());
+    flag_takes_value(&OsString::from(name))
+}
+
 fn flag_takes_value(arg: &OsString) -> bool {
     let text = arg.to_string_lossy();
     if text.contains('=') {
@@ -733,8 +801,11 @@ fn flag_takes_value(arg: &OsString) -> bool {
         text.as_ref(),
         "-f" | "--format"
             | "-d"
+            | "--dir"
             | "-m"
+            | "--model"
             | "-o"
+            | "--output"
             | "--search"
             | "--search-limit"
             | "--fail-under-health"
@@ -1053,13 +1124,16 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
     let mut lines =
         vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
     lines.extend(sessions.into_iter().map(|session| {
+        // rm-034: NAME/SOURCE/MODEL are session-derived (the session name
+        // comes from the first user message), so neutralize control
+        // sequences before this tab-separated text reaches a terminal.
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
-            session.name,
+            sanitize_line_segment(&session.name),
             session.health,
             session_capability(session),
-            session.metrics.source_tool,
-            session.metrics.model_used,
+            sanitize_line_segment(&session.metrics.source_tool),
+            sanitize_line_segment(&session.metrics.model_used),
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,
@@ -1315,12 +1389,16 @@ mod tests {
     }
 
     #[test]
-    fn go_flag_compatible_args_ignore_flags_after_positional_path() {
+    fn go_flag_compatible_args_ignore_unknown_flags_after_positional_path() {
+        // rm-035 preserved the upstream-compat tolerance: tokens the CLI
+        // does not recognize after the positional path are still dropped
+        // (Go flag semantics). The old form of this test used `-f json`,
+        // which is now hoisted instead — see the test below.
         let args = go_flag_compatible_args([
             OsString::from("agenttrace"),
             OsString::from("session.jsonl"),
-            OsString::from("-f"),
-            OsString::from("json"),
+            OsString::from("--upstream-legacy-flag"),
+            OsString::from("junk"),
         ]);
 
         assert_eq!(
@@ -1330,6 +1408,183 @@ mod tests {
                 OsString::from("session.jsonl")
             ]
         );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_hoist_known_value_flag_after_positional_path() {
+        // rm-035: `agenttrace session.jsonl --format json` used to silently
+        // produce the text report with exit 0 (and bypassed the
+        // markdown/html guard). The known flag now reaches clap.
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("session.jsonl"),
+            OsString::from("--format"),
+            OsString::from("json"),
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("session.jsonl"),
+                OsString::from("--format"),
+                OsString::from("json")
+            ]
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_hoist_equals_form_after_positional_path() {
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("session.jsonl"),
+            OsString::from("--format=json"),
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("agenttrace"),
+                OsString::from("session.jsonl"),
+                OsString::from("--format=json")
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_html_guard_fires_on_every_argument_order() {
+        // rm-035 golden test: the markdown/html guard must fire no
+        // matter which side of the positional session path the format
+        // flag lands on. The Go-flag shim hoists every known value
+        // flag, so clap always sees it and the guard is reachable —
+        // before rm-035, `session.jsonl --format markdown` silently
+        // bypassed it (text report, exit 0).
+        let orders: [&[&str]; 7] = [
+            &["agenttrace", "--format", "markdown", "session.jsonl"],
+            &["agenttrace", "--format=markdown", "session.jsonl"],
+            &["agenttrace", "-f", "md", "session.jsonl"],
+            &["agenttrace", "session.jsonl", "--format", "markdown"],
+            &["agenttrace", "session.jsonl", "--format=markdown"],
+            &["agenttrace", "session.jsonl", "-f", "md"],
+            &["agenttrace", "session.jsonl", "--format", "html"],
+        ];
+        for argv in orders {
+            let shimmed = go_flag_compatible_args(argv.iter().map(OsString::from));
+            let args = Args::try_parse_from(shimmed)
+                .unwrap_or_else(|error| panic!("shim dropped a known flag for {argv:?}: {error}"));
+            assert!(
+                markdown_format_requires_report_action(&args),
+                "guard must fire for {argv:?}"
+            );
+        }
+
+        // Negatives: the guard stays quiet when a report action is
+        // present and for formats that are not markdown/html.
+        let overview = Args::try_parse_from(["agenttrace", "--overview", "-f", "md"]).unwrap();
+        assert!(!markdown_format_requires_report_action(&overview));
+        let audit =
+            Args::try_parse_from(["agenttrace", "session.jsonl", "--audit", "-f", "html"]).unwrap();
+        assert!(!markdown_format_requires_report_action(&audit));
+        let text = Args::try_parse_from(["agenttrace", "session.jsonl", "-f", "text"]).unwrap();
+        assert!(!markdown_format_requires_report_action(&text));
+        let json =
+            Args::try_parse_from(["agenttrace", "session.jsonl", "--format", "json"]).unwrap();
+        assert!(!markdown_format_requires_report_action(&json));
+    }
+
+    #[test]
+    fn guard_error_names_report_action_dropped_after_positional_path() {
+        // Review 14f25886 finding 4 (rm-035 guard composition): the
+        // shim+guard pair must not mislead. `agenttrace session.jsonl
+        // --audit --format markdown` hoists the value flag but drops
+        // the post-positional boolean, so the guard fires — and the
+        // error must be able to name the dropped flag and its fix,
+        // not imply that no report action was requested.
+        let raw: Vec<OsString> = ["agenttrace", "session.jsonl", "--audit", "-f", "markdown"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let shimmed = go_flag_compatible_args(raw.clone());
+        let args = Args::try_parse_from(shimmed.clone()).expect("shim hoists the known value flag");
+        assert!(markdown_format_requires_report_action(&args));
+        assert_eq!(
+            dropped_report_action_flag(&raw, &shimmed),
+            Some("--audit".to_string())
+        );
+
+        // Placed before the path, the flag survives the shim, the
+        // guard stays quiet, and there is nothing to name.
+        let raw_ok: Vec<OsString> = ["agenttrace", "--audit", "session.jsonl", "-f", "markdown"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let shimmed_ok = go_flag_compatible_args(raw_ok.clone());
+        let args_ok = Args::try_parse_from(shimmed_ok.clone()).unwrap();
+        assert_eq!(dropped_report_action_flag(&raw_ok, &shimmed_ok), None);
+        assert!(!markdown_format_requires_report_action(&args_ok));
+
+        // A dropped flag that is not a report action must not be named
+        // (here a post-positional unknown boolean is dropped but the
+        // guard is not firing on json anyway — the helper only ever
+        // reports the six report-action flags).
+        let raw_other: Vec<OsString> = [
+            "agenttrace",
+            "session.jsonl",
+            "--nonsense",
+            "-f",
+            "markdown",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let shimmed_other = go_flag_compatible_args(raw_other.clone());
+        assert_eq!(dropped_report_action_flag(&raw_other, &shimmed_other), None);
+    }
+
+    #[test]
+    fn sessions_listing_neutralizes_hostile_payloads() {
+        // rm-034 payload test (review 14f25886 finding 2): the learning
+        // doc claims --sessions carries a payload test — name, source
+        // tool, and model are session-derived strings reaching a
+        // terminal as tab-separated text, so OSC-52/SGR/BEL/C1-CSI
+        // must arrive as U+FFFD with the readable text preserved. The
+        // JSON branch relies on serde escaping (documented negative).
+        let session = Session {
+            name: "PWN\u{1b}]52;c;aGVsbG8=\u{7}".to_string(),
+            path: "/tmp/hostile.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: agenttrace_core::Metrics {
+                model_used: "EVIL\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}[31mRED".to_string(),
+                source_tool: "\u{9b}src".to_string(),
+                ..agenttrace_core::Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        let text = render_session_list(&[session], "text", 10);
+        assert!(!text.contains('\u{1b}'), "raw ESC survived: {text:?}");
+        assert!(!text.contains('\u{7}'), "raw BEL survived: {text:?}");
+        assert!(!text.contains('\u{9b}'), "raw C1 CSI survived: {text:?}");
+        assert!(text.contains('\u{fffd}'));
+        assert!(text.contains("aGVsbG8="));
+        assert!(text.contains("PWN"));
+    }
+
+    #[test]
+    fn value_flag_allowlist_covers_the_long_forms_of_every_short_flag() {
+        // rm-035: -d/-m/-o gained --dir/--model/--output. The shim's
+        // allowlist and clap's arg surface must not drift apart again:
+        // a long form that clap accepts but the allowlist misses would
+        // silently eat its value.
+        for flag in ["--dir", "--model", "--output", "--format"] {
+            assert!(
+                flag_takes_value(&OsString::from(flag)),
+                "{flag} missing from flag_takes_value allowlist"
+            );
+            assert!(is_known_value_flag(&OsString::from(format!("{flag}=v"))));
+        }
     }
 
     #[test]

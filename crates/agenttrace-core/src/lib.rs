@@ -7,6 +7,7 @@ mod history;
 mod insights;
 mod parser;
 mod pricing;
+pub mod render;
 mod reports;
 mod search;
 mod session_cache;
@@ -1092,7 +1093,15 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         } else {
             overview.critical += 1;
         }
-        let agent = session.metrics.source_tool.clone();
+        // rm-039: sessions whose parser never set a source tool (the
+        // claude-code JSONL family historically left it empty) used to
+        // collapse into an unlabeled By-Agent row. Group them under an
+        // explicit "unknown" bucket instead — never an empty label.
+        let agent = if session.metrics.source_tool.is_empty() {
+            "unknown".to_string()
+        } else {
+            session.metrics.source_tool.clone()
+        };
         let agent_entry = overview.by_agent.entry(agent).or_default();
         agent_entry.sessions += 1;
         agent_entry.cost += session.metrics.cost_estimated;

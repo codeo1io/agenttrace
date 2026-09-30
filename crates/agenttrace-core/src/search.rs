@@ -1,3 +1,4 @@
+use crate::render::sanitize_line_segment;
 use crate::reports::{json_float, json_string};
 use crate::{
     canonical_sessions, format_cost, format_tokens, highest_authority_for_metrics, round4,
@@ -113,29 +114,35 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         out.push_str("No matching session metadata found.\n");
         return out;
     }
+    // rm-034: this is terminal text over session-derived strings — every
+    // field a poisoned session file controls (name, source tool, model,
+    // cwd, path, match evidence) is neutralized at this boundary. The
+    // JSON branch above relies on serde escaping instead.
     for result in results {
         out.push_str(&format!(
             "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
-            result.name,
-            result.source_tool,
-            result.model,
+            sanitize_line_segment(&result.name),
+            sanitize_line_segment(&result.source_tool),
+            sanitize_line_segment(&result.model),
             result.health,
             format_cost(result.cost),
             format_tokens(result.tokens)
         ));
         if !result.cwd.is_empty() {
-            out.push_str(&format!("  cwd: {}\n", result.cwd));
+            out.push_str(&format!("  cwd: {}\n", sanitize_line_segment(&result.cwd)));
         }
         if !result.path.is_empty() {
-            out.push_str(&format!("  path: {}\n", result.path));
+            out.push_str(&format!(
+                "  path: {}\n",
+                sanitize_line_segment(&result.path)
+            ));
         }
         for item in &result.matches {
-            out.push_str(&format!("  - {}\n", item));
+            out.push_str(&format!("  - {}\n", sanitize_line_segment(item)));
         }
     }
     out
 }
-
 fn search_session_evidence(session: &Session, query: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut matches = Vec::new();
@@ -280,5 +287,33 @@ mod tests {
         let report = report_search_json(&[result]);
         assert!(report.contains("\"cost\": 0,"));
         assert!(!report.contains("\"cost\": 0.0,"));
+    }
+
+    #[test]
+    fn report_search_text_neutralizes_hostile_payloads() {
+        // rm-034 payload test (review 14f25886 finding 2): every field
+        // a poisoned session file controls in --search output — name,
+        // source tool, model, cwd, path, match evidence — must arrive
+        // with OSC-52/SGR/BEL/C1-CSI neutralized while the readable
+        // payload text survives. The JSON branch relies on serde
+        // escaping instead (documented negative).
+        let result = SearchResult {
+            name: "PWN\u{1b}]52;c;aGVsbG8=\u{7}".to_string(),
+            path: "/tmp/evil\u{1b}[31m/x.jsonl".to_string(),
+            cwd: "/tmp/\u{9b}cwd".to_string(),
+            source_tool: "cli\u{7}".to_string(),
+            model: "EVIL\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}[31mRED".to_string(),
+            health: 100,
+            cost: 0.0,
+            tokens: 1,
+            matches: vec!["hit\u{1b}[31mRED".to_string()],
+        };
+        let text = report_search_text(&[result], "evil");
+        assert!(!text.contains('\u{1b}'), "raw ESC survived: {text:?}");
+        assert!(!text.contains('\u{7}'), "raw BEL survived: {text:?}");
+        assert!(!text.contains('\u{9b}'), "raw C1 CSI survived: {text:?}");
+        assert!(text.contains('\u{fffd}'));
+        assert!(text.contains("aGVsbG8="));
+        assert!(text.contains("PWN"));
     }
 }

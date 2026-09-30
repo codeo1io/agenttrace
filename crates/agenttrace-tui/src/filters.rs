@@ -420,7 +420,47 @@ pub(super) fn terminal_safe_report(text: &str) -> String {
             '━' | '─' | '═' | '—' | '–' => '-',
             '│' | '┃' => '|',
             '┌' | '┐' | '└' | '┘' | '┬' | '┴' | '├' | '┤' | '┼' => '+',
+            // rm-034: control bytes (C0/DEL/C1) are the carrier of every
+            // terminal-control sequence; ratatui happens to drop them as
+            // zero-width today, but this mapping makes the guarantee local
+            // instead of load-bearing on the widget layer. Newline and tab
+            // stay — they are layout, not injection.
+            ch if ch.is_control() && ch != '\n' && ch != '\t' => '\u{FFFD}',
             _ => ch,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_safe_report;
+
+    #[test]
+    fn report_pane_replaces_control_bytes_with_replacement_character() {
+        // rm-034: the report pane's guarantee is LOCAL to
+        // terminal_safe_report — an OSC-52 clipboard write, an SGR
+        // sequence, BEL and the C1 CSI form are all control bytes and
+        // must all become U+FFFD even if the widget layer ever changes
+        // how it renders zero-width characters.
+        let hostile = "EVIL\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}[31mRED\u{1b}[0m\u{9b}44mBLUE";
+        let safe = terminal_safe_report(hostile);
+        assert!(!safe.contains('\u{1b}'), "ESC survived the report pane");
+        assert!(!safe.contains('\u{7}'), "BEL survived the report pane");
+        assert!(!safe.contains('\u{9b}'), "C1 CSI survived the report pane");
+        assert!(safe.contains("EVIL") && safe.contains("aGVsbG8=") && safe.contains("RED"));
+        // ESC, BEL, ESC, ESC, C1 CSI — every introducer and terminator.
+        assert_eq!(safe.matches('\u{FFFD}').count(), 5);
+    }
+
+    #[test]
+    fn report_pane_keeps_layout_controls_and_plain_text() {
+        // Newline and tab are layout, not injection — they pass through.
+        assert_eq!(terminal_safe_report("line\n\ttab"), "line\n\ttab");
+        // Ordinary text and CJK are untouched; the width substitutions
+        // (em/box-drawing to ASCII) are pinned separately below.
+        assert_eq!(terminal_safe_report("成本 report ok"), "成本 report ok");
+        assert_eq!(terminal_safe_report(""), "");
+        // The box-drawing substitutions stay pinned too.
+        assert_eq!(terminal_safe_report("│━│"), "|-|");
+    }
 }

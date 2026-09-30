@@ -1,6 +1,7 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
+    load_sqlite_backed_sessions, parse_file, render::sanitize_line_segment,
+    skip_sqlite_backed_file_dir, Session, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -367,16 +368,30 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
         let status = if dir.exists { "found" } else { "missing" };
+        // rm-034 (review 14f25886 finding 1): provider paths, symlink
+        // targets, and parse-failure sample file names are filesystem
+        // strings — a hostile directory or file name can carry OSC-52
+        // and SGR payloads straight into the terminal, so they route
+        // through the shared render policy like every other
+        // session-derived text sink. The JSON branch keeps serde
+        // escaping (documented negative).
         let symlink = match &dir.symlink_target {
-            Some(target) => format!(" (symlink -> {target})"),
+            Some(target) => format!(" (symlink -> {})", sanitize_line_segment(target)),
             None => String::new(),
         };
         out.push_str(&format!(
             "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}\n",
-            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
+            dir.name,
+            status,
+            dir.files,
+            dir.parsed,
+            dir.failed,
+            dir.cache_hits,
+            sanitize_line_segment(&dir.path),
+            symlink
         ));
         for sample in &dir.failure_samples {
-            out.push_str(&format!("    failed: {sample}\n"));
+            out.push_str(&format!("    failed: {}\n", sanitize_line_segment(sample)));
         }
     }
     out.push_str("\nRecommendations:\n");
@@ -496,4 +511,63 @@ fn file_mod_time_nanos(metadata: &std::fs::Metadata) -> Option<i64> {
 
 fn is_under(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doctor_text_neutralizes_hostile_paths_and_failure_samples() {
+        // rm-034 payload test (review 14f25886 finding 1): the doctor's
+        // terminal text renders provider directory paths, symlink
+        // targets, and parse-failure sample file names — all filesystem
+        // strings a hostile directory or file name controls. An OSC-52
+        // clipboard-write payload, an SGR sequence, BEL, and the C1 CSI
+        // form must all arrive as U+FFFD, with the readable payload
+        // text preserved. This is the exact shape the live review probe
+        // rendered raw before the fix (`failed: ...BAD^[]52;c;Zm9v=^G.jsonl`).
+        let report = DoctorReport {
+            version: "test".to_string(),
+            mode: "test".to_string(),
+            cache_path: String::new(),
+            cache_entries: 0,
+            cache_dirs: 0,
+            cached_valid: 0,
+            cache_size_bytes: 0,
+            cache_limits: "0/0".to_string(),
+            sessions: 0,
+            session_files: 0,
+            directories: vec![DoctorDirReport {
+                name: "Hostile".to_string(),
+                path: "/tmp/evil\u{1b}[31mdir".to_string(),
+                exists: true,
+                files: 2,
+                parsed: 1,
+                failed: 1,
+                cache_hits: 0,
+                symlink_target: Some("/tmp/\u{1b}]52;c;aGVsbG8=\u{7}".to_string()),
+                failure_samples: vec!["/tmp/BAD\u{1b}]52;c;Zm9v=\u{7}.jsonl".to_string()],
+            }],
+            statusline: DoctorStatuslineReport {
+                path: String::new(),
+                exists: false,
+                captures: 0,
+                sessions: 0,
+                bytes: 0,
+            },
+            pricing: String::new(),
+            recommendations: Vec::new(),
+        };
+        let text = doctor_report_text(&report);
+        assert!(!text.contains('\u{1b}'), "raw ESC survived: {text:?}");
+        assert!(!text.contains('\u{7}'), "raw BEL survived: {text:?}");
+        assert!(!text.contains('\u{9b}'), "raw C1 CSI survived: {text:?}");
+        assert!(text.contains('\u{fffd}'));
+        assert!(
+            text.contains("aGVsbG8="),
+            "payload text must survive neutralized: {text:?}"
+        );
+        assert!(text.contains("failed: /tmp/BAD"));
+    }
 }

@@ -1,3 +1,4 @@
+use crate::render::sanitize_line_segment;
 use crate::{
     average_health, canonical_sessions, classify_tool_authority, context_trends, cost_audit,
     delivery_evidence, fmt_duration, format_cost, format_count, format_tokens,
@@ -287,7 +288,7 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         language.t("Estimated cost", "估算成本"),
         format_cost(metrics.cost_estimated),
         language.t("model", "模型"),
-        metrics.model_used
+        sanitize_line_segment(&metrics.model_used)
     ));
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
@@ -890,7 +891,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            model,
+            sanitize_line_segment(&model),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -1304,7 +1305,7 @@ pub fn report_compare_with_language(
         } else {
             "N/A".to_string()
         };
-        let name = truncate_runes(&session.name, 27);
+        let name = truncate_runes(&sanitize_line_segment(&session.name), 27);
         out.push_str(&format!(
             "  {:<28} {:>4} {:>5} {:>5} {:>5} {:>9} {} {}/100\n",
             name,
@@ -1935,7 +1936,11 @@ fn tool_display_name(name: &str) -> String {
         "cursor" => "Cursor".to_string(),
         "cline" => "Cline".to_string(),
         "generic" => "Generic JSON/JSONL".to_string(),
-        other => other.to_string(),
+        // rm-039: explicit bucket for sessions with no source tool.
+        "unknown" => "Unknown agent".to_string(),
+        // Unmapped values are session-derived: neutralize control
+        // sequences before they reach the terminal (rm-034).
+        other => sanitize_line_segment(other),
     }
 }
 
@@ -2361,6 +2366,14 @@ fn report_html_code_list(values: &[String]) -> String {
         .join(", ")
 }
 
+/// rm-034 (HTML sink): escapes markup metacharacters only. Control
+/// bytes are a RECORDED NEGATIVE, not an oversight: they pass through
+/// raw, so `cat`/`less` on a generated HTML report can still drive a
+/// terminal — treat generated HTML as untrusted text or open it in a
+/// browser. Escaping them here would also falsify the file for
+/// non-terminal consumers; the terminal-text paths use
+/// `render::sanitize_line_segment` instead. Follow-up tracked under
+/// rm-034 (ROADMAP) if a terminal-safe HTML variant is ever needed.
 fn html_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -2436,6 +2449,10 @@ fn text_wrapped_key_values(label: &str, values: &[String], limit: usize) -> Vec<
 }
 
 fn text_cell(value: &str, limit: usize) -> String {
+    // rm-034: cell values are session-derived (names, notes, labels);
+    // neutralize control sequences before layout so hostile strings
+    // cannot inject into the terminal through report cells.
+    let value = sanitize_line_segment(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
@@ -2535,14 +2552,19 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 }
 
 fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', "<br>")
+    // rm-034: sanitize after the markdown escapes so legitimate newlines
+    // still become <br> while ESC/OSC/CSI bytes die here — markdown is
+    // rendered on terminals too.
+    sanitize_line_segment(&value.replace('|', "\\|").replace('\n', "<br>"))
 }
 
 fn markdown_inline_code(value: &str) -> String {
-    value
-        .replace('`', "'")
-        .replace('|', "\\|")
-        .replace('\n', "<br>")
+    sanitize_line_segment(
+        &value
+            .replace('`', "'")
+            .replace('|', "\\|")
+            .replace('\n', "<br>"),
+    )
 }
 
 fn report_markdown_code_list(values: &[String]) -> String {
@@ -2753,6 +2775,80 @@ mod tests {
         assert!(
             !source.contains("\nfn percentile("),
             "reports.rs must not re-declare percentile; use crate::percentile"
+        );
+    }
+
+    fn hostile_session() -> Session {
+        // Mirrors the assess AF-1 live probe: an OSC-52 clipboard-write
+        // payload plus an SGR sequence riding the model string.
+        Session {
+            name: "PWN\u{1b}]52;c;aGVsbG8=\u{7}".to_string(),
+            path: "/tmp/hostile.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                model_used: "EVIL\u{1b}]52;c;aGVsbG8=\u{7}\u{1b}[31mRED".to_string(),
+                cost_estimated: 0.0001,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn html_sink_keeps_escaping_markup_metacharacters() {
+        // rm-034 acceptance clause: "the HTML sink keeps html_escape with
+        // a regression test." Control bytes passing through is the
+        // documented negative on the function itself (see its doc
+        // comment); this test pins the markup escapes it promises.
+        assert_eq!(html_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&#34;e&#39;f");
+        assert_eq!(html_escape("plain-text"), "plain-text");
+        // Cross-script model name stays inert as markup.
+        assert_eq!(
+            html_escape("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn report_text_neutralizes_terminal_sequences_in_session_strings() {
+        // rm-034: the session text report interpolated the untrusted
+        // model string verbatim — a live OSC-52 clipboard write.
+        let report = report_text(&hostile_session());
+        assert!(!report.contains('\u{1b}'), "ESC survived the text report");
+        assert!(!report.contains('\u{7}'), "BEL survived the text report");
+        assert!(report.contains("EVIL"));
+        assert!(report.contains("aGVsbG8="));
+
+        // The overview By Model row carried the same payload.
+        let overview = crate::compute_overview(&[hostile_session()]);
+        let text = report_overview_text(&overview, &[]);
+        assert!(!text.contains('\u{1b}'), "ESC survived the overview");
+        assert!(text.contains("aGVsbG8="));
+
+        // Markdown is rendered on terminals too.
+        let markdown = report_overview_markdown(&overview, &[]);
+        assert!(!markdown.contains('\u{1b}'), "ESC survived the markdown");
+    }
+
+    #[test]
+    fn overview_groups_sourceless_sessions_under_unknown_agent() {
+        // rm-039: sessions whose parser never set a source tool used to
+        // collapse into an unlabeled By-Agent row (`|  | 3 | $0.0033`).
+        let mut session = hostile_session();
+        session.metrics.source_tool = String::new();
+        let overview = crate::compute_overview(&[session]);
+        assert!(
+            overview.by_agent.contains_key("unknown"),
+            "sourceless session must land in the explicit unknown bucket"
+        );
+        let text = report_overview_text(&overview, &[]);
+        assert!(text.contains("Unknown agent"));
+        assert!(
+            !text.contains("── By Agent ──\n    \u{20}"),
+            "empty label row"
         );
     }
 }

@@ -16,6 +16,7 @@
 //! stdin still prints a line, diagnostics go to stderr only, the tee is
 //! best-effort, and the process exits 0.
 
+use crate::render::sanitize_line_segment;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -254,19 +255,6 @@ fn render_status_line(payload: &Value) -> String {
     } else {
         parts.join(" | ")
     }
-}
-
-/// Review F1 (cycle 7): payload strings are user-authored (session
-/// names are chat titles) and go straight to the host terminal. A
-/// newline would break the one-line contract; ESC/OSC/CSI sequences
-/// would inject into the terminal. Control characters (C0, DEL, C1 —
-/// exactly `char::is_control`) are replaced with U+FFFD so the line
-/// stays one line and carries no escape sequences.
-fn sanitize_line_segment(segment: &str) -> String {
-    segment
-        .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect()
 }
 
 /// Appends one capture to the journal, compacting it first when the
