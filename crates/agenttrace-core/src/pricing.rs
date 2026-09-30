@@ -1252,8 +1252,8 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create temp dir");
         let path = root.join("pricing.json");
         write_pricing_cache_at(&path, "{\"stub\":true}").expect("write cache");
-        let meta_raw = std::fs::read(path.with_extension("meta.json"))
-            .expect("provenance sidecar exists");
+        let meta_raw =
+            std::fs::read(path.with_extension("meta.json")).expect("provenance sidecar exists");
         let meta: PricingCacheMeta =
             serde_json::from_slice(&meta_raw).expect("sidecar is valid JSON");
         assert_eq!(meta.url, PRICING_URL);

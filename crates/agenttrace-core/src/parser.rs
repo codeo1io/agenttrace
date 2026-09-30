@@ -4482,16 +4482,15 @@ mod tests {
                 "total_token_usage": {"input_tokens": total_input}
             })
         };
-        let (first, prev) =
-            codex_token_count_usage(Some(&step(2500)), None).expect("first event");
+        let (first, prev) = codex_token_count_usage(Some(&step(2500)), None).expect("first event");
         assert_eq!(first["input_tokens"], 2500);
         // Rewind to 1000 fabricates no usage (empty delta -> no event),
         // and preserves the 2500 high-water mark as `prev`.
         let rewound = codex_token_count_usage(Some(&step(1000)), prev.as_ref());
         assert!(rewound.is_none());
         // Rebound to 3000 counts only the 500-token climb past the mark.
-        let (rebound, _) = codex_token_count_usage(Some(&step(3000)), prev.as_ref())
-            .expect("rebound event");
+        let (rebound, _) =
+            codex_token_count_usage(Some(&step(3000)), prev.as_ref()).expect("rebound event");
         assert_eq!(rebound["input_tokens"], 500);
     }
 
