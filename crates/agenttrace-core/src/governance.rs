@@ -519,19 +519,19 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
             .diagnostics
             .tool_latencies
             .iter()
-            .find(|item| item.is_slow || item.timeouts > 0)
+            .find(|item| item.is_slow || item.unmatched > 0)
         {
             items.push(recommendation(
                 "slow-tool",
-                if slow.timeouts > 0 { "high" } else { "medium" },
+                if slow.unmatched > 0 { "high" } else { "medium" },
                 "latency",
                 "Bound slow tool execution",
                 "A tool exceeded the latency threshold or returned without a result.".to_string(),
                 vec![
                     format!("session={}", session.name),
                     format!(
-                        "tool={} p95={:.1}s timeouts={}",
-                        slow.tool_name, slow.p95_sec, slow.timeouts
+                        "tool={} p95={:.1}s unmatched={}",
+                        slow.tool_name, slow.p95_sec, slow.unmatched
                     ),
                 ],
                 session.metrics.cost_estimated * 0.1,

@@ -59,7 +59,11 @@ pub struct ToolLatency {
     pub p95_sec: f64,
     pub max_sec: f64,
     pub min_sec: f64,
-    pub timeouts: usize,
+    /// Tool calls whose matching result event is absent from the trace
+    /// (truncated log, crashed session, or call still in flight). The
+    /// trace carries no timeout marker, so these are reported as
+    /// unmatched instead of being mislabeled as timeouts (rm-004).
+    pub unmatched: usize,
     pub is_slow: bool,
 }
 
@@ -428,7 +432,15 @@ pub fn fix_suggestions(session: &Session) -> Vec<FixSuggestion> {
 pub fn predict_cost_anomaly(history: &[Session], current: &Session) -> CostAlert {
     let costs = history
         .iter()
-        .filter(|session| session.path != current.path && session.metrics.assistant_turns > 0)
+        // Only sessions with a real (non-zero) cost estimate belong in
+        // the baseline: zero-cost sessions are unpriced, not free, and
+        // dragging them into the mean fabricates a cheap baseline that
+        // inflates every anomaly ratio (rm-004).
+        .filter(|session| {
+            session.path != current.path
+                && session.metrics.assistant_turns > 0
+                && session.metrics.cost_estimated > 0.0
+        })
         .map(|session| session.metrics.cost_estimated / session.metrics.assistant_turns as f64)
         .collect::<Vec<_>>();
     if costs.is_empty() || current.metrics.assistant_turns == 0 {
@@ -520,14 +532,14 @@ pub fn session_findings(session: &Session, history: &[Session]) -> Vec<SessionFi
     if let Some(latency) = diagnostics
         .tool_latencies
         .iter()
-        .filter(|item| item.max_sec >= 5.0 || item.timeouts > 0)
+        .filter(|item| item.max_sec >= 5.0 || item.unmatched > 0)
         .max_by(|left, right| left.max_sec.total_cmp(&right.max_sec))
     {
         findings.push(finding(
             "latency",
             latency.max_sec,
             &latency.tool_name,
-            if latency.timeouts > 0 {
+            if latency.unmatched > 0 {
                 "high"
             } else {
                 "medium"
@@ -616,6 +628,7 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
     let mut max_consecutive = 0;
     let mut max_tool = "";
     let mut retries = 0;
+    let mut groups = 0;
     for call in events.iter().flat_map(|event| &event.tool_calls) {
         if call.name == last {
             consecutive += 1;
@@ -627,6 +640,9 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
                 max_consecutive = consecutive;
                 max_tool = last;
             }
+            if consecutive >= 3 {
+                groups += 1;
+            }
             consecutive = 1;
             last = &call.name;
         }
@@ -634,6 +650,9 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
     if consecutive > max_consecutive {
         max_consecutive = consecutive;
         max_tool = last;
+    }
+    if consecutive >= 3 {
+        groups += 1;
     }
     let tool = if max_consecutive >= 3 {
         max_consecutive as f64 * 0.015
@@ -657,7 +676,7 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
         tool_loop_cost: tool * scale,
         total_loop_cost: total,
         retry_events: retries,
-        loop_groups: usize::from(max_consecutive >= 3),
+        loop_groups: groups,
         loop_type: if max_consecutive >= 3 {
             format!("{max_tool}_loop")
         } else {
@@ -726,19 +745,26 @@ fn tool_latencies(events: &[Event]) -> Vec<ToolLatency> {
             let entry = values.entry(call.name.clone()).or_default();
             if let Some(end) = results.get(call.id.as_str()) {
                 let seconds = (*end - start).num_milliseconds() as f64 / 1000.0;
-                if (0.0..3600.0).contains(&seconds) {
+                // Non-positive durations mean disordered or identical
+                // timestamps and carry no latency signal. Genuine calls
+                // longer than an hour used to be silently dropped by a
+                // 3600s cap; they are now kept up to a 24h sanity bound
+                // on clock skew (rm-004).
+                if seconds > 0.0 && seconds <= 86_400.0 {
                     entry.0.push(seconds);
                 }
             } else {
+                // No result event for this call id: the trace cannot
+                // say it timed out — report it as unmatched (rm-004).
                 entry.1 += 1;
             }
         }
     }
     let mut out = values
         .into_iter()
-        .map(|(tool_name, (mut values, timeouts))| {
+        .map(|(tool_name, (mut values, unmatched))| {
             values.sort_by(f64::total_cmp);
-            let count = values.len() + timeouts;
+            let count = values.len() + unmatched;
             let avg_sec = if values.is_empty() {
                 0.0
             } else {
@@ -755,7 +781,7 @@ fn tool_latencies(events: &[Event]) -> Vec<ToolLatency> {
                 p95_sec,
                 max_sec: values.last().copied().unwrap_or(0.0),
                 min_sec: values.first().copied().unwrap_or(0.0),
-                timeouts,
+                unmatched,
                 is_slow: p95_sec > 30.0,
             }
         })
@@ -867,9 +893,9 @@ fn stuck_patterns(events: &[Event], metrics: &Metrics) -> Vec<StuckPattern> {
         .iter()
         .filter(|event| event.role == "assistant" && event.content.len() > 50)
     {
-        *content
-            .entry(event.content.chars().take(50).collect::<String>())
-            .or_insert(0) += 1;
+        // Key on the full response: the old 50-char prefix key flagged
+        // distinct long responses that merely shared an opening (rm-004).
+        *content.entry(event.content.clone()).or_insert(0) += 1;
     }
     for count in content.into_values().filter(|count| *count >= 4) {
         out.push(StuckPattern {
@@ -997,6 +1023,149 @@ mod tests {
         let json = serde_json::to_string(&steps).unwrap();
         assert!(!json.contains("private"));
         assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn loop_groups_counts_distinct_runs_not_a_flag() {
+        // rm-004 golden: loop_groups reports the number of consecutive-tool
+        // runs of length >= 3, not a 0/1 "any loop" flag.
+        let mut events = Vec::new();
+        let mut seq = 0usize;
+        for (tool, count) in [("read", 4), ("write", 3), ("search", 2)] {
+            for _ in 0..count {
+                events.push(Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("call-{seq}"),
+                        name: tool.to_string(),
+                        args: "{}".to_string(),
+                    }],
+                    ..Event::default()
+                });
+                seq += 1;
+            }
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        assert_eq!(diagnostics.loop_cost.loop_groups, 2);
+        assert_eq!(diagnostics.loop_cost.turns, 4);
+        assert_eq!(diagnostics.loop_cost.retry_events, 3);
+        assert_eq!(diagnostics.loop_cost.loop_type, "read_loop");
+    }
+
+    #[test]
+    fn cost_anomaly_baseline_ignores_unpriced_sessions() {
+        // rm-004 golden: zero-cost sessions are excluded from the baseline
+        // so they cannot dilute it. Old behavior put this at "critical"
+        // (poisoned baseline 1.0 -> ratio 7.5); priced baseline 3.0/turn vs
+        // current 7.5/turn is a 2.5x drift -> warning.
+        let priced = |name: &str, cost: f64| Session {
+            name: name.to_string(),
+            path: format!("/tmp/{name}"),
+            cwd: String::new(),
+            metrics: Metrics {
+                assistant_turns: 10,
+                cost_estimated: cost,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let current = priced("current", 75.0);
+        let history = vec![priced("a", 30.0), priced("b", 0.0), priced("c", 0.0)];
+        let alert = predict_cost_anomaly(&history, &current);
+        assert_eq!(alert.level, "warning");
+        assert!(alert.message.contains("2.5x"));
+    }
+
+    #[test]
+    fn tool_latencies_keep_long_calls_and_report_unmatched() {
+        // rm-004 golden: calls over the old 3600s cap stay in the
+        // distribution (a 4000s call is slow, not invisible), and calls
+        // whose result event is absent count as unmatched, never as
+        // "timeouts" the trace never recorded.
+        let events = vec![
+            Event {
+                role: "assistant".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-long".to_string(),
+                        name: "bash".to_string(),
+                        args: "{}".to_string(),
+                    },
+                    ToolCall {
+                        id: "call-never".to_string(),
+                        name: "bash".to_string(),
+                        args: "{}".to_string(),
+                    },
+                ],
+                ..Event::default()
+            },
+            Event {
+                role: "tool".to_string(),
+                timestamp: "2026-01-01T01:06:40Z".to_string(),
+                tool_call_id: "call-long".to_string(),
+                content: "done".to_string(),
+                ..Event::default()
+            },
+        ];
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        let latency = &diagnostics.tool_latencies[0];
+        assert_eq!(latency.tool_name, "bash");
+        assert_eq!(latency.count, 2);
+        assert_eq!(latency.unmatched, 1);
+        assert!((latency.max_sec - 4000.0).abs() < 1e-6);
+        assert!(latency.avg_sec > 0.0);
+    }
+
+    #[test]
+    fn repeated_response_requires_identical_full_content() {
+        // rm-004 golden: two DISTINCT long responses sharing a 50-char
+        // opening are not "the same response repeated". With the old
+        // prefix key, 3+3 such responses fused into one count of 6 and
+        // crossed the >=4 threshold as a false positive.
+        let prefix = "p".repeat(50);
+        let mut events = Vec::new();
+        for (suffix, count) in [("a", 3), ("b", 3)] {
+            for _ in 0..count {
+                events.push(Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-01-01T00:00:00Z".to_string(),
+                    content: format!("{prefix}{suffix}"),
+                    ..Event::default()
+                });
+            }
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        assert!(!diagnostics
+            .stuck_patterns
+            .iter()
+            .any(|pattern| pattern.pattern == "repeated_response"));
+
+        // Four byte-identical responses still report exactly once, with
+        // the true repeat count.
+        for _ in 0..4 {
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                content: format!("{prefix}c"),
+                ..Event::default()
+            });
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        let repeated: Vec<_> = diagnostics
+            .stuck_patterns
+            .iter()
+            .filter(|pattern| pattern.pattern == "repeated_response")
+            .collect();
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(
+            repeated[0].description,
+            "Repeated assistant response 4 times"
+        );
     }
 
     #[test]

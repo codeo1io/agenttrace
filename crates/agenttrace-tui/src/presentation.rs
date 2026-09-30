@@ -2409,7 +2409,7 @@ pub(super) fn diagnostics_native_text(session: &Session, language: Language) -> 
     for latency in diagnostics
         .tool_latencies
         .iter()
-        .filter(|item| item.p95_sec > 30.0 || item.timeouts > 0)
+        .filter(|item| item.p95_sec > 30.0 || item.unmatched > 0)
         .take(3)
     {
         lines.push(format!(
@@ -2420,8 +2420,8 @@ pub(super) fn diagnostics_native_text(session: &Session, language: Language) -> 
             latency.p95_sec,
             text(language, "max", "最大"),
             latency.max_sec,
-            text(language, "timeouts", "超时"),
-            latency.timeouts
+            text(language, "unmatched", "未匹配"),
+            latency.unmatched
         ));
     }
     lines.push(format!(
