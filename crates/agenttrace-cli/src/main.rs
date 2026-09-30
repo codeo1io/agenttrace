@@ -21,6 +21,8 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+mod upstream;
+
 #[derive(Debug, Parser)]
 #[command(name = "agenttrace")]
 #[command(about = "TUI observability for AI coding agent sessions")]
@@ -75,6 +77,12 @@ struct Args {
     /// `agenttrace statusline`.
     #[arg(long = "statusline-report")]
     statusline_report: bool,
+    /// `agenttrace upstream`: refresh the remote-tracking refs from the
+    /// network via `git fetch` (and probe the npm registry) before
+    /// reporting fork-vs-upstream drift. Without it, `agenttrace
+    /// upstream` is fully offline (rm-021).
+    #[arg(long)]
+    fetch: bool,
     #[arg(long)]
     version: bool,
     #[arg(long)]
@@ -165,6 +173,16 @@ fn run() -> anyhow::Result<()> {
     // line would otherwise hang or error on every prompt.
     if args.path.as_deref() == Some("statusline") {
         return agenttrace_core::run_statusline_host();
+    }
+    // `agenttrace upstream` is a repository status host command (rm-021,
+    // cycle 1): fork-vs-upstream drift made visible. Like the statusline
+    // host command it dispatches before action validation; unlike it,
+    // this is an explicit user action that may fail loudly. It is fully
+    // offline unless --fetch explicitly opts into the network.
+    if args.path.as_deref() == Some("upstream") {
+        let report = upstream::status_report(&args.format, args.fetch)?;
+        write_stdout(&report)?;
+        return Ok(());
     }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
@@ -1146,6 +1164,12 @@ fn has_session_action(args: &Args) -> bool {
 }
 
 fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
+    // --fetch only means something for the upstream command; staying
+    // silent about it elsewhere would let a typo'd invocation report
+    // stale data while looking refreshed.
+    if args.fetch && args.path.as_deref() != Some("upstream") {
+        bail!("--fetch applies only to the upstream command: agenttrace --fetch upstream");
+    }
     let actions = [
         args.compare,
         args.audit,
@@ -1529,6 +1553,7 @@ mod tests {
             waste: false,
             list_models: false,
             statusline_report: false,
+            fetch: false,
             update_pricing: false,
             test_match: false,
             version: false,
