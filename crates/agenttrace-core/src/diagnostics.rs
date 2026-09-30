@@ -622,15 +622,58 @@ pub fn loop_waste_percent(loop_cost: f64, total_cost: f64) -> f64 {
     loop_cost.clamp(0.0, total_cost) / total_cost * 100.0
 }
 
+// Review F7 (rm-028): two argument objects that differ only in key
+// order are the same arguments -- producers differ in key order across
+// calls of one retry run, and raw string equality let those runs escape
+// the loop key. serde_json is built with preserve_order, so parse ->
+// serialize alone does not canonicalize; sort object keys explicitly
+// (arrays keep order, scalars are unchanged). Non-JSON argument text
+// falls back to comparing as raw text, as before.
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut pairs: Vec<(String, serde_json::Value)> = map
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json(value)))
+                .collect();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs
+                .into_iter()
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+                .into()
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn canonical_args(args: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(value) => {
+            serde_json::to_string(&canonical_json(&value)).unwrap_or_else(|_| args.to_string())
+        }
+        Err(_) => args.to_string(),
+    }
+}
+
 fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
-    let mut last = "";
+    // rm-028: a retry is the same call re-issued -- same tool AND same
+    // arguments. Keying on the tool name alone counted a parallel batch
+    // of distinct-argument calls in one assistant turn as a retry loop
+    // and priced it into loop_cost (the `Bash_loop` false positive).
+    let mut last: Option<(&str, String)> = None;
     let mut consecutive = 0;
     let mut max_consecutive = 0;
     let mut max_tool = "";
     let mut retries = 0;
     let mut groups = 0;
     for call in events.iter().flat_map(|event| &event.tool_calls) {
-        if call.name == last {
+        let call_args = canonical_args(&call.args);
+        let same_call =
+            matches!(&last, Some((name, args)) if *name == call.name && *args == call_args);
+        if same_call {
             consecutive += 1;
             if consecutive >= 3 {
                 retries += 1;
@@ -638,18 +681,18 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
         } else {
             if consecutive > max_consecutive {
                 max_consecutive = consecutive;
-                max_tool = last;
+                max_tool = last.map(|(name, _)| name).unwrap_or("");
             }
             if consecutive >= 3 {
                 groups += 1;
             }
             consecutive = 1;
-            last = &call.name;
+            last = Some((call.name.as_str(), call_args));
         }
     }
     if consecutive > max_consecutive {
         max_consecutive = consecutive;
-        max_tool = last;
+        max_tool = last.map(|(name, _)| name).unwrap_or("");
     }
     if consecutive >= 3 {
         groups += 1;
@@ -1051,6 +1094,123 @@ mod tests {
         assert_eq!(diagnostics.loop_cost.turns, 4);
         assert_eq!(diagnostics.loop_cost.retry_events, 3);
         assert_eq!(diagnostics.loop_cost.loop_type, "read_loop");
+    }
+
+    #[test]
+    fn parallel_batch_of_distinct_argument_calls_is_not_a_loop() {
+        // rm-028 + rm-025 golden (assess probe, run cbe30a9c): one
+        // assistant turn issuing three same-name calls with DISTINCT
+        // arguments is a parallel batch -- keying retries on the tool
+        // name alone reported Bash_loop (retry_events 1, loop_groups 1)
+        // and priced it into loop_cost, while the dropped call/result
+        // join key made all three paired results count as unmatched.
+        let mut events = Vec::new();
+        for (seq, args) in ["{\"path\":\"a\"}", "{\"path\":\"b\"}", "{\"path\":\"c\"}"]
+            .into_iter()
+            .enumerate()
+        {
+            let call_id = format!("call-{seq}");
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: call_id.clone(),
+                    name: "Bash".to_string(),
+                    args: args.to_string(),
+                }],
+                ..Event::default()
+            });
+            events.push(Event {
+                role: "tool".to_string(),
+                timestamp: "2026-01-01T00:00:01Z".to_string(),
+                content: "done".to_string(),
+                tool_call_id: call_id,
+                ..Event::default()
+            });
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        assert_eq!(diagnostics.loop_cost.retry_events, 0);
+        assert_eq!(diagnostics.loop_cost.loop_groups, 0);
+        assert_eq!(diagnostics.loop_cost.loop_type, "");
+        assert_eq!(diagnostics.tool_latencies[0].count, 3);
+        assert_eq!(diagnostics.tool_latencies[0].unmatched, 0);
+    }
+
+    #[test]
+    fn identical_argument_retries_are_still_a_loop() {
+        // rm-028 negative control: re-issuing the same call -- same tool
+        // AND same arguments -- is still a retry loop after the (name,
+        // args) keying change.
+        let mut events = Vec::new();
+        for seq in 0..3 {
+            let call_id = format!("call-{seq}");
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: format!("2026-01-01T00:00:0{seq}Z"),
+                tool_calls: vec![ToolCall {
+                    id: call_id.clone(),
+                    name: "Bash".to_string(),
+                    args: "{\"path\":\"same\"}".to_string(),
+                }],
+                ..Event::default()
+            });
+            events.push(Event {
+                role: "tool".to_string(),
+                timestamp: format!("2026-01-01T00:00:0{}Z", seq + 1),
+                content: "done again".to_string(),
+                tool_call_id: call_id,
+                ..Event::default()
+            });
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        assert_eq!(diagnostics.loop_cost.retry_events, 1);
+        assert_eq!(diagnostics.loop_cost.loop_groups, 1);
+        assert_eq!(diagnostics.loop_cost.turns, 3);
+        assert_eq!(diagnostics.loop_cost.loop_type, "Bash_loop");
+        assert_eq!(diagnostics.tool_latencies[0].unmatched, 0);
+    }
+
+    #[test]
+    fn reordered_argument_keys_are_still_the_same_call_for_loop_keying() {
+        // Review F7 (rm-028): producers may serialize the same argument
+        // object with keys in different order across calls of one retry
+        // run. Raw string equality let that run escape the (name, args)
+        // loop key -- the retry loop went undetected. Arguments that
+        // differ only in key order are the same call and must still be
+        // keyed together.
+        let mut events = Vec::new();
+        let arg_variants = [
+            "{\"path\":\"same\",\"mode\":\"r\"}",
+            "{\"mode\":\"r\",\"path\":\"same\"}",
+            "{\"path\":\"same\",\"mode\":\"r\"}",
+        ];
+        for (seq, args) in arg_variants.iter().enumerate() {
+            let call_id = format!("call-{seq}");
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: format!("2026-01-01T00:00:0{seq}Z"),
+                tool_calls: vec![ToolCall {
+                    id: call_id.clone(),
+                    name: "Read".to_string(),
+                    args: args.to_string(),
+                }],
+                ..Event::default()
+            });
+            events.push(Event {
+                role: "tool".to_string(),
+                timestamp: format!("2026-01-01T00:00:0{}Z", seq + 1),
+                content: "done".to_string(),
+                tool_call_id: call_id,
+                ..Event::default()
+            });
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        assert_eq!(
+            diagnostics.loop_cost.loop_type, "Read_loop",
+            "key-order-only argument differences must not break the retry key"
+        );
+        assert_eq!(diagnostics.loop_cost.retry_events, 1);
+        assert_eq!(diagnostics.loop_cost.turns, 3);
     }
 
     #[test]
