@@ -1,11 +1,12 @@
 use crate::round4;
 use anyhow::{anyhow, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
@@ -340,13 +341,18 @@ fn pricing_override_models() -> &'static BTreeSet<String> {
     PRICING_OVERRIDE_MODELS.get_or_init(BTreeSet::new)
 }
 
+/// Cap on a downloaded pricing catalog (rm-018). The LiteLLM catalog is
+/// ~4 MB today; 32 MiB leaves growth headroom while bounding what a
+/// redirected or hostile endpoint can stream into memory.
+const PRICING_DOWNLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 fn download_pricing(timeout: Duration) -> anyhow::Result<(String, BTreeMap<String, Price>)> {
-    let raw = ureq::get(PRICING_URL)
+    let response = ureq::get(PRICING_URL)
         .timeout(timeout)
         .call()
-        .map_err(|err| anyhow!("download failed: {err}"))?
-        .into_string()
-        .context("read pricing response")?;
+        .map_err(|err| anyhow!("download failed: {err}"))?;
+    let raw_bytes = read_body_capped(response.into_reader(), PRICING_DOWNLOAD_MAX_BYTES)?;
+    let raw = String::from_utf8(raw_bytes).context("pricing catalog is not valid UTF-8")?;
     let entries = convert_litellm(raw.as_bytes());
     if entries.is_empty() {
         return Err(anyhow!("no chat models found in downloaded data"));
@@ -354,17 +360,57 @@ fn download_pricing(timeout: Duration) -> anyhow::Result<(String, BTreeMap<Strin
     Ok((raw, entries))
 }
 
+fn read_body_capped(mut reader: impl Read, cap: u64) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(cap + 1)
+        .read_to_end(&mut bytes)
+        .context("read pricing response")?;
+    if bytes.len() as u64 > cap {
+        return Err(anyhow!(
+            "pricing catalog exceeds the {} MiB download cap",
+            cap / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Provenance stamp (rm-018): recorded next to every downloaded cache so
+/// the catalog's origin URL, fetch time, and size are answerable from disk
+/// without touching the network.
+#[derive(Serialize, Deserialize)]
+struct PricingCacheMeta {
+    url: String,
+    fetched_at_unix: u64,
+    bytes: usize,
+}
+
 fn write_pricing_cache(raw: &str) -> anyhow::Result<()> {
-    let path = pricing_cache_path();
+    write_pricing_cache_at(&pricing_cache_path(), raw)
+}
+
+fn write_pricing_cache_at(path: &Path, raw: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // Stage through a unique temp sibling, then rename into place so a
     // crash mid-write can no longer leave a torn catalog behind
     // (pass-7 P7-5); sweep_orphaned_temps reclaims the temp.
-    let tmp = crate::session_cache::unique_temp_path(&path);
+    let tmp = crate::session_cache::unique_temp_path(path);
     std::fs::write(&tmp, raw)?;
-    std::fs::rename(&tmp, &path)?;
+    std::fs::rename(&tmp, path)?;
+    let meta = PricingCacheMeta {
+        url: PRICING_URL.to_string(),
+        fetched_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0),
+        bytes: raw.len(),
+    };
+    let meta_path = path.with_extension("meta.json");
+    let meta_tmp = crate::session_cache::unique_temp_path(&meta_path);
+    std::fs::write(&meta_tmp, serde_json::to_vec_pretty(&meta)?)?;
+    std::fs::rename(&meta_tmp, &meta_path)?;
     Ok(())
 }
 
@@ -1175,6 +1221,46 @@ fn user_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn pricing_download_cap_rejects_oversized_bodies() {
+        // rm-018: the catalog fetch previously read the entire response
+        // into memory unbounded; a redirected or hostile endpoint could
+        // stream gigabytes. The cap reads at most cap+1 bytes and errors
+        // on exceedance instead of buffering forever.
+        let at_cap = read_body_capped(Cursor::new(vec![0u8; 64]), 64).expect("at-cap body ok");
+        assert_eq!(at_cap.len(), 64);
+        let over_cap = read_body_capped(Cursor::new(vec![0u8; 65]), 64);
+        let message = over_cap.expect_err("over-cap body must fail").to_string();
+        assert!(
+            message.contains("download cap"),
+            "error must name the cap, got: {message}"
+        );
+    }
+
+    #[test]
+    fn pricing_cache_write_stamps_provenance_sidecar() {
+        // rm-018: every downloaded cache carries a meta sidecar recording
+        // origin URL, fetch time, and size so the cache's provenance is
+        // answerable from disk without network access.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-meta-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("pricing.json");
+        write_pricing_cache_at(&path, "{\"stub\":true}").expect("write cache");
+        let meta_raw = std::fs::read(path.with_extension("meta.json"))
+            .expect("provenance sidecar exists");
+        let meta: PricingCacheMeta =
+            serde_json::from_slice(&meta_raw).expect("sidecar is valid JSON");
+        assert_eq!(meta.url, PRICING_URL);
+        assert_eq!(meta.bytes, "{\"stub\":true}".len());
+        assert!(meta.fetched_at_unix > 0, "fetch time is stamped");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn builtin_fallback_includes_go_alias_slice() {
