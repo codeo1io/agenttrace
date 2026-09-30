@@ -1651,6 +1651,49 @@ mod tests {
     }
 
     #[test]
+    fn all_three_installers_refuse_when_the_sidecar_cannot_be_verified() {
+        // rm-029: parity is about refusal semantics, not just sidecar
+        // naming. install.ps1's IWR throws on a missing sidecar and the
+        // script refuses; npm's download() rejects HTTP != 200 and
+        // main() exits 1. install.sh used to warn and proceed -- the
+        // gate below pins the refusal so the degradation lane cannot
+        // silently return.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+        let sh = std::fs::read_to_string(format!("{root}install.sh")).expect("install.sh readable");
+        assert!(
+            !sh.contains("skipping checksum verification"),
+            "install.sh must not degrade to skipping verification when the sidecar is missing or no hashing tool exists"
+        );
+        assert!(
+            sh.contains("No checksum sidecar at"),
+            "install.sh must diagnose a missing sidecar explicitly"
+        );
+        assert!(
+            sh.contains("No sha256 tool found"),
+            "install.sh must diagnose a missing hashing tool explicitly"
+        );
+        // The refusal must be the terminal path for both conditions:
+        // each diagnosis is followed by an abort before the binary is
+        // placed (the messages below only print on the way to exit 1).
+        let missing = sh
+            .find("No checksum sidecar at")
+            .and_then(|at| sh[at..].find("exit 1").map(|end| at + end))
+            .expect("missing-sidecar diagnosis must be followed by exit 1");
+        let no_tool = sh
+            .find("No sha256 tool found")
+            .and_then(|at| sh[at..].find("exit 1").map(|end| at + end))
+            .expect("missing-hashing-tool diagnosis must be followed by exit 1");
+        assert!(
+            missing < sh.find("Binary size").unwrap_or(usize::MAX),
+            "the missing-sidecar refusal must abort before the size check continues the install"
+        );
+        assert!(
+            no_tool < sh.find("Binary size").unwrap_or(usize::MAX),
+            "the missing-hashing-tool refusal must abort before the size check continues the install"
+        );
+    }
+
+    #[test]
     fn event_typed_and_string_usage_coerce_instead_of_dropping_the_event() {
         // Pass-7 P7-1: strict `BTreeMap<String, i64>` usage rejected the
         // shapes real agents write, and the generic fallback then dropped

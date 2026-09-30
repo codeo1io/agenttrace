@@ -54,6 +54,11 @@ bad_stub="$tmp/bad-stub"
 } >"$bad_stub"
 chmod +x "$bad_stub"
 
+# rm-029 made a missing sidecar a refusal, so every fixture that is
+# meant to reach the runtime-verification step carries its sidecar.
+sha256sum "$ok_stub" | cut -d' ' -f1 >"$ok_stub.sha256"
+sha256sum "$bad_stub" | cut -d' ' -f1 >"$bad_stub.sha256"
+
 # — test A: a runnable download is installed and confirmed —
 out="$tmp/out.a"
 if ! AGENTTRACE_INSTALL_DIR="$tmp/a" AGENTTRACE_DOWNLOAD_URL="file://$ok_stub" \
@@ -84,7 +89,7 @@ grep -q "GLIBC_2.39" "$out" ||
 # from the stock PATH on both this host and CI runners.
 toolbox="$tmp/toolbox"
 mkdir -p "$toolbox"
-for tool in sh uname tr mkdir curl mktemp chmod wc head rm mv cp grep cat; do
+for tool in sh uname tr mkdir curl mktemp chmod wc cut head rm mv cp grep cat sha256sum; do
 	tool_path="$(command -v "$tool")" ||
 		fail "test C: host is missing $tool, needed to assemble the sandbox PATH"
 	ln -s "$tool_path" "$toolbox/$tool"
@@ -104,6 +109,8 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
+# The ref is pinned via AGENTTRACE_SOURCE_REF (a release tag) so the
+# fallback never needs to resolve api.github.com in an offline run.
 shims="$tmp/shims"
 mkdir -p "$shims"
 cat >"$shims/git" <<FAKE_GIT
@@ -126,6 +133,7 @@ FAKE_CARGO
 chmod +x "$shims/git" "$shims/cargo"
 out="$tmp/out.d"
 if ! env PATH="$shims:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/d" \
+	AGENTTRACE_SOURCE_REF="v0.0.0-stub" \
 	AGENTTRACE_DOWNLOAD_URL="file://$bad_stub" sh install.sh >"$out" 2>&1; then
 	cat "$out" >&2
 	fail "test D: install.sh must fall back to a source build for an incompatible download"
@@ -137,6 +145,67 @@ grep -q "Falling back to building from source" "$out" ||
 	fail "test D: fallback must be announced"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
+
+# — test E: source build pinned by FULL COMMIT ID (rm-030 review F3) —
+# `git clone --branch` cannot resolve a commit id (names only), so a
+# SHA pin must fetch the commit directly. A real local git fixture
+# (real git on PATH, only cargo shimmed) proves it end-to-end offline:
+# the fetched HEAD must equal the pin, be announced as verified, and
+# the built artifact must be installed.
+cargoshim="$tmp/cargoshim"
+mkdir -p "$cargoshim"
+cat >"$cargoshim/cargo" <<'FAKE_CARGO'
+#!/bin/sh
+exit 0
+FAKE_CARGO
+chmod +x "$cargoshim/cargo"
+fx="$tmp/fxrepo"
+mkdir -p "$fx/target/release"
+cp "$ok_stub" "$fx/target/release/agenttrace"
+git -C "$fx" init -q
+git -C "$fx" add -A
+git -C "$fx" -c user.email=ci@example.com -c user.name=ci commit -qm fixture
+FX_SHA="$(git -C "$fx" rev-parse HEAD)"
+out="$tmp/out.e"
+if ! env PATH="$cargoshim:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
+	AGENTTRACE_DOWNLOAD_URL="file://$bad_stub" \
+	AGENTTRACE_SOURCE_URL="file://$fx" \
+	AGENTTRACE_SOURCE_REF="$FX_SHA" sh install.sh >"$out" 2>&1; then
+	cat "$out" >&2
+	fail "test E: a full-commit-id pin must build and install"
+fi
+[[ -x "$tmp/e/agenttrace" ]] || fail "test E: SHA-pinned build must be installed"
+cmp -s "$tmp/e/agenttrace" "$ok_stub" ||
+	fail "test E: installed binary must be the SHA-pinned source artifact"
+grep -q "Pin verified: fetched commit matches $FX_SHA" "$out" ||
+	fail "test E: the fetched commit must be checked against and reported as matching the pin"
+
+# — test F: an unresolvable commit pin refuses instead of building —
+out="$tmp/out.f"
+if env PATH="$cargoshim:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/f" \
+	AGENTTRACE_DOWNLOAD_URL="file://$bad_stub" \
+	AGENTTRACE_SOURCE_URL="file://$fx" \
+	AGENTTRACE_SOURCE_REF="$(printf 'd%.0s' $(seq 1 40))" \
+	sh install.sh >"$out" 2>&1; then
+	cat "$out" >&2
+	fail "test F: an unresolvable commit pin must refuse"
+fi
+[[ ! -e "$tmp/f/agenttrace" ]] || fail "test F: nothing may be installed on refusal"
+grep -q "Cannot fetch pinned ref" "$out" ||
+	fail "test F: refusal must name the unresolvable pinned ref"
+
+# — test G: a download with NO sidecar is refused, never installed (rm-029) —
+nosha_stub="$tmp/nosha-stub"
+cp "$ok_stub" "$nosha_stub"
+out="$tmp/out.g"
+if env AGENTTRACE_INSTALL_DIR="$tmp/g" \
+	AGENTTRACE_DOWNLOAD_URL="file://$nosha_stub" sh install.sh >"$out" 2>&1; then
+	cat "$out" >&2
+	fail "test G: install.sh must refuse a download whose sidecar is missing"
+fi
+[[ ! -e "$tmp/g/agenttrace" ]] || fail "test G: nothing may be installed without a sidecar"
+grep -q "No checksum sidecar at" "$out" ||
+	fail "test G: refusal must diagnose the missing sidecar"
 
 # — glibc-baseline guard: a locally built binary must not require a glibc
 #   newer than the compatibility floor we defend (Ubuntu 22.04 = 2.35) —
