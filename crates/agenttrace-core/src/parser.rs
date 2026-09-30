@@ -2254,7 +2254,8 @@ fn codex_token_count_usage(
     let info = raw_info?.as_object()?;
     let total = token_usage_map(info.get("total_token_usage"));
     let (counts, next_total) = if !total.is_empty() {
-        (token_usage_delta(&total, prev_total), Some(total))
+        let delta = token_usage_delta(&total, prev_total);
+        (delta, Some(token_usage_high_water(&total, prev_total)))
     } else {
         (
             token_usage_map(info.get("last_token_usage")),
@@ -2305,6 +2306,17 @@ fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
             .map(|value| ((*key).to_string(), value))
     })
     .collect()
+}
+
+// Codex can briefly rewind total_token_usage (e.g. after compaction) and then climb back;
+// tracking the high-water mark keeps the rebound from being counted twice.
+fn token_usage_high_water(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
+    let mut merged = prev.cloned().unwrap_or_default();
+    for (key, value) in cur {
+        let slot = merged.entry(key.clone()).or_insert(0);
+        *slot = (*slot).max(*value);
+    }
+    merged
 }
 
 fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
@@ -4426,6 +4438,65 @@ fn session_name(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn codex_total_usage_rewind_after_compaction_is_single_counted() {
+        // rm-013 (upstream PR #286, be25c4c): Codex rewinds
+        // total_token_usage after compaction and climbs back. The rewind
+        // event still emits (output tokens keep rising), so under raw-total
+        // delta accounting it replaced the previous cumulative with the
+        // rewound input side and the rebound was counted a second time.
+        // High-water accounting keeps the running maximum per token class,
+        // so the rebound back over the old mark is free.
+        let total = |input: i64, cached: i64, output: i64, reasoning: i64| {
+            serde_json::json!({
+                "input_tokens": input,
+                "cached_input_tokens": cached,
+                "output_tokens": output,
+                "reasoning_output_tokens": reasoning
+            })
+        };
+        let meta = serde_json::json!({
+            "timestamp": "2026-09-30T01:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/probe", "model": "gpt-5.3-codex"}
+        })
+        .to_string();
+        let token_count = |second: usize, totals: Value| {
+            serde_json::json!({
+                "timestamp": format!("2026-09-30T01:00:{second:02}Z"),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": totals}
+                }
+            })
+            .to_string()
+        };
+        let raw = [
+            meta,
+            // Rising cumulative: the first token_count reports everything.
+            token_count(1, total(1000, 400, 200, 50)),
+            // Compaction rewinds the context-side counters (input/cached)
+            // while output keeps climbing: this event still emits and is
+            // exactly where the raw-total previous went wrong.
+            token_count(2, total(600, 250, 350, 60)),
+            // Rebound over the old high-water mark.
+            token_count(3, total(1100, 480, 500, 90)),
+        ]
+        .join("\n");
+        let session =
+            parse_raw_session("codex", "rollout.jsonl", &raw).expect("codex rollout parses");
+        // True per-event deltas: (1000, 400, 250) + (0, 0, 160) + (100, 80,
+        // 180). Input is net of cache reads, so the single-counted total is
+        // exactly the final cumulative input minus cached (1100 - 480):
+        // 620 input / 480 cache read / 590 output. The pre-fix raw-total
+        // accounting yields 870 input / 630 cache read here.
+        assert_eq!(session.metrics.tokens_input, 620);
+        assert_eq!(session.metrics.tokens_cache_r, 480);
+        assert_eq!(session.metrics.tokens_output, 590);
+        assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+    }
 
     #[test]
     fn bom_is_stripped_once_at_offset_zero_and_nowhere_else() {

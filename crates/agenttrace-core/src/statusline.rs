@@ -610,9 +610,13 @@ fn render_statusline_report_text(
     if !insights.session_caches.is_empty() {
         out.push_str("Prompt cache per session:\n");
         for cache in &insights.session_caches {
+            // rm-012: session ids and miss-cause names are journal
+            // payload strings and print raw no longer — they pass the
+            // same control-character sanitization as the render path
+            // (the journal itself keeps storing what it saw).
             out.push_str(&format!(
                 "  {}: hit {}, misses {}",
-                cache.session_id,
+                sanitize_line_segment(&cache.session_id),
                 cache
                     .hit_ratio
                     .map(|ratio| format!("{:.0}%", ratio * 100.0))
@@ -625,7 +629,7 @@ fn render_statusline_report_text(
             if !cache.last_miss_causes.is_empty() {
                 out.push_str(&format!(
                     " (last miss: {})",
-                    cache.last_miss_causes.join(", ")
+                    sanitize_line_segment(&cache.last_miss_causes.join(", "))
                 ));
             }
             if let Some(tokens) = cache.recache_tokens_if_cold {
@@ -638,7 +642,7 @@ fn render_statusline_report_text(
         let causes = insights
             .miss_causes
             .iter()
-            .map(|(cause, count)| format!("{cause} x{count}"))
+            .map(|(cause, count)| format!("{} x{count}", sanitize_line_segment(cause)))
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!("Miss causes: {causes}\n"));
@@ -899,5 +903,74 @@ mod tests {
             line.chars().all(|c| !c.is_control()),
             "display_name fallback sanitized: {line:?}"
         );
+    }
+
+    #[test]
+    fn statusline_report_sanitizes_journal_derived_strings() {
+        // rm-012 regression: the journal is data (append_statusline_capture
+        // stores what it saw verbatim, by design), so every journal-derived
+        // string the text report prints — session ids and miss-cause names —
+        // must pass the same control-character sanitization as the render
+        // path. Live repro 2026-09-30 (assess attempt 6c039674): a crafted
+        // statusline payload once captured emitted raw ANSI SGR + OSC-52
+        // (clipboard-write) sequences through `agenttrace --statusline-report`.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-report-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        // Point the environment at the temp root before any append (the
+        // default path is the user's real journal), under the shared env
+        // lock so sibling-module tests cannot re-point it mid-append.
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let payload = serde_json::json!({
+            "session_id": "probe2-RED\u{001b}[31mX",
+            "prompt_cache": {
+                "hit_ratio": 0.5,
+                "misses": 3,
+                "last_miss_cause": {
+                    "causes": ["tools\u{001b}[2Jchanged\r\nnewline"]
+                },
+                "miss_causes": {"esc\u{001b}]52;c;aGk=\u{0007} OSC52": 2}
+            }
+        });
+        append_statusline_capture(&payload).expect("append hostile capture");
+        let text = render_statusline_report("text").expect("text report renders");
+        // cat -v equivalence: no raw control bytes may reach the terminal
+        // beyond the report's own line breaks.
+        assert!(
+            text.lines()
+                .all(|line| line.chars().all(|c| !c.is_control())),
+            "no control bytes reach the terminal: {text:?}"
+        );
+        assert!(
+            text.contains('\u{FFFD}'),
+            "control characters are replaced visibly: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{001b}'),
+            "no raw ESC byte survives anywhere: {text:?}"
+        );
+        assert!(
+            !text.contains("\u{001b}]52;"),
+            "the OSC-52 clipboard-write opener is neutralized: {text:?}"
+        );
+        // The JSON path keeps the payload verbatim (serde escapes it) —
+        // sanitization is a print-site concern, not a data concern.
+        let json = render_statusline_report("json").expect("json report renders");
+        let value: Value = serde_json::from_str(&json).expect("json report parses");
+        assert_eq!(
+            value["insights"]["session_caches"][0]["session_id"], "probe2-RED\u{001b}[31mX",
+            "JSON output is unchanged: raw payload, serde-escaped"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
     }
 }
