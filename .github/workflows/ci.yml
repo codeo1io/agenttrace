@@ -187,3 +187,22 @@ jobs:
         run: |
           bash -n scripts/record-demo.sh scripts/ci/*.sh
           sh -n install.sh
+
+  deny:
+    # rm-010, cycle 1 ("Trusted transport, gated supply chain"): dependency
+    # policy gate — advisories (RUSTSEC), licenses, bans, sources — against
+    # deny.toml at the repo root. Pattern from upstream PR #288 (merged
+    # 2026-09-30); runs on every push/PR/schedule like upstream, independent
+    # of the lint/full split (metadata-only, no compile, ~1min).
+    name: Dependency policy (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Check advisories, licenses, bans and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          command: check
+          arguments: --all-features

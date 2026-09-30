@@ -1,0 +1,45 @@
+# cargo-deny configuration (rm-010, cycle 1 — "Trusted transport, gated
+# supply chain"). Pattern carried from upstream luoyuctl/agenttrace PR #288
+# (merged 2026-09-30), adapted verbatim: the fork's dependency tree is the
+# upstream tree at the fork point, so the license allow-list fits as-is.
+# The CI lane lives in .github/workflows/ci.yml (`deny` job).
+# OpenSSF Scorecard is deliberately NOT added: the fork remote is private
+# (codeo1io/agenttrace) and Scorecard only scores public repositories —
+# add .github/workflows/scorecard.yml when the repo goes public.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "Unicode-3.0",
+  "BSL-1.0",
+]
+exceptions = [
+  { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
