@@ -35,6 +35,7 @@ struct Args {
         value_parser = ["text", "json", "markdown", "md", "html"]
     )]
     format: String,
+    /// Session directory to scan instead of auto-discovered agent homes
     #[arg(short = 'd')]
     dir: Option<String>,
     #[arg(long)]

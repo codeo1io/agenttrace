@@ -101,8 +101,9 @@ impl CapturedStatusline {
 }
 
 /// Where the journal lives. Follows the session-cache root so
-/// `AGENTTRACE_SESSION_CACHE_DIR` relocates both, and `--clear-cache`
-/// semantics (separate file) stay obvious.
+/// `AGENTTRACE_SESSION_CACHE_DIR` relocates both; `--clear-cache`
+/// removes it by explicit path alongside the other cache artifacts
+/// (rm-086: the session-cache artifact registry owns that set).
 pub fn statusline_capture_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
         if !dir.as_os_str().is_empty() {

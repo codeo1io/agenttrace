@@ -3608,6 +3608,12 @@ pub(super) fn display_source_label(source: &str) -> String {
     if source == "oh_my_pi" || source.ends_with("/.omp/agent/sessions") {
         return "Oh My Pi sessions".to_string();
     }
+    if source == "pi_senpi" {
+        return "Pi (senpi) sessions".to_string();
+    }
+    if source == "pi_omo" {
+        return "Pi (omo) sessions".to_string();
+    }
     if source == "claude_code" || source.ends_with("/.claude/projects") {
         return "Claude Code".to_string();
     }

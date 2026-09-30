@@ -238,6 +238,8 @@ pub(super) fn display_source_label(source: &str) -> String {
         "" | "auto-discovery" => "auto discovery".to_string(),
         "pi" => "Pi sessions".to_string(),
         "oh_my_pi" => "Oh My Pi sessions".to_string(),
+        "pi_senpi" => "Pi (senpi) sessions".to_string(),
+        "pi_omo" => "Pi (omo) sessions".to_string(),
         "claude_code" => "Claude Code".to_string(),
         "codex_cli" => "Codex".to_string(),
         "hermes_db" => "Hermes DB".to_string(),
@@ -353,5 +355,17 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(format!("{:?}", lines[0]).contains("Ready"));
         assert_eq!(display_source_label("codex_cli"), "Codex");
+        // rm-084 review follow-up: fork ids must render as labels, never
+        // leak as raw slugs — here and in the presentation.rs twin.
+        assert_eq!(display_source_label("pi_senpi"), "Pi (senpi) sessions");
+        assert_eq!(display_source_label("pi_omo"), "Pi (omo) sessions");
+        assert_eq!(
+            crate::app::presentation::display_source_label("pi_senpi"),
+            "Pi (senpi) sessions"
+        );
+        assert_eq!(
+            crate::app::presentation::display_source_label("pi_omo"),
+            "Pi (omo) sessions"
+        );
     }
 }
