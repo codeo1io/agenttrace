@@ -1,0 +1,8 @@
+# Pin the compiler so the fmt/clippy/test gates run on the same
+# toolchain everywhere. CI pins dtolnay/rust-toolchain with
+# `toolchain: stable` and the declared MSRV is 1.80 (Cargo.toml);
+# `stable` matches today's CI resolution exactly (no MSRV lane exists
+# that this file could override). Without a pin, formatting drifts
+# red whenever the local/CI compilers diverge (rm-216).
+[toolchain]
+channel = "stable"

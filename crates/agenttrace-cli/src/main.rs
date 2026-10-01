@@ -64,6 +64,11 @@ struct Args {
     output: Option<PathBuf>,
     #[arg(long)]
     latest: bool,
+    /// Report token and cost waste for one session: cache efficiency
+    /// over the billed input side — hit_rate = cache_r /
+    /// (input + cache_r + cache_w), in percent — plus the non-cached
+    /// input spend (fresh input and cache writes, priced per model
+    /// from the bundled catalog).
     #[arg(long)]
     waste: bool,
     #[arg(long = "list-models")]
