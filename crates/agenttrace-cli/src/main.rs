@@ -27,7 +27,10 @@ mod upstream;
 #[command(name = "agenttrace")]
 #[command(about = "TUI observability for AI coding agent sessions")]
 struct Args {
+    /// Session transcript to report on instead of the newest one
+    /// (`statusline` and `upstream` dispatch host commands instead)
     path: Option<String>,
+    /// Output format for report actions: text, json, markdown/md, or html
     #[arg(
         short = 'f',
         long = "format",
@@ -38,38 +41,63 @@ struct Args {
     /// Session directory to scan instead of auto-discovered agent homes
     #[arg(short = 'd')]
     dir: Option<String>,
+    /// Multi-session comparison report against the --model reference
     #[arg(long)]
     compare: bool,
+    /// Cost-audit report: raw token components, normalized pricing,
+    /// fallback confidence
     #[arg(long)]
     audit: bool,
+    /// Rank evidence-backed improvement recommendations by severity
+    /// and impact
     #[arg(long = "recommend")]
     recommend: bool,
+    /// MCP governance report over observed MCP invocations
     #[arg(long = "mcp-governance")]
     mcp_governance: bool,
+    /// Cross-session context, cache, repeat-read, and read/write trends
     #[arg(long = "context-trends")]
     context_trends: bool,
+    /// Correlate local Git commit timestamps with sessions (heuristic,
+    /// read-only)
     #[arg(long = "delivery-evidence")]
     delivery_evidence: bool,
+    /// Aggregate report: scope, parse/pricing confidence, cost audit,
+    /// recommendations, trends
     #[arg(long)]
     overview: bool,
+    /// List the matching sessions as a text table or JSON
     #[arg(long)]
     sessions: bool,
+    /// Diagnostics for the newest (or --path) session in the current view
     #[arg(long)]
     diagnostics: bool,
+    /// Diagnostics for the Nth highest-priority session in the view
+    /// (1-based)
     #[arg(long)]
     inspect: Option<usize>,
+    /// Reference model name for --compare output
     #[arg(short = 'm', default_value = "default")]
     model: String,
+    /// Also write the report to this file
     #[arg(short = 'o')]
     output: Option<PathBuf>,
+    /// Report on the newest matching session instead of opening the TUI
     #[arg(long)]
     latest: bool,
+    /// Waste report for the newest matching session: prompt-cache
+    /// efficiency, tool-call bloat, and loop waste
     #[arg(long)]
     waste: bool,
+    /// List the pricing catalog with per-million-token rates
     #[arg(long = "list-models")]
     list_models: bool,
+    /// Refresh the local pricing snapshot from the LiteLLM community
+    /// source (networked)
     #[arg(long = "update-pricing")]
     update_pricing: bool,
+    /// Pricing self-check: show how sample model names resolve to
+    /// catalog rates
     #[arg(long = "test-match")]
     test_match: bool,
     /// Report on the Claude Code statusline capture journal (candidate
@@ -84,28 +112,40 @@ struct Args {
     /// upstream` is fully offline (rm-024).
     #[arg(long)]
     fetch: bool,
+    /// Print the agenttrace version and exit
     #[arg(long)]
     version: bool,
+    /// Use built-in demo sessions instead of scanning real agent homes
     #[arg(long)]
     demo: bool,
+    /// Report installation and data-source health
     #[arg(long)]
     doctor: bool,
+    /// Full-text search across the matching sessions (see --search-limit)
     #[arg(long)]
     search: Option<String>,
+    /// Maximum number of --search results to print
     #[arg(long = "search-limit", default_value_t = 20)]
     search_limit: usize,
+    /// Exit 2 when average session health is below this score
     #[arg(long = "fail-under-health", default_value_t = 0)]
     fail_under_health: i32,
+    /// Exit 2 when any session is in critical health
     #[arg(long = "fail-on-critical")]
     fail_on_critical: bool,
+    /// Exit 2 when the tool-call failure rate exceeds this percentage
     #[arg(long = "max-tool-fail-rate")]
     max_tool_fail_rate: Option<f64>,
+    /// Compare --overview -f json against a baseline JSON file
     #[arg(long)]
     baseline: Option<String>,
+    /// Baseline breach threshold for duration regression, in percent
     #[arg(long = "baseline-max-duration-delta-pct", default_value_t = 0.0)]
     baseline_max_duration_delta_pct: f64,
+    /// Baseline breach threshold for cost regression, in percent
     #[arg(long = "baseline-max-cost-delta-pct", default_value_t = 0.0)]
     baseline_max_cost_delta_pct: f64,
+    /// Baseline breach threshold for token regression, in percent
     #[arg(long = "baseline-max-token-delta-pct", default_value_t = 0.0)]
     baseline_max_token_delta_pct: f64,
     /// Opt out of the baseline regression gate: keep the comparison in the
@@ -113,28 +153,45 @@ struct Args {
     /// (pass-7 P7-3).
     #[arg(long = "no-baseline-gate")]
     no_baseline_gate: bool,
+    /// Output language for translated report surfaces: en or zh
     #[arg(long = "lang", default_value = "en", value_name = "en|zh")]
     lang: String,
+    /// Time window filter: today, 7d, 30d, or all
     #[arg(long, default_value = "all")]
     range: String,
+    /// Only sessions under this project path
     #[arg(long, default_value = "")]
     project: String,
+    /// Only sessions from this source tool (e.g. claude_code,
+    /// hermes_jsonl)
     #[arg(long, default_value = "")]
     source: String,
+    /// Only sessions whose model name contains this text
     #[arg(long = "model-filter", default_value = "")]
     model_filter: String,
+    /// Only sessions whose name, path, model, or content matches this
+    /// text
     #[arg(long, default_value = "")]
     query: String,
+    /// Only sessions in this health band: good, warn, crit (or a
+    /// comparison like <50)
     #[arg(long, default_value = "")]
     health: String,
+    /// Only sessions whose estimated cost matches (e.g. >10, <=0.5)
     #[arg(long, default_value = "")]
     cost: String,
+    /// Only sessions with an anomaly matching this text (or "any")
     #[arg(long, default_value = "")]
     anomaly: String,
+    /// Sort key: recent, health, cost, turns, failures, source, name,
+    /// or anomalies
     #[arg(long, default_value = "recent")]
     sort: String,
+    /// Sort direction: asc or desc
     #[arg(long, default_value = "desc")]
     order: String,
+    /// Cap list views only (--sessions rows, overview recent_sessions);
+    /// never filters aggregates
     #[arg(long, default_value_t = 20)]
     limit: usize,
     /// Explicitly bound governance reports to the newest N sessions.
@@ -143,10 +200,15 @@ struct Args {
     /// (pass-8 F8-1).
     #[arg(long)]
     sample: Option<usize>,
+    /// Delete the local session-cache artifacts (see PRIVACY.md), then
+    /// continue with the requested action
     #[arg(long = "clear-cache")]
     clear_cache: bool,
+    /// Write derived titles and metrics for matched sessions to the
+    /// preserved history file
     #[arg(long = "preserve-history")]
     preserve_history: bool,
+    /// Merge previously preserved history entries into this run
     #[arg(long = "include-history")]
     include_history: bool,
 }
@@ -1225,6 +1287,31 @@ mod tests {
     use super::*;
     use agenttrace_core::Metrics;
     use std::io::Write;
+
+    #[test]
+    fn help_renders_a_description_for_every_flag() {
+        // rm-188: at ec8acdc about twenty flags rendered blank --help
+        // entries (missing doc comments). This pins the whole surface:
+        // every declared arg — long flags, short-only flags, and the
+        // positional — must carry non-empty help text.
+        use clap::CommandFactory;
+        let cmd = Args::command();
+        let mut checked = 0;
+        for arg in cmd.get_arguments() {
+            let name = arg
+                .get_long()
+                .map(|long| format!("--{long}"))
+                .or_else(|| arg.get_short().map(|short| format!("-{short}")))
+                .unwrap_or_else(|| format!("positional <{}>", arg.get_id()));
+            let help = arg.get_help().map(|help| help.to_string());
+            assert!(
+                help.as_deref().is_some_and(|text| !text.trim().is_empty()),
+                "{name} renders a blank --help description"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 40, "flag surface shrank unexpectedly: {checked}");
+    }
 
     #[test]
     fn report_language_accepts_supported_values_and_rejects_the_rest() {

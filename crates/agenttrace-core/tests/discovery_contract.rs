@@ -2368,10 +2368,20 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
     // parsed from out-of-scope sessions.
     let root = temp_root("agenttrace-range-health");
     fs::create_dir_all(&root).expect("create range-health dir");
-    let recent = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
-{"role":"user","content":"recent work","timestamp":"2026-09-01T10:00:00Z"}
-{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
-"#;
+    // The "recent" fixture must stay inside the `now - 30d` window used
+    // below; a hardcoded date ages out of scope (the 2026-09-01 fixture
+    // crossed the boundary on 2026-10-01 and the test failed
+    // deterministically from then on). Derive it from the clock.
+    let recent_start = chrono::Utc::now() - chrono::Duration::days(1);
+    let recent_stamp = recent_start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let recent_end = (recent_start + chrono::Duration::seconds(1))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let recent = format!(
+        r#"{{"role":"session_meta","timestamp":"{recent_stamp}","ModelUsed":"claude-sonnet-4"}}
+{{"role":"user","content":"recent work","timestamp":"{recent_stamp}"}}
+{{"role":"assistant","content":"done","timestamp":"{recent_end}"}}"#
+    );
     let old = r#"{"role":"session_meta","timestamp":"2020-01-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
 {"role":"user","content":"ancient work","timestamp":"2020-01-02T10:00:00Z"}
 {"role":"assistant","content":"done","timestamp":"2020-01-02T10:00:01Z"}

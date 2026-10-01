@@ -274,6 +274,14 @@ fn sanitize_line_segment(segment: &str) -> String {
 /// retention bound is crossed. Errors are the caller's business (the
 /// host entry point turns them into stderr notes).
 pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
+    // rm-179: reclaim compaction temps orphaned by an earlier crash so
+    // no artifact class accumulates outside the disclosed set. The hook
+    // latency contract tolerates this (one read_dir of the cache dir);
+    // the generous max age keeps a live writer's temp untouchable.
+    crate::session_cache::sweep_orphaned_temps(
+        &statusline_capture_path(),
+        crate::session_cache::ORPHAN_TEMP_MAX_AGE,
+    );
     let path = statusline_capture_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -315,7 +323,15 @@ fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<
         kept.push(line);
     }
     kept.reverse();
-    let temp = path.with_extension("jsonl.compact");
+    // rm-179: the fixed `jsonl.compact` sibling made two concurrent
+    // statusline hooks clobber each other's compaction (both truncated
+    // the same temp mid-write, so an atomic rename could publish torn
+    // lines), and a crash orphaned it outside every artifact sweep. The
+    // shared unique-per-writer temp fixes both: concurrent writers never
+    // share a temp file, and the `<name>.tmp.<pid>.<seq>` name matches
+    // the dir-wide `sweep_orphaned_temps` pattern that reclaims crash
+    // orphans on the next run.
+    let temp = crate::session_cache::unique_temp_path(path);
     {
         let mut file = fs::File::create(&temp)?;
         for line in kept {
@@ -850,6 +866,114 @@ mod tests {
             newest.contains("\"captured_at\":39"),
             "the newest line survives compaction: {newest}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compaction_temps_match_the_cache_sweep_pattern_and_are_reclaimed() {
+        // rm-179: a crash mid-compaction must not strand an artifact
+        // outside the disclosed set. The compaction temp now reuses
+        // session_cache::unique_temp_path, so it carries the
+        // `<name>.tmp.<pid>.<seq>` shape the dir-wide sweep reclaims.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-sweep-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        fs::write(&journal, "{\"captured_at\":1}\n").expect("seed journal");
+        let temp = crate::session_cache::unique_temp_path(&journal);
+        assert!(
+            temp.file_name()
+                .expect("temp name")
+                .to_str()
+                .expect("utf8")
+                .starts_with("statusline.jsonl.tmp."),
+            "compaction temp must carry the sweepable pattern: {}",
+            temp.display()
+        );
+        // Simulate the crash orphan: the temp exists, the journal intact.
+        fs::write(&temp, "{\"captured_at\":0}\n").expect("seed orphan");
+        let removed =
+            crate::session_cache::sweep_orphaned_temps(&journal, std::time::Duration::ZERO);
+        assert_eq!(removed, 1, "the sweep must reclaim the orphan");
+        assert!(!temp.exists(), "orphan removed");
+        assert!(journal.exists(), "live journal untouched");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_compactions_lose_no_entries() {
+        // rm-179: with the fixed `jsonl.compact` temp, concurrent
+        // statusline hooks truncated the same temp mid-write and an
+        // atomic rename could publish torn or lost lines. With unique
+        // per-writer temps every published journal is a complete,
+        // order-preserving suffix of the original.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let original: Vec<String> = (0..200)
+            .map(|i| {
+                format!(
+                    "{{\"captured_at\":{i},\"payload\":{{\"filler\":\"{}\"}}}}",
+                    "x".repeat(80)
+                )
+            })
+            .collect();
+        fs::write(&journal, format!("{}\n", original.join("\n"))).expect("write journal");
+        // Keep-under sized to retain ~25 lines.
+        let keep_under = 25 * (original[0].len() as u64 + 1);
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let journal = journal.clone();
+            handles.push(std::thread::spawn(move || {
+                compact_statusline_capture_under(&journal, keep_under).expect("compact")
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("compaction thread");
+        }
+        let kept = fs::read_to_string(&journal).expect("read journal");
+        let lines: Vec<&str> = kept.lines().collect();
+        assert!(!lines.is_empty(), "journal must keep the newest lines");
+        // Every retained line must be a COMPLETE original line (a torn
+        // interleave would fail this) and retain order.
+        let positions: Vec<usize> = lines
+            .iter()
+            .map(|line| {
+                original
+                    .iter()
+                    .position(|candidate| candidate == line)
+                    .unwrap_or_else(|| panic!("torn or lost line survived: {line}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "retained lines must stay in journal order: {positions:?}"
+        );
+        let newest = lines.last().expect("at least one line");
+        assert!(
+            newest.contains("\"captured_at\":199"),
+            "the newest line survives: {newest}"
+        );
+        // No temp may remain after every compaction succeeded.
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .expect("read cache dir")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|name| name.contains(".tmp.") || name.contains("compact"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must not linger");
         let _ = fs::remove_dir_all(root);
     }
 

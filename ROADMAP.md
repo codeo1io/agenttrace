@@ -304,6 +304,7 @@
 - signals: correctness.timezone:crates/agenttrace-core/src/insights.rs::L65-70 (Today range computes UTC midnight boundaries rather than the user's local day)
 - acceptance: today range anchors to local midnight with documented timezone handling; a test pinning the boundary around a fixed offset passes
 - evidence: new unit test for the local-day boundary; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- live anchor addendum (2026-10-01, run 4b9cc093 assess 5290a1cd at HEAD ec8acdc): re-verified live — insights.rs::L66-70 still derives TimeRange::Today from Utc::now().date_naive(); both consumers pinned (CLI main.rs::L850 `--range today`; TUI app.rs::L1433 session_matches_time_range); the codebase convention is local-day (parser.rs::L1214-1221 handles aider timestamps as local-zone), so UTC-midnight "today" is the outlier, not the rule. Assess finding A1 re-anchors here rather than minting a duplicate id.
 
 ### Harden discovery-cache keys and listing freshness
 - id: `rm-041` | track: reliability | priority: 73.0 | status: candidate
@@ -371,6 +372,7 @@
 - signals: reliability.unbounded_read:crates/agenttrace-core/src/pricing.rs::L348 (override/network pricing path converts the entire response via .into_string() with no size cap — an oversized or hostile body becomes unbounded memory in a diagnostics tool)
 - acceptance: body read is capped at a documented limit with a clear error on breach; cap and error path covered by a truncated-body fixture test
 - evidence: new test asserting the cap error; cargo test green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+- roadmap correction (2026-10-01, run 4b9cc093 assess A7 at HEAD ec8acdc): the "no size cap → unbounded memory" premise is stale — ureq 2.x caps into_string() at 10 MiB, so pricing.rs::L343-351 fails HARD (transport-flavored io::Error) once the LiteLLM catalog crosses that cap rather than reading without bound. The original acceptance stands; the fixture should pin the 10 MiB boundary explicitly and the breach error must name the limit.
 
 ### install.sh source-build fallback clones the unpinned default branch
 - id: `rm-051` | track: security | priority: 78.0 | status: candidate
@@ -412,6 +414,7 @@
 - signals: ux.i18n_noop:crates/agenttrace-core/src/reports.rs::L458+L565+L604+L626+L767+L918+L1066 (report_overview_{json,text,markdown,html}* take no ReportLanguage), ux.i18n_noop:crates/agenttrace-cli/src/main.rs::L1066 (render_session_list) plus the audit/recommend/mcp-governance/context-trends/delivery-evidence render paths, contrast: report_text_with_language (reports.rs:220), report_json_with_language (:74), report_compare_with_language (:1267) and the diagnostics/waste/TUI surfaces all translate — the flag is parsed globally at main.rs:806-810 and silently ignored on the remaining surfaces
 - acceptance: --lang is effective for every user-facing action (overview in all four formats, sessions, audit, recommend, mcp-governance, context-trends, delivery-evidence) or an unsupported action exits with an explicit flag-not-supported error; golden tests pin non-English output for each renderer family; --help documents the flag's coverage
 - evidence: live 2026-10-01 (assess 5d6eb40c F1, this worktree @ 9d88b36): `--overview --lang en` vs `--lang zh` byte-identical in text/markdown/html/json (diff clean on /tmp/at-probe/{en,zh}.txt) while `--diagnostics/--waste/--compare --lang zh` render Chinese (e.g. 浪费分析, 多会话对比) — a silent no-op, not a partial translation
+- rider folded (2026-10-01, run 4b9cc093 assess N5 at HEAD ec8acdc): the ~55 inline bilingual t(language, ("en", ...), ("zh", ...)) pairs in reports.rs drift independently of the TUI's i18n.rs map — when threading ReportLanguage per this item, route both behind one shared translation surface so en/zh pairs cannot drift. Counts re-verified at ec8acdc.
 
 ### Disclose local at-rest artifacts in PRIVACY.md and align --clear-cache
 - id: `rm-086` | track: security | priority: 80.0 | status: implemented
@@ -424,7 +427,7 @@
 - id: `rm-087` | track: customer-experience | priority: 78.0 | status: candidate
 - signals: capability.missing:crates/agenttrace-cli/src/main.rs (flag-definition greps for since/until/from/to/after/before/start/end return 0; the only time-adjacent selectors are --latest and the statusline windows), user_need.ccusage_parity (ccusage README :150 `--since 2026-04-25 --until 2026-05-16`, :178 "Date Filtering" feature bullet; fetched live 2026-10-01, archived as research-5b2d04a1/ccusage-readme3.md), docs/ideation/2026-09-02-agenttrace-extensions-ideation.md:382 (idea 13 "Absolute-time scoping", never converted)
 - acceptance: --since/--until (plus a --last N[d|w] shorthand if cheap) are accepted by overview/sessions/waste/compare/governance actions in every output format; boundary semantics documented (inclusive start, exclusive end, or stated otherwise) and pinned by fixtures across the boundary; the timezone rule is stated once and reused; scoping composes with rm-085's i18n threading so scoped reports render in the selected language
-- evidence: live 2026-10-01 (research 5b2d04a1 RC-2): default --overview on this host aggregates all 5691 sessions back to months with no in-tool way to ask "this month"/"last week"; boundary: rm-018 owns the today-range UTC-day bug inside insights — this item owns the user-facing scoping surface only
+- evidence: live 2026-10-01 (research 5b2d04a1 RC-2): default --overview on this host aggregates all 5691 sessions back to months with no in-tool way to ask "this month"/"last week"; boundary: rm-040 owns the today-range UTC-day bug inside insights — this item owns the user-facing scoping surface only. (cross-ref corrected 2026-10-01 by run 4b9cc093 roadmap phase: the original rm-018 was campaign-local numbering of the minting lineage; in this file's lineage the today-range bug is rm-040.)
 
 ### Shell completions and man page via clap_complete/clap_mangen
 - id: `rm-088` | track: customer-experience | priority: 70.0 | status: candidate
@@ -489,5 +492,136 @@
 - signals: capability.closed:crates/agenttrace-core/Cargo.toml::L13 (publish = false); crates.io fetch 2026-09-30: no agenttrace-core crate registered (name free); research RC-14: the parser corpus is the fork's moat, pass-5 defensible-center analysis (diagnosis depth) supports broadcasting it as an embeddable library
 - acceptance: publish = false dropped (or scoped to a stable subset crate); semver + API-stability policy documented in CONTRIBUTING; docs.rs renders the crate; the public API surface carries no TUI/runtime dependencies
 - evidence: published crate resolves on crates.io; docs.rs build green; a downstream smoke consumer builds against the published API; full suite green; conductor validation digest validation:v1:<sha> recorded in the shipping PR
+
+<!-- rm-173..rm-193 appended by run 4b9cc093d3584579b7e65a8b7dfeb8b5 roadmap phase (campaign repository-maintenance ad3ce401e5c645f6ae6d0afd57e1c0cd cycle 1, attempt f71c3a0eada641c5a8fc1210cd32573d) at HEAD ec8acdc, worktree conductor/run-4b9cc093d358, porcelain-clean at dispatch.
+ID discipline: this tree's wall was rm-161 (62 unique ids, duplicate probe clean). New ids start at rm-173, RESERVING rm-162..rm-172 for the staged-but-unlanded integration block (worktree integration-58cb435705b8-c7dca75d): its staged ROADMAP still carries campaign-local rm-012..rm-022 duplicating landed ids and must renumber at landing — 11 items fit rm-162..rm-172 exactly. Verified live 2026-10-01: fork master still ec8acdc (git ls-remote), no sibling worktree claims above rm-161, duplicate probe re-run clean after this append.
+Sources: assess ledger 5290a1cd (spool assess-5290a1cd999a40c3a6cc66dd109e0dae/2026-10-01-assessment.md — fresh A1-A7 at ec8acdc plus standing F1/F2/F3/F4/F5/F6/F7, K1/K3/K4, N1/N3/N4/N5 re-verified) and research notes f006888b (spool research-f006888b8daa4871aa16852ea4a0dfb4/2026-10-01-research-notes.md — RC-1..RC-4 keep their provisional ids rm-173..rm-176). One item minted from direct verification by this phase: rm-187 (pytest suite unwired from CI; flagged first by sibling assess 3c3e933d, re-verified at ec8acdc by grep over .github/workflows + scripts/ci).
+Dedup decisions (no double-mint): A1 = rm-040's defect (live-anchor addendum appended there, both consumers pinned); A7 recorded as a premise correction on rm-050 (ureq caps at 10 MiB — read bounded, failure silent-class); N5 folded as a rider into rm-085 (inline bilingual pairs vs i18n.rs map); A6 refutes research candidate K2 (FIFO admission works at ec8acdc — K2 was never minted, no item to close; ledger-only). Stale cross-ref swept: rm-087's evidence cited rm-018 for the today-range bug (campaign-local numbering of its minting lineage); corrected to rm-040. Carried-unminted debt from three prior assess ledgers (4b079a74/ec96be09, 980eb773/29c7340b, e741e661/ae44ccd0 at 1806e18/e182) cleared into rm-177..rm-193. -->
+
+### Port upstream PR #295 (WinGet manifest schema violation)
+- id: `rm-173` | track: upstream-sync | priority: 78.0 | status: candidate
+- signals: upstream luoyuctl/agenttrace moved 41ac231c→52ab2cd8 ahead-by-1 on 2026-10-01T06:08:29Z via merged PR #295 (+3/-2 on scripts/release/render-channels.sh); generated manifest files lack yaml-language-server schema headers (L88/L96/L120 in the PR view) and zip Archive installers emit PortableCommandAlias (L130/L134), which the WinGet schema rejects for Archive installers; live proof: microsoft/winget-pkgs PR 444788 open/unmerged on the broken manifest; this fork's render-channels.sh carries the same two PortableCommandAlias lines with zero test pins; patch archived at research-f006888b/evidence/upstream-pr295-render-channels.patch
+- acceptance: render-channels.sh emits the yaml-language-server schema directive header on every generated manifest file; zip-Archive installers stop emitting PortableCommandAlias (or the installer type moves to a schema-legal form); a fixture render (dry run against a pinned channel file) byte-compares against a schema-valid golden, pinned by an in-repo test so the fix cannot silently regress
+- evidence: landing PR shows before/after rendered manifest for one channel plus the golden-fixture test green; upstream PR #295 is the reference implementation, not a blind copy — cite it in the landing commit
+
+### Antigravity SQLite conversation-store adapter
+- id: `rm-174` | track: compatibility | priority: 74.0 | status: candidate
+- signals: Antigravity agents persist sessions as SQLite under five roots (~/.gemini/antigravity/conversations, ~/.antigravity/conversations, ~/Library/Application Support/Antigravity/conversations, %USERPROFILE%\.antigravity\conversations, $XDG_DATA_HOME/antigravity/conversations) with ANTIGRAVITY_DATA_DIR override; files are .db under conversations/ rather than JSONL (upstream ccusage paths.rs snapshot archived at research-f006888b/evidence/ccusage-antigravity-paths.rs); zero antigravity references in this repo; the sqlite discovery walk (sqlite_sessions.rs::L91-137) does not recognize the family
+- acceptance: discovery recognizes all five roots with env overrides honored; SQLite admission scoped to the family (conversations/**/*.db) or probe-based admission that never hangs on non-SQLite files; unmapped/unreadable SQLite skips with skip accounting (rm-039 unknown≠zero), never a hard failure; at least one golden .db fixture round-trips to priced sessions — fixture comparisons at schema+row dump level only, never byte-equality (fleet constraint: SQLite headers embed library-version bytes); doctor reports the family with resolved roots when present and notes absence otherwise
+- evidence: fixture corpus committed under tests (schema+row dump golden); live corpus probe recorded in the landing PR if a real Antigravity corpus is available (none found this cycle — state that explicitly rather than shipping speculative schema parsing)
+
+### Claude cross-session duplicate-request collapse
+- id: `rm-175` | track: correctness | priority: 72.0 | status: candidate
+- signals: ccusage #1765 (fixes #1762, researched this cycle): identical request payloads copied across sessions are counted once per copy, inflating usage; agenttrace's parse path has zero dedup surface (verified by grep at ec8acdc — no content fingerprint or dedup keys anywhere in the parse pipeline); effect lands in session counts, message counts, and total cost
+- acceptance: parse path computes a structural fingerprint for request-bearing records where upstream provides no identity; collapse applies only to byte-identical payloads (no fuzzy matching), first occurrence wins, session attribution stays with the original; the collapse count is surfaced (report line or doctor), never silent; golden fixture containing the known duplicated payload shows before/after counts; negative case pinned: genuinely distinct near-identical records do NOT collapse
+- evidence: before/after fixture counts + negative case in the landing PR; upstream #1765's taxonomy cited for the duplicate class
+
+### Grok Build CLI session family
+- id: `rm-176` | track: compatibility | priority: 62.0 | status: candidate
+- signals: Grok CLI persists updates.jsonl (+ summary.json) under ~/.grok/sessions/**/ with GROK_HOME override (upstream snapshot archived at research-f006888b/evidence/ccusage-grok-paths.rs); zero grok references in this repo; format details unpinned — no local corpus found this cycle
+- acceptance: discovery recognizes the grok roots honoring GROK_HOME; a family stub with graceful no-op when absent and skip accounting when present is an ACCEPTABLE landing state if documented needs-corpus (explicit note in doctor + README) because no real corpus exists to pin a schema; if a corpus is obtained: schema pinned from real samples, parser + pricing wired, golden fixture tests; no speculative schema parsing without a captured sample
+- evidence: landing PR states which of the two states landed and why; discovery tests for root resolution honoring GROK_HOME either way
+
+### Hermes tool-failure counters are structurally zero
+- id: `rm-177` | track: correctness | priority: 90.0 | status: implemented
+- signals: sqlite_sessions.rs::L195-196 reads tool_calls_total AND tool_calls_ok from the SAME column (idx 5); tool_calls_fail is never assigned anywhere in the loader; --max-tool-fail-rate can therefore never trip; fleet ledger ec96be09 additionally counted messages.effect_disposition at 186,167 live tool rows referenced zero times in the repo (rm-039 unknown≠zero violation); carried unminted through three prior assess ledgers (4b079a74/ec96be09, 980eb773/29c7340b, e741e661/ae44ccd0) — mint debt cleared here
+- acceptance: total/ok/fail each derive from their own persisted columns or from an enforced total=ok+fail identity at load time; golden sqlite fixture whose ok/fail/total counts all differ pins the mapping (schema+row dump comparison, not byte-equality); live demo that --max-tool-fail-rate trips on a fixture containing failing tool calls (impossible today); missing/unknown counters render UNPROVABLE per rm-039 rather than 0; effect_disposition either consumed or dropped with a migration note
+- evidence: before (gate cannot trip) / after (trips) runs in the landing PR; regression test green; the same-column defect shown in a before diff hunk
+
+### Windows: zero USERPROFILE fallback while shipping Windows artifacts
+- id: `rm-178` | track: compatibility | priority: 88.0 | status: candidate
+- signals: discovery.rs::L52-54 yields an empty home list when HOME is unset — native Windows provides USERPROFILE, not HOME; zero USERPROFILE fallback workspace-wide (doctor.rs::L266, sqlite_sessions.rs::L65, pricing.rs::L1160, session_cache.rs::L1087 degrade path); README:72 ships install.ps1 and release.yml:61-66 publishes Windows targets; CI is ubuntu-only; net effect: silent zero-session no-op on the platform the project explicitly ships for
+- acceptance: one shared home-resolution helper (HOME then USERPROFILE, or a dirs-style platform resolver) used at all four cited sites; env-driven unit tests pin the Windows-shaped environment (HOME unset, USERPROFILE set) per site; discovery/doctor/sqlite loaders locate fixture session homes under a USERPROFILE-shaped root; a windows CI lane exercises discovery on a fixture corpus, or the shipping docs carry an explicit supported-platform statement — landing at least one of the two, with the other tracked
+- evidence: env-driven tests green; CI lane run or documented decision note in the landing PR
+
+### Statusline compaction: fixed temp path, registry-blind orphan
+- id: `rm-179` | track: reliability | priority: 80.0 | status: implemented
+- signals: statusline.rs::L318 compacts to the FIXED path jsonl.compact — unique_temp_path already exists (session_cache.rs::L355) but is unused here; concurrent statusline hooks clobber each other's compaction and a crash orphans the temp (~5 MiB journal content observed) OUTSIDE both the rm-086 cache_artifact_paths registry (session_cache.rs::L216-227) and the legacy sweep; PRIVACY.md's "exactly four artifact classes" enumeration is falsifiable by that orphan
+- acceptance: compaction writes via unique temp + atomic rename; compaction temps are covered by the rm-086 registry or the sweep so no artifact class exists outside the enumerated set; test proves two concurrent compactions lose no entries; PRIVACY.md artifact enumeration parity test extended to include the compaction temp class
+- evidence: concurrency test + registry-parity test green in the landing PR
+
+### Session-cache save has no cross-process lock
+- id: `rm-180` | track: reliability | priority: 78.0 | status: candidate
+- signals: session_cache.rs::L815-861 performs read-modify-write + rename with no cross-process lock; the common collision is a statusline hook writing while an interactive run saves — one side's entries are silently lost
+- acceptance: save path takes an exclusive advisory lock (adjacent lock file or sqlite-level); lock contention within a small bound degrades to a documented skip consistent with the statusline latency contract, never a hang; test spawns N concurrent saves each adding a distinct entry and asserts all N persist
+- evidence: concurrency test through the public API + contention-degradation path pinned by test, in the landing PR
+
+### Cached costs carry no pricing-snapshot identity
+- id: `rm-181` | track: data-freshness | priority: 76.0 | status: candidate
+- signals: session_cache.rs::L1106-1111 is_fresh keys on {size, mtime} of the session file only; SCHEMA_VERSION=20 is the sole invalidator, so after --update-pricing pulls a changed catalog, cached per-session costs are re-labeled with the new snapshot date but still computed from old prices (research b88e6baa demonstrated a $0.0105-stale vs $1.2340-labeled divergence; an earlier review finding named it but minted no id)
+- acceptance: cache entries record a pricing-snapshot fingerprint (snapshot date + content hash — accessors already exist from rm-021) and is_fresh requires fingerprint match; live demo: same corpus repriced under two snapshots yields two different totals, each labeled with its true snapshot; invalidation pinned by test; catalog changes must not require a SCHEMA_VERSION bump
+- evidence: two-snapshot reprice demo + invalidation test in the landing PR
+
+### TUI test suite is non-hermetic without the cache-dir guard
+- id: `rm-182` | track: reliability | priority: 74.0 | status: implemented
+- signals: cargo test -p agenttrace-tui --lib WITHOUT AGENTTRACE_SESSION_CACHE_DIR fails 44/45 at ec8acdc (RC=101; tests.rs::L1972 reads the HOST's real statusline journal); with_session_cache_dir_for_test unlocks process-global env mutation; CI only runs the guarded form, so the unguarded breakage ships unnoticed
+- acceptance: the suite is green with AND without the env guard, on clean HOME and dirty host HOME alike; the offending test constructs its journal fixture explicitly instead of resolving the real home; no test mutates process-global env without isolation; a CI lane (or documented local command) runs the unguarded form
+- evidence: both invocation forms RC=0 in the landing PR; this cycle's failing form already recorded at /tmp/assess-5290a1cd/tui-unguarded.log for before/after comparison
+
+### Pricing overrides bypass the finite-rate gate
+- id: `rm-183` | track: correctness | priority: 72.0 | status: implemented
+- signals: apply_pricing_overrides (pricing.rs::L311-316) extends the catalog with zero validation; the is_finite gate lives only in convert_litellm (pricing.rs::L462-466); parse_pricing_overrides (pricing.rs::L383-393) accepts any f64 — NaN/inf/negative override entries corrupt cost math silently; boundary: rm-050 owns the download body cap, this item owns override-entry validation
+- acceptance: override entries validated at load: non-finite and negative rates rejected with a named error naming the override file and entry key; valid overrides still apply (existing override tests stay green); tests feed 1e400 (parses to inf), NaN, and negative fixtures and assert the named rejection error
+- evidence: validation tests + a live --update-pricing run against a hostile overrides file showing the named error, in the landing PR
+
+### Unbounded, uncached git subprocesses
+- id: `rm-184` | track: reliability | priority: 70.0 | status: candidate
+- signals: upstream.rs::L184-186 spawns git fetch with no timeout while the npm probe two functions away bounds curl with --max-time 15 (L317); the log/diff/rev-list calls in the same file are equally unbounded; governance.rs::L780-784 runs git -C root log --all per project root, uncached, per report invocation (callers: CLI main.rs::L306, TUI app.rs::L1569) — a stalled git hangs the tool indefinitely; retraction recorded: the earlier claim that git aliases could shadow builtins is FALSE (verified live: alias.log='!echo' did not execute) — only the unbounded/uncached defects stand
+- acceptance: every spawned git subprocess runs under a documented timeout and degrades to a named error, never a hang; governance log results cached per (root, head) for the report run; timeout error paths pinned by tests with a stub git; boundary: rm-048 owns FETCH_HEAD trust disclosure — this item owns execution bounds and caching only
+- evidence: stub-git timeout tests + a cache-hit test asserting one log invocation per root per run in the landing PR
+
+### Terminal output perimeter: bidi and control characters unsanitized
+- id: `rm-185` | track: security | priority: 68.0 | status: candidate
+- signals: live probe at ec8acdc: a session named with U+202E (RTL override) renders raw in --overview (incident timeline) and --sessions (table); "model<script>" prints raw in text mode (the HTML path escapes — rm-035's surface); the sanitization class shipped for statusline (rm-034) is not applied to the terminal perimeter; contract nuance from the rm-034 fix: the sanitizer is control-bytes-only and printable CSI tails legitimately survive — so this fix must target C0/C1 control bytes plus explicit bidi-override codepoints, not printable CSI
+- acceptance: terminal-facing renderers (text reports, --sessions/--overview output, TUI) pass free-text fields through one shared sanitizer neutralizing C0/C1 controls and the bidi-override class (U+202E family) — stripped or visibly escaped; byte-level test asserts no raw ESC/bidi-override bytes in captured stdout for the hostile fixture; the TUI consumes the same shared function (no third copy); if the rm-034 contract wording changes, update that item's note
+- evidence: hostile-fixture stdout byte assertions + golden render outputs in the landing PR
+
+### OpenCode: hardcoded $HOME/.local/share ignores XDG_DATA_HOME
+- id: `rm-186` | track: compatibility | priority: 66.0 | status: candidate
+- signals: sqlite_sessions.rs::L116-121 hardcodes $HOME/.local/share/opencode/...; live probe (research b88e6baa K3): with XDG_DATA_HOME set and a corpus present there, opencode rows fail to appear and the CLI exits rc=1 with no doctor row
+- acceptance: XDG_DATA_HOME honored when set, $HOME/.local/share fallback preserved; doctor reports the resolved opencode path and flags a missing dir; tests pin both env shapes (XDG set with fixture corpus → rows appear; XDG unset → fallback)
+- evidence: env-driven tests + the live probe flipped (rows appear, doctor row present) in the landing PR
+
+### Adversarial-sqlite pytest suite is wired into zero CI lanes
+- id: `rm-187` | track: reliability | priority: 66.0 | status: candidate
+- signals: scripts/fixtures/test_make_adversarial_sqlite.py (10 tests, landed at ec8acdc with the rm-155..161 block) has no pytest reference in .github/workflows or scripts/ci (verified by grep this phase; first flagged by sibling assess 3c3e933d) — the suite can rot green-in-theory while never executing
+- acceptance: a CI lane (or a step in an existing lane) runs the pytest suite and fails the build on test failure, with the python + pytest dependency pinned or provisioned deterministically; the lane proves itself by intentionally breaking one fixture expectation on a throwaway branch (link in the landing PR description), then reverting
+- evidence: lane run green in the landing PR; the intentional-break proof run linked
+
+### ~20 user-facing flags render blank --help descriptions
+- id: `rm-188` | track: developer-experience | priority: 64.0 | status: implemented
+- signals: at ec8acdc these flags print blank descriptions in --help: --compare --audit --recommend --mcp-governance --context-trends --delivery-evidence --overview --sessions --diagnostics --inspect -o --latest --waste --list-models --update-pricing --test-match --demo --search --clear-cache --preserve-history --include-history; root cause: undocumented #[arg(long)] fields in crates/agenttrace-cli/src/main.rs (help="" greps zero — missing doc comments, not empty strings); README additionally documents none of --waste/--compare/--test-match
+- acceptance: every #[arg(long)] field in the CLI carries a doc comment or explicit help rendering non-blank help; a test or gate asserts --help output contains no flag entry with an empty description (golden --help snapshot or parse-and-assert); README documents --waste, --compare, and --test-match
+- evidence: golden-help test green + README diff in the landing PR
+
+### Parser holds two whole-file copies and the walk has no size gate
+- id: `rm-189` | track: performance | priority: 62.0 | status: candidate
+- signals: parser.rs::L23-24 does fs::read then str::from_utf8 — two whole-file RAM copies per file; the discovery walk admits any file size (no gate); 5.2 GB real corpora exist on the author's host, so pathological entries multiply memory pressure across the walk
+- acceptance: the parse path holds one buffer (read-into-Vec + in-place UTF-8 validation, or streaming classification for cheap paths) with no full duplicate; the discovery walk applies a documented size gate above which files are skipped WITH skip accounting (rm-047's torn-line disclosure pattern), never silently; peak-RSS before/after on a named fixture corpus recorded in the landing PR (/usr/bin/time -v or equivalent)
+- evidence: gate-accounting unit tests + the recorded RSS numbers
+
+### History entry ids derive from an unstable hash
+- id: `rm-190` | track: reliability | priority: 60.0 | status: candidate
+- signals: history.rs::L104-107 derives entry ids from DefaultHasher; demonstrated instability across toolchains (same path hashed to 8b048e65 on one rustc and 76885271 on another, research b88e6baa K4) — a toolchain upgrade silently orphans prior history records (pins, exclusions, delivery evidence)
+- acceptance: history ids derive from a pinned, versioned hash (documented algorithm, e.g. FNV-1a or sha over the canonical path) with the algorithm name persisted in the history file; existing ids are never rewritten (or remapped once with a recorded migration); golden-id test pins fixture-path ids so any implementation change that would renumber fails loudly
+- evidence: golden-id fixture test + migration note (if any) in the landing PR
+
+### Source-label maps triplicated across surfaces
+- id: `rm-191` | track: developer-experience | priority: 58.0 | status: candidate
+- signals: source→display-label maps live in three places at ec8acdc — reports.rs::L1918-1921, tui/shared.rs::L243, doctor.rs::L279; adding a source family requires three coordinated edits and the maps can drift (a fourth drift site existed at 1806e182 in presentation.rs and was consolidated then)
+- acceptance: one shared mapping in agenttrace-core (e.g. source_label(source) -> &'static str) consumed by all three sites; parity test asserts every source enum variant renders the same label across surfaces; single point of addition for new sources enforced by construction or by grep gate
+- evidence: parity test green + grep showing one remaining map in the landing PR
+
+### pi-family discovery follows symlinks silently
+- id: `rm-192` | track: security | priority: 56.0 | status: candidate
+- signals: discovery.rs::L167-207 admits pi-family children via is_dir(), which follows symlinks; exposure is bounded (only <child>/sessions is probed) but a symlinked home can alias or loop roots and the follow behavior is undocumented
+- acceptance: symlinked children under pi-family roots are skipped or explicitly annotated (symlink_metadata class check) with the decision documented; a cyclic/self-referential symlink fixture terminates; doctor reports skipped-symlink count when nonzero; non-symlink roots unchanged (regression fixture)
+- evidence: symlink fixtures including a cycle + termination test in the landing PR
+
+### check-locked-cargo gate pattern too narrow
+- id: `rm-193` | track: reliability | priority: 54.0 | status: candidate
+- signals: scripts/ci/check-locked-cargo.sh:31 greps for `cargo (test|build|clippy)` — misses toolchain-prefixed forms (`cargo +nightly test`), `cargo doc`, `cargo install --path`, `cargo publish`; zero live offenders at ec8acdc (swept over .github/workflows + scripts) so this is prevention-only; rider extending the landed rm-157 gate
+- acceptance: pattern matches toolchain-prefixed invocations and the dependency-resolving subcommand set (test|build|clippy|run|doc|install|publish|tree) or documents an explicit exclusion list with rationale; negative fixture tests: workflow snippets with `cargo +nightly test` and `cargo doc` FAIL the gate; the gate stays green on the live tree
+- evidence: negative-fixture runs + live sweep green in the landing PR
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->
