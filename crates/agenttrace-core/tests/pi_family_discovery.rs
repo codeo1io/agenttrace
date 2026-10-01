@@ -14,9 +14,7 @@
 //! project dirs directly) and pins the discovery set, the doctor-visible
 //! registry names, and the per-home source labels.
 
-use agenttrace_core::{
-    find_session_files, known_session_dirs, load_sessions_from_dir, parse_file,
-};
+use agenttrace_core::{find_session_files, known_session_dirs, load_sessions_from_dir, parse_file};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,14 +51,22 @@ fn write_pi_family_fixture(home: &Path) -> Vec<PathBuf> {
             "pi-xdg.jsonl",
         ),
         // ~/.omp fork: default agent dir plus an agent-dir variant.
-        pi_transcript(&home.join(".omp").join("agent"), "proj", "omp-default.jsonl"),
+        pi_transcript(
+            &home.join(".omp").join("agent"),
+            "proj",
+            "omp-default.jsonl",
+        ),
         pi_transcript(
             &home.join(".omp").join("agent-beta"),
             "proj",
             "omp-agent-dir.jsonl",
         ),
         // ~/.senpi fork (both shapes seen live).
-        pi_transcript(&home.join(".senpi").join("agent"), "proj", "senpi-default.jsonl"),
+        pi_transcript(
+            &home.join(".senpi").join("agent"),
+            "proj",
+            "senpi-default.jsonl",
+        ),
         pi_transcript(
             &home.join(".senpi").join("agent-cliproxy-only"),
             "proj",
@@ -69,7 +75,11 @@ fn write_pi_family_fixture(home: &Path) -> Vec<PathBuf> {
         // ~/.omo fork: agent dir, agent-dir variant, and project dirs
         // directly under `<root>/sessions` (the omo home itself is the
         // agent dir on real hosts).
-        pi_transcript(&home.join(".omo").join("agent"), "proj", "omo-default.jsonl"),
+        pi_transcript(
+            &home.join(".omo").join("agent"),
+            "proj",
+            "omo-default.jsonl",
+        ),
         pi_transcript(
             &home.join(".omo").join("agent-cliproxy-only"),
             "proj",
@@ -125,14 +135,23 @@ fn default_discovery_covers_pi_forks_and_agent_dir_variants() {
             .collect();
         for expected_path in [
             home.join(".pi").join("agent").join("sessions"),
-            home.join(".pi").join("agent-cliproxy-only").join("sessions"),
-            home.join(".config").join("pi").join("agent").join("sessions"),
+            home.join(".pi")
+                .join("agent-cliproxy-only")
+                .join("sessions"),
+            home.join(".config")
+                .join("pi")
+                .join("agent")
+                .join("sessions"),
             home.join(".omp").join("agent").join("sessions"),
             home.join(".omp").join("agent-beta").join("sessions"),
             home.join(".senpi").join("agent").join("sessions"),
-            home.join(".senpi").join("agent-cliproxy-only").join("sessions"),
+            home.join(".senpi")
+                .join("agent-cliproxy-only")
+                .join("sessions"),
             home.join(".omo").join("agent").join("sessions"),
-            home.join(".omo").join("agent-cliproxy-only").join("sessions"),
+            home.join(".omo")
+                .join("agent-cliproxy-only")
+                .join("sessions"),
             home.join(".omo").join("sessions"),
         ] {
             assert!(
