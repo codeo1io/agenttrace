@@ -2230,15 +2230,18 @@ fn with_home_and_cache(home: &std::path::Path, cache: &std::path::Path, f: impl 
         let previous_home = std::env::var_os("HOME");
         let previous_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
         let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
+        let previous_xdg_data = std::env::var_os("XDG_DATA_HOME");
         let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
         std::env::set_var("HOME", home);
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore_env("HOME", previous_home);
         restore_env("XDG_CONFIG_HOME", previous_xdg_config);
         restore_env("XDG_CACHE_HOME", previous_xdg_cache);
+        restore_env("XDG_DATA_HOME", previous_xdg_data);
         restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
         result
     };

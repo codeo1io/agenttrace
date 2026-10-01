@@ -1413,9 +1413,22 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
     Ok(meta_events)
 }
 
+/// Source label for a pi-family transcript, by the home root that
+/// actually owns it (rm-084): `~/.pi` (any agent dir, including
+/// relocated agent state) and the XDG pi root are `pi`; the fork roots
+/// keep their own identities (`pi_senpi`, `pi_omo`, `oh_my_pi`) so a
+/// fork corpus is never attributed to a different agent. A pi-family
+/// transcript outside every known root (the `-d` escape for an agent
+/// dir relocated elsewhere) keeps the historical family fallback.
 fn pi_source_for_path(path: &str) -> String {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    if normalized.contains("/.pi/agent/sessions/") {
+    if normalized.contains("/.senpi/") {
+        "pi_senpi".to_string()
+    } else if normalized.contains("/.omo/") {
+        "pi_omo".to_string()
+    } else if normalized.contains("/.omp/") {
+        "oh_my_pi".to_string()
+    } else if normalized.contains("/.pi/") || normalized.contains("/.config/pi/") {
         "pi".to_string()
     } else {
         "oh_my_pi".to_string()

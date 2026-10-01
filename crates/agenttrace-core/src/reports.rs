@@ -1930,6 +1930,8 @@ fn tool_display_name(name: &str) -> String {
         "copilot_cli" => "Copilot CLI".to_string(),
         "kimi_cli" => "Kimi CLI".to_string(),
         "pi" => "Pi".to_string(),
+        "pi_senpi" => "Pi (senpi)".to_string(),
+        "pi_omo" => "Pi (omo)".to_string(),
         "oh_my_pi" => "Oh My Pi".to_string(),
         "aider" => "Aider".to_string(),
         "cursor" => "Cursor".to_string(),

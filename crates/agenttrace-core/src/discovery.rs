@@ -98,22 +98,14 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
             name: "Claude Code".to_string(),
             path: env_home("CLAUDE_CONFIG_DIR", home.join(".claude")).join("projects"),
         },
-        KnownSessionDir {
-            name: "Pi".to_string(),
-            path: home.join(".pi").join("agent").join("sessions"),
-        },
-        KnownSessionDir {
-            name: "Pi XDG".to_string(),
-            path: home
-                .join(".config")
-                .join("pi")
-                .join("agent")
-                .join("sessions"),
-        },
-        KnownSessionDir {
-            name: "Oh My Pi".to_string(),
-            path: home.join(".omp").join("agent").join("sessions"),
-        },
+        // Pi-family homes moved to structural enumeration below
+        // (rm-084): forks relocate the whole root (~/.omp, ~/.senpi,
+        // ~/.omo) and pi relocates the agent dir inside a root
+        // (~/.pi/<name>/sessions), so any child of a pi-family root
+        // that carries a sessions/ directory registers instead of a
+        // per-home allowlist. An agent dir relocated outside these
+        // roots stays out of discovery; `-d <dir>` is the documented
+        // escape for that case.
         KnownSessionDir {
             name: "WorkBuddy".to_string(),
             path: home.join(".workbuddy").join("projects"),
@@ -137,6 +129,7 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
     ];
     dirs.extend(open_code_known_session_dirs(&home));
     dirs.extend(cline_known_session_dirs(&home));
+    dirs.extend(pi_family_known_session_dirs(&home));
     dirs
 }
 
@@ -151,6 +144,61 @@ pub fn discover_session_dirs() -> Vec<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         if cwd.join(".aider.chat.history.md").is_file() && seen.insert(cwd.clone()) {
             dirs.push(cwd);
+        }
+    }
+    dirs
+}
+
+/// Pi-family session homes (rm-084). pi stores transcripts under
+/// `<agent-dir>/sessions/<project-slug>/*.jsonl`; the agent dir
+/// defaults to `~/.pi/agent`, forks relocate the whole root (`~/.omp`,
+/// `~/.senpi`, `~/.omo` — the omo home is itself an agent dir on real
+/// hosts, with project dirs directly under `~/.omo/sessions`), and
+/// isolated agent state / profiles relocate the agent dir to a sibling
+/// (`~/.pi/agent-cliproxy-only/sessions`). Enumeration is structural:
+/// the default agent dir of every known root registers, plus any child
+/// directory of a root that carries a `sessions/` directory, so a new
+/// fork or agent-dir variant appears without per-home code. Children
+/// without a `sessions/` directory (`~/.pi/cache`, `~/.omo/memory`,
+/// ...) are never registered, keeping non-session fork state out of
+/// discovery. An agent dir relocated outside these roots is not
+/// discoverable from the filesystem layout; `-d <dir>` is the
+/// documented escape for that case.
+fn pi_family_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
+    let roots = [
+        (home.join(".pi"), "Pi"),
+        (home.join(".config").join("pi"), "Pi XDG"),
+        (home.join(".omp"), "Oh My Pi"),
+        (home.join(".senpi"), "Senpi"),
+        (home.join(".omo"), "Omo"),
+    ];
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for (root, brand) in roots {
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+        candidates.push((brand.to_string(), root.join("agent").join("sessions")));
+        // A fork home whose agent dir is the root itself.
+        candidates.push((brand.to_string(), root.join("sessions")));
+        if let Ok(children) = fs::read_dir(&root) {
+            let mut children: Vec<PathBuf> = children.flatten().map(|entry| entry.path()).collect();
+            children.sort();
+            for child in children {
+                let Some(name) = child.file_name().and_then(std::ffi::OsStr::to_str) else {
+                    continue;
+                };
+                let label = if name == "agent" {
+                    brand.to_string()
+                } else {
+                    format!("{brand} ({name})")
+                };
+                candidates.push((label, child.join("sessions")));
+            }
+        }
+        for (name, path) in candidates {
+            if !seen.contains(&path) && path.is_dir() {
+                seen.insert(path.clone());
+                dirs.push(KnownSessionDir { name, path });
+            }
         }
     }
     dirs
