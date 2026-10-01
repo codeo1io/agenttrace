@@ -39,7 +39,11 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
-          toolchain: stable
+          # rm-173: aligned with the repo's rust-toolchain.toml pin. The
+          # toolchain file governs every cargo step below (rustup resolution:
+          # toolchain file > `rustup default`), so this input must name the
+          # same version or the action installs a toolchain nothing runs.
+          toolchain: "1.98.1"
 
 
       # Self-hosted cargo target persistence: branch checkouts invalidate the
@@ -93,7 +97,8 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
-          toolchain: stable
+          # rm-173: same pin as the Lint job above / rust-toolchain.toml.
+          toolchain: "1.98.1"
 
       - name: Check Rust formatting
         run: cargo fmt --check
