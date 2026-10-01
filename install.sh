@@ -5,6 +5,15 @@ set -eu
 # Usage: curl -sL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
 
 REPO="luoyuctl/agenttrace"
+# Pinned ref for the build-from-source fallback (rm-051): the fallback
+# must never clone a moving default branch — whatever master holds at
+# clone time is not what this installer was tested against. Keep in
+# lockstep with the newest published release tag; override for forks or
+# testing with AGENTTRACE_SOURCE_REF (tag or branch name).
+REF="${AGENTTRACE_SOURCE_REF:-v0.9.0}"
+# Install receipt for the source-build fallback (rm-051): records the
+# exact ref that was built, so an install can be audited later.
+INSTALL_RECEIPT="${AGENTTRACE_INSTALL_RECEIPT:-${XDG_DATA_HOME:-$HOME/.local/share}/agenttrace/install-receipt}"
 BIN="agenttrace"
 INSTALL_DIR="${AGENTTRACE_INSTALL_DIR:-}"
 
@@ -114,17 +123,28 @@ if ! "$TMP" --version >"$VERIFY_LOG" 2>&1; then
   fi
   if command -v git >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
     echo "🔧 Falling back to building from source with this host's toolchain..."
+    echo "   Cloning $REPO at pinned ref $REF (set AGENTTRACE_SOURCE_REF to override)."
     SRC=$(mktemp -d)
-    if git clone --depth 1 "https://github.com/${REPO}.git" "$SRC" \
+    if git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$SRC" \
        && (cd "$SRC" && cargo build --release -p agenttrace) \
        && cp "$SRC/target/release/agenttrace" "$TMP" && chmod +x "$TMP"; then
       rm -rf "$SRC"
-      echo "   Built from source successfully."
+      RECEIPT_DIR=$(dirname "$INSTALL_RECEIPT")
+      mkdir -p "$RECEIPT_DIR"
+      {
+        echo "installed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        echo "source=source-build"
+        echo "repo=$REPO"
+        echo "ref=$REF"
+      } >"$INSTALL_RECEIPT"
+      echo "   Built from source successfully (pinned ref $REF)."
+      echo "   Receipt: $INSTALL_RECEIPT"
     else
       rm -rf "$SRC"
       rm -f "$TMP"
-      echo "❌ Source build failed. Install Rust (https://rustup.rs) and retry, or:"
-      echo "   git clone https://github.com/${REPO}.git && cd agenttrace && cargo build --release -p agenttrace"
+      echo "❌ Source build failed (pinned ref '$REF'; set AGENTTRACE_SOURCE_REF to a published tag or branch to override)."
+      echo "   Install Rust (https://rustup.rs) and retry, or:"
+      echo "   git clone --branch $REF https://github.com/${REPO}.git && cd agenttrace && cargo build --release -p agenttrace"
       exit 1
     fi
   else

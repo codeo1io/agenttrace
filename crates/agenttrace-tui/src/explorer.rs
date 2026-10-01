@@ -1954,6 +1954,38 @@ fn share_summary(session: &Session) -> String {
     format!("AgentTrace\nHealth: {}\nEstimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, session.metrics.cost_estimated, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
 }
 
+/// Bound on how long the TUI waits for a clipboard helper to exit after
+/// it has been fed the summary (rm-200). A wedged pbcopy/wl-copy/xclip
+/// (hung daemon, dead Wayland socket) must surface as a notice instead
+/// of freezing the interface. Generous for slow remote clipboards, short
+/// enough that the failure is visible.
+const CLIPBOARD_WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Waits for the child with a deadline. On expiry the child is killed
+/// and reaped, so the caller never blocks past `bound`, and a timeout
+/// error is returned instead of a status (the exit status of a killed
+/// process would read as a misleading helper failure).
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    bound: std::time::Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("did not exit within {bound:?}"),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn copy_summary(summary: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1977,7 +2009,8 @@ fn copy_summary(summary: &str) -> anyhow::Result<()> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("clipboard input unavailable"))?
         .write_all(summary.as_bytes());
-    let status = child.wait()?;
+    let status = wait_with_timeout(&mut child, CLIPBOARD_WAIT_BOUND)
+        .map_err(|error| anyhow::anyhow!("{program} {error}"))?;
     result?;
     anyhow::ensure!(status.success(), "{program} exited with {status}");
     Ok(())
@@ -2811,6 +2844,38 @@ fn left_rule() -> Block<'static> {
 #[cfg(test)]
 mod interaction_tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn clipboard_wait_is_bounded_and_reaps_a_hung_helper() {
+        // rm-200: a clipboard helper that never exits must not freeze the
+        // TUI. `sleep 30` ignores stdin entirely, which is the wedged-helper
+        // shape; the bounded wait must return an error well before the
+        // child's own lifetime, and the child must be reaped (killed), not
+        // left running.
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sleeper");
+        drop(child.stdin.take());
+        let started = std::time::Instant::now();
+        let outcome = wait_with_timeout(&mut child, Duration::from_millis(150));
+        let elapsed = started.elapsed();
+        assert!(
+            outcome.is_err(),
+            "a helper that outlives the bound must surface as an error"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the wait must be bounded; took {elapsed:?}"
+        );
+        assert!(
+            child.try_wait().expect("child reaped").is_some(),
+            "the timed-out helper must be killed and reaped, not leaked"
+        );
+    }
 
     #[test]
     fn initial_progress_remains_visible_after_first_batch() {

@@ -2368,10 +2368,19 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
     // parsed from out-of-scope sessions.
     let root = temp_root("agenttrace-range-health");
     fs::create_dir_all(&root).expect("create range-health dir");
-    let recent = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
-{"role":"user","content":"recent work","timestamp":"2026-09-01T10:00:00Z"}
-{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
-"#;
+    // Time-bomb guard (fixed 2026-10-01): this fixture used to be
+    // hardcoded at 2026-09-01T10:00:00Z, which silently aged out of the
+    // `now - 30d` window below on 2026-10-01T10:00:00Z and then failed
+    // deterministically forever. Derive it from the clock so the
+    // "recent" session can never age out of its own window again.
+    let recent_ts = (chrono::Utc::now() - chrono::Duration::days(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let recent = format!(
+        r#"{{"role":"session_meta","timestamp":"{recent_ts}","ModelUsed":"claude-sonnet-4"}}
+{{"role":"user","content":"recent work","timestamp":"{recent_ts}"}}
+{{"role":"assistant","content":"done","timestamp":"{recent_ts}"}}
+"#
+    );
     let old = r#"{"role":"session_meta","timestamp":"2020-01-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
 {"role":"user","content":"ancient work","timestamp":"2020-01-02T10:00:00Z"}
 {"role":"assistant","content":"done","timestamp":"2020-01-02T10:00:01Z"}

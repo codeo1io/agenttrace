@@ -28,7 +28,7 @@ three shipped locations, while the live remote was public
 `{"isPrivate":false,"visibility":"PUBLIC"}` on 2026-09-30):
 
 1. the deny.toml header comment explaining why OpenSSF Scorecard is absent (deny.toml:6),
-2. the rm-010 roadmap note recording the Scorecard deferral rationale (ROADMAP.md:42),
+2. the rm-010 roadmap note recording the Scorecard deferral rationale (ROADMAP.md:109; entry at :104 — line refreshed 2026-10-01 after roadmap growth),
 3. the Prevention section of the RustSec lockfile solutions document (docs/solutions/security-issues/rustsec-advisory-shipped-via-ungated-lockfile.md:55).
 
 None of the three cited a verification command or a date, so nothing in the
@@ -66,7 +66,7 @@ repository-maintenance cycle 1):
    correction stating the verified reality and the verification method,
    preserving the original decision context. The roadmap's rm-010 note shows
    the pattern: the cycle-1 deferral stays, followed by a cycle-2 correction
-   (ROADMAP.md:42).
+   (ROADMAP.md:109; refreshed 2026-10-01).
 3. **Move checkable properties into gates.** The claims this incident
    incubated became enforced surfaces: an OpenSSF Scorecard workflow now
    exists (`.github/workflows/scorecard.yml`), and the lockfile posture the
