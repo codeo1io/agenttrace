@@ -16,12 +16,15 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 20;
 // titles replaced by first-user-message names) shipped while this stayed
 // at 5, so v5 snapshots can carry stale names under new semantics. The
 // version check regenerates them on next use.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 6;
+// v7: Hermes ok/fail stop being fabricated from tool_call_count and gain the
+// message-derived proven split (rm-177); v6 snapshots would keep serving the
+// zeroed failure rate, so they regenerate on next use.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
 /// never races an in-flight write (pass-7 P7-5).
-const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub(crate) const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Hard entry bound for the session cache (pass-8 F8-3). Beyond it the
 /// entries with the oldest source-file fingerprint (mtime) are dropped
@@ -264,8 +267,7 @@ fn legacy_cache_artifact_paths() -> Vec<PathBuf> {
             let Some(file_name) = file_name.to_str() else {
                 return false;
             };
-            (file_name.starts_with("hermes-sqlite-v")
-                || file_name.starts_with("opencode-sqlite-v"))
+            (file_name.starts_with("hermes-sqlite-v") || file_name.starts_with("opencode-sqlite-v"))
                 && file_name.ends_with(".json")
         })
         .map(|entry| entry.path())
@@ -1252,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_six_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1285,10 +1287,12 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version six (cycle-4 CU-10): cycle 3 shipped the placeholder-name
-        // rewrite while the version stayed at five, so v5 snapshots can
-        // carry stale names under new semantics and must regenerate.
-        assert_eq!(doc["schema_version"], 6);
+        // Version seven (rm-177): six fabricated Hermes tool ok/fail from
+        // `tool_call_count` (failure rate silently zero), so v6 snapshots
+        // carry the fabricated split and must regenerate. (Version six
+        // itself, cycle-4 CU-10: cycle 3 shipped the placeholder-name
+        // rewrite while the version stayed at five.)
+        assert_eq!(doc["schema_version"], 7);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1299,15 +1303,16 @@ mod tests {
             Some(&serde_json::Value::from(720)),
             "the stored-versus-derived delta must survive the snapshot cache"
         );
-        let loaded = load_sqlite_snapshot_from(&database, &snapshot).expect("schema six cache hit");
+        let loaded =
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(5);
+        old["schema_version"] = serde_json::Value::from(6);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema five json"),
+            serde_json::to_vec(&old).expect("schema six json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
@@ -1792,10 +1797,8 @@ mod tests {
         // set comes from cache_artifact_paths() itself (file names are
         // env-independent), so this fails if a store is added to the
         // code but not to the clear set.
-        let root = std::env::temp_dir().join(format!(
-            "agenttrace-clear-cache-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-clear-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create temp cache root");
         let paths: Vec<PathBuf> = cache_artifact_paths()
@@ -1917,5 +1920,14 @@ mod tests {
                 "PRIVACY.md must disclose the legacy {pattern}* purge"
             );
         }
+        // rm-179: atomic-write temps (`.tmp.<pid>.<seq>` siblings of the
+        // artifacts above, including the statusline compaction temp) are
+        // a transient artifact class reclaimed by the dir-wide sweep;
+        // the disclosure must name the pattern so no artifact class
+        // exists outside the enumerated set.
+        assert!(
+            privacy.contains(".tmp."),
+            "PRIVACY.md must disclose the crash-orphan `*.tmp.*` temp purge"
+        );
     }
 }

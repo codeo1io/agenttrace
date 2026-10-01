@@ -3,7 +3,7 @@ use anyhow::{anyhow, Context};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
@@ -307,11 +307,18 @@ fn fallback_catalog() -> PricingCatalog {
 
 fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
     let mut override_models = BTreeSet::new();
-    if let Some((prices, aliases)) = load_pricing_overrides() {
-        override_models.extend(prices.keys().cloned());
-        catalog.entries.extend(prices);
-        catalog.aliases.extend(aliases);
+    let Some((prices, aliases, rejections)) = load_pricing_overrides() else {
+        return override_models;
+    };
+    // rm-183: a hostile override entry (NaN/inf/negative rate) must be
+    // refused by name -- override file plus entry key -- instead of
+    // silently corrupting cost math; valid sibling entries still apply.
+    for rejection in &rejections {
+        eprintln!("{rejection}");
     }
+    override_models.extend(prices.keys().cloned());
+    catalog.entries.extend(prices);
+    catalog.aliases.extend(aliases);
     override_models
 }
 
@@ -395,27 +402,112 @@ struct PricingOverrides {
     aliases: BTreeMap<String, String>,
 }
 
-fn load_pricing_overrides() -> Option<(BTreeMap<String, Price>, BTreeMap<String, String>)> {
-    let path = std::env::var_os("AGENTTRACE_PRICING_FILE").map(PathBuf::from)?;
-    parse_pricing_overrides(&std::fs::read(path).ok()?)
+/// One refused pricing-override entry (rm-183). The override file is
+/// user-supplied, so a refusal must name the file and the offending entry
+/// key rather than silently corrupting cost math (the `is_finite` gate
+/// previously lived only in the LiteLLM `convert_litellm` path).
+#[derive(Debug, Clone, PartialEq)]
+struct PricingOverrideRejection {
+    path: PathBuf,
+    model: String,
+    field: &'static str,
+    value: f64,
 }
 
-fn parse_pricing_overrides(
-    raw: &[u8],
-) -> Option<(BTreeMap<String, Price>, BTreeMap<String, String>)> {
-    let overrides: PricingOverrides = serde_json::from_slice(raw).ok()?;
-    Some((
-        overrides
-            .prices
-            .into_iter()
-            .map(|(model, price)| (normalize_model(&model), price))
-            .collect(),
-        overrides
-            .aliases
-            .into_iter()
-            .map(|(alias, model)| (normalize_model(&alias), normalize_model(&model)))
-            .collect(),
-    ))
+impl std::fmt::Display for PricingOverrideRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "agenttrace: rejected pricing override entry '{}' from {}: field '{}' = {} \
+             (override rates must be finite and non-negative)",
+            self.model,
+            self.path.display(),
+            self.field,
+            self.value
+        )
+    }
+}
+
+/// First rate field of `price` that is non-finite or negative, if any.
+/// JSON cannot spell `NaN`, and serde_json 1.0.150 refuses out-of-range
+/// floats (`1e400`) at parse time -- the finite half of this gate is
+/// defense-in-depth for programmatic callers; the negative half rejects
+/// the hostile class JSON can actually express.
+fn price_field_violation(price: &Price) -> Option<(&'static str, f64)> {
+    for (field, value) in [
+        ("input", price.input),
+        ("output", price.output),
+        ("cw", price.cw),
+        ("cr", price.cr),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Some((field, value));
+        }
+    }
+    None
+}
+
+/// Catalog prices, model aliases, and rejections parsed from a
+/// `AGENTTRACE_PRICING_FILE` override file (rm-183).
+type LoadedPricingOverrides = (
+    BTreeMap<String, Price>,
+    BTreeMap<String, String>,
+    Vec<PricingOverrideRejection>,
+);
+
+fn load_pricing_overrides() -> Option<LoadedPricingOverrides> {
+    let path = std::env::var_os("AGENTTRACE_PRICING_FILE").map(PathBuf::from)?;
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            eprintln!(
+                "agenttrace: cannot read pricing overrides from {}: {err}; \
+                 continuing with catalog pricing",
+                path.display()
+            );
+            return None;
+        }
+    };
+    parse_pricing_overrides(&path, &raw)
+}
+
+fn parse_pricing_overrides(path: &Path, raw: &[u8]) -> Option<LoadedPricingOverrides> {
+    let overrides: PricingOverrides = match serde_json::from_slice(raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            // Named refusal for a malformed file (rm-183): the serde error
+            // names the line/column, so surface it instead of silently
+            // ignoring the overrides.
+            eprintln!(
+                "agenttrace: cannot parse pricing override file {}: {err}; \
+                 continuing with catalog pricing",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let mut prices = BTreeMap::new();
+    let mut rejections = Vec::new();
+    for (model, price) in overrides.prices {
+        // Validate before normalizing so a rejection names the entry key
+        // exactly as the user wrote it (rm-183).
+        if let Some((field, value)) = price_field_violation(&price) {
+            rejections.push(PricingOverrideRejection {
+                path: path.to_path_buf(),
+                model,
+                field,
+                value,
+            });
+            continue;
+        }
+        prices.insert(normalize_model(&model), price);
+    }
+    let aliases = overrides
+        .aliases
+        .into_iter()
+        .map(|(alias, model)| (normalize_model(&alias), normalize_model(&model)))
+        .collect();
+    Some((prices, aliases, rejections))
 }
 
 fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
@@ -1201,7 +1293,8 @@ mod tests {
 
     #[test]
     fn user_pricing_overrides_normalize_models_and_aliases() {
-        let (prices, aliases) = parse_pricing_overrides(
+        let (prices, aliases, rejections) = parse_pricing_overrides(
+            std::path::Path::new("/tmp/overrides.json"),
             br#"{"prices":{"Provider/My-Model":{"input":1,"output":2,"cw":3,"cr":4}},"aliases":{"MY-ALIAS":"Provider/My-Model"}}"#,
         )
         .expect("pricing overrides");
@@ -1210,6 +1303,131 @@ mod tests {
             aliases.get("my-alias").map(String::as_str),
             Some("my-model")
         );
+        assert!(
+            rejections.is_empty(),
+            "valid file must not reject: {rejections:?}"
+        );
+    }
+
+    #[test]
+    fn hostile_pricing_override_rates_are_rejected_with_named_errors() {
+        // rm-183: the override file is user-supplied and bypassed every
+        // validation -- the is_finite gate lived only in the LiteLLM
+        // path. Negative rates (fully expressible in JSON) invert cost
+        // math and must be refused by name while valid siblings in the
+        // same file still apply. (The original "1e400 parses to inf"
+        // premise is corrected in the out-of-range test below.)
+        let file = std::path::Path::new("/tmp/hostile-overrides.json");
+        let (prices, _aliases, rejections) = parse_pricing_overrides(
+            file,
+            br#"{"prices":{
+                "provider/negative-rate":{"input":1,"output":-0.5,"cw":0,"cr":0},
+                "provider/negative-cache":{"input":1,"output":2,"cw":3,"cr":-4},
+                "provider/good-model":{"input":1,"output":2,"cw":3,"cr":4}}}"#,
+        )
+        .expect("pricing overrides parse");
+        assert_eq!(rejections.len(), 2, "both hostile entries refused");
+        let messages: Vec<String> = rejections.iter().map(ToString::to_string).collect();
+        assert!(
+            messages[0].contains("'provider/negative-cache'")
+                && messages[0].contains("field 'cr'")
+                && messages[0].contains("-4")
+                && messages[0].contains("/tmp/hostile-overrides.json"),
+            "named rejection must name file, key, field, value: {}",
+            messages[0]
+        );
+        assert!(
+            messages[1].contains("'provider/negative-rate'")
+                && messages[1].contains("field 'output'")
+                && messages[1].contains("-0.5"),
+            "negative rejection must name the offending field: {}",
+            messages[1]
+        );
+        // Valid sibling entries survive in the same file.
+        assert!(prices.contains_key("good-model"), "valid sibling applies");
+        assert!(
+            !prices.contains_key("negative-rate"),
+            "hostile entry dropped"
+        );
+        assert!(
+            !prices.contains_key("negative-cache"),
+            "negative entry dropped"
+        );
+    }
+
+    #[test]
+    fn out_of_range_pricing_numbers_are_refused_wholesale() {
+        // rm-183 premise correction, pinned: serde_json 1.0.150 rejects
+        // out-of-range floats (1e400) with `NumberOutOfRange` at parse
+        // time, so an infinite rate can never reach `Price` via JSON.
+        // The correct contract is that the whole file is refused (with a
+        // named parse error naming the file) and nothing from it applies;
+        // the finite half of `price_field_violation` remains as
+        // defense-in-depth for programmatic callers.
+        assert!(
+            parse_pricing_overrides(
+                std::path::Path::new("/tmp/inf-overrides.json"),
+                br#"{"prices":{"provider/inf-rate":{"input":1e400,"output":2,"cw":0,"cr":0}}}"#,
+            )
+            .is_none(),
+            "out-of-range number must refuse the file"
+        );
+    }
+
+    #[test]
+    fn nan_pricing_override_rate_is_rejected() {
+        // JSON cannot spell NaN, so the NaN leg exercises the validator
+        // directly: a NaN rate (any field) must be rejected like inf.
+        let nan_price = Price {
+            input: 1.0,
+            output: 2.0,
+            cw: f64::NAN,
+            cr: 0.0,
+        };
+        let (field, value) = price_field_violation(&nan_price).expect("NaN rate must violate");
+        assert_eq!(field, "cw");
+        assert!(value.is_nan());
+        // Zero rates stay legal: genuinely-free override entries must work.
+        assert_eq!(price_field_violation(&Price::default()), None);
+    }
+
+    #[test]
+    fn hostile_override_file_reports_and_valid_entries_apply_via_env() {
+        // rm-183 end-to-end leg: point AGENTTRACE_PRICING_FILE at a file
+        // mixing hostile and valid entries and confirm the loaded catalog
+        // keeps the valid one and drops the hostile one.
+        let _guard = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_PRICING_FILE");
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-pricing-hostile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("overrides.json");
+        std::fs::write(
+            &file,
+            r#"{"prices":{
+                "provider/negative-rate":{"input":1,"output":-0.5,"cw":0,"cr":0},
+                "provider/my-valid":{"input":1,"output":2,"cw":3,"cr":4}}}"#,
+        )
+        .expect("write hostile overrides");
+        std::env::set_var("AGENTTRACE_PRICING_FILE", &file);
+        let mut catalog = fallback_catalog();
+        let override_models = apply_pricing_overrides(&mut catalog);
+        std::env::remove_var("AGENTTRACE_PRICING_FILE");
+        if let Some(value) = prior {
+            std::env::set_var("AGENTTRACE_PRICING_FILE", value);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            catalog.entries.contains_key("my-valid"),
+            "valid override entry must apply: {:?}",
+            override_models
+        );
+        assert!(
+            !catalog.entries.contains_key("negative-rate"),
+            "hostile override entry must be dropped"
+        );
+        assert!(override_models.contains("my-valid"));
+        assert!(!override_models.contains("negative-rate"));
     }
 
     #[test]

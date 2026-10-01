@@ -130,6 +130,20 @@ agenttrace --delivery-evidence --range 30d -f json
 # Report subscription limit pressure and upstream prompt-cache miss
 # causes captured by the statusline hook (see "Statusline capture" below).
 agenttrace --statusline-report -f json
+
+# Multi-session comparison against the reference model (default "default",
+# override with --model). Coverage follows the governance contract:
+# every matching session unless --sample bounds it.
+agenttrace --compare --range 30d
+
+# Waste breakdown for the newest matching session: prompt-cache
+# efficiency, tool-call bloat, and loop waste, each priced from the
+# catalog.
+agenttrace --waste --range 7d
+
+# Pricing self-check: how sample model names (aliases, normalization,
+# one deliberately unknown model) resolve to catalog rates.
+agenttrace --test-match
 ```
 
 `pricing-overrides.json` accepts `aliases` plus per-million-token `prices`:

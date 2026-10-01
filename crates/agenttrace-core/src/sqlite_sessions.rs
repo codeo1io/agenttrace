@@ -166,11 +166,68 @@ fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec
     filter_since(sessions, since)
 }
 
+/// Per-session tool-outcome counts derived from the `messages` table (rm-177).
+///
+/// Hermes' `sessions` table persists only `tool_call_count` — there is no
+/// ok/outcome column — so the proven split comes from the session's own
+/// `role = 'tool'` result rows. The executor wraps every raised, timed-out and
+/// shutdown failure in the canonical `Error executing tool '<name>': ...`
+/// prefix, and polished tools report `"success": false` / `"ok": false` or a
+/// non-zero `exit_code` / `returncode`; Hermes itself classifies failures
+/// exactly this way (`_tool_result_failed` deliberately treats nothing else
+/// as failed), so a result row matching no marker is a proven success in the
+/// writer's own model. `effect_disposition` is NOT an outcome signal — `none`
+/// means the call was blocked before running and `unknown` (timeout) already
+/// persists the canonical error prefix — and stays reserved for future
+/// side-effect analytics (migration note for this fix).
+struct ToolOutcomeCounts {
+    results: usize,
+    failures: usize,
+}
+
+fn sqlite_tool_outcome_counts(db: &Connection) -> HashMap<String, ToolOutcomeCounts> {
+    // Boolean markers are plain LIKE (portable across SQLite builds); the
+    // exit-code probes run on the bundled SQLite, where JSON1 is always on.
+    let sql = "\
+        select session_id, count(*), \
+         sum(case when content like 'Error executing tool ''%' \
+             or content like '%\"success\": false%' \
+             or content like '%\"ok\": false%' \
+             or (json_valid(content) and coalesce(json_extract(content, '$.exit_code'), 0) != 0) \
+             or (json_valid(content) and coalesce(json_extract(content, '$.returncode'), 0) != 0) \
+         then 1 else 0 end) \
+         from messages where role = 'tool' group by session_id";
+    let Ok(mut stmt) = db.prepare(sql) else {
+        return HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+        ))
+    }) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for (session_id, results, failures) in rows.filter_map(Result::ok) {
+        out.insert(
+            session_id,
+            ToolOutcomeCounts {
+                results: results.max(0) as usize,
+                failures: failures.max(0) as usize,
+            },
+        );
+    }
+    out
+}
+
 fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
     let Ok(db) = open_sqlite_read_only(path) else {
         return Vec::new();
     };
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
+    let tool_outcomes = sqlite_tool_outcome_counts(&db);
     let cwd = if sqlite_has_column(&db, "sessions", "cwd") {
         "cwd"
     } else {
@@ -193,7 +250,10 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             end_unix: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
             events: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as usize,
             tool_calls_total: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as usize,
-            tool_calls_ok: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as usize,
+            // rm-177: `sessions` has no outcome column, so ok/fail are derived
+            // from per-message evidence below instead of fabricated from the
+            // total (which silently zeroed the failure rate).
+            tool_calls_ok: 0,
             input_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0),
             output_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0),
             cache_read_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0),
@@ -216,6 +276,21 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
                 agg.user_messages = counts.user;
                 agg.assistant_turns = counts.assistant;
                 agg.tool_results = counts.tool;
+            }
+            if let Some(counts) = tool_outcomes.get(&agg.id) {
+                // Proven split from the session's own tool-result rows; the
+                // residual between the persisted total and ok+fail is
+                // unproven (compacted or crash-missing rows) and stays out of
+                // both counters instead of being fabricated as successes
+                // (rm-039: unknown != zero).
+                agg.tool_calls_ok = counts.results.saturating_sub(counts.failures);
+                agg.tool_calls_fail = counts.failures;
+                let proven = agg.tool_calls_ok + agg.tool_calls_fail;
+                if proven > agg.tool_calls_total {
+                    // Enforced total = ok + fail identity: direct message
+                    // evidence wins over a lagging persisted aggregate.
+                    agg.tool_calls_total = proven;
+                }
             }
             session_from_sqlite_agg(agg)
         })
@@ -842,6 +917,91 @@ fn clean_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// Golden fixture for the Hermes tool-outcome mapping (rm-177): ok, fail
+    /// and total all differ, unknown outcomes are never fabricated as
+    /// successes, and a lagging persisted total is lifted to the proven split.
+    #[test]
+    fn hermes_tool_outcomes_split_from_message_evidence() {
+        let dir = std::env::temp_dir().join(format!("agenttrace-rm177-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let db_path = dir.join("state.db");
+        let _ = fs::remove_file(&db_path);
+        let db = Connection::open(&db_path).unwrap();
+        db.execute_batch(
+            "create table sessions (id text primary key, model text, started_at real, \
+             ended_at real, message_count integer, tool_call_count integer, input_tokens integer, \
+             output_tokens integer, cache_read_tokens integer, cache_write_tokens integer, cwd text); \
+             create table messages (id integer primary key autoincrement, session_id text not null, \
+             role text not null, content text, tool_call_id text, tool_calls text, tool_name text, \
+             effect_disposition text, timestamp real not null, token_count integer, finish_reason text);",
+        )
+        .unwrap();
+        let insert_session =
+            "insert into sessions (id, model, started_at, ended_at, message_count, \
+             tool_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) \
+             values (?1, 'gpt-5', 1.0, 2.0, 9, ?2, 10, 10, 0, 0)";
+        // a: five persisted calls — two plain results, one structured success,
+        // one executor-wrapped failure, one structured failure.
+        db.execute(insert_session, ["a", "5"]).unwrap();
+        for (role, content) in [
+            ("user", "list the repo"),
+            ("assistant", "running tools"),
+            ("tool", "OK: 42 rows"),
+            ("tool", "{\"rows\": [{\"path\": \"src/lib.rs\"}]}"),
+            ("tool", "{\"success\": true, \"bytes\": 10}"),
+            ("tool", "Error executing tool 'bash': exit 1"),
+            ("tool", "{\"success\": false, \"error\": \"boom\"}"),
+        ] {
+            db.execute(
+                "insert into messages (session_id, role, content, tool_call_id, tool_calls, \
+                 tool_name, effect_disposition, timestamp, token_count, finish_reason) \
+                 values ('a', ?1, ?2, 'tc', '[]', 'bash', null, 1.0, 5, null)",
+                [role, content],
+            )
+            .unwrap();
+        }
+        // b: two persisted calls whose result rows were compacted away — the
+        // split must stay unproven (0/0), not fabricated as two successes.
+        db.execute(insert_session, ["b", "2"]).unwrap();
+        db.execute(
+            "insert into messages (session_id, role, content, timestamp) values ('b', 'user', 'hi', 1.0)",
+            (),
+        )
+        .unwrap();
+        // c: persisted total lags the message evidence (3 proven results,
+        // 1 failing) — the identity lifts the total to 3.
+        db.execute(insert_session, ["c", "1"]).unwrap();
+        for content in ["OK", "OK", "Error executing tool 'read': gone"] {
+            db.execute(
+                "insert into messages (session_id, role, content, timestamp) values ('c', 'tool', ?1, 1.0)",
+                [content],
+            )
+            .unwrap();
+        }
+        drop(db);
+
+        // query_ bypasses the session cache entirely, so the fixture is hermetic.
+        let sessions = query_hermes_sqlite_sessions(&db_path, None);
+        let metrics = |id: &str| {
+            let session = sessions.iter().find(|session| session.name == id).unwrap();
+            (
+                session.metrics.tool_calls_total,
+                session.metrics.tool_calls_ok,
+                session.metrics.tool_calls_fail,
+            )
+        };
+        assert_eq!(metrics("a"), (5, 3, 2));
+        assert_eq!(metrics("b"), (2, 0, 0));
+        assert_eq!(metrics("c"), (3, 2, 1));
+
+        // The gate math `--max-tool-fail-rate` consumes (fail / proven
+        // outcomes): session a now trips at a 30% threshold.
+        let rate: f64 = 2.0 / (3.0 + 2.0) * 100.0;
+        assert!((rate - 40.0).abs() < 1e-9);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sqlite_session_preserves_workspace() {
