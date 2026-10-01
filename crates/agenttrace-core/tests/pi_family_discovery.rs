@@ -277,3 +277,71 @@ fn lock_env() -> std::sync::MutexGuard<'static, ()> {
         Err(poisoned) => poisoned.into_inner(),
     }
 }
+
+#[test]
+fn stale_pi_family_children_are_not_registered() {
+    // rm-084 assess addendum: backup/snapshot copies of an agent home
+    // (`agent.bak`, `agent-backup-2026-09-14`) silently duplicate their
+    // corpus into every total; the stale-child policy must skip them
+    // while live profile variants (`agent-cliproxy-only`) and unknown
+    // new forks keep registering as before.
+    let root = temp_root("agenttrace-pi-family-stale");
+    let home = root.join("home");
+    let live = vec![
+        pi_transcript(&home.join(".pi").join("agent"), "proj", "live.jsonl"),
+        pi_transcript(
+            &home.join(".pi").join("agent-cliproxy-only"),
+            "proj",
+            "profile.jsonl",
+        ),
+        pi_transcript(&home.join(".omo").join("agent-2025"), "proj", "year.jsonl"),
+    ];
+    let stale = vec![
+        pi_transcript(&home.join(".pi").join("agent.bak"), "proj", "bak.jsonl"),
+        pi_transcript(
+            &home.join(".pi").join("agent-backup-2026-09-14"),
+            "proj",
+            "snapshot.jsonl",
+        ),
+        pi_transcript(&home.join(".omp").join("agent-old"), "proj", "old.jsonl"),
+        pi_transcript(
+            &home.join(".senpi").join("agent-20260901"),
+            "proj",
+            "stamp.jsonl",
+        ),
+    ];
+
+    with_home(&home, || {
+        let discovered: HashSet<String> = find_session_files(None)
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        let expected: HashSet<String> = live
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            discovered, expected,
+            "discovery must return exactly the live corpus: stale backup children \
+             are skipped and live profile variants keep registering"
+        );
+
+        let registry: Vec<String> = known_session_dirs()
+            .into_iter()
+            .map(|dir| dir.path.to_string_lossy().to_string())
+            .collect();
+        for path in &stale {
+            let Some(stale_home) = path.parent().and_then(Path::parent).and_then(Path::parent)
+            else {
+                panic!("fixture must sit three levels under its home: {}", path.display())
+            };
+            assert!(
+                !registry.contains(&stale_home.to_string_lossy().to_string()),
+                "stale child home must not be registered: {}",
+                stale_home.display()
+            );
+        }
+    });
+
+    let _ = fs::remove_dir_all(root);
+}

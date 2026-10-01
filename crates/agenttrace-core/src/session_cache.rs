@@ -1886,11 +1886,18 @@ mod tests {
         // history file — with its purge path. Names come from the same
         // constructors that build the paths, so adding a store without
         // disclosing it fails here.
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("PRIVACY.md");
-        let privacy = fs::read_to_string(&repo_root)
-            .unwrap_or_else(|err| panic!("read {}: {err}", repo_root.display()));
+        let Some(privacy) = privacy_doc_contents() else {
+            // rm-086 assess addendum: a no-checkout test run (cargo
+            // install --path, released tarball) has no PRIVACY.md next
+            // to the manifest; skip instead of panicking so the suite
+            // stays portable. In CI the checkout always carries the
+            // doc, so the disclosure contract is still enforced there.
+            eprintln!(
+                "skipping privacy_disclosure_lists_every_artifact: \
+                 PRIVACY.md is not present next to the manifest (no-checkout run)"
+            );
+            return;
+        };
         let mut names: Vec<String> = cache_artifact_paths()
             .iter()
             .chain(std::iter::once(&crate::history::history_path()))
@@ -1917,5 +1924,27 @@ mod tests {
                 "PRIVACY.md must disclose the legacy {pattern}* purge"
             );
         }
+    }
+
+    /// Locates the PRIVACY.md disclosure for the test above (rm-086
+    /// assess addendum): `AGENTTRACE_PRIVACY_DOC` overrides the path —
+    /// and fails hard when set but unreadable, because an explicit
+    /// override is a contract — otherwise the manifest-relative
+    /// document is used when present. Returns `None` in a no-checkout
+    /// run so the test can skip instead of panicking.
+    fn privacy_doc_contents() -> Option<String> {
+        if let Some(path) = std::env::var_os("AGENTTRACE_PRIVACY_DOC") {
+            let path = std::path::PathBuf::from(path);
+            return Some(fs::read_to_string(&path).unwrap_or_else(|err| {
+                panic!(
+                    "AGENTTRACE_PRIVACY_DOC is set but unreadable ({}): {err}",
+                    path.display()
+                )
+            }));
+        }
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("PRIVACY.md");
+        fs::read_to_string(repo_root).ok()
     }
 }

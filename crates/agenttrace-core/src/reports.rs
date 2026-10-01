@@ -1913,26 +1913,67 @@ fn strip_nulls(value: Value) -> Value {
     }
 }
 
+/// Canonical base labels for source-tool ids that appear in more than
+/// one display surface (rm-228). The report renderers below and the
+/// TUI session view (crates/agenttrace-tui/src/shared.rs) both derive
+/// their surface wording from this table, and lockstep tests on both
+/// sides fail when an id listed here lacks a real label in either
+/// surface — a new cross-surface source id cannot ship rendering as a
+/// raw slug in exactly one of them. Ids that only ever appear in one
+/// surface (report-only format ids such as `gemini_cli`) stay in that
+/// surface's own map; move them here when a second surface needs them.
+pub const SOURCE_LABELS: &[(&str, &str)] = &[
+    ("pi", "Pi"),
+    ("oh_my_pi", "Oh My Pi"),
+    ("pi_senpi", "Pi (senpi)"),
+    ("pi_omo", "Pi (omo)"),
+    ("claude_code", "Claude Code"),
+    ("codex_cli", "Codex"),
+    ("hermes_db", "Hermes DB"),
+    ("opencode_db", "OpenCode DB"),
+];
+
+/// Looks up the canonical base label for a source-tool id.
+pub fn source_base_label(id: &str) -> Option<&'static str> {
+    SOURCE_LABELS
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map(|(_, label)| *label)
+}
+
+/// Report-surface wording that differs from the canonical base label
+/// (rm-228): these ids render from SOURCE_LABELS with the report
+/// qualifier/wording below so the two surfaces share one id→base
+/// truth while keeping their intentionally different vocabulary.
+const REPORT_LABEL_OVERRIDES: &[(&str, &str)] = &[
+    ("codex_cli", "Codex CLI"),
+    ("hermes_db", "Hermes Agent (DB)"),
+    ("opencode_db", "OpenCode (DB)"),
+];
+
 fn tool_display_name(name: &str) -> String {
+    // rm-228: every id in the canonical SOURCE_LABELS table renders
+    // from it (with a report-specific wording override where the
+    // report vocabulary differs); only single-surface format ids keep
+    // local arms below.
+    if let Some(base) = source_base_label(name) {
+        return REPORT_LABEL_OVERRIDES
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, label)| label.to_string())
+            .unwrap_or_else(|| base.to_string());
+    }
     match name {
         "hermes_jsonl" => "Hermes Agent (JSONL)".to_string(),
         "hermes_json" => "Hermes Agent (.json)".to_string(),
-        "hermes_db" => "Hermes Agent (DB)".to_string(),
-        "claude_code" => "Claude Code".to_string(),
         "claude_code_jsonl" => "Claude Code (JSONL)".to_string(),
-        "codex_cli" => "Codex CLI".to_string(),
         "codex_rollout" => "Codex CLI (Rollout)".to_string(),
         "gemini_cli" => "Gemini CLI".to_string(),
         "qwen_code" => "Qwen Code".to_string(),
         "opencode" => "OpenCode".to_string(),
-        "opencode_db" => "OpenCode (DB)".to_string(),
         "openclaw" => "OpenClaw".to_string(),
         "copilot_cli" => "Copilot CLI".to_string(),
         "kimi_cli" => "Kimi CLI".to_string(),
-        "pi" => "Pi".to_string(),
-        "pi_senpi" => "Pi (senpi)".to_string(),
-        "pi_omo" => "Pi (omo)".to_string(),
-        "oh_my_pi" => "Oh My Pi".to_string(),
         "aider" => "Aider".to_string(),
         "cursor" => "Cursor".to_string(),
         "cline" => "Cline".to_string(),

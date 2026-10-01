@@ -234,16 +234,28 @@ pub(super) fn display_session_source(session: &Session) -> String {
 
 pub(super) fn display_source_label(source: &str) -> String {
     let source = source.trim();
+    // rm-228 single source of truth: id arms derive from the canonical
+    // core table (agenttrace_core::SOURCE_LABELS); the four pi-family
+    // rows add the session-view " sessions" wording, the rest render
+    // the base label verbatim. presentation.rs delegates here instead
+    // of drifting a twin map, and the path-suffix arms below fold in
+    // what the former test twin knew so both build modes agree.
+    if let Some(base) = agenttrace_core::source_base_label(source) {
+        const SESSION_VIEW_WORDING: [&str; 4] = ["pi", "oh_my_pi", "pi_senpi", "pi_omo"];
+        return if SESSION_VIEW_WORDING.contains(&source) {
+            format!("{base} sessions")
+        } else {
+            base.to_string()
+        };
+    }
     match source {
         "" | "auto-discovery" => "auto discovery".to_string(),
-        "pi" => "Pi sessions".to_string(),
-        "oh_my_pi" => "Oh My Pi sessions".to_string(),
-        "pi_senpi" => "Pi (senpi) sessions".to_string(),
-        "pi_omo" => "Pi (omo) sessions".to_string(),
-        "claude_code" => "Claude Code".to_string(),
-        "codex_cli" => "Codex".to_string(),
-        "hermes_db" => "Hermes DB".to_string(),
-        "opencode_db" => "OpenCode DB".to_string(),
+        _ if source.ends_with("/.pi/agent/sessions") => "Pi sessions".to_string(),
+        _ if source.ends_with("/.omp/agent/sessions") => "Oh My Pi sessions".to_string(),
+        _ if source.ends_with("/.claude/projects") => "Claude Code".to_string(),
+        _ if source.contains("/.codex/") => "Codex".to_string(),
+        _ if source.ends_with("/.hermes/state.db") => "Hermes DB".to_string(),
+        _ if source.ends_with("/opencode.db") => "OpenCode DB".to_string(),
         _ if source.contains('/') => source
             .rsplit('/')
             .find(|part| !part.is_empty())

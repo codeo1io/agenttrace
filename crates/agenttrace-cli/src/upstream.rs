@@ -34,6 +34,13 @@ const DEFAULT_REF: &str = "master";
 /// itself ships no npm manifest; the registry is the source of truth.
 const NPM_PACKAGE: &str = "@zack78/agenttrace";
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@zack78%2fagenttrace/latest";
+
+/// rm-225 contrast: wall-clock cap for the npm-probe curl. The
+/// delivery-evidence `git log` subprocess
+/// (`agenttrace_core::GIT_INSPECT_TIMEOUT_SECS`) carries the same
+/// discipline; the test at the bottom of this module pins the pair so
+/// they cannot drift apart.
+const NPM_PROBE_TIMEOUT_SECS: u64 = 15;
 /// Text view caps the unported commit list; JSON carries all of them.
 const MAX_UNPORTED_LISTED: usize = 20;
 
@@ -314,7 +321,10 @@ fn mtime_age(path: &std::path::Path) -> Option<u64> {
 /// fails the report) when curl is absent or the registry answers badly.
 fn npm_registry_version() -> Option<String> {
     let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "15", NPM_REGISTRY_URL])
+        .arg("-fsSL")
+        .arg("--max-time")
+        .arg(NPM_PROBE_TIMEOUT_SECS.to_string())
+        .arg(NPM_REGISTRY_URL)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -477,6 +487,17 @@ mod tests {
         assert_eq!(classify_area("crates/agenttrace-tui/src/app.rs"), "tui");
         assert_eq!(classify_area("README.md"), "docs/testdata");
         assert_eq!(classify_area("some/where/else.bin"), "other");
+    }
+
+    #[test]
+    fn npm_probe_and_git_inspect_timeouts_match() {
+        // rm-225: the delivery-evidence `git log` subprocess is bounded
+        // by the same wall-clock ceiling as this module's npm-probe
+        // curl, so neither subprocess family can hang the report.
+        assert_eq!(
+            NPM_PROBE_TIMEOUT_SECS,
+            agenttrace_core::GIT_INSPECT_TIMEOUT_SECS
+        );
     }
 
     #[test]

@@ -3598,42 +3598,10 @@ pub(super) fn display_session_source(session: &Session) -> String {
 }
 
 pub(super) fn display_source_label(source: &str) -> String {
-    let source = source.trim();
-    if source.is_empty() || source == "auto-discovery" {
-        return "auto discovery".to_string();
-    }
-    if source == "pi" || source.ends_with("/.pi/agent/sessions") {
-        return "Pi sessions".to_string();
-    }
-    if source == "oh_my_pi" || source.ends_with("/.omp/agent/sessions") {
-        return "Oh My Pi sessions".to_string();
-    }
-    if source == "pi_senpi" {
-        return "Pi (senpi) sessions".to_string();
-    }
-    if source == "pi_omo" {
-        return "Pi (omo) sessions".to_string();
-    }
-    if source == "claude_code" || source.ends_with("/.claude/projects") {
-        return "Claude Code".to_string();
-    }
-    if source == "codex_cli" || source.contains("/.codex/") {
-        return "Codex".to_string();
-    }
-    if source == "hermes_db" || source.ends_with("/.hermes/state.db") {
-        return "Hermes DB".to_string();
-    }
-    if source == "opencode_db" || source.ends_with("/opencode.db") {
-        return "OpenCode DB".to_string();
-    }
-    if source.contains('/') {
-        return source
-            .rsplit('/')
-            .find(|part| !part.is_empty())
-            .unwrap_or(source)
-            .to_string();
-    }
-    source.to_string()
+    // rm-228: single source of truth — the canonical map lives in
+    // shared.rs (id arms derived from agenttrace_core::SOURCE_LABELS);
+    // this twin delegates instead of drifting a second copy.
+    super::shared::display_source_label(source)
 }
 
 pub(super) fn driver_model(session: &Session) -> String {

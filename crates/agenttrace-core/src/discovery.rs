@@ -186,6 +186,9 @@ fn pi_family_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
                 let Some(name) = child.file_name().and_then(std::ffi::OsStr::to_str) else {
                     continue;
                 };
+                if is_stale_pi_family_child(name) {
+                    continue;
+                }
                 let label = if name == "agent" {
                     brand.to_string()
                 } else {
@@ -202,6 +205,49 @@ fn pi_family_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
         }
     }
     dirs
+}
+
+/// Decides whether a child of a pi-family root is a stale copy of an
+/// agent home rather than a live agent dir (rm-084 assess addendum:
+/// `~/.pi/agent.bak/sessions`-class duplicates silently double-count
+/// their corpus into every total, and nothing else distinguishes them
+/// from a live profile dir such as `agent-cliproxy-only`).
+///
+/// Policy (suffix- and date-stamp-based, deliberately narrow so new
+/// fork profiles keep registering): a child is stale when its final
+/// `.`/`-`/`_`-separated token is a backup/trash marker
+/// (bak/backup/old/orig/copy/tmp/save/trash), or when it ends in a
+/// date stamp (`-YYYY-MM-DD`, `-YYYYMMDD`) — the shapes snapshot and
+/// backup tooling produces. Anything else registers as before.
+fn is_stale_pi_family_child(name: &str) -> bool {
+    const MARKERS: [&str; 8] = ["bak", "backup", "old", "orig", "copy", "tmp", "save", "trash"];
+    let lower = name.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split(['.', '-', '_']).collect();
+    if let Some(last) = tokens.last() {
+        if MARKERS.contains(last) {
+            return true;
+        }
+        if last.len() == 8 && last.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    if tokens.len() >= 3 {
+        let (year, month, day) = (
+            tokens[tokens.len() - 3],
+            tokens[tokens.len() - 2],
+            tokens[tokens.len() - 1],
+        );
+        if year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && year.bytes().all(|b| b.is_ascii_digit())
+            && month.bytes().all(|b| b.is_ascii_digit())
+            && day.bytes().all(|b| b.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {

@@ -668,17 +668,18 @@ pub fn delivery_evidence_with_git(sessions: &[Session]) -> DeliveryEvidence {
 }
 
 fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryEvidence {
-    let commits = if inspect_git {
+    let git = if inspect_git {
         git_commits_by_root(sessions)
     } else {
-        Default::default()
+        GitEvidence::default()
     };
     let mut summary = DeliverySummary::default();
     let mut records = Vec::new();
     for session in sessions {
         let project = resolve_project(session);
         let authority = &session.metrics.tool_authority;
-        let matching_commits = commits
+        let matching_commits = git
+            .commits_by_root
             .get(&project.root)
             .map(|commits| commits_for_session(commits, session))
             .unwrap_or_default();
@@ -725,7 +726,17 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
             )
         };
         if inspect_git && matching_commits.is_empty() && !project.root.is_empty() {
-            evidence.push("no overlapping local commit found; this does not rule out uncommitted, remote, non-code, or later-delivered work".to_string());
+            if let Some(reason) = git.refused_roots.get(&project.root) {
+                // rm-225: say the inspection was skipped and why — the
+                // root failed the trust policy (transcript-shaped path);
+                // a silent "no overlapping commit" would overstate what
+                // was checked.
+                evidence.push(format!(
+                    "local Git inspection skipped: the derived project root was refused by the trust policy ({reason}); set AGENTTRACE_DELIVERY_EVIDENCE_ROOTS to inspect it explicitly"
+                ));
+            } else {
+                evidence.push("no overlapping local commit found; this does not rule out uncommitted, remote, non-code, or later-delivered work".to_string());
+            }
         }
         match level {
             "strong" => summary.strong += 1,
@@ -763,35 +774,243 @@ struct GitCommit {
     timestamp: DateTime<Utc>,
 }
 
-fn git_commits_by_root(sessions: &[Session]) -> BTreeMap<String, Vec<GitCommit>> {
-    let roots = sessions
-        .iter()
-        .map(resolve_project)
-        .map(|project| project.root)
-        .filter(|root| !root.is_empty())
-        .collect::<BTreeSet<_>>();
-    roots
-        .into_iter()
-        .filter_map(|root| git_commits(&root).map(|commits| (root, commits)))
-        .collect()
+/// rm-225: wall-clock ceiling for one delivery-evidence `git log`.
+/// Mirrors the npm-probe curl cap (crates/agenttrace-cli/src/upstream.rs
+/// `NPM_PROBE_TIMEOUT_SECS`); a contrast test pins the pair so the two
+/// subprocess disciplines cannot drift apart.
+pub const GIT_INSPECT_TIMEOUT_SECS: u64 = 15;
+
+/// rm-225: `--max-count` bound on the `git log --all` query, on top of
+/// the per-root `--since` floor (earliest session window per root). A
+/// session cannot match a commit older than its own window, so the
+/// floor is exact; the cap bounds even a pathological repository that
+/// holds millions of commits inside the window.
+pub const GIT_INSPECT_MAX_COMMITS: usize = 10_000;
+
+/// rm-225: explicit allowlist (path list, `:`-separated) for the git
+/// roots delivery evidence may inspect. When set it REPLACES the
+/// default trust policy: only roots at or under an entry are queried,
+/// and an entry may explicitly trust a path the default policy refuses
+/// (e.g. a repository kept under the system temp directory).
+pub const GIT_INSPECT_ROOT_ALLOWLIST_VAR: &str = "AGENTTRACE_DELIVERY_EVIDENCE_ROOTS";
+
+/// rm-225 verdict of the delivery-evidence root trust policy. The
+/// derived git root comes from session metadata, and a hostile
+/// transcript controls that metadata (the session directory name
+/// decodes into an arbitrary path via `decode_agent_project_dir`), so
+/// the spawn site — not the decoder — is the trust boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootTrust {
+    Trusted,
+    Refused(&'static str),
 }
 
-fn git_commits(root: &str) -> Option<Vec<GitCommit>> {
-    let output = Command::new("git")
-        .args(["-C", root, "log", "--all", "--format=%ct"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Pure core of the root trust policy (rm-225), parameterized by the
+/// environment so tests pin it without mutating process state:
+///
+/// * an allowlist entry covering the root (after canonicalizing both)
+///   is trusted outright — explicit user configuration wins, even for
+///   a path the default policy would refuse;
+/// * with an allowlist set but no entry covering it, the root is
+///   refused — the allowlist replaces, not extends, the defaults;
+/// * otherwise a root under the system temp directory is refused:
+///   that is exactly the shape of the transcript-decoded hostile path;
+/// * otherwise the default policy trusts the user's own territory —
+///   anything at or under `$HOME`, at or under the working directory,
+///   or an ancestor of it (the audit running inside the repository);
+/// * anything else (e.g. `/etc`, an unrelated mount) is refused.
+fn root_trust_decision(
+    root: &str,
+    home: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+    temp: Option<&std::path::Path>,
+    allowlist: Option<&str>,
+) -> RootTrust {
+    if root.trim().is_empty() {
+        return RootTrust::Refused("empty root");
     }
+    let Some(root_canon) = std::fs::canonicalize(root).ok() else {
+        return RootTrust::Refused("path does not resolve on this host");
+    };
+    let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
+    if let Some(list) = allowlist {
+        let covered = list
+            .split(':')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .filter_map(|entry| canonical(std::path::Path::new(entry)))
+            .any(|entry| root_canon.starts_with(&entry));
+        if covered {
+            return RootTrust::Trusted;
+        }
+        return RootTrust::Refused("not under any allowlist entry");
+    }
+    if let Some(temp) = temp.and_then(canonical) {
+        if root_canon.starts_with(&temp) {
+            return RootTrust::Refused("inside the system temp directory");
+        }
+    }
+    if home
+        .and_then(canonical)
+        .is_some_and(|home| root_canon.starts_with(&home))
+    {
+        return RootTrust::Trusted;
+    }
+    if let Some(cwd) = cwd.and_then(canonical) {
+        if root_canon.starts_with(&cwd) || cwd.starts_with(&root_canon) {
+            return RootTrust::Trusted;
+        }
+    }
+    RootTrust::Refused("outside the user home and the working directory")
+}
+
+/// Env-reading wrapper over [`root_trust_decision`] (rm-225).
+fn trusted_root(root: &str) -> RootTrust {
+    let allowlist = std::env::var(GIT_INSPECT_ROOT_ALLOWLIST_VAR).ok();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let cwd = std::env::current_dir().ok();
+    let temp = std::env::temp_dir();
+    root_trust_decision(
+        root,
+        home.as_deref(),
+        cwd.as_deref(),
+        Some(temp.as_path()),
+        allowlist.as_deref(),
+    )
+}
+
+/// Builds the bounded, hardened `git log` for one root (rm-225):
+/// fsmonitor off (no side processes), prompts and system config off,
+/// `%ct` output, `--since` pinned to the earliest session window that
+/// could match, `--max-count` as a hard cap.
+fn git_log_command(root: &str, floor: Option<DateTime<Utc>>, cap: usize) -> Command {
+    let mut command = Command::new("git");
+    command.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        root,
+        "log",
+        "--all",
+        "--format=%ct",
+    ]);
+    if let Some(floor) = floor {
+        command.arg(format!("--since={}", floor.timestamp()));
+    }
+    command.arg(format!("--max-count={cap}"));
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    command
+}
+
+/// Polls a child to completion and kills it at the deadline (rm-225).
+/// Returns `None` for a timeout or an unrecoverable wait error.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// Commits reachable in one root's repository, bounded and hardened
+/// (rm-225). Stdout is redirected to a scratch file under the system
+/// temp dir rather than a pipe: the capped 10k-line `%ct` output can
+/// exceed the pipe buffer (notably on macOS) and would deadlock the
+/// deadline poll while git blocks on write.
+fn git_commits(command: &mut Command, timeout: std::time::Duration) -> Option<Vec<GitCommit>> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default();
+    let out_path = std::env::temp_dir().join(format!(
+        "agenttrace-git-log-{}-{nanos}",
+        std::process::id()
+    ));
+    let stdout = std::fs::File::create(&out_path).ok()?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::null());
+    let read = (|| {
+        let mut child = command.spawn().ok()?;
+        let status = wait_with_deadline(&mut child, timeout)?;
+        if !status.success() {
+            return None;
+        }
+        std::fs::read_to_string(&out_path).ok()
+    })();
+    let _ = std::fs::remove_file(&out_path);
     Some(
-        String::from_utf8_lossy(&output.stdout)
+        read?
             .lines()
             .filter_map(|line| line.parse::<i64>().ok())
             .filter_map(|timestamp| DateTime::from_timestamp(timestamp, 0))
             .map(|timestamp| GitCommit { timestamp })
             .collect(),
     )
+}
+
+/// Git evidence for the whole corpus (rm-225): commits per trusted
+/// root, plus the roots the trust policy refused — so per-session
+/// evidence can say the inspection was skipped instead of silently
+/// claiming "no overlapping commit".
+#[derive(Default)]
+struct GitEvidence {
+    commits_by_root: BTreeMap<String, Vec<GitCommit>>,
+    refused_roots: BTreeMap<String, &'static str>,
+}
+
+fn git_commits_by_root(sessions: &[Session]) -> GitEvidence {
+    let mut sessions_by_root: BTreeMap<String, Vec<&Session>> = BTreeMap::new();
+    for session in sessions {
+        let root = resolve_project(session).root;
+        if !root.is_empty() {
+            sessions_by_root.entry(root).or_default().push(session);
+        }
+    }
+    let mut evidence = GitEvidence::default();
+    for (root, root_sessions) in sessions_by_root {
+        // Commits can only match inside [start - 2m, end + 5m]; a root
+        // whose sessions have no parseable window can never produce a
+        // match, so it never spawns git at all. The `--since` floor is
+        // the earliest possible match across the root's sessions.
+        let Some(floor) = root_sessions
+            .iter()
+            .filter_map(|session| parse_timestamp(&session.metrics.session_start))
+            .map(|start| start - Duration::minutes(2))
+            .min()
+        else {
+            continue;
+        };
+        match trusted_root(&root) {
+            RootTrust::Trusted => {
+                let mut command = git_log_command(&root, Some(floor), GIT_INSPECT_MAX_COMMITS);
+                if let Some(commits) = git_commits(
+                    &mut command,
+                    std::time::Duration::from_secs(GIT_INSPECT_TIMEOUT_SECS),
+                ) {
+                    evidence.commits_by_root.insert(root, commits);
+                }
+            }
+            RootTrust::Refused(reason) => {
+                evidence.refused_roots.insert(root, reason);
+            }
+        }
+    }
+    evidence
 }
 
 fn commits_for_session<'a>(commits: &'a [GitCommit], session: &Session) -> Vec<&'a GitCommit> {
@@ -1139,5 +1358,293 @@ mod tests {
         assert_eq!(report.summary.medium, 1);
         assert!(report.methodology.contains("heuristic"));
         assert!(report.sessions[0].confidence.contains("not attributable"));
+    }
+
+    // ---- rm-225: bounded, hardened delivery-evidence git inspection ----
+
+    #[test]
+    fn git_log_args_are_bounded_and_hardened() {
+        let floor = DateTime::parse_from_rfc3339("2026-05-03T10:00:00Z")
+            .expect("fixed floor parses")
+            .with_timezone(&Utc);
+        let command = git_log_command("/tmp/probe", Some(floor), 500);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        for expected in [
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            "/tmp/probe",
+            "log",
+            "--all",
+            "--format=%ct",
+            &format!("--since={}", floor.timestamp()),
+            "--max-count=500",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "git log args must include {expected}: {args:?}"
+            );
+        }
+        let env: Vec<(&std::ffi::OsStr, &std::ffi::OsStr)> = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect();
+        assert!(
+            env.contains(&("GIT_TERMINAL_PROMPT".as_ref(), "0".as_ref())),
+            "git must not be allowed to prompt: {env:?}"
+        );
+        assert!(
+            env.contains(&("GIT_CONFIG_NOSYSTEM".as_ref(), "1".as_ref())),
+            "system git config must be disabled: {env:?}"
+        );
+    }
+
+    #[test]
+    fn git_inspection_defaults_stay_bounded() {
+        assert_eq!(GIT_INSPECT_TIMEOUT_SECS, 15, "mirrors the npm-probe curl cap");
+        assert_eq!(GIT_INSPECT_MAX_COMMITS, 10_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_subprocess_is_killed_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep spawns on unix");
+        let status = wait_with_deadline(&mut child, std::time::Duration::from_millis(150));
+        assert!(status.is_none(), "deadline must return None, got {status:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the deadline must fire near 150ms, not after the child's 30s"
+        );
+        assert!(child.try_wait().expect("killed child reaps").is_some());
+    }
+
+    fn temp_repo(kind: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm225-policy-{kind}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create policy fixture root");
+        dir
+    }
+
+    #[test]
+    fn root_trust_policy_pins_the_default_and_allowlist_verdicts() {
+        let root = temp_repo("cases");
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        let trusted = root.join("home").join("project");
+        let outside = root.join("elsewhere").join("project");
+        let temp = root.join("tmpdir");
+        let temp_repo = temp.join("repo");
+        let deep_repo = cwd.join("deep").join("repo");
+        for dir in [&home, &cwd, &trusted, &outside, &temp, &temp_repo, &deep_repo] {
+            std::fs::create_dir_all(dir).expect("create fixture dir");
+        }
+        // Home containment, cwd subtree, and cwd ancestors are the
+        // user's own territory.
+        assert_eq!(
+            root_trust_decision(
+                trusted.to_str().expect("utf-8"),
+                Some(&home),
+                Some(&cwd),
+                Some(&temp),
+                None
+            ),
+            RootTrust::Trusted
+        );
+        // Cwd subtree containment (production single-repo case).
+        assert_eq!(
+            root_trust_decision(
+                deep_repo.to_str().expect("utf-8"),
+                Some(&home),
+                Some(&cwd),
+                Some(&temp),
+                None
+            ),
+            RootTrust::Trusted
+        );
+        // Running the audit from inside the repository trusts the
+        // repository (cwd is under the root).
+        assert_eq!(
+            root_trust_decision(
+                cwd.to_str().expect("utf-8"),
+                Some(&home),
+                Some(&deep_repo),
+                Some(&temp),
+                None
+            ),
+            RootTrust::Trusted
+        );
+        // Outside home and the working tree: refused.
+        assert_eq!(
+            root_trust_decision(
+                outside.to_str().expect("utf-8"),
+                Some(&home),
+                Some(&cwd),
+                Some(&temp),
+                None
+            ),
+            RootTrust::Refused("outside the user home and the working directory")
+        );
+        // Temp-dir roots are the transcript-decoded hostile shape.
+        assert_eq!(
+            root_trust_decision(
+                temp_repo.to_str().expect("utf-8"),
+                Some(&home),
+                Some(&cwd),
+                Some(&temp),
+                None
+            ),
+            RootTrust::Refused("inside the system temp directory")
+        );
+        // An explicit allowlist overrides — and replaces — the default
+        // policy: it may trust a temp path ...
+        let allowlist = temp_repo.to_str().expect("utf-8");
+        assert_eq!(
+            root_trust_decision(
+                allowlist,
+                Some(&home),
+                Some(&cwd),
+                Some(&temp),
+                Some(allowlist)
+            ),
+            RootTrust::Trusted
+        );
+        // ... and it refuses paths that were trusted by default.
+        assert_eq!(
+            root_trust_decision(
+                trusted.to_str().expect("utf-8"),
+                Some(&home),
+                Some(&cwd),
+                Some(&temp),
+                Some(allowlist)
+            ),
+            RootTrust::Refused("not under any allowlist entry")
+        );
+        // Unresolvable and empty roots never reach the spawn site.
+        assert_eq!(
+            root_trust_decision("", Some(&home), Some(&cwd), Some(&temp), None),
+            RootTrust::Refused("empty root")
+        );
+        assert_eq!(
+            root_trust_decision(
+                "/definitely/not/a/path-rm225",
+                Some(&home),
+                Some(&cwd),
+                Some(&temp),
+                None
+            ),
+            RootTrust::Refused("path does not resolve on this host")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_evidence_refuses_transcript_derived_temp_roots() {
+        // Rebuilds the assess F1 hostile shape end to end: a session
+        // whose directory NAME decodes (empty cwd) into a repository
+        // planted under /tmp, with one commit inside the session
+        // window. Pre-rm-225 this scored "strong" from a repository
+        // the user never chose; now the root is refused and the note
+        // says the inspection was skipped. With an explicit allowlist
+        // the same fixture scores strong again (positive control: the
+        // git fixture itself is sound).
+        let scratch = std::env::temp_dir().join(format!(
+            "agenttrace-rm225-e2e-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let pid = std::process::id();
+        // The decoder probes literal `/tmp`, so the planted repository
+        // must live there (not under TMPDIR, which may point elsewhere).
+        let repo = std::path::Path::new("/tmp")
+            .join(pid.to_string())
+            .join("repo");
+        std::fs::create_dir_all(&repo).expect("create hostile repo dir");
+        let git = || {
+            let mut command = Command::new("git");
+            command
+                .arg("-C")
+                .arg(repo.to_str().expect("utf-8 repo path"))
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+                .env("GIT_AUTHOR_DATE", "2026-05-03T10:01:30Z")
+                .env("GIT_COMMITTER_DATE", "2026-05-03T10:01:30Z")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            command
+        };
+        let init = git()
+            .args(["init", "-q"])
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init must succeed");
+        let commit = git()
+            .args(["commit", "-q", "--allow-empty", "-m", "fixture"])
+            .output()
+            .expect("git commit");
+        assert!(commit.status.success(), "git commit must succeed");
+        let mut hostile = session("hostile");
+        // Empty cwd forces project resolution through the session
+        // DIRECTORY NAME decoder: "-<pid>-repo" inside a projects/
+        // tree decodes to /tmp/<pid>/repo.
+        hostile.cwd = String::new();
+        hostile.path = scratch
+            .join("projects")
+            .join(format!("-tmp-{pid}-repo"))
+            .join("session.jsonl")
+            .to_string_lossy()
+            .to_string();
+        hostile.metrics.session_start = "2026-05-03T10:01:00.000Z".to_string();
+        hostile.metrics.session_end = "2026-05-03T10:04:00.000Z".to_string();
+        hostile.metrics.tool_calls_total = 1;
+
+        let report = delivery_evidence_with_git(&[hostile.clone()]);
+        assert_eq!(
+            report.summary.strong, 0,
+            "a transcript-shaped temp root must not produce git evidence"
+        );
+        assert_eq!(report.summary.non_code, 1);
+        assert!(
+            report.sessions[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("was refused by the trust policy")),
+            "the evidence must say the inspection was skipped: {:?}",
+            report.sessions[0].evidence
+        );
+
+        // Positive control: an explicit allowlist entry for exactly
+        // this repository turns the git path back on.
+        let _env = crate::test_env::lock_env();
+        let previous = std::env::var_os(GIT_INSPECT_ROOT_ALLOWLIST_VAR);
+        std::env::set_var(
+            GIT_INSPECT_ROOT_ALLOWLIST_VAR,
+            repo.to_str().expect("utf-8 repo path"),
+        );
+        let allowed = delivery_evidence_with_git(&[hostile]);
+        match previous {
+            Some(value) => std::env::set_var(GIT_INSPECT_ROOT_ALLOWLIST_VAR, value),
+            None => std::env::remove_var(GIT_INSPECT_ROOT_ALLOWLIST_VAR),
+        }
+        assert_eq!(
+            allowed.summary.strong, 1,
+            "the allowlist must restore the (real) git match — fixture control"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(std::path::Path::new("/tmp").join(pid.to_string()));
     }
 }

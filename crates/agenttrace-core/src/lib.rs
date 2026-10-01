@@ -36,11 +36,11 @@ pub use discovery::{
 };
 pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
 pub use governance::{
-    context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance,
-    recommendations, session_cost_audit, ContextTrend, ContextTrendTotals, CostAudit,
-    DeliveryEvidence, DeliverySummary, McpGovernance, McpGovernanceItem, ModelCostAudit,
-    PriceBreakdown, PricingCoverage, ProjectContextTrend, Recommendation, SessionCostAudit,
-    SessionDeliveryEvidence, TokenBreakdown,
+    context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git,
+    mcp_governance, recommendations, session_cost_audit, ContextTrend, ContextTrendTotals,
+    CostAudit, DeliveryEvidence, DeliverySummary, GIT_INSPECT_TIMEOUT_SECS, McpGovernance,
+    McpGovernanceItem, ModelCostAudit, PriceBreakdown, PricingCoverage, ProjectContextTrend,
+    Recommendation, SessionCostAudit, SessionDeliveryEvidence, TokenBreakdown,
 };
 pub use history::{history_path, merge_preserved_history, preserve_derived_history};
 pub use insights::{
@@ -59,7 +59,8 @@ pub use reports::{
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_text, report_overview_text_with_context,
-    report_text, report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage,
+    report_text, report_text_with_language, source_base_label, BaselineBreaches, BaselineThresholds,
+    ReportLanguage, SOURCE_LABELS,
 };
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
