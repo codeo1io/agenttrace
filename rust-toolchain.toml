@@ -1,0 +1,8 @@
+# Pin the toolchain so `cargo fmt --check` (ci.yml "Check Rust formatting") and
+# every other lane render against one stable rustc/rustfmt pair instead of
+# floating with whatever `stable` is on the runner (rm-173: the gate drifted
+# red at ec8acdc because 2083a8d landed unformatted under a newer stable).
+# Bump deliberately: re-run `cargo fmt` across the workspace in the same PR.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
