@@ -264,8 +264,7 @@ fn legacy_cache_artifact_paths() -> Vec<PathBuf> {
             let Some(file_name) = file_name.to_str() else {
                 return false;
             };
-            (file_name.starts_with("hermes-sqlite-v")
-                || file_name.starts_with("opencode-sqlite-v"))
+            (file_name.starts_with("hermes-sqlite-v") || file_name.starts_with("opencode-sqlite-v"))
                 && file_name.ends_with(".json")
         })
         .map(|entry| entry.path())
@@ -1792,10 +1791,8 @@ mod tests {
         // set comes from cache_artifact_paths() itself (file names are
         // env-independent), so this fails if a store is added to the
         // code but not to the clear set.
-        let root = std::env::temp_dir().join(format!(
-            "agenttrace-clear-cache-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-clear-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create temp cache root");
         let paths: Vec<PathBuf> = cache_artifact_paths()

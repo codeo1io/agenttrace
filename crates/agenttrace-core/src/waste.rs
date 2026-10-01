@@ -110,10 +110,10 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         stuck_score = 20.0;
     }
     score += stuck_score;
-    if session.metrics.tokens_cache_r > 0
-        && session.metrics.tokens_input > 0
-        && session.metrics.tokens_cache_r as f64 / (session.metrics.tokens_input as f64) < 0.3
-    {
+    // Cache penalty uses the same hit-rate semantics as the cache
+    // panel above (reads over ALL input-side tokens): sessions that do
+    // use caching but hit poorly take the penalty (rm-214).
+    if session.metrics.tokens_cache_r > 0 && cache.hit_rate < 30.0 {
         score += 6.0;
     }
     let waste_score = (score as i32).clamp(0, 100);
@@ -189,17 +189,36 @@ pub fn render_waste_report_with_language(session: &Session, language: ReportLang
 }
 
 fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
-    let hit_rate = if metrics.tokens_input > 0 {
-        metrics.tokens_cache_r as f64 / metrics.tokens_input as f64 * 100.0
+    // All input-side tokens the model processed and the user was billed
+    // for: fresh input, cache writes, and cache reads. Dividing cache
+    // reads by fresh input alone (the old math) reports rates above
+    // 100% whenever caching works — a 120-fresh/900k-read session
+    // printed "hit 750000%" (rm-214).
+    let total_input_side =
+        (metrics.tokens_input + metrics.tokens_cache_r + metrics.tokens_cache_w).max(0);
+    let hit_rate = if total_input_side > 0 {
+        metrics.tokens_cache_r as f64 / total_input_side as f64 * 100.0
     } else {
         0.0
     };
-    let wasted_tokens = metrics
-        .tokens_input
-        .saturating_sub(metrics.tokens_cache_r)
-        .max(0);
+    // Non-cached input-side spend: fresh input plus cache writes, which
+    // are billed above the cache-read price. The write multiple is
+    // per-model — pricing::token_cost prices writes at the catalog cw
+    // directly, and 74 of the snapshot's models differ from the 1.25x
+    // Anthropic family default (claude-3-haiku 1.2x, azure gpt-4o
+    // ~0.5x) — so derive it from the same catalog and keep 1.25x only
+    // as the fallback for models without a cw entry. The old math
+    // subtracted reads from fresh input, which saturates to zero —
+    // "free" — exactly when caching is heavy (rm-214).
+    let uncached_fresh = metrics.tokens_input.max(0) as f64;
     let price = pricing::lookup_price(&metrics.model_used);
-    let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
+    let write_multiple = if price.cw > 0.0 && price.input > 0.0 {
+        price.cw / price.input
+    } else {
+        1.25
+    };
+    let uncached_writes = metrics.tokens_cache_w.max(0) as f64 * write_multiple;
+    let wasted_cost = round4((uncached_fresh + uncached_writes) / 1e6 * price.input);
     let (rating, suggestion) = if hit_rate >= 80.0 {
         (
             "excellent",
@@ -223,7 +242,7 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
     };
     CacheEfficiency {
         cache_read_tokens: metrics.tokens_cache_r,
-        total_input_tokens: metrics.tokens_input,
+        total_input_tokens: total_input_side,
         hit_rate,
         wasted_cost,
         rating,
@@ -649,5 +668,106 @@ mod tests {
         let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
         assert!(rendered.contains("allocated share of session cost"));
         assert!(rendered.contains("75% of session"));
+    }
+
+    #[test]
+    fn cache_efficiency_hit_rate_bounded_and_truthful() {
+        // rm-214 golden: 120 fresh input tokens with 900k cache reads —
+        // the case that used to print "hit 750000%" and "Wasted: $0.0000".
+        let metrics = Metrics {
+            tokens_input: 120,
+            tokens_cache_r: 900_000,
+            model_used: "claude-sonnet-4-5-20250929".to_string(),
+            ..Metrics::default()
+        };
+        let cache = analyze_cache_efficiency(&metrics);
+        // Hit rate is reads over ALL input-side tokens: bounded by 100%.
+        assert!(cache.hit_rate > 99.9 && cache.hit_rate <= 100.0);
+        assert_eq!(cache.total_input_tokens, 900_120);
+        assert_eq!(cache.cache_read_tokens, 900_000);
+        // The 120 fresh tokens are real, non-free spend.
+        assert!(cache.wasted_cost > 0.0);
+        assert_eq!(cache.rating, "excellent");
+    }
+
+    #[test]
+    fn cache_efficiency_empty_metrics_is_zero_not_nan() {
+        let cache = analyze_cache_efficiency(&Metrics::default());
+        assert_eq!(cache.hit_rate, 0.0);
+        assert_eq!(cache.total_input_tokens, 0);
+        assert_eq!(cache.cache_read_tokens, 0);
+        assert_eq!(cache.wasted_cost, 0.0);
+        assert_eq!(cache.rating, "none");
+    }
+
+    #[test]
+    fn cache_write_priced_at_per_model_cw_not_flat_125() {
+        // rm-214 review fix: the write component of the wasted cost
+        // follows the catalog's per-model cw, like pricing::token_cost.
+        // claude-3-haiku bills cache writes at 1.2x input — the flat
+        // 1.25x of the first cut mispriced every non-Anthropic-family
+        // model (74 of the snapshot's models differ).
+        let model = "claude-3-haiku-20240307";
+        let price = pricing::lookup_price(model);
+        assert!(
+            price.input > 0.0 && (price.cw / price.input - 1.2).abs() < 1e-9,
+            "fixture model must carry a non-1.25x catalog cw"
+        );
+        let metrics = Metrics {
+            tokens_input: 1_000_000,
+            tokens_cache_w: 1_000_000,
+            model_used: model.to_string(),
+            ..Metrics::default()
+        };
+        let cache = analyze_cache_efficiency(&metrics);
+        // 1M fresh at input plus 1M writes at cw = input + cw per M.
+        let expected = round4(price.input + price.cw);
+        assert!((cache.wasted_cost - expected).abs() < 1e-9);
+        // And NOT the flat-1.25x price the first cut paid.
+        let flat = round4(price.input * 2.25);
+        assert!((cache.wasted_cost - flat).abs() > 1e-6);
+    }
+
+    #[test]
+    fn cache_write_falls_back_to_125_when_catalog_has_no_cw() {
+        // Models without a catalog cw (the "default" price carries
+        // none) keep the 1.25x input-family default for cache writes.
+        let price = pricing::lookup_price("default");
+        assert_eq!(price.cw, 0.0, "fixture model must have no catalog cw");
+        let metrics = Metrics {
+            tokens_input: 1_000_000,
+            tokens_cache_w: 1_000_000,
+            model_used: "default".to_string(),
+            ..Metrics::default()
+        };
+        let cache = analyze_cache_efficiency(&metrics);
+        let expected = round4(2.25 * price.input);
+        assert!((cache.wasted_cost - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn waste_report_never_prints_impossible_hit_rates() {
+        // rm-214 golden: the rendered report stays in [0,100]% and shows
+        // the fresh-token spend instead of "free" zero.
+        let session = Session {
+            name: "probe".to_string(),
+            path: "/tmp/session.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                tokens_input: 120,
+                tokens_cache_r: 900_000,
+                model_used: "claude-sonnet-4-5-20250929".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = render_waste_report(&session);
+        // 900000/900120 = 99.987% rounds to 100%.
+        assert!(report.contains("hit 100%"));
+        assert!(!report.contains("750000"));
+        assert!(report.contains("Cache waste"));
     }
 }

@@ -1804,7 +1804,17 @@ fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: 
     }
 }
 
+/// Serializes every env-pinned test in this binary. The cache-dir override
+/// is process-global while the test harness runs tests on parallel threads,
+/// so two tests pinning different directories race each other's reads (one
+/// test's render can observe another test's journal). The lock turns the
+/// pin into an exclusive section instead.
+static SESSION_CACHE_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn with_session_cache_dir_for_test(cache_dir: &std::path::Path, run: impl FnOnce()) {
+    let _guard = SESSION_CACHE_DIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
     std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache_dir);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
@@ -1956,50 +1966,66 @@ fn efficiency_panel_renders_statusline_limits_and_cache_causes() {
     // prompt-cache miss causes come from the statusline capture journal,
     // not transcripts; when captures exist the Efficiency panel surfaces
     // them. With no journal the panel is unchanged.
-    let mut app = App::new(
-        vec![session("billing", "claude_code", "gpt-5", 45, 0.2, "bash")],
-        "test",
-        None,
-    );
-    app.run_command("efficiency")
-        .expect("open efficiency panel");
-    let backend = TestBackend::new(140, 44);
-    let mut terminal = Terminal::new(backend).expect("test terminal");
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render efficiency panel");
-    let without = format!("{:?}", terminal.backend().buffer());
-    assert!(
-        !without.contains("Subscription limits"),
-        "no journal means no statusline block: {without}"
-    );
+    //
+    // Hermeticity (full-tests fix): the "no journal" precondition must
+    // not lean on host state. The efficiency panel loads the DEFAULT
+    // journal (agenttrace_core::load_statusline_insights) whenever
+    // AGENTTRACE_SESSION_CACHE_DIR is unset, so a populated host
+    // ~/.cache/agenttrace/statusline.jsonl flipped the first assert red
+    // under filtered/serial schedules. Pin an empty scratch cache dir so
+    // the precondition holds on every host and schedule.
+    let cache_root = std::env::temp_dir().join(format!(
+        "agenttrace-rust-tui-efficiency-empty-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&cache_root).expect("create empty statusline cache dir");
+    with_session_cache_dir_for_test(&cache_root, || {
+        let mut app = App::new(
+            vec![session("billing", "claude_code", "gpt-5", 45, 0.2, "bash")],
+            "test",
+            None,
+        );
+        app.run_command("efficiency")
+            .expect("open efficiency panel");
+        let backend = TestBackend::new(140, 44);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render efficiency panel");
+        let without = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            !without.contains("Subscription limits"),
+            "no journal means no statusline block: {without}"
+        );
 
-    let insights = agenttrace_core::statusline_insights(&[agenttrace_core::CapturedStatusline {
-        captured_at: 1_760_000_100,
-        payload: serde_json::json!({
-            "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-            "rate_limits": {
-                "five_hour": {"used_percentage": 84.0, "resets_at": 1760000000}
-            },
-            "prompt_cache": {
-                "hit_ratio": 0.9,
-                "misses": 4,
-                "last_miss_cause": {"causes": ["tools_changed"]},
-                "miss_causes": {"tools_changed": 2}
-            }
-        }),
-    }]);
-    app.governance.as_mut().unwrap().statusline = Some(insights);
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render efficiency panel with statusline insights");
-    let with = format!("{:?}", terminal.backend().buffer());
-    assert!(
-        with.contains("Subscription limits"),
-        "limit pressure must render: {with}"
-    );
-    assert!(
-        with.contains("tools_changed"),
-        "cache-miss causes must render: {with}"
-    );
+        let insights =
+            agenttrace_core::statusline_insights(&[agenttrace_core::CapturedStatusline {
+                captured_at: 1_760_000_100,
+                payload: serde_json::json!({
+                    "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+                    "rate_limits": {
+                        "five_hour": {"used_percentage": 84.0, "resets_at": 1760000000}
+                    },
+                    "prompt_cache": {
+                        "hit_ratio": 0.9,
+                        "misses": 4,
+                        "last_miss_cause": {"causes": ["tools_changed"]},
+                        "miss_causes": {"tools_changed": 2}
+                    }
+                }),
+            }]);
+        app.governance.as_mut().unwrap().statusline = Some(insights);
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render efficiency panel with statusline insights");
+        let with = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            with.contains("Subscription limits"),
+            "limit pressure must render: {with}"
+        );
+        assert!(
+            with.contains("tools_changed"),
+            "cache-miss causes must render: {with}"
+        );
+    });
 }

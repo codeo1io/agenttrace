@@ -60,6 +60,47 @@ grep -q "Publish Homebrew Formula" .github/workflows/release.yml ||
 	fail "release workflow must publish the Homebrew Formula"
 grep -q "Luoyuctl.AgentTrace" scripts/release/render-channels.sh ||
 	fail "release helper must render the WinGet package identifier"
+
+# The rendered WinGet manifests must pass a schema assertion (upstream
+# #295): each manifest carries its per-type winget 1.10.0 schema header
+# as its first line and nothing carries the schema-invalid
+# PortableCommandAlias. `winget validate` needs Windows; the equivalent
+# YAML-schema check renders the manifests with deterministic checksums
+# and asserts the headers on the rendered output.
+render_tmp="$(mktemp -d)"
+trap 'rm -rf "$render_tmp"' EXIT
+render_checksums="$render_tmp/checksums.txt"
+: >"$render_checksums"
+for asset in \
+	agenttrace-linux-amd64 \
+	agenttrace-linux-arm64 \
+	agenttrace-darwin-amd64 \
+	agenttrace-darwin-arm64 \
+	agenttrace-windows-amd64.exe \
+	agenttrace-windows-arm64.exe; do
+	printf '%s  *%s\n' \
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+		"$asset" >>"$render_checksums"
+done
+scripts/release/render-channels.sh 0.0.0 "$render_checksums" "$render_tmp/out" >/dev/null ||
+	fail "release helper must render the package channels"
+manifests="$render_tmp/out/winget/manifests/l/Luoyuctl/AgentTrace/0.0.0"
+for manifest in \
+	version:Luoyuctl.AgentTrace.yaml \
+	defaultLocale:Luoyuctl.AgentTrace.locale.en-US.yaml \
+	installer:Luoyuctl.AgentTrace.installer.yaml; do
+	manifest_type="${manifest%%:*}"
+	manifest_file="$manifests/${manifest#*:}"
+	[[ -f "$manifest_file" ]] ||
+		fail "rendered WinGet $manifest_type manifest is missing: $manifest_file"
+	[[ "$(head -n 1 "$manifest_file")" == "# yaml-language-server: \$schema=https://aka.ms/winget-manifest.$manifest_type.1.10.0.schema.json" ]] ||
+		fail "rendered WinGet $manifest_type manifest must declare the $manifest_type 1.10.0 schema as its first line"
+	grep -q "^ManifestType: $manifest_type$" "$manifest_file" ||
+		fail "rendered WinGet $manifest_type manifest must declare ManifestType: $manifest_type"
+done
+if grep -R -q "PortableCommandAlias" "$render_tmp/out"; then
+	fail "rendered WinGet manifests must not contain the schema-invalid PortableCommandAlias"
+fi
 grep -q "Submit WinGet manifest" .github/workflows/release.yml ||
 	fail "release workflow must submit the WinGet manifest"
 grep -q "WINGET_GITHUB_TOKEN" .github/workflows/release.yml ||
