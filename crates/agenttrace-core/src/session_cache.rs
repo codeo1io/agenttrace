@@ -213,20 +213,85 @@ pub fn session_cache_path() -> PathBuf {
     user_cache_dir().join("agenttrace").join("sessions.json")
 }
 
+/// Every at-rest artifact `--clear-cache` removes (rm-086), built
+/// from the same constructors that write the files: the parsed-metrics
+/// journal, the Hermes and OpenCode SQLite snapshots, the statusline
+/// capture journal, and the LiteLLM pricing catalog. The statusline
+/// and pricing files resolve through their own env-aware path
+/// constructors, so each artifact is cleared where it actually lives
+/// instead of assuming it sits beside the session cache.
+/// `privacy_disclosure_lists_every_artifact` (tests) pins PRIVACY.md's
+/// disclosure table against these file names, so a new store cannot
+/// ship undisclosed.
+pub(crate) fn cache_artifact_paths() -> Vec<PathBuf> {
+    vec![
+        session_cache_path(),
+        sqlite_snapshot_path("hermes"),
+        sqlite_snapshot_path("opencode"),
+        crate::statusline::statusline_capture_path(),
+        crate::pricing::pricing_cache_path(),
+    ]
+}
+
 pub fn clear_session_cache() -> anyhow::Result<()> {
-    let cache = session_cache_path();
-    for path in [
-        cache.clone(),
-        cache.with_file_name("hermes-sqlite.json"),
-        cache.with_file_name("opencode-sqlite.json"),
-    ] {
+    let mut paths = cache_artifact_paths();
+    paths.extend(legacy_cache_artifact_paths());
+    remove_cache_artifacts(&paths)
+}
+
+/// Superseded-version leftovers (rm-086 review follow-up): older builds
+/// wrote versioned SQLite snapshots (`hermes-sqlite-v7-*.json`,
+/// `opencode-sqlite-v7-*.json`); no live code names those files today,
+/// so on an upgraded host they would otherwise survive `--clear-cache`
+/// forever — the most privacy-sensitive class (full parsed metrics)
+/// among the least visible files. Swept by pattern from the same
+/// env-aware cache root the registry uses; prefixes are pinned to the
+/// two stores that ever wrote them so nothing else in the directory is
+/// touched.
+fn legacy_cache_artifact_paths() -> Vec<PathBuf> {
+    // Both snapshot constructors share one env-aware cache root.
+    let snapshot_path = sqlite_snapshot_path("hermes");
+    let Some(cache_dir) = snapshot_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                return false;
+            };
+            (file_name.starts_with("hermes-sqlite-v")
+                || file_name.starts_with("opencode-sqlite-v"))
+                && file_name.ends_with(".json")
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn remove_cache_artifacts(paths: &[PathBuf]) -> anyhow::Result<()> {
+    // rm-086 review follow-up: clear as much as we can, then report —
+    // a first failure must not strand the artifacts after it (a partial
+    // clear is the worst outcome for a privacy-motivated purge).
+    let mut failures: Vec<String> = Vec::new();
+    for path in paths {
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+            Err(err) => failures.push(format!("{}: {}", path.display(), err)),
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "failed to remove some cache artifacts: {}",
+            failures.join("; ")
+        )
+    }
 }
 
 pub(crate) fn load_sqlite_snapshot(database: &Path, name: &str) -> Option<Vec<Session>> {
@@ -1716,5 +1781,141 @@ mod tests {
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clear_cache_removes_every_artifact_and_only_those() {
+        // rm-086: --clear-cache used to remove sessions.json and the two
+        // SQLite snapshots while leaving the statusline journal and the
+        // pricing catalog on disk — the two artifacts a
+        // privacy-motivated user most expects to be gone. The artifact
+        // set comes from cache_artifact_paths() itself (file names are
+        // env-independent), so this fails if a store is added to the
+        // code but not to the clear set.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-clear-cache-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp cache root");
+        let paths: Vec<PathBuf> = cache_artifact_paths()
+            .iter()
+            .map(|path| root.join(path.file_name().expect("artifact file name")))
+            .collect();
+        assert_eq!(
+            paths.len(),
+            5,
+            "registry: session cache, two sqlite snapshots, statusline journal, pricing catalog"
+        );
+        for path in &paths {
+            fs::write(path, b"x").expect("write artifact");
+        }
+        let bystander = root.join("unrelated.txt");
+        fs::write(&bystander, b"x").expect("write bystander");
+        // rm-086 review follow-up: superseded-version leftovers from older
+        // builds must leave with the purge too (they are invisible to the
+        // registry — no live code names them — but they hold the same
+        // parsed metrics), while near-miss names stay untouched.
+        let legacy_hermes = root.join("hermes-sqlite-v7-20250801.json");
+        let legacy_opencode = root.join("opencode-sqlite-v7-20250801.json");
+        let legacy_bystander = root.join("other-sqlite-v7.json");
+        for path in [&legacy_hermes, &legacy_opencode, &legacy_bystander] {
+            fs::write(path, b"x").expect("write legacy artifact");
+        }
+
+        // e2e through the real entry point: pin the env-aware roots
+        // (the session-cache dir — and XDG_CACHE_HOME too, because the
+        // pricing catalog resolves through user_cache_dir(), not through
+        // AGENTTRACE_SESSION_CACHE_DIR) and drive clear_session_cache(),
+        // which composes the registry with the legacy sweep —
+        // remove_cache_artifacts alone would not exercise
+        // legacy_cache_artifact_paths() at all. Artifacts are written
+        // where the pinned env actually resolves them.
+        let _env = crate::test_env::lock_env();
+        let previous_cache_root = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        std::env::set_var("XDG_CACHE_HOME", root.join("xdg-cache"));
+        let live: Vec<PathBuf> = cache_artifact_paths();
+        for path in &live {
+            fs::create_dir_all(path.parent().expect("artifact parent"))
+                .expect("create artifact parent");
+            fs::write(path, b"x").expect("write artifact");
+        }
+        clear_session_cache().expect("clear removes registry + legacy sweep");
+        for path in &live {
+            assert!(!path.exists(), "{} must be removed", path.display());
+        }
+        assert!(
+            !legacy_hermes.exists(),
+            "legacy versioned snapshot must be swept"
+        );
+        assert!(
+            !legacy_opencode.exists(),
+            "legacy versioned opencode snapshot must be swept"
+        );
+        assert!(
+            bystander.exists(),
+            "clear touches only registered artifacts, not the whole directory"
+        );
+        assert!(
+            legacy_bystander.exists(),
+            "the legacy sweep matches only the two store prefixes, not every *-sqlite-v*.json"
+        );
+
+        // A second pass is a no-op, not an error: every artifact is
+        // already NotFound.
+        clear_session_cache().expect("second clear is a no-op");
+
+        match previous_cache_root {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        match previous_xdg_cache {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn privacy_disclosure_lists_every_artifact() {
+        // rm-086: PRIVACY.md must disclose every at-rest artifact the
+        // code writes — the cache-root registry plus the preserved
+        // history file — with its purge path. Names come from the same
+        // constructors that build the paths, so adding a store without
+        // disclosing it fails here.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("PRIVACY.md");
+        let privacy = fs::read_to_string(&repo_root)
+            .unwrap_or_else(|err| panic!("read {}: {err}", repo_root.display()));
+        let mut names: Vec<String> = cache_artifact_paths()
+            .iter()
+            .chain(std::iter::once(&crate::history::history_path()))
+            .map(|path| {
+                path.file_name()
+                    .expect("artifact file name")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in &names {
+            assert!(
+                privacy.contains(name.as_str()),
+                "PRIVACY.md must disclose at-rest artifact {name}"
+            );
+        }
+        // rm-086 review follow-up: the swept superseded-version leftovers
+        // are disclosed as a pattern row, not as exact file names.
+        for pattern in ["hermes-sqlite-v", "opencode-sqlite-v"] {
+            assert!(
+                privacy.contains(pattern),
+                "PRIVACY.md must disclose the legacy {pattern}* purge"
+            );
+        }
     }
 }

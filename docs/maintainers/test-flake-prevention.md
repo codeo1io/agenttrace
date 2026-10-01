@@ -66,3 +66,30 @@ schema-faithful to the producer's documented payload while being disclosed as
 fixtures, not recordings — see `docs/guides/statusline-capture.md` for the
 worked example. A test that passes by under-claiming is preferable to one
 that passes by inventing evidence.
+
+## Rule 6 — Pin the code's full env read-set, not the helper's hand-me-down list
+
+An environment-faking helper is hermetic only for the variables it pins.
+Enumerate the read-set from the code under test, not from habit:
+`with_home_and_cache` (crates/agenttrace-core/tests/discovery_contract.rs)
+pins `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and
+`AGENTTRACE_SESSION_CACHE_DIR`, but opencode discovery also reads
+`XDG_DATA_HOME` (crates/agenttrace-core/src/discovery.rs), so those tests
+inherit whatever the *runner* exports — green on a bare shell, red under a
+CI/delegate runner that sets it, on a tree nobody changed. When a suite's
+verdict moves between runners, diff the runner env (`env | sort`) against
+the helper's pinned set before suspecting the code; the durable fix is
+pinning (or unsetting) the missing variable inside the helper, not a
+"run without XDG_DATA_HOME" convention.
+
+Case study (cycle 1, campaign 1f5ad3cf): the implement phase saw two
+`discovery_contract` tests fail only under the delegate runner; `git stash`
+at HEAD 9d88b36 reproduced the same failures on the untouched base, proving
+the cause was inherited environment, not the batch. All subsequent gate
+runs prepend `env -u XDG_DATA_HOME` (sandboxed `HOME` per the recorded
+recipe); the cycle's full-suite envelope is result-1618525-330496923.json.
+Kin to the sibling lane's Rule 6 (absence-asserting tests pin host state):
+both are incomplete-hermetic-boundary flakes — this one enters through the
+helper's variable list, that one through un-pinned host files. Numbered
+Rule 6 campaign-locally; sibling campaign 2962e401 (run aa9c4fd6) holds its
+own uncommitted Rule 6 in a parallel worktree — renumber at fold.
