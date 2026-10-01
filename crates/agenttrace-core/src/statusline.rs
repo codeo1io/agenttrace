@@ -283,10 +283,10 @@ pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
         payload: payload.clone(),
     })
     .unwrap_or_else(|_| "{}".to_string());
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    // rm-208: the journal is captured conversation context (session
+    // names, project paths, working directories); create it owner-only
+    // instead of the fs default (0644/0664).
+    let mut file = crate::session_cache::open_private_append(&path)?;
     let size_after_append = file.metadata()?.len() + line.len() as u64 + 1;
     writeln!(file, "{line}")?;
     if size_after_append > STATUSLINE_CAPTURE_MAX_BYTES {
@@ -315,14 +315,21 @@ fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<
         kept.push(line);
     }
     kept.reverse();
-    let temp = path.with_extension("jsonl.compact");
-    {
-        let mut file = fs::File::create(&temp)?;
-        for line in kept {
-            writeln!(file, "{line}")?;
-        }
-        file.flush()?;
+    // rm-202: the temp is a per-writer `unique_temp_path` sibling, not
+    // a fixed `<name>.jsonl.compact` — concurrent compacts can no longer
+    // interleave into (and race the rename of) one shared temp, and a
+    // crash before the rename leaves a `.tmp.` orphan that the
+    // cache-load sweep already removes instead of a name no sweep
+    // knows. The rewrite is bounded (half the 10 MiB retention bound),
+    // so building it in memory first is safe, and the owner-only write
+    // (rm-208) keeps the renamed journal private as well.
+    let temp = crate::session_cache::unique_temp_path(path);
+    let mut rewritten = String::with_capacity(kept_bytes.min(usize::MAX as u64) as usize);
+    for line in kept {
+        rewritten.push_str(line);
+        rewritten.push('\n');
     }
+    crate::session_cache::write_private(&temp, rewritten.as_bytes())?;
     fs::rename(&temp, path)?;
     Ok(())
 }
@@ -966,6 +973,138 @@ mod tests {
         assert_eq!(
             value["insights"]["session_caches"][0]["session_id"], "probe2-RED\u{001b}[31mX",
             "JSON output is unchanged: raw payload, serde-escaped"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_compacts_stay_coherent_and_leave_no_fixed_temp() {
+        // rm-202: the compaction temp used to be a FIXED
+        // `<name>.jsonl.compact` sibling, so two concurrent compacts
+        // interleaved their writes into one shared file (a torn journal
+        // renamed into place), and a crash before the rename orphaned a
+        // name no sweep knows. With a per-writer unique temp each
+        // compact renames a coherent whole file, and a crash orphan
+        // matches the `.tmp.` pattern the cache-load sweep already
+        // removes.
+        use std::sync::{Arc, Barrier};
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        // Rounds of two concurrent compacts over a ~5 MiB journal (the
+        // retention bound is 10 MiB): large enough that both writers
+        // hold their temp open simultaneously under a shared name, and
+        // many rounds so a racy window is not missed by luck.
+        for round in 0..10 {
+            let mut raw = String::new();
+            for i in 0..30_000 {
+                raw.push_str(&format!(
+                    "{{\"captured_at\":{i},\"payload\":{{\"filler\":\"{}\"}}}}\n",
+                    "x".repeat(150)
+                ));
+            }
+            fs::write(&journal, &raw).expect("seed journal");
+            let barrier = Arc::new(Barrier::new(2));
+            let writers: Vec<_> = [512 * 1024u64, 1024 * 1024]
+                .map(|keep| {
+                    let journal = journal.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        compact_statusline_capture_under(&journal, keep)
+                    })
+                })
+                .into_iter()
+                .collect();
+            for writer in writers {
+                writer
+                    .join()
+                    .expect("writer thread must not panic")
+                    .unwrap_or_else(|error| {
+                        panic!("round {round}: concurrent compact must not fail: {error}")
+                    });
+            }
+            // Whichever compact won the last rename, every surviving
+            // line must be whole — a truncated or interleaved line is a
+            // torn journal handed to every reader.
+            for line in fs::read_to_string(&journal)
+                .expect("journal survives the race")
+                .lines()
+            {
+                serde_json::from_str::<CapturedStatusline>(line).unwrap_or_else(|error| {
+                    panic!("round {round}: torn line survived compaction: {error}: {line:?}")
+                });
+            }
+            assert!(
+                !journal.with_extension("jsonl.compact").exists(),
+                "the fixed-name compaction temp must never appear"
+            );
+            let leftovers: Vec<_> = fs::read_dir(&root)
+                .expect("read journal dir")
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temps must not survive the renames: {leftovers:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn journal_and_compact_rewrite_are_owner_only() {
+        // rm-208: the journal is captured conversation context (session
+        // names, project paths, working directories) — a group/world-
+        // readable copy hands it to every local account. It must be
+        // created owner-only, and the compact rewrite (temp + rename)
+        // must not relax that.
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-perms-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        // Point the environment at the temp root before any append (the
+        // default path is the user's real journal), under the shared env
+        // lock so sibling-module tests cannot re-point it mid-append.
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let payload: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        append_statusline_capture(&payload).expect("append capture");
+        let mode = fs::metadata(&journal)
+            .expect("journal exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "journal must be owner-only, got {:o}",
+            mode & 0o777
+        );
+        compact_statusline_capture_under(&journal, 1).expect("compact");
+        let mode = fs::metadata(&journal)
+            .expect("journal survives compaction")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "compaction must not relax journal privacy, got {:o}",
+            mode & 0o777
         );
         match prior {
             Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),

@@ -16,7 +16,11 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 20;
 // titles replaced by first-user-message names) shipped while this stayed
 // at 5, so v5 snapshots can carry stale names under new semantics. The
 // version check regenerates them on next use.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 6;
+// Bumped 6 → 7 (cycle-1 rm-198): hermes tool outcome semantics changed —
+// tool_calls_ok/fail are now derived from the messages table instead of
+// fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
+// tool outcome splits and must regenerate once.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -341,7 +345,7 @@ fn store_sqlite_snapshot_at(
         sessions: sessions.iter().map(GoSession::from_session).collect(),
     };
     let tmp = unique_temp_path(path);
-    fs::write(&tmp, serde_json::to_vec(&snapshot)?)?;
+    write_private(&tmp, &serde_json::to_vec(&snapshot)?)?;
     fs::rename(tmp, path)?;
     Ok(())
 }
@@ -363,6 +367,53 @@ pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
         .to_string();
     name.push_str(&format!(".tmp.{}.{}", std::process::id(), seq));
     path.with_file_name(name)
+}
+
+/// Owner-only creation for conversation-derived artifacts (cycle-1
+/// rm-208): the session cache, the SQLite snapshots, the statusline
+/// journal, and derived history all carry session names, tool args,
+/// project paths, and transcript-derived metrics, so a group/world-
+/// readable copy hands them to every local account. `fs::write`/
+/// `File::create` default to 0644 (0664 under a common umask); this
+/// helper creates 0o600 on Unix — umask can only tighten it — and
+/// keeps the platform default elsewhere. Callers keep their own
+/// temp-then-rename atomicity.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes)
+    }
+}
+
+/// Append-mode counterpart of [`write_private`] for the statusline
+/// journal (cycle-1 rm-208): creates the journal owner-only the first
+/// time it is written; an existing file's permissions are left alone.
+pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::OpenOptions::new().create(true).append(true).open(path)
+    }
 }
 
 /// Remove temp files left behind by crashed writers (pass-7 P7-5):
@@ -856,7 +907,7 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
         doc.insert("dirs".to_string(), Value::Object(dirs));
     }
     let tmp = unique_temp_path(&cache.path);
-    fs::write(&tmp, serde_json::to_vec(&Value::Object(doc))?)?;
+    write_private(&tmp, &serde_json::to_vec(&Value::Object(doc))?)?;
     fs::rename(tmp, &cache.path)?;
     Ok(())
 }
@@ -1252,7 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_six_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1285,10 +1336,11 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version six (cycle-4 CU-10): cycle 3 shipped the placeholder-name
-        // rewrite while the version stayed at five, so v5 snapshots can
-        // carry stale names under new semantics and must regenerate.
-        assert_eq!(doc["schema_version"], 6);
+        // Version seven (cycle-1 rm-198): hermes tool outcome semantics
+        // changed (ok/fail now derive from the messages table instead of
+        // fabricating ok == tool_call_count), so v6 snapshots carry stale
+        // tool outcome splits and must regenerate.
+        assert_eq!(doc["schema_version"], 7);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1299,15 +1351,16 @@ mod tests {
             Some(&serde_json::Value::from(720)),
             "the stored-versus-derived delta must survive the snapshot cache"
         );
-        let loaded = load_sqlite_snapshot_from(&database, &snapshot).expect("schema six cache hit");
+        let loaded =
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(5);
+        old["schema_version"] = serde_json::Value::from(6);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema five json"),
+            serde_json::to_vec(&old).expect("schema six json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
@@ -1917,5 +1970,61 @@ mod tests {
                 "PRIVACY.md must disclose the legacy {pattern}* purge"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_cache_and_snapshot_artifacts_are_owner_only() {
+        // rm-208: sessions.json and the SQLite snapshots carry session
+        // names, tool arguments, and transcript-derived metrics. The
+        // fs::write default (0644) hands them to every local account;
+        // both artifacts must land owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-artifact-perms-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let database = root.join("state.db");
+        let snapshot = root.join("hermes.db.json");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&database, b"db").expect("write database");
+        let session = Session {
+            name: "private session".to_string(),
+            path: database.to_string_lossy().to_string(),
+            cwd: "/work/secret".to_string(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
+        let mode = fs::metadata(&snapshot)
+            .expect("snapshot exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "sqlite snapshot must be owner-only, got {:o}",
+            mode & 0o777
+        );
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            ..Default::default()
+        };
+        save_session_cache(&mut cache).expect("save cache");
+        let mode = fs::metadata(&cache.path)
+            .expect("sessions.json exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "sessions.json must be owner-only, got {:o}",
+            mode & 0o777
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

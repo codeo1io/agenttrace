@@ -48,7 +48,9 @@ pub fn preserve_derived_history(sessions: &[Session]) -> anyhow::Result<()> {
     // crash mid-write can no longer tear the only durable record of
     // derived sessions (pass-7 P7-5).
     let tmp = crate::session_cache::unique_temp_path(&path);
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&records)?)?;
+    // rm-208: derived history names projects and carries session
+    // metrics; write it owner-only instead of the 0644 default.
+    crate::session_cache::write_private(&tmp, &serde_json::to_vec_pretty(&records)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -231,6 +233,54 @@ mod tests {
         assert!(!path.exists(), "torn history must not be re-read in place");
         let preserved = std::fs::read(&quarantine).expect("quarantine preserves bytes");
         assert_eq!(preserved, b"{\"torn\": ");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn history_file_is_owner_only() {
+        // rm-208: derived history names projects and carries session
+        // metrics; the 0644 default makes it readable by every local
+        // account. It must land owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-perms-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        // Point the environment at the temp root under the shared env
+        // lock (the default path is the user's real history file).
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+        let session = Session {
+            name: "secret task".to_string(),
+            path: "/tmp/private/session.jsonl".to_string(),
+            cwd: "/work/project".to_string(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 95,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        preserve_derived_history(&[session]).expect("preserve history");
+        let path = root.join("history.json");
+        let mode = std::fs::metadata(&path)
+            .expect("history.json exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "history.json must be owner-only, got {:o}",
+            mode & 0o777
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+        }
+        drop(_env);
         let _ = std::fs::remove_dir_all(root);
     }
 }

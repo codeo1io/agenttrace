@@ -126,6 +126,7 @@ FAKE_CARGO
 chmod +x "$shims/git" "$shims/cargo"
 out="$tmp/out.d"
 if ! env PATH="$shims:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/d" \
+	AGENTTRACE_INSTALL_RECEIPT="$tmp/d-receipt" \
 	AGENTTRACE_DOWNLOAD_URL="file://$bad_stub" sh install.sh >"$out" 2>&1; then
 	cat "$out" >&2
 	fail "test D: install.sh must fall back to a source build for an incompatible download"
@@ -135,8 +136,78 @@ cmp -s "$tmp/d/agenttrace" "$ok_stub" ||
 	fail "test D: installed binary must be the fallback-built artifact"
 grep -q "Falling back to building from source" "$out" ||
 	fail "test D: fallback must be announced"
+grep -q "pinned ref" "$out" ||
+	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
+grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
+	fail "test D: install receipt must record the default pinned ref (rm-051)"
+
+# — test E: the fallback clones a PINNED ref, never a moving default
+#   branch (rm-051) — this fake git refuses an unpinned clone and
+#   records the ref it was handed —
+shims_e="$tmp/shims-e"
+mkdir -p "$shims_e"
+cat >"$shims_e/git" <<FAKE_GIT_E
+#!/bin/sh
+set -e
+if [ "\$1" = "clone" ]; then
+	ref=""
+	prev=""
+	for arg in "\$@"; do
+		if [ "\$prev" = "--branch" ]; then ref="\$arg"; fi
+		prev="\$arg"
+	done
+	[ -n "\$ref" ] || {
+		echo "UNPINNED CLONE ATTEMPTED: git \$*" >&2
+		exit 99
+	}
+	case "\$ref" in
+		no-such-*) echo "fatal: Remote branch \$ref not found" >&2; exit 1 ;;
+	esac
+	for dest do :; done
+	mkdir -p "\$dest/target/release"
+	cp "$ok_stub" "\$dest/target/release/agenttrace"
+	echo "clone --branch \$ref" >>"$tmp/git-e.args"
+	exit 0
+fi
+exit 1
+FAKE_GIT_E
+cat >"$shims_e/cargo" <<'FAKE_CARGO'
+#!/bin/sh
+exit 0
+FAKE_CARGO
+chmod +x "$shims_e/git" "$shims_e/cargo"
+out="$tmp/out.e"
+if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
+	AGENTTRACE_INSTALL_RECEIPT="$tmp/e-receipt" \
+	AGENTTRACE_DOWNLOAD_URL="file://$bad_stub" sh install.sh >"$out" 2>&1; then
+	cat "$out" >&2
+	fail "test E: pinned source build must succeed"
+fi
+grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
+grep -q "pinned ref v0.9.0" "$out" ||
+	fail "test E: fallback must echo the pinned ref to the user"
+grep -q '^source=source-build$' "$tmp/e-receipt" ||
+	fail "test E: install receipt must record the source-build lane"
+grep -q '^repo=luoyuctl/agenttrace$' "$tmp/e-receipt" ||
+	fail "test E: install receipt must record the repository"
+
+# — test F: an unresolvable pin aborts with a clear, actionable message —
+out="$tmp/out.f"
+if env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/f" \
+	AGENTTRACE_INSTALL_RECEIPT="$tmp/f-receipt" \
+	AGENTTRACE_SOURCE_REF="no-such-tag-xyz" \
+	AGENTTRACE_DOWNLOAD_URL="file://$bad_stub" sh install.sh >"$out" 2>&1; then
+	cat "$out" >&2
+	fail "test F: an unresolvable pinned ref must abort the install"
+fi
+[[ ! -e "$tmp/f/agenttrace" ]] || fail "test F: nothing may be installed on an unresolvable pin"
+grep -q "pinned ref 'no-such-tag-xyz'" "$out" ||
+	fail "test F: the failure must name the pinned ref"
+grep -q "AGENTTRACE_SOURCE_REF" "$out" ||
+	fail "test F: the failure must point at the AGENTTRACE_SOURCE_REF override"
 
 # — glibc-baseline guard: a locally built binary must not require a glibc
 #   newer than the compatibility floor we defend (Ubuntu 22.04 = 2.35) —

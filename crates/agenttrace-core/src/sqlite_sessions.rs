@@ -171,6 +171,7 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
         return Vec::new();
     };
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
+    let tool_outcomes = hermes_tool_outcome_counts(&db);
     let cwd = if sqlite_has_column(&db, "sessions", "cwd") {
         "cwd"
     } else {
@@ -193,7 +194,6 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             end_unix: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
             events: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as usize,
             tool_calls_total: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as usize,
-            tool_calls_ok: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as usize,
             input_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0),
             output_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0),
             cache_read_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0),
@@ -215,6 +215,22 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             if let Some(counts) = roles.get(&agg.id) {
                 agg.user_messages = counts.user;
                 agg.assistant_turns = counts.assistant;
+            }
+            if let Some(outcomes) = tool_outcomes.get(&agg.id) {
+                // rm-198: the hermes session row records only the number
+                // of tool calls, never their outcome. The outcome split
+                // comes from the messages table instead (observed result
+                // rows, minus the ones hermes renders as tool errors),
+                // matching the parser convention that ok+fail counts
+                // observed results while tool_calls_total counts calls.
+                agg.tool_results = outcomes.results;
+                agg.tool_calls_fail = outcomes.failures;
+                agg.tool_calls_ok = outcomes.results.saturating_sub(outcomes.failures);
+                agg.tool_calls_total = agg.tool_calls_total.max(outcomes.results);
+            } else if let Some(counts) = roles.get(&agg.id) {
+                // No content column (or no tool rows): an outcome split
+                // cannot be derived, so report the observed result count
+                // without fabricating a success split.
                 agg.tool_results = counts.tool;
             }
             session_from_sqlite_agg(agg)
@@ -647,6 +663,56 @@ fn sqlite_role_counts(
     out
 }
 
+/// Per-session hermes tool outcome counts, derived from the `messages`
+/// table. `results` counts observed `role='tool'` rows; `failures`
+/// counts the rows hermes renders as tool errors. The hermes executor
+/// writes a failing result as `§<id>§ Error executing tool '<name>':
+/// <reason>` (an untagged leading phrase is tolerated for older
+/// renders) — verified against a live state.db where the marker matches
+/// 317 tool rows and zero rows of any other role, while
+/// `messages.effect_disposition` stays NULL for ~all rows and cannot
+/// serve as the outcome signal. Sessions row `tool_call_count` counts
+/// calls, never outcomes (rm-198).
+#[derive(Debug, Default)]
+struct HermesToolOutcomes {
+    results: usize,
+    failures: usize,
+}
+
+fn hermes_tool_outcome_counts(db: &Connection) -> HashMap<String, HermesToolOutcomes> {
+    if !sqlite_has_column(db, "messages", "content") {
+        return HashMap::new();
+    }
+    let sql = "select session_id, count(*), \
+               sum(case when (content like '§_%§ Error executing tool %' \
+                            or content like 'Error executing tool %') \
+                        then 1 else 0 end) \
+               from messages where role = 'tool' group by session_id";
+    let Ok(mut stmt) = db.prepare(sql) else {
+        return HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+        ))
+    }) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for (session_id, results, failures) in rows.filter_map(Result::ok) {
+        out.insert(
+            session_id,
+            HermesToolOutcomes {
+                results: results.max(0) as usize,
+                failures: failures.max(0) as usize,
+            },
+        );
+    }
+    out
+}
+
 fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     let mut models = agg.models;
     if models.is_empty() && !agg.model.is_empty() {
@@ -868,5 +934,127 @@ mod tests {
             "SQLite aggregate: multiple models"
         );
         assert_eq!(session.metrics.cost_estimated, 1.25);
+    }
+
+    /// Minimal hermes `state.db` fixture: two sessions. `s1` recorded two
+    /// tool calls on the session row and has three messages rows — one
+    /// clean tool result and one hermes-rendered tool error. `s2` recorded
+    /// two tool calls but retained no message rows.
+    fn hermes_state_db_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("state.db");
+        let db = Connection::open(&path).expect("open fixture db");
+        db.execute_batch(
+            r#"
+            create table sessions (
+                id text primary key,
+                model text,
+                started_at real,
+                ended_at real,
+                message_count integer,
+                tool_call_count integer,
+                input_tokens integer,
+                output_tokens integer,
+                cache_read_tokens integer,
+                cache_write_tokens integer,
+                cwd text
+            );
+            create table messages (
+                id integer primary key,
+                session_id text,
+                role text,
+                content text
+            );
+            insert into sessions values
+                ('s1', 'claude-sonnet-4', 1700000000.0, 1700000600.0, 5, 2, 10, 20, 0, 0, '/work/x'),
+                ('s2', 'claude-sonnet-4', 1700000700.0, 1700001200.0, 3, 2, 10, 20, 0, 0, '/work/x');
+            insert into messages (session_id, role, content) values
+                ('s1', 'user', 'go'),
+                ('s1', 'assistant', 'doing'),
+                ('s1', 'tool', '§7§ {"output": "ok"}'),
+                ('s1', 'tool', '§8§ Error executing tool ''terminal'': timed out after 420.0'),
+                ('s2', 'user', 'go');
+            "#,
+        )
+        .expect("seed fixture");
+        path
+    }
+
+    #[test]
+    fn hermes_tool_outcomes_come_from_result_rows_not_the_call_count() {
+        // rm-198 (golden boundary): pre-fix, tool_calls_total and
+        // tool_calls_ok both read sessions.tool_call_count, so hermes
+        // sessions claimed every tool call succeeded and
+        // tool_calls_fail was structurally 0. Post-fix, the split comes
+        // from the messages table: observed results, minus the rows
+        // hermes renders as tool errors.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm198-metrics-{}-{}",
+            std::process::id(),
+            1981
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = hermes_state_db_fixture(&root);
+        let sessions = query_hermes_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(sessions.len(), 2, "both fixture sessions must load");
+
+        let s1 = sessions
+            .iter()
+            .find(|session| session.name == "s1")
+            .expect("s1");
+        assert_eq!(s1.metrics.tool_calls_total, 2, "calls from session row");
+        assert_eq!(s1.metrics.tool_results, 2, "observed tool result rows");
+        assert_eq!(s1.metrics.tool_calls_ok, 1, "clean result rows");
+        assert_eq!(
+            s1.metrics.tool_calls_fail, 1,
+            "hermes-rendered error rows must count as failures"
+        );
+
+        let s2 = sessions
+            .iter()
+            .find(|session| session.name == "s2")
+            .expect("s2");
+        assert_eq!(s2.metrics.tool_calls_total, 2, "calls from session row");
+        assert_eq!(s2.metrics.tool_results, 0, "no retained message rows");
+        assert_eq!(
+            s2.metrics.tool_calls_ok, 0,
+            "no fabricated success split when no results were observed"
+        );
+        assert_eq!(s2.metrics.tool_calls_fail, 0);
+    }
+
+    #[test]
+    fn hermes_tool_failures_trip_the_overview_gate() {
+        // rm-198 end-to-end leg: fixture metrics -> tool_fail_rate ->
+        // evaluate_overview_gate (--max-tool-fail-rate). Pre-fix the rate
+        // is always 0 for hermes-sourced sessions, so the shipped gate
+        // could never trip on them.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm198-gate-{}-{}",
+            std::process::id(),
+            1982
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = hermes_state_db_fixture(&root);
+        let sessions = query_hermes_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+
+        // s1: ok 1 / fail 1 -> 50% across the corpus (s2 contributes no
+        // observed outcomes, matching the parser convention).
+        let rate = crate::tool_fail_rate(&sessions);
+        assert!((rate - 50.0).abs() < 1e-9, "tool_fail_rate was {rate}");
+        let failures = crate::evaluate_overview_gate(
+            &crate::Overview::default(),
+            &sessions,
+            0,
+            false,
+            Some(40.0),
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|message| message.contains("tool failure rate")),
+            "--max-tool-fail-rate must trip on hermes-sourced failures: {failures:?}"
+        );
     }
 }

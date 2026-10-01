@@ -180,7 +180,10 @@ Claude Code invokes the command on every prompt with a single-line JSON
 payload on stdin; agenttrace renders the status line and appends the raw
 payload to a local journal (`~/.cache/agenttrace/statusline.jsonl`, capped at
 10 MiB, oldest lines compacted away; set `AGENTTRACE_SESSION_CACHE_DIR` to
-relocate it). The command never fails the host — bad or empty input still
+relocate it). Cache files are written owner-only (`0600` on Unix) and
+compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
+load reclaims if a crash leaves one behind (see PRIVACY.md). The command
+never fails the host — bad or empty input still
 exits 0 with a one-line fallback. Review what was captured with
 `agenttrace --statusline-report`, the Efficiency panel in the TUI, or
 `agenttrace --doctor` ("Statusline capture" line). See
