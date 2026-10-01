@@ -2368,10 +2368,16 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
     // parsed from out-of-scope sessions.
     let root = temp_root("agenttrace-range-health");
     fs::create_dir_all(&root).expect("create range-health dir");
-    let recent = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
-{"role":"user","content":"recent work","timestamp":"2026-09-01T10:00:00Z"}
-{"role":"assistant","content":"done","timestamp":"2026-09-01T10:00:01Z"}
-"#;
+    // Now-relative so the fixture can never age out of the 30-day window
+    // (review 2026-10-01: the hardcoded 2026-09-01 ts detonated permanently
+    // at 2026-10-01T10:00:00Z).
+    let recent_ts = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    let recent = format!(
+        r#"{{"role":"session_meta","timestamp":"{}","ModelUsed":"claude-sonnet-4"}}
+{{"role":"user","content":"recent work","timestamp":"{}"}}
+{{"role":"assistant","content":"done","timestamp":"{}"}}"#,
+        recent_ts, recent_ts, recent_ts
+    );
     let old = r#"{"role":"session_meta","timestamp":"2020-01-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
 {"role":"user","content":"ancient work","timestamp":"2020-01-02T10:00:00Z"}
 {"role":"assistant","content":"done","timestamp":"2020-01-02T10:00:01Z"}

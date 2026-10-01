@@ -5,6 +5,13 @@ on:
     tags:
       - "v*"
 
+env:
+  # rm-196: the single upstream publishing identity. Third-party registry
+  # lanes (npm publish, homebrew tap, winget submit) are gated to this
+  # repository, so a fork v* tag builds, attests, and attaches its channels
+  # but never cross-publishes into registries it does not own.
+  UPSTREAM_REPO: luoyuctl/agenttrace
+
 jobs:
   verify:
     name: Verify release sources
@@ -32,6 +39,9 @@ jobs:
 
       - name: Rust tests (locked)
         run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
+
+      - name: Check channel identity (rm-196)
+        run: scripts/release/check-channel-identity.sh
 
   build:
     name: Build release assets
@@ -170,6 +180,10 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          if [[ "$GITHUB_REPOSITORY" != "$UPSTREAM_REPO" ]]; then
+            echo "::notice title=channel-gate::Skipping npm publish: registry lanes run only on $UPSTREAM_REPO (this run: $GITHUB_REPOSITORY)"
+            exit 0
+          fi
           test -n "$NODE_AUTH_TOKEN" || {
             echo "NPM_TOKEN is required to publish the npm package." >&2
             exit 1
@@ -178,9 +192,17 @@ jobs:
 
       - name: Publish npm launcher
         run: |
+          if [[ "$GITHUB_REPOSITORY" != "$UPSTREAM_REPO" ]]; then
+            echo "::notice title=channel-gate::Skipping npm publish: registry lanes run only on $UPSTREAM_REPO (this run: $GITHUB_REPOSITORY)"
+            exit 0
+          fi
           npm publish "./dist/zack78-agenttrace-${GITHUB_REF_NAME#v}.tgz" --access public
 
       - name: Render Homebrew and WinGet manifests
+        env:
+          # rm-196: channels resolve the repository actually being released,
+          # so fork-tagged renders never point at upstream URLs.
+          CHANNEL_REPO: ${{ github.repository }}
         run: |
           scripts/release/render-channels.sh \
             "${GITHUB_REF_NAME#v}" \
@@ -191,6 +213,10 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          if [[ "$GITHUB_REPOSITORY" != "$UPSTREAM_REPO" ]]; then
+            echo "::notice title=channel-gate::Skipping homebrew tap update: registry lanes run only on $UPSTREAM_REPO (this run: $GITHUB_REPOSITORY)"
+            exit 0
+          fi
           test -n "$HOMEBREW_TAP_TOKEN" || {
             echo "HOMEBREW_TAP_TOKEN is required to update luoyuctl/homebrew-tap." >&2
             exit 1
@@ -250,6 +276,10 @@ jobs:
         env:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
         run: |
+          if ($env:GITHUB_REPOSITORY -ne $env:UPSTREAM_REPO) {
+            Write-Host "::notice title=channel-gate::Skipping winget submission: registry lanes run only on $env:UPSTREAM_REPO (this run: $env:GITHUB_REPOSITORY)"
+            exit 0
+          }
           if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
             throw "WINGET_GITHUB_TOKEN is required to submit the WinGet manifest."
           }
