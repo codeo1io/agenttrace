@@ -3234,7 +3234,7 @@ pub(super) fn loading_status_lines(app: &App) -> Vec<Line<'static>> {
             app.t("skipped", "跳过"),
             format_count(state.skipped as i64),
             app.t("pricing fallback", "价格回退"),
-            format_count(health.fallback_pricing as i64),
+            pricing_fallback_value(app, health),
             app.t("latest", "最新"),
             if health.latest_session_at.is_empty() {
                 app.t("unknown", "未知").to_string()
@@ -3243,6 +3243,25 @@ pub(super) fn loading_status_lines(app: &App) -> Vec<Line<'static>> {
             }
         )),
     ]
+}
+
+/// rm-078: the fallback count now carries its split — how many sessions
+/// were approximated from a neighboring built-in entry versus priced at
+/// the plain default rate — so silent approximation is countable on the
+/// TUI load summary too.
+fn pricing_fallback_value(app: &App, health: &DataHealth) -> String {
+    let total = format_count(health.fallback_pricing as i64);
+    if health.fallback_pricing == 0 {
+        return total;
+    }
+    format!(
+        "{} ({} {}, {} {})",
+        total,
+        app.t("approx", "近似"),
+        format_count(health.pricing_approximated as i64),
+        app.t("default", "默认"),
+        format_count(health.pricing_default as i64)
+    )
 }
 
 pub(super) fn load_summary_line(app: &App) -> String {

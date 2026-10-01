@@ -138,6 +138,17 @@ agenttrace --statusline-report -f json
 {"aliases":{"provider/raw-model":"my-model"},"prices":{"my-model":{"input":1,"output":2,"cw":0,"cr":0}}}
 ```
 
+Proxy fleets often record a placeholder model name (`"model": "<synthetic>"`
+in the raw transcript) that matches no catalog key, so every such session
+silently prices at the default rate. Point an alias at the model you
+actually pay for and the report names the resolved key on the cost line:
+`{"aliases":{"<synthetic>":"glm-5.2"}}` renders as
+`(model: <synthetic> (priced via override glm-5.2))`. Cost lines annotate
+any rate that differs from the recorded model — `priced via builtin …`
+for the built-in fallback table, `priced at default rate` when no key
+matched at all — and `--overview -f json` counts both buckets in
+`data_health` (`pricing_approximated` / `pricing_default`).
+
 `--overview` now includes scope, parse and pricing confidence, cost audit,
 prioritized recommendations, MCP governance, context trends, and delivery
 signals in JSON, Markdown, and HTML output. All cost and delivery fields are

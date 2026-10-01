@@ -7,8 +7,18 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
-const PRICING_URL: &str =
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+/// Catalog URLs for `--update-pricing`, tried in order. LiteLLM renamed
+/// this file overnight once already (the legacy `_json`-suffixed name
+/// started 404ing on 2026-10-01), so the refresh walks a list instead of
+/// pinning one URL and names every URL it tried when they all fail
+/// (rm-078).
+const PRICING_URLS: [&str; 2] = [
+    // Current canonical catalog.
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    // Pre-2026-10-01 name, kept so a rename back (or a stale mirror)
+    // does not kill the refresh.
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window_json.json",
+];
 /// Trimmed LiteLLM chat-model pricing snapshot, vendored so agenttrace is
 /// fully offline by default. Regenerate with `scripts/pricing/update-snapshot.sh`
 /// and keep `PRICING_SNAPSHOT_DATE` in sync with the date it prints.
@@ -18,12 +28,80 @@ const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, Deserialize)]
 pub struct Price {
     pub input: f64,
     pub output: f64,
     pub cw: f64,
     pub cr: f64,
+}
+
+/// How a model's price was matched. The matcher has always computed
+/// this and thrown it away; it is now threaded out so surfaces that
+/// print money can say which rate actually priced a session (rm-078).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceMatchStatus {
+    /// The model's own (normalized) name is a catalog or override key.
+    Exact,
+    /// A key matched only after variant widening (vendor-prefix strip,
+    /// minor-segment drop, deepseek rewrite) — a neighboring name's rate.
+    Variant,
+    /// No catalog key at all: the built-in fallback table priced the
+    /// session — a neighboring name's rate after variant widening, or
+    /// the model's own name if only the built-in table knows it. Either
+    /// way the catalog did not price it. Silent approximation before
+    /// rm-078.
+    BuiltinVariant,
+    /// No key anywhere: the default rate priced the session.
+    Default,
+}
+
+impl PriceMatchStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Variant => "variant",
+            Self::BuiltinVariant => "builtin_variant",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Which table the winning key came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceSource {
+    /// The LiteLLM catalog (bundled snapshot or refreshed cache).
+    Snapshot,
+    /// A user `AGENTTRACE_PRICING_FILE` price or alias entry.
+    Override,
+    /// The built-in fallback table.
+    Builtin,
+    /// The plain default rate (no key at all).
+    Default,
+}
+
+impl PriceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Override => "override",
+            Self::Builtin => "builtin",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// One price lookup with the matcher's usually-disclosed half: what was
+/// paid, and how it was found. This is the primitive the provenance
+/// surfaces consume; text renderers use `priced_via_phrase`.
+#[derive(Debug, Clone)]
+pub struct PriceMatchInfo {
+    pub price: Price,
+    pub status: PriceMatchStatus,
+    /// Catalog/builtin key that priced the model; `None` only for the
+    /// default rate, which has no key.
+    pub matched_key: Option<String>,
+    pub source: PriceSource,
 }
 
 #[derive(Debug, Clone)]
@@ -50,9 +128,49 @@ struct LiteLlmModel {
 }
 
 pub fn lookup_price(model: &str) -> Price {
+    lookup_price_match(model).price
+}
+
+/// `lookup_price` with the matcher's provenance: the status, the key
+/// that actually priced the model, and the table it came from (rm-078).
+pub fn lookup_price_match(model: &str) -> PriceMatchInfo {
     let catalog = pricing_catalog();
-    let model = resolve_alias(model, &catalog.aliases);
-    lookup_price_in(&model, &catalog.entries)
+    let normalized = normalize_model(model);
+    let resolved = resolve_alias(model, &catalog.aliases);
+    let mut info = lookup_price_in_match(&resolved, &catalog.entries, pricing_override_models());
+    if resolved != normalized && info.source == PriceSource::Snapshot {
+        // A user alias rewrite is an override decision even when the
+        // target key itself comes from the catalog.
+        info.source = PriceSource::Override;
+    }
+    info
+}
+
+/// Parenthesized provenance phrase for per-session cost lines, e.g.
+/// `" (priced via builtin claude-opus-4)"`. Empty when the model string
+/// as the source recorded it is itself the exact key that priced the
+/// session — nothing to disclose. `zh` selects the Chinese phrasing used
+/// by the bilingual text report (rm-078).
+pub fn priced_via_phrase(model: &str, zh: bool) -> String {
+    priced_via_phrase_in(model, &lookup_price_match(model), zh)
+}
+
+fn priced_via_phrase_in(model: &str, info: &PriceMatchInfo, zh: bool) -> String {
+    let key = info.matched_key.as_deref().unwrap_or("");
+    if info.status == PriceMatchStatus::Exact && key == model {
+        return String::new();
+    }
+    let phrase = match (zh, info.source) {
+        (false, PriceSource::Snapshot) => format!("priced via catalog {key}"),
+        (false, PriceSource::Override) => format!("priced via override {key}"),
+        (false, PriceSource::Builtin) => format!("priced via builtin {key}"),
+        (false, PriceSource::Default) => "priced at default rate".to_string(),
+        (true, PriceSource::Snapshot) => format!("按目录价 {key} 计价"),
+        (true, PriceSource::Override) => format!("按覆盖价 {key} 计价"),
+        (true, PriceSource::Builtin) => format!("按内置价 {key} 计价"),
+        (true, PriceSource::Default) => "按默认费率计价".to_string(),
+    };
+    format!(" ({phrase})")
 }
 
 pub fn has_specific_price(model: &str) -> bool {
@@ -341,7 +459,34 @@ fn pricing_override_models() -> &'static BTreeSet<String> {
 }
 
 fn download_pricing(timeout: Duration) -> anyhow::Result<(String, BTreeMap<String, Price>)> {
-    let raw = ureq::get(PRICING_URL)
+    // Walk the known URLs in order; LiteLLM renamed this file overnight
+    // once already (2026-10-01), so a single pin is a single point of
+    // failure (rm-078). Name every URL tried when they all fail.
+    let mut failures = Vec::new();
+    for url in PRICING_URLS {
+        match fetch_pricing_url(url, timeout) {
+            Ok(fetched) => return Ok(fetched),
+            Err(err) => failures.push(format!("{url}: {err}")),
+        }
+    }
+    Err(pricing_download_failed(&failures))
+}
+
+/// rm-078: when every known catalog URL fails, the error names each URL
+/// tried so an overnight rename is diagnosable from the message alone
+/// instead of looking like an opaque network failure.
+fn pricing_download_failed(failures: &[String]) -> anyhow::Error {
+    anyhow!(
+        "pricing catalog download failed for every known URL:\n  {}",
+        failures.join("\n  ")
+    )
+}
+
+fn fetch_pricing_url(
+    url: &str,
+    timeout: Duration,
+) -> anyhow::Result<(String, BTreeMap<String, Price>)> {
+    let raw = ureq::get(url)
         .timeout(timeout)
         .call()
         .map_err(|err| anyhow!("download failed: {err}"))?
@@ -368,17 +513,55 @@ fn write_pricing_cache(raw: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn lookup_price_in(model: &str, entries: &BTreeMap<String, Price>) -> Price {
+/// The matcher with its usually-discarded half surfaced: which key
+/// priced the model, how it matched, and which table won. The returned
+/// price is byte-identical to the old lookup path — only the discarded
+/// classification is new (rm-078).
+fn lookup_price_in_match(
+    model: &str,
+    entries: &BTreeMap<String, Price>,
+    override_models: &BTreeSet<String>,
+) -> PriceMatchInfo {
     if let Some(key) = matching_catalog_key(model, entries) {
-        return entries.get(&key).copied().unwrap_or_default();
+        let exact = key == model || key == normalize_model(model);
+        let source = if override_models.contains(&key) {
+            PriceSource::Override
+        } else {
+            PriceSource::Snapshot
+        };
+        return PriceMatchInfo {
+            price: entries.get(&key).copied().unwrap_or_default(),
+            status: if exact {
+                PriceMatchStatus::Exact
+            } else {
+                PriceMatchStatus::Variant
+            },
+            matched_key: Some(key),
+            source,
+        };
     }
     let builtin = builtin_pricing();
     for variant in match_variants(model) {
         if let Some(price) = builtin.get(&variant) {
-            return *price;
+            // The built-in table's own "default" row is the default
+            // rate, not a variant match — classify it as such.
+            if variant != "default" {
+                return PriceMatchInfo {
+                    price: *price,
+                    status: PriceMatchStatus::BuiltinVariant,
+                    matched_key: Some(variant),
+                    source: PriceSource::Builtin,
+                };
+            }
+            break;
         }
     }
-    builtin.get("default").copied().unwrap_or_default()
+    PriceMatchInfo {
+        price: builtin.get("default").copied().unwrap_or_default(),
+        status: PriceMatchStatus::Default,
+        matched_key: None,
+        source: PriceSource::Default,
+    }
 }
 
 fn matching_catalog_key(model: &str, entries: &BTreeMap<String, Price>) -> Option<String> {
@@ -1175,6 +1358,212 @@ fn user_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestEntry = (&'static str, (f64, f64, f64, f64));
+
+    fn entries(pairs: &[TestEntry]) -> BTreeMap<String, Price> {
+        pairs
+            .iter()
+            .map(|(name, (input, output, cw, cr))| {
+                (
+                    name.to_string(),
+                    Price {
+                        input: *input,
+                        output: *output,
+                        cw: *cw,
+                        cr: *cr,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn price_match_classifies_exact_variant_builtin_and_default() {
+        // rm-078: the matcher used to compute this classification and
+        // throw it away. Deterministic against a synthetic catalog, so
+        // the user's real pricing cache cannot perturb the assertions.
+        let catalog = entries(&[
+            ("claude-opus-4", (5.0, 25.0, 6.25, 0.5)),
+            ("gpt-4.1", (2.0, 8.0, 0.0, 0.5)),
+        ]);
+        let no_overrides = BTreeSet::new();
+
+        // Exact: the model string is itself the catalog key.
+        let m = lookup_price_in_match("claude-opus-4", &catalog, &no_overrides);
+        assert_eq!(m.status, PriceMatchStatus::Exact);
+        assert_eq!(m.matched_key.as_deref(), Some("claude-opus-4"));
+        assert_eq!(m.source, PriceSource::Snapshot);
+        assert_eq!(m.price.input, 5.0);
+
+        // Exact after normalization: vendor prefix stripped, key names
+        // the rate that actually priced the session.
+        let m = lookup_price_in_match("openai/gpt-4.1", &catalog, &no_overrides);
+        assert_eq!(m.status, PriceMatchStatus::Exact);
+        assert_eq!(m.matched_key.as_deref(), Some("gpt-4.1"));
+        assert_eq!(m.source, PriceSource::Snapshot);
+
+        // Variant: minor-segment widening reached a neighboring key
+        // (`claude-opus-4-9` drops its short digit tail to
+        // `claude-opus-4`, a neighboring name's rate).
+        let m = lookup_price_in_match("claude-opus-4-9", &catalog, &no_overrides);
+        assert_eq!(m.status, PriceMatchStatus::Variant);
+        assert_eq!(m.matched_key.as_deref(), Some("claude-opus-4"));
+
+        // Builtin variant: catalog miss priced by the built-in table.
+        // `claude-sonnet-4-8` is not a catalog key, but its widened
+        // variant `claude-sonnet-4` is a built-in entry — a neighboring
+        // name's rate, an approximation.
+        let m = lookup_price_in_match(
+            "claude-sonnet-4-8",
+            &entries(&[("unrelated-model", (1.0, 1.0, 0.0, 0.0))]),
+            &no_overrides,
+        );
+        assert_eq!(m.status, PriceMatchStatus::BuiltinVariant);
+        assert_eq!(m.matched_key.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(m.source, PriceSource::Builtin);
+        assert_eq!(m.price.input, builtin_pricing()["claude-sonnet-4"].input);
+
+        // Default: no key anywhere, matched_key is genuinely absent.
+        let m = lookup_price_in_match("totally-unknown-thing", &BTreeMap::new(), &no_overrides);
+        assert_eq!(m.status, PriceMatchStatus::Default);
+        assert_eq!(m.matched_key, None);
+        assert_eq!(m.source, PriceSource::Default);
+        assert_eq!(m.price, default_price());
+
+        // The builtin table's own "default" row classifies as the
+        // default rate, not as a builtin variant hit.
+        let m = lookup_price_in_match("unknown", &BTreeMap::new(), &no_overrides);
+        assert_eq!(m.status, PriceMatchStatus::Default);
+        assert_eq!(m.matched_key, None);
+    }
+
+    #[test]
+    fn price_match_labels_override_entries_and_keeps_prices_identical() {
+        let catalog = entries(&[("my-model", (1.0, 2.0, 3.0, 4.0))]);
+        let overrides = BTreeSet::from(["my-model".to_string()]);
+        let m = lookup_price_in_match("my-model", &catalog, &overrides);
+        assert_eq!(m.source, PriceSource::Override);
+        assert_eq!(m.status, PriceMatchStatus::Exact);
+
+        // Same key, same overrides set absent: the entry is catalog-sourced.
+        let m = lookup_price_in_match("my-model", &catalog, &BTreeSet::new());
+        assert_eq!(m.source, PriceSource::Snapshot);
+
+        // The refactor must not move a cent: every classification path
+        // returns the same price the old lookup returned.
+        for model in [
+            "claude-opus-4",
+            "openai/gpt-4.1",
+            "claude-opus-4-9",
+            "claude-sonnet-4-8",
+            "unknown",
+            "",
+            "GLM-5.2",
+        ] {
+            let plain = lookup_price_in_match(model, &catalog, &BTreeSet::new()).price;
+            // Direct comparison against a hand-rolled old-path lookup:
+            // catalog first, then builtin variants, then builtin default.
+            let expected = matching_catalog_key(model, &catalog)
+                .map(|key| catalog[&key])
+                .unwrap_or_else(|| {
+                    let builtin = builtin_pricing();
+                    match_variants(model)
+                        .iter()
+                        .find_map(|variant| {
+                            (variant != "default")
+                                .then(|| builtin.get(variant).copied())
+                                .flatten()
+                        })
+                        .unwrap_or_else(|| builtin["default"])
+                });
+            assert_eq!(plain, expected, "price moved for {model}");
+        }
+    }
+
+    #[test]
+    fn priced_via_phrase_discloses_only_when_the_key_differs() {
+        let exact = PriceMatchInfo {
+            price: default_price(),
+            status: PriceMatchStatus::Exact,
+            matched_key: Some("glm-5.2".to_string()),
+            source: PriceSource::Snapshot,
+        };
+        assert_eq!(priced_via_phrase_in("glm-5.2", &exact, false), "");
+
+        let builtin = PriceMatchInfo {
+            price: default_price(),
+            status: PriceMatchStatus::BuiltinVariant,
+            matched_key: Some("glm-5".to_string()),
+            source: PriceSource::Builtin,
+        };
+        assert_eq!(
+            priced_via_phrase_in("glm-5.2", &builtin, false),
+            " (priced via builtin glm-5)"
+        );
+        assert_eq!(
+            priced_via_phrase_in("glm-5.2", &builtin, true),
+            " (按内置价 glm-5 计价)"
+        );
+
+        let defaulted = PriceMatchInfo {
+            price: default_price(),
+            status: PriceMatchStatus::Default,
+            matched_key: None,
+            source: PriceSource::Default,
+        };
+        assert_eq!(
+            priced_via_phrase_in("mystery-model", &defaulted, false),
+            " (priced at default rate)"
+        );
+        assert_eq!(
+            priced_via_phrase_in("mystery-model", &defaulted, true),
+            " (按默认费率计价)"
+        );
+
+        // A catalog hit under a normalized name still names the key.
+        let normalized = PriceMatchInfo {
+            price: default_price(),
+            status: PriceMatchStatus::Exact,
+            matched_key: Some("gpt-4.1".to_string()),
+            source: PriceSource::Snapshot,
+        };
+        assert_eq!(
+            priced_via_phrase_in("openai/gpt-4.1", &normalized, false),
+            " (priced via catalog gpt-4.1)"
+        );
+    }
+
+    #[test]
+    fn download_pricing_failure_names_every_url_tried() {
+        // rm-078: an overnight catalog rename must be diagnosable from
+        // the error alone — it names every URL tried, not just the last.
+        let failures = PRICING_URLS
+            .iter()
+            .map(|url| format!("{url}: download failed: 404"))
+            .collect::<Vec<_>>();
+        let message = pricing_download_failed(&failures).to_string();
+        assert!(
+            message.starts_with("pricing catalog download failed for every known URL:"),
+            "message: {message}"
+        );
+        for url in PRICING_URLS {
+            assert!(message.contains(url), "message must name {url}: {message}");
+        }
+    }
+
+    #[test]
+    fn pricing_urls_try_the_canonical_catalog_first_and_keep_the_legacy_name() {
+        // LiteLLM renamed the catalog file overnight on 2026-10-01 (the
+        // legacy name 404s live); the refresh must not depend on a
+        // single name (rm-078).
+        assert_eq!(PRICING_URLS.len(), 2);
+        assert!(PRICING_URLS[0].ends_with("/model_prices_and_context_window.json"));
+        assert!(PRICING_URLS[1].ends_with("/model_prices_and_context_window_json.json"));
+        assert!(PRICING_URLS
+            .iter()
+            .all(|url| url.starts_with("https://raw.githubusercontent.com/BerriAI/litellm/main/")));
+    }
 
     #[test]
     fn builtin_fallback_includes_go_alias_slice() {
