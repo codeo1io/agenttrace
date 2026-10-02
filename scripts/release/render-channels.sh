@@ -23,7 +23,13 @@ fail() {
 version="${1#v}"
 checksums_file="$2"
 output_dir="$3"
-repo="luoyuctl/agenttrace"
+# Single distribution identity (rm-196): CHANNEL_REPO lets the release workflow
+# inject the repository actually being released (github.repository), so rendered
+# channels always resolve the publishing repo. The default is the upstream
+# channel that the installers (install.sh, install.ps1, npm/scripts/install.js)
+# also bake; scripts/release/check-channel-identity.sh enforces that all four
+# surfaces carry one identical definition.
+repo="${CHANNEL_REPO:-luoyuctl/agenttrace}"
 
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "invalid version: $version"
 [[ -f "$checksums_file" ]] || fail "checksums file does not exist: $checksums_file"
@@ -44,6 +50,12 @@ windows_amd64="$(checksum_for agenttrace-windows-amd64.exe)"
 windows_arm64="$(checksum_for agenttrace-windows-arm64.exe)"
 
 homebrew_dir="$output_dir/homebrew/Formula"
+# WinGet package identity is pinned to the upstream package (Luoyuctl.AgentTrace):
+# fork renders keep the identifier (they describe the same application) but are
+# never submitted — the npm/homebrew/winget submission lanes in
+# .github/workflows/release.yml are gated to the upstream publishing repo
+# (UPSTREAM_REPO), so a fork v* tag can build and attach channels but can never
+# cross-publish into a registry it does not own.
 winget_dir="$output_dir/winget/manifests/l/Luoyuctl/AgentTrace/$version"
 mkdir -p "$homebrew_dir" "$winget_dir"
 
@@ -86,6 +98,7 @@ end
 FORMULA
 
 cat >"$winget_dir/Luoyuctl.AgentTrace.yaml" <<VERSION
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
 PackageIdentifier: Luoyuctl.AgentTrace
 PackageVersion: $version
 DefaultLocale: en-US
@@ -94,6 +107,7 @@ ManifestVersion: 1.10.0
 VERSION
 
 cat >"$winget_dir/Luoyuctl.AgentTrace.locale.en-US.yaml" <<LOCALE
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
 PackageIdentifier: Luoyuctl.AgentTrace
 PackageVersion: $version
 PackageLocale: en-US
@@ -118,6 +132,7 @@ ManifestVersion: 1.10.0
 LOCALE
 
 cat >"$winget_dir/Luoyuctl.AgentTrace.installer.yaml" <<INSTALLER
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
 PackageIdentifier: Luoyuctl.AgentTrace
 PackageVersion: $version
 InstallerType: portable
@@ -127,11 +142,9 @@ Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/$repo/releases/download/v$version/agenttrace-windows-amd64.exe
     InstallerSha256: $windows_amd64
-    PortableCommandAlias: agenttrace
   - Architecture: arm64
     InstallerUrl: https://github.com/$repo/releases/download/v$version/agenttrace-windows-arm64.exe
     InstallerSha256: $windows_arm64
-    PortableCommandAlias: agenttrace
 ManifestType: installer
 ManifestVersion: 1.10.0
 INSTALLER

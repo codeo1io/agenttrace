@@ -95,6 +95,25 @@ A prebuilt binary that cannot run on this host (for example, one built
 against a newer libc) is never installed silently: the installer reports
 the loader's error, and `install.sh` falls back to a source build.
 
+### Distribution identity (forks)
+
+Release channels resolve the repository the release is cut from: the release
+workflow passes `CHANNEL_REPO` to `scripts/release/render-channels.sh`, so the
+Homebrew formula and WinGet manifests always point at the publishing
+repository's release assets. The distribution identity itself —
+`luoyuctl/agenttrace` — is defined once per surface (`render-channels.sh`,
+`install.sh`, `install.ps1`, `npm/scripts/install.js`) and enforced by
+`scripts/release/check-channel-identity.sh` in the release `verify` job.
+
+Third-party registry submissions (npm publish, the Homebrew tap, the WinGet
+package) run **only** on `luoyuctl/agenttrace`: those lanes are gated on
+`UPSTREAM_REPO` in `.github/workflows/release.yml` and skip with a visible
+notice everywhere else. A fork tag therefore builds, attests, and attaches its
+own channels, but can never publish into a registry it does not own. The WinGet
+package identity (`Luoyuctl.AgentTrace`) stays pinned to the upstream package
+by design; fork-scoped package identities are intentionally out of scope for
+this gate.
+
 ## Quickstart
 
 ```bash

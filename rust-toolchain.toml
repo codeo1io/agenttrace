@@ -1,0 +1,10 @@
+# Toolchain pin: rustup reads this file for every cargo invocation, so local
+# `cargo fmt` / `cargo clippy` run the same stable channel (and components)
+# that CI installs via dtolnay/rust-toolchain@stable in .github/workflows/ci.yml
+# and .github/workflows/release.yml. Exact-version pinning is a deliberate
+# follow-up; the channel pin already removes the
+# "local rustfmt silently differs from CI" failure mode.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
