@@ -282,12 +282,21 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         language.t("Total tokens", "Token 总数"),
         format_tokens(total_tokens)
     ));
+    // rm-237: surface the service tier next to the model when the
+    // session recorded one — a flex session priced at half is confusing
+    // without the tier label.
+    let tier_note = if metrics.service_tier.is_empty() {
+        String::new()
+    } else {
+        format!("  {}: {}", language.t("tier", "等级"), metrics.service_tier)
+    };
     out.push_str(&format!(
-        "  {}: {:>12}  ({}: {})\n\n",
+        "  {}: {:>12}  ({}: {}{})\n\n",
         language.t("Estimated cost", "估算成本"),
         format_cost(metrics.cost_estimated),
         language.t("model", "模型"),
-        metrics.model_used
+        metrics.model_used,
+        tier_note
     ));
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
@@ -2604,6 +2613,40 @@ fn possible_cost_driver_note_strict(session: &Session) -> Option<String> {
 mod tests {
     use super::*;
     use crate::Metrics;
+
+    #[test]
+    fn session_report_labels_service_tier_next_to_model() {
+        // rm-237: a flex session priced at half is confusing without the
+        // tier label, so the text report must show it beside the model.
+        let flex = Session {
+            name: "flex-rollout".to_string(),
+            path: "/tmp/flex-rollout.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                tokens_input: 1_000_000,
+                tokens_output: 2_000_000,
+                model_used: "gpt-5.1".to_string(),
+                service_tier: "flex".to_string(),
+                cost_estimated: 10.625,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let text = report_text(&flex);
+        assert!(text.contains("tier: flex"), "tier note missing: {text}");
+        assert!(text.contains("gpt-5.1"));
+        let untiered = Session {
+            metrics: Metrics {
+                model_used: "gpt-5.1".to_string(),
+                ..Metrics::default()
+            },
+            ..flex
+        };
+        assert!(!report_text(&untiered).contains("tier:"));
+    }
 
     #[test]
     fn overview_summary_totals_saturate_across_sessions() {

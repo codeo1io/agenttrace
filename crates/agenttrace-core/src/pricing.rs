@@ -23,6 +23,12 @@ pub struct Price {
     pub input: f64,
     pub output: f64,
     pub cw: f64,
+    /// Above-1h cache-write rate (rm-238): LiteLLM documents a separate
+    /// `cache_creation_input_token_cost_above_1hr` for Claude models
+    /// billed at twice the five-minute rate. 0.0 means "no published
+    /// rate" and cost time falls back to `cw`.
+    #[serde(default)]
+    pub cw_1h: f64,
     pub cr: f64,
 }
 
@@ -31,6 +37,11 @@ pub struct PricingCatalog {
     pub entries: BTreeMap<String, Price>,
     pub aliases: BTreeMap<String, String>,
     pub source: String,
+    /// Content fingerprint of `entries` + `aliases` (rm-196): the
+    /// session cache records it per entry so a refreshed catalog
+    /// re-prices cached sessions. Never clock-derived — identical
+    /// content maps to one revision across processes.
+    pub revision: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +52,8 @@ struct LiteLlmModel {
     output_cost: f64,
     #[serde(default, rename = "cache_creation_input_token_cost")]
     cache_write_cost: f64,
+    #[serde(default, rename = "cache_creation_input_token_cost_above_1hr")]
+    cache_write_1h_cost: f64,
     #[serde(default, rename = "cache_read_input_token_cost")]
     cache_read_cost: f64,
     #[serde(default)]
@@ -81,6 +94,7 @@ pub fn default_price() -> Price {
         input: 3.0,
         output: 15.0,
         cw: 0.0,
+        cw_1h: 0.0,
         cr: 0.0,
     })
 }
@@ -121,6 +135,80 @@ pub fn bundled_snapshot_model_count() -> usize {
 pub fn bundled_snapshot_age_days() -> Option<i64> {
     let date = chrono::NaiveDate::parse_from_str(PRICING_SNAPSHOT_DATE, "%Y-%m-%d").ok()?;
     Some((chrono::Utc::now().date_naive() - date).num_days().max(0))
+}
+
+/// OpenAI service-tier multiplier for Codex rollouts (rm-237). Flex is
+/// billed at a documented discount — ccusage #1814 pins 50% across 20
+/// OpenAI models — so `flex` returns the flex multiplier (default 0.5,
+/// `AGENTTRACE_FLEX_MULTIPLIER` overrides it). `priority`/`fast` have no
+/// public per-model table and are approximated at the Standard
+/// multiplier; every other tier (including the empty tier on older
+/// rollouts) stays at 1.0 so nothing is silently repriced.
+pub fn tier_multiplier(tier: &str) -> f64 {
+    tier_multiplier_raw(tier, flex_multiplier_from_env())
+}
+
+/// The multiplier map with an explicit flex factor, so tests can pin it
+/// without touching process env.
+pub(crate) fn tier_multiplier_raw(tier: &str, flex: f64) -> f64 {
+    match tier.trim().to_ascii_lowercase().as_str() {
+        "flex" => flex,
+        _ => 1.0,
+    }
+}
+
+fn flex_multiplier_from_env() -> f64 {
+    std::env::var("AGENTTRACE_FLEX_MULTIPLIER")
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && (0.0..=10.0).contains(value))
+        .unwrap_or(0.5)
+}
+
+/// Current pricing-catalog revision (rm-196). Consulted by the session
+/// cache to decide whether cached sessions were priced by this catalog.
+pub fn pricing_revision() -> u64 {
+    #[cfg(test)]
+    {
+        let overridden = TEST_PRICING_REVISION.load(std::sync::atomic::Ordering::Relaxed);
+        if overridden != 0 {
+            return overridden;
+        }
+    }
+    pricing_catalog().revision
+}
+
+#[cfg(test)]
+static TEST_PRICING_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test seam: pretend the catalog changed (or changed back) without a
+/// real download. 0 restores the real catalog revision.
+#[cfg(test)]
+pub(crate) fn test_set_pricing_revision(revision: u64) {
+    TEST_PRICING_REVISION.store(revision, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Content fingerprint of a catalog: iteration is over sorted BTreeMap
+/// keys and `DefaultHasher::new()` is deterministically seeded, so the
+/// same content yields the same revision in every process.
+fn catalog_revision(entries: &BTreeMap<String, Price>, aliases: &BTreeMap<String, String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+    for (name, price) in entries {
+        name.hash(&mut hasher);
+        price.input.to_bits().hash(&mut hasher);
+        price.output.to_bits().hash(&mut hasher);
+        price.cw.to_bits().hash(&mut hasher);
+        price.cw_1h.to_bits().hash(&mut hasher);
+        price.cr.to_bits().hash(&mut hasher);
+    }
+    aliases.len().hash(&mut hasher);
+    for (alias, target) in aliases {
+        alias.hash(&mut hasher);
+        target.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn catalog_source(catalog: &PricingCatalog) -> String {
@@ -176,8 +264,10 @@ pub fn update_pricing() -> anyhow::Result<usize> {
         entries,
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
+        revision: 0,
     };
     let override_models = apply_pricing_overrides(&mut catalog);
+    catalog.revision = catalog_revision(&catalog.entries, &catalog.aliases);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     let _ = PRICING_CATALOG.set(catalog);
     Ok(count)
@@ -285,6 +375,7 @@ fn pricing_catalog() -> &'static PricingCatalog {
 fn load_catalog_for_current_env() -> PricingCatalog {
     let mut catalog = load_pricing_cache().unwrap_or_else(fallback_catalog);
     let override_models = apply_pricing_overrides(&mut catalog);
+    catalog.revision = catalog_revision(&catalog.entries, &catalog.aliases);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     catalog
 }
@@ -296,12 +387,15 @@ fn fallback_catalog() -> PricingCatalog {
             entries: builtin_pricing(),
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
+            revision: 0,
         };
     }
+    let revision = catalog_revision(&entries, &BTreeMap::new());
     PricingCatalog {
         entries,
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
+        revision,
     }
 }
 
@@ -329,10 +423,12 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
     if entries.is_empty() {
         return None;
     }
+    let revision = catalog_revision(&entries, &BTreeMap::new());
     Some(PricingCatalog {
         entries,
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
+        revision,
     })
 }
 
@@ -452,6 +548,7 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
             input: model.input_cost * 1e6,
             output: model.output_cost * 1e6,
             cw: model.cache_write_cost * 1e6,
+            cw_1h: model.cache_write_1h_cost * 1e6,
             cr: model.cache_read_cost * 1e6,
         };
         // Hostile or overflowing catalog rates must not reach costing:
@@ -462,6 +559,7 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
         if !(price.input.is_finite()
             && price.output.is_finite()
             && price.cw.is_finite()
+            && price.cw_1h.is_finite()
             && price.cr.is_finite())
         {
             continue;
@@ -596,6 +694,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 5.0,
                 output: 25.0,
                 cw: 6.25,
+                cw_1h: 0.0,
                 cr: 0.50,
             },
         ),
@@ -605,6 +704,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 5.0,
                 output: 25.0,
                 cw: 6.25,
+                cw_1h: 0.0,
                 cr: 0.50,
             },
         ),
@@ -614,6 +714,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 5.0,
                 output: 25.0,
                 cw: 6.25,
+                cw_1h: 10.0,
                 cr: 0.50,
             },
         ),
@@ -623,6 +724,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 5.0,
                 output: 25.0,
                 cw: 6.25,
+                cw_1h: 10.0,
                 cr: 0.50,
             },
         ),
@@ -632,6 +734,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 5.0,
                 output: 25.0,
                 cw: 6.25,
+                cw_1h: 0.0,
                 cr: 0.50,
             },
         ),
@@ -641,6 +744,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 15.0,
                 output: 75.0,
                 cw: 18.75,
+                cw_1h: 0.0,
                 cr: 1.50,
             },
         ),
@@ -650,6 +754,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 3.0,
                 output: 15.0,
                 cw: 3.75,
+                cw_1h: 0.0,
                 cr: 0.30,
             },
         ),
@@ -659,6 +764,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 3.0,
                 output: 15.0,
                 cw: 3.75,
+                cw_1h: 6.0,
                 cr: 0.30,
             },
         ),
@@ -668,6 +774,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 3.0,
                 output: 15.0,
                 cw: 3.75,
+                cw_1h: 0.0,
                 cr: 0.30,
             },
         ),
@@ -677,6 +784,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 3.0,
                 output: 15.0,
                 cw: 3.75,
+                cw_1h: 6.0,
                 cr: 0.30,
             },
         ),
@@ -686,6 +794,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 3.0,
                 output: 15.0,
                 cw: 3.75,
+                cw_1h: 0.0,
                 cr: 0.30,
             },
         ),
@@ -695,6 +804,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.0,
                 output: 5.0,
                 cw: 1.25,
+                cw_1h: 2.0,
                 cr: 0.10,
             },
         ),
@@ -704,6 +814,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.0,
                 output: 5.0,
                 cw: 1.25,
+                cw_1h: 0.0,
                 cr: 0.10,
             },
         ),
@@ -713,6 +824,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.80,
                 output: 4.0,
                 cw: 1.0,
+                cw_1h: 0.0,
                 cr: 0.08,
             },
         ),
@@ -722,6 +834,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 2.0,
                 output: 12.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.20,
             },
         ),
@@ -731,6 +844,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.5,
                 output: 3.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.05,
             },
         ),
@@ -740,6 +854,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.25,
                 output: 10.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -749,6 +864,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.15,
                 output: 0.60,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -758,6 +874,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 5.0,
                 output: 30.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.50,
             },
         ),
@@ -767,6 +884,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 2.5,
                 output: 15.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.25,
             },
         ),
@@ -776,6 +894,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.0,
                 output: 0.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -785,6 +904,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.75,
                 output: 4.5,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.075,
             },
         ),
@@ -794,6 +914,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.75,
                 output: 14.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.175,
             },
         ),
@@ -803,6 +924,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.75,
                 output: 14.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.175,
             },
         ),
@@ -812,6 +934,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.25,
                 output: 10.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -821,6 +944,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.25,
                 output: 2.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -830,6 +954,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.25,
                 output: 2.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.025,
             },
         ),
@@ -839,6 +964,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 2.0,
                 output: 8.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -848,6 +974,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.40,
                 output: 1.60,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -857,6 +984,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.10,
                 output: 0.40,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -866,6 +994,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.435,
                 output: 0.87,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.003625,
             },
         ),
@@ -875,6 +1004,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.14,
                 output: 0.28,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0028,
             },
         ),
@@ -884,6 +1014,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.27,
                 output: 1.10,
                 cw: 0.07,
+                cw_1h: 0.0,
                 cr: 0.014,
             },
         ),
@@ -893,6 +1024,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.55,
                 output: 2.19,
                 cw: 0.14,
+                cw_1h: 0.0,
                 cr: 0.028,
             },
         ),
@@ -902,6 +1034,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.0,
                 output: 3.20,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.20,
             },
         ),
@@ -911,6 +1044,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.20,
                 output: 4.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.24,
             },
         ),
@@ -920,6 +1054,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 1.40,
                 output: 4.40,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.26,
             },
         ),
@@ -929,6 +1064,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.60,
                 output: 3.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.10,
             },
         ),
@@ -938,6 +1074,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.95,
                 output: 4.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.16,
             },
         ),
@@ -947,6 +1084,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.10,
                 output: 0.30,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.02,
             },
         ),
@@ -956,6 +1094,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.0,
                 output: 0.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -965,6 +1104,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.30,
                 output: 2.40,
                 cw: 0.375,
+                cw_1h: 0.0,
                 cr: 0.03,
             },
         ),
@@ -974,6 +1114,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.30,
                 output: 2.40,
                 cw: 0.375,
+                cw_1h: 0.0,
                 cr: 0.03,
             },
         ),
@@ -983,6 +1124,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.30,
                 output: 2.40,
                 cw: 0.375,
+                cw_1h: 0.0,
                 cr: 0.03,
             },
         ),
@@ -992,6 +1134,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.30,
                 output: 1.20,
                 cw: 0.375,
+                cw_1h: 0.0,
                 cr: 0.03,
             },
         ),
@@ -1001,6 +1144,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.30,
                 output: 2.40,
                 cw: 0.375,
+                cw_1h: 0.0,
                 cr: 0.03,
             },
         ),
@@ -1010,6 +1154,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.30,
                 output: 2.40,
                 cw: 0.375,
+                cw_1h: 0.0,
                 cr: 0.03,
             },
         ),
@@ -1019,6 +1164,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.325,
                 output: 1.95,
                 cw: 0.40625,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1028,6 +1174,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.325,
                 output: 1.95,
                 cw: 0.40625,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1037,6 +1184,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.40,
                 output: 2.40,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1046,6 +1194,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.0,
                 output: 0.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1055,6 +1204,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.0,
                 output: 0.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1064,6 +1214,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.0,
                 output: 0.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1073,6 +1224,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.20,
                 output: 1.50,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.02,
             },
         ),
@@ -1082,6 +1234,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.20,
                 output: 1.50,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.02,
             },
         ),
@@ -1091,6 +1244,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 0.0,
                 output: 0.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1100,6 +1254,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 3.0,
                 output: 15.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1109,6 +1264,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 input: 3.0,
                 output: 15.0,
                 cw: 0.0,
+                cw_1h: 0.0,
                 cr: 0.0,
             },
         ),
@@ -1175,6 +1331,88 @@ fn user_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_tier_multipliers_match_documented_billing() {
+        // rm-237: ccusage #1814 documents OpenAI's Flex tier at a 50%
+        // discount (20 affected models at the time); priority/fast have
+        // no public per-model table, so they are approximated at the
+        // Standard multiplier and every unrecognized value stays at 1.0
+        // rather than repricing anything.
+        assert_eq!(tier_multiplier_raw("flex", 0.5), 0.5);
+        assert_eq!(tier_multiplier_raw("FLEX", 0.5), 0.5);
+        for tier in [
+            "", "default", "standard", "auto", "none", "priority", "fast", "garbage",
+        ] {
+            assert_eq!(tier_multiplier_raw(tier, 0.5), 1.0, "tier {tier}");
+        }
+    }
+
+    #[test]
+    fn flex_multiplier_env_override_is_applied_and_sanitized() {
+        // AGENTTRACE_FLEX_MULTIPLIER overrides the flex discount;
+        // non-numeric, non-finite, or out-of-range values fall back to
+        // the documented default instead of repricing at 0 or \u{221e}.
+        let _env = crate::test_env::lock_env();
+        let previous = std::env::var_os("AGENTTRACE_FLEX_MULTIPLIER");
+        std::env::set_var("AGENTTRACE_FLEX_MULTIPLIER", "0.25");
+        assert_eq!(tier_multiplier("flex"), 0.25);
+        std::env::set_var("AGENTTRACE_FLEX_MULTIPLIER", "not-a-number");
+        assert_eq!(tier_multiplier("flex"), 0.5);
+        std::env::set_var("AGENTTRACE_FLEX_MULTIPLIER", "-1");
+        assert_eq!(tier_multiplier("flex"), 0.5);
+        std::env::set_var("AGENTTRACE_FLEX_MULTIPLIER", "100");
+        assert_eq!(tier_multiplier("flex"), 0.5);
+        match previous {
+            Some(value) => std::env::set_var("AGENTTRACE_FLEX_MULTIPLIER", value),
+            None => std::env::remove_var("AGENTTRACE_FLEX_MULTIPLIER"),
+        }
+    }
+
+    #[test]
+    fn bundled_snapshot_carries_above_one_hour_cache_write_rates() {
+        // rm-238: LiteLLM documents a separate
+        // cache_creation_input_token_cost_above_1hr for Claude models
+        // (e.g. sonnet-4-5 at 6.0/M vs the 3.75/M five-minute rate); the
+        // bundled snapshot must carry it through the conversion so the
+        // cost split prices the 1h tier instead of silently using the
+        // cheap rate.
+        let price = lookup_price("claude-sonnet-4-5");
+        assert!(
+            price.cw_1h > price.cw,
+            "above-1h rate must exceed the 5m rate"
+        );
+        let haiku = lookup_price("claude-haiku-4-5");
+        assert!(haiku.cw_1h > haiku.cw);
+        // Models without a documented 1h rate keep 0.0 and fall back to
+        // the flat rate at cost time.
+        assert_eq!(lookup_price("gpt-4.1").cw_1h, 0.0);
+    }
+
+    #[test]
+    fn pricing_revision_changes_when_catalog_content_changes() {
+        // rm-196: the session cache stores the pricing-catalog revision
+        // alongside each entry so a catalog refresh re-prices cached
+        // sessions. The revision must be content-derived and stable for
+        // identical catalogs — never clock-derived.
+        let first = pricing_revision();
+        assert_eq!(first, pricing_revision(), "revision is stable in-process");
+        let mut entries = pricing_catalog().entries.clone();
+        entries.insert(
+            "probe/model-with-new-price".to_string(),
+            Price {
+                input: 1.0,
+                output: 2.0,
+                cw: 0.0,
+                cw_1h: 0.0,
+                cr: 0.0,
+            },
+        );
+        let changed = catalog_revision(&entries, &pricing_catalog().aliases);
+        assert_ne!(first, changed, "content change must move the revision");
+        let round_trip = catalog_revision(&pricing_catalog().entries, &pricing_catalog().aliases);
+        assert_eq!(first, round_trip, "identical content maps to one revision");
+    }
 
     #[test]
     fn builtin_fallback_includes_go_alias_slice() {
@@ -1306,6 +1544,7 @@ mod tests {
             entries: BTreeMap::new(),
             aliases: BTreeMap::new(),
             source: source.to_string(),
+            revision: 0,
         };
         assert_eq!(
             catalog_source(&catalog("cache")),
@@ -1356,6 +1595,7 @@ mod tests {
             ]),
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
+            revision: 0,
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
         assert!(

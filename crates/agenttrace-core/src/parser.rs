@@ -117,8 +117,17 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if parsed_value.is_none() {
-        if let Some((events, ignorable_lines)) = parse_codex_rollout_jsonl(raw) {
+        if let Some((events, ignorable_lines, service_tier)) = parse_codex_rollout_jsonl(raw) {
             let mut session = session_from_events(name, path, events)?;
+            // rm-237: the rollout's OpenAI service tier reprices the
+            // whole token bill (flex at the documented discount), so
+            // record it and re-cost — session_from_events prices before
+            // the tier is known.
+            if !service_tier.is_empty() {
+                session.metrics.service_tier = service_tier;
+                let price = crate::pricing::lookup_price(&session.metrics.model_used);
+                session.metrics.cost_estimated = crate::priced_cost(&session.metrics, &price);
+            }
             // rm-047: make the fast-path skips visible in parse
             // diagnostics instead of discarding them silently.
             if ignorable_lines > 0 {
@@ -2107,9 +2116,12 @@ fn qwen_model_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     non_empty_usage(usage)
 }
 
-fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, usize)> {
+fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, usize, String)> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
+    // rm-237: OpenAI service tier (flex/priority/...) rides
+    // event_msg/thread_settings_applied; last applied wins.
+    let mut service_tier = String::new();
     let mut saw_codex = false;
     let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
     // rm-047: the head-probe fast path used to discard lines invisibly;
@@ -2187,6 +2199,17 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, usize)> {
                             source_tool: "codex_cli".to_string(),
                             ..Event::default()
                         });
+                    }
+                }
+                if string(payload.get("type")) == Some("thread_settings_applied") {
+                    if let Some(tier) = payload
+                        .get("thread_settings")
+                        .and_then(|settings| settings.get("service_tier"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|tier| !tier.is_empty())
+                    {
+                        service_tier = tier.to_string();
                     }
                 }
             }
@@ -2283,7 +2306,7 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, usize)> {
         }
     }
     if saw_codex {
-        non_empty(events).map(|events| (events, ignorable_lines))
+        non_empty(events).map(|events| (events, ignorable_lines, service_tier))
     } else {
         None
     }
@@ -2298,14 +2321,17 @@ fn codex_line_is_ignorable(line: &str) -> bool {
     if json_key_present(head, r#""type":"compacted""#) {
         return true;
     }
-    // The usage-bearing token_count event is the one event_msg worth
-    // keeping: rescue it whenever its marker appears anywhere in the
+    // The usage-bearing token_count event and the tier-bearing
+    // thread_settings_applied event are the two event_msg lines worth
+    // keeping: rescue each whenever its marker appears anywhere in the
     // line at a key boundary. The old negative required exact
     // `"payload":{"type":"token_count"` adjacency inside the first 160
     // bytes, so reordered payload keys or a marker past the window
-    // silently dropped the session's only usage record (rm-047).
+    // silently dropped the session's only usage record (rm-047); the
+    // same rescue now keeps the service tier (rm-237).
     json_key_present(head, r#""type":"event_msg""#)
         && !json_key_present(line, r#""type":"token_count""#)
+        && !json_key_present(line, r#""type":"thread_settings_applied""#)
 }
 
 /// True when `needle` occurs in `line` at a JSON key position (the byte
@@ -4223,6 +4249,24 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
             usage.insert(target.to_string(), value);
         }
     }
+    // rm-238: Claude Code splits cache writes by ephemerality inside
+    // usage.cache_creation — the 1h tier bills above the 5m rate
+    // (Claude Code 2.1.286 fixed this under-pricing in its own spend
+    // meter). Surface the split alongside the total; costing prices
+    // it from the catalog's above-1h rate.
+    let one_hour_split = obj
+        .get("cache_creation")
+        .and_then(|value| value.get("ephemeral_1h_input_tokens"))
+        .and_then(number_as_i64)
+        .filter(|value| *value > 0)
+        .or_else(|| {
+            obj.get("ephemeral_1h_input_tokens")
+                .and_then(number_as_i64)
+                .filter(|value| *value > 0)
+        });
+    if let Some(ephemeral) = one_hour_split {
+        usage.insert("cache_creation_1h_input_tokens".to_string(), ephemeral);
+    }
     // Thinking tokens ride the output rate but are reported separately
     // (Gemini usageMetadata.thoughtsTokenCount and the OpenAI-compatible
     // reasoning aliases); fold into output and keep the breakdown
@@ -5067,5 +5111,99 @@ mod tests {
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
+
+    #[test]
+    fn codex_flex_service_tier_reprices_session_at_flex_discount() {
+        // rm-237: Codex rollouts record the OpenAI service tier on
+        // event_msg/thread_settings_applied payloads. Flex is billed at
+        // a discount (0.5x by default, ccusage #1814 documents the 50%
+        // discount; AGENTTRACE_FLEX_MULTIPLIER overrides it), so a
+        // parser that ignores the tier over-reports Flex spend by ~2x.
+        let line = |value: Value| value.to_string();
+        let meta = line(serde_json::json!({
+            "timestamp": "2026-09-30T01:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/probe", "model": "gpt-5.3-codex"}
+        }));
+        let tier = line(serde_json::json!({
+            "timestamp": "2026-09-30T01:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_settings_applied",
+                "thread_settings": {"service_tier": "flex"}
+            }
+        }));
+        let tokens = line(serde_json::json!({
+            "timestamp": "2026-09-30T01:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {
+                    "input_tokens": 1_000_000,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 2_000_000,
+                    "reasoning_output_tokens": 0
+                }}
+            }
+        }));
+        let session = parse_raw_session(
+            "rollout-2026-09-30-01.jsonl",
+            "/tmp/rollout-2026-09-30-01.jsonl",
+            &format!("{meta}\n{tier}\n{tokens}\n"),
+        )
+        .expect("codex rollout session");
+        assert_eq!(session.metrics.service_tier, "flex");
+        let price = crate::pricing::lookup_price("gpt-5.3-codex");
+        let expected = crate::round4(
+            (1_000_000_f64 / 1e6 * price.input + 2_000_000_f64 / 1e6 * price.output) * 0.5,
+        );
+        assert_eq!(
+            session.metrics.cost_estimated, expected,
+            "flex session must be priced at the flex discount"
+        );
+    }
+
+    #[test]
+    fn claude_code_one_hour_cache_write_split_is_extracted() {
+        // rm-238: Claude Code journals report cache writes split by
+        // ephemerality inside message.usage.cache_creation. The 1h tier
+        // is billed above the 5m rate (Claude Code 2.1.286 fixed this
+        // exact under-pricing in its own spend meter), so the split
+        // must survive into the usage map next to the total.
+        let entry = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-09-30T01:00:00Z",
+            "message": {
+                "id": "msg_probe_1",
+                "model": "claude-sonnet-4-5",
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_creation_input_tokens": 1500,
+                    "cache_read_input_tokens": 5,
+                    "service_tier": null,
+                    "cache_creation": {
+                        "ephemeral_1h_input_tokens": 1000,
+                        "ephemeral_5m_input_tokens": 500
+                    }
+                }
+            }
+        });
+        let obj = entry.as_object().cloned().expect("probe entry object");
+        let events = parse_claude_code_jsonl(&[obj]).expect("claude code events");
+        let usage = events
+            .iter()
+            .find(|event| event.role == "meta")
+            .and_then(|event| event.usage.get("cache_creation_1h_input_tokens").copied())
+            .expect("1h cache-write split reaches the usage map");
+        assert_eq!(usage, 1000);
+        let total = events
+            .iter()
+            .find(|event| event.role == "meta")
+            .and_then(|event| event.usage.get("cache_creation_input_tokens").copied())
+            .expect("total cache writes stay in the usage map");
+        assert_eq!(total, 1500);
     }
 }

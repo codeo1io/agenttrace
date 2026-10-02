@@ -67,6 +67,11 @@ pub struct SessionCache {
 struct CacheEntry {
     mod_time: i64,
     size: i64,
+    /// Pricing-catalog revision this entry was priced under (rm-196).
+    /// Entries written before the field existed deserialize as 0 and
+    /// re-price once against the live catalog.
+    #[serde(default)]
+    pricing_rev: u64,
     session: GoSession,
 }
 
@@ -166,6 +171,10 @@ struct GoMetrics {
     tokens_reasoning: i64,
     #[serde(default, rename = "TokensCacheW")]
     tokens_cache_w: i64,
+    #[serde(default, rename = "TokensCacheW1h")]
+    tokens_cache_w_1h: i64,
+    #[serde(default, rename = "ServiceTier")]
+    service_tier: String,
     #[serde(default, rename = "TokensCacheR")]
     tokens_cache_r: i64,
     #[serde(default, rename = "GapsSec")]
@@ -918,6 +927,28 @@ pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> 
         delete_cached_session_key(&key, cache);
         return None;
     }
+    // rm-196: an entry priced under a different pricing catalog must
+    // re-parse (and re-price) even when the journal fingerprint is
+    // unchanged — otherwise a catalog refresh keeps serving stale
+    // costs until the session file itself changes. Entries loaded from
+    // disk carry `pricing_rev` inside their raw JSON; entries written
+    // before the field existed count as revision 0 and re-price once.
+    let current_rev = crate::pricing::pricing_revision();
+    let entry_rev = cache
+        .entries
+        .get(&key)
+        .map(|entry| entry.pricing_rev)
+        .or_else(|| {
+            cache
+                .raw_entries
+                .get(&key)
+                .and_then(|raw| raw.get("pricing_rev").and_then(Value::as_u64))
+                .or(Some(0))
+        });
+    if entry_rev != Some(current_rev) {
+        delete_cached_session_key(&key, cache);
+        return None;
+    }
     if cached_entry_missing_tool_warnings(&key, cache) {
         delete_cached_session_key(&key, cache);
         return None;
@@ -946,6 +977,7 @@ pub fn store_session(
         CacheEntry {
             mod_time: file_mod_time_nanos(&metadata),
             size: metadata.len() as i64,
+            pricing_rev: crate::pricing::pricing_revision(),
             session: GoSession::from_session(session),
         },
     );
@@ -1061,6 +1093,8 @@ impl GoMetrics {
             tokens_output: metrics.tokens_output,
             tokens_reasoning: metrics.tokens_reasoning,
             tokens_cache_w: metrics.tokens_cache_w,
+            tokens_cache_w_1h: metrics.tokens_cache_w_1h,
+            service_tier: metrics.service_tier.clone(),
             tokens_cache_r: metrics.tokens_cache_r,
             gaps_sec: metrics.gaps_sec.clone(),
             model_used: metrics.model_used.clone(),
@@ -1097,6 +1131,8 @@ impl GoMetrics {
             tokens_output: self.tokens_output,
             tokens_reasoning: self.tokens_reasoning,
             tokens_cache_w: self.tokens_cache_w,
+            tokens_cache_w_1h: self.tokens_cache_w_1h,
+            service_tier: self.service_tier,
             tokens_cache_r: self.tokens_cache_r,
             timestamps: Vec::new(),
             gaps_sec: self.gaps_sec,
@@ -1449,6 +1485,67 @@ mod tests {
                 .dirs
                 .contains_key(&listed.to_string_lossy().to_string()),
             "live dir listings are untouched"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pricing_catalog_revision_change_invalidates_cached_entries() {
+        // rm-196: cache freshness used to be file-fingerprint-only, so a
+        // refreshed pricing catalog never re-priced cached sessions —
+        // a session parsed under an old catalog kept its old cost until
+        // the journal itself changed. Entries now record the pricing
+        // revision they were priced under; a revision change must
+        // invalidate while the journal fingerprint stays identical.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-rev-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("session.jsonl");
+        fs::write(&file, b"session").expect("write session file");
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let handle = fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open file");
+        handle.set_modified(stamp).expect("set deterministic mtime");
+        drop(handle);
+        let session = Session {
+            name: "session".to_string(),
+            path: file.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let mut cache = SessionCache::default();
+        store_session(&file, &session, &mut cache).expect("store entry");
+        assert!(
+            cached_session(&file, &mut cache).is_some(),
+            "same catalog revision: the entry stays fresh"
+        );
+        // A catalog refresh (or an upgrade that changes bundled prices)
+        // must invalidate the entry without touching the journal file.
+        crate::pricing::test_set_pricing_revision(987_654_321);
+        assert!(
+            cached_session(&file, &mut cache).is_none(),
+            "pricing revision change must force a re-parse and re-price"
+        );
+        assert!(
+            cache.entries.is_empty(),
+            "the stale entry must be dropped, not re-served"
+        );
+        // Re-stored under the new revision the entry is fresh again.
+        store_session(&file, &session, &mut cache).expect("re-store entry");
+        assert!(cached_session(&file, &mut cache).is_some());
+        crate::pricing::test_set_pricing_revision(0);
+        assert!(
+            cached_session(&file, &mut cache).is_none(),
+            "restoring the real revision invalidates the probe entry"
         );
         let _ = fs::remove_dir_all(root);
     }

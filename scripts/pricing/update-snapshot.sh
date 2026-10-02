@@ -33,6 +33,7 @@ for key, value in data.items():
         "input_cost_per_token": inp,
         "output_cost_per_token": outp,
         "cache_creation_input_token_cost": value.get("cache_creation_input_token_cost") or 0,
+        "cache_creation_input_token_cost_above_1hr": value.get("cache_creation_input_token_cost_above_1hr") or 0,
         "cache_read_input_token_cost": value.get("cache_read_input_token_cost") or 0,
         "mode": "chat",
         "litellm_provider": value.get("litellm_provider") or "",

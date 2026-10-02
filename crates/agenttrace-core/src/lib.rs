@@ -27,6 +27,7 @@ pub use diagnostics::{
     LargeParam, LoopCost, LoopFingerprint, SessionFinding, StuckPattern, ToolLatency, TraceStep,
     UnusedTool,
 };
+pub use pricing::pricing_revision;
 
 pub use discovery::{
     collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
@@ -337,6 +338,12 @@ pub struct Metrics {
     /// `tokens_output` (pass-9 CU-20).
     pub tokens_reasoning: i64,
     pub tokens_cache_w: i64,
+    /// Above-1h cache writes (rm-238): the portion of
+    /// `tokens_cache_w` billed at the `cw_1h` rate. Claude Code splits
+    /// this out of `cache_creation_input_tokens` via
+    /// `ephemeral_1h_input_tokens`; other homes leave it at 0 and cost
+    /// time falls back to the flat rate.
+    pub tokens_cache_w_1h: i64,
     pub tokens_cache_r: i64,
     #[serde(skip)]
     pub timestamps: Vec<DateTime<Utc>>,
@@ -347,6 +354,11 @@ pub struct Metrics {
     pub session_end: String,
     pub duration_sec: f64,
     pub cost_estimated: f64,
+    /// OpenAI service tier recorded on the session (rm-237), e.g.
+    /// `flex`/`priority` from Codex `thread_settings_applied`. Empty
+    /// means no tier (or a non-Codex home) and prices at 1.0x.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub service_tier: String,
     /// How far message-derived token aggregation drifted from the
     /// authoritative totals stored on the session row (SQLite sources).
     /// Zero unless stored totals were applied.
@@ -672,6 +684,31 @@ fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
+/// Cost of a session's token metrics under `price` (rm-237 + rm-238).
+/// Cache writes split at the ephemerality line — the 1h portion
+/// prices at `cw_1h` when the catalog publishes one and falls back to
+/// `cw` otherwise — and the OpenAI service tier multiplies the whole
+/// bill (flex at the documented discount; anything else at 1.0x).
+/// Split out of `analyze` so the Codex parser can re-price after it
+/// learns the tier from a later line.
+pub(crate) fn priced_cost(metrics: &Metrics, price: &pricing::Price) -> f64 {
+    let cache_write_1h = metrics.tokens_cache_w_1h.min(metrics.tokens_cache_w).max(0);
+    let cache_write_5m = metrics.tokens_cache_w.saturating_sub(cache_write_1h).max(0);
+    let cw_1h = if price.cw_1h > 0.0 {
+        price.cw_1h
+    } else {
+        price.cw
+    };
+    round4(
+        (metrics.tokens_input as f64 / 1e6 * price.input
+            + metrics.tokens_output as f64 / 1e6 * price.output
+            + cache_write_5m as f64 / 1e6 * price.cw
+            + cache_write_1h as f64 / 1e6 * cw_1h
+            + metrics.tokens_cache_r as f64 / 1e6 * price.cr)
+            * pricing::tier_multiplier(&metrics.service_tier),
+    )
+}
+
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let price = pricing::lookup_price(model);
     let mut metrics = Metrics {
@@ -729,6 +766,12 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     metrics.tokens_cache_w = metrics
                         .tokens_cache_w
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
+                    // rm-238: keep the 1h portion of the cache-write
+                    // total separately; clamped so a hostile split can
+                    // never exceed the recorded total.
+                    let one_hour = usage_tokens("cache_creation_1h_input_tokens")
+                        .min(usage_tokens("cache_creation_input_tokens"));
+                    metrics.tokens_cache_w_1h = metrics.tokens_cache_w_1h.saturating_add(one_hour);
                     metrics.tokens_cache_r = metrics
                         .tokens_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
@@ -838,12 +881,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     if metrics.tool_calls_ok > max_ok {
         metrics.tool_calls_ok = max_ok;
     }
-    metrics.cost_estimated = round4(
-        metrics.tokens_input as f64 / 1e6 * price.input
-            + metrics.tokens_output as f64 / 1e6 * price.output
-            + metrics.tokens_cache_w as f64 / 1e6 * price.cw
-            + metrics.tokens_cache_r as f64 / 1e6 * price.cr,
-    );
+    metrics.cost_estimated = priced_cost(&metrics, &price);
     // rm-046: a class pinned at i64::MAX means accumulation saturated —
     // the total is a clamp, not an exact sum, and the provenance must
     // say so instead of claiming precise arithmetic.
@@ -1711,6 +1749,72 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priced_cost_splits_cache_writes_by_ephemeral_tier_and_applies_service_tier() {
+        // rm-237 + rm-238: the cost model must price the 1h portion of
+        // cache writes at the above-1h rate (falling back to the flat
+        // rate when the catalog lacks one) and multiply the whole bill
+        // by the OpenAI service-tier factor (flex = 0.5 by default,
+        // priority approximated at 1.0 until a public table ships).
+        use crate::pricing::Price;
+        let price = Price {
+            input: 3.0,
+            output: 15.0,
+            cw: 3.75,
+            cw_1h: 6.0,
+            cr: 0.3,
+        };
+        let metrics = Metrics {
+            tokens_input: 1_000_000,
+            tokens_output: 1_000_000,
+            tokens_cache_w: 2_000_000,
+            tokens_cache_w_1h: 1_000_000,
+            tokens_cache_r: 1_000_000,
+            ..Metrics::default()
+        };
+        let standard = priced_cost(&metrics, &price);
+        assert!((standard - (3.0 + 15.0 + 3.75 + 6.0 + 0.3)).abs() < 1e-9);
+        let mut flex = metrics.clone();
+        flex.service_tier = "flex".to_string();
+        assert!((priced_cost(&flex, &price) - 0.5 * standard).abs() < 1e-9);
+        let mut priority = metrics.clone();
+        priority.service_tier = "priority".to_string();
+        assert!((priced_cost(&priority, &price) - standard).abs() < 1e-9);
+        // A catalog entry without an above-1h rate falls back to the
+        // flat cache-write rate instead of silently pricing at zero.
+        let flat = Price {
+            cw_1h: 0.0,
+            ..price
+        };
+        assert!((priced_cost(&metrics, &flat) - (3.0 + 15.0 + 7.5 + 0.3)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn analysis_aggregates_one_hour_cache_write_usage_key() {
+        // rm-238: the parser surfaces
+        // usage.cache_creation.ephemeral_1h_input_tokens as
+        // cache_creation_1h_input_tokens; analysis must accumulate it
+        // alongside the cache-write total so the cost split is usable.
+        let usage: std::collections::BTreeMap<String, i64> = [
+            ("input_tokens", 100),
+            ("output_tokens", 200),
+            ("cache_creation_input_tokens", 1500),
+            ("cache_creation_1h_input_tokens", 1000),
+            ("cache_read_input_tokens", 50),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let events = vec![Event {
+            role: "meta".to_string(),
+            usage,
+            ..Event::default()
+        }];
+        let metrics = analyze(&events, "claude-sonnet-4-5");
+        assert_eq!(metrics.tokens_cache_w, 1500);
+        assert_eq!(metrics.tokens_cache_w_1h, 1000);
+    }
 
     #[test]
     fn all_three_installers_verify_sha256_sidecars() {
