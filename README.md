@@ -93,7 +93,13 @@ iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.p
 
 A prebuilt binary that cannot run on this host (for example, one built
 against a newer libc) is never installed silently: the installer reports
-the loader's error, and `install.sh` falls back to a source build.
+the loader's error, and `install.sh` falls back to a source build. That
+fallback is pinned, never a floating master tip: it builds the release tag
+matching the failed artifact (or whatever `AGENTTRACE_SOURCE_REF` names — a
+tag or a full commit id; a commit-id pin is fetched directly and verified
+against the pin), and records what it built in an install receipt
+(`repo`, `ref`, and the exact `commit`) so the fallback install stays
+auditable after the fact.
 
 ## Quickstart
 

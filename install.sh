@@ -51,6 +51,8 @@ echo "🔍 Fetching latest release..."
 ASSET="${BIN}-${OS}-${ARCH}"
 # AGENTTRACE_DOWNLOAD_URL overrides the release URL (used by offline CI tests).
 RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download/${ASSET}}"
+# AGENTTRACE_SOURCE_URL overrides the source-build clone/fetch URL (offline CI tests).
+SRC_URL="${AGENTTRACE_SOURCE_URL:-https://github.com/${REPO}.git}"
 
 # — download —
 echo "⬇️  Downloading agenttrace (${OS}/${ARCH})..."
@@ -64,36 +66,41 @@ fi
 chmod 0755 "$TMP"
 
 # — checksum verification (parity with release.yml's .sha256 sidecars) —
-# release.yml uploads "${ASSET}.sha256" next to every binary. Older
-# releases predate the sidecar, so a missing sidecar warns instead of
-# failing; a present sidecar that does not match fails the install
-# (pass-11 A11-3, cycle 7).
+# release.yml uploads "${ASSET}.sha256" next to every binary. A missing
+# sidecar, like a mismatched one, means the bytes about to be installed
+# cannot be verified: absence from a fetched URL is itself a red flag,
+# not a condition to tolerate (rm-234, campaign-local rm-029;
+# install.ps1 and npm refuse the same way -- see the
+# all_three_installers_refuse_when_the_sidecar_cannot_be_verified test
+# in crates/agenttrace-core/src/lib.rs).
 CHECKSUM_URL="${RELEASE_URL}.sha256"
 TMP_SHA=$(mktemp)
-if curl -fsSL -o "$TMP_SHA" "$CHECKSUM_URL"; then
-  EXPECTED=$(cut -d' ' -f1 "$TMP_SHA" | tr -d '\r\n')
-  ACTUAL=""
-  if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL=$(sha256sum "$TMP" | cut -d' ' -f1)
-  elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL=$(shasum -a 256 "$TMP" | cut -d' ' -f1)
-  else
-    echo "⚠️  No sha256 tool found (sha256sum or shasum); skipping checksum verification."
-  fi
-  if [ -n "$ACTUAL" ]; then
-    if [ "$EXPECTED" != "$ACTUAL" ]; then
-      rm -f "$TMP" "$TMP_SHA"
-      echo "❌ Checksum mismatch for ${ASSET}."
-      echo "   Expected: ${EXPECTED}"
-      echo "   Actual:   ${ACTUAL}"
-      echo "   The download may be corrupted or tampered with; not installing."
-      exit 1
-    fi
-    echo "   SHA-256 verified."
-  fi
-else
-  echo "⚠️  No checksum sidecar at ${CHECKSUM_URL}; skipping checksum verification."
+if ! curl -fsSL -o "$TMP_SHA" "$CHECKSUM_URL"; then
+  rm -f "$TMP" "$TMP_SHA"
+  echo "❌ No checksum sidecar at ${CHECKSUM_URL}."
+  echo "   The release is incomplete or the download URL was tampered with; not installing."
+  exit 1
 fi
+EXPECTED=$(cut -d' ' -f1 "$TMP_SHA" | tr -d '\r\n')
+ACTUAL=""
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL=$(sha256sum "$TMP" | cut -d' ' -f1)
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL=$(shasum -a 256 "$TMP" | cut -d' ' -f1)
+else
+  rm -f "$TMP" "$TMP_SHA"
+  echo "❌ No sha256 tool found (sha256sum or shasum); cannot verify the download, not installing."
+  exit 1
+fi
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+  rm -f "$TMP" "$TMP_SHA"
+  echo "❌ Checksum mismatch for ${ASSET}."
+  echo "   Expected: ${EXPECTED}"
+  echo "   Actual:   ${ACTUAL}"
+  echo "   The download may be corrupted or tampered with; not installing."
+  exit 1
+fi
+echo "   SHA-256 verified."
 rm -f "$TMP_SHA"
 
 # — size check —
@@ -124,9 +131,47 @@ if ! "$TMP" --version >"$VERIFY_LOG" 2>&1; then
   if command -v git >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
     echo "🔧 Falling back to building from source with this host's toolchain..."
     echo "   Cloning $REPO at pinned ref $REF (set AGENTTRACE_SOURCE_REF to override)."
+    # rm-051 + rm-235 (campaign-local rm-030): the fallback builds a
+    # PINNED, verifiable ref -- never a floating master tip. The pin is
+    # the release tag declared above (rm-051) or whatever
+    # AGENTTRACE_SOURCE_REF names (a tag or a full 40-char commit id);
+    # the built commit is recorded in the install receipt and, for a
+    # commit-id pin, CHECKED against the pin, so the install verifies --
+    # not just records -- exactly what it built.
     SRC=$(mktemp -d)
-    if git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$SRC" \
-       && (cd "$SRC" && cargo build --release -p agenttrace) \
+    # A full commit id cannot be resolved by `clone --branch` (it takes
+    # ref NAMES only; proven live on git 2.34.1: "Remote branch <sha>
+    # not found in upstream origin"), so a SHA pin fetches the commit
+    # directly (rm-235, review F3).
+    PINNED_SHA=""
+    CLONE_OK=0
+    if printf '%s' "$REF" | grep -qE '^[0-9a-fA-F]{40}$'; then
+      PINNED_SHA=$(printf '%s' "$REF" | tr '[:upper:]' '[:lower:]')
+      if git init -q "$SRC" \
+         && (cd "$SRC" && git remote add origin "$SRC_URL") \
+         && (cd "$SRC" && git fetch -q --depth 1 origin "$PINNED_SHA") \
+         && (cd "$SRC" && git checkout -q --detach FETCH_HEAD); then
+        CLONE_OK=1
+      fi
+    elif git clone -q --depth 1 --branch "$REF" "$SRC_URL" "$SRC"; then
+      CLONE_OK=1
+    fi
+    SRC_SHA=""
+    if [ "$CLONE_OK" = 1 ]; then
+      SRC_SHA=$(cd "$SRC" && git rev-parse HEAD 2>/dev/null) || SRC_SHA=""
+    fi
+    if [ "$CLONE_OK" != 1 ] || { [ -n "$PINNED_SHA" ] && [ "$PINNED_SHA" != "$SRC_SHA" ]; }; then
+      rm -rf "$SRC"
+      rm -f "$TMP" "$VERIFY_LOG"
+      if [ -n "$PINNED_SHA" ] && [ "$CLONE_OK" = 1 ]; then
+        echo "❌ Fetched commit ${SRC_SHA} does not match the pinned ref ${PINNED_SHA}; refusing."
+      else
+        echo "❌ Cannot fetch pinned ref '$REF' for the source build; refusing to build an unverified master tip."
+        echo "   Set AGENTTRACE_SOURCE_REF=<tag-or-full-commit-sha> to pin the build explicitly."
+      fi
+      exit 1
+    fi
+    if (cd "$SRC" && cargo build --release -p agenttrace) \
        && cp "$SRC/target/release/agenttrace" "$TMP" && chmod +x "$TMP"; then
       rm -rf "$SRC"
       RECEIPT_DIR=$(dirname "$INSTALL_RECEIPT")
@@ -136,15 +181,24 @@ if ! "$TMP" --version >"$VERIFY_LOG" 2>&1; then
         echo "source=source-build"
         echo "repo=$REPO"
         echo "ref=$REF"
+        if [ -n "$SRC_SHA" ]; then
+          echo "commit=$SRC_SHA"
+        fi
       } >"$INSTALL_RECEIPT"
       echo "   Built from source successfully (pinned ref $REF)."
       echo "   Receipt: $INSTALL_RECEIPT"
+      if [ -n "$SRC_SHA" ]; then
+        echo "   Built from $REF (commit ${SRC_SHA})"
+      fi
+      if [ -n "$PINNED_SHA" ]; then
+        echo "   Pin verified: fetched commit matches $PINNED_SHA"
+      fi
     else
       rm -rf "$SRC"
-      rm -f "$TMP"
-      echo "❌ Source build failed (pinned ref '$REF'; set AGENTTRACE_SOURCE_REF to a published tag or branch to override)."
+      rm -f "$TMP" "$VERIFY_LOG"
+      echo "❌ Source build failed (pinned ref '$REF'; set AGENTTRACE_SOURCE_REF to a published tag or commit id to override)."
       echo "   Install Rust (https://rustup.rs) and retry, or:"
-      echo "   git clone --branch $REF https://github.com/${REPO}.git && cd agenttrace && cargo build --release -p agenttrace"
+      echo "   git clone --branch $REF $SRC_URL && cd agenttrace && cargo build --release -p agenttrace"
       exit 1
     fi
   else

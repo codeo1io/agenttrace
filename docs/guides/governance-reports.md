@@ -63,12 +63,15 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 20 and the SQLite snapshot is schema 6 because
-both now persist provenance. Older versions are discarded and rebuilt on the
-next load; the migration is read-only and does not modify source session
-files. Cache entries whose source file has disappeared are pruned the next
-time the cache loads, and the snapshot is bounded at 20,000 entries (oldest
-source-file mtime drops first).
+The session cache is schema 21 and the SQLite snapshot is schema 7; the
+versions move whenever the persisted session model changes (the session
+cache to 21 when tool call/result pairing and retry-loop keying were
+corrected, the SQLite snapshot to 7 when Hermes tool outcomes began
+deriving from message result rows). Older versions are discarded and
+rebuilt on the next load; the migration is read-only and does not modify
+source session files. Cache entries whose source file has disappeared are
+pruned the next time the cache loads, and the snapshot is bounded at
+20,000 entries (oldest source-file mtime drops first).
 
 ## Prioritized recommendations
 

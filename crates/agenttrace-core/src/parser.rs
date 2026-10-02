@@ -666,6 +666,8 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         return None;
     }
     let mut events = Vec::new();
+    let mut flat_call_ordinals: BTreeMap<String, usize> = BTreeMap::new();
+    let mut flat_result_ordinals: BTreeMap<String, usize> = BTreeMap::new();
     for entry in objs.iter() {
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
         match string(entry.get("type")).unwrap_or("") {
@@ -676,24 +678,72 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 source_tool: "claude_code".to_string(),
                 ..Event::default()
             }),
-            "tool_use" => events.push(Event {
-                role: "assistant".to_string(),
-                timestamp,
-                tool_calls: vec![ToolCall {
-                    name: string(entry.get("tool_name")).unwrap_or("").to_string(),
-                    args: jsonish(entry.get("tool_input")),
-                    ..ToolCall::default()
-                }],
-                source_tool: "claude_code".to_string(),
-                ..Event::default()
-            }),
-            "tool_result" => events.push(Event {
-                role: "tool".to_string(),
-                content: jsonish(entry.get("tool_output")),
-                timestamp,
-                source_tool: "claude_code".to_string(),
-                ..Event::default()
-            }),
+            // rm-230 (campaign-local rm-025): preserve the call/result
+            // join key so diagnostics can pair each call with its result.
+            // The flat format may carry the id explicitly (`tool_use_id` /
+            // `id`); entries without one pair positionally PER TOOL (k-th
+            // id-less Bash call <-> k-th id-less Bash result) so a present
+            // result stops counting as `unmatched` and inflating the
+            // review filter. Positional pairing is only used when no id
+            // exists, and the ordinals are per-tool and count ID-LESS
+            // entries only: explicit ids consume nothing from the
+            // positional namespace (review F5: a shared count let an
+            // out-of-order mixed stream mint different ordinals per side
+            // and stay spuriously unmatched), and per-tool ordinals keep
+            // an out-of-order result stream from pairing one tool's
+            // result onto another tool's call (review R2-3: a global
+            // ordinal attributed Bash's end-time to Read's latency and
+            // let one tool's surplus result mask another tool's genuinely
+            // missing result).
+            "tool_use" => {
+                let explicit = ["tool_use_id", "id", "callId", "toolCallId"]
+                    .iter()
+                    .find_map(|key| string(entry.get(*key)))
+                    .unwrap_or("");
+                let name = string(entry.get("tool_name")).unwrap_or("").to_string();
+                let id = if explicit.is_empty() {
+                    let ordinal = flat_call_ordinals.entry(name.clone()).or_insert(0);
+                    let id = format!("flat-pair-{name}-{ordinal}");
+                    *ordinal += 1;
+                    id
+                } else {
+                    explicit.to_string()
+                };
+                events.push(Event {
+                    role: "assistant".to_string(),
+                    timestamp,
+                    tool_calls: vec![ToolCall {
+                        id,
+                        name,
+                        args: jsonish(entry.get("tool_input")),
+                    }],
+                    source_tool: "claude_code".to_string(),
+                    ..Event::default()
+                });
+            }
+            "tool_result" => {
+                let explicit = ["tool_use_id", "id", "callId", "toolCallId"]
+                    .iter()
+                    .find_map(|key| string(entry.get(*key)))
+                    .unwrap_or("");
+                let name = string(entry.get("tool_name")).unwrap_or("").to_string();
+                let tool_call_id = if explicit.is_empty() {
+                    let ordinal = flat_result_ordinals.entry(name.clone()).or_insert(0);
+                    let id = format!("flat-pair-{name}-{ordinal}");
+                    *ordinal += 1;
+                    id
+                } else {
+                    explicit.to_string()
+                };
+                events.push(Event {
+                    role: "tool".to_string(),
+                    content: jsonish(entry.get("tool_output")),
+                    timestamp,
+                    tool_call_id,
+                    source_tool: "claude_code".to_string(),
+                    ..Event::default()
+                });
+            }
             _ => {}
         }
     }
@@ -4704,6 +4754,153 @@ mod tests {
         let session =
             parse_raw_session("mid", "mid.jsonl", mid_content).expect("mid-content BOM parses");
         assert_eq!(session.metrics.user_messages, 1);
+    }
+
+    #[test]
+    fn claude_flat_transcript_preserves_the_call_result_join() {
+        // rm-230 (campaign-local rm-025): flat tool_use/tool_result
+        // entries must keep the id that pairs them (explicit
+        // `tool_use_id` when present); id-less entries pair positionally
+        // per tool (k-th call <-> k-th result of the SAME tool). Before
+        // the fix every flat call reported unmatched in diagnostics.
+        let raw = concat!(
+            "{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"content\":\"go\"}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"path\":\"a\"},\"tool_use_id\":\"tu-1\"}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"tool_name\":\"Bash\",\"tool_output\":\"ok\",\"tool_use_id\":\"tu-1\"}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"tool_name\":\"Read\",\"tool_input\":{\"path\":\"b\"}}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"tool_name\":\"Read\",\"tool_output\":\"ok\"}\n"
+        );
+        let events = parse_claude_transcript_jsonl(&jsonl_objects(raw).collect::<Vec<_>>())
+            .expect("flat claude transcript detected");
+        let calls: Vec<&ToolCall> = events.iter().flat_map(|e| &e.tool_calls).collect();
+        let results: Vec<&Event> = events.iter().filter(|e| e.role == "tool").collect();
+        // Explicit ids are kept verbatim on both sides.
+        assert_eq!(calls[0].id, "tu-1");
+        assert_eq!(results[0].tool_call_id, "tu-1");
+        // Id-less entries pair positionally among THEMSELVES, per tool:
+        // the k-th id-less call <-> k-th id-less result of the SAME
+        // tool (explicit ids consume no positional slot; review F5).
+        assert_eq!(calls[1].id, "flat-pair-Read-0");
+        assert_eq!(results[1].tool_call_id, "flat-pair-Read-0");
+    }
+
+    #[test]
+    fn claude_flat_transcript_positional_pairs_survive_out_of_order_mixing() {
+        // Review F5: with one shared per-side counter incremented by
+        // every entry, an out-of-order mixed stream (explicit call,
+        // id-less call, id-less result, explicit result) minted
+        // flat-pair-1 on the call side but flat-pair-0 on the result
+        // side -- both entries then stayed spuriously unmatched
+        // (verified: 2 unmatched pre-fix). Ordinals that count id-less
+        // entries only keep the sides in agreement regardless of how
+        // explicit and id-less entries interleave.
+        let raw = concat!(
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"ls a\"},\"tool_use_id\":\"tu-1\"}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"tool_name\":\"Read\",\"tool_input\":{\"path\":\"b\"}}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"tool_name\":\"Read\",\"tool_output\":\"ok\"}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"tool_name\":\"Bash\",\"tool_output\":\"ok\",\"tool_use_id\":\"tu-1\"}\n"
+        );
+        let session = parse_raw_session("mix", "mix.jsonl", raw).expect("flat session parses");
+        for lat in &session.diagnostics.tool_latencies {
+            assert_eq!(
+                lat.unmatched, 0,
+                "{} must not report unmatched on a fully-paired mixed stream",
+                lat.tool_name
+            );
+        }
+        let total: usize = session
+            .diagnostics
+            .tool_latencies
+            .iter()
+            .map(|lat| lat.count)
+            .sum();
+        assert_eq!(total, 2, "both calls must be accounted for");
+    }
+
+    #[test]
+    fn claude_flat_transcript_positional_pairs_stay_within_one_tool() {
+        // Review R2-3: with one GLOBAL per-side ordinal, an id-less
+        // result stream that interleaves tools paired the wrong tool's
+        // result onto a call -- tool_latencies then attributed Bash's
+        // end-time to Read (and vice versa), and one tool's surplus
+        // result masked another tool's genuinely missing one. Per-tool
+        // ordinals keep positional pairing inside one tool: Bash(call
+        // @00:01) pairs with Bash(result @00:04) -> 3s, Read(call @00:02)
+        // pairs with Read(result @00:09) -> 7s, both unmatched 0.
+        let raw = concat!(
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"ls a\"}}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"tool_name\":\"Read\",\"tool_input\":{\"path\":\"b\"}}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:09Z\",\"tool_name\":\"Read\",\"tool_output\":\"ok\"}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"tool_name\":\"Bash\",\"tool_output\":\"ok\"}\n"
+        );
+        let session = parse_raw_session("cross", "cross.jsonl", raw).expect("flat session parses");
+        let lat = |name: &str| {
+            session
+                .diagnostics
+                .tool_latencies
+                .iter()
+                .find(|lat| lat.tool_name == name)
+                .unwrap_or_else(|| panic!("{name} latency missing"))
+        };
+        assert_eq!(lat("Bash").unmatched, 0);
+        assert_eq!(lat("Bash").max_sec, 3.0);
+        assert_eq!(lat("Read").unmatched, 0);
+        assert_eq!(lat("Read").max_sec, 7.0);
+    }
+
+    #[test]
+    fn claude_flat_transcript_missing_result_is_not_masked_by_another_tool() {
+        // Review R2-3 consequence (2): with global ordinals, one Bash
+        // call plus two Read results kept every entry paired -- Bash's
+        // genuinely missing result was silently swallowed by Read's
+        // surplus. Per-tool ordinals keep the defect visible: Bash is
+        // unmatched, Read's second result is simply extra.
+        let raw = concat!(
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"ls a\"}}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"tool_name\":\"Read\",\"tool_input\":{\"path\":\"b\"}}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:03Z\",\"tool_name\":\"Read\",\"tool_output\":\"ok\"}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"tool_name\":\"Read\",\"tool_output\":\"ok again\"}\n"
+        );
+        let session = parse_raw_session("mask", "mask.jsonl", raw).expect("flat session parses");
+        let bash = session
+            .diagnostics
+            .tool_latencies
+            .iter()
+            .find(|lat| lat.tool_name == "Bash")
+            .expect("Bash latency present");
+        assert_eq!(bash.unmatched, 1, "a missing Bash result must stay visible");
+    }
+
+    #[test]
+    fn claude_flat_transcript_diagnoses_as_paired_end_to_end() {
+        // rm-230 (campaign-local rm-025) acceptance, through the real
+        // entry point: a flat transcript whose calls and results pair
+        // (explicit ids, or positional for id-less entries) reports ZERO
+        // unmatched calls in session diagnostics. Before the fix every
+        // flat call was unmatched.
+        let raw = concat!(
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"ls a\"},\"tool_use_id\":\"tu-1\"}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:04Z\",\"tool_name\":\"Bash\",\"tool_output\":\"ok\",\"tool_use_id\":\"tu-1\"}\n",
+            "{\"type\":\"tool_use\",\"timestamp\":\"2026-01-01T00:00:05Z\",\"tool_name\":\"Bash\",\"tool_input\":{\"cmd\":\"ls a\"}}\n",
+            "{\"type\":\"tool_result\",\"timestamp\":\"2026-01-01T00:00:08Z\",\"tool_name\":\"Bash\",\"tool_output\":\"ok\"}\n"
+        );
+        let session = parse_raw_session("flat", "flat.jsonl", raw).expect("flat session parses");
+        let latencies = &session.diagnostics.tool_latencies;
+        assert_eq!(latencies.len(), 1);
+        assert_eq!(latencies[0].tool_name, "Bash");
+        assert_eq!(latencies[0].count, 2);
+        assert_eq!(latencies[0].unmatched, 0);
+        // Review F10 (rm-230 acceptance): pin the escalation surface the
+        // acceptance names. session_findings escalates latency only when
+        // max_sec >= 5.0 OR unmatched > 0; on this fully-paired corpus
+        // (unmatched 0, every latency < 5s) no "latency" finding may
+        // appear -- before the join fix this corpus escalated (unmatched
+        // fed the high-severity filter in session_findings).
+        let findings = crate::session_findings(&session, &[]);
+        assert!(
+            findings.iter().all(|finding| finding.kind != "latency"),
+            "a fully-paired flat transcript must not escalate a latency finding"
+        );
     }
 
     #[test]
