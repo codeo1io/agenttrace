@@ -61,6 +61,21 @@
 - Added `scripts/pricing/update-snapshot.sh` to regenerate the bundled pricing snapshot.
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
+## v0.9.0 - 2026-09-30
+
+Backfilled from the GitHub release notes for the tags that shipped without
+changelog entries (`v0.8.0`, `v0.8.1`, `v0.9.0`; full changelogs:
+[v0.8.1...v0.9.0](https://github.com/luoyuctl/agenttrace/compare/v0.8.1...v0.9.0)).
+
+### Fixed
+
+- Parser: skip leading non-session lines in Oh My Pi JSONL ([#284](https://github.com/luoyuctl/agenttrace/pull/284)).
+- Windows: link the MSVC CRT statically so installed binaries no longer require the
+  Visual C++ Redistributable ([#285](https://github.com/luoyuctl/agenttrace/pull/285)).
+- Codex cost double counting fixed and TUI triage tightened ([#286](https://github.com/luoyuctl/agenttrace/pull/286));
+  includes the total-usage rewind/high-water handling that `rm-162` ports into
+  this fork's parser.
+
 ## v0.7.1 - 2026-07-20
 
 ### Changed

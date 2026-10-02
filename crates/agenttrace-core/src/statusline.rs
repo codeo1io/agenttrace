@@ -618,7 +618,7 @@ fn render_statusline_report_text(
     if !insights.session_caches.is_empty() {
         out.push_str("Prompt cache per session:\n");
         for cache in &insights.session_caches {
-            // rm-012: session ids and miss-cause names are journal
+            // rm-034: session ids and miss-cause names are journal
             // payload strings and print raw no longer — they pass the
             // same control-character sanitization as the render path
             // (the journal itself keeps storing what it saw).
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn statusline_report_sanitizes_journal_derived_strings() {
-        // rm-012 regression: the journal is data (append_statusline_capture
+        // rm-034 regression: the journal is data (append_statusline_capture
         // stores what it saw verbatim, by design), so every journal-derived
         // string the text report prints — session ids and miss-cause names —
         // must pass the same control-character sanitization as the render

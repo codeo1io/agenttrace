@@ -2383,6 +2383,8 @@ fn codex_token_count_usage(
     let info = raw_info?.as_object()?;
     let total = token_usage_map(info.get("total_token_usage"));
     let (counts, next_total) = if !total.is_empty() {
+        // rm-162 / upstream #286: keep the high-water mark as `prev` so a
+        // post-compaction rewind followed by a rebound is not counted twice.
         let delta = token_usage_delta(&total, prev_total);
         (delta, Some(token_usage_high_water(&total, prev_total)))
     } else {
@@ -2404,8 +2406,14 @@ fn codex_token_count_usage(
         .copied()
         .unwrap_or(0);
     let input = (counts.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-    let output = counts.get("output_tokens").copied().unwrap_or(0)
-        + counts.get("reasoning_output_tokens").copied().unwrap_or(0);
+    // Saturating (rm-162): two legal in-range counters can sum past i64::MAX
+    // on adversarial journals; plain `+` panicked in debug and wrapped negative
+    // in release. Sibling sums at sum_numbers already saturate for the same reason.
+    let output = counts
+        .get("output_tokens")
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(counts.get("reasoning_output_tokens").copied().unwrap_or(0));
 
     let mut usage = BTreeMap::new();
     usage.insert("input_tokens".to_string(), input);
@@ -2437,8 +2445,9 @@ fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
     .collect()
 }
 
-// Codex can briefly rewind total_token_usage (e.g. after compaction) and then climb back;
-// tracking the high-water mark keeps the rebound from being counted twice.
+// Codex can briefly rewind total_token_usage (e.g. after compaction) and then
+// climb back; tracking the high-water mark keeps the rebound from being counted
+// twice. Ported from upstream #286 (rm-035, renumbered rm-162 at integration).
 fn token_usage_high_water(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
     let mut merged = prev.cloned().unwrap_or_default();
     for (key, value) in cur {
@@ -4576,7 +4585,7 @@ mod tests {
 
     #[test]
     fn codex_total_usage_rewind_after_compaction_is_single_counted() {
-        // rm-013 (upstream PR #286, be25c4c): Codex rewinds
+        // rm-035 (upstream PR #286, be25c4c): Codex rewinds
         // total_token_usage after compaction and climbs back. The rewind
         // event still emits (output tokens keep rising), so under raw-total
         // delta accounting it replaced the previous cumulative with the
@@ -4734,6 +4743,76 @@ mod tests {
             Some(&2),
             "skipped codex chatter is visible in parse diagnostics"
         );
+    }
+
+    #[test]
+    fn codex_usage_sums_saturate_instead_of_overflowing() {
+        // rm-162: output_tokens + reasoning_output_tokens can each carry a
+        // legal in-range i64 whose sum overflows on adversarial journals;
+        // plain `+` panicked in debug and wrapped negative in release.
+        // Saturating addition clamps at i64::MAX, matching sum_numbers.
+        let info = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": 10,
+                "output_tokens": i64::MAX,
+                "reasoning_output_tokens": i64::MAX
+            }
+        });
+        let (usage, _) = codex_token_count_usage(Some(&info), None).expect("usage event");
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], i64::MAX);
+    }
+
+    #[test]
+    fn codex_usage_rewind_uses_high_water_mark() {
+        // rm-162 / upstream #286: Codex can briefly rewind
+        // total_token_usage after compaction and then climb back. Without
+        // the high-water mark every token up to the old mark is counted
+        // twice on the rebound; with it, only the climb past it counts.
+        let step = |total_input: i64| {
+            serde_json::json!({
+                "total_token_usage": {"input_tokens": total_input}
+            })
+        };
+        let (first, prev) = codex_token_count_usage(Some(&step(2500)), None).expect("first event");
+        assert_eq!(first["input_tokens"], 2500);
+        // Rewind to 1000 fabricates no usage (empty delta -> no event),
+        // and preserves the 2500 high-water mark as `prev`.
+        let rewound = codex_token_count_usage(Some(&step(1000)), prev.as_ref());
+        assert!(rewound.is_none());
+        // Rebound to 3000 counts only the 500-token climb past the mark.
+        let (rebound, _) =
+            codex_token_count_usage(Some(&step(3000)), prev.as_ref()).expect("rebound event");
+        assert_eq!(rebound["input_tokens"], 500);
+    }
+
+    #[test]
+    fn add_usage_accumulators_saturate_instead_of_overflowing() {
+        // rm-162 / IR-1: add_usage and add_usage_value are journal-
+        // controlled accumulators on the OpenCode path; i64::MAX-scale
+        // magnitudes must saturate, not panic (debug) or wrap negative
+        // (release) the way the plain += did.
+        let mut dst: BTreeMap<String, i64> = BTreeMap::new();
+        dst.insert("input_tokens".to_string(), i64::MAX - 5);
+        let mut src: BTreeMap<String, i64> = BTreeMap::new();
+        src.insert("input_tokens".to_string(), 100);
+        add_usage(&mut dst, &src);
+        assert_eq!(dst["input_tokens"], i64::MAX);
+
+        let mut usage: BTreeMap<String, i64> = BTreeMap::new();
+        add_usage_value(
+            &mut usage,
+            "output_tokens",
+            Some(&serde_json::Value::from(i64::MAX)),
+        );
+        assert_eq!(usage["output_tokens"], i64::MAX);
+        // A second MAX-scale accumulation still holds at MAX.
+        add_usage_value(
+            &mut usage,
+            "output_tokens",
+            Some(&serde_json::Value::from(i64::MAX)),
+        );
+        assert_eq!(usage["output_tokens"], i64::MAX);
     }
 
     #[test]

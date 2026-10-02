@@ -58,8 +58,16 @@ jobs:
           mkdir -p "$CACHE_DIR"
           if [ -f "$CACHE_DIR/$KEY.tar" ]; then
             mkdir -p target
-            tar -xf "$CACHE_DIR/$KEY.tar" -C .
-            echo "restored from $KEY"
+            # rm-170: a tar truncated by a killed save used to fail the step
+            # outright — a cold build is strictly better than a red PR, so a
+            # corrupt cache is deleted and the run continues cold.
+            if tar -xf "$CACHE_DIR/$KEY.tar" -C .; then
+              echo "restored from $KEY"
+            else
+              rm -f "$CACHE_DIR/$KEY.tar"
+              rm -rf target
+              echo "cache for $KEY was corrupt; removed, building cold"
+            fi
           else
             echo "no cache for $KEY"
           fi
@@ -78,7 +86,17 @@ jobs:
           KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
           CACHE_DIR="$RUNNER_TOOL_CACHE/../cargo-cache"
           mkdir -p "$CACHE_DIR"
-          tar -cf "$CACHE_DIR/$KEY.tar" target
+          # rm-170: the cache is bounded (newest 3 lockfile keys, ~370M per
+          # tar). Re-archiving an unchanged tree burned a full 369M write on
+          # every lint run, so only re-tar when the restored cache is
+          # missing or the build actually produced newer artifacts.
+          if [ -f "$CACHE_DIR/$KEY.tar" ] \
+            && ! find target -newer "$CACHE_DIR/$KEY.tar" -print -quit 2>/dev/null | grep -q .; then
+            echo "cache for $KEY is current; skipping re-tar"
+          else
+            tar -cf "$CACHE_DIR/$KEY.tar" target
+            echo "saved $KEY"
+          fi
           ls -t "$CACHE_DIR"/*.tar 2>/dev/null | tail -n +4 | xargs -r rm -f
 
   full:
@@ -189,7 +207,11 @@ jobs:
         run: scripts/ci/check-cargo-manifests.sh
 
       - name: Codex plugin version sync
-        run: scripts/ci/check-plugin-version.sh
+        run: |
+          # rm-163: the tag anchor needs tags; a fetch-depth:1 checkout has
+          # none and the anchor would silently no-op. Fetch open, gate closed.
+          git fetch --tags --quiet || true
+          scripts/ci/check-plugin-version.sh
 
       - name: Validate helper scripts
         run: |
