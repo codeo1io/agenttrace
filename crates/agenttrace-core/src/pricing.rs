@@ -18,6 +18,33 @@ const PRICING_SNAPSHOT_DATE: &str = "2026-09-13";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
+static PRICING_OVERRIDE_STATUS: OnceLock<PricingOverrideStatus> = OnceLock::new();
+
+/// Cycle-4 B1: what actually happened to a requested
+/// `AGENTTRACE_PRICING_FILE`. Before this, an unreadable path, invalid
+/// JSON, wrong-schema keys (the natural trap: pasting a LiteLLM snapshot
+/// straight in), or a negative rate all collapsed into the same silent
+/// "zero overrides, rc0, empty stderr" outcome while `--test-match`
+/// kept advertising the bundled catalog (ccusage #1810 reported the same
+/// failure shape in the wild).
+#[derive(Debug, Clone)]
+pub enum PricingOverrideStatus {
+    /// No `AGENTTRACE_PRICING_FILE` was set — bundled catalog only.
+    NotRequested,
+    /// The file parsed, validated, and its entries were applied.
+    Applied {
+        path: PathBuf,
+        models: usize,
+        aliases: usize,
+    },
+    /// The file was requested but rejected; overrides are NOT active and
+    /// `reason` names the first concrete cause.
+    Failed { path: PathBuf, reason: String },
+}
+
+pub fn pricing_override_status() -> &'static PricingOverrideStatus {
+    PRICING_OVERRIDE_STATUS.get_or_init(|| PricingOverrideStatus::NotRequested)
+}
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, Deserialize)]
 pub struct Price {
@@ -89,10 +116,21 @@ pub fn default_price() -> Price {
 pub fn pricing_source() -> String {
     let catalog = pricing_catalog();
     let source = catalog_source(catalog);
-    if pricing_override_models().is_empty() {
-        source
-    } else {
-        format!("{source} + user overrides available")
+    match pricing_override_status() {
+        PricingOverrideStatus::NotRequested => source,
+        PricingOverrideStatus::Applied {
+            path,
+            models,
+            aliases,
+        } => format!(
+            "{source} + user overrides applied ({} model(s), {aliases} alias(es) from {})",
+            models,
+            path.display()
+        ),
+        PricingOverrideStatus::Failed { path, reason } => format!(
+            "{source} + user overrides FAILED for {}: {reason}",
+            path.display()
+        ),
     }
 }
 
@@ -433,7 +471,8 @@ fn matching_catalog_key(model: &str, entries: &BTreeMap<String, Price>) -> Optio
         .find(|variant| entries.contains_key(variant))
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PricingOverrides {
     #[serde(default)]
     prices: BTreeMap<String, Price>,
@@ -441,27 +480,89 @@ struct PricingOverrides {
     aliases: BTreeMap<String, String>,
 }
 
-fn load_pricing_overrides() -> Option<(BTreeMap<String, Price>, BTreeMap<String, String>)> {
+/// Parsed, validated override payload: (model → price, alias → model).
+type PricingOverrideMaps = (BTreeMap<String, Price>, BTreeMap<String, String>);
+
+fn load_pricing_overrides() -> Option<PricingOverrideMaps> {
     let path = std::env::var_os("AGENTTRACE_PRICING_FILE").map(PathBuf::from)?;
-    parse_pricing_overrides(&std::fs::read(path).ok()?)
+    match std::fs::read(&path) {
+        Err(err) => {
+            record_pricing_override_failure(&path, format!("cannot read: {err}"));
+            None
+        }
+        Ok(raw) => match parse_pricing_overrides(&raw) {
+            Ok((prices, aliases)) => {
+                let models = prices.len();
+                let alias_count = aliases.len();
+                let _ = PRICING_OVERRIDE_STATUS.set(PricingOverrideStatus::Applied {
+                    path,
+                    models,
+                    aliases: alias_count,
+                });
+                Some((prices, aliases))
+            }
+            Err(reason) => {
+                record_pricing_override_failure(&path, reason);
+                None
+            }
+        },
+    }
 }
 
-fn parse_pricing_overrides(
-    raw: &[u8],
-) -> Option<(BTreeMap<String, Price>, BTreeMap<String, String>)> {
-    let overrides: PricingOverrides = serde_json::from_slice(raw).ok()?;
-    Some((
-        overrides
-            .prices
-            .into_iter()
-            .map(|(model, price)| (normalize_model(&model), price))
-            .collect(),
-        overrides
-            .aliases
-            .into_iter()
-            .map(|(alias, model)| (normalize_model(&alias), normalize_model(&model)))
-            .collect(),
-    ))
+/// A requested override file was rejected. Overrides are inactive (the
+/// bundled catalog keeps working), but the rejection is loud exactly
+/// once per process and `pricing_source()`/`--test-match` report it, so
+/// no artifact can quietly compute costs under the wrong assumption.
+fn record_pricing_override_failure(path: &Path, reason: String) {
+    eprintln!(
+        "agenttrace: AGENTTRACE_PRICING_FILE ignored: {}: {reason}",
+        path.display()
+    );
+    let _ = PRICING_OVERRIDE_STATUS.set(PricingOverrideStatus::Failed {
+        path: path.to_path_buf(),
+        reason,
+    });
+}
+
+fn parse_pricing_overrides(raw: &[u8]) -> Result<PricingOverrideMaps, String> {
+    let overrides: PricingOverrides =
+        serde_json::from_slice(raw).map_err(|err| format!("invalid JSON: {err}"))?;
+    let mut prices = BTreeMap::new();
+    for (model, price) in overrides.prices {
+        validate_override_price(&model, &price)?;
+        prices.insert(normalize_model(&model), price);
+    }
+    let aliases = overrides
+        .aliases
+        .into_iter()
+        .map(|(alias, model)| (normalize_model(&alias), normalize_model(&model)))
+        .collect();
+    Ok((prices, aliases))
+}
+
+/// Rates must be finite and non-negative before they can touch costing.
+/// Mirrors the `convert_litellm` non-finite guard, but for user-supplied
+/// files the rejection is named (model + field) instead of a silent skip:
+/// a typo like `-3` used to flow straight into a negative session cost.
+fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
+    for (field, value) in [
+        ("input", price.input),
+        ("output", price.output),
+        ("cw", price.cw),
+        ("cr", price.cr),
+    ] {
+        if !value.is_finite() {
+            return Err(format!(
+                "model {model:?}: {field} rate is not finite ({value})"
+            ));
+        }
+        if value < 0.0 {
+            return Err(format!(
+                "model {model:?}: {field} rate is negative ({value})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
@@ -1296,6 +1397,55 @@ mod tests {
             aliases.get("my-alias").map(String::as_str),
             Some("my-model")
         );
+    }
+
+    #[test]
+    fn user_pricing_overrides_reject_invalid_json_with_reason() {
+        // Cycle-4 B1 red-first: an unreadable or malformed override file
+        // used to collapse into `None` via the `.ok()?` chain — zero
+        // overrides, rc0, empty stderr, `--test-match` still advertising
+        // "(bundled)". The rejection must now carry a reason.
+        let err = parse_pricing_overrides(b"not json at all")
+            .expect_err("malformed JSON must be rejected");
+        assert!(
+            err.contains("invalid JSON"),
+            "reason should name the JSON failure: {err}"
+        );
+    }
+
+    #[test]
+    fn user_pricing_overrides_reject_unknown_schema_keys() {
+        // The natural trap from the cycle-4 assessment: pasting a LiteLLM
+        // snapshot (whose top level is model names, not {prices, aliases})
+        // used to deserialize into an empty-but-valid PricingOverrides —
+        // the file "loaded" and did nothing. deny_unknown_fields turns
+        // that into a named rejection.
+        let err = parse_pricing_overrides(
+            br#"{"gpt-4o": {"input_cost_per_token": 2.5e-6, "mode": "chat"}}"#,
+        )
+        .expect_err("wrong-schema keys must be rejected");
+        assert!(
+            err.contains("unknown field") && err.contains("gpt-4o"),
+            "reason should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn user_pricing_overrides_reject_negative_rates_naming_model_and_field() {
+        // A sign typo used to flow straight into costing (corroborated
+        // live: a -520 USD session cost). Rejection must name model +
+        // field so the user can find the bad line.
+        let err = parse_pricing_overrides(
+            br#"{"prices":{"my-model":{"input":-5,"output":1,"cw":0,"cr":0}}}"#,
+        )
+        .expect_err("negative rates must be rejected");
+        assert!(
+            err.contains("my-model") && err.contains("input") && err.contains("negative"),
+            "reason should name model, field, and defect: {err}"
+        );
+        // All-clean sibling in the same file must still be fine.
+        parse_pricing_overrides(br#"{"prices":{"my-model":{"input":5,"output":1,"cw":0,"cr":0}}}"#)
+            .expect("non-negative rates are accepted");
     }
 
     #[test]

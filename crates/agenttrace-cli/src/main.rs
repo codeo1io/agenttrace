@@ -18,7 +18,7 @@ use clap::Parser;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 mod upstream;
@@ -36,7 +36,7 @@ struct Args {
     )]
     format: String,
     /// Session directory to scan instead of auto-discovered agent homes
-    #[arg(short = 'd')]
+    #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
     #[arg(long)]
     compare: bool,
@@ -843,6 +843,22 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         bail!("session path does not exist: {}", path.display());
     }
     let dir = args.dir.as_deref().map(PathBuf::from);
+    // Cycle-4 B2: a typo'd `-d` path used to produce the same
+    // "No session files found in …" error as a genuinely empty
+    // directory — the two need different messages and different exit
+    // codes (2 = the request itself is wrong; 1 = nothing matched).
+    if let Some(dir) = args.dir.as_deref() {
+        let path = Path::new(dir);
+        if !path.exists() {
+            eprintln!("agenttrace: session directory does not exist: {dir}");
+            eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
+            std::process::exit(2);
+        }
+        if !path.is_dir() {
+            eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
+            std::process::exit(2);
+        }
+    }
     let range = parse_range(args)?;
     let report = load_sessions_with_options(
         dir.as_deref(),
@@ -858,10 +874,12 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     let sessions = report.sessions.clone();
     if sessions.is_empty() {
         if report.discovered == 0 {
-            bail!(
-                "No session files found in {}",
-                args.dir.as_deref().unwrap_or("")
-            );
+            match args.dir.as_deref() {
+                Some(dir) => bail!(
+                    "No session files found in {dir} (directory exists but holds no session files)"
+                ),
+                None => bail!("No session files found in any auto-discovered agent home"),
+            }
         }
         bail!("No sessions match the requested filters");
     }
