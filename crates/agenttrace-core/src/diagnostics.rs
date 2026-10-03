@@ -302,10 +302,10 @@ fn p95_gap(session: &Session) -> f64 {
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect::<Vec<_>>();
     gaps.sort_by(f64::total_cmp);
-    let index = ((gaps.len() as f64) * 0.95) as usize;
-    gaps.get(index.min(gaps.len().saturating_sub(1)))
-        .copied()
-        .unwrap_or(0.0)
+    // One "p95" definition per tool: the crate's Go-pinned percentile
+    // (truncation at len * p, see lib.rs `percentile`), not a local
+    // re-implementation of the index math (rm-352).
+    crate::percentile(&gaps, 0.95)
 }
 
 pub(crate) fn analyze_diagnostics(events: &[Event], metrics: &Metrics) -> Diagnostics {
@@ -821,10 +821,11 @@ fn tool_latencies(events: &[Event]) -> Vec<ToolLatency> {
             } else {
                 values.iter().sum::<f64>() / values.len() as f64
             };
-            let p95_sec = values
-                .get(((values.len() as f64 * 0.95).ceil() as usize).saturating_sub(1))
-                .copied()
-                .unwrap_or(0.0);
+            // Same house rule as every other "p95" in the report — the
+            // Go-pinned crate::percentile — instead of a local ceil-1
+            // nearest-rank that disagreed with p95_gap on the same data
+            // (rm-352).
+            let p95_sec = crate::percentile(&values, 0.95);
             ToolLatency {
                 tool_name,
                 count,
@@ -1427,5 +1428,112 @@ mod tests {
             diagnostics: Diagnostics::default(),
             cwd: String::new(),
         }
+    }
+
+    fn session_with_gaps(gaps: &[f64]) -> Session {
+        Session {
+            name: "gaps".to_string(),
+            path: "gaps".to_string(),
+            metrics: Metrics {
+                gaps_sec: gaps.to_vec(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+            cwd: String::new(),
+        }
+    }
+
+    #[test]
+    fn p95_gap_pins_the_house_percentile_rule_at_boundaries() {
+        // One "p95" definition per tool: p95_gap must keep selecting
+        // exactly what `crate::percentile` selects on the same filtered,
+        // sorted gaps — the Go-pinned truncation at `len * p` (see
+        // `percentile_matches_go_index_rule` in lib.rs). len=20 -> the
+        // 20th-smallest, len=100 -> the 96th-smallest; len=40 multiplies
+        // through f64 to exactly 38.0 (Go float64 parity), index 38.
+        let gaps_20: Vec<f64> = (1..=20).map(|v| v as f64).collect();
+        assert_eq!(p95_gap(&session_with_gaps(&gaps_20)), 20.0);
+        let gaps_40: Vec<f64> = (1..=40).map(|v| v as f64).collect();
+        assert_eq!(p95_gap(&session_with_gaps(&gaps_40)), 39.0);
+        let gaps_100: Vec<f64> = (1..=100).map(|v| v as f64).collect();
+        assert_eq!(p95_gap(&session_with_gaps(&gaps_100)), 96.0);
+        assert_eq!(p95_gap(&session_with_gaps(&[7.0])), 7.0);
+        assert_eq!(p95_gap(&session_with_gaps(&[])), 0.0);
+        // Non-finite and non-positive gaps are filtered before ranking.
+        assert_eq!(
+            p95_gap(&session_with_gaps(&[f64::NAN, 0.0, -1.0, 5.0])),
+            5.0
+        );
+    }
+
+    fn latency_events(durations: &[f64]) -> Vec<Event> {
+        let mut events = Vec::new();
+        for (index, duration) in durations.iter().enumerate() {
+            let call = format!("call-{index}");
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: call.clone(),
+                    name: "bash".to_string(),
+                    args: "true".to_string(),
+                }],
+                ..Event::default()
+            });
+            let end = duration;
+            events.push(Event {
+                role: "tool".to_string(),
+                tool_call_id: call,
+                content: "ok".to_string(),
+                timestamp: format!(
+                    "2026-01-01T00:{:02}:{:02}Z",
+                    (end / 60.0) as i64,
+                    (end % 60.0) as i64
+                ),
+                ..Event::default()
+            });
+        }
+        events
+    }
+
+    #[test]
+    fn tool_latency_p95_uses_the_house_percentile_rule() {
+        // rm-352: the tool p95 used ceil-1 (nearest-rank) while every
+        // other "p95" in the report uses the Go-pinned trunc(len * p)
+        // rule — two different p95s in one document. With 20 measured
+        // calls of 1..=20 seconds the old rule picked 19.0; the house
+        // rule picks the 20th-smallest, 20.0.
+        let durations: Vec<f64> = (1..=20).map(|v| v as f64).collect();
+        let diagnostics = analyze_diagnostics(&latency_events(&durations), &Metrics::default());
+        let bash = diagnostics
+            .tool_latencies
+            .iter()
+            .find(|latency| latency.tool_name == "bash")
+            .expect("bash latency entry");
+        assert_eq!(bash.count, 20);
+        assert_eq!(bash.p95_sec, 20.0);
+        assert!(!bash.is_slow);
+    }
+
+    #[test]
+    fn tool_latency_p95_slow_flip_matches_the_house_rule() {
+        // 19 fast calls plus one 31s call: the house rule ranks p95 at
+        // the 20th-smallest (31.0 -> slow) where the old ceil-1 rule
+        // picked the 19th (1.0 -> not slow). Same report, opposite
+        // verdicts — the reason a shared percentile rule matters.
+        let mut durations: Vec<f64> = vec![1.0; 19];
+        durations.push(31.0);
+        let diagnostics = analyze_diagnostics(&latency_events(&durations), &Metrics::default());
+        let bash = diagnostics
+            .tool_latencies
+            .iter()
+            .find(|latency| latency.tool_name == "bash")
+            .expect("bash latency entry");
+        assert_eq!(bash.count, 20);
+        assert_eq!(bash.p95_sec, 31.0);
+        assert!(bash.is_slow);
     }
 }

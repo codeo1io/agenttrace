@@ -452,7 +452,10 @@ fn run() -> anyhow::Result<()> {
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
-        if args.limit < sessions.len() {
+        // The note belongs to an explicit --limit (default 20), mirroring
+        // the explicit-set idiom the governance and compare branches use —
+        // corpus size alone must not imply a cap was applied (rm-354).
+        if args.limit != 20 && args.limit < sessions.len() {
             eprintln!(
                 "Note: --limit caps list views only; this overview's aggregates cover all {} sessions.",
                 sessions.len()

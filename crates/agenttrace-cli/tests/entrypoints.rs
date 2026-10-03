@@ -503,3 +503,66 @@ fn statusline_host_mode_survives_stdout_write_failure() {
     );
     let _ = std::fs::remove_dir_all(cache);
 }
+
+#[test]
+fn overview_limit_note_only_fires_when_limit_is_explicit() {
+    // rm-354/F6: the "caps list views only" note keyed off
+    // `args.limit < sessions.len()`, so every overview of a >20-session
+    // corpus printed it with the DEFAULT limit (never requested). The
+    // note belongs to an explicit --limit, mirroring the explicit-set
+    // idiom the governance and compare branches already use.
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-limit-note-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let corpus = work.join("projects/p");
+    std::fs::create_dir_all(&corpus).expect("create corpus dir");
+    for index in 1..=21 {
+        let record = format!(
+            "{{\"sessionId\":\"s{index}\",\"uuid\":\"u{index}\",\"timestamp\":\"2026-01-01T00:00:{index:02}Z\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+        );
+        std::fs::write(corpus.join(format!("session-{index}.jsonl")), record)
+            .expect("write session fixture");
+    }
+    let projects_dir = corpus
+        .parent()
+        .expect("projects dir")
+        .to_str()
+        .expect("valid UTF-8 path")
+        .to_string();
+    let stderr_of = |args: &[&str]| -> String {
+        let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(args)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", work.join("cache"))
+            .output()
+            .expect("run agenttrace overview");
+        assert!(
+            output.status.success(),
+            "overview failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).to_string()
+    };
+    // Default limit, 21 discovered sessions: the note must stay silent.
+    let default_stderr = stderr_of(&["--overview", "-d", &projects_dir, "-f", "json"]);
+    assert!(
+        !default_stderr.contains("caps list views only"),
+        "default limit must not print the --limit note, got: {default_stderr}"
+    );
+    // Explicit small limit: the note must disclose the aggregate scope.
+    let limited_stderr = stderr_of(&[
+        "--overview",
+        "-d",
+        &projects_dir,
+        "-f",
+        "json",
+        "--limit",
+        "5",
+    ]);
+    assert!(
+        limited_stderr.contains("caps list views only"),
+        "explicit --limit must keep the note, got: {limited_stderr}"
+    );
+    let _ = std::fs::remove_dir_all(work);
+}
