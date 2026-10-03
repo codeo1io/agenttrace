@@ -44,8 +44,13 @@ here):
    reports/TUI. Effort M–L.
 4. **Cache-bound accounting over the deduplicated key union** (A11-2;
    ROADMAP.md:977). Eviction correctness in both directions (byte bound
-   double-counts; entry bound under-drops). Latent today (15.5 MB vs 64 MiB)
-   but the same file 53's captures will rotate through. Effort S–M.
+   double-counts; entry bound under-drops). No longer latent: a real
+   5,293-entry corpus wrote sessions.json at 72,257,626 B = 108.9% of the
+   64 MiB cap (run 364aa3be assess c22757c9, 2026-10-02) — the values-only
+   estimate called it in-bounds. Corrected by rm-298 (run 364aa3be cycle 1):
+   the bound is byte-true over the written document (path keys, JSON
+   punctuation, top-level fields, `dirs` included) and `dirs` gained its
+   first count+byte bounds. Effort S–M.
 5. **Installer mode and checksum parity** (A11-3; ROADMAP.md:994). chmod
    0755 (0711 today, verified live) plus published SHA-256 verification the
    way npm's installer already does, with checksum emission added to the

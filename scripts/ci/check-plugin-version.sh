@@ -53,6 +53,27 @@ if [[ -n "$latest_tag" ]] \
   fail "plugin.json version $plugin_version does not advance past the latest released tag v$latest_tag (merged into HEAD)"
 fi
 
+# Per-tag CHANGELOG-section arm (rm-303, run 364aa3be): every ^v semver
+# tag MERGED INTO HEAD must have a CHANGELOG section — a heading
+# `## vX.Y.Z ...` — or an explicit no-section marker carrying a
+# rationale on one line:
+#   <!-- no-changelog-section: vX.Y.Z: reason -->
+# Before this arm the gate anchored only the LATEST heading and tag, so
+# mid-range merged tags could stay sectionless forever (v0.8.1 shipped
+# that way: heading jump v0.9.0 -> v0.7.1). Lineage-scoped and
+# no-tag-fallback like the anchor above.
+while IFS= read -r tag; do
+  [[ -n "$tag" ]] || continue
+  escaped_tag=${tag//./\\.}
+  if grep -qE "^## ${escaped_tag}( |$)" "$changelog"; then
+    continue
+  fi
+  if grep -qF "<!-- no-changelog-section: $tag:" "$changelog"; then
+    continue
+  fi
+  fail "merged tag $tag has no CHANGELOG section: add a '## $tag' heading or an explicit '<!-- no-changelog-section: $tag: reason -->' marker"
+done < <(git -C "$root" tag --merged HEAD 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+
 # Asset integrity: every string value in the manifest that looks like a
 # relative path must resolve at the repo root.
 while IFS= read -r rel; do

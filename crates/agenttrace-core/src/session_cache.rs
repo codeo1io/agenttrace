@@ -41,13 +41,31 @@ const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(
 /// snapshot without limit.
 pub const MAX_SESSION_CACHE_ENTRIES: usize = 20_000;
 
-/// Hard bound on the serialized `sessions.json` size. The entry-count
+/// Hard bound on the serialized `sessions.json` size, enforced over
+/// EVERY byte the writer emits — entry values, per-path keys, JSON
+/// punctuation, the top-level fields, and the `dirs` map (rm-298: the
+/// values-only estimate let a real 5,293-entry corpus write 108.9% of
+/// this cap while the estimator called it in-bounds). The entry-count
 /// bound alone cannot stop unbounded growth: entries carry full tool-arg
 /// maps and directory listings, so a corpus of large sessions can grow
 /// the cache to hundreds of MB at 20,000 entries. Eviction follows the
 /// same policy as the count bound: oldest source-file fingerprint first
 /// (pass-9 CU-22).
 pub const MAX_SESSION_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hard count bound for cached directory listings (rm-298). Before it,
+/// only entries had bounds: the `dirs` map grew with directory-tree
+/// breadth (2,783 listings / 3.6 MB on the operator corpus) with
+/// nothing to stop it. Eviction is oldest directory mtime first, the
+/// same policy as the entry bounds.
+pub const MAX_SESSION_CACHE_DIRS: usize = 20_000;
+
+/// Hard byte bound for the serialized `dirs` map — one eighth of the
+/// overall cache cap (rm-298), so listings can never crowd session
+/// entries out of the byte bound: evicting entries alone can always
+/// reach the cap because the dirs block already sits inside this
+/// budget.
+pub const MAX_SESSION_CACHE_DIR_BYTES: usize = MAX_SESSION_CACHE_BYTES / 8;
 
 /// Walk-semantics version for cached directory listings. Bumped when the
 /// discovery walk's directory set changes so stale listings are dropped
@@ -765,12 +783,15 @@ fn delete_cached_session_key(path: &str, cache: &mut SessionCache) {
     }
 }
 
-/// Deduplicated cache paths with each path sized exactly once: a path
-/// decoded from `raw_entries` also lives in `entries` (see
+/// Deduplicated cache paths, each sized as the writer will emit it: a
+/// path decoded from `raw_entries` also lives in `entries` (see
 /// `cached_entry`), so chaining the two maps' keys counts it twice — the
 /// byte bound then over-evicts (up to ~2x near the ceiling) and the
-/// entry bound wastes drop slots and under-drops. The size is the larger
-/// of the raw and decoded serialized forms (pass-11 A11-2, cycle 7).
+/// entry bound wastes drop slots and under-drops (pass-11 A11-2, cycle
+/// 7). At save time the decoded copy OVERWRITES the raw copy for the
+/// same path, so when both maps hold a path its written-form size is
+/// the decoded entry's — exactly what the byte-true bound must count
+/// (rm-298).
 fn cache_paths_sized_once(cache: &SessionCache) -> Vec<(String, usize)> {
     let mut sized: BTreeMap<String, usize> = BTreeMap::new();
     for (path, value) in &cache.raw_entries {
@@ -783,12 +804,86 @@ fn cache_paths_sized_once(cache: &SessionCache) -> Vec<(String, usize)> {
         let bytes = serde_json::to_string(entry)
             .map(|text| text.len())
             .unwrap_or(0);
-        let slot = sized.entry(path.clone()).or_insert(0);
-        if bytes > *slot {
-            *slot = bytes;
-        }
+        sized.insert(path.clone(), bytes);
     }
     sized.into_iter().collect()
+}
+
+/// Serialized length of a JSON object key as `save_session_cache`
+/// writes it: the surrounding quotes plus any escape sequences
+/// (rm-298 — the keys were the invisible ~80 bytes per entry).
+fn json_key_len(key: &str) -> usize {
+    serde_json::to_string(key)
+        .map(|text| text.len())
+        .unwrap_or(0)
+}
+
+/// Serialized length of a JSON object from its members' total bytes
+/// (`key` + `:` + value each) and the member count: two braces plus a
+/// comma between adjacent members (rm-298).
+fn json_object_len(member_bytes: usize, count: usize) -> usize {
+    if count == 0 {
+        2
+    } else {
+        2 + member_bytes + (count - 1)
+    }
+}
+
+/// Total member bytes of the `dirs` map as written: per listing, the
+/// path key, one colon, and the serialized value (rm-298).
+fn dirs_member_bytes(cache: &SessionCache) -> usize {
+    cache
+        .dirs
+        .iter()
+        .map(|(path, entry)| {
+            json_key_len(path)
+                + 1
+                + serde_json::to_string(entry)
+                    .map(|text| text.len())
+                    .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// Length of the document `save_session_cache` writes for these
+/// blocks: the fixed top-level fields, the entries map, the `dirs`
+/// member (when non-empty), and the closing brace (rm-298).
+fn doc_frame_len(
+    entries_member_bytes: usize,
+    entries_count: usize,
+    dirs_bytes: usize,
+    dirs_count: usize,
+) -> usize {
+    let mut total = format!(
+        "{{\"schema_version\":{},\"dir_listing_version\":{},\"entries\":",
+        SESSION_CACHE_SCHEMA_VERSION, DIR_LISTING_WALK_VERSION
+    )
+    .len();
+    total += json_object_len(entries_member_bytes, entries_count);
+    if dirs_count > 0 {
+        total += 1 + "\"dirs\":".len() + json_object_len(dirs_bytes, dirs_count);
+    }
+    total + 1
+}
+
+/// Byte-true projection of the cache file: exactly the number of
+/// bytes `save_session_cache` writes for this cache state — entry
+/// values, per-path keys, JSON punctuation, top-level fields, and the
+/// `dirs` map. The byte bound enforces the cap over THIS number, so
+/// the written file cannot exceed the bound through uncounted
+/// overhead (rm-298).
+fn serialized_doc_size(cache: &SessionCache) -> usize {
+    let sized = cache_paths_sized_once(cache);
+    let entries_member_bytes: usize = sized
+        .iter()
+        .map(|(path, bytes)| json_key_len(path) + 1 + bytes)
+        .sum();
+    doc_frame_len(
+        entries_member_bytes,
+        sized.len(),
+        dirs_member_bytes(cache),
+        cache.dirs.len(),
+    )
 }
 
 /// Enforces the entry bound by dropping the entries with the oldest
@@ -828,40 +923,108 @@ fn enforce_entry_bound(cache: &mut SessionCache, max: usize) -> usize {
     dropped
 }
 
-/// Enforces the serialized-size bound by dropping the entries with the
-/// oldest source-file fingerprint (mtime) first -- the same eviction order
-/// as `enforce_entry_bound` -- until the estimated serialized size fits
-/// under `max` bytes. The estimate is the sum of each entry's serialized
-/// JSON length, matching what `save_session_cache` writes, counting each
-/// path of the deduplicated union once (pass-11 A11-2); headerless
-/// entries count as the oldest age (F5-5). Returns how many entries were
-/// dropped (pass-9 CU-22).
-fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
-    let mut by_age: Vec<(i64, String, usize)> = cache_paths_sized_once(cache)
-        .into_iter()
-        .map(|(path, bytes)| {
+/// Enforces the dirs-map bounds (rm-298): listings drop oldest
+/// directory mtime first — the same eviction policy as the entry
+/// bounds — until the count is at most `max_count` and the serialized
+/// `{...}` block is at most `max_bytes`. Before this, `dirs` was
+/// bounded by nothing at all, so a broad directory tree could grow
+/// the snapshot without limit and then crowd entries out of the byte
+/// bound. Returns how many listings were dropped.
+fn enforce_dirs_bound(cache: &mut SessionCache, max_count: usize, max_bytes: usize) -> usize {
+    let mut by_age: Vec<(i64, String, usize)> = cache
+        .dirs
+        .iter()
+        .map(|(path, entry)| {
             (
-                cached_entry_header(&path, cache).map_or(i64::MIN, |header| header.mod_time),
-                path,
-                bytes,
+                entry.mod_time,
+                path.clone(),
+                json_key_len(path)
+                    + 1
+                    + serde_json::to_string(entry)
+                        .map(|text| text.len())
+                        .unwrap_or(0),
             )
         })
         .collect();
-    let total: usize = by_age.iter().map(|(_, _, bytes)| *bytes).sum();
+    // (mod_time, path): deterministic even on mtime ties.
+    by_age.sort();
+    let mut member_bytes: usize = by_age.iter().map(|(_, _, member)| *member).sum();
+    let mut remaining = by_age.len();
+    // Oldest first; drop listings until both budgets hold.
+    let mut dropped = 0;
+    for (_, path, member) in by_age {
+        if remaining <= max_count && json_object_len(member_bytes, remaining) <= max_bytes {
+            break;
+        }
+        if cache.dirs.remove(&path).is_some() {
+            dropped += 1;
+            member_bytes -= member;
+            remaining -= 1;
+        }
+    }
+    if dropped > 0 {
+        cache.dirty = true;
+    }
+    dropped
+}
+
+/// Enforces the serialized-size bound over the byte-true projection of
+/// the WRITTEN document (rm-298): entry values, per-path keys, JSON
+/// punctuation, top-level fields, and the dirs map — exactly what
+/// `save_session_cache` emits. Entries drop oldest source-file
+/// fingerprint (mtime) first, the same eviction order as
+/// `enforce_entry_bound`; headerless entries count as the oldest age
+/// (F5-5); each path of the deduplicated union counts once (pass-11
+/// A11-2). The dirs block is bounded separately by `enforce_dirs_bound`,
+/// so evicting entries alone always reaches the cap. Returns how many
+/// entries were dropped (pass-9 CU-22; byte-true since rm-298).
+fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
+    // Fast path (the common case): one projection over the whole cache,
+    // no member bookkeeping. This is also the production consumer of
+    // `serialized_doc_size` — the same projection the tests pin to the
+    // written file byte for byte.
+    if serialized_doc_size(cache) <= max {
+        return 0;
+    }
+    let mut by_age: Vec<(i64, String, usize)> = cache_paths_sized_once(cache)
+        .into_iter()
+        .map(|(path, bytes)| {
+            let member = json_key_len(&path) + 1 + bytes;
+            (
+                cached_entry_header(&path, cache).map_or(i64::MIN, |header| header.mod_time),
+                path,
+                // `key`:value as one member; the comma between members
+                // is accounted for in the decrement below.
+                member,
+            )
+        })
+        .collect();
+    let entries_member_bytes: usize = by_age.iter().map(|(_, _, member)| *member).sum();
+    let mut entries_count = by_age.len();
+    let dirs_bytes = dirs_member_bytes(cache);
+    let mut total = doc_frame_len(
+        entries_member_bytes,
+        entries_count,
+        dirs_bytes,
+        cache.dirs.len(),
+    );
     if total <= max {
         return 0;
     }
-    // Oldest first; drop entries until the estimate fits.
+    // Oldest first; drop entries until the written document fits.
     by_age.sort_by_key(|(mod_time, _, _)| *mod_time);
     let mut dropped = 0;
-    let mut remaining = total;
-    for (_, path, bytes) in by_age {
-        if remaining <= max {
+    for (_, path, member) in by_age {
+        if total <= max {
             break;
         }
         if cache.entries.remove(&path).is_some() | cache.raw_entries.remove(&path).is_some() {
             dropped += 1;
-            remaining = remaining.saturating_sub(bytes);
+            // Dropping one member frees its bytes plus one comma —
+            // unless it was the only member, when the map collapses
+            // to `{}` and only the member bytes go.
+            total -= member + usize::from(entries_count >= 2);
+            entries_count -= 1;
         }
     }
     if dropped > 0 {
@@ -871,11 +1034,14 @@ fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
 }
 
 pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
-    // Hard bounds before serializing: beyond MAX_SESSION_CACHE_ENTRIES the
-    // oldest-fingerprint entries are dropped (pass-8 F8-3), and the
-    // serialized size is capped at MAX_SESSION_CACHE_BYTES with the same
-    // eviction order (pass-9 CU-22).
+    // Hard bounds before serializing: beyond MAX_SESSION_CACHE_ENTRIES
+    // the oldest-fingerprint entries are dropped (pass-8 F8-3); the
+    // dirs map keeps its own count and byte budgets (rm-298); and the
+    // serialized document is capped at MAX_SESSION_CACHE_BYTES over
+    // every byte this function writes — keys, punctuation, top-level
+    // fields, and dirs included (pass-9 CU-22; byte-true rm-298).
     enforce_entry_bound(cache, MAX_SESSION_CACHE_ENTRIES);
+    enforce_dirs_bound(cache, MAX_SESSION_CACHE_DIRS, MAX_SESSION_CACHE_DIR_BYTES);
     enforce_byte_bound(cache, MAX_SESSION_CACHE_BYTES);
     if let Some(parent) = cache.path.parent() {
         fs::create_dir_all(parent)?;
@@ -1590,14 +1756,18 @@ mod tests {
 
         // Four default entries are tiny; use a ceiling that fits only the
         // newest two to exercise the eviction path deterministically.
-        let sizes: Vec<usize> = cache
+        // Byte-true ceiling (rm-298): the whole written document minus
+        // the two oldest members, each freeing its `key`:value plus one
+        // comma (four members remain as each drops). BTreeMap order is
+        // session-0..3, matching the ascending mtimes.
+        let members: Vec<usize> = cache
             .entries
-            .values()
-            .map(|entry| serde_json::to_string(entry).expect("serialize").len())
+            .iter()
+            .map(|(path, entry)| {
+                json_key_len(path) + 1 + serde_json::to_string(entry).expect("serialize").len() + 1
+            })
             .collect();
-        let total: usize = sizes.iter().sum();
-        let oldest_two: usize = sizes[..2].iter().sum();
-        let max = total - oldest_two;
+        let max = serialized_doc_size(&cache) - members[0] - members[1];
         let dropped = enforce_byte_bound(&mut cache, max);
         assert_eq!(dropped, 2, "the two oldest entries drop first");
         assert_eq!(cache.entry_count(), 2);
@@ -1729,11 +1899,13 @@ mod tests {
             size_of.values().all(|bytes| *bytes > 0),
             "entries must be sized, not zeroed"
         );
-        let total: usize = size_of.values().sum();
-        // `paths` was stored oldest-mtime first; the ceiling fits exactly
-        // the two newest distinct paths.
-        let oldest_two = size_of[&paths[0]] + size_of[&paths[1]];
-        let max = total - oldest_two;
+        // `paths` was stored oldest-mtime first; the byte-true ceiling
+        // (rm-298) fits exactly the two newest distinct paths: the whole
+        // written document minus the two oldest members, each freeing
+        // its `key`:value plus one comma (four members remain as each
+        // drops).
+        let member = |path: &str| json_key_len(path) + 1 + size_of[path] + 1;
+        let max = serialized_doc_size(&cache) - member(&paths[0]) - member(&paths[1]);
         let dropped = enforce_byte_bound(&mut cache, max);
         assert_eq!(dropped, 2, "the two oldest distinct paths drop, exactly");
         assert_eq!(cache.entry_count(), 2);
@@ -1768,6 +1940,195 @@ mod tests {
             "the headerless entry is the oldest and must be evictable"
         );
         assert!(cache.raw_entries.contains_key("/gone/dated-entry"));
+    }
+
+    #[test]
+    fn byte_bound_covers_the_written_document_not_a_model() {
+        // rm-298: `enforce_byte_bound` used to size entry VALUES only,
+        // while `save_session_cache` also writes per-path keys, JSON
+        // punctuation, the top-level fields, and the whole `dirs` map —
+        // on a real 5,293-entry corpus that gap wrote sessions.json at
+        // 72,257,626 B = 108.9% of the 64 MiB "hard bound" (assess
+        // c22757c9). The contract the doc comment states is about the
+        // WRITTEN FILE, so the fixture asserts on the file on disk, not
+        // on the estimator's model of it: with a ceiling the old
+        // values-only estimate called in-bounds, the written document
+        // must still fit under it, and eviction must be oldest-first.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-byte-true-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            ..SessionCache::default()
+        };
+        for i in 0..8i64 {
+            let path = format!("/corpus/projects/probe/session-{i:02}-with-a-long-key-name.jsonl");
+            let value = serde_json::json!({
+                "mod_time": 1_000_000 + i * 1_000,
+                "size": 1,
+                "session": {
+                    "Name": format!("session-{i}"),
+                    "Path": path,
+                    "pad": "x".repeat(1_500),
+                },
+            });
+            cache.raw_entries.insert(path, value);
+        }
+        for i in 0..4i64 {
+            cache.dirs.insert(
+                format!("/corpus/projects/probe-{i}"),
+                DirCacheEntry {
+                    mod_time: 500_000 + i,
+                    files: vec!["f".repeat(120); 6],
+                    dirs: Vec::new(),
+                },
+            );
+        }
+        // The pre-rm-298 model's in-bounds ceiling: the values-only sum.
+        let values_only: usize = cache_paths_sized_once(&cache).iter().map(|(_, b)| *b).sum();
+        let max = values_only;
+        enforce_byte_bound(&mut cache, max);
+        save_session_cache(&mut cache).expect("save cache");
+        let written = fs::metadata(&cache.path).expect("cache file written").len() as usize;
+        assert!(
+            written <= max,
+            "the written sessions.json must obey the byte bound: {written} > {max}"
+        );
+        // Eviction stays oldest-mtime-first and never touches dirs.
+        assert!(
+            !cache
+                .raw_entries
+                .contains_key("/corpus/projects/probe/session-00-with-a-long-key-name.jsonl"),
+            "the oldest entry is the first to go"
+        );
+        assert!(
+            cache
+                .raw_entries
+                .contains_key("/corpus/projects/probe/session-07-with-a-long-key-name.jsonl"),
+            "the newest entry survives"
+        );
+        assert_eq!(
+            cache.dirs.len(),
+            4,
+            "entry eviction never drops dir listings"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serialized_doc_size_predicts_the_written_file_exactly() {
+        // rm-298: the byte bound is only as honest as its projection.
+        // Pin that `serialized_doc_size` equals the file
+        // `save_session_cache` writes, byte for byte — including a key
+        // that needs JSON escaping, a path living in both maps (the
+        // decoded copy overwrites the raw copy at save time), and a
+        // non-empty dirs map — so any drift between the model and the
+        // writer fails here first.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-doc-size-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            ..SessionCache::default()
+        };
+        for i in 0..3i64 {
+            let path = format!("/corpus/projects/probe \"quoted-{i}\"\\slash/s-{i}.jsonl");
+            let session = GoSession {
+                name: format!("session-{i}"),
+                path: path.clone(),
+                ..GoSession::default()
+            };
+            let value = serde_json::json!({
+                "mod_time": 900_000 + i * 1_000,
+                "size": 1,
+                "session": serde_json::to_value(&session).expect("serialize session"),
+                "pad": "y".repeat(600),
+            });
+            cache.raw_entries.insert(path.clone(), value);
+            if i == 1 {
+                // Raw and decoded copies differ for this path: the
+                // decoded copy overwrites the raw one at save time, and
+                // the projection must count the WRITTEN form (the raw
+                // copy's stray fields never reach the file).
+                cache.entries.insert(
+                    path,
+                    CacheEntry {
+                        mod_time: 900_000 + i * 1_000,
+                        size: 1,
+                        session,
+                    },
+                );
+            }
+        }
+        cache.dirs.insert(
+            "/corpus/projects/probe \"quoted-0\"\\slash".to_string(),
+            DirCacheEntry {
+                mod_time: 500_000,
+                files: vec!["f".repeat(120); 6],
+                dirs: Vec::new(),
+            },
+        );
+        let projected = serialized_doc_size(&cache);
+        save_session_cache(&mut cache).expect("save cache");
+        let written = fs::metadata(&cache.path).expect("cache file written").len() as usize;
+        assert_eq!(
+            written, projected,
+            "the projection must equal the written file byte for byte"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&cache.path).expect("read cache file"))
+                .expect("written cache parses as JSON");
+        assert!(
+            doc.get("dirs").is_some(),
+            "the dirs map is part of the written document"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dirs_map_gains_count_and_byte_bounds_of_its_own() {
+        // rm-298: `dirs` had no bound at all — only entries did — so a
+        // broad directory tree grew the snapshot without limit. The
+        // listings now drop oldest mtime first until both the count
+        // and the serialized-block budgets hold.
+        let mut cache = SessionCache::default();
+        for i in 0..6i64 {
+            cache.dirs.insert(
+                format!("/corpus/projects/probe-{i}"),
+                DirCacheEntry {
+                    mod_time: 400_000 + i * 1_000,
+                    files: vec![format!("file-{i}-{}.jsonl", "f".repeat(60)); 4],
+                    dirs: Vec::new(),
+                },
+            );
+        }
+        // Count bound alone: keep the three newest listings.
+        let dropped = enforce_dirs_bound(&mut cache, 3, usize::MAX);
+        assert_eq!(dropped, 3);
+        assert_eq!(cache.dirs.len(), 3);
+        assert!(!cache.dirs.contains_key("/corpus/projects/probe-0"));
+        assert!(cache.dirs.contains_key("/corpus/projects/probe-5"));
+        assert!(cache.dirty, "evicting listings marks the cache dirty");
+
+        // Byte bound: one byte under the current block — the oldest of
+        // the three goes and the block fits the budget.
+        cache.dirty = false;
+        let budget = json_object_len(dirs_member_bytes(&cache), cache.dirs.len()) - 1;
+        let dropped = enforce_dirs_bound(&mut cache, usize::MAX, budget);
+        assert_eq!(dropped, 1);
+        assert_eq!(cache.dirs.len(), 2);
+        assert!(!cache.dirs.contains_key("/corpus/projects/probe-3"));
+        assert!(
+            json_object_len(dirs_member_bytes(&cache), cache.dirs.len()) <= budget,
+            "the serialized dirs block must fit the byte budget"
+        );
+        assert!(cache.dirty);
     }
 
     #[test]

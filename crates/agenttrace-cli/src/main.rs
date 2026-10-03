@@ -203,19 +203,30 @@ fn run() -> anyhow::Result<()> {
 
     let language = report_language(&args.lang)?;
 
+    // rm-301: stdout purity under machine formats. The side-effect
+    // announcements below are human progress chatter; with `-f json` the
+    // stdout stream must stay a single parseable JSON document end to
+    // end (a downstream `jq` breaks on any leading line), so they route
+    // to stderr. The human path keeps them on stdout exactly as before.
+    let announce: fn(&str) -> anyhow::Result<()> = if args.format == "json" {
+        write_stderr
+    } else {
+        write_stdout
+    };
+
     if args.clear_cache {
         agenttrace_core::clear_session_cache()?;
-        write_stdout("Session cache cleared.\n")?;
+        announce("Session cache cleared.\n")?;
         if !has_session_action(&args) {
             return Ok(());
         }
     }
 
     if args.update_pricing {
-        write_stdout("Downloading pricing from LiteLLM...\n")?;
+        announce("Downloading pricing from LiteLLM...\n")?;
         let count = update_pricing()?;
-        write_stdout(&format!("Loaded {count} model prices\n"))?;
-        write_stdout(&format!(
+        announce(&format!("Loaded {count} model prices\n"))?;
+        announce(&format!(
             "Cache saved: {}\n",
             pricing_cache_path().display()
         ))?;
@@ -571,6 +582,13 @@ fn run() -> anyhow::Result<()> {
     }
 
     bail!("no report action selected")
+}
+
+fn write_stderr(value: &str) -> anyhow::Result<()> {
+    match io::stderr().write_all(value.as_bytes()) {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result.map_err(Into::into),
+    }
 }
 
 fn write_stdout(value: &str) -> anyhow::Result<()> {
