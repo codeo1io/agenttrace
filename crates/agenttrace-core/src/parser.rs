@@ -1263,11 +1263,37 @@ fn flush_aider_event(
 }
 
 fn aider_time(value: &str) -> String {
-    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
-        .ok()
-        .and_then(|ts| ts.and_local_timezone(chrono::Local).single())
-        .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
-        .unwrap_or_default()
+    // rm-356 (cycle-3, run 27fdc908): local-time conversion must be
+    // DETERMINISTIC at DST transitions. `.single()` returned None for both
+    // ambiguous fold instants and nonexistent gap instants, and the old
+    // `.unwrap_or_default()` then emitted an EMPTY timestamp -- blank
+    // temporal columns and zero durations for sessions inside transition
+    // hours. Policy (chrono LocalResult guidance): fold maps to the EARLIEST
+    // occurrence; a gap shifts forward one hour to the first representable
+    // instant; the old empty-string fallback survives only for unparseable
+    // input, and a UTC-attached rendering is the last resort if even the
+    // shifted instant cannot be represented locally.
+    let Some(naive) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok() else {
+        return String::new();
+    };
+    let render = |ts: chrono::DateTime<chrono::Local>| {
+        ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    };
+    match naive.and_local_timezone(chrono::Local) {
+        chrono::LocalResult::Single(local) => render(local),
+        chrono::LocalResult::Ambiguous(first, second) => {
+            // Fall-back fold: the wall clock reads twice. EARLIEST occurrence
+            // wins; `min` keeps that true regardless of chrono's tuple
+            // ordering (element order is not part of the documented
+            // contract -- empirically the EST leg came first).
+            render(first.min(second))
+        }
+        chrono::LocalResult::None => naive
+            .checked_add_signed(chrono::Duration::hours(1))
+            .and_then(|shifted| shifted.and_local_timezone(chrono::Local).single())
+            .map(render)
+            .unwrap_or_else(|| render(naive.and_utc().with_timezone(&chrono::Local))),
+    }
 }
 
 fn infer_aider_model(text: &str) -> Option<String> {
@@ -4019,7 +4045,7 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                 events.push(Event {
                     role: "tool".to_string(),
                     content: text.to_string(),
-                    timestamp: ts,
+                    timestamp: ts.clone(),
                     tool_call_id: string(message.get("tool_call_id"))
                         .unwrap_or("")
                         .to_string(),
@@ -4027,6 +4053,7 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                         .get("is_error")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    model_used: model.to_string(),
                     source_tool: "kimi_cli".to_string(),
                     ..Event::default()
                 });
@@ -4034,7 +4061,8 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                 events.push(Event {
                     role: role.to_string(),
                     content: text.to_string(),
-                    timestamp: ts,
+                    timestamp: ts.clone(),
+                    model_used: model.to_string(),
                     source_tool: "kimi_cli".to_string(),
                     ..Event::default()
                 });
@@ -4050,6 +4078,7 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                         role: role.to_string(),
                         content: string(block.get("text")).unwrap_or("").to_string(),
                         timestamp: ts.clone(),
+                        model_used: model.to_string(),
                         source_tool: "kimi_cli".to_string(),
                         ..Event::default()
                     }),
@@ -4064,6 +4093,7 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
                         timestamp: ts.clone(),
+                        model_used: model.to_string(),
                         source_tool: "kimi_cli".to_string(),
                         ..Event::default()
                     }),
@@ -4090,6 +4120,7 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                             })),
                         }],
                         timestamp: ts.clone(),
+                        model_used: model.to_string(),
                         source_tool: "kimi_cli".to_string(),
                         ..Event::default()
                     }),
@@ -4105,6 +4136,7 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                             .get("is_error")
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
+                        model_used: model.to_string(),
                         source_tool: "kimi_cli".to_string(),
                         ..Event::default()
                     }),
@@ -4112,36 +4144,47 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
                 }
             }
         }
-        _ => {
-            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-                let calls = tool_calls
-                    .iter()
-                    .filter_map(|call| {
-                        let call = call.as_object()?;
-                        let function = call.get("function").and_then(Value::as_object);
-                        Some(ToolCall {
-                            id: string(call.get("id")).unwrap_or("").to_string(),
-                            name: function
-                                .and_then(|function| string(function.get("name")))
-                                .unwrap_or("")
-                                .to_string(),
-                            args: jsonish(function.and_then(|function| function.get("arguments"))),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if !calls.is_empty() {
-                    events.push(Event {
-                        role: role.to_string(),
-                        tool_calls: calls,
-                        timestamp: ts,
-                        source_tool: "kimi_cli".to_string(),
-                        ..Event::default()
-                    });
-                }
-            }
+        _ => {}
+    }
+    // rm-355 (cycle-3, run 27fdc908): OpenAI-style `tool_calls` ride
+    // ALONGSIDE content -- the model emits prose in the same message as
+    // its calls. This block used to live inside the content catch-all
+    // arm, so a message carrying BOTH content (String or block Array)
+    // AND tool_calls silently dropped every call: tool_calls_total,
+    // tools_top and tool_authority went blind on exactly those sessions
+    // (live PoC kboth vs kctrl, research 9f37656d), and upstream's own Go
+    // fix 11bfe00 attests the shape occurs in real kimi transcripts.
+    // Mirroring the codex path (event_from_message), tool_calls are now
+    // parsed independent of the content shape and emitted EXACTLY ONCE
+    // as their own event -- appending here (rather than per content arm)
+    // cannot double-count, which is the 11bfe00 bug shape.
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        let calls = tool_calls
+            .iter()
+            .filter_map(|call| {
+                let call = call.as_object()?;
+                let function = call.get("function").and_then(Value::as_object);
+                Some(ToolCall {
+                    id: string(call.get("id")).unwrap_or("").to_string(),
+                    name: function
+                        .and_then(|function| string(function.get("name")))
+                        .unwrap_or("")
+                        .to_string(),
+                    args: jsonish(function.and_then(|function| function.get("arguments"))),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !calls.is_empty() {
+            events.push(Event {
+                role: role.to_string(),
+                tool_calls: calls,
+                timestamp: ts,
+                model_used: model.to_string(),
+                source_tool: "kimi_cli".to_string(),
+                ..Event::default()
+            });
         }
     }
-    let _ = model;
 }
 
 fn jsonl_objects(raw: &str) -> impl Iterator<Item = Map<String, Value>> + '_ {
@@ -5343,5 +5386,136 @@ mod tests {
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
+
+    #[test]
+    fn kimi_tool_calls_alongside_content_are_parsed_exactly_once() {
+        // rm-355 (cycle-3, run 27fdc908): a kimi chat-doc assistant message
+        // carrying BOTH `content` and OpenAI-style `tool_calls` used to drop
+        // every call -- tool_calls were only read in the content catch-all
+        // arm. Live PoC kboth vs kctrl (research 9f37656d) rendered
+        // tool_calls_total 0 / tools_top {} / authority '' with health 100.
+        let doc = serde_json::json!({
+            "model": "kimi-k2-0905-preview",
+            "messages": [
+                {"role": "user", "content": "help me", "timestamp": "2026-10-01T10:00:00Z"},
+                {
+                    "role": "assistant",
+                    "content": "Running it now.",
+                    "timestamp": "2026-10-01T10:00:05Z",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let events = parse_kimi_value(&doc).expect("kimi doc must parse");
+        let content_events = events
+            .iter()
+            .filter(|event| event.content == "Running it now.")
+            .count();
+        let call_events: Vec<_> = events
+            .iter()
+            .filter(|event| !event.tool_calls.is_empty())
+            .collect();
+        assert_eq!(content_events, 1, "prose must survive alongside calls");
+        assert_eq!(
+            call_events.len(),
+            1,
+            "calls must parse exactly once -- no drop, and no 11bfe00 double-count"
+        );
+        assert_eq!(call_events[0].tool_calls.len(), 1);
+        assert_eq!(call_events[0].tool_calls[0].name, "bash");
+        assert_eq!(call_events[0].tool_calls[0].args, "{\"command\": \"ls\"}");
+        // rm-355 model attribution: every emitted event carries the doc model
+        // (parity with the codex event_from_message path), so chat-doc
+        // sessions without usage records stop pricing at `default`.
+        assert!(events
+            .iter()
+            .all(|event| event.model_used == "kimi-k2-0905-preview"));
+    }
+
+    #[test]
+    fn kimi_tool_calls_without_content_emit_single_event() {
+        // Control leg (PoC kctrl shape): content absent. The hoist must not
+        // add a second emission -- exactly one tool_calls event.
+        let doc = serde_json::json!({
+            "model": "kimi-k2-0905-preview",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "timestamp": "2026-10-01T10:00:05Z",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let events = parse_kimi_value(&doc).expect("kimi doc must parse");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| !event.tool_calls.is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn kimi_tool_calls_alongside_block_content_are_parsed() {
+        // Array-shaped content (block list) + tool_calls: the same hoist --
+        // one text event plus exactly one calls event.
+        let doc = serde_json::json!({
+            "model": "kimi-k2-0905-preview",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "timestamp": "2026-10-01T10:00:05Z",
+                    "content": [{"type": "text", "text": "Working on it."}],
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "edit_file", "arguments": "{\"path\": \"a.rs\"}"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let events = parse_kimi_value(&doc).expect("kimi doc must parse");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.content == "Working on it.")
+                .count(),
+            1
+        );
+        let calls: Vec<_> = events
+            .iter()
+            .filter(|event| !event.tool_calls.is_empty())
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_calls[0].name, "edit_file");
+    }
+
+    #[test]
+    fn aider_time_fallbacks_stay_truthful() {
+        // rm-356 (cycle-3, run 27fdc908): unparseable input keeps the
+        // historical empty-string fallback; a representable instant always
+        // renders a full RFC3339 timestamp (never an empty string, which is
+        // the fold/gap collapse the fix removes). Zone-dependent fold/gap
+        // offsets are pinned in tests/aider_dst.rs.
+        assert_eq!(aider_time("not a timestamp"), "");
+        let rendered = aider_time("2026-06-15 12:00:00");
+        assert!(rendered.len() >= 19, "got {rendered:?}");
+        assert!(rendered.contains('T'));
     }
 }

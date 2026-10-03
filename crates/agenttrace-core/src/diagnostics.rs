@@ -678,9 +678,21 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
     let mut retries = 0;
     let mut groups = 0;
     for call in events.iter().flat_map(|event| &event.tool_calls) {
-        let call_args = canonical_args(&call.args);
-        let same_call =
-            matches!(&last, Some((name, args)) if *name == call.name && *args == call_args);
+        // rm-358 (cycle-3, run 27fdc908): canonical_args fully parses and
+        // re-serializes the call's argument JSON; it is the expensive step
+        // and was paid for EVERY call before the cheap tool-NAME check ran.
+        // Gate on the name first, then try a raw byte-compare before
+        // canonicalizing: retry loops re-issue byte-identical argument text
+        // (see the R2-7 note above), and a raw string equal to the previous
+        // CANONICAL string is itself canonical (canonicalization is
+        // idempotent), so equality survives the short-circuit and the
+        // same_call truth table is unchanged.
+        let same_call = match last.as_ref().filter(|(name, _)| *name == call.name) {
+            Some((_, prev_args)) => {
+                *prev_args == call.args || canonical_args(&call.args) == *prev_args
+            }
+            None => false,
+        };
         if same_call {
             consecutive += 1;
             if consecutive >= 3 {
@@ -695,6 +707,7 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
                 groups += 1;
             }
             consecutive = 1;
+            let call_args = canonical_args(&call.args);
             last = Some((call.name.as_str(), call_args));
         }
     }
@@ -981,9 +994,16 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|time| time.with_timezone(&Utc))
 }
 
-fn hash(value: &str) -> u32 {
-    value.bytes().take(200).fold(5381_u32, |hash, byte| {
-        hash.wrapping_mul(33).wrapping_add(byte as u32)
+fn hash(value: &str) -> u64 {
+    // rm-359 (cycle-3, run 27fdc908): full-length 64-bit fingerprint. The
+    // previous DJB2-u32 over `take(200)` collided for any two result strings
+    // identical in their first 200 bytes but differing after, minting false
+    // loop identities that fed loop-cost labels. DJB2 is kept (in-tree,
+    // deterministic across releases -- std DefaultHasher is NOT stable
+    // across Rust versions) but widened to u64 and applied to the whole
+    // string, so only a genuine 64-bit collision can conflate results.
+    value.bytes().fold(5381_u64, |hash, byte| {
+        hash.wrapping_mul(33).wrapping_add(u64::from(byte))
     })
 }
 
@@ -1427,5 +1447,59 @@ mod tests {
             diagnostics: Diagnostics::default(),
             cwd: String::new(),
         }
+    }
+
+    #[test]
+    fn full_length_hash_separates_200_byte_prefix_twins() {
+        // rm-359 (cycle-3, run 27fdc908): the old DJB2-u32 over
+        // `take(200)` minted the SAME fingerprint for any two result
+        // strings equal in their first 200 bytes but differing after --
+        // false loop identities feeding loop-cost labels. The widened
+        // full-length 64-bit hash must separate them.
+        let common = "x".repeat(200);
+        let left = format!("{common}alpha");
+        let right = format!("{common}beta");
+        assert_ne!(
+            hash(&left),
+            hash(&right),
+            "strings differing past byte 200 must not share a fingerprint"
+        );
+        assert_eq!(hash(&left), hash(&left));
+    }
+
+    #[test]
+    fn byte_identical_long_retries_keep_loop_detection_unchanged() {
+        // rm-358 (cycle-3, run 27fdc908): the canonical_args short-circuit
+        // (raw == previous canonical implies equality) must not change loop
+        // results for byte-identical retry text -- the dominant real shape,
+        // since retry loops re-issue identical argument strings.
+        let long_args = format!("{{\"content\":\"{}\"}}", "y".repeat(400));
+        let mut events = Vec::new();
+        for seq in 0..3 {
+            let call_id = format!("call-{seq}");
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: format!("2026-01-01T00:00:0{seq}Z"),
+                tool_calls: vec![ToolCall {
+                    id: call_id.clone(),
+                    name: "Write".to_string(),
+                    args: long_args.clone(),
+                }],
+                ..Event::default()
+            });
+            events.push(Event {
+                role: "tool".to_string(),
+                timestamp: format!("2026-01-01T00:00:0{}Z", seq + 1),
+                content: "done".to_string(),
+                tool_call_id: call_id,
+                ..Event::default()
+            });
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        assert_eq!(diagnostics.loop_cost.loop_type, "Write_loop");
+        assert_eq!(diagnostics.loop_cost.retry_events, 1);
+        assert_eq!(diagnostics.loop_cost.loop_groups, 1);
+        assert_eq!(diagnostics.loop_cost.turns, 3);
+        assert_eq!(diagnostics.tool_latencies[0].unmatched, 0);
     }
 }
