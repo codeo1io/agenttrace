@@ -1,7 +1,7 @@
 use crate::{parse_ts, pricing, total_tokens, Session};
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
@@ -401,6 +401,47 @@ pub fn project_decode_status(session: &Session) -> ProjectDecodeStatus {
 
 pub fn project_name(session: &Session) -> String {
     resolve_project(session).display_name
+}
+
+/// rm-394: display names for project rollups, aligned with the input
+/// sessions (index-for-index).
+///
+/// An un-collided project keeps its basename exactly as before; when
+/// two distinct roots share a basename (alice/api vs bob/api) every row
+/// for them is disambiguated as `basename (/root)` so rollups aggregate
+/// the two projects as two rows instead of one merged lie.
+/// Unattributed sessions keep the single `unknown` bucket. `--doctor`
+/// discloses the collisions it observes (same rule, same source).
+pub fn project_rollup_display_names<'a>(
+    sessions: impl IntoIterator<Item = &'a Session>,
+) -> Vec<String> {
+    let identities: Vec<_> = sessions.into_iter().map(resolve_project).collect();
+    let mut roots_by_basename: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for identity in &identities {
+        if identity.id == "unknown" {
+            continue;
+        }
+        roots_by_basename
+            .entry(identity.display_name.as_str())
+            .or_default()
+            .insert(identity.root.as_str());
+    }
+    identities
+        .iter()
+        .map(|identity| {
+            if identity.id == "unknown" {
+                return "unknown".to_string();
+            }
+            let collided = roots_by_basename
+                .get(identity.display_name.as_str())
+                .is_some_and(|roots| roots.len() > 1);
+            if collided {
+                format!("{} ({})", identity.display_name, identity.root)
+            } else {
+                identity.display_name.clone()
+            }
+        })
+        .collect()
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -936,5 +977,76 @@ mod tests {
         assert!(TimeRange::Today
             .since(now)
             .is_some_and(|start| start <= now));
+    }
+
+    #[test]
+    fn project_rollup_display_names_disambiguates_colliding_basenames() {
+        // rm-394: alice/api and bob/api share the basename "api"; the
+        // old keying (`project_name`) merged them into one row. Rollups
+        // must keep two rows, each disambiguated with its root; a lone
+        // basename stays bare, and a cwd-less session stays "unknown".
+        let root = unique_decode_root("rollup");
+        let alice = root.join("alice").join("api");
+        let bob = root.join("bob").join("api");
+        let solo = root.join("solo");
+        for dir in [&alice, &bob, &solo] {
+            fs::create_dir_all(dir).expect("fixture dirs");
+        }
+        let sessions = [
+            session_at(alice.to_string_lossy().as_ref(), "/tmp/a.jsonl"),
+            session_at(bob.to_string_lossy().as_ref(), "/tmp/b.jsonl"),
+            session_at(solo.to_string_lossy().as_ref(), "/tmp/c.jsonl"),
+            session_at("", "/tmp/d.jsonl"),
+        ];
+        let names = project_rollup_display_names(sessions.iter());
+        assert_eq!(names.len(), 4);
+        assert!(
+            names[0].starts_with("api (") && names[0].contains("alice"),
+            "alice's row must carry its root: {}",
+            names[0]
+        );
+        assert!(
+            names[1].starts_with("api (") && names[1].contains("bob"),
+            "bob's row must carry its root: {}",
+            names[1]
+        );
+        assert_ne!(names[0], names[1], "colliding roots must not merge");
+        assert_eq!(names[2], "solo", "unique basenames stay bare");
+        assert_eq!(names[3], "unknown", "unattributed keeps the bucket");
+    }
+
+    #[test]
+    fn overview_and_context_trends_key_collisions_apart() {
+        // rm-394 end-to-end: the overview by-project table and the
+        // governance context trends roll the two api roots as two rows.
+        let root = unique_decode_root("rollup-e2e");
+        let alice = root.join("alice").join("api");
+        let bob = root.join("bob").join("api");
+        for dir in [&alice, &bob] {
+            fs::create_dir_all(dir).expect("fixture dirs");
+        }
+        let sessions = [
+            session_at(alice.to_string_lossy().as_ref(), "/tmp/a.jsonl"),
+            session_at(bob.to_string_lossy().as_ref(), "/tmp/b.jsonl"),
+        ];
+        let overview = crate::compute_overview(&sessions);
+        let api_rows = overview
+            .by_project
+            .keys()
+            .filter(|name| name.starts_with("api ("))
+            .count();
+        assert_eq!(
+            api_rows,
+            2,
+            "by_project must hold two disambiguated api rows, got {:?}",
+            overview.by_project.keys().collect::<Vec<_>>()
+        );
+        let trends = crate::context_trends(&sessions);
+        let api_series = trends
+            .projects
+            .iter()
+            .filter(|project| project.project.starts_with("api ("))
+            .count();
+        assert_eq!(api_series, 2, "context trends must stay two series");
     }
 }

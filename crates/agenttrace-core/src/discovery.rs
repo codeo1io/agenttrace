@@ -179,20 +179,26 @@ fn pi_family_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
         candidates.push((brand.to_string(), root.join("agent").join("sessions")));
         // A fork home whose agent dir is the root itself.
         candidates.push((brand.to_string(), root.join("sessions")));
-        if let Ok(children) = fs::read_dir(&root) {
-            let mut children: Vec<PathBuf> = children.flatten().map(|entry| entry.path()).collect();
-            children.sort();
-            for child in children {
-                let Some(name) = child.file_name().and_then(std::ffi::OsStr::to_str) else {
-                    continue;
-                };
-                let label = if name == "agent" {
-                    brand.to_string()
-                } else {
-                    format!("{brand} ({name})")
-                };
-                candidates.push((label, child.join("sessions")));
+        // rm-393: an unreadable home root used to vanish every session
+        // under it; disclose the skip so the shrink is visible.
+        match fs::read_dir(&root) {
+            Ok(children) => {
+                let mut children: Vec<PathBuf> =
+                    children.flatten().map(|entry| entry.path()).collect();
+                children.sort();
+                for child in children {
+                    let Some(name) = child.file_name().and_then(std::ffi::OsStr::to_str) else {
+                        continue;
+                    };
+                    let label = if name == "agent" {
+                        brand.to_string()
+                    } else {
+                        format!("{brand} ({name})")
+                    };
+                    candidates.push((label, child.join("sessions")));
+                }
             }
+            Err(error) => disclose_unreadable_dir(&root, &error),
         }
         for (name, path) in candidates {
             if !seen.contains(&path) && path.is_dir() {
@@ -319,7 +325,28 @@ pub fn load_sessions_with_progress_from_cache_mode(
                 while let Some(&index) =
                     misses.get(next_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    if tx.send((index, parse_file(&files[index]).ok())).is_err() {
+                    // rm-396: an oversized file is a disclosed skip, not a
+                    // silent miss — record it where the walk/doctor can
+                    // disclose the shrink.
+                    let session = match parse_file(&files[index]) {
+                        Ok(session) => Some(session),
+                        Err(error) => {
+                            if let Some(oversized) =
+                                error.downcast_ref::<crate::parser::SessionFileTooLargeError>()
+                            {
+                                crate::disclosed::record(
+                                    crate::disclosed::DisclosedSkipKind::OversizedFile,
+                                    &files[index],
+                                    format!(
+                                        "{} bytes above the {} byte parse bound",
+                                        oversized.size, oversized.bound
+                                    ),
+                                );
+                            }
+                            None
+                        }
+                    };
+                    if tx.send((index, session)).is_err() {
                         break;
                     }
                 }
@@ -551,7 +578,12 @@ fn walk_session_files_cached(
         return;
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
+    // rm-393: the walk used to return silently when a directory could
+    // not be read, making every session under it invisible and letting
+    // `--doctor` report a healthy corpus. Record the skip; the doctor
+    // and the report paths disclose it.
+    let Ok(entries) = fs::read_dir(dir).inspect_err(|error| disclose_unreadable_dir(dir, error))
+    else {
         return;
     };
     let mut files = Vec::new();
@@ -604,6 +636,22 @@ fn walk_session_files_cached(
     }
 }
 
+/// rm-393: a directory the walk cannot read hides every session under
+/// it. Missing directories are not a shrink (nothing listed them as a
+/// candidate — brand-home probes miss constantly), so only
+/// existence-with-unreadability (permissions, I/O errors, TOCTOU races
+/// aside) is disclosed; the OS error text rides along as the detail.
+fn disclose_unreadable_dir(path: &Path, error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return;
+    }
+    crate::disclosed::record_io_error(
+        crate::disclosed::DisclosedSkipKind::UnreadableDirectory,
+        path,
+        error,
+    );
+}
+
 fn walk_session_files(
     dir: &Path,
     depth: usize,
@@ -614,7 +662,10 @@ fn walk_session_files(
     if depth > max_depth {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
+    // rm-393: as the cached walk above — an unreadable directory is a
+    // disclosed skip, never a silent shrink.
+    let Ok(entries) = fs::read_dir(dir).inspect_err(|error| disclose_unreadable_dir(dir, error))
+    else {
         return;
     };
     for entry in entries.flatten() {
@@ -928,5 +979,83 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rm-393 acceptance: a directory the walk cannot read shrinks the
+    /// discovered corpus, so it must be recorded as a disclosed skip —
+    /// never a silent hole. Skips are process-global; assertions are
+    /// scoped to this test's fixture paths.
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_directory_is_a_disclosed_skip() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "at-unreadable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let secret = root.join("secret");
+        fs::create_dir_all(&secret).expect("fixture dirs");
+        fs::write(secret.join("s1.jsonl"), "{}\n").expect("fixture file");
+        assert!(
+            find_session_files(Some(&root))
+                .iter()
+                .any(|file| file.ends_with("s1.jsonl")),
+            "fixture must be discovered while readable"
+        );
+
+        let mut perms = fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&secret, perms).expect("chmod 000");
+        // Running as root (some CI containers) defeats the permission
+        // drop; detect it and only assert when the mode actually blocks.
+        if fs::read_dir(&secret).is_err() {
+            let files = find_session_files(Some(&root));
+            assert!(
+                !files.iter().any(|file| file.starts_with(&secret)),
+                "unreadable dir must not contribute files: {files:?}"
+            );
+            let skips = crate::disclosed::snapshot();
+            let skip = skips.iter().find(|skip| {
+                skip.kind == crate::disclosed::DisclosedSkipKind::UnreadableDirectory
+                    && skip.path.ends_with("secret")
+            });
+            let skip = skip.expect("unreadable dir must be a disclosed skip");
+            assert!(
+                !skip.detail.is_empty(),
+                "skip detail must carry the OS reason"
+            );
+        }
+
+        let mut perms = fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&secret, perms).expect("restore for cleanup");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// rm-393: `NotFound` brand-home probes must not be disclosed as
+    /// skips (nothing listed them as a candidate — no shrink happened).
+    #[test]
+    fn missing_directory_is_not_a_disclosed_skip() {
+        let missing = std::env::temp_dir().join("at-never-there-bac902a9");
+        let before = crate::disclosed::snapshot()
+            .into_iter()
+            .filter(|skip| skip.path.ends_with("at-never-there-bac902a9"))
+            .count();
+        let _ = collect_session_files(&missing);
+        let after = crate::disclosed::snapshot()
+            .into_iter()
+            .filter(|skip| skip.path.ends_with("at-never-there-bac902a9"))
+            .count();
+        assert_eq!(
+            before, after,
+            "a missing probe directory is not a disclosed skip"
+        );
     }
 }

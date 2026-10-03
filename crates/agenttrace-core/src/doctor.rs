@@ -19,6 +19,18 @@ pub struct DoctorReport {
     /// rm-381 disclosure: outcomes of reversing `-`-encoded agent project
     /// directory names for scanned sessions without a `cwd`.
     pub project_decode: DoctorProjectDecodeReport,
+    /// rm-394 disclosure: project display names that collide on basename
+    /// across distinct roots and are therefore disambiguated with their
+    /// root in every rollup (`api (/home/alice/api)` …). Empty when every
+    /// project name is unique in this scan.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub project_name_collisions: Vec<String>,
+    /// rm-393/rm-396 disclosure: everything the discovery walk or the
+    /// parser skipped — unreadable directories (with the OS error) and
+    /// oversized session files (with the byte size) — so a corpus that
+    /// silently shrank now says so instead of reporting a healthy scan.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disclosed_skips: Vec<crate::disclosed::DisclosedSkip>,
     /// On-disk size of `sessions.json`, zero when absent.
     pub cache_size_bytes: u64,
     /// The hard bounds `save_session_cache` enforces before serializing
@@ -113,7 +125,36 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         "auto-discovery"
     };
     let mut project_decode = DoctorProjectDecodeReport::default();
-    let directories = doctor_directories(dir, &files, &sqlite_sessions, &mut project_decode);
+    // rm-394: full-identity map (root -> basename) over every parsed
+    // session, the input for the basename-collision disclosure.
+    let mut project_identities: BTreeMap<String, String> = BTreeMap::new();
+    let directories = doctor_directories(
+        dir,
+        &files,
+        &sqlite_sessions,
+        &mut project_decode,
+        &mut project_identities,
+    );
+    for session in &sqlite_sessions {
+        let identity = crate::insights::resolve_project(session);
+        project_identities.insert(identity.id.clone(), identity.display_name.clone());
+    }
+    let mut by_basename: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, basename) in &project_identities {
+        // "unknown" is a single unattributed bucket, not a collision.
+        if id == "unknown" {
+            continue;
+        }
+        by_basename
+            .entry(basename.as_str())
+            .or_default()
+            .push(id.as_str());
+    }
+    let project_collisions: Vec<String> = by_basename
+        .into_iter()
+        .filter(|(_basename, roots)| roots.len() > 1)
+        .map(|(basename, roots)| format!("{basename} — {}", roots.join("; ")))
+        .collect();
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -132,6 +173,13 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
         project_decode,
+        // rm-394: collision disclosure is computed over every parsed
+        // session (directories below + sqlite-backed), so it rides the
+        // same pass as the decode report.
+        project_name_collisions: project_collisions,
+        // rm-393/rm-396: everything the walk and the parse skipped this
+        // scan, with the reason and (for oversized files) the size.
+        disclosed_skips: crate::disclosed::snapshot(),
         directories,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
@@ -143,6 +191,20 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
+    // rm-393/rm-396: skips must read as actionable, not as healthy.
+    if !report.disclosed_skips.is_empty() {
+        report.recommendations.push(format!(
+            "{} session file(s)/director(ies) were skipped during this scan (unreadable or oversized); counts above are computed over the readable corpus only",
+            report.disclosed_skips.len()
+        ));
+    }
+    // rm-394: colliding project names are disambiguated in every rollup.
+    if !report.project_name_collisions.is_empty() {
+        report.recommendations.push(format!(
+            "{} project name(s) collide across distinct roots and are disambiguated with their root path in rollups",
+            report.project_name_collisions.len()
+        ));
+    }
     report
 }
 
@@ -237,6 +299,7 @@ fn doctor_directories(
     files: &[PathBuf],
     sqlite_sessions: &[Session],
     project_decode: &mut DoctorProjectDecodeReport,
+    project_identities: &mut BTreeMap<String, String>,
 ) -> Vec<DoctorDirReport> {
     let mut cache = load_session_cache();
     if let Some(dir) = dir {
@@ -247,6 +310,7 @@ fn doctor_directories(
             files,
             &mut cache,
             project_decode,
+            project_identities,
         )];
     }
 
@@ -275,6 +339,7 @@ fn doctor_directories(
             &matching,
             &mut cache,
             project_decode,
+            project_identities,
         ));
     }
     dirs.extend(doctor_sqlite_directories(sqlite_sessions));
@@ -287,28 +352,58 @@ fn doctor_dir_report(
     files: &[PathBuf],
     cache: &mut crate::SessionCache,
     project_decode: &mut DoctorProjectDecodeReport,
+    project_identities: &mut BTreeMap<String, String>,
 ) -> DoctorDirReport {
     let mut parsed = 0;
     let mut cache_hits = 0;
+    let mut oversized_skipped = 0;
     let mut failure_samples = Vec::new();
     for file in files {
         // Keep the parsed session where the decode disclosure (rm-381) can
-        // see it; the parse accounting below is unchanged.
+        // see it; the parse accounting below is unchanged apart from the
+        // rm-396 oversized class, which is a disclosed skip, not a failure.
         let session = if let Some(session) = cached_session(file, cache) {
             cache_hits += 1;
             parsed += 1;
             Some(session)
-        } else if let Ok(session) = parse_file(file) {
-            parsed += 1;
-            Some(session)
         } else {
-            if failure_samples.len() < 3 {
-                failure_samples.push(file.to_string_lossy().to_string());
+            match parse_file(file) {
+                Ok(session) => {
+                    parsed += 1;
+                    Some(session)
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::parser::SessionFileTooLargeError>()
+                        .is_some() =>
+                {
+                    oversized_skipped += 1;
+                    if let Some(oversized) =
+                        error.downcast_ref::<crate::parser::SessionFileTooLargeError>()
+                    {
+                        crate::disclosed::record(
+                            crate::disclosed::DisclosedSkipKind::OversizedFile,
+                            file,
+                            format!(
+                                "{} bytes above the {} byte parse bound",
+                                oversized.size, oversized.bound
+                            ),
+                        );
+                    }
+                    None
+                }
+                Err(_) => {
+                    if failure_samples.len() < 3 {
+                        failure_samples.push(file.to_string_lossy().to_string());
+                    }
+                    None
+                }
             }
-            None
         };
         if let Some(session) = session {
             collect_project_decode(project_decode, &session);
+            let identity = crate::insights::resolve_project(&session);
+            project_identities.insert(identity.id.clone(), identity.display_name.clone());
         }
     }
     DoctorDirReport {
@@ -317,7 +412,9 @@ fn doctor_dir_report(
         exists: path.is_dir(),
         files: files.len(),
         parsed,
-        failed: files.len().saturating_sub(parsed),
+        // rm-396: disclosed oversized skips are neither parsed nor failed;
+        // they ride the top-level disclosed-skips disclosure with sizes.
+        failed: files.len().saturating_sub(parsed + oversized_skipped),
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,
@@ -470,6 +567,13 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     for sample in &report.project_decode.samples {
         out.push_str(&format!("    {sample}\n"));
     }
+    // rm-394: colliding basenames are disambiguated with their root in
+    // every rollup; say so instead of letting two rows look arbitrary.
+    for collision in &report.project_name_collisions {
+        out.push_str(&format!(
+            "    name collision (rows disambiguated by root): {collision}\n"
+        ));
+    }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
         let status = if dir.exists { "found" } else { "missing" };
@@ -483,6 +587,22 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));
+        }
+    }
+    // rm-393/rm-396: a corpus that shrank says so, with the reason and
+    // (for oversized files) the size — never a silent healthy scan.
+    if !report.disclosed_skips.is_empty() {
+        out.push_str(&format!(
+            "\nDisclosed skips: {}\n",
+            report.disclosed_skips.len()
+        ));
+        for skip in &report.disclosed_skips {
+            out.push_str(&format!(
+                "  - {}: {} ({})\n",
+                skip.kind.label(),
+                skip.path,
+                skip.detail
+            ));
         }
     }
     out.push_str("\nRecommendations:\n");
@@ -602,4 +722,103 @@ fn file_mod_time_nanos(metadata: &std::fs::Metadata) -> Option<i64> {
 
 fn is_under(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pi_session(cwd: &str) -> String {
+        // Minimal parseable pi session carrying the project cwd (built by
+        // substitution, not format!: the JSON braces would all need
+        // escaping).
+        r#"{"type":"session","version":3,"id":"1","cwd":"__CWD__"}
+{"type":"message","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"task"}}"#
+            .replace("__CWD__", cwd)
+            + "\n"
+    }
+
+    /// rm-392..396 batch integration: a corpus holding an unreadable
+    /// directory, an oversized file, and two projects sharing a basename
+    /// must produce a doctor report that discloses all three — not a
+    /// green scan over a silently shrunken corpus.
+    #[test]
+    #[cfg(unix)]
+    fn doctor_discloses_shrinks_and_collisions() {
+        use crate::parser::DEFAULT_MAX_SESSION_FILE_BYTES;
+
+        let _guard = crate::parser::OVERSIZE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "at-doctor-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let alice = root.join("alice").join("api");
+        let bob = root.join("bob").join("api");
+        std::fs::create_dir_all(&alice).expect("alice fixture");
+        std::fs::create_dir_all(&bob).expect("bob fixture");
+        std::fs::create_dir_all(root.join("secret")).expect("secret fixture");
+        std::fs::write(root.join("good.jsonl"), pi_session(alice.to_str().unwrap()))
+            .expect("good1");
+        std::fs::write(root.join("good2.jsonl"), pi_session(bob.to_str().unwrap())).expect("good2");
+        std::fs::write(root.join("secret").join("hidden.jsonl"), "{}\n").expect("hidden");
+        {
+            let file = std::fs::File::create(root.join("huge.jsonl")).expect("huge create");
+            file.set_len(DEFAULT_MAX_SESSION_FILE_BYTES + 1)
+                .expect("huge sparse len");
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(root.join("secret"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(root.join("secret"), perms).expect("chmod");
+
+        let report = build_doctor_report(Some(&root), false);
+        let mine: Vec<_> = report
+            .disclosed_skips
+            .iter()
+            .filter(|skip| skip.path.starts_with(root.to_string_lossy().as_ref()))
+            .collect();
+        assert!(
+            mine.iter().any(|skip| skip.kind
+                == crate::disclosed::DisclosedSkipKind::UnreadableDirectory
+                && skip.path.ends_with("secret")),
+            "unreadable secret must be disclosed: {mine:?}"
+        );
+        assert!(
+            mine.iter().any(
+                |skip| skip.kind == crate::disclosed::DisclosedSkipKind::OversizedFile
+                    && skip.path.ends_with("huge.jsonl")
+                    && skip.detail.contains("above the")
+            ),
+            "oversized huge.jsonl must be disclosed with its size: {mine:?}"
+        );
+        assert!(
+            !report.project_name_collisions.is_empty()
+                && report
+                    .project_name_collisions
+                    .iter()
+                    .all(|collision| collision.starts_with("api — ")),
+            "colliding api basenames must be disclosed with both roots: {:?}",
+            report.project_name_collisions
+        );
+        let text = render_doctor_report(Some(&root), false, "text").expect("render doctor");
+        assert!(
+            text.contains("Disclosed skips:"),
+            "text shows the skip section"
+        );
+        assert!(text.contains("huge.jsonl") && text.contains("secret"));
+        assert!(text.contains("name collision"));
+
+        // Restore for cleanup regardless of assertions above.
+        let mut perms = std::fs::metadata(root.join("secret"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(root.join("secret"), perms);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -901,7 +901,10 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            model,
+            // rm-392: the model string is transcript-derived and was the
+            // one text-table cell emitted raw; route it through the
+            // shared control-byte sanitizer like every other cell.
+            crate::statusline::sanitize_line_segment(&model),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -2393,9 +2396,16 @@ fn report_html_code_list(values: &[String]) -> String {
         .join(", ")
 }
 
+/// rm-392: HTML cells carry transcript-derived strings (model names,
+/// tool names, session labels), so they go through the shared control-
+/// byte sanitizer (`statusline::sanitize_line_segment`, the rm-383
+/// family) BEFORE the HTML metacharacter escaping below — control
+/// bytes are not HTML-meaningful and pass `html_escape` untouched, so
+/// without this a model field holding OSC-52 bytes would inject into
+/// any terminal that displays the report raw.
 fn html_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
+    for ch in crate::statusline::sanitize_line_segment(value).chars() {
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -2468,11 +2478,16 @@ fn text_wrapped_key_values(label: &str, values: &[String], limit: usize) -> Vec<
 }
 
 fn text_cell(value: &str, limit: usize) -> String {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    // rm-392: collapse whitespace first (drops \n/\t), then neutralize
+    // surviving control bytes (ESC, OSC, CSI — not whitespace) with the
+    // shared sanitizer so no text table cell can carry escape sequences.
+    let collapsed = crate::statusline::sanitize_line_segment(
+        &value.split_whitespace().collect::<Vec<_>>().join(" "),
+    );
     if limit > 3 {
-        truncate_text_runes(&value, limit, "...")
+        truncate_text_runes(&collapsed, limit, "...")
     } else {
-        value
+        collapsed
     }
 }
 
@@ -2566,15 +2581,22 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
     phrase
 }
 
+/// rm-392: markdown cells carry transcript-derived strings; `\n` still
+/// renders as `<br>` (a legitimate multi-line cell), every other control
+/// byte is neutralized by the shared sanitizer (rm-383 family) so a
+/// model field holding OSC-52/CSI bytes cannot inject when the report
+/// is displayed raw.
 fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', "<br>")
+    let escaped = value.replace('|', "\\|").replace('\n', "<br>");
+    crate::statusline::sanitize_line_segment(&escaped)
 }
 
 fn markdown_inline_code(value: &str) -> String {
-    value
+    let escaped = value
         .replace('`', "'")
         .replace('|', "\\|")
-        .replace('\n', "<br>")
+        .replace('\n', "<br>");
+    crate::statusline::sanitize_line_segment(&escaped)
 }
 
 fn report_markdown_code_list(values: &[String]) -> String {
@@ -2824,5 +2846,79 @@ mod tests {
             !source.contains("\nfn percentile("),
             "reports.rs must not re-declare percentile; use crate::percentile"
         );
+    }
+
+    #[test]
+    fn html_escape_neutralizes_control_bytes_and_escapes_html() {
+        // rm-392: control bytes passed `html_escape` untouched (they are
+        // not HTML metacharacters), and printable hostile HTML must stay
+        // escaped — both classes in one cell (assess PoC corpus
+        // /tmp/at-assess-fc197/corpus/osc-session.jsonl).
+        let escaped = html_escape("a\u{001b}]52;c;aGVsbG8=\u{0007}<img onerror=alert(1)>");
+        assert!(
+            !escaped.contains('\u{001b}') && !escaped.contains('\u{0007}'),
+            "control bytes may not survive the HTML renderer: {escaped:?}"
+        );
+        assert!(escaped.contains("]\u{FFFD}") || escaped.contains("a\u{FFFD}"));
+        assert!(escaped.contains("&lt;img onerror=alert(1)&gt;"));
+    }
+
+    #[test]
+    fn markdown_cells_neutralize_control_bytes_and_keep_pipe_newline_rules() {
+        // rm-392: `markdown_cell` escaped only `|` and `\n`; every other
+        // control byte (ESC/BEL of an OSC-52 clipboard-write) passed into
+        // the .md output verbatim.
+        let cell = markdown_cell("gpt-\u{001b}]52;c;aGVsbG8=\u{0007}");
+        assert!(
+            !cell.contains('\u{001b}') && !cell.contains('\u{0007}'),
+            "control bytes may not survive markdown cells: {cell:?}"
+        );
+        assert!(cell.contains("gpt-\u{FFFD}]52;c;aGVsbG8=\u{FFFD}"));
+        // The pre-rm-392 escaping rules still hold verbatim.
+        assert_eq!(markdown_cell("a|b\nc"), "a\\|b<br>c");
+        assert_eq!(markdown_inline_code("a|b\u{001b}c"), "a\\|b\u{FFFD}c");
+    }
+
+    #[test]
+    fn overview_triple_neutralizes_control_bytes_from_model_strings() {
+        // rm-392 acceptance: the assess byte-scan PoC (1/1/2 raw control
+        // bytes in text/markdown/html) scans 0/0/0 after the batch. The
+        // By-Model table was the one text cell emitted raw; markdown and
+        // html passed the OSC-52 payload through their cell helpers.
+        let hostile_model = "gpt-\u{001b}]52;c;aGVsbG8=\u{0007}";
+        let metrics = Metrics {
+            model_used: hostile_model.to_string(),
+            ..Metrics::default()
+        };
+        let session = Session {
+            name: "osc-model".to_string(),
+            path: "/tmp/osc-model.jsonl".to_string(),
+            cwd: String::new(),
+            metrics,
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let sessions = vec![session];
+        let overview = crate::compute_overview(&sessions);
+        let health = crate::DataHealth::default();
+        let range = crate::TimeRange::default();
+        let renders = [
+            report_overview_text_with_context(&overview, &sessions, &health, range, false),
+            report_overview_markdown_with_context(&overview, &sessions, &health, range, false),
+            report_overview_html_with_context(&overview, &sessions, &health, range, false),
+        ];
+        for (format, rendered) in ["text", "markdown", "html"].iter().zip(&renders) {
+            assert!(
+                !rendered.contains('\u{001b}') && !rendered.contains('\u{0007}'),
+                "{format} overview leaked control bytes: {rendered:?}"
+            );
+            assert!(
+                rendered.contains("]52;c;aGVsbG8="),
+                "{format} overview lost the visible payload tail (sanitizer must replace, not drop)"
+            );
+        }
+        assert!(renders[0].contains('\u{FFFD}') && renders[1].contains('\u{FFFD}'));
     }
 }

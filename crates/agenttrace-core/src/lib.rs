@@ -1,5 +1,6 @@
 mod demo;
 mod diagnostics;
+mod disclosed;
 mod discovery;
 mod doctor;
 mod governance;
@@ -27,6 +28,11 @@ pub use diagnostics::{
     LargeParam, LoopCost, LoopFingerprint, SessionFinding, StuckPattern, ToolLatency, TraceStep,
     UnusedTool,
 };
+pub use disclosed::{
+    record as record_disclosed_skip, record_io_error as record_disclosed_skip_io_error,
+    reset as reset_disclosed_skips, snapshot as snapshot_disclosed_skips, DisclosedSkip,
+    DisclosedSkipKind,
+};
 
 pub use discovery::{
     collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
@@ -45,11 +51,14 @@ pub use governance::{
 pub use history::{history_path, merge_preserved_history, preserve_derived_history};
 pub use insights::{
     compare_session_outcome, data_health, data_health_scoped, filter_sessions,
-    project_decode_status, project_name, report_scope, resolve_project, session_capability,
-    session_matches_time_range, DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope,
-    SessionComparison, SourceScope, TimeRange,
+    project_decode_status, project_name, project_rollup_display_names, report_scope,
+    resolve_project, session_capability, session_matches_time_range, DataHealth,
+    ProjectDecodeStatus, ProjectIdentity, ReportScope, SessionComparison, SourceScope, TimeRange,
 };
-pub use parser::{parse_file, parse_raw_session};
+pub use parser::{
+    max_session_file_bytes, parse_file, parse_raw_session, SessionFileTooLargeError,
+    DEFAULT_MAX_SESSION_FILE_BYTES,
+};
 pub use pricing::{
     list_pricing, lookup_price, pricing_cache_path, pricing_source, pricing_source_for,
     render_model_pricing_list, render_test_match, update_pricing,
@@ -64,8 +73,9 @@ pub use reports::{
 };
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
-    cached_session, clear_session_cache, load_cached_sessions, load_cached_sessions_from_cache,
-    load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,
+    atomic_write_report, cached_session, clear_session_cache, load_cached_sessions,
+    load_cached_sessions_from_cache, load_session_cache, save_session_cache, session_cache_path,
+    store_session, SessionCache,
 };
 pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
 pub use statusline::{
@@ -1175,8 +1185,14 @@ pub fn compute_overview(sessions: &[Session]) -> Overview {
 }
 
 pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) -> Overview {
+    let sessions: Vec<&Session> = sessions.collect();
+    // rm-394: by-project keys come from the full resolved identity so
+    // colliding basenames stay two rows (see
+    // `insights::project_rollup_display_names`); `--doctor` discloses
+    // the collisions it observes.
+    let rollup_names = crate::insights::project_rollup_display_names(sessions.iter().copied());
     let mut overview = Overview::default();
-    for session in sessions {
+    for (session, project) in sessions.iter().zip(rollup_names) {
         overview.total_sessions += 1;
         overview.total_cost += session.metrics.cost_estimated;
         if session.health >= 80 {
@@ -1200,10 +1216,7 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         model_entry.sessions += 1;
         model_entry.cost += session.metrics.cost_estimated;
 
-        let project_entry = overview
-            .by_project
-            .entry(project_name(session))
-            .or_default();
+        let project_entry = overview.by_project.entry(project).or_default();
         project_entry.sessions += 1;
         project_entry.cost += session.metrics.cost_estimated;
 
