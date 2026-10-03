@@ -59,7 +59,21 @@ pub fn run_with_language(sessions_dir: &str, language: Option<&str>) -> anyhow::
 }
 
 pub fn run_with_sessions(sessions: Vec<Session>, label: &str) -> anyhow::Result<()> {
-    run_with_app(App::new(sessions, label, None))
+    run_with_sessions_with_language(sessions, label, None)
+}
+
+/// rm-341: the --demo TUI entry accepts the same --lang option as the
+/// discovery entry instead of silently dropping it.
+pub fn run_with_sessions_with_language(
+    sessions: Vec<Session>,
+    label: &str,
+    language: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut app = App::new(sessions, label, None);
+    if let Some(language) = parse_language(language) {
+        app.language = language;
+    }
+    run_with_app(app)
 }
 
 fn parse_language(value: Option<&str>) -> Option<Language> {

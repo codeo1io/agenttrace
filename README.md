@@ -175,6 +175,19 @@ it never filters aggregates, audit totals, or recommendations. Governance
 reports are unbounded by default — use `--sample N` for an explicitly
 disclosed bound.
 
+### `--baseline` and `--compare`
+
+`--baseline <file>` gates an `--overview -f json` run against a previously
+saved overview document: thresholds are set with
+`--baseline-max-duration-delta-pct` and the token/cost equivalents, and
+`--no-baseline-gate` keeps the comparison while skipping the exit-code gate.
+`--baseline` requires `--overview -f json`.
+
+`--compare` builds a two-view comparison report over the selected sessions
+and never reads a baseline document, so combining `--baseline` with
+`--compare` exits 1 with an error naming both flags rather than falling
+through to a misleading action error.
+
 ### Statusline capture
 
 Subscription limit windows (`5h`/`7d` usage and reset times) and Claude

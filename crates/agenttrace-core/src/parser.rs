@@ -3982,9 +3982,25 @@ pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
                         .map(|n| n as i64)
                 })
         }),
-        Value::String(text) => text.parse::<i64>().ok(),
+        Value::String(text) => numeric_string_as_i64(text),
         _ => None,
     }
+}
+
+/// rm-342: usage counters serialized as strings ("100") must contribute
+/// exactly like the identical JSON Number. Integer strings parse
+/// directly; float-form ("100.5", "1e3"), padded, and beyond-i64::MAX
+/// strings coerce and clamp the same way the Number arm does instead of
+/// silently dropping. Non-numeric strings ("true", "lots") stay skipped
+/// — they carry no count to honor.
+fn numeric_string_as_i64(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return Some(value);
+    }
+    // `as` casts from f64 to i64 saturate, mirroring the Number arm for
+    // magnitudes beyond i64::MAX.
+    trimmed.parse::<f64>().ok().map(|value| value as i64)
 }
 
 fn boolish(value: Option<&Value>) -> bool {
@@ -5343,5 +5359,52 @@ mod tests {
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
+
+    #[test]
+    fn numeric_string_usage_coerces_like_numbers() {
+        // rm-342 (run 71a7d5db, cycle 3): usage counters serialized as
+        // strings must contribute exactly like the identical JSON Number.
+        // Integer strings already parsed; float-form, padded, and
+        // beyond-i64::MAX strings used to drop silently while their
+        // Number twins coerced.
+        assert_eq!(number_as_i64(&Value::from(100i64)), Some(100));
+        assert_eq!(number_as_i64(&Value::from(100.5)), Some(100));
+        assert_eq!(
+            number_as_i64(&Value::from(9223372036854775808u64)),
+            Some(i64::MAX)
+        );
+        assert_eq!(number_as_i64(&Value::String("100".to_string())), Some(100));
+        assert_eq!(
+            number_as_i64(&Value::String(" 100 ".to_string())),
+            Some(100)
+        );
+        assert_eq!(
+            number_as_i64(&Value::String("100.5".to_string())),
+            Some(100)
+        );
+        assert_eq!(number_as_i64(&Value::String("1e3".to_string())), Some(1000));
+        assert_eq!(
+            number_as_i64(&Value::String("9223372036854775808".to_string())),
+            Some(i64::MAX)
+        );
+        // Not numeric: booleans and prose carry no count to honor.
+        assert_eq!(number_as_i64(&Value::Bool(true)), None);
+        assert_eq!(number_as_i64(&Value::String("true".to_string())), None);
+        assert_eq!(number_as_i64(&Value::String("lots".to_string())), None);
+    }
+
+    #[test]
+    fn pi_usage_with_string_counts_contributes_tokens() {
+        // rm-342 end-to-end pin on the assess N9 PoC shape: input
+        // "100" (string) + output 50 (number) must total 150 — the
+        // counts are honored, never silently dropped.
+        let usage = serde_json::json!({
+            "input_tokens": "100",
+            "output_tokens": 50,
+        });
+        let map = oh_my_pi_usage(Some(&usage)).expect("usage map");
+        assert_eq!(map.get("input_tokens"), Some(&100));
+        assert_eq!(map.get("output_tokens"), Some(&50));
     }
 }

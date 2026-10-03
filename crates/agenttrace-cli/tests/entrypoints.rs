@@ -661,3 +661,150 @@ fn empty_session_dir_message_differs_from_missing() {
         "must not be confusable with the missing-directory case: {stderr}"
     );
 }
+
+#[test]
+fn early_exit_test_match_honors_output_and_json() {
+    // rm-341 (run 71a7d5db, cycle 3): the early exits used to ignore -o
+    // and -f json. --test-match must write the requested file and emit a
+    // JSON document under -f json.
+    let tmp = std::env::temp_dir().join(format!("agenttrace-rm341-tm-{}", std::process::id()));
+    let out_file = tmp.join("tm.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--test-match",
+            "-o",
+            out_file.to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(output.status.success(), "CLI failed: {:?}", output);
+    assert!(out_file.is_file(), "-o must be honored by --test-match");
+    let saved = std::fs::read_to_string(&out_file).expect("read -o target");
+    assert!(
+        saved.starts_with("Pricing:"),
+        "unexpected file body: {saved:?}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--test-match", "-f", "json"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(output.status.success(), "CLI failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--test-match -f json must emit JSON");
+    assert!(
+        value["models"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "expected a non-empty models array, got {stdout}"
+    );
+    assert!(
+        value["source"].as_str().is_some(),
+        "expected a pricing source field, got {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn early_exit_list_models_honors_output_and_json() {
+    // rm-341: --list-models must honor -o and -f json (previously wrote
+    // text to stdout regardless and never created the file).
+    let tmp = std::env::temp_dir().join(format!("agenttrace-rm341-lm-{}", std::process::id()));
+    let out_file = tmp.join("lm.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--list-models",
+            "-o",
+            out_file.to_str().expect("path is UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(output.status.success(), "CLI failed: {:?}", output);
+    assert!(out_file.is_file(), "-o must be honored by --list-models");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--list-models", "-f", "json"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(output.status.success(), "CLI failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--list-models -f json must emit JSON");
+    assert!(
+        value["models"]
+            .as_object()
+            .is_some_and(|rows| !rows.is_empty()),
+        "expected a non-empty models map, got {stdout}"
+    );
+    assert!(
+        value["source"].as_str().is_some(),
+        "expected a pricing source field, got {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn baseline_compare_pair_fails_loudly_and_coherently() {
+    // rm-341: '--compare --baseline f' used to claim "--baseline requires
+    // --overview -f json", pointing users at a combination that then died
+    // with a DIFFERENT error ("choose exactly one report action"). The
+    // pair must be rejected up front with one truthful message.
+    for argv in [
+        vec!["agenttrace", "--compare", "--baseline", "f.json"],
+        vec![
+            "agenttrace",
+            "--overview",
+            "--compare",
+            "--baseline",
+            "f.json",
+            "-f",
+            "json",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(&argv[1..])
+            .output()
+            .expect("run agenttrace CLI");
+        assert!(
+            !output.status.success(),
+            "{argv:?} must exit non-zero, got {:?}",
+            output.status
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--baseline cannot be combined with --compare"),
+            "{argv:?} must name both flags, got stderr: {stderr}"
+        );
+    }
+
+    // The multi-action rejection without --baseline is unchanged.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "--compare"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("choose exactly one report action"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn readme_documents_compare_and_baseline_flags() {
+    // rm-341: --compare was completely undocumented (grep-empty across
+    // README and docs/guides in the assess pass); keep it documented.
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )
+    .expect("read README.md");
+    assert!(
+        readme.contains("--compare"),
+        "README must document --compare"
+    );
+    assert!(
+        readme.contains("--baseline"),
+        "README must document --baseline gating"
+    );
+}

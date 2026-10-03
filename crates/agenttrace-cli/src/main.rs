@@ -1,11 +1,11 @@
 use agenttrace_core::{
     add_baseline_comparison, average_health, compute_overview, context_trends, cost_audit,
     data_health, data_health_scoped, delivery_evidence_with_git, demo_sessions,
-    evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
-    load_sessions_with_options, mcp_governance, parse_file, predict_cost_anomaly,
-    pricing_cache_path, recommendations, render_doctor_report, render_model_pricing_list,
-    render_test_match, render_waste_report_with_language, report_compare_json,
-    report_json_with_language, report_overview_html_with_context,
+    evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first, list_pricing,
+    load_sessions_with_options, lookup_price, mcp_governance, parse_file, predict_cost_anomaly,
+    pricing_cache_path, pricing_source, recommendations, render_doctor_report,
+    render_model_pricing_list, render_test_match, render_waste_report_with_language,
+    report_compare_json, report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
     report_overview_text_with_context, report_search_json, report_search_text,
     report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
@@ -225,7 +225,15 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.test_match {
-        write_stdout(&render_test_match())?;
+        // rm-341: the early exits must honor -o and -f json like every
+        // other report action instead of ignoring both.
+        let out = if args.format == "json" {
+            render_test_match_json()?
+        } else {
+            render_test_match()
+        };
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
         return Ok(());
     }
 
@@ -238,7 +246,15 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.list_models {
-        write_stdout(&render_model_pricing_list())?;
+        // rm-341: honor -o and -f json (previously wrote text to stdout
+        // regardless and never created the file).
+        let out = if args.format == "json" {
+            render_model_pricing_list_json()?
+        } else {
+            render_model_pricing_list()
+        };
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
         return Ok(());
     }
 
@@ -252,7 +268,13 @@ fn run() -> anyhow::Result<()> {
     if !has_session_action(&args) {
         if args.demo {
             let sessions = demo_sessions()?;
-            return agenttrace_tui::run_with_sessions(sessions, "demo");
+            // rm-341: --demo honors --lang like the discovery TUI path
+            // instead of silently dropping it.
+            return agenttrace_tui::run_with_sessions_with_language(
+                sessions,
+                "demo",
+                Some(&args.lang),
+            );
         }
         return agenttrace_tui::run_with_language(
             args.dir.as_deref().unwrap_or(""),
@@ -935,6 +957,50 @@ fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn render_test_match_json() -> anyhow::Result<String> {
+    // rm-341: -f json support for the --test-match early exit; the same
+    // probe models as render_test_match, one row per model.
+    let models = [
+        "claude-sonnet-4-5-20250929",
+        "anthropic/claude-sonnet-4-6",
+        "vertex_ai/claude-opus-4-5@20251101",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "openai/gpt-4.1",
+        "gpt-4.1-mini-2025-04-14",
+        "deepseek-chat",
+        "deepseek/deepseek-v3.2",
+        "gemini-2.5-pro",
+        "unknown-model-xyz",
+    ];
+    let rows: Vec<_> = models
+        .iter()
+        .map(|model| {
+            let price = lookup_price(model);
+            serde_json::json!({
+                "model": model,
+                "input_per_million": price.input,
+                "output_per_million": price.output,
+                "cache_write_per_million": price.cw,
+                "cache_read_per_million": price.cr,
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "source": pricing_source(),
+        "models": rows,
+    });
+    Ok(serde_json::to_string_pretty(&doc)?)
+}
+
+fn render_model_pricing_list_json() -> anyhow::Result<String> {
+    // rm-341: -f json support for the --list-models early exit.
+    let doc = serde_json::json!({
+        "source": pricing_source(),
+        "models": list_pricing(),
+    });
+    Ok(serde_json::to_string_pretty(&doc)?)
+}
+
 fn prepare_cli_view(mut sessions: Vec<Session>, args: &Args) -> anyhow::Result<Vec<Session>> {
     validate_view_filters(args)?;
     sessions.retain(|session| {
@@ -1197,6 +1263,16 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
     // stale data while looking refreshed.
     if args.fetch && args.path.as_deref() != Some("upstream") {
         bail!("--fetch applies only to the upstream command: agenttrace --fetch upstream");
+    }
+    // rm-341: --baseline gates --overview -f json; --compare never reads
+    // it. Rejecting the pair up front replaces two errors that used to
+    // contradict each other ("--baseline requires --overview -f json"
+    // followed by "choose exactly one report action" once --overview was
+    // added).
+    if args.baseline.is_some() && args.compare {
+        bail!(
+            "--baseline cannot be combined with --compare: --baseline gates --overview -f json only"
+        );
     }
     let actions = [
         args.compare,
