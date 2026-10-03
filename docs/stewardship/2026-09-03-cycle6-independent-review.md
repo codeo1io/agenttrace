@@ -119,6 +119,20 @@ persists). Suggest: include path keys + a `dirs` allowance in the estimate
 (or bound `dirs`), or soften the doctor wording to "entries bound".
 Severity: Medium.
 
+[Resolved 2026-10-03, run 364aa3be cycle 1, rm-298: the suggested fix landed
+in both directions — `enforce_byte_bound` now enforces the cap over a
+byte-true projection of the WRITTEN document (entry values, per-path keys,
+JSON punctuation, top-level fields, and the `dirs` map), and `dirs` gained
+its own count and serialized-byte bounds (`MAX_SESSION_CACHE_DIRS`,
+`MAX_SESSION_CACHE_DIR_BYTES`), so the "hard bound" wording at doctor.rs
+:19-22 (doc) and :349-352 (render) at fd5532f is now literally true. The
+live failure mode this review predicted did occur in between: the operator
+corpus wrote 72,257,626 B = 108.9% of the 64 MiB cap (assess c22757c9). The
+line citations above had drifted with integration; current surfaces:
+enforce_byte_bound/cache_paths_sized_once in session_cache.rs at fd5532f,
+save_session_cache writes schema_version + dir_listing_version + entries +
+dirs as before.]
+
 ### F3 — CU-20 alias aggregation inconsistent across the three fold sites
 
 `qwen_usage` SUMS all four thinking aliases (parser.rs:1970-1977), while

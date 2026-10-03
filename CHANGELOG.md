@@ -76,6 +76,15 @@ changelog entries (`v0.8.0`, `v0.8.1`, `v0.9.0`; full changelogs:
   includes the total-usage rewind/high-water handling that `rm-162` ports into
   this fork's parser.
 
+## v0.8.1 - 2026-09-06
+
+Annotated retroactively (`rm-303`): this tag shipped without a changelog
+section. Its delta is the TUI navigation/feedback/loading-progress work of
+[#283](https://github.com/luoyuctl/agenttrace/pull/283) (`a34dea2`); the
+v0.9.0 section above backfills the release notes for `v0.8.0`–`v0.9.0` in
+one place
+([release page](https://github.com/luoyuctl/agenttrace/releases/tag/v0.8.1)).
+
 ## v0.7.1 - 2026-07-20
 
 ### Changed

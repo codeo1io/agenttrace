@@ -808,3 +808,64 @@ fn readme_documents_compare_and_baseline_flags() {
         "README must document --baseline gating"
     );
 }
+
+#[test]
+fn clear_cache_json_stdout_is_a_single_json_document() {
+    // rm-301: `--clear-cache --overview -f json` used to prefix
+    // "Session cache cleared." to the machine-readable report, so a
+    // downstream `jq` broke on the very first line. Under `-f json` the
+    // side-effect announcements must move to stderr (stdout = one
+    // parseable JSON document end to end); the human path keeps them
+    // on stdout exactly as before.
+    let sandbox = std::env::temp_dir().join(format!(
+        "agenttrace-rm301-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = sandbox.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            // --clear-cache removes every cache artifact through their
+            // env-aware constructors; pin them all inside the sandbox.
+            .env("HOME", &sandbox)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(args)
+            .output()
+            .expect("run agenttrace CLI")
+    };
+
+    let machine = run(&["--clear-cache", "--overview", "--demo", "-f", "json"]);
+    assert!(
+        machine.status.success(),
+        "CLI failed: {:?}",
+        String::from_utf8_lossy(&machine.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&machine.stdout);
+    assert!(
+        stdout.starts_with('{'),
+        "stdout under -f json must start with the JSON document, got {stdout:?}"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim_end()).expect("stdout parses as one JSON document");
+    assert!(parsed.is_object(), "the overview report is a JSON object");
+    let stderr = String::from_utf8_lossy(&machine.stderr);
+    assert!(
+        stderr.contains("Session cache cleared."),
+        "the announcement moves to stderr, not away: {stderr:?}"
+    );
+
+    let human = run(&["--clear-cache", "--overview", "--demo"]);
+    assert!(
+        human.status.success(),
+        "human-path CLI failed: {:?}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("Session cache cleared."),
+        "the human path keeps its announcements on stdout"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
