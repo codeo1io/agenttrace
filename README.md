@@ -117,6 +117,9 @@ agenttrace
 agenttrace --audit --range 30d -f json
 # agenttrace --audit --sample 500 -f json
 
+# --range today bounds the report to your local calendar day (sessions
+# since your local midnight); 7d/30d are rolling windows, unaffected.
+
 # Optional local model aliases and per-million-token price overrides.
 AGENTTRACE_PRICING_FILE=pricing-overrides.json agenttrace --audit -f json
 
