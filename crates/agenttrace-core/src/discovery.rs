@@ -204,6 +204,22 @@ fn pi_family_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
     dirs
 }
 
+/// Canonical identity of a session file, used for cross-root dedup.
+///
+/// rm-338: registered roots can alias or nest one canonical directory
+/// (e.g. `~/.omp/agent/sessions` symlinked at `~/.pi/agent/sessions`, or
+/// a second root pointed inside the first root's tree). The seen-sets in
+/// `find_session_files` and `find_session_files_cached` therefore key on
+/// canonical identity whenever more than one root is registered, so each
+/// session file is admitted exactly once. Aliasing is DEDUPED, not
+/// rejected (the --doctor-side alias disclosure is owned by the rm-249
+/// fold at integration); when canonicalization fails (broken symlink,
+/// permissions) the listed path is used, preserving the pre-rm-338
+/// literal-path behavior for that entry.
+fn canonical_identity(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
@@ -211,9 +227,24 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
         }
         return collect_session_files(dir);
     }
+    let dirs = discover_session_dirs();
+    let cross_root = dirs.len() > 1;
+    let mut identities: HashSet<PathBuf> = HashSet::new();
     let mut all = Vec::new();
-    for dir in discover_session_dirs() {
-        all.extend(collect_session_files(&dir));
+    for dir in dirs {
+        for path in collect_session_files(&dir) {
+            // rm-338: dedup across roots by canonical identity so roots
+            // aliasing or nesting one canonical directory cannot
+            // double-count a session file; listed paths are kept as-is.
+            let identity = if cross_root {
+                canonical_identity(&path)
+            } else {
+                path.clone()
+            };
+            if identities.insert(identity) {
+                all.push(path);
+            }
+        }
     }
     sort_paths_by_mod_time(all)
 }
@@ -410,14 +441,23 @@ pub(crate) fn find_session_files_cached(
         }
         return collect_session_files_cached(dir, cache);
     }
+    let dirs = discover_session_dirs();
+    let cross_root = dirs.len() > 1;
     let mut seen = HashSet::new();
     let mut all = Vec::new();
-    for dir in discover_session_dirs() {
+    for dir in dirs {
         if skip_sqlite_backed && skip_sqlite_backed_file_dir(&dir) {
             continue;
         }
         for path in collect_session_files_cached(&dir, cache) {
-            if seen.insert(path.clone()) {
+            // rm-338: dedup across roots by canonical identity (see
+            // canonical_identity); listed paths are kept as-is.
+            let identity = if cross_root {
+                canonical_identity(&path)
+            } else {
+                path.clone()
+            };
+            if seen.insert(identity) {
                 all.push(path);
             }
         }

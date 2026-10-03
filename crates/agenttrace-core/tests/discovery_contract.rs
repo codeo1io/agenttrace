@@ -2658,3 +2658,122 @@ fn doctor_names_symlinked_session_roots_instead_of_silent_following() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+// rm-338 (run 71a7d5db, cycle 3): cross-root canonical-identity dedup.
+// Registered roots that alias or nest one canonical directory used to
+// double-count every session they share (assess 2e3a33 N1: a 2-session
+// corpus reported "Total Sessions: 2" twice over). The fixtures below pin
+// both alias shapes and the single-root listed-path contract.
+
+fn write_rm338_pi_session(home: &std::path::Path) -> std::path::PathBuf {
+    let dir = home.join(".pi").join("agent").join("sessions").join("proj");
+    fs::create_dir_all(&dir).expect("create pi sessions dir");
+    let file = dir.join("a.jsonl");
+    fs::write(
+        &file,
+        concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"rm338\",\"cwd\":\"/work/projects/proj\"}\n",
+            "{\"type\":\"message\",\"id\":\"u1\",\"timestamp\":\"2026-10-01T10:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"question one\"}}\n",
+            "{\"type\":\"message\",\"id\":\"a2\",\"timestamp\":\"2026-10-01T10:00:30.000Z\",\"message\":{\"role\":\"assistant\",\"content\":\"ans\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}\n",
+        ),
+    )
+    .expect("write session fixture");
+    file
+}
+
+#[cfg(unix)]
+#[test]
+fn cross_root_symlink_alias_counts_each_session_once() {
+    // Symlinked session root (assess home5 PoC shape):
+    // ~/.omp/agent/sessions -> ../.pi/agent/sessions. Both roots register,
+    // and the shared file must be admitted exactly once by discovery AND
+    // by the load path.
+    let root = temp_root("agenttrace-rm338-symlink");
+    let home = root.join("home");
+    let file = write_rm338_pi_session(&home);
+    fs::create_dir_all(home.join(".omp").join("agent")).expect("create omp agent dir");
+    std::os::unix::fs::symlink(
+        "../../.pi/agent/sessions",
+        home.join(".omp").join("agent").join("sessions"),
+    )
+    .expect("symlink omp sessions to pi sessions");
+
+    with_home(&home, || {
+        let files = find_session_files(None);
+        assert_eq!(
+            files.len(),
+            1,
+            "symlink-aliased roots must list each session file exactly once, got {files:?}"
+        );
+        assert_eq!(
+            fs::canonicalize(&files[0]).ok(),
+            fs::canonicalize(&file).ok(),
+            "the kept entry must be the shared canonical file"
+        );
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "load path must count the aliased session once"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_overlap_alias_counts_each_session_once() {
+    // Nested overlap: a second registered root pointed INSIDE the first
+    // root's tree (~/.senpi/agent/sessions -> ../../.pi/agent/sessions/proj),
+    // so the shared file is reachable from both roots at different depths.
+    let root = temp_root("agenttrace-rm338-nested");
+    let home = root.join("home");
+    write_rm338_pi_session(&home);
+    fs::create_dir_all(home.join(".senpi").join("agent")).expect("create senpi agent dir");
+    std::os::unix::fs::symlink(
+        "../../.pi/agent/sessions/proj",
+        home.join(".senpi").join("agent").join("sessions"),
+    )
+    .expect("symlink senpi sessions into pi sessions subtree");
+
+    with_home(&home, || {
+        let files = find_session_files(None);
+        assert_eq!(
+            files.len(),
+            1,
+            "nested-overlapping roots must list each session file exactly once, got {files:?}"
+        );
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "load path must count the overlapped session once"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn single_root_discovery_keeps_listed_paths() {
+    // Non-aliasing contract pin: with one registered root the identity
+    // dedup must not rewrite or drop listed paths, so totals on a
+    // non-aliasing host stay byte-identical before and after rm-338.
+    let root = temp_root("agenttrace-rm338-single");
+    let home = root.join("home");
+    let file = write_rm338_pi_session(&home);
+
+    with_home(&home, || {
+        let files = find_session_files(None);
+        assert_eq!(
+            files,
+            vec![file],
+            "single-root discovery must keep the listed path"
+        );
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
