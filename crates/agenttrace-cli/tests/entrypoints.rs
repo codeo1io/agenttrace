@@ -503,3 +503,161 @@ fn statusline_host_mode_survives_stdout_write_failure() {
     );
     let _ = std::fs::remove_dir_all(cache);
 }
+
+// ---- Cycle-4 B1/B2: pricing overrides fail loud; -d paths fail distinctly ----
+// Red-first evidence: before this batch, AGENTTRACE_PRICING_FILE={bad json,
+// wrong schema, negative rate} all produced rc0 + empty stderr while
+// --test-match kept advertising the bundled catalog (assessment 8acb07dc N1,
+// same shape as ccusage #1810 in the wild).
+
+fn unique_temp(name: &str, contents: &str) -> PathBuf {
+    let path =
+        std::env::temp_dir().join(format!("at-cycle4-b1-{}-{}.json", name, std::process::id()));
+    std::fs::write(&path, contents).expect("write temp pricing file");
+    path
+}
+
+fn run_with_pricing_file(file: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--test-match")
+        .env("AGENTTRACE_PRICING_FILE", file)
+        .output()
+        .expect("run agenttrace --test-match")
+}
+
+#[test]
+fn pricing_override_invalid_json_fails_loudly() {
+    let file = unique_temp("bad", "not json at all");
+    let out = run_with_pricing_file(&file);
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "warning posture keeps rc0: {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("AGENTTRACE_PRICING_FILE ignored") && stderr.contains("invalid JSON"),
+        "stderr must name the file and the reason: {stderr}"
+    );
+    assert!(
+        stdout.contains("user overrides FAILED"),
+        "the pricing label must disclose the failure: {stdout}"
+    );
+    assert!(
+        !stdout.contains("overrides applied"),
+        "a failed file must never claim applied overrides: {stdout}"
+    );
+}
+
+#[test]
+fn pricing_override_wrong_schema_names_the_unknown_key() {
+    // The natural trap: pasting a LiteLLM snapshot straight into the env var.
+    let file = unique_temp(
+        "docschema",
+        r#"{"gpt-4o": {"input_cost_per_token": 2.5e-6, "mode": "chat"}}"#,
+    );
+    let out = run_with_pricing_file(&file);
+    let _ = std::fs::remove_file(&file);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown field") && stderr.contains("gpt-4o"),
+        "reason must name the offending key: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("user overrides FAILED"),
+        "label must disclose: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn pricing_override_negative_rate_is_rejected_by_name() {
+    let file = unique_temp(
+        "neg",
+        r#"{"prices":{"my-model":{"input":-5,"output":1,"cw":0,"cr":0}}}"#,
+    );
+    let out = run_with_pricing_file(&file);
+    let _ = std::fs::remove_file(&file);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("my-model") && stderr.contains("negative") && stderr.contains("input"),
+        "reason must name model, field, defect: {stderr}"
+    );
+}
+
+#[test]
+fn pricing_override_success_discloses_applied_overrides() {
+    let file = unique_temp(
+        "good",
+        r#"{"prices":{"my-model":{"input":5,"output":10,"cw":0,"cr":0}},"aliases":{"mm":"my-model"}}"#,
+    );
+    let out = run_with_pricing_file(&file);
+    let _ = std::fs::remove_file(&file);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "rc0 on success: {:?}", out.status);
+    assert!(
+        stdout.contains("user overrides applied") && stdout.contains("1 model(s)"),
+        "label must count what was applied: {stdout}"
+    );
+    assert!(
+        stdout.contains("good"),
+        "label must name the override file: {stdout}"
+    );
+    assert!(
+        !stderr.contains("ignored"),
+        "a good file must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn nonexistent_session_dir_exits_two_with_distinct_message() {
+    let missing = std::env::temp_dir().join(format!("at-cycle4-b2-missing-{}", std::process::id()));
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--sessions", "-d", missing.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace with missing -d");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bad request class, not empty result"
+    );
+    assert!(
+        stderr.contains("does not exist"),
+        "message must say the directory is missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No session files found"),
+        "must not be confusable with the empty-directory case: {stderr}"
+    );
+    // B2: --dir works as the long form of -d.
+    let out_long = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--sessions", "--dir", missing.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace with missing --dir");
+    assert_eq!(out_long.status.code(), Some(2), "--dir long form parses");
+}
+
+#[test]
+fn empty_session_dir_message_differs_from_missing() {
+    let empty = std::env::temp_dir().join(format!("at-cycle4-b2-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).expect("create empty dir");
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--sessions", "-d", empty.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace on empty -d");
+    let _ = std::fs::remove_dir(&empty);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "empty corpus stays rc1");
+    assert!(
+        stderr.contains("No session files found") && stderr.contains("holds no session files"),
+        "message must describe the empty-directory case: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not exist"),
+        "must not be confusable with the missing-directory case: {stderr}"
+    );
+}

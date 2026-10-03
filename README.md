@@ -122,6 +122,12 @@ agenttrace --audit --range 30d -f json
 
 # Optional local model aliases and per-million-token price overrides.
 AGENTTRACE_PRICING_FILE=pricing-overrides.json agenttrace --audit -f json
+# A requested override file never fails silently: if it is unreadable,
+# malformed, carries unknown keys (e.g. a raw LiteLLM snapshot pasted in),
+# or holds a negative rate, agenttrace prints a one-line warning to stderr
+# naming the path and reason, the pricing label reports
+# "user overrides FAILED" (--test-match shows it), and the bundled
+# catalog keeps applying. Exit code is unchanged.
 
 # Rank evidence-backed actions by severity and estimated impact.
 agenttrace --recommend --range 30d -f json
