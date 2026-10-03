@@ -28,7 +28,12 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 21;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
+// Bumped 7 → 8 (cycle-3 rm-360): Claude Code sidechain (sub-agent)
+// records are now excluded from parent aggregates and disclosed via
+// sidechain_events, and the claude parser records per-message model
+// attribution; v7 snapshots carry sidechain-inflated token/cost/turn
+// totals and first-model-only attribution, so they must regenerate once.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -192,6 +197,10 @@ struct GoMetrics {
     cost_estimated: f64,
     #[serde(default, rename = "StoredTotalsDelta")]
     stored_totals_delta: i64,
+    /// Events from Claude Code sidechain (sub-agent) records,
+    /// excluded from every parent aggregate (rm-360).
+    #[serde(default, rename = "SidechainEvents")]
+    sidechain_events: usize,
     /// Parse lines lost inside the session source, by reason (pass-7
     /// P7-1). Preserved across cache round-trips; absent on clean parses.
     #[serde(
@@ -1056,6 +1065,7 @@ impl GoMetrics {
             tool_calls_total: metrics.tool_calls_total,
             tool_calls_ok: metrics.tool_calls_ok,
             tool_calls_fail: metrics.tool_calls_fail,
+            sidechain_events: metrics.sidechain_events,
             tool_usage: metrics.tool_usage.clone(),
             file_usage: metrics.file_usage.clone(),
             tool_arg_usage: metrics.tool_arg_usage.clone(),
@@ -1092,6 +1102,7 @@ impl GoMetrics {
             tool_calls_total: self.tool_calls_total,
             tool_calls_ok: self.tool_calls_ok,
             tool_calls_fail: self.tool_calls_fail,
+            sidechain_events: self.sidechain_events,
             tool_usage: self.tool_usage,
             file_usage: self.file_usage,
             tool_arg_usage: self.tool_arg_usage,
@@ -1310,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_eight_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1343,11 +1354,13 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version seven (cycle-1 rm-198): hermes tool outcome semantics
-        // changed (ok/fail now derive from the messages table instead of
-        // fabricating ok == tool_call_count), so v6 snapshots carry stale
-        // tool outcome splits and must regenerate.
-        assert_eq!(doc["schema_version"], 7);
+        // Version eight (cycle-3 rm-360): Claude Code sidechain
+        // (sub-agent) records are now excluded from parent aggregates
+        // and disclosed via sidechain_events, and claude attribution is
+        // per-message, so v7 snapshots carry sidechain-inflated totals
+        // and must regenerate. (Version seven, cycle-1 rm-198, moved hermes
+        // tool outcomes to the messages table.)
+        assert_eq!(doc["schema_version"], 8);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1359,15 +1372,15 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eight cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(6);
+        old["schema_version"] = serde_json::Value::from(7);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema six json"),
+            serde_json::to_vec(&old).expect("schema seven json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());

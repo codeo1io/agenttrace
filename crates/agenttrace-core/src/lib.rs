@@ -136,6 +136,11 @@ pub struct Event {
     pub tool_call_id: String,
     #[serde(default, rename = "is_error", alias = "IsError")]
     pub is_error: bool,
+    /// Claude Code sidechain (sub-agent) record: parsed, but excluded
+    /// from parent aggregates and disclosed via
+    /// `Metrics::sidechain_events` (rm-360).
+    #[serde(default, rename = "Sidechain", alias = "sidechain")]
+    pub sidechain: bool,
     #[serde(
         default,
         rename = "Usage",
@@ -351,6 +356,10 @@ pub struct Metrics {
     /// authoritative totals stored on the session row (SQLite sources).
     /// Zero unless stored totals were applied.
     pub stored_totals_delta: i64,
+    /// Events parsed from Claude Code sidechain (sub-agent) records.
+    /// Excluded from every aggregate above; disclosed so sub-agent
+    /// activity is never silently folded into parent totals (rm-360).
+    pub sidechain_events: usize,
     /// Parse lines lost inside this session's source file, by reason
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
     /// Empty for clean parses.
@@ -510,15 +519,20 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
     let mut model = "default".to_string();
     let mut cwd = String::new();
     for event in &events {
+        // Sidechain (sub-agent) events must not set the parent
+        // session's model or cwd (rm-360).
+        if event.sidechain {
+            continue;
+        }
         if !event.model_used.is_empty() && event.model_used != "unknown" {
             model = event.model_used.clone();
         }
         if cwd.is_empty() && !event.cwd.is_empty() {
             cwd = event.cwd.clone();
         }
-        if model != "default" && !cwd.is_empty() {
-            break;
-        }
+        // No early break: with per-message model propagation (rm-020
+        // rider) the final main-thread model is the closest single-model
+        // key for a mixed-model session, so attribution is last-wins.
     }
     let mut metrics = analyze(&events, &model);
     let display_name = session_display_name(name, &events);
@@ -683,7 +697,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         ..Metrics::default()
     };
     let has_meta_usage = events.iter().any(|event| {
-        matches!(event.role.as_str(), "session_meta" | "meta") && !event.usage.is_empty()
+        !event.sidechain
+            && matches!(event.role.as_str(), "session_meta" | "meta")
+            && !event.usage.is_empty()
     });
     metrics.provenance.tokens = if has_meta_usage {
         "reported_by_agent"
@@ -697,6 +713,13 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     metrics.provenance.pricing_source = pricing::pricing_source_for(model);
 
     for event in events {
+        // Claude Code sidechain (sub-agent) events are counted and
+        // skipped: they must not inflate any parent aggregate
+        // (rm-360).
+        if event.sidechain {
+            metrics.sidechain_events += 1;
+            continue;
+        }
         if metrics.source_tool.is_empty()
             && !event.source_tool.is_empty()
             && event.role != "meta"
@@ -818,7 +841,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         }
     }
 
-    metrics.events_total = events.len();
+    metrics.events_total = events.iter().filter(|event| !event.sidechain).count();
     metrics.timestamps.sort();
     if let (Some(first), Some(last)) = (metrics.timestamps.first(), metrics.timestamps.last()) {
         metrics.session_start = first.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -2529,5 +2552,36 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         }
+    }
+
+    #[test]
+    fn session_aggregates_exclude_sidechain_events() {
+        // rm-360 unit pin: sidechain events are counted and skipped by
+        // analyze() — they must not move any parent aggregate and must
+        // not contribute the session model or cwd.
+        let parent = Event {
+            role: "assistant".to_string(),
+            model_used: "claude-sonnet-4".to_string(),
+            cwd: "/work/probe".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "t1".to_string(),
+                name: "bash".to_string(),
+                args: String::new(),
+            }],
+            ..Event::default()
+        };
+        let side = Event {
+            role: "assistant".to_string(),
+            model_used: "claude-haiku-4".to_string(),
+            cwd: "/work/sidechain".to_string(),
+            sidechain: true,
+            ..Event::default()
+        };
+        let session = session_from_events("s", "s.jsonl", vec![parent, side]).expect("builds");
+        assert_eq!(session.metrics.assistant_turns, 1);
+        assert_eq!(session.metrics.events_total, 1);
+        assert_eq!(session.metrics.sidechain_events, 1);
+        assert_eq!(session.metrics.model_used, "claude-sonnet-4");
+        assert_eq!(session.cwd, "/work/probe");
     }
 }

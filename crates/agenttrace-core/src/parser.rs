@@ -2477,6 +2477,16 @@ fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage 
     .collect()
 }
 
+/// Parse Claude Code session JSONL (`~/.claude/projects/*/*.jsonl`).
+///
+/// Sub-agent transcripts live in the same file with
+/// `isSidechain: true` (claude-code #97857); every event emitted from
+/// such a record is tagged `Event::sidechain` so aggregation can
+/// exclude sub-agent usage from parent totals and disclose the count
+/// (rm-360). Model attribution is per-message: each assistant record
+/// re-reads `message.model` instead of keeping the first observed
+/// model, so mixed-model sessions attribute each usage event to the
+/// model that served it (rm-020 rider).
 fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -2485,7 +2495,12 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
-        if cwd.is_empty() {
+        let sidechain = obj
+            .get("isSidechain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let record_start = events.len();
+        if cwd.is_empty() && !sidechain {
             if let Some(body_cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty()) {
                 cwd = body_cwd.to_string();
                 events.push(Event {
@@ -2501,110 +2516,118 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             "user" => {
                 saw_claude = true;
                 let ts = string(obj.get("timestamp")).unwrap_or("").to_string();
-                let Some(message) = obj.get("message").and_then(Value::as_object) else {
-                    continue;
-                };
-                claude_user_content_events(message.get("content"), &ts, &model, &mut events);
+                if let Some(message) = obj.get("message").and_then(Value::as_object) {
+                    claude_user_content_events(message.get("content"), &ts, &model, &mut events);
+                }
             }
             "assistant" => {
                 saw_claude = true;
                 let ts = string(obj.get("timestamp")).unwrap_or("").to_string();
-                let Some(message) = obj.get("message").and_then(Value::as_object) else {
-                    continue;
-                };
-                if model == "unknown" {
+                if let Some(message) = obj.get("message").and_then(Value::as_object) {
+                    // Per-message model attribution (rm-020 rider): each
+                    // assistant record re-reads `message.model` so the
+                    // usage snapshot below is priced at the model that
+                    // served it, not the first model observed in the file.
                     if let Some(next_model) = string(message.get("model")).filter(|m| !m.is_empty())
                     {
                         model = next_model.to_string();
                     }
-                }
-                if let Some(usage_value) = message.get("usage") {
-                    let message_id = string(message.get("id")).unwrap_or("");
-                    let usage_key = if message_id.is_empty() {
-                        String::new()
-                    } else {
-                        serde_json::to_string(usage_value)
-                            .map(|usage| format!("{message_id}:{usage}"))
-                            .unwrap_or_default()
-                    };
-                    if usage_key.is_empty() || seen_usage_snapshots.insert(usage_key) {
-                        if let Some(usage) = usage_from_value(usage_value) {
-                            events.push(Event {
-                                role: "meta".to_string(),
+                    if let Some(usage_value) = message.get("usage") {
+                        let message_id = string(message.get("id")).unwrap_or("");
+                        let usage_key = if message_id.is_empty() {
+                            String::new()
+                        } else {
+                            serde_json::to_string(usage_value)
+                                .map(|usage| format!("{message_id}:{usage}"))
+                                .unwrap_or_default()
+                        };
+                        if usage_key.is_empty() || seen_usage_snapshots.insert(usage_key) {
+                            if let Some(usage) = usage_from_value(usage_value) {
+                                events.push(Event {
+                                    role: "meta".to_string(),
+                                    timestamp: ts.clone(),
+                                    usage,
+                                    model_used: model.clone(),
+                                    source_tool: "claude_code".to_string(),
+                                    ..Event::default()
+                                });
+                            }
+                        }
+                    }
+                    let mut assistant_parts = Vec::new();
+                    let mut reasoning_parts = Vec::new();
+                    let mut tool_calls = Vec::new();
+                    for block in message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let Some(block) = block.as_object() else {
+                            continue;
+                        };
+                        match string(block.get("type")).unwrap_or("") {
+                            "text" => {
+                                if let Some(text) =
+                                    string(block.get("text")).filter(|t| !t.is_empty())
+                                {
+                                    assistant_parts.push(text.to_string());
+                                }
+                            }
+                            "thinking" => {
+                                if let Some(text) =
+                                    string(block.get("thinking")).filter(|t| !t.is_empty())
+                                {
+                                    reasoning_parts.push(text.to_string());
+                                }
+                            }
+                            "tool_use" => tool_calls.push(ToolCall {
+                                id: string(block.get("id")).unwrap_or("").to_string(),
+                                name: string(block.get("name")).unwrap_or("").to_string(),
+                                args: jsonish(
+                                    block.get("input").or_else(|| block.get("arguments")),
+                                ),
+                            }),
+                            "tool_result" => events.push(Event {
+                                role: "tool".to_string(),
                                 timestamp: ts.clone(),
-                                usage,
-                                model_used: model.clone(),
+                                tool_call_id: string(block.get("tool_use_id"))
+                                    .unwrap_or("")
+                                    .to_string(),
+                                content: tool_result_content(block),
+                                is_error: block
+                                    .get("is_error")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
                                 source_tool: "claude_code".to_string(),
                                 ..Event::default()
-                            });
+                            }),
+                            _ => {}
                         }
                     }
-                }
-                let mut assistant_parts = Vec::new();
-                let mut reasoning_parts = Vec::new();
-                let mut tool_calls = Vec::new();
-                for block in message
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let Some(block) = block.as_object() else {
-                        continue;
-                    };
-                    match string(block.get("type")).unwrap_or("") {
-                        "text" => {
-                            if let Some(text) = string(block.get("text")).filter(|t| !t.is_empty())
-                            {
-                                assistant_parts.push(text.to_string());
-                            }
-                        }
-                        "thinking" => {
-                            if let Some(text) =
-                                string(block.get("thinking")).filter(|t| !t.is_empty())
-                            {
-                                reasoning_parts.push(text.to_string());
-                            }
-                        }
-                        "tool_use" => tool_calls.push(ToolCall {
-                            id: string(block.get("id")).unwrap_or("").to_string(),
-                            name: string(block.get("name")).unwrap_or("").to_string(),
-                            args: jsonish(block.get("input").or_else(|| block.get("arguments"))),
-                        }),
-                        "tool_result" => events.push(Event {
-                            role: "tool".to_string(),
-                            timestamp: ts.clone(),
-                            tool_call_id: string(block.get("tool_use_id"))
-                                .unwrap_or("")
-                                .to_string(),
-                            content: tool_result_content(block),
-                            is_error: block
-                                .get("is_error")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
+                    if !assistant_parts.is_empty()
+                        || !reasoning_parts.is_empty()
+                        || !tool_calls.is_empty()
+                    {
+                        events.push(Event {
+                            role: "assistant".to_string(),
+                            content: assistant_parts.join("\n"),
+                            reasoning: reasoning_parts.join("\n"),
+                            timestamp: ts,
+                            tool_calls,
+                            model_used: model.clone(),
                             source_tool: "claude_code".to_string(),
                             ..Event::default()
-                        }),
-                        _ => {}
+                        });
                     }
-                }
-                if !assistant_parts.is_empty()
-                    || !reasoning_parts.is_empty()
-                    || !tool_calls.is_empty()
-                {
-                    events.push(Event {
-                        role: "assistant".to_string(),
-                        content: assistant_parts.join("\n"),
-                        reasoning: reasoning_parts.join("\n"),
-                        timestamp: ts,
-                        tool_calls,
-                        model_used: model.clone(),
-                        source_tool: "claude_code".to_string(),
-                        ..Event::default()
-                    });
                 }
             }
             _ => {}
+        }
+        if sidechain {
+            for event in &mut events[record_start..] {
+                event.sidechain = true;
+            }
         }
     }
     if saw_claude {
@@ -5343,5 +5366,109 @@ mod tests {
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
+
+    #[test]
+    fn claude_code_sidechain_records_are_excluded_and_disclosed() {
+        // rm-360: Claude Code nests sub-agent transcripts in the parent
+        // session file with `isSidechain: true`. Pre-fix the sub-agent
+        // user/assistant records folded into the parent: turns 1 -> 2,
+        // tokens 15 -> 165, the haiku sub-agent usage priced at the
+        // parent's sonnet rate. Post-fix every event from a sidechain
+        // record is tagged, excluded from every parent aggregate, and
+        // disclosed via metrics.sidechain_events.
+        let user = |sidechain: bool| {
+            serde_json::json!({
+                "type": "user",
+                "uuid": if sidechain { "sub-u" } else { "main-u" },
+                "sessionId": "s1",
+                "timestamp": "2026-10-01T10:00:00Z",
+                "isSidechain": sidechain,
+                "cwd": if sidechain { "/work/subagent" } else { "/work/probe" },
+                "message": {
+                    "role": "user",
+                    "content": if sidechain { "sub task" } else { "main question" }
+                }
+            })
+        };
+        let assistant = |model: &str, input: i64, output: i64, sidechain: bool| {
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": if sidechain { "sub-a" } else { "main-a" },
+                "sessionId": "s1",
+                "timestamp": "2026-10-01T10:00:05Z",
+                "isSidechain": sidechain,
+                "message": {
+                    "id": if sidechain { "msg-sub" } else { "msg-main" },
+                    "role": "assistant",
+                    "model": model,
+                    "content": [{"type": "text", "text": "answer"}],
+                    "usage": {"input_tokens": input, "output_tokens": output}
+                }
+            })
+        };
+        let raw = [
+            user(false),
+            assistant("claude-sonnet-4", 10, 5, false),
+            user(true),
+            assistant("claude-haiku-4", 100, 50, true),
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let session = parse_raw_session("sess", "sess.jsonl", &raw).expect("parses");
+        // Parent aggregates keep only the main thread.
+        assert_eq!(session.metrics.assistant_turns, 1);
+        assert_eq!(session.metrics.tokens_input, 10);
+        assert_eq!(session.metrics.tokens_output, 5);
+        assert_eq!(session.metrics.model_used, "claude-sonnet-4");
+        assert_eq!(session.cwd, "/work/probe");
+        // ... and the excluded activity is disclosed, not dropped.
+        // Three events come from sidechain records: the sub-agent user
+        // record, its usage meta event, and its assistant turn.
+        assert_eq!(session.metrics.sidechain_events, 3);
+    }
+
+    #[test]
+    fn claude_code_model_attribution_is_per_message() {
+        // rm-020 rider: the parser kept the FIRST observed
+        // `message.model` for every later usage event, so a session that
+        // switched sonnet -> haiku priced all of its tokens at sonnet
+        // (PoC: 165 tok priced at sonnet instead of a haiku-priced final
+        // turn). Post-fix every assistant record re-reads message.model,
+        // so the session attributes to the model that served the last
+        // turn.
+        let turn = |model: &str, input: i64, output: i64, id: &str, ts: &str| {
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": id,
+                "sessionId": "s1",
+                "timestamp": ts,
+                "cwd": "/work/probe",
+                "message": {
+                    "id": id,
+                    "role": "assistant",
+                    "model": model,
+                    "content": [{"type": "text", "text": "answer"}],
+                    "usage": {"input_tokens": input, "output_tokens": output}
+                }
+            })
+        };
+        let raw = [
+            turn("claude-sonnet-4", 10, 5, "msg-1", "2026-10-01T10:00:00Z"),
+            turn("claude-haiku-4", 100, 50, "msg-2", "2026-10-01T10:01:00Z"),
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let session = parse_raw_session("sess", "sess.jsonl", &raw).expect("parses");
+        assert_eq!(session.metrics.tokens_input, 110);
+        assert_eq!(session.metrics.tokens_output, 55);
+        // Last-wins session attribution: haiku served the final turn.
+        // Pre-fix this stayed "claude-sonnet-4".
+        assert_eq!(session.metrics.model_used, "claude-haiku-4");
+        assert_eq!(session.metrics.sidechain_events, 0);
     }
 }

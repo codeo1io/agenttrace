@@ -667,12 +667,14 @@ fn sqlite_role_counts(
 /// table. `results` counts observed `role='tool'` rows; `failures`
 /// counts the rows hermes renders as tool errors. The hermes executor
 /// writes a failing result as `§<id>§ Error executing tool '<name>':
-/// <reason>` (an untagged leading phrase is tolerated for older
-/// renders) — verified against a live state.db where the marker matches
+/// <reason>` — verified against a live state.db where the marker matches
 /// 317 tool rows and zero rows of any other role, while
 /// `messages.effect_disposition` stays NULL for ~all rows and cannot
 /// serve as the outcome signal. Sessions row `tool_call_count` counts
-/// calls, never outcomes (rm-198).
+/// calls, never outcomes (rm-198). Only the tagged `§<id>§` form counts
+/// as a failure: a successful output can begin with the bare phrase
+/// (a transcript quoting an older error), so the untagged leading
+/// prefix would double-count successes as failures (rm-361).
 #[derive(Debug, Default)]
 struct HermesToolOutcomes {
     results: usize,
@@ -684,8 +686,7 @@ fn hermes_tool_outcome_counts(db: &Connection) -> HashMap<String, HermesToolOutc
         return HashMap::new();
     }
     let sql = "select session_id, count(*), \
-               sum(case when (content like '§_%§ Error executing tool %' \
-                            or content like 'Error executing tool %') \
+               sum(case when content like '§_%§ Error executing tool %' \
                         then 1 else 0 end) \
                from messages where role = 'tool' group by session_id";
     let Ok(mut stmt) = db.prepare(sql) else {
@@ -1055,6 +1056,83 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("tool failure rate")),
             "--max-tool-fail-rate must trip on hermes-sourced failures: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_tool_failures_require_the_tagged_marker() {
+        // rm-361: the untagged `content like 'Error executing tool %'`
+        // arm matched ANY tool row beginning with the phrase — including
+        // successful outputs quoting an older transcript — so two clean
+        // rows counted as failures (66.7% fail rate) and tripped
+        // --max-tool-fail-rate on a session with zero real failures.
+        // Only the tagged `§<id>§ Error executing tool ...` render
+        // counts as a failure now.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm361-marker-{}-{}",
+            std::process::id(),
+            3610
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = root.join("state.db");
+        let db = Connection::open(&path).expect("open fixture db");
+        db.execute_batch(
+            r#"
+            create table sessions (
+                id text primary key,
+                model text,
+                started_at real,
+                ended_at real,
+                message_count integer,
+                tool_call_count integer,
+                input_tokens integer,
+                output_tokens integer,
+                cache_read_tokens integer,
+                cache_write_tokens integer,
+                cwd text
+            );
+            create table messages (
+                id integer primary key,
+                session_id text,
+                role text,
+                content text
+            );
+            insert into sessions values
+                ('s1', 'claude-sonnet-4', 1700000000.0, 1700000600.0, 5, 3, 10, 20, 0, 0, '/work/fp');
+            insert into messages (session_id, role, content) values
+                ('s1', 'user', 'echo the old error verbatim'),
+                ('s1', 'assistant', 'running'),
+                ('s1', 'tool', 'Error executing tool ''bash'': echoed from last week (this call succeeded)'),
+                ('s1', 'tool', 'Error executing tool ''web_search'': quoted line the user pasted (succeeded)'),
+                ('s1', 'tool', '§5§ {"output": "clean"}');
+            "#,
+        )
+        .expect("seed fixture");
+        let sessions = query_hermes_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(sessions.len(), 1);
+        let s1 = &sessions[0];
+        assert_eq!(s1.metrics.tool_results, 3, "observed tool result rows");
+        assert_eq!(
+            s1.metrics.tool_calls_fail, 0,
+            "an untagged leading phrase alone must not count as a failure"
+        );
+        assert_eq!(s1.metrics.tool_calls_ok, 3);
+        // The gate must no longer trip on a zero-real-failure session:
+        // pre-fix the rate here was 66.7%.
+        let rate = crate::tool_fail_rate(&sessions);
+        assert!((rate - 0.0).abs() < 1e-9, "tool_fail_rate was {rate}");
+        let failures = crate::evaluate_overview_gate(
+            &crate::Overview::default(),
+            &sessions,
+            0,
+            false,
+            Some(50.0),
+        );
+        assert!(
+            failures.is_empty(),
+            "gate must not trip on quoted-error false positives: {failures:?}"
         );
     }
 }

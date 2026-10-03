@@ -143,6 +143,12 @@ pub struct DataHealth {
     /// or overflowing pricing inputs). Their costs render as null in
     /// reports; the count keeps the corruption visible (pass-8 F8-5).
     pub non_finite_costs: usize,
+    /// Events parsed from Claude Code sidechain (sub-agent) records,
+    /// summed across parsed sessions. Each session's sidechain events
+    /// are excluded from its parent aggregates; this counter keeps the
+    /// excluded activity visible instead of silently dropping it
+    /// (rm-360).
+    pub sidechain_events: usize,
 }
 
 pub fn session_capability(session: &Session) -> &'static str {
@@ -428,6 +434,9 @@ fn data_health_from_parts(
     let stored_totals_delta_tokens = sessions.iter().fold(0i64, |acc, s| {
         acc.saturating_add(s.metrics.stored_totals_delta.saturating_abs())
     });
+    let sidechain_events = sessions.iter().fold(0usize, |acc, s| {
+        acc.saturating_add(s.metrics.sidechain_events)
+    });
     let unknown_time_sessions = sessions
         .iter()
         .filter(|s| parse_ts(&s.metrics.session_start).is_none())
@@ -485,6 +494,7 @@ fn data_health_from_parts(
         unknown_time_sessions,
         line_skips,
         non_finite_costs,
+        sidechain_events,
         with_duration: sessions
             .iter()
             .filter(|s| s.metrics.duration_sec > 0.0)
@@ -565,5 +575,18 @@ mod tests {
         let missing = resolve_project(&session_at("", "/nowhere/projects/-gone-dir/s.jsonl"));
         assert_eq!(missing.display_name, "unknown");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn data_health_discloses_sidechain_events() {
+        // rm-360: the overview keeps sub-agent activity visible instead
+        // of silently dropping it — each session's excluded count sums
+        // into the fleet-wide disclosure.
+        let mut a = session_at("/a", "/a.jsonl");
+        a.metrics.sidechain_events = 2;
+        let mut b = session_at("/b", "/b.jsonl");
+        b.metrics.sidechain_events = 3;
+        let health = data_health(&[a, b], 2, 0);
+        assert_eq!(health.sidechain_events, 5);
     }
 }
