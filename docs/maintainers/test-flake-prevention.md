@@ -125,3 +125,30 @@ incomplete-hermetic-boundary class as both Rule 6s, entered through fixture
 placement rather than env read-sets or absence-assertions. Numbered Rule 7
 campaign-locally; sibling lanes hold their own uncommitted rules
 (2962e401's Rule 6) — renumber at fold.
+
+## Rule 8 — budget or isolate host-state-reading commands in gates (2026-10-03, cycle-2, run 0d487394)
+
+`agenttrace --doctor -f json` (and any lane that walks the session
+store) stalls past two minutes when `HOME` points at the grown real store
+(~/.claude ≈253 MB + sibling roots on this delegate host) while
+completing rc0 in under 30 s under an isolated `HOME`. This is a host
+condition, not a regression: cycle-2 re-proved it at BASE by stashing the
+batch and rebuilding 5ef66c0 — the base binary also times out (45 s, rc124
+under `timeout`), so a red here indicts the environment, never the batch.
+Same family as Rule 1's TMPDIR shadow (ambient host state leaking through
+an un-isolated variable) and kin to Rule 6's host-state pinning.
+
+Recipe (recorded in the cycle's full-suite logs): every gate that invokes
+`--doctor` (`scripts/ci/check-docs-commands.sh` step 2,
+`scripts/ci/check-rust-release-local.sh`) runs under a scratch `HOME` +
+`TMPDIR`, a pinned `AGENTTRACE_BIN` (the worktree binary under test), and
+a redirected `AGENTTRACE_CI_OUT`; gates needing the real CLI/TUI fixtures
+set `AGENTTRACE_REAL_CLI_DIR` / `AGENTTRACE_TUI_REAL_DIR` — an isolated
+`HOME` hides the default fixture paths, which cost the cycle's assess
+sweep a false-red rerun. Gate budgets set accordingly (>120 s or
+isolated). Numbered Rule 7 campaign-locally by run 0d487394
+(`docs/stewardship/2026-10-03-cycle2-compounding.md` retains the
+campaign-local numeral); renumbered to Rule 8 at its integration merge,
+where Rule 7 was already taken by run cf755698's fixture-root rule above —
+the cross-campaign collision convention both rules record.
+

@@ -59,6 +59,11 @@ pub struct PricingCatalog {
     pub entries: BTreeMap<String, Price>,
     pub aliases: BTreeMap<String, String>,
     pub source: String,
+    /// Catalog key -> provider label ("anthropic", "openrouter", ...)
+    /// preserved from the same LiteLLM rows the rates came from
+    /// (rm-245). Read-only attribution data: provenance and freshness
+    /// semantics stay with pricing_source_for and are untouched here.
+    pub providers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +187,28 @@ pub fn pricing_source_for(model: &str) -> String {
     pricing_source_for_catalog(model, catalog, pricing_override_models())
 }
 
+/// Model-vendor attribution (rm-245): the provider label of the catalog
+/// row that would price this model. Resolution mirrors the rate lookup
+/// exactly - alias first, then variant match - so a provider is claimed
+/// only where a price is claimed. Returns None when the catalog does
+/// not know the model; callers must bucket those explicitly (as
+/// "unknown") instead of dropping them.
+pub fn provider_for(model: &str) -> Option<String> {
+    let catalog = pricing_catalog();
+    provider_for_in(model, catalog)
+}
+
+fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
+    let normalized = normalize_model(model);
+    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    let key = matching_catalog_key(&resolved, &catalog.entries)?;
+    catalog
+        .providers
+        .get(&key)
+        .cloned()
+        .filter(|provider| !provider.trim().is_empty())
+}
+
 fn pricing_source_for_catalog(
     model: &str,
     catalog: &PricingCatalog,
@@ -206,15 +233,16 @@ pub fn pricing_cache_path() -> PathBuf {
 }
 
 pub fn update_pricing() -> anyhow::Result<usize> {
-    let (raw, entries) = download_pricing(Duration::from_secs(30))?;
+    let (raw, converted) = download_pricing(Duration::from_secs(30))?;
     write_pricing_cache(&raw)?;
-    let count = entries.len();
+    let count = converted.entries.len();
     // Publish the fresh catalog to later pricing_catalog() consumers in
     // this process (a no-op when the singleton was already initialized).
     let mut catalog = PricingCatalog {
-        entries,
+        entries: converted.entries,
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
+        providers: converted.providers,
     };
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
@@ -329,18 +357,20 @@ fn load_catalog_for_current_env() -> PricingCatalog {
 }
 
 fn fallback_catalog() -> PricingCatalog {
-    let entries = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
-    if entries.is_empty() {
+    let converted = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+    if converted.entries.is_empty() {
         return PricingCatalog {
             entries: builtin_pricing(),
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
+            providers: BTreeMap::new(),
         };
     }
     PricingCatalog {
-        entries,
+        entries: converted.entries,
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
+        providers: converted.providers,
     }
 }
 
@@ -364,14 +394,15 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         .map(|age| age > CACHE_MAX_AGE)
         .unwrap_or(false);
     let raw = std::fs::read(&path).ok()?;
-    let entries = convert_litellm(&raw);
-    if entries.is_empty() {
+    let converted = convert_litellm(&raw);
+    if converted.entries.is_empty() {
         return None;
     }
     Some(PricingCatalog {
-        entries,
+        entries: converted.entries,
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
+        providers: converted.providers,
     })
 }
 
@@ -384,18 +415,18 @@ fn pricing_override_models() -> &'static BTreeSet<String> {
 /// redirected or hostile endpoint can stream into memory.
 const PRICING_DOWNLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-fn download_pricing(timeout: Duration) -> anyhow::Result<(String, BTreeMap<String, Price>)> {
+fn download_pricing(timeout: Duration) -> anyhow::Result<(String, ConvertedCatalog)> {
     let response = ureq::get(PRICING_URL)
         .timeout(timeout)
         .call()
         .map_err(|err| anyhow!("download failed: {err}"))?;
     let raw_bytes = read_body_capped(response.into_reader(), PRICING_DOWNLOAD_MAX_BYTES)?;
     let raw = String::from_utf8(raw_bytes).context("pricing catalog is not valid UTF-8")?;
-    let entries = convert_litellm(raw.as_bytes());
-    if entries.is_empty() {
+    let converted = convert_litellm(raw.as_bytes());
+    if converted.entries.is_empty() {
         return Err(anyhow!("no chat models found in downloaded data"));
     }
-    Ok((raw, entries))
+    Ok((raw, converted))
 }
 
 fn read_body_capped(reader: impl Read, cap: u64) -> anyhow::Result<Vec<u8>> {
@@ -579,11 +610,24 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
     current
 }
 
-fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
+/// Catalog key -> price entries plus the model-key -> provider-label
+/// mapping harvested from the same source rows (rm-245). The provider
+/// label travels with the winning rate entry - same priority
+/// selection, same key - so `provider_for` and `lookup_price` can never
+/// disagree about which catalog row served a model.
+struct ConvertedCatalog {
+    entries: BTreeMap<String, Price>,
+    providers: BTreeMap<String, String>,
+}
+
+fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
     let Ok(Value::Object(source)) = serde_json::from_slice::<Value>(raw) else {
-        return BTreeMap::new();
+        return ConvertedCatalog {
+            entries: BTreeMap::new(),
+            providers: BTreeMap::new(),
+        };
     };
-    let mut selected: BTreeMap<String, (i32, Price)> = BTreeMap::new();
+    let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -615,16 +659,19 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
         }
         let priority = provider_priority(&model.provider);
         match selected.get(&normalized) {
-            Some((existing, _)) if *existing >= priority => {}
+            Some((existing, _, _)) if *existing >= priority => {}
             _ => {
-                selected.insert(normalized, (priority, price));
+                selected.insert(normalized, (priority, price, model.provider));
             }
         }
     }
-    selected
-        .into_iter()
-        .map(|(name, (_, price))| (name, price))
-        .collect()
+    let mut entries = BTreeMap::new();
+    let mut providers = BTreeMap::new();
+    for (name, (_, price, provider)) in selected {
+        providers.insert(name.clone(), provider);
+        entries.insert(name, price);
+    }
+    ConvertedCatalog { entries, providers }
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -1542,6 +1589,7 @@ mod tests {
             entries: BTreeMap::new(),
             aliases: BTreeMap::new(),
             source: source.to_string(),
+            providers: BTreeMap::new(),
         };
         assert_eq!(
             catalog_source(&catalog("cache")),
@@ -1592,6 +1640,7 @@ mod tests {
             ]),
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
+            providers: BTreeMap::new(),
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
         assert!(
@@ -1636,12 +1685,60 @@ mod tests {
                 .as_slice(),
         );
         assert!(
-            catalog.contains_key("finite-model"),
+            catalog.entries.contains_key("finite-model"),
             "finite entries survive the conversion"
         );
         assert!(
-            !catalog.contains_key("poisoned-model"),
+            !catalog.entries.contains_key("poisoned-model"),
             "entries whose scaled price is non-finite are dropped"
+        );
+    }
+
+    #[test]
+    fn convert_litellm_preserves_the_provider_per_winning_entry() {
+        // rm-245: provider attribution must ride with the winning rate
+        // entry, not be re-derived from name prefixes. Whatever key
+        // normalization produces, the provider map must cover exactly
+        // the priced entries and carry each winning row's label.
+        let fixture = serde_json::json!({
+            "finite-model": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015,
+                "mode": "chat",
+                "litellm_provider": "finite"
+            },
+            "vendor-x/model-y": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015,
+                "mode": "chat",
+                "litellm_provider": "vendor-x"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&fixture)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        let entry_keys: Vec<&String> = converted.entries.keys().collect();
+        let provider_keys: Vec<&String> = converted.providers.keys().collect();
+        assert_eq!(
+            entry_keys, provider_keys,
+            "price keys and provider keys must cover the same catalog rows"
+        );
+        assert_eq!(
+            converted.providers.get("finite-model").map(String::as_str),
+            Some("finite"),
+            "provider label must round-trip with its entry"
+        );
+        let vendored_key = converted
+            .providers
+            .keys()
+            .find(|key| key.contains("model-y"))
+            .expect("vendored entry survives conversion");
+        assert_eq!(
+            converted.providers.get(vendored_key).map(String::as_str),
+            Some("vendor-x"),
+            "provider label must round-trip with its entry"
         );
     }
 }

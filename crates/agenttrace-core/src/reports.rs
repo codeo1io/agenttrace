@@ -3,7 +3,7 @@ use crate::{
     delivery_evidence, fmt_duration, format_cost, format_count, format_tokens,
     highest_authority_for_metrics, is_high_authority_category, mcp_governance, recommendations,
     report_scope, round4, sanitize_line_segment, sorted_keys, sorted_set, total_tokens, Anomaly,
-    GroupOverview, Overview, Session, ToolCall, VERSION,
+    GroupOverview, Overview, Session, TaskTypeOverview, ToolCall, VERSION,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -480,6 +480,20 @@ pub fn report_overview_json_with_health(
     let agents = group_items(&overview.by_agent, true);
     let models = group_items(&overview.by_model, false);
     let projects = group_items(&overview.by_project, false);
+    let providers = group_items(&overview.by_provider, false);
+    let task_types = task_type_items(&overview.by_task_type, overview.total_cost);
+    let top_cost_drivers = top_cost_driver_rows(&ordered, 3)
+        .into_iter()
+        .map(|row| {
+            json!({
+                "session": row.session,
+                "cost": round4(row.cost),
+                "share_pct": (row.share_pct * 10.0).round() / 10.0,
+                "possible_driver": row.note,
+            })
+        })
+        .map(strip_nulls)
+        .collect::<Vec<_>>();
     let recent_sessions: Vec<Value> = ordered
         .iter()
         .take(10)
@@ -521,6 +535,9 @@ pub fn report_overview_json_with_health(
         "by_agent": agents,
         "by_model": models,
         "by_project": projects,
+        "by_provider": providers,
+        "by_task_type": task_types,
+        "top_cost_drivers": top_cost_drivers,
         "recent_sessions": recent_sessions,
         "incident_timelines": incident_timelines(&ordered),
         "anomalies": anomalies,
@@ -883,6 +900,27 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         out.push('\n');
     }
 
+    // rm-245: ranked top-cost sessions beside the cost-audit evidence -
+    // what actually moved the bill, with each session's share of the
+    // total and the strict driver note when one exists.
+    let drivers = top_cost_driver_rows(&ordered, 3);
+    if !drivers.is_empty() {
+        out.push_str("  ── Top cost drivers (share of total) ──\n");
+        for row in drivers {
+            out.push_str(&format!(
+                "    {:<30} {:>8} {:>5.1}%{}\n",
+                text_cell(&row.session, 30),
+                format_cost(row.cost),
+                row.share_pct,
+                row.note
+                    .as_deref()
+                    .map(|note| format!("  {note}"))
+                    .unwrap_or_default()
+            ));
+        }
+        out.push('\n');
+    }
+
     out.push_str("  ── By Agent ──\n");
     for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
@@ -904,6 +942,36 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
             model,
             format_count(group.sessions),
             format_cost(group.cost)
+        ));
+    }
+    out.push('\n');
+
+    // rm-245: vendor and task-type dimensions beside by-model. Providers
+    // come from the pricing catalog row that prices each model;
+    // unresolvable models land in the explicit "unknown" bucket.
+    out.push_str("  ── By Provider ──\n");
+    for (provider, group) in overview_text_model_groups(&overview.by_provider)
+        .into_iter()
+        .take(8)
+    {
+        out.push_str(&format!(
+            "    {:<25} {:>4} Sessions  {:>8}\n",
+            provider,
+            format_count(group.sessions),
+            format_cost(group.cost)
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("  ── By Task Type ──\n");
+    for (task_type, group) in &overview.by_task_type {
+        out.push_str(&format!(
+            "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
+            task_type,
+            format_count(group.sessions),
+            format_cost(group.cost),
+            format_tokens(group.tokens_input),
+            format_tokens(group.tokens_output)
         ));
     }
     out.push('\n');
@@ -1041,6 +1109,48 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         ));
     }
 
+    // rm-245: vendor and task-type dimensions beside the by-agent view.
+    out.push_str("\n## By provider\n\n");
+    out.push_str("| Provider | Sessions | Cost |\n|---|---:|---:|\n");
+    for (provider, group) in sorted_model_groups(&overview.by_provider) {
+        out.push_str(&format!(
+            "| {} | {} | {} |\n",
+            markdown_cell(&provider),
+            format_count(group.sessions),
+            format_cost(group.cost)
+        ));
+    }
+
+    out.push_str("\n## By task type\n\n");
+    out.push_str(
+        "| Task type | Sessions | Tokens in | Tokens out | Cost |\n|---|---:|---:|---:|---:|\n",
+    );
+    for (task_type, group) in &overview.by_task_type {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            markdown_cell(task_type),
+            format_count(group.sessions),
+            format_tokens(group.tokens_input),
+            format_tokens(group.tokens_output),
+            format_cost(group.cost)
+        ));
+    }
+
+    let drivers = top_cost_driver_rows(&ordered, 3);
+    if !drivers.is_empty() {
+        out.push_str("\n## Top cost drivers\n\n");
+        out.push_str("| Session | Cost | Share | Possible driver |\n|---|---:|---:|---|\n");
+        for row in drivers {
+            out.push_str(&format!(
+                "| {} | {} | {:.1}% | {} |\n",
+                markdown_cell(&row.session),
+                format_cost(row.cost),
+                row.share_pct,
+                markdown_cell(row.note.as_deref().unwrap_or(""))
+            ));
+        }
+    }
+
     out.push_str("\n## Recent sessions\n\n");
     out.push_str(
         "| Session | Source | Model | Health | Cost | Anomalies |\n|---|---|---|---:|---:|---:|\n",
@@ -1081,6 +1191,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     let trend = analyze_health_trend(&ordered);
     let agents = sorted_agent_groups(&overview.by_agent);
     let models = sorted_model_groups(&overview.by_model);
+    let providers = sorted_model_groups(&overview.by_provider);
 
     let mut out = String::new();
     let mut w = |line: String| {
@@ -1245,6 +1356,46 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
         ));
     }
     w("</tbody></table></section>".to_string());
+
+    // rm-245: vendor and task-type dimensions beside by-model.
+    w("<section><h2>By provider</h2><table><thead><tr><th>Provider</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
+    for (provider, group) in providers.iter().take(12) {
+        w(format!(
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            html_escape(provider),
+            format_count(group.sessions),
+            format_cost(group.cost)
+        ));
+    }
+    w("</tbody></table></section>".to_string());
+
+    w("<section><h2>By task type</h2><table><thead><tr><th>Task type</th><th class=\"num\">Sessions</th><th class=\"num\">Tokens in</th><th class=\"num\">Tokens out</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
+    for (task_type, group) in &overview.by_task_type {
+        w(format!(
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            html_escape(task_type),
+            format_count(group.sessions),
+            format_tokens(group.tokens_input),
+            format_tokens(group.tokens_output),
+            format_cost(group.cost)
+        ));
+    }
+    w("</tbody></table></section>".to_string());
+
+    let drivers = top_cost_driver_rows(&ordered, 3);
+    if !drivers.is_empty() {
+        w("<section><h2>Top cost drivers</h2><table><thead><tr><th>Session</th><th class=\"num\">Cost</th><th class=\"num\">Share</th><th>Possible driver</th></tr></thead><tbody>".to_string());
+        for row in drivers {
+            w(format!(
+                "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{:.1}%</td><td>{}</td></tr>",
+                html_escape(&row.session),
+                format_cost(row.cost),
+                row.share_pct,
+                html_escape(row.note.as_deref().unwrap_or(""))
+            ));
+        }
+        w("</tbody></table></section>".to_string());
+    }
 
     w("<section><h2>Recent anomalies</h2>".to_string());
     if overview.anomalies_top.is_empty() {
@@ -1693,6 +1844,82 @@ fn group_items(groups: &BTreeMap<String, GroupOverview>, agent_display: bool) ->
         });
     }
     items
+}
+
+/// rm-245: per-task-type rollup entries. Keys are the fixed taxonomy
+/// (coding / debugging / planning) produced by `infer_task_type`;
+/// tokens ride along because "what kind of work burned the tokens" is
+/// the question this dimension answers.
+fn task_type_items(groups: &BTreeMap<String, TaskTypeOverview>, total_cost: f64) -> Vec<Value> {
+    let mut items: Vec<_> = groups
+        .iter()
+        .map(|(task_type, group)| {
+            json!({
+                "task_type": task_type,
+                "sessions": group.sessions,
+                "tokens": {
+                    "input": group.tokens_input.max(0),
+                    "output": group.tokens_output.max(0),
+                },
+                "cost": round4(group.cost),
+                "share_pct": if total_cost > 0.0 {
+                    (group.cost / total_cost * 1000.0).round() / 10.0
+                } else {
+                    0.0
+                },
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        number_value(b, "cost")
+            .partial_cmp(&number_value(a, "cost"))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| string_value(a, "task_type").cmp(&string_value(b, "task_type")))
+    });
+    items
+}
+
+/// rm-245: ranked top-cost sessions with their share of total spend and
+/// the strict possible-driver note when one exists. Deterministic:
+/// cost desc, then session name. Total comes from the same session set,
+/// so shares always sum to 100% over the full ranking (the rendered
+/// list is capped, the denominator is not).
+struct CostDriverRow {
+    session: String,
+    cost: f64,
+    share_pct: f64,
+    note: Option<String>,
+}
+
+fn top_cost_driver_rows(sessions: &[Session], limit: usize) -> Vec<CostDriverRow> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let total: f64 = sessions
+        .iter()
+        .map(|session| session.metrics.cost_estimated)
+        .sum();
+    let mut ranked: Vec<&Session> = sessions.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.metrics
+            .cost_estimated
+            .total_cmp(&a.metrics.cost_estimated)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|session| CostDriverRow {
+            session: session.name.clone(),
+            cost: session.metrics.cost_estimated,
+            share_pct: if total > 0.0 {
+                session.metrics.cost_estimated / total * 100.0
+            } else {
+                0.0
+            },
+            note: possible_cost_driver_note_strict(session),
+        })
+        .collect()
 }
 
 fn surfaces(sessions: &[Session]) -> Value {

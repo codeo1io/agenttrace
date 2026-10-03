@@ -200,6 +200,7 @@ fn run() -> anyhow::Result<()> {
     {
         bail!("markdown and html formats require --overview or a governance report action");
     }
+    validate_range_applicability(&args)?;
 
     let language = report_language(&args.lang)?;
 
@@ -1275,6 +1276,22 @@ fn has_session_action(args: &Args) -> bool {
             .unwrap_or(false)
 }
 
+/// rm-244: `--range` only filters session reports. Every action that
+/// consumes it is covered by `has_session_action`; on the interactive
+/// and utility paths (`--demo` TUI, plain TUI, `--clear-cache`,
+/// `--doctor`, `--list-models`, ...) the flag used to be accepted and
+/// silently ignored, which looks exactly like a working filter. Reject
+/// the combination loudly, in the same style as the format
+/// applicability guard in `main`.
+fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
+    if args.range != "all" && !has_session_action(args) {
+        bail!(
+            "--range requires a session report action (for example --overview, --sessions, --diagnostics, --waste, --search QUERY, --compare, or --audit); the interactive and utility views ignore it"
+        );
+    }
+    Ok(())
+}
+
 fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
     // --fetch only means something for the upstream command; staying
     // silent about it elsewhere would let a typo'd invocation report
@@ -1821,5 +1838,44 @@ mod tests {
             r#"{{"role":"assistant","content":"done","timestamp":"2026-05-02T10:01:{idx:02}Z","ModelUsed":"gpt-4.1"}}"#
         )
         .expect("write compare assistant");
+    }
+
+    #[test]
+    fn range_without_a_consumer_is_rejected() {
+        // rm-244: `agenttrace --range 30d` used to fall through to the
+        // TUI with the filter silently ignored. It must exit rc!=0,
+        // name the flag, and suggest composable actions.
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.range = "30d".to_string();
+        let err = validate_range_applicability(&args)
+            .expect_err("must reject --range without a consumer");
+        let message = err.to_string();
+        assert!(
+            message.contains("--range"),
+            "error must name the flag: {message}"
+        );
+        assert!(
+            message.contains("--overview"),
+            "error must suggest a report action: {message}"
+        );
+    }
+
+    #[test]
+    fn range_default_and_range_with_consumer_pass_the_guard() {
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.range = "all".to_string();
+        assert!(validate_range_applicability(&args).is_ok());
+
+        let mut args = compare_args(None);
+        args.range = "7d".to_string();
+        assert!(validate_range_applicability(&args).is_ok());
+
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.overview = true;
+        args.range = "7d".to_string();
+        assert!(validate_range_applicability(&args).is_ok());
     }
 }
