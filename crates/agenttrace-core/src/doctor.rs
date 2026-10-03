@@ -16,6 +16,9 @@ pub struct DoctorReport {
     pub cache_entries: usize,
     pub cache_dirs: usize,
     pub cached_valid: usize,
+    /// rm-230 disclosure: outcomes of reversing `-`-encoded agent project
+    /// directory names for scanned sessions without a `cwd`.
+    pub project_decode: DoctorProjectDecodeReport,
     /// On-disk size of `sessions.json`, zero when absent.
     pub cache_size_bytes: u64,
     /// The hard bounds `save_session_cache` enforces before serializing
@@ -109,6 +112,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     } else {
         "auto-discovery"
     };
+    let mut project_decode = DoctorProjectDecodeReport::default();
+    let directories = doctor_directories(dir, &files, &sqlite_sessions, &mut project_decode);
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -126,7 +131,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         ),
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
-        directories: doctor_directories(dir, &files, &sqlite_sessions),
+        project_decode,
+        directories,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
             "LiteLLM snapshot {} (bundled, {} models, {} days old)",
@@ -138,6 +144,55 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
     report
+}
+
+/// Aggregate of [`crate::insights::project_decode_status`] over the scanned
+/// corpus (rm-230): how many `-`-encoded project directories resolved
+/// cleanly, how many were attributed by the deterministic longest-run rule
+/// with a shadowed alternative, and how many fell back to "unknown".
+/// `--doctor` prints this so host-state-sensitive attribution is visible
+/// instead of silent.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DoctorProjectDecodeReport {
+    pub resolved: usize,
+    pub ambiguous: usize,
+    pub unresolved: usize,
+    /// Up to six sanitized examples (ambiguous and unresolved interleaved,
+    /// in scan order).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<String>,
+}
+
+fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session) {
+    use crate::insights::ProjectDecodeStatus;
+    match crate::insights::project_decode_status(session) {
+        ProjectDecodeStatus::NotConsulted => {}
+        ProjectDecodeStatus::Resolved { .. } => out.resolved += 1,
+        ProjectDecodeStatus::Ambiguous { path, shadowed } => {
+            out.ambiguous += 1;
+            if out.samples.len() < 6 {
+                let shadowed = shadowed
+                    .iter()
+                    .map(|alt| crate::statusline::sanitize_line_segment(alt))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.samples.push(format!(
+                    "ambiguous: {} attributed via the longest-verified-path rule; verified alternatives shadowed: {}",
+                    crate::statusline::sanitize_line_segment(&path),
+                    shadowed
+                ));
+            }
+        }
+        ProjectDecodeStatus::Unresolved { encoded } => {
+            out.unresolved += 1;
+            if out.samples.len() < 6 {
+                out.samples.push(format!(
+                    "unresolved: projects/{} has no verified decode; session attributed to `unknown`",
+                    crate::statusline::sanitize_line_segment(&encoded)
+                ));
+            }
+        }
+    }
 }
 
 fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
@@ -181,11 +236,18 @@ fn doctor_directories(
     dir: Option<&Path>,
     files: &[PathBuf],
     sqlite_sessions: &[Session],
+    project_decode: &mut DoctorProjectDecodeReport,
 ) -> Vec<DoctorDirReport> {
     let mut cache = load_session_cache();
     if let Some(dir) = dir {
         let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        return vec![doctor_dir_report("custom", &abs, files, &mut cache)];
+        return vec![doctor_dir_report(
+            "custom",
+            &abs,
+            files,
+            &mut cache,
+            project_decode,
+        )];
     }
 
     let mut count_by_root = BTreeMap::new();
@@ -212,6 +274,7 @@ fn doctor_directories(
             &candidate.path,
             &matching,
             &mut cache,
+            project_decode,
         ));
     }
     dirs.extend(doctor_sqlite_directories(sqlite_sessions));
@@ -223,18 +286,29 @@ fn doctor_dir_report(
     path: &Path,
     files: &[PathBuf],
     cache: &mut crate::SessionCache,
+    project_decode: &mut DoctorProjectDecodeReport,
 ) -> DoctorDirReport {
     let mut parsed = 0;
     let mut cache_hits = 0;
     let mut failure_samples = Vec::new();
     for file in files {
-        if cached_session(file, cache).is_some() {
+        // Keep the parsed session where the decode disclosure (rm-230) can
+        // see it; the parse accounting below is unchanged.
+        let session = if let Some(session) = cached_session(file, cache) {
             cache_hits += 1;
             parsed += 1;
-        } else if parse_file(file).is_ok() {
+            Some(session)
+        } else if let Ok(session) = parse_file(file) {
             parsed += 1;
-        } else if failure_samples.len() < 3 {
-            failure_samples.push(file.to_string_lossy().to_string());
+            Some(session)
+        } else {
+            if failure_samples.len() < 3 {
+                failure_samples.push(file.to_string_lossy().to_string());
+            }
+            None
+        };
+        if let Some(session) = session {
+            collect_project_decode(project_decode, &session);
         }
     }
     DoctorDirReport {
@@ -333,6 +407,29 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
     if report.cached_valid == 0 {
         recommendations.push("No reusable parsed session entries for this scan. Cached directory listings may still speed discovery; the next TUI startup should reuse parsed sessions incrementally.".to_string());
     }
+    // rm-230 disclosure: attribution made under host-state ambiguity, or not
+    // made at all, is surfaced instead of silently decided.
+    let decode = &report.project_decode;
+    if decode.ambiguous > 0 || decode.unresolved > 0 {
+        let mut note = format!(
+            "{} session(s) under a `-`-encoded projects directory were ",
+            decode.ambiguous + decode.unresolved
+        );
+        if decode.ambiguous > 0 && decode.unresolved > 0 {
+            note.push_str(&format!(
+                "split between {} attributed by the deterministic longest-verified-path rule with a verified alternative present (ambiguous) and {} with no verified decode (attributed to `unknown`)",
+                decode.ambiguous, decode.unresolved
+            ));
+        } else if decode.ambiguous > 0 {
+            note.push_str("attributed by the deterministic longest-verified-path rule while another directory also verified (ambiguous)");
+        } else {
+            note.push_str(
+                "left unattributed because no directory matching the encoded name verified",
+            );
+        }
+        note.push_str("; transcripts that record a cwd attribute exactly — prefer exporting those, or see `--doctor` samples above");
+        recommendations.push(note);
+    }
     recommendations
 }
 
@@ -364,6 +461,15 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.statusline.path, statusline_state
     ));
     out.push_str(&format!("Pricing snapshot: {}\n", report.pricing));
+    out.push_str(&format!(
+        "Project attribution: {} resolved, {} ambiguous, {} unresolved encoded project dirs\n",
+        report.project_decode.resolved,
+        report.project_decode.ambiguous,
+        report.project_decode.unresolved
+    ));
+    for sample in &report.project_decode.samples {
+        out.push_str(&format!("    {sample}\n"));
+    }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
         let status = if dir.exists { "found" } else { "missing" };

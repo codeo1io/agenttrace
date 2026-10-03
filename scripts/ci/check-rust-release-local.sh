@@ -4,8 +4,16 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-rust-release-local}"
-bin="$repo_root/target/release/agenttrace"
+# rm-240: write only under this invocation's own unique subdirectory. The
+# old `rm -rf "$AGENTTRACE_CI_OUT"` destroyed sibling gate artifacts when
+# the env var pointed at a shared directory (two release-local checks, or a
+# release-local next to other gates sharing one AGENTTRACE_CI_OUT, wiped
+# each other's logs mid-suite). Honor AGENTTRACE_BIN like the other gates
+# instead of hardcoding target/release so CARGO_TARGET_DIR layouts work.
+out_parent="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-rust-release-local}"
+mkdir -p "$out_parent"
+out_dir="$(mktemp -d "$out_parent/release-local.XXXXXX")"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 
 fail() {
   echo "check-rust-release-local: $*" >&2
@@ -22,8 +30,7 @@ run_env() {
   env "$@"
 }
 
-rm -rf "$out_dir"
-mkdir -p "$out_dir"
+mkdir -p "$out_dir/contracts" "$out_dir/real-cli-smoke"
 
 run cargo fmt --check
 run cargo clippy -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings

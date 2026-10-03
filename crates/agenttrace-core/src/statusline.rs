@@ -263,7 +263,16 @@ fn render_status_line(payload: &Value) -> String {
 /// would inject into the terminal. Control characters (C0, DEL, C1 —
 /// exactly `char::is_control`) are replaced with U+FFFD so the line
 /// stays one line and carries no escape sequences.
-fn sanitize_line_segment(segment: &str) -> String {
+///
+/// rm-232: this is THE shared control-character sanitizer for every CLI
+/// text renderer that prints session- or journal-derived strings
+/// (search text output, session text reports, the --sessions TSV, and
+/// --doctor disclosure samples); JSON output paths deliberately skip it
+/// because JSON escaping already encodes control bytes losslessly, and
+/// markdown/HTML renderers apply their own escaping before this class
+/// applies. Printable CSI/OSC tails may legitimately survive — only the
+/// control bytes themselves (ESC, BEL, …) are neutralized.
+pub fn sanitize_line_segment(segment: &str) -> String {
     segment
         .chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })

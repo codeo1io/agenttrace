@@ -44,9 +44,10 @@ pub use governance::{
 };
 pub use history::{history_path, merge_preserved_history, preserve_derived_history};
 pub use insights::{
-    compare_session_outcome, data_health, data_health_scoped, filter_sessions, project_name,
-    report_scope, resolve_project, session_capability, session_matches_time_range, DataHealth,
-    ProjectIdentity, ReportScope, SessionComparison, SourceScope, TimeRange,
+    compare_session_outcome, data_health, data_health_scoped, filter_sessions,
+    project_decode_status, project_name, report_scope, resolve_project, session_capability,
+    session_matches_time_range, DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope,
+    SessionComparison, SourceScope, TimeRange,
 };
 pub use parser::{parse_file, parse_raw_session};
 pub use pricing::{
@@ -68,7 +69,7 @@ pub use session_cache::{
 };
 pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
 pub use statusline::{
-    load_statusline_insights, render_statusline_report, run_statusline_host,
+    load_statusline_insights, render_statusline_report, run_statusline_host, sanitize_line_segment,
     statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
     StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
 };

@@ -93,3 +93,35 @@ both are incomplete-hermetic-boundary flakes — this one enters through the
 helper's variable list, that one through un-pinned host files. Numbered
 Rule 6 campaign-locally; sibling campaign 2962e401 (run aa9c4fd6) holds its
 own uncommitted Rule 6 in a parallel worktree — renumber at fold.
+
+## Rule 7 — Fixtures that exercise host-observing code get unique roots, and pin the host state they need absent
+
+When the code under test observes the live filesystem (decode probing,
+discovery walks, anything that `stat`s a path it did not create), a fixture
+under a runner-shared namespace such as `std::env::temp_dir()` inherits
+whatever the runner's *host* keeps there: a host directory that
+shadow-matches an intermediate fixture component flips the code's
+observable result on a tree nobody changed. Two-part rule: (a) give every
+such fixture a namespace no sibling test or host dir can collide with —
+`unique_decode_root()` in `crates/agenttrace-core/src/insights.rs`
+(temp_dir + `at-<pid>-<tid>-<seq>-<label>`, one per-process `AtomicUsize`
+seq) — extending Rule 2's thread-keying from shared *mutation* to host
+*probing*; (b) plant the host state you rely on the absence of, so the
+suite re-proves immunity every run instead of silently depending on a
+clean TMPDIR: the regression test creates the shadow sibling and asserts
+attribution is unaffected.
+
+Case study (cycle 2, campaign 6a10ae64, run cf755698): `cargo test
+--workspace` was 110/1 FAILED on hermes delegate hosts
+(`projects_group_worktrees_and_decode_agent_dirs`, insights.rs:563) and
+green under `TMPDIR=/tmp`, because the host keeps
+`/home/agent/.hermes/tmp/delegate/agenttrace` and the greedy project-dir
+decoder probed that live-FS shadow first — the red was host state, not the
+tree. After rm-230 (deterministic budget-bounded decode) plus this rule
+(rm-231), the suite is 285/0 with the shadow deliberately planted during
+validation, and the rc101 cascade in `check-rust-release-local.sh` (its
+cargo-test step died before its own checks) vanished with it. Same
+incomplete-hermetic-boundary class as both Rule 6s, entered through fixture
+placement rather than env read-sets or absence-assertions. Numbered Rule 7
+campaign-locally; sibling lanes hold their own uncommitted rules
+(2962e401's Rule 6) — renumber at fold.

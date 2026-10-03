@@ -200,9 +200,38 @@ pub fn resolve_project(session: &Session) -> ProjectIdentity {
     }
 }
 
-// Claude Code and Cursor name project folders after the workspace path with separators
-// replaced by '-'; recover the real directory only when that path still exists.
+// Claude Code and Cursor name project folders after the workspace path with
+// separators replaced by '-'. The encoding is not injective — a literal '-',
+// '/', '.' or '_' inside a directory name all encode to '-' — so
+// `-x-my-repo` may equally decode to `/x/my-repo`, `/x/my/repo`,
+// `/x/my.repo` or `/x/my_repo`, and only host state can distinguish them.
+//
+// rm-230: the decode is deterministic and host-state-independent in its
+// tie-break. The walk consumes the encoded components left to right and at
+// each step takes the LONGEST run of remaining components that verifies as
+// a single existing directory, with separator variants tried in the fixed
+// order '-', '.', '_'. Both consequences are pinned by tests:
+//   * a decoy that is merely a more-split spelling of the encoded name
+//     (`/x/my/repo` planted next to the true `/x/my-repo`) can no longer
+//     capture attribution the way the old greedy first-match decoder let
+//     it, and
+//   * an unrelated intermediate directory (`/<tmp>/agenttrace` shadowing
+//     `/<tmp>/agenttrace-project-<pid>/…` fixtures) can no longer truncate
+//     the walk into "unknown".
+// `resolve_project` still prefers the transcript's own `cwd` when present
+// (cwd-first), so this decoder only runs for sessions without one.
+// Residual ambiguity — a verified alternative was shadowed by the
+// longest-run rule at some step — is disclosed through
+// `project_decode_status` / `--doctor` instead of being decided silently.
 fn decode_agent_project_dir(session_path: &str) -> Option<String> {
+    let parts = encoded_project_components(session_path)?;
+    decode_encoded_components(&parts, false).map(|walk| walk.path)
+}
+
+/// The `-`-encoded project directory components of a transcript path
+/// (`…/projects/<encoded>/…`), with the leading '-' (the encoded root
+/// slash) stripped the way the encoders write it.
+fn encoded_project_components(session_path: &str) -> Option<Vec<&str>> {
     let path = Path::new(session_path);
     let dir = path.ancestors().find_map(|ancestor| {
         let parent = ancestor.parent()?;
@@ -211,31 +240,139 @@ fn decode_agent_project_dir(session_path: &str) -> Option<String> {
             .flatten()
     })?;
     let encoded = dir.trim_start_matches('-');
-    if encoded.is_empty() {
-        return None;
+    (!encoded.is_empty()).then(|| encoded.split('-').collect())
+}
+
+struct EncodedWalk {
+    path: String,
+    /// Other COMPLETE decodes of the same encoded name (in the fixed search
+    /// order), recorded for disclosure (`--doctor`), never chosen.
+    shadowed: Vec<String>,
+}
+
+/// Probe budget for one decode: caps worst-case host filesystem work while
+/// leaving realistic corpora (a dozen components, a few ambiguous steps)
+/// fully explored. The unambiguous walk alone costs ~3 probes per component
+/// pair (O(n^2) stat() calls, microseconds each); the budget exists to
+/// bound combinatorial ambiguity blowups, not linear scans. Deterministic —
+/// the search order is fixed, so a budget-truncated scan reports the same
+/// chosen path every run.
+const DECODE_PROBE_BUDGET: usize = 1024;
+
+/// Enumerates complete decodes of the encoded components in a fixed order —
+/// at every step the longest run of remaining components is tried first,
+/// then separator variants '-', '.', '_', then consuming an empty component
+/// without movement — and records them into `out`. The first entry of `out`
+/// is therefore the deterministic choice: it is exactly the path the greedy
+/// longest-run walk yields whenever that walk completes, and when the greedy
+/// walk dead-ends the search still finds a decode instead of falling back
+/// to "unknown". `disclose` keeps scanning after the first hit so ambiguity
+/// can be reported; without it the search stops at the first complete
+/// decode, which yields the identical chosen path at a fraction of the
+/// probes.
+fn decode_encoded_components(parts: &[&str], disclose: bool) -> Option<EncodedWalk> {
+    let mut out = Vec::new();
+    let mut probes = 0usize;
+    explore_encoded_components(parts, 0, Path::new("/"), &mut out, &mut probes, disclose);
+    let mut iter = out.into_iter();
+    let path = iter.next()?;
+    Some(EncodedWalk {
+        path,
+        shadowed: iter.collect(),
+    })
+}
+
+fn explore_encoded_components(
+    parts: &[&str],
+    idx: usize,
+    current: &Path,
+    out: &mut Vec<String>,
+    probes: &mut usize,
+    disclose: bool,
+) {
+    if out.len() > if disclose { 8 } else { 0 } || *probes > DECODE_PROBE_BUDGET {
+        return;
     }
-    let mut current = PathBuf::from("/");
-    let mut pending = String::new();
-    for part in encoded.split('-') {
-        pending = if pending.is_empty() {
-            part.to_string()
-        } else {
-            format!("{pending}-{part}")
-        };
+    if idx == parts.len() {
+        out.push(current.to_string_lossy().to_string());
+        return;
+    }
+    for len in (1..=parts.len() - idx).rev() {
+        let joined = parts[idx..idx + len].join("-");
+        // Separator variants '-', '.', '_' of the run. A dash-free run (a
+        // single component, or consecutive empties) spells identically in
+        // all three; dedupe so each distinct spelling is probed — and
+        // recursed from — exactly once.
+        let mut variants = Vec::with_capacity(3);
         for candidate in [
-            pending.clone(),
-            pending.replace('-', "."),
-            pending.replace('-', "_"),
+            joined.clone(),
+            joined.replace('-', "."),
+            joined.replace('-', "_"),
         ] {
+            // An empty component (consecutive dashes) encodes either an
+            // empty path segment or a literal dash inside a longer name;
+            // on its own it moves nowhere, so it is consumed after the
+            // runs have been tried, never probed.
+            if !candidate.is_empty() && !variants.contains(&candidate) {
+                variants.push(candidate);
+            }
+        }
+        for candidate in variants {
+            *probes += 1;
             let next = current.join(&candidate);
             if next.is_dir() {
-                current = next;
-                pending.clear();
-                break;
+                explore_encoded_components(parts, idx + len, &next, out, probes, disclose);
+                if !disclose && !out.is_empty() {
+                    return;
+                }
             }
         }
     }
-    (pending.is_empty() && current != Path::new("/")).then(|| current.to_string_lossy().to_string())
+    // Consecutive dashes: consume the empty component without moving. Only
+    // meaningful as the tail of the walk (a leading/middle empty inside a
+    // run was already covered by the joined spellings above).
+    if parts[idx].is_empty() {
+        explore_encoded_components(parts, idx + 1, current, out, probes, disclose);
+    }
+}
+
+/// Outcome of reversing a transcript's `-`-encoded agent project
+/// directory, for `--doctor` disclosure (rm-230).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectDecodeStatus {
+    /// The decoder was not consulted: the session records a `cwd`, or the
+    /// transcript does not live under a `…/projects/<encoded>/` directory.
+    NotConsulted,
+    /// Every step of the walk verified exactly one candidate.
+    Resolved { path: String },
+    /// The deterministic longest-run rule chose `path`, but at least one
+    /// other COMPLETE decode of the same encoded name verified
+    /// (`shadowed`): the attribution is defensible, not proven.
+    Ambiguous { path: String, shadowed: Vec<String> },
+    /// No complete verified decode: attribution falls back to "unknown".
+    Unresolved { encoded: String },
+}
+
+/// Reports how a session without a `cwd` was attributed when its project
+/// directory name is '-'-encoded — deterministic decode plus ambiguity
+/// disclosure (rm-230). See `decode_agent_project_dir` for the rule and
+/// its tie-break.
+pub fn project_decode_status(session: &Session) -> ProjectDecodeStatus {
+    if !session.cwd.trim().is_empty() {
+        return ProjectDecodeStatus::NotConsulted;
+    }
+    let Some(parts) = encoded_project_components(&session.path) else {
+        return ProjectDecodeStatus::NotConsulted;
+    };
+    match decode_encoded_components(&parts, true) {
+        Some(EncodedWalk { path, shadowed }) if shadowed.is_empty() => {
+            ProjectDecodeStatus::Resolved { path }
+        }
+        Some(EncodedWalk { path, shadowed }) => ProjectDecodeStatus::Ambiguous { path, shadowed },
+        None => ProjectDecodeStatus::Unresolved {
+            encoded: parts.join("-"),
+        },
+    }
 }
 
 pub fn project_name(session: &Session) -> String {
@@ -539,9 +676,29 @@ mod tests {
         }
     }
 
+    /// Unique fixture root for decode/project tests (rm-231): pid + thread
+    /// id + sequence make collisions impossible, and the `at-…` prefix means
+    /// no plausible host ancestor or sibling directory can shadow a
+    /// component of the encoded path. The old `…/agenttrace-project-<pid>`
+    /// fixtures were flipped to "unknown" whenever the host TMPDIR contained
+    /// a directory literally named `agenttrace` (as hermes delegate hosts
+    /// do), failing the suite host-dependently.
+    fn unique_decode_root(label: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "at-{}-{:?}-{}-{label}",
+            std::process::id(),
+            std::thread::current().id(),
+            seq
+        ))
+    }
+
     #[test]
     fn projects_group_worktrees_and_decode_agent_dirs() {
-        let root = std::env::temp_dir().join(format!("agenttrace-project-{}", std::process::id()));
+        // rm-231: hermetic fixture — unique root, no `agenttrace` component
+        // for host TMPDIR shadows to collide with.
+        let root = unique_decode_root("grouping");
         let repo = root.join("src").join("my-repo");
         let worktree = root.join("worktrees").join("a1b2").join("my-repo");
         fs::create_dir_all(repo.join(".git").join("worktrees").join("wt")).unwrap();
@@ -564,6 +721,151 @@ mod tests {
 
         let missing = resolve_project(&session_at("", "/nowhere/projects/-gone-dir/s.jsonl"));
         assert_eq!(missing.display_name, "unknown");
+        assert_eq!(
+            project_decode_status(&session_at("", "/nowhere/projects/-gone-dir/s.jsonl")),
+            ProjectDecodeStatus::Unresolved {
+                encoded: "gone-dir".to_string()
+            }
+        );
+        // A cwd-bearing session never consults the decoder.
+        assert_eq!(
+            project_decode_status(&session_at("/somewhere", "/any/projects/-x/s.jsonl")),
+            ProjectDecodeStatus::NotConsulted
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decode_ignores_shadow_directories_at_plausible_ancestors() {
+        // rm-231 regression (assess N2): with TMPDIR=/home/agent/.hermes/
+        // tmp/delegate and a leftover sibling directory literally named
+        // `agenttrace`, the old greedy decoder consumed it as the first
+        // component of the fixture path `…/<tmp>/agenttrace-project-<pid>/
+        // src/my-repo` and the walk never recovered — the suite failed only
+        // on hosts with that shadow (release-local gate rc101 cascade). The
+        // shadow is planted INSIDE the unique root, so the fixture never
+        // mutates shared host state while reproducing the exact trap.
+        let root = unique_decode_root("shadow");
+        let fixture = root.join(format!("agenttrace-project-{}", std::process::id()));
+        let repo = fixture.join("src").join("my-repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::create_dir_all(root.join("agenttrace")).expect("plant shadow ancestor");
+        let encoded = repo.to_string_lossy().replace('/', "-");
+        let transcript = root.join("projects").join(&encoded).join("session.jsonl");
+        fs::create_dir_all(&transcript).unwrap();
+        let decoded = resolve_project(&session_at(
+            "",
+            &transcript.join("s.jsonl").to_string_lossy(),
+        ));
+        assert_eq!(decoded.display_name, "my-repo");
+        assert_eq!(
+            decoded.root,
+            lexical_normalize(&repo).to_string_lossy().to_string()
+        );
+        // The shadow never even becomes a disclosed candidate.
+        assert!(matches!(
+            project_decode_status(&session_at(
+                "",
+                &transcript.join("s.jsonl").to_string_lossy()
+            )),
+            ProjectDecodeStatus::Resolved { .. }
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decode_prefers_the_longest_verified_path_over_a_decoy_split() {
+        // rm-230 regression, assess PoC triple (delegate/172562a8…-scratch/
+        // poc-misattr-{decoy,true,nodecoy}.json): with the true project
+        // `<root>/misattr/my-repo` and an unrelated decoy
+        // `<root>/misattr/my/repo`, the old greedy first-match decoder
+        // attributed the session to the decoy while it existed (`--project
+        // my-repo` rc1) and flipped back after it was removed. Attribution
+        // must be byte-identical in both host states, and the ambiguity must
+        // be disclosed, not decided silently.
+        let root = unique_decode_root("misattr");
+        let base = root.join("misattr");
+        let true_repo = base.join("my-repo");
+        fs::create_dir_all(&true_repo).expect("create true repo");
+        let decoy = base.join("my").join("repo");
+        fs::create_dir_all(&decoy).expect("plant decoy");
+        let encoded = true_repo.to_string_lossy().replace('/', "-");
+        let transcript = root
+            .join("projects")
+            .join(&encoded)
+            .join("session.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let session = session_at("", &transcript);
+
+        // Decoy present: attributed to the true project, not the decoy.
+        let with_decoy = resolve_project(&session);
+        assert_eq!(with_decoy.display_name, "my-repo");
+        assert_eq!(
+            with_decoy.root,
+            lexical_normalize(&true_repo).to_string_lossy().to_string()
+        );
+        // The alternative the old decoder would have descended into is
+        // disclosed as shadowed.
+        match project_decode_status(&session) {
+            ProjectDecodeStatus::Ambiguous { path, shadowed } => {
+                assert!(path.ends_with("misattr/my-repo"), "true path: {path}");
+                assert!(
+                    shadowed.iter().any(|alt| alt.ends_with("misattr/my/repo")),
+                    "decoy decode disclosed: {shadowed:?}"
+                );
+            }
+            other => panic!("expected ambiguity disclosure, got {other:?}"),
+        }
+
+        // Decoy removed: a fresh walk (bypassing the resolve memo) yields the
+        // byte-identical attribution — host state cannot flip it.
+        fs::remove_dir_all(&decoy).unwrap();
+        let parts = encoded_project_components(&transcript).expect("encoded components");
+        let walk = decode_encoded_components(&parts, false).expect("decode without decoy");
+        assert_eq!(walk.path, true_repo.to_string_lossy().to_string());
+        assert!(walk.shadowed.is_empty());
+        assert!(matches!(
+            project_decode_status(&session),
+            ProjectDecodeStatus::Resolved { .. }
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decode_tolerates_literal_dashes_and_empty_components() {
+        // A literal '-' inside a component name encodes exactly like a path
+        // separator, so the longest-run rule prefers the joined spelling;
+        // consecutive dashes (empty components) consume no movement.
+        let root = unique_decode_root("dashes");
+        let dashed = root.join("a--b");
+        fs::create_dir_all(&dashed).unwrap();
+        // `…-e-` is the encoding of both `/…/e-` and `/…/e/`: the dashed
+        // directory wins as the longer run when it exists, and the trailing
+        // empty component is tolerated when it does not.
+        let trailing_dash = root.join("e-");
+        fs::create_dir_all(&trailing_dash).unwrap();
+        for repo in [&dashed, &trailing_dash] {
+            let encoded = repo.to_string_lossy().replace('/', "-");
+            let transcript = root
+                .join("projects")
+                .join(&encoded)
+                .join("s.jsonl")
+                .to_string_lossy()
+                .to_string();
+            let parts = encoded_project_components(&transcript).expect("encoded components");
+            let walk = decode_encoded_components(&parts, false).expect("decode dashed name");
+            assert_eq!(walk.path, repo.to_string_lossy().to_string());
+        }
+        // Without a dashed sibling on disk, the same trailing-dash encoding
+        // decodes to `/…/f` and the trailing empty component is consumed
+        // harmlessly (the tolerance the old decoder provided by accident).
+        fs::create_dir_all(root.join("f")).unwrap();
+        let mut encoded = root.join("f").to_string_lossy().replace('/', "-");
+        encoded.push('-');
+        let parts: Vec<&str> = encoded.split('-').collect();
+        let walk = decode_encoded_components(&parts, false).expect("decode trailing empty");
+        assert_eq!(walk.path, root.join("f").to_string_lossy().to_string());
         let _ = fs::remove_dir_all(root);
     }
 }
