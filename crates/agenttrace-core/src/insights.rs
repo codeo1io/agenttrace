@@ -1,5 +1,5 @@
 use crate::{parse_ts, pricing, total_tokens, Session};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -44,6 +44,24 @@ pub enum TimeRange {
     All,
 }
 
+/// Start of the calendar day containing `now` under a fixed UTC `offset`,
+/// expressed as a UTC instant (rm-040). Fixed offsets carry no DST
+/// ambiguity, so the mapping is total; on zone-transition days the anchor
+/// can sit an hour off true local midnight, which is strictly better than
+/// anchoring every non-UTC user to UTC midnight every day.
+fn day_start_for_offset(now: DateTime<Utc>, offset: FixedOffset) -> DateTime<Utc> {
+    let midnight = now
+        .with_timezone(&offset)
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always representable");
+    midnight
+        .and_local_timezone(offset)
+        .single()
+        .expect("fixed offsets have no DST ambiguity")
+        .with_timezone(&Utc)
+}
+
 impl TimeRange {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -64,10 +82,16 @@ impl TimeRange {
     }
     pub fn since(self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
-            Self::Today => now
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .map(|value| value.and_utc()),
+            Self::Today => {
+                // rm-040: "today" is the reporting user's calendar day, not
+                // the UTC one. UTC+9 users lost their local morning from
+                // `--range today` (a 23:00Z session is 08:00 JST the next
+                // day), and west-of-UTC users had yesterday evening counted
+                // in. Anchor to local midnight, expressed as a UTC instant
+                // for the comparison in session_matches_time_range.
+                let offset = now.with_timezone(&Local).offset().fix();
+                Some(day_start_for_offset(now, offset))
+            }
             Self::Days7 => Some(now - chrono::Duration::days(7)),
             Self::Days30 => Some(now - chrono::Duration::days(30)),
             Self::All => None,
@@ -565,5 +589,50 @@ mod tests {
         let missing = resolve_project(&session_at("", "/nowhere/projects/-gone-dir/s.jsonl"));
         assert_eq!(missing.display_name, "unknown");
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn at(instant: &str) -> DateTime<Utc> {
+        instant.parse().expect("rfc3339 fixture instant")
+    }
+
+    #[test]
+    fn range_today_anchors_to_the_users_local_midnight() {
+        // rm-040, east-of-UTC probe (the assess PoC corpus): at 05:00Z a
+        // UTC+9 user is at 14:00 on their Oct 2, so "today" starts at
+        // Oct 2 00:00 JST = Oct 1 15:00Z — and the 23:00Z session (08:00
+        // JST that morning) is INSIDE today. UTC-midnight anchoring
+        // excluded it.
+        let now = at("2026-10-02T05:00:00Z");
+        let east = day_start_for_offset(now, FixedOffset::east_opt(9 * 3600).unwrap());
+        assert_eq!(east, at("2026-10-01T15:00:00Z"));
+        assert!(at("2026-10-01T23:00:00Z") >= east);
+
+        // West-of-UTC probe: the same instant is 00:00 Oct 2 for a UTC-5
+        // user, so "today" starts at 05:00Z and yesterday 23:30 local
+        // (04:30Z) is OUTSIDE today. UTC-midnight anchoring counted it in.
+        let west = day_start_for_offset(now, FixedOffset::west_opt(5 * 3600).unwrap());
+        assert_eq!(west, at("2026-10-02T05:00:00Z"));
+        assert!(at("2026-10-02T04:30:00Z") < west);
+
+        // UTC users keep the previous boundary exactly.
+        assert_eq!(
+            day_start_for_offset(now, FixedOffset::east_opt(0).unwrap()),
+            at("2026-10-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn range_today_uses_local_midnight_whatever_the_host_zone() {
+        // since() must agree with the helper under the live host offset,
+        // in any deployment timezone, and never start after `now`.
+        let now = Utc::now();
+        let offset = now.with_timezone(&Local).offset().fix();
+        assert_eq!(
+            TimeRange::Today.since(now),
+            Some(day_start_for_offset(now, offset))
+        );
+        assert!(TimeRange::Today
+            .since(now)
+            .is_some_and(|start| start <= now));
     }
 }
