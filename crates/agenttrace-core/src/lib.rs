@@ -399,7 +399,25 @@ pub struct Overview {
     pub by_agent: BTreeMap<String, GroupOverview>,
     pub by_model: BTreeMap<String, GroupOverview>,
     pub by_project: BTreeMap<String, GroupOverview>,
+    /// rm-245: vendor attribution from the pricing catalog (never
+    /// invented from name prefixes). Models the catalog cannot resolve
+    /// bucket explicitly under "unknown" instead of being dropped.
+    pub by_provider: BTreeMap<String, GroupOverview>,
+    /// rm-245: heuristic task-type attribution. Correlation over parsed
+    /// aggregates, not ground truth; see `infer_task_type`.
+    pub by_task_type: BTreeMap<String, TaskTypeOverview>,
     pub anomalies_top: Vec<AnomalyTop>,
+}
+
+/// Task-type rollup (rm-245). Carries token totals alongside sessions
+/// and cost because "what kind of work burned the tokens" is the
+/// question this dimension answers.
+#[derive(Debug, Clone, Default)]
+pub struct TaskTypeOverview {
+    pub sessions: usize,
+    pub cost: f64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1199,6 +1217,25 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         model_entry.sessions += 1;
         model_entry.cost += session.metrics.cost_estimated;
 
+        // rm-245: attribution dimensions. The provider comes from the
+        // same catalog row that prices the model, so vendor claims and
+        // price claims can never disagree; unresolvable models go to an
+        // explicit "unknown" bucket rather than vanishing.
+        let provider = pricing::provider_for(&session.metrics.model_used)
+            .unwrap_or_else(|| "unknown".to_string());
+        let provider_entry = overview.by_provider.entry(provider).or_default();
+        provider_entry.sessions += 1;
+        provider_entry.cost += session.metrics.cost_estimated;
+
+        let task_type_entry = overview
+            .by_task_type
+            .entry(infer_task_type(session).to_string())
+            .or_default();
+        task_type_entry.sessions += 1;
+        task_type_entry.cost += session.metrics.cost_estimated;
+        task_type_entry.tokens_input += session.metrics.tokens_input.max(0);
+        task_type_entry.tokens_output += session.metrics.tokens_output.max(0);
+
         let project_entry = overview
             .by_project
             .entry(project_name(session))
@@ -1465,6 +1502,53 @@ fn collect_searchable_tool_args(value: &Value, seen: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// Task-type heuristic (rm-245): a documented, deterministic, three-way
+/// cascade over aggregates the parser already produced - no new
+/// parsing, no message-content inspection. This is correlation over
+/// tool-mix and failure evidence, not ground truth; the inference
+/// limits are part of the overview contract (docs/guides/
+/// governance-reports.md). The cascade is ordered:
+/// - `debugging`: failure-driven work - at least one failed tool call
+///   with a >=25% session fail rate (the same strictness the cost-driver
+///   note uses), or a `tool_failures` anomaly on the session;
+/// - `coding`: execution evidence - write-capable or test/build tool
+///   authority observed with at least one tool call;
+/// - `planning`: everything else (read-only, reasoning-only, zero-tool
+///   sessions).
+pub fn infer_task_type(session: &Session) -> &'static str {
+    let metrics = &session.metrics;
+    let total_calls = metrics.tool_calls_ok + metrics.tool_calls_fail;
+    let fail_rate = if total_calls == 0 {
+        0.0
+    } else {
+        metrics.tool_calls_fail as f64 / total_calls as f64
+    };
+    let failure_driven = (metrics.tool_calls_fail > 0 && fail_rate >= 0.25)
+        || session
+            .anomalies
+            .iter()
+            .any(|anomaly| anomaly.kind == "tool_failures");
+    if failure_driven {
+        return "debugging";
+    }
+    let execution_evidence = total_calls > 0
+        && metrics.tool_authority.iter().any(|(authority, count)| {
+            *count > 0
+                && matches!(
+                    authority.as_str(),
+                    "external_publish"
+                        | "git_write"
+                        | "write_files"
+                        | "package_install"
+                        | "test_or_build"
+                )
+        });
+    if execution_evidence {
+        return "coding";
+    }
+    "planning"
 }
 
 pub(crate) fn classify_tool_authority(tool_call: &ToolCall) -> String {

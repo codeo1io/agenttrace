@@ -9,8 +9,13 @@ All cost values are estimates. Delivery evidence is a heuristic and does not pro
 Use the same scope controls for every report:
 
 ```bash
-agenttrace --range 30d --project storefront --source claude_code
+agenttrace --overview --range 30d --project storefront --source claude_code
 ```
+
+Scope controls must ride a report action (`--overview`, `--sessions`, `--audit`, …).
+A scope flag on its own is rejected loudly — `--range 30d` without an
+action prints an error instead of silently launching the interactive
+view with the filter ignored.
 
 Supported controls include `--range today|7d|30d|all`, `--project`, `--source`, `--model-filter`, `--query`, `--health`, `--cost`, `--anomaly`, `--sort`, `--order`, and `--limit`.
 
@@ -63,7 +68,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 20 and the SQLite snapshot is schema 6 because
+The session cache is schema 20 and the SQLite snapshot is schema 7 because
 both now persist provenance. Older versions are discarded and rebuilt on the
 next load; the migration is read-only and does not modify source session
 files. Cache entries whose source file has disappeared are pruned the next
@@ -104,7 +109,8 @@ agenttrace --delivery-evidence --range 30d -f json
 
 The command uses a read-only local Git heuristic. It compares commits under a resolved project root with the session time window, with a small lead and tail allowance. It also reports observed file-write, Git-write, publish, and general tool-activity categories.
 
-Evidence levels mean:
+Evidence levels mean, in the order the report ranks them (strongest
+first):
 
 - `strong`: one or more local Git commits overlap the session window.
 - `medium`: observed Git-write or publish category.
@@ -112,7 +118,16 @@ Evidence levels mean:
 - `non_code`: tool activity exists without code-delivery evidence.
 - `none`: no relevant evidence was observed.
 
+The session list is sorted by that strength — `strong` before `medium`
+before `weak` before `non_code` before `none`, with the session name as
+the tie-break inside a level — not alphabetically by label.
 A matching commit is correlation only; it does not establish who made the commit, whether it merged to `main`, or whether it produced user value.
+
+The local `git log` probe is read-only and bounded: it is capped at ten
+seconds per repository root, and a probe that overruns the cap is
+treated as unavailable — that root degrades to the tool-authority
+heuristic and the report says so. A repository that answers slowly
+slows the report by at most that cap.
 
 ## Overview appendix
 
@@ -121,5 +136,24 @@ A matching commit is correlation only; it does not establish who made the commit
 ```bash
 agenttrace --overview --range 30d -f html -o agenttrace-overview.html
 ```
+
+The overview also carries attribution dimensions over the same scope:
+
+- `by_provider`: which vendor's models the spend went to. Providers
+  come from the pricing-catalog row that prices each model — never
+  from the model name's prefix — and models the catalog cannot resolve
+  bucket explicitly under `unknown` instead of being dropped.
+- `by_task_type`: a heuristic re-slice of the same parsed aggregates
+  into `coding` (write-capable or test/build tool authority observed),
+  `debugging` (failure-driven work: at least one failed tool call with
+  a ≥25% session fail rate, or a tool-failures anomaly), and
+  `planning` (everything else). Token totals ride with each bucket.
+  This is correlation over tool-mix and failure evidence, not ground
+  truth; the cascade is documented and deterministic so two identical
+  sessions always classify identically.
+- `top_cost_drivers`: the ranked top sessions by estimated cost, each
+  with its share of total spend and its strict possible-driver note
+  when one exists. Shares are computed over the full in-scope corpus,
+  so the rendered top-3 always sums to less than or equal to 100%.
 
 For CI gates and baseline comparison, see [CI integration](ci-integration.md).

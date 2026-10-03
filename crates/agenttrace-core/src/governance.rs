@@ -4,7 +4,9 @@ use crate::{
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Child, Command, Stdio};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CostAudit {
@@ -742,17 +744,16 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
             confidence: format!("{confidence}: time-window heuristic; Git commits are correlated, not attributable proof of main-merge or business value"),
         });
     }
-    records.sort_by(|left, right| {
-        left.level
-            .cmp(&right.level)
-            .then_with(|| left.session.cmp(&right.session))
-    });
+    sort_delivery_records(&mut records);
     DeliveryEvidence {
         methodology: if inspect_git {
-            "Read-only local Git heuristic: commit timestamps are matched to session start/end with a 2-minute lead and 5-minute tail. It does not prove authorship, merge-to-main, or business value."
+            format!(
+                "Read-only local Git heuristic: commit timestamps are matched to session start/end with a 2-minute lead and 5-minute tail. It does not prove authorship, merge-to-main, or business value. The local git log probe is bounded at {} seconds per repository root; a probe that overruns the bound is treated as unavailable and its root degrades to the tool-authority heuristic.",
+                GIT_PROBE_TIMEOUT.as_secs()
+            )
         } else {
-            "Lightweight heuristic based on observed tool authority only. Run --delivery-evidence for read-only local Git timestamp correlation."
-        }.to_string(),
+            "Lightweight heuristic based on observed tool authority only. Run --delivery-evidence for read-only local Git timestamp correlation.".to_string()
+        },
         summary,
         sessions: records,
     }
@@ -776,22 +777,96 @@ fn git_commits_by_root(sessions: &[Session]) -> BTreeMap<String, Vec<GitCommit>>
         .collect()
 }
 
+/// Wall-clock bound for the read-only `git log` probe (rm-242): a
+/// wedged or pathologically slow git binary must degrade the report to
+/// the tool-authority heuristic instead of stalling it indefinitely.
+/// Same cap class as the network pricing fetch (pricing.rs
+/// `download_pricing`), sized for a local repository walk rather than a
+/// network round trip. The bound is disclosed in the report's
+/// `methodology` string.
+const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wait for a spawned child with a wall-clock deadline. Returns the
+/// exit status when the child finishes inside the bound; kills the
+/// child and returns `None` when the deadline passes. Callers that
+/// piped stdout must keep draining it on another thread so a full
+/// pipe can never turn a fast child into a spurious timeout.
+fn wait_child_bounded(
+    child: &mut Child,
+    bound: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + bound;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 fn git_commits(root: &str) -> Option<Vec<GitCommit>> {
-    let output = Command::new("git")
+    // rm-242: the probe used `Command::output()`, which waits without a
+    // bound. Here stdout is drained on a helper thread while the main
+    // thread polls `try_wait` against `GIT_PROBE_TIMEOUT`, so a hung
+    // git degrades after ten seconds instead of hanging the report.
+    let mut child = Command::new("git")
         .args(["-C", root, "log", "--all", "--format=%ct"])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let mut stdout = child.stdout.take();
+    let drain = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(stream) = stdout.as_mut() {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+    let status = wait_child_bounded(&mut child, GIT_PROBE_TIMEOUT)?;
+    if !status.success() {
         return None;
     }
+    let stdout = drain.join().ok()?;
     Some(
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&stdout)
             .lines()
             .filter_map(|line| line.parse::<i64>().ok())
             .filter_map(|timestamp| DateTime::from_timestamp(timestamp, 0))
             .map(|timestamp| GitCommit { timestamp })
             .collect(),
     )
+}
+
+/// Evidence-strength ordering for the delivery-evidence session list
+/// (rm-243). The previous lexicographic level sort rendered the labels
+/// alphabetically — `medium`, `non_code`, `none`, `strong`, `weak` — so
+/// the weakest evidence could lead the report. The contract is ranked:
+/// strong > medium > weak > non_code > none, with the session name as
+/// the deterministic tie-break inside a level.
+fn sort_delivery_records(records: &mut [SessionDeliveryEvidence]) {
+    records.sort_by(|left, right| {
+        delivery_level_rank(&left.level)
+            .cmp(&delivery_level_rank(&right.level))
+            .then_with(|| left.session.cmp(&right.session))
+    });
+}
+
+/// Smaller rank is stronger evidence; unrecognized labels sort last so
+/// future levels cannot silently resurrect the alphabet bug.
+fn delivery_level_rank(level: &str) -> u8 {
+    match level {
+        "strong" => 0,
+        "medium" => 1,
+        "weak" => 2,
+        "non_code" => 3,
+        _ => 4,
+    }
 }
 
 fn commits_for_session<'a>(commits: &'a [GitCommit], session: &Session) -> Vec<&'a GitCommit> {
@@ -984,7 +1059,7 @@ fn is_write_tool(tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Diagnostics, Metrics, ToolWarning};
+    use crate::{demo_sessions, Diagnostics, Metrics, ToolWarning};
 
     fn session(name: &str) -> Session {
         Session {
@@ -1139,5 +1214,142 @@ mod tests {
         assert_eq!(report.summary.medium, 1);
         assert!(report.methodology.contains("heuristic"));
         assert!(report.sessions[0].confidence.contains("not attributable"));
+    }
+
+    #[test]
+    fn delivery_evidence_orders_levels_by_strength_not_alphabet() {
+        // rm-243: the old lexicographic sort rendered the labels
+        // alphabetically - medium, non_code, none, strong, weak - so the
+        // weakest evidence could lead the report. One record per level
+        // must come out ranked strongest-first instead.
+        let mut records: Vec<SessionDeliveryEvidence> =
+            ["weak", "strong", "none", "non_code", "medium"]
+                .into_iter()
+                .map(|level| SessionDeliveryEvidence {
+                    session: format!("session-{level}"),
+                    project: "demo".to_string(),
+                    level: level.to_string(),
+                    evidence: Vec::new(),
+                    confidence: String::new(),
+                })
+                .collect();
+        sort_delivery_records(&mut records);
+        let levels: Vec<&str> = records.iter().map(|r| r.level.as_str()).collect();
+        assert_eq!(levels, ["strong", "medium", "weak", "non_code", "none"]);
+        assert_ne!(
+            levels,
+            ["medium", "non_code", "none", "strong", "weak"],
+            "must not regress to the alphabetical order"
+        );
+    }
+
+    #[test]
+    fn delivery_evidence_rank_ties_break_on_session_name() {
+        let mut records: Vec<SessionDeliveryEvidence> = ["zeta", "alpha"]
+            .into_iter()
+            .map(|name| SessionDeliveryEvidence {
+                session: name.to_string(),
+                project: "demo".to_string(),
+                level: "weak".to_string(),
+                evidence: Vec::new(),
+                confidence: String::new(),
+            })
+            .collect();
+        sort_delivery_records(&mut records);
+        let names: Vec<&str> = records.iter().map(|r| r.session.as_str()).collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn delivery_evidence_unknown_level_sorts_weakest() {
+        // A future level literal must land after "none" rather than
+        // resurrecting the alphabet bug somewhere in the middle.
+        let mut records: Vec<SessionDeliveryEvidence> =
+            [("none", "a"), ("new_level", "b"), ("strong", "c")]
+                .into_iter()
+                .map(|(level, name)| SessionDeliveryEvidence {
+                    session: name.to_string(),
+                    project: "demo".to_string(),
+                    level: level.to_string(),
+                    evidence: Vec::new(),
+                    confidence: String::new(),
+                })
+                .collect();
+        sort_delivery_records(&mut records);
+        let levels: Vec<&str> = records.iter().map(|r| r.level.as_str()).collect();
+        assert_eq!(levels, ["strong", "none", "new_level"]);
+    }
+
+    #[test]
+    fn delivery_evidence_demo_levels_are_ranked_not_alphabetized() {
+        // End to end on the shipped demo corpus: whatever levels the
+        // heuristic assigns, the rendered list must be non-increasing in
+        // evidence rank.
+        let report = delivery_evidence_with_git(&demo_sessions().expect("demo corpus"));
+        assert!(!report.sessions.is_empty());
+        let ranks: Vec<u8> = report
+            .sessions
+            .iter()
+            .map(|record| delivery_level_rank(&record.level))
+            .collect();
+        let mut sorted = ranks.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            ranks,
+            sorted,
+            "levels must be ranked, got {:?}",
+            report
+                .sessions
+                .iter()
+                .map(|r| r.level.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wait_child_bounded_kills_a_sleeping_child_at_the_deadline() {
+        // rm-242: the sleeping-git stand-in from the assessment PoC (a
+        // git that never exits) must be capped by the bound, not waited
+        // on forever.
+        let started = Instant::now();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let status = wait_child_bounded(&mut child, std::time::Duration::from_millis(300));
+        assert!(
+            status.is_none(),
+            "a child that outlives the bound must time out"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the bound must actually cap the wait, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn wait_child_bounded_returns_status_for_a_fast_child() {
+        let mut child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let status = wait_child_bounded(&mut child, std::time::Duration::from_secs(5));
+        assert!(status.expect("fast child finishes").success());
+    }
+
+    #[test]
+    fn git_probe_bound_is_disclosed_in_the_methodology() {
+        let report = delivery_evidence_with_git(&demo_sessions().expect("demo corpus"));
+        assert!(
+            report
+                .methodology
+                .contains(&GIT_PROBE_TIMEOUT.as_secs().to_string()),
+            "methodology must disclose the probe bound: {}",
+            report.methodology
+        );
     }
 }
