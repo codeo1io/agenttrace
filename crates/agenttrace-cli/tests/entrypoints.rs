@@ -503,3 +503,152 @@ fn statusline_host_mode_survives_stdout_write_failure() {
     );
     let _ = std::fs::remove_dir_all(cache);
 }
+
+#[test]
+fn governance_reports_honor_gate_flags() {
+    // rm-346 arm-a: the --fail-* gate flags are parsed on every report
+    // path, but used to be evaluated only in the --overview arm — `--audit
+    // --fail-under-health 100` on a corpus the same flags condemn under
+    // --overview exited rc0 with 0-byte stderr. The gate must fire after the
+    // report as well: report on stdout, failures + evidence on stderr,
+    // exit code 2.
+    let gated_audit = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--demo",
+            "--audit",
+            "-f",
+            "json",
+            "--fail-under-health",
+            "100",
+        ])
+        .output()
+        .expect("run gated audit");
+    assert_eq!(
+        gated_audit.status.code(),
+        Some(2),
+        "--audit must honor --fail-under-health like --overview does"
+    );
+    let stderr = String::from_utf8_lossy(&gated_audit.stderr).to_string();
+    assert!(
+        stderr.contains("Gate failed"),
+        "gate failure on stderr: {stderr}"
+    );
+    assert!(
+        !gated_audit.stdout.is_empty(),
+        "the audit report itself must still print to stdout"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "no panic text on stderr: {stderr}"
+    );
+
+    // The same honoring applies to the other governance report paths that
+    // parse the same flags (--recommend shares the branch).
+    let gated_recommend = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--demo",
+            "--recommend",
+            "-f",
+            "json",
+            "--fail-under-health",
+            "100",
+        ])
+        .output()
+        .expect("run gated recommend");
+    assert_eq!(
+        gated_recommend.status.code(),
+        Some(2),
+        "--recommend must honor --fail-under-health like --overview does"
+    );
+
+    // Control: without gate flags the governance report stays green.
+    let plain_audit = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--audit", "-f", "json"])
+        .output()
+        .expect("run plain audit");
+    assert!(
+        plain_audit.status.success(),
+        "plain --audit stays rc0: {:?}",
+        String::from_utf8_lossy(&plain_audit.stderr)
+    );
+}
+
+#[test]
+fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
+    // rm-346 arm-b: --baseline-max-{duration,cost,token}-delta-pct used to
+    // reach the comparison unvalidated. NaN made the bound vacuous (rc0,
+    // zero stderr, on a corpus the baseline condemns) and -1 false-failed a
+    // byte-identical baseline (rc2 "Gate failed"). Both must be rc1 naming
+    // the flag, before any comparison runs.
+    let work = std::env::temp_dir().join("agenttrace-rm346b-baseline");
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    let baseline = work.join("baseline.json");
+    let generate = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--demo",
+            "--overview",
+            "-f",
+            "json",
+            "-o",
+            baseline.to_str().expect("baseline path is valid UTF-8"),
+        ])
+        .output()
+        .expect("generate demo baseline");
+    assert!(generate.status.success(), "baseline generation failed");
+
+    for (flag, value) in [
+        ("--baseline-max-cost-delta-pct", "NaN"),
+        ("--baseline-max-token-delta-pct", "NaN"),
+        ("--baseline-max-duration-delta-pct", "NaN"),
+        ("--baseline-max-cost-delta-pct", "-1"),
+        ("--baseline-max-token-delta-pct", "-1"),
+        ("--baseline-max-duration-delta-pct", "-1"),
+    ] {
+        // The joined `--flag=value` form is required for negative values —
+        // a bare `-1` is eaten by the argument parser before validation.
+        let joined = format!("{flag}={value}");
+        let rejected = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args([
+                "--demo",
+                "--overview",
+                "-f",
+                "json",
+                "--baseline",
+                baseline.to_str().expect("baseline path is valid UTF-8"),
+                &joined,
+            ])
+            .output()
+            .expect("run gated overview");
+        let stderr = String::from_utf8_lossy(&rejected.stderr).to_string();
+        assert_eq!(
+            rejected.status.code(),
+            Some(1),
+            "{flag} {value} must be rejected rc1, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(flag),
+            "rejection must name the flag {flag}: {stderr}"
+        );
+    }
+
+    // Control: a byte-identical baseline with valid (default) thresholds
+    // stays green — no false Gate failed.
+    let identical = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--demo",
+            "--overview",
+            "-f",
+            "json",
+            "--baseline",
+            baseline.to_str().expect("baseline path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run identical baseline");
+    assert!(
+        identical.status.success(),
+        "identical baseline must stay rc0: {:?}",
+        String::from_utf8_lossy(&identical.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}

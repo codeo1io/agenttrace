@@ -1667,7 +1667,23 @@ fn oh_my_pi_timestamp(raw: Option<&Value>, fallback: &str) -> String {
 }
 
 fn is_qwen_code_jsonl(objs: &[JsonObject]) -> bool {
-    objs.iter().any(is_qwen_code_event)
+    // rm-345: a sessionId-scrubbed claude export can still contain lines that
+    // individually look qwen-ish (uuid + message, no claude-only keys), so
+    // file-level detection must also require that NO line carries claude
+    // evidence — one claude model string or claude-only key anywhere means
+    // the whole file is a claude export, not qwen_code.
+    objs.iter().any(is_qwen_code_event) && !objs.iter().any(carries_claude_evidence)
+}
+
+/// File-level claude signals: the camelCase keys qwen never writes
+/// (`sessionId` on non-scrubbed exports, the claude-only keys that survive
+/// scrubbing) plus claude model strings (rm-345).
+fn carries_claude_evidence(obj: &Map<String, Value>) -> bool {
+    obj.contains_key("sessionId")
+        || CLAUDE_ONLY_JSONL_KEYS
+            .iter()
+            .any(|key| obj.contains_key(*key))
+        || carries_claude_model(obj)
 }
 
 fn is_qwen_code_value(value: &Value) -> bool {
@@ -1679,6 +1695,30 @@ fn is_qwen_code_value(value: &Value) -> bool {
             .any(is_qwen_code_event),
         _ => false,
     }
+}
+
+/// Keys that only claude-code transcripts carry. Privacy scrubbers drop
+/// `sessionId` from claude exports but keep these; carrying any of them
+/// disqualifies a sessionId-less object from the qwen_code uuid branch, so
+/// scrubbed claude exports classify claude_code instead of silently
+/// misattributing to qwen_code (rm-345).
+const CLAUDE_ONLY_JSONL_KEYS: [&str; 5] = [
+    "parentUuid",
+    "isSidechain",
+    "toolUseResult",
+    "requestId",
+    "promptId",
+];
+
+/// A claude model string inside `message.model` survives sessionId
+/// scrubbing, and qwen_code never stamps claude models — so one disqualifies
+/// the qwen uuid branch just like the claude-only keys do (rm-345).
+fn carries_claude_model(obj: &Map<String, Value>) -> bool {
+    obj.get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("model"))
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.to_ascii_lowercase().starts_with("claude"))
 }
 
 fn is_qwen_code_event(obj: &Map<String, Value>) -> bool {
@@ -1694,6 +1734,10 @@ fn is_qwen_code_event(obj: &Map<String, Value>) -> bool {
     }
     if obj.contains_key("uuid") {
         return !obj.contains_key("sessionId")
+            && !CLAUDE_ONLY_JSONL_KEYS
+                .iter()
+                .any(|key| obj.contains_key(*key))
+            && !carries_claude_model(obj)
             && (obj.contains_key("message")
                 || obj.contains_key("result")
                 || obj.contains_key("subtype"));
@@ -5343,5 +5387,110 @@ mod tests {
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
+
+    #[test]
+    fn qwen_predicate_rejects_claude_only_markers() {
+        // rm-345: privacy-scrubbed claude-code exports drop sessionId but keep
+        // claude-only keys. The uuid branch of is_qwen_code_event used to
+        // classify any sessionId-less `message`/`result`/`subtype` object as
+        // qwen_code, silently misattributing those exports. Any claude-only
+        // marker must disqualify the object.
+        let claude_only_markers = [
+            "parentUuid",
+            "isSidechain",
+            "toolUseResult",
+            "requestId",
+            "promptId",
+        ];
+        for marker in claude_only_markers {
+            let mut obj = Map::new();
+            obj.insert("type".into(), Value::String("user".into()));
+            obj.insert("uuid".into(), Value::String("u-1".into()));
+            obj.insert("message".into(), serde_json::json!({"role": "user"}));
+            obj.insert(marker.into(), Value::Null);
+            assert!(
+                !is_qwen_code_event(&obj),
+                "claude-only marker `{marker}` must disqualify a claude export"
+            );
+        }
+
+        // A claude model string on a uuid-keyed object is just as
+        // disqualifying as the keys above — it survives sessionId scrubbing
+        // and qwen_code never stamps claude models.
+        let mut claude_model = Map::new();
+        claude_model.insert("type".into(), Value::String("assistant".into()));
+        claude_model.insert("uuid".into(), Value::String("u-3".into()));
+        claude_model.insert(
+            "message".into(),
+            serde_json::json!({"role": "assistant", "model": "claude-opus-4.6"}),
+        );
+        assert!(!is_qwen_code_event(&claude_model));
+
+        // Genuine qwen_code events (uuid + message, no claude-only keys,
+        // no sessionId, no claude model) must still match.
+        let mut genuine = Map::new();
+        genuine.insert("type".into(), Value::String("user".into()));
+        genuine.insert("uuid".into(), Value::String("u-2".into()));
+        genuine.insert(
+            "message".into(),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        );
+        assert!(is_qwen_code_event(&genuine));
+
+        // A uuid-keyed object naming a qwen model still matches.
+        let mut qwen_model = Map::new();
+        qwen_model.insert("type".into(), Value::String("assistant".into()));
+        qwen_model.insert("uuid".into(), Value::String("u-4".into()));
+        qwen_model.insert(
+            "message".into(),
+            serde_json::json!({"role": "assistant", "model": "qwen3-coder-plus"}),
+        );
+        assert!(is_qwen_code_event(&qwen_model));
+
+        // And the sessionId fast path is untouched.
+        let mut session_id = Map::new();
+        session_id.insert("type".into(), Value::String("user".into()));
+        session_id.insert("session_id".into(), Value::String("s-1".into()));
+        assert!(is_qwen_code_event(&session_id));
+    }
+
+    #[test]
+    fn claude_export_stripped_of_session_id_is_not_qwen_code() {
+        // rm-345 end-to-end: a claude-code transcript scrubbed of sessionId
+        // keeps claude-only keys (parentUuid here), so is_qwen_code_jsonl must
+        // not claim the file and parse_claude_code_jsonl must — the session
+        // classifies claude_code instead of qwen_code.
+        let dir = std::env::temp_dir().join("agenttrace-rm345-claude-stripped");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stripped.jsonl");
+        std::fs::write(
+            &path,
+            "{\"uuid\":\"a1\",\"parentUuid\":\"a0\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"do the thing\"}}\n",
+        )
+        .unwrap();
+
+        let parsed = parse_file(&path).expect("claude transcript must parse");
+        assert_eq!(
+            parsed.metrics.source_tool, "claude_code",
+            "sessionId-stripped claude export must not classify qwen_code"
+        );
+
+        // The marker-free scrub shape from the live PoC: no claude-only keys,
+        // but the assistant line still stamps a claude model string.
+        let model_only = dir.join("stripped-model-only.jsonl");
+        std::fs::write(
+            &model_only,
+            "{\"type\":\"user\",\"uuid\":\"b1\",\"timestamp\":\"2026-05-03T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"degraded claude\"}}\n\
+             {\"type\":\"assistant\",\"uuid\":\"b2\",\"timestamp\":\"2026-05-03T10:00:01Z\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-4.6\",\"content\":[{\"type\":\"text\",\"text\":\"reply\"}]}}\n",
+        )
+        .unwrap();
+        let parsed = parse_file(&model_only).expect("marker-free transcript must parse");
+        assert_eq!(
+            parsed.metrics.source_tool, "claude_code",
+            "a claude model string must disqualify the qwen uuid branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

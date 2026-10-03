@@ -309,6 +309,53 @@ fn run() -> anyhow::Result<()> {
         let out = render_governance_report(&value, &args.format)?;
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
+        // rm-346 arm-a: the --fail-* gate flags are parsed on every report
+        // path but used to be evaluated only under --overview — a gated
+        // `--audit` (or sibling governance report) exited rc0 with 0-byte
+        // stderr on a corpus the same flags condemn. Honor them here too:
+        // the report still prints, the failures and evidence go to stderr,
+        // and the process exits 2.
+        let overview = compute_overview(&sessions);
+        let failures = evaluate_overview_gate(
+            &overview,
+            &sessions,
+            args.fail_under_health,
+            args.fail_on_critical,
+            args.max_tool_fail_rate,
+        );
+        if !failures.is_empty() {
+            for failure in failures {
+                eprintln!("Gate failed: {failure}");
+            }
+            eprintln!("Local evidence:");
+            eprintln!("- avg health: {:.1}", average_health(&sessions));
+            eprintln!("- critical sessions: {}", overview.critical);
+            eprintln!("- tool fail rate: {:.1}%", tool_fail_rate(&sessions));
+            if let Some(session) = sessions.iter().min_by(|left, right| {
+                left.health
+                    .cmp(&right.health)
+                    .then_with(|| left.path.cmp(&right.path))
+                    .then_with(|| left.name.cmp(&right.name))
+            }) {
+                eprintln!("- lowest-health session: {}", session.path);
+            }
+            let inspect = if args.demo {
+                format!(
+                    "agenttrace --demo {} -f json",
+                    governance_inspect_flag(&args)
+                )
+            } else if let Some(dir) = args.dir.as_deref() {
+                format!(
+                    "agenttrace -d {:?} {} -f json",
+                    dir,
+                    governance_inspect_flag(&args)
+                )
+            } else {
+                format!("agenttrace {} -f json", governance_inspect_flag(&args))
+            };
+            eprintln!("- inspect: `{inspect}`");
+            std::process::exit(2);
+        }
         return Ok(());
     }
 
@@ -1204,6 +1251,22 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The report flag that selected the governance branch, for gate-evidence
+/// `inspect` hints that reproduce the gated run (rm-346 arm-a).
+fn governance_inspect_flag(args: &Args) -> &'static str {
+    if args.audit {
+        "--audit"
+    } else if args.recommend {
+        "--recommend"
+    } else if args.mcp_governance {
+        "--mcp-governance"
+    } else if args.context_trends {
+        "--context-trends"
+    } else {
+        "--delivery-evidence"
+    }
+}
+
 fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     if !(0..=100).contains(&args.fail_under_health) {
         bail!("--fail-under-health must be between 0 and 100");
@@ -1216,6 +1279,29 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     }
     if args.search.is_some() && args.search_limit == 0 {
         bail!("--search-limit must be at least 1");
+    }
+    // rm-346 arm-b: the --baseline-max-*-delta-pct thresholds used to reach
+    // the comparison unvalidated — NaN made the bound vacuous (rc0, zero
+    // stderr, on a corpus the baseline condemns) and a negative value
+    // false-failed a byte-identical baseline. Reject both before any
+    // comparison runs.
+    for (flag, value) in [
+        (
+            "--baseline-max-duration-delta-pct",
+            args.baseline_max_duration_delta_pct,
+        ),
+        (
+            "--baseline-max-cost-delta-pct",
+            args.baseline_max_cost_delta_pct,
+        ),
+        (
+            "--baseline-max-token-delta-pct",
+            args.baseline_max_token_delta_pct,
+        ),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            bail!("{flag} must be a finite number >= 0 (got {value})");
+        }
     }
     Ok(())
 }
