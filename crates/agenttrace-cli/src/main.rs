@@ -8,9 +8,9 @@ use agenttrace_core::{
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
     report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, search_sessions, session_capability, tool_fail_rate, total_tokens,
-    update_pricing, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
-    TimeRange, VERSION,
+    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
+    tool_fail_rate, total_tokens, update_pricing, BaselineThresholds, LoadOptions, LoadReport,
+    ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -691,7 +691,11 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        serde_json::Value::String(value) => value.clone(),
+        // rm-383 review-fix: governance-family reports render
+        // journal-derived strings (e.g. mcp_server_name inferred from a
+        // crafted tool name) through this leaf; control bytes must not
+        // reach the terminal (same contract as the TSV/search renderers).
+        serde_json::Value::String(value) => sanitize_line_segment(value),
         _ => value.to_string(),
     }
 }
@@ -1072,13 +1076,18 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
     let mut lines =
         vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
     lines.extend(sessions.into_iter().map(|session| {
+        // rm-383: name, source tool, and model are
+        // transcript-derived; sanitize them for terminal display and TSV
+        // row integrity (assess PoC: a crafted session name carried a raw
+        // OSC-52 clipboard-write byte-for-byte into the --sessions TSV).
+        // JSON output escapes control bytes losslessly and stays untouched.
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
-            session.name,
+            sanitize_line_segment(&session.name),
             session.health,
             session_capability(session),
-            session.metrics.source_tool,
-            session.metrics.model_used,
+            sanitize_line_segment(&session.metrics.source_tool),
+            sanitize_line_segment(&session.metrics.model_used),
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,
@@ -1265,6 +1274,80 @@ mod tests {
         let second = render();
         assert_eq!(first, second);
         assert!(first.contains(agenttrace_core::DEMO_REPORT_EPOCH));
+    }
+
+    #[test]
+    fn session_list_tsv_sanitizes_transcript_derived_control_bytes() {
+        // rm-383: assess PoC — a crafted session name carried a raw OSC-52
+        // clipboard-write sequence byte-for-byte into the --sessions TSV
+        // (byte-verified in delegate/172562a8…-scratch/evidence.log). Text
+        // renderers neutralize control bytes; JSON output escapes them
+        // losslessly and is untouched.
+        let session = Session {
+            name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
+            path: "/tmp/osc.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                source_tool: "pi\u{0007}".to_string(),
+                model_used: "m\u{001b}[2J".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        let tsv = render_session_list(std::slice::from_ref(&session), "tsv", 20);
+        assert!(
+            tsv.lines()
+                // Tab is the TSV separator itself; no OTHER control byte
+                // may survive in any cell.
+                .all(|line| line.chars().all(|c| !c.is_control() || c == '\t')),
+            "no raw control bytes in the TSV: {tsv:?}"
+        );
+        assert!(tsv.contains('\u{FFFD}'));
+        assert!(tsv.contains("]52;c;aGVsbG8="));
+        // JSON output keeps the bytes, escaped — data integrity over
+        // terminal trust, by design.
+        let json = render_session_list(&[session], "json", 20);
+        assert!(json.contains("\\u001b"));
+    }
+
+    #[test]
+    fn governance_text_render_sanitizes_report_string_leaves() {
+        // rm-383 review-fix (ff2edfcf F1): the governance-family plain
+        // renderer behind --mcp-governance (and the shared render_plain_value
+        // used by --audit/--recommend/--context-trends/--delivery-evidence,
+        // text being the DEFAULT format) printed report strings raw — a
+        // crafted mcp_server_name derived from a tool name
+        // `mcp__e<ESC>]52;c;aGVsbG8<BEL>vil__tool` carried a byte-for-byte
+        // clipboard-write OSC into the terminal. Control bytes → U+FFFD;
+        // printable CSI tails legitimately survive; JSON stays escaped.
+        let report = serde_json::json!({
+            "servers": [
+                {
+                    "server": "e\u{001b}]52;c;aGVsbG8\u{0007}vil",
+                    "invoked_sessions": 1,
+                }
+            ],
+            "audited_sessions": 1,
+        });
+        let text = render_plain_value(&report, 0);
+        assert!(
+            // Newline is the renderer's own layout byte; no OTHER control
+            // byte may survive in any line (same idiom as the TSV test).
+            text.lines()
+                .all(|line| line.chars().all(|c| !c.is_control())),
+            "no raw control bytes in governance text output: {text:?}"
+        );
+        assert!(text.contains('\u{FFFD}'));
+        assert!(text.contains("]52;c;aGVsbG8"));
+        // Non-string leaves render untouched.
+        assert!(text.contains("invoked_sessions: 1"));
+        // JSON output keeps the bytes escaped — data integrity over
+        // terminal trust, by design.
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("\\u001b"));
     }
 
     #[test]

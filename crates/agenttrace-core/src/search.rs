@@ -114,23 +114,37 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         return out;
     }
     for result in results {
+        // rm-383: names, tool/model strings, cwd/path and match evidence are
+        // transcript-derived; a raw ESC/OSC-52 in any of them must not reach
+        // the terminal (assess PoC: --search -f text emitted a verbatim
+        // clipboard-write sequence from a crafted tool name). JSON output
+        // escapes control bytes losslessly and is intentionally untouched.
         out.push_str(&format!(
             "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
-            result.name,
-            result.source_tool,
-            result.model,
+            crate::statusline::sanitize_line_segment(&result.name),
+            crate::statusline::sanitize_line_segment(&result.source_tool),
+            crate::statusline::sanitize_line_segment(&result.model),
             result.health,
             format_cost(result.cost),
             format_tokens(result.tokens)
         ));
         if !result.cwd.is_empty() {
-            out.push_str(&format!("  cwd: {}\n", result.cwd));
+            out.push_str(&format!(
+                "  cwd: {}\n",
+                crate::statusline::sanitize_line_segment(&result.cwd)
+            ));
         }
         if !result.path.is_empty() {
-            out.push_str(&format!("  path: {}\n", result.path));
+            out.push_str(&format!(
+                "  path: {}\n",
+                crate::statusline::sanitize_line_segment(&result.path)
+            ));
         }
         for item in &result.matches {
-            out.push_str(&format!("  - {}\n", item));
+            out.push_str(&format!(
+                "  - {}\n",
+                crate::statusline::sanitize_line_segment(item)
+            ));
         }
     }
     out
@@ -280,5 +294,34 @@ mod tests {
         let report = report_search_json(&[result]);
         assert!(report.contains("\"cost\": 0,"));
         assert!(!report.contains("\"cost\": 0.0,"));
+    }
+
+    #[test]
+    fn search_text_sanitizes_transcript_derived_control_bytes() {
+        // rm-383: assess PoC (delegate/172562a8…-scratch/osc-search.txt) —
+        // `--search -f text` rendered a raw OSC-52 clipboard-write sequence
+        // from a crafted tool name byte-for-byte into the terminal. Every
+        // transcript-derived field of the text renderer must come out free
+        // of control bytes; the printable tail of the sequence survives as
+        // text (only the ESC/BEL bytes are neutralized).
+        let result = SearchResult {
+            name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
+            path: "/tmp/s.jsonl".to_string(),
+            cwd: "/tmp\u{001b}[31mred".to_string(),
+            source_tool: "pi\u{0007}".to_string(),
+            model: "m\u{001b}[2J".to_string(),
+            health: 88,
+            cost: 0.0,
+            tokens: 42,
+            matches: vec!["tool argument: x\u{001b}]52;c;aGVsbG8=\u{0007}".to_string()],
+        };
+        let text = report_search_text(&[result], "probe");
+        assert!(
+            text.lines()
+                .all(|line| line.chars().all(|c| !c.is_control())),
+            "no raw control bytes may reach the terminal: {text:?}"
+        );
+        assert!(text.contains('\u{FFFD}'));
+        assert!(text.contains("]52;c;aGVsbG8="));
     }
 }

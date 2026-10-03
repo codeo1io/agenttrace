@@ -2,8 +2,8 @@ use crate::{
     average_health, canonical_sessions, classify_tool_authority, context_trends, cost_audit,
     delivery_evidence, fmt_duration, format_cost, format_count, format_tokens,
     highest_authority_for_metrics, is_high_authority_category, mcp_governance, recommendations,
-    report_scope, round4, sorted_keys, sorted_set, total_tokens, Anomaly, GroupOverview, Overview,
-    Session, ToolCall, VERSION,
+    report_scope, round4, sanitize_line_segment, sorted_keys, sorted_set, total_tokens, Anomaly,
+    GroupOverview, Overview, Session, ToolCall, VERSION,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -287,7 +287,9 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         language.t("Estimated cost", "估算成本"),
         format_cost(metrics.cost_estimated),
         language.t("model", "模型"),
-        metrics.model_used
+        // rm-383: model strings are transcript-derived; sanitize for the
+        // terminal like every other text-renderer field.
+        sanitize_line_segment(&metrics.model_used)
     ));
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
@@ -368,7 +370,14 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         out.push_str(&sub);
         out.push('\n');
         for (tool, count) in top_tool_rows(&metrics.tool_usage).into_iter().take(8) {
-            out.push_str(&format!("  {:<35} {:>4}\n", tool, count));
+            // rm-383: tool names are journal/transcript-derived (assess PoC:
+            // --latest -f text rendered a raw OSC-52 clipboard-write from a
+            // crafted tool name); no control byte may reach the terminal.
+            out.push_str(&format!(
+                "  {:<35} {:>4}\n",
+                sanitize_line_segment(&tool),
+                count
+            ));
         }
         out.push('\n');
     }
@@ -431,7 +440,9 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
                 anomaly_emoji(&anomaly.severity),
                 severity_label_for_language(&anomaly.severity, language),
                 anomaly_type_label_for_language(&anomaly.kind, language),
-                anomaly_detail_for_language(anomaly, language)
+                // rm-383: anomaly detail strings embed parsed transcript
+                // values; sanitize like every other text-renderer field.
+                sanitize_line_segment(&anomaly_detail_for_language(anomaly, language))
             ));
         }
     }
@@ -2630,6 +2641,44 @@ mod tests {
         let sessions = vec![session.clone(), session];
         let summary = overview_summary(&crate::Overview::default(), &sessions);
         assert_eq!(summary["total_tokens"].as_i64(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn session_text_report_sanitizes_transcript_derived_control_bytes() {
+        // rm-383: assess PoC (delegate/172562a8…-scratch/osc-latest.txt) —
+        // `--latest -f text` rendered a raw OSC-52 clipboard-write sequence
+        // from a crafted tool name in the TOP TOOLS table byte-for-byte.
+        // Model strings and anomaly detail are transcript-derived the same
+        // way; none may carry control bytes into the terminal. The report's
+        // own newlines are the only control characters in the output.
+        let mut metrics = Metrics {
+            model_used: "m\u{001b}[2J".to_string(),
+            ..Metrics::default()
+        };
+        metrics
+            .tool_usage
+            .insert("evil\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(), 3);
+        let session = Session {
+            name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
+            path: "/tmp/osc.jsonl".to_string(),
+            cwd: String::new(),
+            metrics,
+            anomalies: vec![crate::Anomaly {
+                kind: "tool_failures".to_string(),
+                severity: "low".to_string(),
+                detail: "2 failed, last: boom\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
+            }],
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let text = report_text(&session);
+        assert!(
+            !text.contains('\u{001b}') && !text.contains('\u{0007}'),
+            "no raw ESC/BEL bytes may reach the terminal: {text:?}"
+        );
+        assert!(text.contains('\u{FFFD}'));
+        assert!(text.contains("]52;c;aGVsbG8="));
     }
 
     #[test]
