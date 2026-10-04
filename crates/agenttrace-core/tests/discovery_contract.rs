@@ -2658,3 +2658,79 @@ fn doctor_names_symlinked_session_roots_instead_of_silent_following() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn custom_dir_walk_skips_npm_and_package_manifests() {
+    // rm-370 (cycle 4): custom `-d` walks must not admit npm/package
+    // manifests as session candidates. Live evidence: `-d ~/.pi --doctor`
+    // reported 157 failed rows whose samples were
+    // `agent-cliproxy-only/models-store.json`,
+    // `agent-cliproxy-only/npm/package-lock.json`, and
+    // `agent/npm/package-lock.json`.
+    let root = temp_root("agenttrace-manifest-noise");
+    fs::create_dir_all(root.join("agent/npm")).expect("create npm dir");
+    fs::create_dir_all(root.join("agent-cliproxy-only")).expect("create cliproxy dir");
+    fs::create_dir_all(root.join("sessions")).expect("create sessions dir");
+    fs::write(root.join("agent/npm/package-lock.json"), "{}").expect("write package-lock");
+    fs::write(root.join("agent-cliproxy-only/models-store.json"), "{}")
+        .expect("write models-store");
+    fs::write(root.join("sessions/yarn.lock"), "{}").expect("write yarn lock");
+    let session_path = root.join("sessions/session.jsonl");
+    fs::write(&session_path, SAMPLE_JSONL).expect("write session");
+    // Aider's exact-name history keeps its admission (guarded for the
+    // aider-lane contract).
+    let aider_path = root.join(".aider.chat.history.md");
+    fs::write(&aider_path, "# aider chat started at 2026-05-02 10:00:00\n")
+        .expect("write aider history");
+
+    with_session_cache(&root.join("cache"), || {
+        let files = find_session_files(Some(&root));
+        assert!(
+            files.contains(&session_path),
+            "the real session must be found: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("package-lock.json")),
+            "package-lock.json must not be admitted as a session: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("models-store.json")),
+            "models-store.json must not be admitted as a session: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("yarn.lock")),
+            "*.lock manifests must not be admitted as sessions: {files:?}"
+        );
+        assert!(
+            files.contains(&aider_path),
+            "aider exact-name history keeps its admission: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn manifest_blocklist_leaves_auto_discovery_admission_unchanged() {
+    // rm-370 (cycle 4): the manifest blocklist is aimed at custom `-d`
+    // walks; the auto-discovery lane registers `<root>/<child>/sessions`
+    // only, so its admission set must be unchanged by the blocklist.
+    let root = temp_root("agenttrace-manifest-auto");
+    let home = root.join("home");
+    let sessions = home.join(".pi/agent/sessions");
+    fs::create_dir_all(&sessions).expect("create pi sessions dir");
+    fs::create_dir_all(home.join(".pi/agent/npm")).expect("create pi npm dir");
+    let session_path = sessions.join("pi-session.jsonl");
+    fs::write(&session_path, SAMPLE_JSONL).expect("write pi session");
+
+    with_home(&home, || {
+        let files = find_session_files(None);
+        assert_eq!(
+            files,
+            vec![session_path.clone()],
+            "auto discovery must keep finding the one real session and nothing else: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}

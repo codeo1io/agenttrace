@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
-out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
-
 fail() {
   echo "check-docs-commands: $*" >&2
   exit 1
 }
+
+# rm-369 (cycle 4): the binary default must be the repo's own release build,
+# not /tmp/agenttrace — /tmp persists across sessions on the CI fleet and a
+# days-old binary silently answered gate runs (observed on 2026-10-03).
+# AGENTTRACE_BIN still overrides for A/B against a pinned build.
+repo_root="$(git rev-parse --show-toplevel)" \
+  || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir/docs"
@@ -19,8 +25,8 @@ mkdir -p "$out_dir/docs"
 "$bin" --demo --overview -f json >"$out_dir/docs/overview.json"
 "$bin" --demo --search billing >"$out_dir/docs/search.txt"
 "$bin" --demo --search internal/ws -f json >"$out_dir/docs/search.json"
-"$bin" --demo --overview -f markdown -o "$out_dir/docs/overview.md" >/tmp/agenttrace-docs-md.stdout
-"$bin" --demo --overview -f html -o "$out_dir/docs/overview.html" >/tmp/agenttrace-docs-html.stdout
+"$bin" --demo --overview -f markdown -o "$out_dir/docs/overview.md" >"$out_dir/docs/overview-md.stdout"
+"$bin" --demo --overview -f html -o "$out_dir/docs/overview.html" >"$out_dir/docs/overview-html.stdout"
 for path in "$out_dir"/docs/*.json; do
   node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$path" \
     || fail "invalid JSON from documented command: $path"

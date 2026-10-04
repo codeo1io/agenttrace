@@ -668,6 +668,15 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.starts_with("request_dump_") || name == "sessions.json" {
         return false;
     }
+    // rm-370 (cycle 4): npm/package manifests are not sessions. Observed as
+    // doctor failure noise on custom `-d` walks over agent tool homes
+    // (`agent/npm/package-lock.json`, `agent-cliproxy-only/models-store.json`).
+    if name == "package-lock.json" || name == "models-store.json" {
+        return false;
+    }
+    if name.ends_with(".lock") {
+        return false;
+    }
     name.ends_with(".jsonl") || name.ends_with(".json")
 }
 
@@ -708,7 +717,7 @@ fn is_skipped_session_dir(path: &Path) -> bool {
         .map(|name| {
             matches!(
                 name,
-                "node_modules" | ".git" | "target" | "dist" | "build" | ".codegraph"
+                "node_modules" | ".git" | "target" | "dist" | "build" | ".codegraph" | "npm"
             )
         })
         .unwrap_or(false)
