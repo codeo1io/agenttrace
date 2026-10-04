@@ -211,7 +211,11 @@ fn render_status_line(payload: &Value) -> String {
             .get("exceeds_200k_tokens")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        parts.push(format!("ctx {used:.0}%{}", if over { " (!)" } else { "" }));
+        parts.push(format!(
+            "ctx {}{}",
+            bounded_pct(used),
+            if over { " (!)" } else { "" }
+        ));
     }
     for (window, label) in [("five_hour", "5h"), ("seven_day", "7d")] {
         let state = serde_json::from_value::<StatuslineRateLimitState>(
@@ -232,7 +236,7 @@ fn render_status_line(payload: &Value) -> String {
                 })
                 .map(|at| format!(" until {at}"))
                 .unwrap_or_default();
-            parts.push(format!("{label} {used:.0}%{reset}"));
+            parts.push(format!("{label} {}{reset}", bounded_pct(used)));
         }
     }
     if let Some(cache) = payload
@@ -241,14 +245,14 @@ fn render_status_line(payload: &Value) -> String {
         .and_then(Value::as_f64)
     {
         // hit_ratio is a 0..1 ratio, not a percentage.
-        parts.push(format!("cache {:.0}%", cache * 100.0));
+        parts.push(format!("cache {}", bounded_pct(cache * 100.0)));
     }
     if let Some(cost) = payload
         .get("cost")
         .and_then(|cost| cost.get("total_cost_usd"))
         .and_then(Value::as_f64)
     {
-        parts.push(format!("${cost:.2}"));
+        parts.push(bounded_cost(cost));
     }
     if parts.is_empty() {
         "agenttrace".to_string()
@@ -1121,5 +1125,64 @@ mod tests {
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// rm-437: statusline numerics are bounded. Hostile or corrupt journal
+/// payloads (1e308 costs, non-finite ratios) must never stretch the
+/// one-line contract; display saturates with explicit markers instead.
+fn bounded_pct(value: f64) -> String {
+    if !value.is_finite() {
+        "--%".to_string()
+    } else if value > 999.5 {
+        "999%+".to_string()
+    } else if value < 0.0 {
+        "0%".to_string()
+    } else {
+        format!("{value:.0}%")
+    }
+}
+
+/// Costs keep two decimals up to $1k, a compact tera suffix to $1e15, and a
+/// compact exponent above that; the minus sign sits before the symbol.
+fn bounded_cost(value: f64) -> String {
+    if value < 0.0 {
+        format!("-{}", bounded_cost(-value))
+    } else if !value.is_finite() {
+        "$0.00".to_string()
+    } else if value >= 1e15 {
+        format!("${value:e}")
+    } else if value >= 999.95 {
+        format!("${:.1}T", value / 1e12)
+    } else {
+        format!("${value:.2}")
+    }
+}
+
+#[cfg(test)]
+mod rm437_statusline_bounds {
+    use super::{bounded_cost, bounded_pct};
+
+    #[test]
+    fn bounded_pct_handles_hostile_magnitudes() {
+        assert_eq!(bounded_pct(f64::NAN), "--%");
+        assert_eq!(bounded_pct(f64::INFINITY), "--%");
+        assert_eq!(bounded_pct(1e308), "999%+");
+        assert_eq!(bounded_pct(-3.0), "0%");
+        assert_eq!(bounded_pct(74.9), "75%");
+    }
+
+    #[test]
+    fn bounded_cost_never_dumps_digits() {
+        assert_eq!(bounded_cost(1.25), "$1.25");
+        assert_eq!(bounded_cost(-5.5), "-$5.50");
+        assert_eq!(bounded_cost(f64::NAN), "$0.00");
+        assert_eq!(bounded_cost(1e308), "$1e308");
+        assert_eq!(bounded_cost(5e14), "$500.0T");
+        let hostile = bounded_cost(1e308);
+        assert!(
+            hostile.len() < 12,
+            "hostile cost must stay compact: {hostile}"
+        );
     }
 }

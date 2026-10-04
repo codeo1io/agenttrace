@@ -507,7 +507,20 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
                 "context",
                 "Start a narrower follow-up session",
                 "Conversation and tool context leave little room for the active task.".to_string(),
-                vec![format!("session={}", session.name), format!("utilization={:.1}%", context.utilization_pct)],
+                vec![
+                    format!("session={}", session.name),
+                    format!("utilization={:.1}%", context.utilization_pct),
+                    // rm-436: disclose whether the numerator is measured
+                    // usage telemetry or a clamped byte-estimate.
+                    format!(
+                        "source={}",
+                        if context.measured {
+                            "usage-tokens"
+                        } else {
+                            "byte-estimate"
+                        }
+                    ),
+                ],
                 session.metrics.cost_estimated * 0.2,
                 (context.conversation_history / 5) as i64,
                 "medium",

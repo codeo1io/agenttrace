@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+
+### Fixed
+
+- context-pressure diagnostics now report the measured per-turn usage peak
+  (input + cache-creation + cache-read tokens) instead of a whole-session
+  byte estimate, eliminating false P0 context-pressure recommendations on
+  long ordinary sessions; sessions without usage data fall back to the
+  estimate clamped at 100% and flagged `measured: false` with a
+  `source=byte-estimate` disclosure on the recommendation (rm-436)
+- statusline numeric segments (cost, context %, rate-limit %, cache hit)
+  are bounded against hostile magnitudes — a `1e308` cost no longer
+  renders a 313-character line (rm-437)
+- duration formatting gains day/year tiers (p95 incident gaps no longer
+  render raw seconds like `253402300800.0s`) and report cells truncate at
+  token boundaries, never mid-number (rm-438)
 ### Fixed
 
 - Flat-transcript sessions pair tool results with their calls (rm-230): the flat Claude-transcript parser arm dropped the `tool_use_id` → `tool_call_id` join key, so every tool call in that format was reported as `unmatched` and fed the high-severity latency-review filter even when its result was present. Explicit ids are now preserved verbatim on both sides and id-less entries pair positionally per tool, so a present result no longer counts as unmatched — and one tool's genuinely missing result is no longer masked by another tool's surplus result. The session cache schema was bumped (20 → 21) so previously cached sessions regenerate under the corrected pairing.

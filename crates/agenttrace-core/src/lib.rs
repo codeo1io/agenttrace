@@ -2532,3 +2532,18 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod rm438_duration_tiers {
+    use crate::fmt_duration;
+
+    #[test]
+    fn day_tier_renders() {
+        assert_eq!(fmt_duration(90_061.0), "1d 1h");
+    }
+
+    #[test]
+    fn year_tier_renders_and_bounds_the_gap_dump() {
+        assert_eq!(fmt_duration(253_402_300_800.0), "8035y 122d");
+    }
+}

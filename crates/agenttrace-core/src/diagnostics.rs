@@ -1429,3 +1429,84 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod rm436_context_utilization {
+    use super::context_utilization;
+    use crate::Event;
+
+    fn ev(content_len: usize, usage: &[(&str, i64)]) -> Event {
+        Event {
+            content: "x".repeat(content_len),
+            usage: usage.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn measured_peak_suppresses_false_p0_on_long_sessions() {
+        // 40 turns x 5KB: the byte-estimate heuristic would report ~57%
+        // (warning) on this shape; the measured peak says 11%.
+        let events: Vec<Event> = (0..40)
+            .map(|_| ev(5_000, &[("input_tokens", 22_000)]))
+            .collect();
+        let ctx = context_utilization(&events, "claude-sonnet-4-5");
+        assert!(ctx.measured, "usage-bearing session must be measured");
+        assert!(
+            (ctx.utilization_pct - 11.0).abs() < 0.01,
+            "got {}",
+            ctx.utilization_pct
+        );
+        assert_eq!(ctx.risk_level, "good");
+    }
+
+    #[test]
+    fn measured_overshoot_passes_through_unclamped() {
+        let events = vec![ev(1_000, &[("input_tokens", 250_000)])];
+        let ctx = context_utilization(&events, "claude-sonnet-4-5");
+        assert!(ctx.measured);
+        assert!(
+            (ctx.utilization_pct - 125.0).abs() < 0.01,
+            "got {}",
+            ctx.utilization_pct
+        );
+    }
+
+    #[test]
+    fn cache_tokens_count_toward_the_measured_peak() {
+        let events = vec![ev(
+            1_000,
+            &[
+                ("input_tokens", 5_000),
+                ("cache_creation_input_tokens", 10_000),
+                ("cache_read_input_tokens", 60_000),
+            ],
+        )];
+        let ctx = context_utilization(&events, "claude-sonnet-4-5");
+        assert!(
+            (ctx.utilization_pct - 37.5).abs() < 0.01,
+            "got {}",
+            ctx.utilization_pct
+        );
+    }
+
+    #[test]
+    fn estimate_clamps_at_100_and_is_flagged() {
+        // No usage anywhere: 1MB content would estimate ~257%.
+        let events = vec![ev(1_000_000, &[])];
+        let ctx = context_utilization(&events, "claude-sonnet-4-5");
+        assert!(!ctx.measured);
+        assert_eq!(
+            ctx.utilization_pct, 100.0,
+            "estimate must be bounded at the window"
+        );
+    }
+
+    #[test]
+    fn hostile_single_message_is_bounded_never_7640() {
+        let events = vec![ev(20_000_000, &[])];
+        let ctx = context_utilization(&events, "claude-sonnet-4-5");
+        assert_eq!(ctx.utilization_pct, 100.0);
+        assert!(!ctx.measured);
+    }
+}

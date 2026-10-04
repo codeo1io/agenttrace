@@ -2826,3 +2826,25 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod rm438_token_truncation {
+    use super::text_cell;
+
+    #[test]
+    fn never_splits_a_number_mid_token() {
+        // Old behavior: "over 7038952..." — the truncated literal silently
+        // hid an order of magnitude. Numbers elide whole.
+        assert_eq!(text_cell("over 7038952 tokens", 12), "over ...");
+    }
+
+    #[test]
+    fn fitting_cells_are_unchanged() {
+        assert_eq!(text_cell("1h 43m", 10), "1h 43m");
+    }
+
+    #[test]
+    fn oversized_single_token_elides_whole() {
+        assert_eq!(text_cell("703895270389527038952", 12), "...");
+    }
+}
