@@ -162,11 +162,12 @@ a commit reached `main`.
 ### Flags go before the session path
 
 `agenttrace` keeps Go-`flag`-compatible argument parsing: option flags are
-recognized only **before** the first positional argument. Anything after the
-positional is treated as positional context and flags there are ignored, so:
+recognized only **before** the first positional argument. Flags after the
+positional are not parsed, so such invocations are rejected with a usage
+error naming the dropped arguments:
 
 ```bash
-agenttrace sessions.jsonl -f json    # -f is IGNORED (after the path)
+agenttrace sessions.jsonl -f json    # rejected: `-f json` follows the path
 agenttrace -f json sessions.jsonl    # -f json works
 ```
 

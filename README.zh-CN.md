@@ -108,10 +108,10 @@ agenttrace
 
 ### 标志写在会话路径之前
 
-`agenttrace` 保持与 Go `flag` 兼容的参数解析：只有在第一个位置参数**之前**的选项标志才会被识别。位置参数之后的任何内容都被当作位置上下文处理，其后的标志会被忽略，因此：
+`agenttrace` 保持与 Go `flag` 兼容的参数解析：只有在第一个位置参数**之前**的选项标志才会被识别。位置参数之后的标志不会被解析，这类调用会以用法错误退出，并指明被丢弃的参数：
 
 ```bash
-agenttrace sessions.jsonl -f json    # -f 被忽略（在路径之后）
+agenttrace sessions.jsonl -f json    # 被拒绝：`-f json` 位于路径之后
 agenttrace -f json sessions.jsonl    # -f json 生效
 ```
 
