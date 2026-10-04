@@ -149,6 +149,7 @@ agenttrace --overview --lang zh
 - 文档导航：[docs/README.md](docs/README.md)
 - CI 集成：[docs/guides/ci-integration.md](docs/guides/ci-integration.md)
 - 治理报告：[docs/guides/governance-reports.md](docs/guides/governance-reports.md)
+- 按时间统计用量（按日/周/月、5 小时窗口）：[docs/guides/usage-over-time.md](docs/guides/usage-over-time.md)
 - Cursor 导入：[docs/guides/cursor-import.md](docs/guides/cursor-import.md)
 - Parser 指南：[docs/guides/parser-guide.md](docs/guides/parser-guide.md)
 - 发布维护指南：[docs/maintainers/distribution.md](docs/maintainers/distribution.md)

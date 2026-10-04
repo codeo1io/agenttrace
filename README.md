@@ -184,6 +184,7 @@ a commit reached `main`.
 - Documentation index: [docs/README.md](docs/README.md)
 - CI setup: [docs/guides/ci-integration.md](docs/guides/ci-integration.md)
 - Governance reports: [docs/guides/governance-reports.md](docs/guides/governance-reports.md)
+- Usage over time (daily/weekly/monthly, 5-hour blocks): [docs/guides/usage-over-time.md](docs/guides/usage-over-time.md)
 - Cursor import: [docs/guides/cursor-import.md](docs/guides/cursor-import.md)
 - Parser guide: [docs/guides/parser-guide.md](docs/guides/parser-guide.md)
 - Maintainer distribution guide: [docs/maintainers/distribution.md](docs/maintainers/distribution.md)
