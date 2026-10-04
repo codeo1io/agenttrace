@@ -302,10 +302,10 @@ fn p95_gap(session: &Session) -> f64 {
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect::<Vec<_>>();
     gaps.sort_by(f64::total_cmp);
-    let index = ((gaps.len() as f64) * 0.95) as usize;
-    gaps.get(index.min(gaps.len().saturating_sub(1)))
-        .copied()
-        .unwrap_or(0.0)
+    // House percentile definition only (rm-420): this used to be an
+    // inline trunc+clamp copy — semantically right, but a literal
+    // duplicate that could drift from the pinned crate definition.
+    crate::percentile(&gaps, 0.95)
 }
 
 pub(crate) fn analyze_diagnostics(events: &[Event], metrics: &Metrics) -> Diagnostics {
@@ -335,7 +335,11 @@ fn trace_steps(events: &[Event], _model: &str) -> Vec<TraceStep> {
             let duration_sec = parse_time(&event.timestamp)
                 .zip(result.and_then(|event| parse_time(&event.timestamp)))
                 .map(|(start, end)| (end - start).num_milliseconds() as f64 / 1000.0)
-                .filter(|duration| (0.0..3600.0).contains(duration))
+                // rm-004 residual arm: this used to clamp at 3600s,
+                // collapsing a 2h call to 0.0 while tool_latencies
+                // kept it (7199.0s) — same 24h sanity bound now, so
+                // steps and latencies agree on one report.
+                .filter(|duration| *duration > 0.0 && *duration <= 86_400.0)
                 .unwrap_or(0.0);
             TraceStep {
                 kind: "tool".to_string(),
@@ -821,10 +825,12 @@ fn tool_latencies(events: &[Event]) -> Vec<ToolLatency> {
             } else {
                 values.iter().sum::<f64>() / values.len() as f64
             };
-            let p95_sec = values
-                .get(((values.len() as f64 * 0.95).ceil() as usize).saturating_sub(1))
-                .copied()
-                .unwrap_or(0.0);
+            // rm-420: a nearest-rank (ceil-1) copy used to live here and
+            // read one rank low at every n ≡ 0 (mod 20) — a 19×2s+1×31s
+            // corpus reported p95=2.0/is_slow=false beside max=31.0.
+            // House definition only (crate::percentile, values already
+            // sorted above via total_cmp).
+            let p95_sec = crate::percentile(&values, 0.95);
             ToolLatency {
                 tool_name,
                 count,
@@ -1249,6 +1255,94 @@ mod tests {
         let alert = predict_cost_anomaly(&history, &current);
         assert_eq!(alert.level, "warning");
         assert!(alert.message.contains("2.5x"));
+    }
+
+    #[test]
+    fn tool_latencies_p95_uses_house_percentile_at_mod_20_boundary() {
+        // rm-420 golden: 19 x 2s + 1 x 31s. A nearest-rank (ceil-1)
+        // percentile reads one rank low at exactly n=20 and reported
+        // p95=2.0 / is_slow=false beside max_sec=31.0; the house
+        // definition (crate::percentile) must report the 31s tail.
+        let mut events = Vec::new();
+        let mut t = 0;
+        for index in 0..20 {
+            let duration = if index == 0 { 31 } else { 2 };
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: format!("2026-01-01T00:{:02}:{:02}Z", (t / 60) % 60, t % 60),
+                tool_calls: vec![ToolCall {
+                    id: format!("c{index}"),
+                    name: "bash".to_string(),
+                    args: "{}".to_string(),
+                }],
+                ..Event::default()
+            });
+            t += duration;
+            events.push(Event {
+                role: "tool".to_string(),
+                timestamp: format!("2026-01-01T00:{:02}:{:02}Z", (t / 60) % 60, t % 60),
+                tool_call_id: format!("c{index}"),
+                content: "done".to_string(),
+                ..Event::default()
+            });
+            t += 1;
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        let latency = &diagnostics.tool_latencies[0];
+        assert_eq!(latency.count, 20);
+        assert!(
+            (latency.p95_sec - 31.0).abs() < 1e-6,
+            "p95 must be the 31s tail, got {}",
+            latency.p95_sec
+        );
+        assert!((latency.max_sec - 31.0).abs() < 1e-6);
+        assert!(latency.is_slow, "the 31s tail must trip the >30s slow gate");
+    }
+
+    #[test]
+    fn p95_gap_uses_house_percentile_at_mod_20_boundary() {
+        // rm-420 golden: gaps 1..=20s. House trunc(len*p) picks index 19
+        // -> 20.0; a nearest-rank re-copy would pick 19.0. Pins the
+        // p95_gap routing through crate::percentile.
+        let mut session = session_with_cost("gaps", 1, 1.0);
+        session.metrics.gaps_sec = (1..=20).map(|value| value as f64).collect();
+        assert!((p95_gap(&session) - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trace_steps_agree_with_tool_latencies_beyond_one_hour() {
+        // rm-004 residual-arm golden: a 2h call must not collapse to
+        // dur=0.0 in steps while tool_latencies keeps 7199s — one
+        // report, one number.
+        let events = vec![
+            Event {
+                role: "assistant".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                tool_calls: vec![ToolCall {
+                    id: "long".to_string(),
+                    name: "train".to_string(),
+                    args: "{}".to_string(),
+                }],
+                ..Event::default()
+            },
+            Event {
+                role: "tool".to_string(),
+                timestamp: "2026-01-01T01:59:59Z".to_string(),
+                tool_call_id: "long".to_string(),
+                content: "done".to_string(),
+                ..Event::default()
+            },
+        ];
+        let steps = trace_steps(&events, "test-model");
+        assert_eq!(steps.len(), 1);
+        assert!(
+            (steps[0].duration_sec - 7199.0).abs() < 1e-6,
+            "2h call must report 7199s, got {}",
+            steps[0].duration_sec
+        );
+        assert_eq!(steps[0].status, "ok");
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        assert!((diagnostics.tool_latencies[0].p95_sec - 7199.0).abs() < 1e-6);
     }
 
     #[test]
