@@ -1,6 +1,5 @@
-use crate::{
-    pricing, project_name, resolve_project, round4, session_capability, total_tokens, Session,
-};
+use crate::insights::project_rollup_display_names;
+use crate::{pricing, resolve_project, round4, session_capability, total_tokens, Session};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -613,8 +612,11 @@ pub fn mcp_governance(sessions: &[Session]) -> McpGovernance {
 pub fn context_trends(sessions: &[Session]) -> ContextTrend {
     let mut totals = ContextAggregate::default();
     let mut projects: BTreeMap<String, ContextAggregate> = BTreeMap::new();
-    for session in sessions {
-        let project = project_name(session);
+    // rm-394: key by the full resolved identity — colliding basenames
+    // (alice/api vs bob/api) roll up as two disambiguated rows instead
+    // of one merged series.
+    let rollup_names = project_rollup_display_names(sessions.iter());
+    for (session, project) in sessions.iter().zip(rollup_names) {
         add_context_session(&mut totals, session);
         add_context_session(projects.entry(project).or_default(), session);
     }

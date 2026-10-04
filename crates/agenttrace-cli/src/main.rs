@@ -898,6 +898,16 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         },
     );
     let sessions = report.sessions.clone();
+    // rm-393/rm-396: discovery or parse skips must be visible on the
+    // report path too, not only in --doctor — one stderr line each.
+    for skip in agenttrace_core::snapshot_disclosed_skips() {
+        eprintln!(
+            "agenttrace: skipped {}: {} ({})",
+            skip.kind.label(),
+            skip.path,
+            skip.detail
+        );
+    }
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
@@ -946,12 +956,20 @@ fn is_cline_task_dir(path: &std::path::Path) -> bool {
         || path.join("task_metadata.json").is_file()
 }
 
+/// rm-395: `-o` writes go through the core temp-then-rename helper
+/// (the rm-250 atomic-write recipe) so a failed write can never leave a
+/// half-written report at the user's chosen path, and failures name
+/// the path and the OS reason instead of a bare io error.
 fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     if let Some(path) = path {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create report directory {}", parent.display()))?;
+            }
         }
-        fs::write(path, content)?;
+        agenttrace_core::atomic_write_report(path, content.as_bytes())
+            .with_context(|| format!("write report {} ({})", path.display(), content.len()))?;
         eprintln!("Saved: {}", path.display());
     }
     Ok(())
@@ -1803,5 +1821,57 @@ mod tests {
             r#"{{"role":"assistant","content":"done","timestamp":"2026-05-02T10:01:{idx:02}Z","ModelUsed":"gpt-4.1"}}"#
         )
         .expect("write compare assistant");
+    }
+}
+
+#[cfg(test)]
+mod rm395_write_output_tests {
+    use super::*;
+
+    /// rm-395: `-o` writes are temp-then-rename (the rm-250 recipe), so a
+    /// successful write leaves exactly the destination, and a failed one
+    /// names the path and leaves no `.tmp` debris next to it.
+    #[test]
+    fn write_output_is_atomic_and_reports_failures_with_context() {
+        let dir = std::env::temp_dir().join(format!("at-writeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+
+        // Success path: nested parent is created, content lands whole.
+        let out = dir.join("nested").join("report.md");
+        write_output(&Some(out.clone()), "hello").expect("write report");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello");
+        let siblings = std::fs::read_dir(dir.join("nested"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .map(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(siblings, 0, "no temp siblings may survive a good write");
+
+        // Failure path: destination is an existing directory. The rename
+        // fails; the error names the destination and nothing is left behind.
+        let as_dir = dir.join("as-dir");
+        std::fs::create_dir_all(&as_dir).expect("destination dir");
+        let error = write_output(&Some(as_dir.clone()), "x").expect_err("writing a dir fails");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("as-dir"),
+            "error must name the destination: {message}"
+        );
+        let debris = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .map(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(debris, 0, "failed writes must not leave temp debris");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

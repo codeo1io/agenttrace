@@ -9,6 +9,56 @@ type TokenUsage = BTreeMap<String, i64>;
 type JsonObject = Map<String, Value>;
 type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 
+/// Default whole-file slurp bound for session files (rm-396): half a
+/// gigabyte. Real transcripts are single-digit megabytes; anything an
+/// order of magnitude past that is either a foreign file that wandered
+/// into a session directory or a hostile file planted to blow up parse
+/// memory. Files above the bound are SKIPPED AS A DISCLOSED CLASS
+/// (counted by `--doctor`, size recorded) rather than parsed or
+/// reported as a failure. Override with `AGENTTRACE_MAX_SESSION_FILE_BYTES`.
+pub const DEFAULT_MAX_SESSION_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The rm-396 parse-time size bound, `AGENTTRACE_MAX_SESSION_FILE_BYTES`
+/// when set to a positive integer, the 512 MiB default otherwise. Read
+/// per call so the override applies without a process restart and stays
+/// testable in-process.
+pub fn max_session_file_bytes() -> u64 {
+    match std::env::var("AGENTTRACE_MAX_SESSION_FILE_BYTES") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|bound| *bound > 0)
+            .unwrap_or(DEFAULT_MAX_SESSION_FILE_BYTES),
+        Err(_) => DEFAULT_MAX_SESSION_FILE_BYTES,
+    }
+}
+
+/// Typed parse error for a session file above the rm-396 bound, so
+/// callers can route it to the disclosed-skip class (doctor counts it,
+/// records the size) instead of the parse-failure class. The message
+/// is the actionable form for explicit `--path` parses: it names the
+/// bound and the override variable.
+/// Serializes the rm-396 oversize tests: one reads a default-bound-sized
+/// file while another manipulates the override env var, and none may
+/// observe another's bound (tests run in parallel). Doctor's integration
+/// test takes the same lock — its oversized fixture depends on the
+/// default bound being in force.
+#[cfg(test)]
+pub(crate) static OVERSIZE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "session file {path} is {} bytes, above the {} byte parse bound; skipped as oversized (raise AGENTTRACE_MAX_SESSION_FILE_BYTES to parse it)",
+    .size,
+    .bound
+)]
+pub struct SessionFileTooLargeError {
+    pub path: PathBuf,
+    pub size: u64,
+    pub bound: u64,
+}
+
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
@@ -20,8 +70,29 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             }
         }
     }
-    let raw =
-        std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
+    // rm-396: bound the whole-file slurp. The pre-check makes the
+    // common case one metadata call; the `take(bound + 1)` read below
+    // keeps the guarantee even if the file grows between the two.
+    let bound = max_session_file_bytes();
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    let raw = {
+        let mut capped = Vec::new();
+        use std::io::Read;
+        file.by_ref()
+            .take(bound.saturating_add(1))
+            .read_to_end(&mut capped)
+            .with_context(|| format!("read session file {}", path.display()))?;
+        capped
+    };
+    if raw.len() as u64 > bound {
+        return Err(SessionFileTooLargeError {
+            path: path.to_path_buf(),
+            size: raw.len() as u64,
+            bound,
+        }
+        .into());
+    }
     // Windows tooling (notably PowerShell 5.1's `>` redirection) writes
     // UTF-16 with a BOM by default; name the encoding instead of failing
     // with a generic read error (pass-7 P7-2).
@@ -5406,5 +5477,81 @@ mod tests {
         let map = oh_my_pi_usage(Some(&usage)).expect("usage map");
         assert_eq!(map.get("input_tokens"), Some(&100));
         assert_eq!(map.get("output_tokens"), Some(&50));
+    }
+
+    fn tiny_jsonl() -> String {
+        // Smallest parseable pi-style session (the shape pinned by
+        // `parsers_preserve_codex_and_pi_workspaces`): a session line
+        // with a cwd plus one message line.
+        r#"{"type":"session","version":3,"id":"1","cwd":"/work/pi"}
+{"type":"message","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"task"}}"#
+            .to_string()
+    }
+
+    #[test]
+    fn oversized_file_is_a_typed_disclosed_error() {
+        let _guard = crate::parser::OVERSIZE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // rm-396: a session file above the parse bound must fail with the
+        // typed error (path, size, bound) — the message names the override
+        // — instead of slurping it. Sparse `set_len` keeps this cheap in CI.
+        let dir = std::env::temp_dir().join(format!("at-oversize-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let path = dir.join("huge.jsonl");
+        {
+            let file = std::fs::File::create(&path).expect("create sparse file");
+            file.set_len(DEFAULT_MAX_SESSION_FILE_BYTES + 1)
+                .expect("sparse len");
+        }
+        let error = parse_file(&path).expect_err("oversized file must not parse");
+        let typed = error
+            .downcast_ref::<SessionFileTooLargeError>()
+            .expect("must be the typed error");
+        assert_eq!(typed.size, DEFAULT_MAX_SESSION_FILE_BYTES + 1);
+        assert_eq!(typed.bound, DEFAULT_MAX_SESSION_FILE_BYTES);
+        let message = format!("{error:#}");
+        assert!(message.contains("AGENTTRACE_MAX_SESSION_FILE_BYTES"));
+        assert!(message.contains("huge.jsonl"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn size_bound_override_and_fallback() {
+        let _guard = crate::parser::OVERSIZE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // rm-396: the override raises the bound (a default-sized-reject
+        // parses once the env allows it); junk and zero values fall back
+        // to the default instead of disabling the bound. Raising the
+        // bound cannot affect other tests parsing small fixtures.
+        let dir = std::env::temp_dir().join(format!("at-oversize-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let path = dir.join("bound.jsonl");
+        std::fs::write(&path, tiny_jsonl()).expect("fixture");
+        assert_eq!(max_session_file_bytes(), DEFAULT_MAX_SESSION_FILE_BYTES);
+        std::env::set_var("AGENTTRACE_MAX_SESSION_FILE_BYTES", "0");
+        assert_eq!(max_session_file_bytes(), DEFAULT_MAX_SESSION_FILE_BYTES);
+        std::env::set_var("AGENTTRACE_MAX_SESSION_FILE_BYTES", "not-a-number");
+        assert_eq!(max_session_file_bytes(), DEFAULT_MAX_SESSION_FILE_BYTES);
+        // Raising the bound far past any fixture keeps every small file
+        // parseable, so this arm is safe under the parallel test run.
+        std::env::set_var(
+            "AGENTTRACE_MAX_SESSION_FILE_BYTES",
+            (DEFAULT_MAX_SESSION_FILE_BYTES * 4).to_string(),
+        );
+        assert_eq!(max_session_file_bytes(), DEFAULT_MAX_SESSION_FILE_BYTES * 4);
+        // A small fixture must never be rejected as oversized — whatever
+        // its format-probe fate is, the bound is not it.
+        if let Err(error) = parse_file(&path) {
+            assert!(
+                error.downcast_ref::<SessionFileTooLargeError>().is_none(),
+                "a small fixture must never hit the size bound"
+            );
+        }
+        std::env::remove_var("AGENTTRACE_MAX_SESSION_FILE_BYTES");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -357,6 +357,28 @@ fn store_sqlite_snapshot_at(
     Ok(())
 }
 
+/// rm-395: atomic write for user-facing report output (`-o`). Same
+/// temp-then-rename recipe as the cache write above (`unique_temp_path`,
+/// rm-250 family) — reused, not duplicated — so a failed or interrupted
+/// write can never leave a half-written report behind. Unlike the
+/// private artifacts this is a user-chosen destination (CI artifacts,
+/// shared directories), so permissions stay at the platform default
+/// instead of the owner-only mode the caches enforce.
+pub fn atomic_write_report(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = unique_temp_path(path);
+    if let Err(error) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            Err(error)
+        }
+    }
+}
+
 /// Per-writer temp path for atomic cache writes (pass-6 P6-3): the fixed
 /// `<name>.json.tmp` sibling made two concurrent agenttrace processes race
 /// on the same temp file, failing or tearing the save. The suffix is unique

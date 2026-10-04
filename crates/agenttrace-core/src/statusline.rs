@@ -268,10 +268,14 @@ fn render_status_line(payload: &Value) -> String {
 /// text renderer that prints session- or journal-derived strings
 /// (search text output, session text reports, the --sessions TSV, and
 /// --doctor disclosure samples); JSON output paths deliberately skip it
-/// because JSON escaping already encodes control bytes losslessly, and
-/// markdown/HTML renderers apply their own escaping before this class
-/// applies. Printable CSI/OSC tails may legitimately survive — only the
-/// control bytes themselves (ESC, BEL, …) are neutralized.
+/// because JSON escaping already encodes control bytes losslessly.
+/// rm-392 completed the family at the remaining renderer gaps: the
+/// overview text tables (`text_cell` and the By-Model rows),
+/// `markdown_cell`/`markdown_inline_code`, and `html_escape` all route
+/// through this function BEFORE their format-specific escaping, so no
+/// report cell carries control bytes. Printable CSI/OSC tails may
+/// legitimately survive — only the control bytes themselves (ESC, BEL,
+/// …) are neutralized.
 pub fn sanitize_line_segment(segment: &str) -> String {
     segment
         .chars()
