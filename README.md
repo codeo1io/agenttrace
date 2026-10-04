@@ -107,6 +107,29 @@ auditable after the fact.
 agenttrace
 ```
 
+### Configuration file
+
+```bash
+# agenttrace reads a small set of knobs from a layered config:
+#   CLI flags > --config PATH > ./.agenttrace/config.toml
+#   > ~/.config/agenttrace/config.toml > AGENTTRACE_* env > defaults
+# Every layer only fills keys left unset above it, and --doctor
+# discloses which files were found and where each knob came from.
+agenttrace --doctor
+
+# ~/.config/agenttrace/config.toml — all keys optional:
+#   history_dir = "/data/agenttrace-history"   # where history.json lives
+#   pricing_file = "pricing-overrides.json"     # per-model price overrides
+#   weekly_budget_usd = 25.0                     # weekly USD spend budget
+agenttrace --budget                # window-burn view: per-day spend vs budget
+agenttrace --statusline-report     # same journal; "Budget: ... remaining" line
+```
+
+Unknown keys, tables, arrays, and non-positive budgets are rejected
+with the file, line number, and key — a typo never silently does
+nothing. The same flags exist on the command line (`--history-dir`,
+`--pricing-file`, `--weekly-budget`) and win over every file.
+
 ### Governance reports
 
 ```bash

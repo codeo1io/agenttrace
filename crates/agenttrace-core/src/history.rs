@@ -24,7 +24,14 @@ struct DerivedSession {
 }
 
 pub fn history_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("AGENTTRACE_HISTORY_DIR").map(PathBuf::from) {
+    // rm-384: a resolved config file (CLI > --config > project > user)
+    // outranks the env knob; the env knob remains the fallback for
+    // library consumers and the config-free statusline host.
+    if let Some(dir) = crate::runtime_config::get()
+        .history_dir
+        .clone()
+        .or_else(|| std::env::var_os("AGENTTRACE_HISTORY_DIR").map(PathBuf::from))
+    {
         return dir.join("history.json");
     }
     let base = std::env::var_os("XDG_DATA_HOME")

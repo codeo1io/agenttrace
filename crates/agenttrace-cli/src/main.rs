@@ -23,6 +23,8 @@ use std::time::SystemTime;
 
 mod upstream;
 
+mod config;
+
 #[derive(Debug, Parser)]
 #[command(name = "agenttrace")]
 #[command(about = "TUI observability for AI coding agent sessions")]
@@ -82,8 +84,30 @@ struct Args {
     /// network via `git fetch` (and probe the npm registry) before
     /// reporting fork-vs-upstream drift. Without it, `agenttrace
     /// upstream` is fully offline (rm-024).
-    #[arg(long)]
+    #[arg(long = "fetch")]
     fetch: bool,
+    /// Explicit configuration file (rm-384). Layered above the
+    /// project and user config files; a missing file is an error.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Override the history directory: highest precedence, then the
+    /// config files, then `AGENTTRACE_HISTORY_DIR` (rm-384).
+    #[arg(long, value_name = "PATH")]
+    history_dir: Option<PathBuf>,
+    /// Override the pricing override file: highest precedence, then
+    /// the config files, then `AGENTTRACE_PRICING_FILE` (rm-384).
+    #[arg(long, value_name = "PATH")]
+    pricing_file: Option<PathBuf>,
+    /// Weekly spend budget in USD for `--statusline-report` and
+    /// `--budget`: highest precedence, then config
+    /// `weekly_budget_usd` (rm-385).
+    #[arg(long, value_name = "USD")]
+    weekly_budget: Option<f64>,
+    /// Show the weekly budget window-burn view: per-day spend from
+    /// the statusline journal against the resolved weekly budget
+    /// (rm-385).
+    #[arg(long)]
+    budget: bool,
     #[arg(long)]
     version: bool,
     #[arg(long)]
@@ -210,6 +234,14 @@ fn run() -> anyhow::Result<()> {
     validate_range_applicability(&args)?;
 
     let language = report_language(&args.lang)?;
+    // rm-384: resolve the layered configuration and install the
+    // winning knobs before any consumer (history persistence,
+    // pricing override loading) initializes.
+    let resolved = config::resolve(&args)?;
+    agenttrace_core::set_runtime_config(agenttrace_core::RuntimeConfigOverrides {
+        history_dir: resolved.history_dir.clone(),
+        pricing_file: resolved.pricing_file.clone(),
+    });
 
     // rm-301: stdout purity under machine formats. The side-effect
     // announcements below are human progress chatter; with `-f json` the
@@ -258,6 +290,21 @@ fn run() -> anyhow::Result<()> {
 
     if args.doctor {
         let doctor_dir = args.dir.as_deref().map(PathBuf::from);
+        // rm-384: disclose the configuration layers and the winning
+        // source of every knob. JSON mode keeps stdout a single pure
+        // object; the disclosure goes to stderr as its own document.
+        if args.format == "json" {
+            eprintln!("{}", config::disclosure_json(&resolved));
+        } else {
+            let out = format!(
+                "{}{}",
+                config::disclosure_text(&resolved),
+                render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?
+            );
+            write_output(&args.output, &out)?;
+            write_stdout(&out)?;
+            return Ok(());
+        }
         let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -278,7 +325,17 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.statusline_report {
-        let out = agenttrace_core::render_statusline_report(&args.format)?;
+        let out =
+            agenttrace_core::render_statusline_report(&args.format, resolved.weekly_budget)?;
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
+        return Ok(());
+    }
+
+    if args.budget {
+        // rm-385: the weekly window-burn view — journal-based, no
+        // session discovery, mirroring --statusline-report.
+        let out = agenttrace_core::render_budget_view(resolved.weekly_budget)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -1040,21 +1097,81 @@ fn is_cline_task_dir(path: &std::path::Path) -> bool {
 
 fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     if let Some(path) = path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // rm-250: stage through a unique temp sibling and rename into
-        // place, so a crash or Ctrl-C mid-write never leaves a
-        // truncated report at the destination (same pattern as the
-        // session-cache and history persistence writers).
-        let temp = unique_temp_sibling(path);
-        let staged = fs::write(&temp, content).and_then(|()| fs::rename(&temp, path));
-        if let Err(error) = staged {
-            let _ = fs::remove_file(&temp);
-            return Err(error).context("writing report output file");
-        }
-        eprintln!("Saved: {}", path.display());
+        // rm-250 residual (cycle 1): resolve the destination honestly
+        // before anything is written. The temp+rename dance used to
+        // silently replace a symlink with a regular file (the link's
+        // target kept its old bytes) and could not write special
+        // files at all.
+        let target = resolve_output_target(path)?;
+        write_output_resolved(path, &target, content)?;
     }
+    Ok(())
+}
+
+/// Follow symlinks to the final destination. A dangling link resolves
+/// to its missing target, which then gets created — the link is
+/// honored instead of replaced. Cycles fail loudly after 32 hops.
+fn resolve_output_target(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..32 {
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = fs::read_link(&target)?;
+                target = match target.parent() {
+                    Some(parent) => parent.join(link),
+                    None => link,
+                };
+            }
+            _ => return Ok(target),
+        }
+    }
+    bail!(
+        "resolving {}: symlink cycle detected (32 hops)",
+        path.display()
+    );
+}
+
+/// Write to the resolved destination. Regular files (and new paths)
+/// keep the rm-250 atomic stage-and-rename; character devices take a
+/// direct stream; fifos, sockets, and block devices are refused with
+/// a disclosed reason instead of silently becoming regular files.
+fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = fs::symlink_metadata(target) {
+            let kind = meta.file_type();
+            if kind.is_fifo() || kind.is_socket() || kind.is_block_device() {
+                bail!(
+                    "refusing to write -o {}: it is a fifo/socket/block device; \
+                     writing would block or silently replace it — write to a \
+                     regular file instead",
+                    requested.display()
+                );
+            }
+            if kind.is_char_device() {
+                let mut handle = fs::File::create(target)
+                    .with_context(|| format!("opening {}", target.display()))?;
+                handle.write_all(content.as_bytes())?;
+                eprintln!("Saved: {}", target.display());
+                return Ok(());
+            }
+        }
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // rm-250: stage through a unique temp sibling and rename into
+    // place, so a crash or Ctrl-C mid-write never leaves a
+   // truncated report at the destination (same pattern as the
+    // session-cache and history persistence writers).
+    let temp = unique_temp_sibling(target);
+    let staged = fs::write(&temp, content).and_then(|()| fs::rename(&temp, target));
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&temp);
+        return Err(error).context("writing report output file");
+    }
+    eprintln!("Saved: {}", target.display());
     Ok(())
 }
 
@@ -1508,6 +1625,40 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     ] {
         if !value.is_finite() || value < 0.0 {
             bail!("{flag} must be a finite number >= 0 (got {value})");
+        }
+    }
+
+    // rm-389 (cycle 1): dispatch-time validation for numeric knobs
+    // that used to degrade silently regardless of the action being
+    // dispatched. Table-driven so every rule stays uniform and each
+    // error names its flag.
+    let rows: Vec<(&str, bool, String)> = vec![
+        (
+            "--limit",
+            args.limit >= 1,
+            format!("--limit must be at least 1 (got {})", args.limit),
+        ),
+        (
+            "--search-limit",
+            args.search_limit >= 1 || !(args.sessions || args.search.is_some()),
+            format!(
+                "--search-limit must be at least 1 with --sessions/--search (got {})",
+                args.search_limit
+            ),
+        ),
+        (
+            "--weekly-budget",
+            args.weekly_budget
+                .is_none_or(|value| value.is_finite() && value > 0.0),
+            format!(
+                "--weekly-budget must be a positive finite USD amount (got {})",
+                args.weekly_budget.unwrap_or(f64::NAN)
+            ),
+        ),
+    ];
+    for (_, valid, message) in rows {
+        if !valid {
+            bail!("{message}");
         }
     }
     Ok(())
@@ -1977,6 +2128,103 @@ mod tests {
     }
 
     #[test]
+    fn write_output_honors_symlinks_instead_of_replacing_them() {
+        // rm-250 residual (cycle 1): -o through a symlink must update
+        // the link's target and keep the link a link — the assess PoC
+        // showed the link itself silently replaced by a regular file
+        // while the target kept its original bytes. A dangling link
+        // resolves to its missing target, which is created.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-write-link-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let real = dir.join("real");
+        fs::write(&real, "original\n").unwrap();
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_output(&Some(link.clone()), "new bytes\n").expect("write via link");
+        assert_eq!(fs::read_to_string(&real).unwrap(), "new bytes\n");
+        assert!(
+            fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "link must stay a link"
+        );
+
+        let dangling = dir.join("dangling.md");
+        std::os::unix::fs::symlink(dir.join("missing.md"), &dangling).unwrap();
+        write_output(&Some(dangling.clone()), "created\n").expect("via dangling link");
+        assert_eq!(fs::read_to_string(dir.join("missing.md")).unwrap(), "created\n");
+        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+
+        let a = dir.join("cycle-a");
+        let b = dir.join("cycle-b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        let error = write_output(&Some(a), "x\n").unwrap_err().to_string();
+        assert!(error.contains("symlink cycle"), "{error}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_output_refuses_special_files_instead_of_materializing_them() {
+        // rm-250 residual (cycle 1): a fifo destination is refused with
+        // a disclosed reason (the assess PoC showed "Saved:" rc0 while
+        // the fifo silently became a regular file); character devices
+        // like /dev/null take a direct stream.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-write-fifo-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let fifo = dir.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        let error = write_output(&Some(fifo.clone()), "x\n").unwrap_err().to_string();
+        assert!(error.contains("refusing to write"), "{error}");
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+            "fifo must be untouched"
+        );
+        write_output(&Some(PathBuf::from("/dev/null")), "x\n").expect("char device streams");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_gate_thresholds_rejects_silent_degradation_values() {
+        // rm-389 (cycle 1): --limit 0 and --search-limit 0 under
+        // --sessions used to be accepted silently at dispatch;
+        // --weekly-budget validates like every other numeric knob.
+        let mut args = compare_args(None);
+        args.limit = 0;
+        let error = validate_gate_thresholds(&args).unwrap_err().to_string();
+        assert!(error.contains("--limit must be at least 1"), "{error}");
+
+        let mut args = compare_args(None);
+        args.sessions = true;
+        args.search_limit = 0;
+        let error = validate_gate_thresholds(&args).unwrap_err().to_string();
+        assert!(error.contains("--search-limit must be at least 1 with --sessions"), "{error}");
+
+        let mut args = compare_args(None);
+        args.weekly_budget = Some(f64::NAN);
+        let error = validate_gate_thresholds(&args).unwrap_err().to_string();
+        assert!(error.contains("--weekly-budget must be a positive finite USD"), "{error}");
+
+        let mut args = compare_args(None);
+        args.search_limit = 0;
+        validate_gate_thresholds(&args).expect("search-limit without search is inert");
+        let mut args = compare_args(None);
+        args.weekly_budget = Some(12.5);
+        validate_gate_thresholds(&args).expect("positive budget accepted");
+    }
+
+    #[test]
     fn compare_uses_shared_filters_and_limit() {
         let root =
             std::env::temp_dir().join(format!("agenttrace-compare-cap-{}", std::process::id()));
@@ -2047,6 +2295,11 @@ mod tests {
         Args {
             path: None,
             format: "json".to_string(),
+            config: None,
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            budget: false,
             dir,
             compare: true,
             audit: false,
