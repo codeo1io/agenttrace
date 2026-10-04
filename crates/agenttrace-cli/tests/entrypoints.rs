@@ -1206,3 +1206,86 @@ fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+#[test]
+fn waste_report_format_matrix_pins_every_machine_surface() {
+    // rm-451 (run b1ff12f8, cycle 2): `--waste -f json` passed the format
+    // guard (json is admitted for every action) and then fell through to
+    // the text renderer — exit 0 with a prose banner where scripts
+    // expected data, an invisible mismatch to the exit code. One rule for
+    // the whole matrix: every format the guard admits is honored (text
+    // and json both render), every format it rejects fails loudly
+    // (markdown names the actions that own it).
+    let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--waste"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        text.status.success(),
+        "text waste report must exit 0: {:?}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let text_stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text_stdout.contains("Waste Analysis"),
+        "text cell renders the banner: {text_stdout}"
+    );
+
+    // json cell: the whole of stdout must be one parseable JSON document
+    // (no banner before or after it), carrying the waste schema.
+    let json = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--waste", "-f", "json"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        json.status.success(),
+        "--waste -f json must exit 0: {:?}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .expect("--waste -f json stdout is strictly JSON, not a text banner");
+    assert_eq!(report["schema"], "agenttrace.waste.v1");
+    assert!(
+        report["waste_score"]
+            .as_i64()
+            .is_some_and(|score| (0..=100).contains(&score)),
+        "waste_score is a clamped 0-100 integer"
+    );
+    for key in [
+        "waste_level",
+        "total_wasted_cost",
+        "loop_waste_percent",
+        "session_cost",
+        "cache",
+        "tool_bloat",
+        "stuck_patterns",
+        "summary",
+        "top_actions",
+    ] {
+        assert!(!report[key].is_null(), "waste json carries {key}");
+    }
+    assert!(
+        report["top_actions"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "top_actions is a non-empty action list"
+    );
+
+    // markdown cell: the guard rejects it loudly and names the owning
+    // actions — the same contract the overview surfaces live under.
+    let markdown = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--waste", "-f", "markdown"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert_eq!(
+        markdown.status.code(),
+        Some(1),
+        "--waste -f markdown is rejected, not silently rendered as text"
+    );
+    let stderr = String::from_utf8_lossy(&markdown.stderr);
+    assert!(
+        stderr
+            .contains("markdown and html formats require --overview or a governance report action"),
+        "rejection names the format's owning actions: {stderr}"
+    );
+}

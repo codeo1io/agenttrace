@@ -188,6 +188,67 @@ pub fn render_waste_report_with_language(session: &Session, language: ReportLang
     waste_report_text(&compute_waste_report(session), language)
 }
 
+/// rm-451 (run b1ff12f8, cycle 2): machine-readable waste report.
+/// `--waste -f json` used to fall through to the text renderer (the
+/// format guard admits `-f json` for every action, so nothing stopped
+/// the mismatch), exiting 0 while scripts parsed a text banner and
+/// believed they held JSON. This renders the same verdicts the text
+/// report carries, as data — one consistent rule for every machine
+/// format: json is honored wherever the guard admits it, and
+/// markdown/html stay the overview/governance surfaces the guard
+/// names. Per-tool `allocated_cost` shares the text report's rm-004
+/// caveat: it is a share of the session estimate, not measured
+/// per-tool spend.
+pub fn waste_report_json(report: &WasteReport) -> String {
+    let payload = serde_json::json!({
+        "schema": "agenttrace.waste.v1",
+        "waste_score": report.waste_score,
+        "waste_level": report.waste_level,
+        "total_wasted_cost": round4(report.total_wasted),
+        "loop_waste_percent": (report.loop_percent * 10.0).round() / 10.0,
+        "session_cost": round4(report.session_cost),
+        "cache": {
+            "rating": report.cache.rating,
+            "hit_rate_percent": (report.cache.hit_rate * 10.0).round() / 10.0,
+            "cache_read_tokens": report.cache.cache_read_tokens,
+            "total_input_tokens": report.cache.total_input_tokens,
+            "wasted_cost": round4(report.cache.wasted_cost),
+            "suggestion": report.cache.suggestion,
+        },
+        "tool_bloat": {
+            "tools_per_turn": (report.bloat.tools_per_turn * 100.0).round() / 100.0,
+            "bloat_score": report.bloat.bloat_score,
+            "bloat_level": report.bloat.bloat_level,
+            "top_bloat": report
+                .bloat
+                .top_bloat
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "tool": item.tool_name,
+                        "calls": item.call_count,
+                        "allocated_cost": round4(item.total_cost),
+                        "redundant": item.is_redundant,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        },
+        "stuck_patterns": report
+            .stuck
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "description": item.description,
+                    "severity": item.severity,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "summary": report.summary,
+        "top_actions": report.top_actions,
+    });
+    serde_json::to_string_pretty(&payload).expect("waste report serializes")
+}
+
 fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
     let hit_rate = if metrics.tokens_input > 0 {
         metrics.tokens_cache_r as f64 / metrics.tokens_input as f64 * 100.0

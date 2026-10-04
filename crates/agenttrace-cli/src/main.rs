@@ -1,16 +1,16 @@
 use agenttrace_core::{
-    add_baseline_comparison, average_health, compute_overview, context_trends, cost_audit,
-    data_health, data_health_scoped, delivery_evidence_with_git, demo_sessions,
-    evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first, list_pricing,
-    load_sessions_with_options, lookup_price, mcp_governance, parse_file, predict_cost_anomaly,
-    pricing_cache_path, pricing_source, recommendations, render_doctor_report,
-    render_model_pricing_list, render_test_match, render_waste_report_with_language,
-    report_compare_json, report_json_with_language, report_overview_html_with_context,
-    report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
-    tool_fail_rate, total_tokens, update_pricing, BaselineThresholds, LoadOptions, LoadReport,
-    ReportLanguage, Session, TimeRange, VERSION,
+    add_baseline_comparison, average_health, compute_overview, compute_waste_report,
+    context_trends, cost_audit, data_health, data_health_scoped, delivery_evidence_with_git,
+    demo_sessions, evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
+    list_pricing, load_sessions_with_options, lookup_price, mcp_governance, parse_file,
+    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
+    render_doctor_report, render_model_pricing_list, render_test_match,
+    render_waste_report_with_language, report_compare_json, report_json_with_language,
+    report_overview_html_with_context, report_overview_json_with_context,
+    report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
+    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
+    session_capability, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
+    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -457,7 +457,15 @@ fn run() -> anyhow::Result<()> {
         let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
         let session =
             latest_session(&sessions).context("No sessions match the requested filters")?;
-        let out = render_waste_report_with_language(session, language);
+        // rm-451: the format guard admits `-f json` for every action, so
+        // every admitted machine format must be honored here too — the
+        // json cell used to fall through to the text banner, handing
+        // scripts prose where they expected data. markdown/html stay
+        // rejected upstream (they are overview/governance surfaces).
+        let out = match args.format.as_str() {
+            "json" => waste_report_json(&compute_waste_report(session)),
+            _ => render_waste_report_with_language(session, language),
+        };
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         return Ok(());

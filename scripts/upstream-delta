@@ -13,6 +13,13 @@
 #
 # The upstream remote is fetch-only by design (pushurl is disabled); this
 # script never mutates anything but the remote-tracking refs (with --fetch).
+#
+# Dev-tool exemption (rm-450): this script spawns git WITHOUT a deadline.
+# The user-facing `agenttrace upstream` command runs the same probes
+# under stated bounds (10s local / 30s fetch — see upstream.rs
+# UPSTREAM_GIT_TIMEOUT / UPSTREAM_FETCH_TIMEOUT); a wedged git there is
+# killed with a terminal error instead of hanging the CLI. A maintainer
+# can Ctrl-C this script, so it keeps the unbounded spawn deliberately.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
