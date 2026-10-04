@@ -311,6 +311,14 @@ pub struct MetricProvenance {
     pub naming: String,
 }
 
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+fn f64_is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Metrics {
     pub events_total: usize,
@@ -342,6 +350,14 @@ pub struct Metrics {
     #[serde(skip)]
     pub timestamps: Vec<DateTime<Utc>>,
     pub gaps_sec: Vec<f64>,
+    /// rm-425: journal-order timestamp regressions (t[i] < t[i-1]).
+    /// Regressed journals get a `clock_skew` anomaly and never a
+    /// `hanging`/`latency` one — sorted-order folding fabricated those.
+    #[serde(skip_serializing_if = "u32_is_zero")]
+    pub timestamp_regressions: u32,
+    /// rm-425: largest regression magnitude, seconds.
+    #[serde(skip_serializing_if = "f64_is_zero")]
+    pub max_timestamp_regression_sec: f64,
     pub model_used: String,
     pub source_tool: String,
     pub session_start: String,
@@ -820,18 +836,18 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     }
 
     metrics.events_total = events.len();
+    // rm-425: gaps fold in JOURNAL order, before `sort()` rewrites the
+    // timeline — see `fold_gaps_in_journal_order`.
+    let (gaps_sec, regressions, max_regression) = fold_gaps_in_journal_order(&metrics.timestamps);
+    metrics.gaps_sec = gaps_sec;
+    metrics.timestamp_regressions = regressions;
+    metrics.max_timestamp_regression_sec = max_regression;
     metrics.timestamps.sort();
     if let (Some(first), Some(last)) = (metrics.timestamps.first(), metrics.timestamps.last()) {
         metrics.session_start = first.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         metrics.session_end = last.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         metrics.duration_sec = (*last - *first).num_milliseconds() as f64 / 1000.0;
         metrics.provenance.duration = "timestamp_span".to_string();
-    }
-    for pair in metrics.timestamps.windows(2) {
-        let gap = (pair[1] - pair[0]).num_milliseconds() as f64 / 1000.0;
-        if gap > 0.0 {
-            metrics.gaps_sec.push(gap);
-        }
     }
     let max_ok = metrics
         .tool_calls_total
@@ -865,9 +881,55 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     metrics
 }
 
+/// rm-425: fold idle gaps in JOURNAL order, not sorted order. The pre-fix
+/// behavior sorted `timestamps` first, which silently rewrites a regressed
+/// journal's timeline — the regressed record jumps to the front and the
+/// spans measured across the discontinuity fabricate huge "hanging" gaps.
+/// Here a regressed timestamp counts toward `timestamp_regressions`, its
+/// negative gap is excluded, and the first non-negative gap after it (the
+/// recovery jump back across the discontinuity) is excluded too;
+/// `detect_anomalies` then reports `clock_skew` instead of idle anomalies.
+/// Monotonic journals fold byte-identically to the old sorted windows.
+fn fold_gaps_in_journal_order(timestamps: &[DateTime<Utc>]) -> (Vec<f64>, u32, f64) {
+    let mut gaps = Vec::new();
+    let mut regressions: u32 = 0;
+    let mut max_regression = 0.0_f64;
+    let mut after_regression = false;
+    for pair in timestamps.windows(2) {
+        let gap = (pair[1] - pair[0]).num_milliseconds() as f64 / 1000.0;
+        if gap < 0.0 {
+            regressions += 1;
+            max_regression = max_regression.max(-gap);
+            after_regression = true;
+        } else if after_regression {
+            after_regression = false;
+        } else if gap > 0.0 {
+            gaps.push(gap);
+        }
+    }
+    (gaps, regressions, max_regression)
+}
+
 pub fn detect_anomalies(metrics: &Metrics) -> Vec<Anomaly> {
     let mut anomalies = Vec::new();
-    if !metrics.gaps_sec.is_empty() {
+    if metrics.timestamp_regressions > 0 {
+        // rm-425: the journal's clock is demonstrably unordered, so idle
+        // math is untrustworthy — disclose that instead of fabricating
+        // hanging/latency anomalies from the discontinuity.
+        anomalies.push(Anomaly {
+            kind: "clock_skew".to_string(),
+            severity: if metrics.max_timestamp_regression_sec > 60.0 {
+                "high"
+            } else {
+                "medium"
+            }
+            .to_string(),
+            detail: format!(
+                "{} timestamp regression(s), max={:.0}s; idle anomalies withheld (clock unordered)",
+                metrics.timestamp_regressions, metrics.max_timestamp_regression_sec
+            ),
+        });
+    } else if !metrics.gaps_sec.is_empty() {
         let mut gaps = metrics.gaps_sec.clone();
         gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let long_gaps = gaps.iter().filter(|gap| **gap > 60.0).count();
@@ -2073,6 +2135,128 @@ mod tests {
         assert_eq!(metrics.session_end, "2026-06-21T01:06:01Z");
         assert_eq!(metrics.gaps_sec, vec![361.0]);
         assert_eq!(detect_anomalies(&metrics)[0].kind, "hanging");
+    }
+
+    #[test]
+    fn regressed_journals_report_clock_skew_not_hanging() {
+        // t1.jsonl shape (assess F-3): the trailing records regress the
+        // clock; the pre-fix sorted fold fabricated a 3595s "hanging" gap.
+        let metrics = analyze(
+            &[
+                Event {
+                    role: "user".to_string(),
+                    timestamp: "2026-10-04T10:00:00".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T11:00:00".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T10:00:05".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T09:59:00".to_string(),
+                    ..Event::default()
+                },
+            ],
+            "default",
+        );
+        assert_eq!(metrics.timestamp_regressions, 2);
+        assert!((metrics.max_timestamp_regression_sec - 3595.0).abs() < 1e-6);
+        // Journal order: the 3600s locally-consistent idle is kept; the two
+        // regressions (and any recovery jump) are excluded. The old sorted
+        // fold produced [5, 60, 3595].
+        assert_eq!(metrics.gaps_sec, vec![3600.0]);
+        let anomalies = detect_anomalies(&metrics);
+        let kinds: Vec<&str> = anomalies.iter().map(|a| a.kind.as_str()).collect();
+        // clock_skew replaces every idle anomaly; `no_tools` is unrelated
+        // (3 assistant turns, 0 tool calls) and stays.
+        assert!(kinds.contains(&"clock_skew"));
+        assert!(!kinds.contains(&"hanging"));
+        assert!(!kinds.contains(&"latency"));
+        let skew = anomalies.iter().find(|a| a.kind == "clock_skew").unwrap();
+        assert_eq!(skew.severity, "high");
+    }
+
+    #[test]
+    fn fold_excludes_the_recovery_jump_after_a_regression() {
+        let metrics = analyze(
+            &[
+                Event {
+                    role: "user".to_string(),
+                    timestamp: "2026-10-04T10:00:00".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T09:00:00".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T11:00:00".to_string(),
+                    ..Event::default()
+                },
+            ],
+            "default",
+        );
+        // −3600s regression; the 09:00→11:00 span crosses the same clock
+        // discontinuity and must not masquerade as a 7200s idle gap.
+        assert_eq!(metrics.timestamp_regressions, 1);
+        assert!(metrics.gaps_sec.is_empty());
+        assert_eq!(detect_anomalies(&metrics)[0].kind, "clock_skew");
+    }
+
+    #[test]
+    fn monotonic_journals_keep_sorted_fold_gaps() {
+        let metrics = analyze(
+            &[
+                Event {
+                    role: "user".to_string(),
+                    timestamp: "2026-10-04T10:00:00".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T10:00:30".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T10:05:00".to_string(),
+                    ..Event::default()
+                },
+                Event {
+                    role: "assistant".to_string(),
+                    timestamp: "2026-10-04T10:06:00".to_string(),
+                    ..Event::default()
+                },
+            ],
+            "default",
+        );
+        assert_eq!(metrics.timestamp_regressions, 0);
+        assert_eq!(metrics.max_timestamp_regression_sec, 0.0);
+        assert_eq!(metrics.gaps_sec, vec![30.0, 270.0, 60.0]);
+    }
+
+    #[test]
+    fn regression_metrics_skip_serialization_when_clean() {
+        let clean = serde_json::to_value(Metrics::default()).unwrap();
+        assert!(clean.get("timestamp_regressions").is_none());
+        assert!(clean.get("max_timestamp_regression_sec").is_none());
+        let regressed = serde_json::to_value(&Metrics {
+            timestamp_regressions: 2,
+            max_timestamp_regression_sec: 3595.0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(regressed["timestamp_regressions"], 2);
+        assert_eq!(regressed["max_timestamp_regression_sec"], 3595.0);
     }
 
     #[test]

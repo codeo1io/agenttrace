@@ -1108,6 +1108,11 @@ impl GoMetrics {
             tokens_cache_r: self.tokens_cache_r,
             timestamps: Vec::new(),
             gaps_sec: self.gaps_sec,
+            // rm-425: the cache summary does not carry journal-order
+            // regression data; a full re-parse restores it. Zero here means
+            // cached listings never fabricate (or suppress) clock_skew.
+            timestamp_regressions: 0,
+            max_timestamp_regression_sec: 0.0,
             model_used: self.model_used,
             source_tool: self.source_tool,
             session_start: self.session_start,

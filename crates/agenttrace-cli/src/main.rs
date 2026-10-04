@@ -2,7 +2,7 @@ use agenttrace_core::{
     add_baseline_comparison, average_health, compute_overview, context_trends, cost_audit,
     data_health, data_health_scoped, delivery_evidence_with_git, demo_sessions,
     evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
-    load_sessions_with_options, mcp_governance, parse_file, predict_cost_anomaly,
+    load_sessions_with_progress, mcp_governance, parse_file, predict_cost_anomaly,
     pricing_cache_path, recommendations, render_doctor_report, render_model_pricing_list,
     render_test_match, render_waste_report_with_language, report_compare_json,
     report_json_with_language, report_overview_html_with_context,
@@ -19,7 +19,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 mod upstream;
 
@@ -820,6 +820,97 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
     load_sessions_report(args).map(|(sessions, _)| sessions)
 }
 
+/// rm-428: parse progress for humans, strictly on stderr. The discovery
+/// layer has emitted `LoadProgress` all along (`discovery.rs`'s FnMut
+/// family) but every CLI path funneled through the no-op wrapper, so a
+/// 10k-session parse sat silent for 7s+. Progress activates only for long
+/// parses (≥1s elapsed or ≥200 discovered files), is throttled to one line
+/// per 500ms plus one final line, and never touches stdout — every `-f`
+/// format stays byte-pure (rm-301 discipline).
+const PROGRESS_MIN_FILES: usize = 200;
+const PROGRESS_MIN_ELAPSED: Duration = Duration::from_secs(1);
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(500);
+
+fn progress_should_activate(elapsed: Duration, discovered: usize) -> bool {
+    elapsed >= PROGRESS_MIN_ELAPSED || discovered >= PROGRESS_MIN_FILES
+}
+
+fn progress_should_emit(since_last_emit: Option<Duration>, is_final: bool) -> bool {
+    match since_last_emit {
+        None => true,
+        Some(elapsed) => is_final || elapsed >= PROGRESS_THROTTLE,
+    }
+}
+
+struct ParseProgressReporter<W: Write> {
+    out: W,
+    started: Option<Instant>,
+    last_emit: Option<Instant>,
+    active: bool,
+    emitted_final: bool,
+    latest: Option<agenttrace_core::LoadProgress>,
+}
+
+impl<W: Write> ParseProgressReporter<W> {
+    fn new(out: W) -> Self {
+        Self {
+            out,
+            started: None,
+            last_emit: None,
+            active: false,
+            emitted_final: false,
+            latest: None,
+        }
+    }
+
+    fn on_progress(&mut self, progress: &agenttrace_core::LoadProgress) {
+        let now = Instant::now();
+        let started = *self.started.get_or_insert(now);
+        if !self.active
+            && !progress_should_activate(now.duration_since(started), progress.discovered)
+        {
+            self.latest = Some(progress.clone());
+            return;
+        }
+        self.active = true;
+        self.latest = Some(progress.clone());
+        let is_final = progress.discovered > 0 && progress.processed >= progress.discovered;
+        let since = self.last_emit.map(|at| now.duration_since(at));
+        if progress_should_emit(since, is_final) {
+            self.emit(progress, is_final);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.active || self.emitted_final {
+            return;
+        }
+        // Force the terminal line even when the final event did not report
+        // processed == discovered (e.g. filtered-out tail).
+        let progress = match self.latest.take() {
+            Some(p) => p,
+            None => return,
+        };
+        self.emit(&progress, true);
+    }
+
+    fn emit(&mut self, progress: &agenttrace_core::LoadProgress, is_final: bool) {
+        let _ = writeln!(
+            self.out,
+            "parsed {}/{} sessions ({} cache hits, {} skipped){}",
+            progress.parsed,
+            progress.discovered,
+            progress.cache_hits,
+            progress.skipped,
+            if is_final { "" } else { "..." }
+        );
+        if is_final {
+            self.emitted_final = true;
+        }
+        self.last_emit = Some(Instant::now());
+    }
+}
+
 fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
     if args.demo {
         return Ok((prepare_explicit_sessions(demo_sessions()?, args)?, None));
@@ -848,7 +939,8 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     }
     let dir = args.dir.as_deref().map(PathBuf::from);
     let range = parse_range(args)?;
-    let report = load_sessions_with_options(
+    let mut progress = ParseProgressReporter::new(io::stderr());
+    let report = load_sessions_with_progress(
         dir.as_deref(),
         &LoadOptions {
             since: range.since(Utc::now()),
@@ -858,7 +950,9 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
             include_history: args.include_history,
             preserve_history: args.preserve_history,
         },
+        |event| progress.on_progress(&event),
     );
+    progress.finish();
     let sessions = report.sessions.clone();
     if sessions.is_empty() {
         if report.discovered == 0 {
@@ -1709,5 +1803,69 @@ mod tests {
             r#"{{"role":"assistant","content":"done","timestamp":"2026-05-02T10:01:{idx:02}Z","ModelUsed":"gpt-4.1"}}"#
         )
         .expect("write compare assistant");
+    }
+
+    fn progress_event(
+        discovered: usize,
+        processed: usize,
+        parsed: usize,
+    ) -> agenttrace_core::LoadProgress {
+        agenttrace_core::LoadProgress {
+            discovered,
+            processed,
+            parsed,
+            skipped: 0,
+            cache_hits: 3,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn progress_activates_only_for_long_parses() {
+        assert!(!progress_should_activate(Duration::from_millis(50), 5));
+        assert!(!progress_should_activate(Duration::from_millis(50), 199));
+        assert!(progress_should_activate(Duration::from_millis(50), 200));
+        assert!(progress_should_activate(Duration::from_secs(2), 5));
+    }
+
+    #[test]
+    fn progress_emits_first_line_immediately_then_throttles_but_never_suppresses_final() {
+        assert!(progress_should_emit(None, false));
+        assert!(!progress_should_emit(
+            Some(Duration::from_millis(10)),
+            false
+        ));
+        assert!(progress_should_emit(Some(Duration::from_secs(1)), false));
+        assert!(progress_should_emit(Some(Duration::from_millis(10)), true));
+    }
+
+    #[test]
+    fn progress_reporter_stays_silent_for_small_parses() {
+        let mut reporter = ParseProgressReporter::new(Vec::new());
+        for processed in 1..=5 {
+            reporter.on_progress(&progress_event(5, processed, processed));
+        }
+        reporter.finish();
+        assert!(!reporter.active);
+        assert!(reporter.out.is_empty());
+    }
+
+    #[test]
+    fn progress_reporter_writes_to_its_writer_only_and_finishes_once() {
+        let mut reporter = ParseProgressReporter::new(Vec::new());
+        // 10k files: activates on the first event (>= PROGRESS_MIN_FILES).
+        reporter.on_progress(&progress_event(10_000, 1, 1));
+        assert!(reporter.active);
+        // Final event: emitted immediately, unthrottled.
+        reporter.on_progress(&progress_event(10_000, 10_000, 10_000));
+        // finish() must not duplicate the terminal line.
+        reporter.finish();
+        let rendered = String::from_utf8(std::mem::take(&mut reporter.out)).unwrap();
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines.len() <= 2, "unexpected extra lines: {rendered}");
+        assert!(lines.len() >= 2, "missing final line: {rendered}");
+        assert!(lines[0].starts_with("parsed 1/10000 sessions"));
+        assert!(lines[1].starts_with("parsed 10000/10000 sessions"));
+        assert!(!lines[1].contains("..."));
     }
 }

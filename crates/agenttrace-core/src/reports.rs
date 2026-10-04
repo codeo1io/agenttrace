@@ -143,7 +143,21 @@ pub fn report_json_with_language(session: &Session, language: ReportLanguage) ->
         json_float(latency_median)
     ));
     out.push_str(&format!("    \"min\": {},\n", json_float(latency_min)));
-    out.push_str(&format!("    \"p95\": {}\n", json_float(latency_p95)));
+    out.push_str(&format!(
+        "    \"p95\": {}{}\n",
+        json_float(latency_p95),
+        // rm-425: disclose journal-order regressions on the machine-readable
+        // surface too; absent (byte-identical to the old output) when clean.
+        if metrics.timestamp_regressions > 0 {
+            format!(
+                ",\n    \"timestamp_regressions\": {},\n    \"max_timestamp_regression_sec\": {}",
+                metrics.timestamp_regressions,
+                json_float(metrics.max_timestamp_regression_sec)
+            )
+        } else {
+            String::new()
+        }
+    ));
     out.push_str("  },\n");
     out.push_str(&format!(
         "  \"model_used\": {},\n",
