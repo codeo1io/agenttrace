@@ -133,7 +133,7 @@ struct Args {
     monthly: bool,
     #[arg(long)]
     blocks: bool,
-    #[arg(long, default_value = "local")]
+    #[arg(long, default_value = "local", allow_hyphen_values = true)]
     tz: String,
     #[arg(long = "token-limit")]
     token_limit: Option<i64>,
@@ -403,7 +403,7 @@ fn run(argv: Vec<OsString>, language: ReportLanguage) -> anyhow::Result<()> {
         && !args.sessions
         && !args.diagnostics
         && args.inspect.is_none()
-        && !(args.daily || args.weekly || args.monthly || args.blocks)
+        && !wants_usage_report(&args)
     {
         let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
         let session =
@@ -419,14 +419,14 @@ fn run(argv: Vec<OsString>, language: ReportLanguage) -> anyhow::Result<()> {
 
     let (sessions, load_report) = load_sessions_report(&args)?;
     let sessions = prepare_cli_view(sessions, &args)?;
-    if sessions.is_empty() {
-        bail!("{}", tr(language, "cli.err.no_match"));
-    }
-
+    // Usage reports render an empty table rather than failing when nothing matches.
     if let Some(out) = render_usage_report(&sessions, &args)? {
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         return Ok(());
+    }
+    if sessions.is_empty() {
+        bail!("{}", tr(language, "cli.err.no_match"));
     }
 
     if args.sessions || args.diagnostics || args.inspect.is_some() {
@@ -799,9 +799,16 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                     .render_or(language_of(args), "")
             );
         }
-        bail!("{}", tr(language_of(args), "cli.err.no_match"));
+        // Usage reports render an empty table for "nothing matched".
+        if !wants_usage_report(args) {
+            bail!("{}", tr(language_of(args), "cli.err.no_match"));
+        }
     }
     Ok((sessions, Some(report)))
+}
+
+fn wants_usage_report(args: &Args) -> bool {
+    args.daily || args.weekly || args.monthly || args.blocks
 }
 
 fn parse_range(args: &Args) -> anyhow::Result<TimeRange> {
@@ -1024,7 +1031,7 @@ fn render_usage_report(sessions: &[Session], args: &Args) -> anyhow::Result<Opti
         (_, _, true) => Some(UsagePeriod::Month),
         _ => None,
     };
-    if period.is_none() && !args.blocks {
+    if !wants_usage_report(args) {
         return Ok(None);
     }
     let tz = UsageTz::parse(&args.tz).with_context(|| {
@@ -1046,7 +1053,7 @@ fn render_usage_report(sessions: &[Session], args: &Args) -> anyhow::Result<Opti
                     UsagePeriod::Month => "month",
                 },
                 "timezone": tz_label,
-                "buckets": buckets,
+                "buckets": buckets.iter().take(args.limit.max(1)).collect::<Vec<_>>(),
             }))?));
         }
         let title = match period {
@@ -1488,6 +1495,12 @@ mod tests {
         args.overview = true;
         let err = load_sessions(&args).expect_err("empty parseable sessions should fail");
         assert!(err.to_string().contains("No sessions match"));
+
+        args.overview = false;
+        args.daily = true;
+        assert!(load_sessions(&args)
+            .expect("usage reports accept an empty match")
+            .is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
