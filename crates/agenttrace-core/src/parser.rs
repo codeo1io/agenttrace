@@ -117,32 +117,43 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if parsed_value.is_none() {
-        if let Some((events, ignorable_lines)) = parse_codex_rollout_jsonl(raw) {
+        if let Some((events, parse_counters)) = parse_codex_rollout_jsonl(raw) {
             let mut session = session_from_events(name, path, events)?;
-            // rm-047: make the fast-path skips visible in parse
-            // diagnostics instead of discarding them silently.
-            if ignorable_lines > 0 {
-                *session
-                    .metrics
-                    .line_skips
-                    .entry("codex_ignorable_line".to_string())
-                    .or_insert(0) += ignorable_lines;
+            // rm-047 made the fast-path skips visible in parse diagnostics;
+            // rm-401 widened the channel to every codex parse decision
+            // worth disclosing (ignorable lines, counted/deduped/unpaired
+            // token_usage_records).
+            for (key, count) in parse_counters {
+                *session.metrics.line_skips.entry(key).or_insert(0) += count;
             }
             return Ok(session);
         }
     }
     let objs = jsonl_objects(raw).collect::<Vec<_>>();
     if parsed_value.is_none() {
-        let probes: [JsonlProbe; 6] = [
+        let probes: [JsonlProbe; 5] = [
             parse_workbuddy_jsonl,
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
             parse_claude_transcript_jsonl,
             parse_copilot_session_jsonl,
-            parse_kimi_wire_jsonl,
         ];
         if let Some(events) = probes.iter().find_map(|probe| probe(&objs)) {
             return session_from_events(name, path, events);
+        }
+        // kimi_cli parses outside the probe array — last, exactly where it
+        // used to sit — because it carries its own disclosure channel for
+        // alias-matched usage fields (rm-400).
+        if let Some((events, usage_alias_counts)) = parse_kimi_wire_jsonl(&objs) {
+            let mut session = session_from_events(name, path, events)?;
+            for (key, count) in usage_alias_counts {
+                *session
+                    .metrics
+                    .line_skips
+                    .entry(format!("kimi_usage_alias:{key}"))
+                    .or_insert(0) += count;
+            }
+            return Ok(session);
         }
     }
     if is_qwen_code_jsonl(&objs) {
@@ -292,7 +303,18 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     non_empty(events)
 }
 
-fn parse_kimi_wire_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
+// kimi_cli's token_usage wire keys; every match is disclosed per session in
+// parse diagnostics (rm-400) so a future wire change cannot silently
+// zero usage again.
+const KIMI_USAGE_ALIAS_KEYS: [&str; 4] = [
+    "input_other",
+    "output",
+    "input_cache_read",
+    "input_cache_creation",
+];
+
+fn parse_kimi_wire_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, BTreeMap<String, usize>)> {
+    let mut usage_alias_counts: BTreeMap<String, usize> = BTreeMap::new();
     if !objs.iter().any(|entry| {
         entry
             .get("message")
@@ -382,25 +404,35 @@ fn parse_kimi_wire_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 ..Event::default()
             }),
             "StatusUpdate" => {
-                if let Some(usage) = payload
-                    .and_then(|payload| payload.get("token_usage"))
-                    .and_then(usage_from_value)
-                {
-                    events.insert(
-                        0,
-                        Event {
+                // rm-400: kimi reports per-StatusUpdate token_usage
+                // under its own wire keys (input_other / output /
+                // input_cache_read / input_cache_creation); usage_from_value
+                // now maps them, and every alias match is disclosed so a
+                // future key change surfaces in parse diagnostics instead of
+                // as silently-zero usage. Meta usage is summed per key in
+                // analyze, so the event rides in arrival order — the old
+                // insert(0) inverted multi-record journals.
+                if let Some(token_usage) = payload.and_then(|payload| payload.get("token_usage")) {
+                    let (usage, matched_keys) = usage_from_value_with_keys(token_usage);
+                    for key in matched_keys {
+                        if KIMI_USAGE_ALIAS_KEYS.contains(&key) {
+                            *usage_alias_counts.entry(key.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                    if let Some(usage) = usage {
+                        events.push(Event {
                             role: "meta".to_string(),
                             usage,
                             source_tool: "kimi_cli".to_string(),
                             ..Event::default()
-                        },
-                    );
+                        });
+                    }
                 }
             }
             _ => {}
         }
     }
-    non_empty(events)
+    non_empty(events).map(|events| (events, usage_alias_counts))
 }
 
 /// Parses a decrypted Antigravity trajectory sidecar
@@ -2201,19 +2233,54 @@ fn qwen_model_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     non_empty_usage(usage)
 }
 
-fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, usize)> {
+/// One buffered token_usage_record — top-level, or embedded as a compacted
+/// payload's latest_token_usage_record — awaiting pairing against a
+/// compaction marker once the whole journal is walked (rm-401).
+struct CodexUsageRecord {
+    response_id: String,
+    usage: BTreeMap<String, i64>,
+    timestamp: String,
+    model: String,
+}
+
+fn collect_codex_usage_record(record: &Value, into: &mut Vec<CodexUsageRecord>, timestamp: &str) {
+    // Mirrors the token_count snapshot gate: records without meaningful
+    // usage are not buffered.
+    let counts = token_usage_map(record.get("usage"));
+    if counts.is_empty() || !usage_has_values(&counts) {
+        return;
+    }
+    into.push(CodexUsageRecord {
+        response_id: string(record.get("response_id")).unwrap_or("").to_string(),
+        usage: counts,
+        timestamp: timestamp.to_string(),
+        model: string(record.get("model")).unwrap_or("unknown").to_string(),
+    });
+}
+
+fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, usize>)> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_codex = false;
     let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
     // rm-047: the head-probe fast path used to discard lines invisibly;
-    // count every skip so parse diagnostics can surface it.
-    let mut ignorable_lines = 0usize;
+    // count every skip so parse diagnostics can surface it. rm-401
+    // widened the map to the compaction-usage decisions too.
+    let mut counters: BTreeMap<String, usize> = BTreeMap::new();
+    // rm-401: token_usage_record events describe one response's
+    // usage; only records paired to a compaction marker count (normal turns
+    // are already inside the cumulative snapshots). Records can arrive
+    // before or after their marker, so both are buffered and paired after
+    // the loop.
+    let mut usage_records: Vec<CodexUsageRecord> = Vec::new();
+    let mut compaction_response_ids: BTreeSet<String> = BTreeSet::new();
     let lines = raw
         .lines()
         .filter(|line| {
             if codex_line_is_ignorable(line) {
-                ignorable_lines += 1;
+                *counters
+                    .entry("codex_ignorable_line".to_string())
+                    .or_insert(0) += 1;
                 false
             } else {
                 true
@@ -2373,31 +2440,126 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, usize)> {
                     _ => {}
                 }
             }
+            "compacted" => {
+                // rm-401: a compaction boundary. The turn that produced
+                // the summary is invisible to every later cumulative snapshot,
+                // so its usage arrives as a token_usage_record paired to
+                // payload.compaction_response_id — sometimes replayed inside
+                // this very payload as latest_token_usage_record. Register the
+                // marker; buffered records pair with it after the loop.
+                if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
+                    if let Some(response_id) = string(payload.get("compaction_response_id")) {
+                        if !response_id.is_empty() {
+                            compaction_response_ids.insert(response_id.to_string());
+                        }
+                    }
+                    if let Some(record) = payload.get("latest_token_usage_record") {
+                        collect_codex_usage_record(record, &mut usage_records, &ts);
+                    }
+                }
+            }
+            "token_usage_record" => {
+                // rm-401: per-response usage records. Compaction turns
+                // carry theirs here; normal turns' usage already lives in the
+                // cumulative token_count snapshots.
+                if let Some(record) = obj.get("payload") {
+                    collect_codex_usage_record(record, &mut usage_records, &ts);
+                }
+            }
             _ => {}
         }
     }
+    // Pair buffered usage records against compaction markers (rm-401).
+    // Counted once per response_id: a marker's latest_token_usage_record and
+    // the replayed top-level record describe the same turn (upstream ccusage
+    // #1821 dedups the copy). Unpaired records describe turns whose usage is
+    // already inside the cumulative snapshots, so they count for nothing but
+    // stay visible in diagnostics — the class this defect evaded. Counted
+    // usage never touches prev_token_total: the compaction turn is outside
+    // every cumulative snapshot, so feeding it to the high-water baseline
+    // would eat the next snapshot's climb.
+    let mut counted: BTreeSet<&str> = BTreeSet::new();
+    for record in &usage_records {
+        if record.response_id.is_empty() || !compaction_response_ids.contains(&record.response_id) {
+            *counters
+                .entry("codex_token_usage_record_unpaired".to_string())
+                .or_insert(0) += 1;
+            continue;
+        }
+        if !counted.insert(record.response_id.as_str()) {
+            *counters
+                .entry("codex_compaction_usage_duplicate".to_string())
+                .or_insert(0) += 1;
+            continue;
+        }
+        let mut cache_read = record
+            .usage
+            .get("cached_input_tokens")
+            .copied()
+            .unwrap_or(0);
+        if cache_read == 0 {
+            cache_read = record
+                .usage
+                .get("cache_read_input_tokens")
+                .copied()
+                .unwrap_or(0);
+        }
+        let cache_write = record
+            .usage
+            .get("cache_creation_input_tokens")
+            .copied()
+            .unwrap_or(0);
+        let input = (record.usage.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
+        let output = record
+            .usage
+            .get("output_tokens")
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(
+                record
+                    .usage
+                    .get("reasoning_output_tokens")
+                    .copied()
+                    .unwrap_or(0),
+            );
+        let usage = BTreeMap::from([
+            ("input_tokens".to_string(), input),
+            ("output_tokens".to_string(), output),
+            ("cache_creation_input_tokens".to_string(), cache_write),
+            ("cache_read_input_tokens".to_string(), cache_read),
+        ]);
+        events.push(Event {
+            role: "meta".to_string(),
+            timestamp: record.timestamp.clone(),
+            model_used: record.model.clone(),
+            source_tool: "codex_cli".to_string(),
+            usage,
+            ..Event::default()
+        });
+        *counters
+            .entry("codex_compaction_usage_record".to_string())
+            .or_insert(0) += 1;
+    }
     if saw_codex {
-        non_empty(events).map(|events| (events, ignorable_lines))
+        non_empty(events).map(|events| (events, counters))
     } else {
         None
     }
 }
 
-// Codex rollouts are dominated by event_msg payloads (item_completed carries full tool output)
-// and compaction snapshots that the parser discards; skip them before JSON-decoding the line.
+// Codex rollouts are dominated by event_msg payloads (item_completed carries
+// full tool output); skip them before JSON-decoding the line. The usage-bearing
+// token_count event is the one event_msg worth keeping: rescue it whenever its
+// marker appears anywhere in the line at a key boundary. compacted lines
+// deliberately do NOT take this fast path (rm-401): they are rare (one
+// per compaction boundary) and they now carry the pairing data
+// (compaction_response_id / latest_token_usage_record) for the compaction
+// turn's token_usage_record, which the blanket skip dropped along with the
+// snapshots.
 fn codex_line_is_ignorable(line: &str) -> bool {
     let Some(head) = line.get(..line.len().min(160)) else {
         return false;
     };
-    if json_key_present(head, r#""type":"compacted""#) {
-        return true;
-    }
-    // The usage-bearing token_count event is the one event_msg worth
-    // keeping: rescue it whenever its marker appears anywhere in the
-    // line at a key boundary. The old negative required exact
-    // `"payload":{"type":"token_count"` adjacency inside the first 160
-    // bytes, so reordered payload keys or a marker past the window
-    // silently dropped the session's only usage record (rm-047).
     json_key_present(head, r#""type":"event_msg""#)
         && !json_key_present(line, r#""type":"token_count""#)
 }
@@ -4293,9 +4455,18 @@ fn repair_lone_surrogates(line: &str) -> Option<String> {
     changed.then_some(out)
 }
 
-fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
-    let obj = value.as_object()?;
+/// usage_from_value plus the wire keys that produced each value. The
+/// kimi_cli StatusUpdate arm uses the matched keys to disclose
+/// alias-matched fields in parse diagnostics (rm-400): the alias
+/// table is a standing guess about other tools' wire formats, so every
+/// alias match is surfaced instead of silently-zeroing usage on a future
+/// key change.
+fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, Vec<&'static str>) {
+    let Some(obj) = value.as_object() else {
+        return (None, Vec::new());
+    };
     let mut usage = BTreeMap::new();
+    let mut matched_keys = Vec::new();
     for (target, keys) in [
         (
             "input_tokens",
@@ -4304,6 +4475,7 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
                 "prompt_tokens",
                 "inputTokens",
                 "promptTokenCount",
+                "input_other", // kimi_cli: non-cached input
             ][..],
         ),
         (
@@ -4313,6 +4485,9 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
                 "completion_tokens",
                 "outputTokens",
                 "candidatesTokenCount",
+                // kimi_cli; number_as_i64's coercion keeps this numeric-only
+                // so a bare string like "high" cannot match
+                "output",
             ][..],
         ),
         (
@@ -4322,6 +4497,7 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
                 "cacheCreationInputTokens",
                 "cache_creation",
                 "cacheWriteTokens",
+                "input_cache_creation", // kimi_cli
             ][..],
         ),
         (
@@ -4331,15 +4507,25 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
                 "cacheReadInputTokens",
                 "cache_read",
                 "cacheReadTokens",
+                "input_cache_read", // kimi_cli
             ][..],
         ),
     ] {
-        if let Some(value) = keys
+        // Prefer the first present key that actually yields a number,
+        // matching the legacy parser's per-format precedence (canonical
+        // keys first, aliases behind); remember which wire key won so
+        // alias matches can be disclosed per session (rm-400).
+        if let Some((key, value)) = keys
             .iter()
-            .find_map(|key| obj.get(*key))
-            .and_then(number_as_i64)
+            .filter_map(|key| {
+                obj.get(*key)
+                    .and_then(number_as_i64)
+                    .map(|value| (*key, value))
+            })
+            .next()
         {
             usage.insert(target.to_string(), value);
+            matched_keys.push(key);
         }
     }
     // Thinking tokens ride the output rate but are reported separately
@@ -4365,10 +4551,14 @@ fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
         usage.insert("reasoning_tokens".to_string(), reasoning);
     }
     if usage.is_empty() {
-        None
+        (None, matched_keys)
     } else {
-        Some(usage)
+        (Some(usage), matched_keys)
     }
+}
+
+fn usage_from_value(value: &Value) -> Option<BTreeMap<String, i64>> {
+    usage_from_value_with_keys(value).0
 }
 
 fn tool_result_content(block: &Map<String, Value>) -> String {
@@ -4743,8 +4933,11 @@ mod tests {
         // usage record.
         let noise = r#"{"timestamp":"2026-09-30T01:00:00Z","type":"event_msg","payload":{"type":"agent_message_delta","delta":"hi"}}"#;
         assert!(codex_line_is_ignorable(noise));
+        // The compacted compaction snapshot used to be blanket-ignorable;
+        // since rm-401 those lines parse (compaction pairing rides
+        // them), so they no longer take the fast path.
         let compacted = r#"{"timestamp":"2026-09-30T01:00:00Z","type":"compacted","payload":{}}"#;
-        assert!(codex_line_is_ignorable(compacted));
+        assert!(!codex_line_is_ignorable(compacted));
 
         // Same event, payload keys reordered and padded past the window.
         let rescued = format!(
@@ -5555,5 +5748,330 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- kimi_cli token_usage aliases (rm-400; renumbered at
+    // integration from the campaign-local id) -------------------------
+
+    #[test]
+    fn kimi_statusupdate_usage_uses_official_wire_aliases() {
+        // Official MoonshotAI/kimi-code wire fixture (MIT, 130 lines,
+        // 15 usage-bearing StatusUpdate records): the token_usage wire
+        // keys (input_other / output / input_cache_read /
+        // input_cache_creation) matched no alias in usage_from_value, so
+        // every record was dropped by the empty->None gate and the
+        // session fell back to text-estimate totals (132) instead of the
+        // reported 563,628.
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/kimi-cli/wire.jsonl"
+        ))
+        .expect("official kimi wire fixture ships with the crate");
+        let session = parse_raw_session("kimi", "wire-official-fixture.jsonl", &raw)
+            .expect("kimi session parses");
+        assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+        assert_eq!(session.metrics.tokens_input, 62_198, "input_other sum");
+        assert_eq!(session.metrics.tokens_output, 4_790, "output sum");
+        assert_eq!(
+            session.metrics.tokens_cache_r, 496_640,
+            "input_cache_read sum"
+        );
+        assert_eq!(
+            session.metrics.tokens_cache_w, 0,
+            "input_cache_creation sum"
+        );
+        assert_eq!(
+            session.metrics.tokens_input
+                + session.metrics.tokens_output
+                + session.metrics.tokens_cache_r
+                + session.metrics.tokens_cache_w,
+            563_628,
+            "grand total across every component"
+        );
+    }
+
+    #[test]
+    fn kimi_statusupdate_usage_events_preserve_arrival_order() {
+        // The StatusUpdate arm used events.insert(0, ..), so with more
+        // than one usage-bearing record the journal's arrival order was
+        // inverted. Totals are order-independent (meta usage is summed
+        // per key in analyze), but anything walking events must see wire
+        // order.
+        let su = |input_other: i64, output: i64| {
+            serde_json::json!({
+                "timestamp": 1,
+                "message": {"type": "StatusUpdate", "payload": {"token_usage": {
+                    "input_other": input_other, "output": output,
+                    "input_cache_read": 0, "input_cache_creation": 0
+                }}}
+            })
+            .to_string()
+        };
+        let raw = [su(10, 1), su(20, 2)].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_kimi_wire_jsonl(&objs).expect("kimi session parses").0;
+        let usage: Vec<i64> = events
+            .iter()
+            .filter(|event| event.role == "meta" && !event.usage.is_empty())
+            .map(|event| event.usage.get("input_tokens").copied().unwrap_or(-1))
+            .collect();
+        assert_eq!(
+            usage,
+            vec![10, 20],
+            "usage events must keep wire arrival order"
+        );
+    }
+
+    #[test]
+    fn kimi_alias_matches_are_numeric_only_and_canonical_first() {
+        // Canonical keys keep precedence over the kimi aliases, and the
+        // bare "output" key only matches when numeric — a string like
+        // "high" in another format's payload must never over-match
+        // through number_as_i64.
+        // Two lines so parse_raw_session dispatches through the jsonl path
+        // (a single-line raw parses as one JSON document instead).
+        let raw = [
+            serde_json::json!({
+                "timestamp": 1,
+                "message": {"type": "StatusUpdate", "payload": {"token_usage": {
+                    "input_tokens": 7, "input_other": 999,
+                    "output": "high", "input_cache_read": 5, "input_cache_creation": 2
+                }}}
+            }),
+            serde_json::json!({
+                "timestamp": 2,
+                "message": {"type": "SomethingElse", "payload": {}}
+            }),
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let session = parse_raw_session("kimi", "wire-alias-semantics.jsonl", &raw)
+            .expect("kimi session parses");
+        assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+        assert_eq!(
+            session.metrics.tokens_input, 7,
+            "canonical input_tokens wins over input_other"
+        );
+        assert_eq!(
+            session.metrics.tokens_output, 0,
+            "non-numeric output string never matches"
+        );
+        assert_eq!(session.metrics.tokens_cache_r, 5);
+        assert_eq!(session.metrics.tokens_cache_w, 2);
+    }
+
+    #[test]
+    fn kimi_usage_alias_matches_are_disclosed_in_parse_diagnostics() {
+        // The alias table is a standing guess about another tool's wire
+        // format; every alias-matched field is counted per session so a
+        // future key change surfaces in parse diagnostics instead of as
+        // silently-zero usage again.
+        let raw = [
+            serde_json::json!({
+                "timestamp": 1,
+                "message": {"type": "StatusUpdate", "payload": {"token_usage": {
+                    "input_other": 11, "output": 3,
+                    "input_cache_read": 5, "input_cache_creation": 0
+                }}}
+            }),
+            serde_json::json!({
+                "timestamp": 2,
+                "message": {"type": "SomethingElse", "payload": {}}
+            }),
+        ]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let session = parse_raw_session("kimi", "wire-alias-disclosure.jsonl", &raw)
+            .expect("kimi session parses");
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("kimi_usage_alias:input_other"),
+            Some(&1)
+        );
+        assert_eq!(
+            session.metrics.line_skips.get("kimi_usage_alias:output"),
+            Some(&1)
+        );
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("kimi_usage_alias:input_cache_read"),
+            Some(&1)
+        );
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("kimi_usage_alias:input_cache_creation"),
+            Some(&1),
+            "a zero-valued matched field is still a wire-shape signal"
+        );
+    }
+
+    // --- codex token_usage_record across compaction (rm-401;
+    // renumbered at integration) ----------------------------------------
+
+    fn codex_compaction_corpus(record_response_id: &str) -> String {
+        // Cycle-2 research PoC corpus: a pre-compaction cumulative
+        // snapshot, a compaction marker, the compaction turn's
+        // token_usage_record (500 in / 300 cached / 200 out — never part
+        // of any later cumulative), and a post-compaction snapshot. Before
+        // the fix the parser counted only the snapshots (1,910) and the
+        // record vanished without a trace; the truth is 2,610.
+        let lines = [
+            serde_json::json!({"timestamp":"2026-10-02T10:00:00Z","type":"session_meta","payload":{"model":"gpt-5.1-codex","cwd":"/home/user/proj"}}),
+            serde_json::json!({"timestamp":"2026-10-02T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.1-codex","cwd":"/home/user/proj"}}),
+            serde_json::json!({"timestamp":"2026-10-02T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":400,"reasoning_output_tokens":150},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":400,"reasoning_output_tokens":150}}}}),
+            serde_json::json!({"timestamp":"2026-10-02T10:01:30Z","type":"compacted","payload":{"compaction_response_id":"resp_comp_42","message":"Previous conversation compacted."}}),
+            serde_json::json!({"timestamp":"2026-10-02T10:02:00Z","type":"token_usage_record","payload":{"response_id":record_response_id,"usage":{"input_tokens":500,"cached_input_tokens":300,"output_tokens":200},"request_id":"req_9f21","model":"gpt-5.1-codex"}}),
+            serde_json::json!({"timestamp":"2026-10-02T10:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"cached_input_tokens":800,"output_tokens":520,"reasoning_output_tokens":190},"last_token_usage":{"input_tokens":200,"cached_input_tokens":200,"output_tokens":120,"reasoning_output_tokens":40}}}}),
+        ];
+        lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn codex_compaction_token_usage_record_is_counted_once() {
+        let session = parse_raw_session(
+            "codex",
+            "rollout-compaction-once.jsonl",
+            &codex_compaction_corpus("resp_comp_42"),
+        )
+        .expect("codex rollout parses");
+        // Snapshots: 400 net input + 600 cache + 550 out, then a
+        // 200-climb giving 0 net input + 200 cache + 160 out. Compaction
+        // turn: 200 net input + 300 cache + 200 out.
+        assert_eq!(session.metrics.tokens_input, 600);
+        assert_eq!(session.metrics.tokens_cache_r, 1_100);
+        assert_eq!(session.metrics.tokens_output, 910);
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_compaction_usage_record"),
+            Some(&1),
+            "the counted record is visible in parse diagnostics"
+        );
+    }
+
+    #[test]
+    fn codex_compaction_usage_is_counted_once_when_copied_into_the_marker() {
+        // Remote-compaction shape (upstream ccusage #1821): the compacted
+        // payload carries latest_token_usage_record AND the same record
+        // is replayed as a top-level token_usage_record with the same
+        // response_id — the compaction turn's usage must be counted
+        // exactly once, with the dedup decision disclosed.
+        let lines = [
+            serde_json::json!({"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.3-codex"}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:00:01Z","type":"turn_context","payload":{"model":"gpt-5.3-codex"}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":200,"reasoning_output_tokens":0}}}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:01:00Z","type":"compacted","payload":{"message":"Conversation compacted","compaction_response_id":"resp_compact_1","latest_token_usage_record":{"response_id":"resp_compact_1","usage":{"input_tokens":1500,"cached_input_tokens":800,"output_tokens":300,"reasoning_output_tokens":120}}}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:01:01Z","type":"token_usage_record","payload":{"response_id":"resp_compact_1","usage":{"input_tokens":1500,"cached_input_tokens":800,"output_tokens":300,"reasoning_output_tokens":120}}}),
+        ];
+        let raw = lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_raw_session("codex", "rollout-compaction-replayed.jsonl", &raw)
+            .expect("codex rollout parses");
+        // 1000 from the snapshot + 700 net from the record, exactly once.
+        assert_eq!(session.metrics.tokens_input, 1_700);
+        assert_eq!(session.metrics.tokens_cache_r, 800);
+        assert_eq!(session.metrics.tokens_output, 620);
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_compaction_usage_record"),
+            Some(&1)
+        );
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_compaction_usage_duplicate"),
+            Some(&1),
+            "the replayed copy is disclosed as deduped, not silently eaten"
+        );
+    }
+
+    #[test]
+    fn codex_unpaired_token_usage_record_is_visible_but_not_counted() {
+        // A token_usage_record whose response_id matches no compaction
+        // marker describes a normal turn whose usage is already inside
+        // the cumulative snapshots; counting it would double-count. The
+        // old parser dropped the line with no trace at all — the class
+        // this defect evaded — so the record stays visible as a counter.
+        let session = parse_raw_session(
+            "codex",
+            "rollout-compaction-unpaired.jsonl",
+            &codex_compaction_corpus("resp_ordinary"),
+        )
+        .expect("codex rollout parses");
+        // Snapshot totals only (the 1,910 shape); the unpaired record
+        // adds nothing.
+        assert_eq!(
+            session.metrics.tokens_input
+                + session.metrics.tokens_cache_r
+                + session.metrics.tokens_output,
+            1_910
+        );
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_token_usage_record_unpaired"),
+            Some(&1)
+        );
+        assert!(!session
+            .metrics
+            .line_skips
+            .contains_key("codex_compaction_usage_record"));
+    }
+
+    #[test]
+    fn codex_compaction_record_does_not_advance_the_high_water_baseline() {
+        // The compaction turn's usage lives outside every later
+        // cumulative snapshot, so it is added standalone — and it must
+        // never become the high-water baseline the snapshots diff
+        // against: a record larger than the running mark would otherwise
+        // eat the next snapshot's climb.
+        let lines = [
+            serde_json::json!({"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.3-codex"}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2500}}}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:01:00Z","type":"compacted","payload":{"compaction_response_id":"resp_c"}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:01:01Z","type":"token_usage_record","payload":{"response_id":"resp_c","usage":{"input_tokens":5000}}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000}}}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000}}}}),
+        ];
+        let raw = lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_raw_session("codex", "rollout-compaction-hwm.jsonl", &raw)
+            .expect("codex rollout parses");
+        // 2500 (first snapshot) + 5000 (the record, standalone) + 500
+        // (rebound past the 2500 mark). If the record had advanced the
+        // baseline the rebound would count 0.
+        assert_eq!(session.metrics.tokens_input, 8_000);
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_compaction_usage_record"),
+            Some(&1)
+        );
     }
 }

@@ -65,3 +65,24 @@ inversion is the regression gate.
 Costs, waste/savings math, and any budget gate derived from Codex sessions
 are computed from the under-counted totals; sessions with frequent remote
 compactions (long agent sessions — the fleet's norm) drift the most.
+
+## Addendum (2026-10-04, integration conflict case 95196cd1)
+
+The fix this verdict called for landed as rm-401 (run 2c2db6f5, batch U2,
+integrated at this merge): `token_usage_record` entries pair with their
+compaction marker by `response_id`, count exactly once per id (the marker's
+embedded `latest_token_usage_record` copy and the replayed top-level record
+are deduped and disclosed as `codex_compaction_usage_duplicate`), unpaired
+records stay visible as `codex_token_usage_record_unpaired` without being
+counted, and counted usage never advances the rm-035/rm-162 high-water
+baseline. The characterization harness `tests/codex_compaction_verdict.rs`
+was flipped to the post-fix totals measured on the merged tree —
+in 1700 (net) / cache_r 800 / out 620 / reasoning 0 on
+`remote-compaction.jsonl` — expressed in the parser's codex decomposition
+(input net of cached, reasoning folded into output). This differs from the
+gross-input arithmetic quoted above (in 3100 / cache 800 / out 600 /
+rea 120): the post-compaction rewound snapshot (700 cumulative, below the
+1200 high-water mark) is still refused by the rewind guard — deliberately,
+as no-double-count — so the post-compaction window's own usage (600 in /
+100 out) remains a disclosed follow-up class rather than being counted.
+That inversion is the regression gate for the fix.

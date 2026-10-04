@@ -5,7 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 21;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 22;
+// Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
+// kimi_cli usage-alias fix and the Codex compaction pairing fix change
+// reported totals for unchanged files, so warm v21 entries carry the
+// pre-fix under-counts this batch exists to correct (the rm-230
+// convention: parser-semantics changes bump the schema so cached
+// sessions regenerate under corrected accounting). Entries regenerate
+// once on next scan.
 // Fork-merge bump (cycle-1 rm-009, v0.9.0 port): upstream #286 moved the
 // schema 17 -> 19 (loop_fingerprints diagnostics model); the fork had
 // independently evolved 17 with its own fields (byte bound, walk v2).
