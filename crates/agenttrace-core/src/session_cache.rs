@@ -218,6 +218,19 @@ struct GoMetrics {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     line_skips: BTreeMap<String, usize>,
+    /// rm-436: USD cost the source journal recorded for usage blocks;
+    /// round-trips so a cached session keeps its recorded-cost pricing
+    /// instead of reverting to the catalog estimate on cache hit.
+    #[serde(default, rename = "UpstreamCostUSD")]
+    upstream_cost_usd: f64,
+    /// rm-436/rm-437: parse-time disclosure counters (pi journals),
+    /// round-tripped so cache hits keep disclosing.
+    #[serde(
+        default,
+        rename = "DisclosureCounters",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    disclosure_counters: BTreeMap<String, usize>,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
 }
@@ -1245,6 +1258,8 @@ impl GoMetrics {
             cost_estimated: metrics.cost_estimated,
             stored_totals_delta: metrics.stored_totals_delta,
             line_skips: metrics.line_skips.clone(),
+            upstream_cost_usd: metrics.upstream_cost_usd,
+            disclosure_counters: metrics.disclosure_counters.clone(),
             provenance: metrics.provenance.clone(),
         }
     }
@@ -1282,6 +1297,8 @@ impl GoMetrics {
             cost_estimated: self.cost_estimated,
             stored_totals_delta: self.stored_totals_delta,
             line_skips: self.line_skips.clone(),
+            upstream_cost_usd: self.upstream_cost_usd,
+            disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
         }
     }
