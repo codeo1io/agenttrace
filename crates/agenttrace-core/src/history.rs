@@ -68,7 +68,15 @@ pub fn merge_preserved_history(live: &mut Vec<Session>) {
 }
 
 fn load_records() -> BTreeMap<String, DerivedSession> {
+    // rm-430: this artifact lives in the data dir, which the cache-dir
+    // sweep never visited — a crash between write_private and rename
+    // stranded `history.json.tmp.<pid>.<seq>` beside the real file
+    // forever, contradicting PRIVACY.md's "reclaimed by the next load"
+    // promise. Reclaim aged orphans on every history load, with the
+    // same generous max-age contract the cache dir uses (a live
+    // concurrent writer's temp survives; it exists for microseconds).
     let path = history_path();
+    crate::session_cache::sweep_orphaned_temps(&path, crate::session_cache::ORPHAN_TEMP_MAX_AGE);
     let Ok(raw) = std::fs::read(&path) else {
         return BTreeMap::new();
     };
@@ -276,6 +284,67 @@ mod tests {
             "history.json must be owner-only, got {:o}",
             mode & 0o777
         );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stranded_history_temp_sibling_is_reclaimed_on_load() {
+        // rm-430: history.json.tmp.<pid>.<seq> siblings live in the DATA
+        // dir (history_path()), which the cache-dir-only sweep never
+        // visited -- PRIVACY.md's "reclaimed by the next cache load ...
+        // not left forever" promise was false for the retained history
+        // artifact. The load path must reclaim an AGED orphan, keep a
+        // fresh one (a live concurrent writer's temp, sub-max-age), and
+        // leave the real history.json untouched.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-sweep-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        // Point history_path() at the temp root under the shared env lock
+        // (the default is the user's real data dir).
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+
+        let live = root.join("history.json");
+        std::fs::write(&live, b"{}").expect("write empty history");
+        let aged_orphan = root.join("history.json.tmp.999999.1");
+        std::fs::write(&aged_orphan, b"{\"stranded\":").expect("write stranded temp");
+        // Age the orphan past ORPHAN_TEMP_MAX_AGE (1h) without sleeping:
+        // backdate its mtime (FileTimes is stable on this toolchain).
+        {
+            let handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&aged_orphan)
+                .expect("open orphan for backdating");
+            handle
+                .set_times(std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60),
+                ))
+                .expect("backdate orphan mtime");
+        }
+        let fresh_orphan = root.join(format!("history.json.tmp.{}.2", std::process::id() + 1));
+        std::fs::write(&fresh_orphan, b"live writer staging").expect("write fresh temp");
+
+        let records = load_records();
+        assert!(records.is_empty(), "empty history decodes to no records");
+        assert!(
+            !aged_orphan.exists(),
+            "aged history tmp sibling must be reclaimed on load"
+        );
+        assert!(
+            fresh_orphan.exists(),
+            "fresh tmp sibling (live writer) must survive the sweep"
+        );
+        assert!(live.exists(), "history.json itself must be untouched");
+
         match prior {
             Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
             None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),

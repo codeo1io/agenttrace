@@ -1134,7 +1134,15 @@ fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
     // zero stderr, on a corpus the baseline condemns) and -1 false-failed a
     // byte-identical baseline (rc2 "Gate failed"). Both must be rc1 naming
     // the flag, before any comparison runs.
-    let work = std::env::temp_dir().join("agenttrace-rm346b-baseline");
+    // rm-429: pid+thread-suffixed root (rm-301 Rule 2/7 pattern below); the
+    // bare fixed name let a concurrently running sibling cargo suite on
+    // this shared host delete the baseline between generate and the
+    // identical-control run (live failure 2026-10-04).
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-rm346b-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     std::fs::create_dir_all(&work).expect("create temp dir");
     let baseline = work.join("baseline.json");
     let generate = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
