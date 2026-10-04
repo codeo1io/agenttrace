@@ -39,6 +39,20 @@ English status string that had rendered in Chinese — roughly 1 run in 50,
 and only under CPU load. Thread-keying the base closed it (18/18 loaded
 runs green).
 
+Rule 2's keying must also reach FIXED test roots (rm-429, 2026-10-04): a
+root like `temp_dir().join("agenttrace-<item>")` with no pid/thread
+component is shared mutable state across every `cargo test` invocation on
+the host, not just this binary's threads. Live case: two conductor lanes
+ran `cargo test` concurrently on one shared delegate host; the second
+suite's `baseline_delta_pct_flags_reject_nan_and_negative_values`
+deleted-and-recreated the first suite's `agenttrace-rm346b-baseline/`
+mid-run, and the identical-control child failed `rc0 expected` with
+`No such file or directory` on a clean HEAD — a pure false regression.
+Every `temp_dir().join("agenttrace…")` in tests carries pid+thread
+components (`agenttrace-<item>-{pid}-{thread:?}` — see the rm-301 root in
+`crates/agenttrace-cli/tests/entrypoints.rs`); a grep probe for unsuffixed
+fixed roots belongs in the same review pass as the doc-commands gate.
+
 ## Rule 3 — TUI background-worker tests draw before polling
 
 TUI background workers (governance delivery, session loading) spawn when

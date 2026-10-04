@@ -33,7 +33,7 @@ const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
 /// never races an in-flight write (pass-7 P7-5).
-const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+pub(crate) const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Hard entry bound for the session cache (pass-8 F8-3). Beyond it the
 /// entries with the oldest source-file fingerprint (mtime) are dropped

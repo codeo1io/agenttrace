@@ -5524,7 +5524,11 @@ mod tests {
         // keeps claude-only keys (parentUuid here), so is_qwen_code_jsonl must
         // not claim the file and parse_claude_code_jsonl must — the session
         // classifies claude_code instead of qwen_code.
-        let dir = std::env::temp_dir().join("agenttrace-rm345-claude-stripped");
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm345-claude-stripped-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stripped.jsonl");
         std::fs::write(

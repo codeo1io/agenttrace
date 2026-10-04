@@ -12,6 +12,15 @@ fail() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir/determinism"
 
+generated_files=()
+for i in 1 2 3; do
+  generated_files+=(
+    "$out_dir/determinism/latest-$i.json"
+    "$out_dir/determinism/overview-$i.json"
+    "$out_dir/determinism/baseline-$i.json"
+  )
+done
+
 for i in 1 2 3; do
   "$bin" --demo --latest -f json >"$out_dir/determinism/latest-$i.json"
   "$bin" --demo --overview -f json >"$out_dir/determinism/overview-$i.json"
@@ -22,9 +31,29 @@ for i in 1 2 3; do
     >"$out_dir/determinism/baseline-$i.json"
 done
 
-for path in "$out_dir"/determinism/*.json; do
+for path in "${generated_files[@]}"; do
   node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$path" \
     || fail "invalid JSON: $path"
+done
+
+# generated_at is wall-clock time at second precision, so runs that straddle a
+# second boundary differ legitimately (#294 mirror; rm-432). Drop it before
+# comparing, recursively, including fields nested within arrays.
+for path in "${generated_files[@]}"; do
+  node -e '
+    const fs = require("fs");
+    const strip = (v) => {
+      if (Array.isArray(v)) return v.map(strip);
+      if (v && typeof v === "object") {
+        return Object.fromEntries(
+          Object.entries(v).filter(([k]) => k !== "generated_at").map(([k, x]) => [k, strip(x)]),
+        );
+      }
+      return v;
+    };
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    fs.writeFileSync(process.argv[1], JSON.stringify(strip(data), null, 2) + "\n");
+  ' "$path" || fail "could not normalize: $path"
 done
 
 cmp -s "$out_dir/determinism/latest-1.json" "$out_dir/determinism/latest-2.json" \
