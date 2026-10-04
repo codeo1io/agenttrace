@@ -234,6 +234,14 @@ struct GoMetrics {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     line_skips: BTreeMap<String, usize>,
+    /// rm-408: present-but-zero usage events, preserved across cache
+    /// round-trips so the disclosure survives a warm cache.
+    #[serde(
+        default,
+        rename = "ZeroUsageEvents",
+        skip_serializing_if = "crate::usize_is_zero"
+    )]
+    zero_usage_events: usize,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
 }
@@ -1261,6 +1269,7 @@ impl GoMetrics {
             cost_estimated: metrics.cost_estimated,
             stored_totals_delta: metrics.stored_totals_delta,
             line_skips: metrics.line_skips.clone(),
+            zero_usage_events: metrics.zero_usage_events,
             provenance: metrics.provenance.clone(),
         }
     }
@@ -1298,6 +1307,7 @@ impl GoMetrics {
             cost_estimated: self.cost_estimated,
             stored_totals_delta: self.stored_totals_delta,
             line_skips: self.line_skips.clone(),
+            zero_usage_events: self.zero_usage_events,
             provenance: self.provenance,
         }
     }

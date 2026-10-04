@@ -21,6 +21,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+mod csv_export;
 mod upstream;
 
 #[derive(Debug, Parser)]
@@ -32,7 +33,7 @@ struct Args {
         short = 'f',
         long = "format",
         default_value = "text",
-        value_parser = ["text", "json", "markdown", "md", "html"]
+        value_parser = ["text", "json", "csv", "markdown", "md", "html"]
     )]
     format: String,
     /// Session directory to scan instead of auto-discovered agent homes
@@ -216,7 +217,8 @@ fn run() -> anyhow::Result<()> {
     // stdout stream must stay a single parseable JSON document end to
     // end (a downstream `jq` breaks on any leading line), so they route
     // to stderr. The human path keeps them on stdout exactly as before.
-    let announce: fn(&str) -> anyhow::Result<()> = if args.format == "json" {
+    let announce: fn(&str) -> anyhow::Result<()> = if matches!(args.format.as_str(), "json" | "csv")
+    {
         write_stderr
     } else {
         write_stdout
@@ -544,6 +546,7 @@ fn run() -> anyhow::Result<()> {
         }
         let range = parse_range(&args)?;
         let mut out = match args.format.as_str() {
+            "csv" => csv_export::overview_csv(&overview),
             "json" => report_overview_json_with_context(
                 &overview,
                 &sessions,
@@ -1272,6 +1275,27 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
     let sessions = sessions.iter().take(limit).collect::<Vec<_>>();
     if format == "json" {
         return serde_json::to_string_pretty(&sessions).expect("sessions serialize");
+    }
+    if format == "csv" {
+        // rm-409: RFC 4180 statement export. rm-383 sanitation composes
+        // BEFORE quoting (control bytes never ride into a cell), and the
+        // rm-408 disclosure column rides along so zeros never read clean.
+        let rows = sessions
+            .iter()
+            .map(|session| csv_export::SessionCsvRow {
+                session: sanitize_line_segment(&session.name),
+                health: session.health,
+                data: session_capability(session).to_string(),
+                source: sanitize_line_segment(&session.metrics.source_tool),
+                model: sanitize_line_segment(&session.metrics.model_used),
+                cost: session.metrics.cost_estimated,
+                tokens: total_tokens(session),
+                fail: session.metrics.tool_calls_fail,
+                anomalies: session.anomalies.len(),
+                zero_usage_events: session.metrics.zero_usage_events,
+            })
+            .collect::<Vec<_>>();
+        return csv_export::sessions_csv(&rows);
     }
     let mut lines =
         vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
