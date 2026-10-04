@@ -61,7 +61,9 @@ pub use reports::{
     report_overview_markdown_with_context, report_overview_text, report_overview_text_with_context,
     report_text, report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage,
 };
-pub use search::{report_search_json, report_search_text, search_sessions};
+pub use search::{
+    report_search_json, report_search_text, report_search_text_with_language, search_sessions,
+};
 pub use session_cache::{
     cached_session, clear_session_cache, load_cached_sessions, load_cached_sessions_from_cache,
     load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,

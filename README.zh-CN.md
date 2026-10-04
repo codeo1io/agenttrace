@@ -117,6 +117,20 @@ agenttrace -f json sessions.jsonl    # -f json 生效
 
 `--limit` 只限制列表视图（例如 overview 的 `recent_sessions`）；它从不过滤聚合值、审计总额或建议。治理报告默认覆盖全部会话——需要显式、带披露的上限时使用 `--sample N`（JSON 中会输出 `audited_sessions` / `total_sessions` / `excluded_reason`）。
 
+### 语言选择（`--lang`）
+
+`--lang en`（默认）与 `--lang zh` 选择报告语言。中文报告由完整接入语言环境的输出路径渲染：
+
+- `--overview`（text、markdown、html）
+- `--sessions` 与 `--search`（text 格式）
+- `--latest`/会话路径（text 与 json：json 会翻译散文取值）
+- `--diagnostics`/`--inspect`（text 格式）
+- `--waste`、`--compare`（text 格式）
+- 交互式 TUI
+- `--clear-cache` 与 `--update-pricing` 的状态输出
+
+其余组合会**以非零退出码（1，与其他参数错误一致）大声失败**，而不是静默渲染英文：`-f json` 机器契约（JSON 结构与英文取值是 CI 依赖的稳定契约）、`--doctor`、`--demo`、`--list-models`、`--test-match`、`--statusline-report` 以及上游状态报告。错误诊断与门禁输出始终保持英文，CI 门禁不受影响。已翻译报告内由代码生成的分析性文字（事件标签、成本驱动说明、健康趋势文案）暂时保持英文。
+
 ## 你会得到什么
 
 | 需求 | agenttrace 提供 |

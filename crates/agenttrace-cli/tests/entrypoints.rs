@@ -346,7 +346,11 @@ fn no_baseline_gate_is_a_boolean_not_a_value_flag() {
     // `--sessions --no-baseline-gate <fixture> --overview` let the
     // post-positional `--overview` through and the run died on
     // "choose exactly one report action"; with the fix the trailing
-    // flag is ignored and the session list prints.
+    // flag is ignored. Since rm-246 the parsed-but-inapplicable
+    // `--no-baseline-gate` (no --baseline supplied) is itself rejected
+    // loudly instead of silently no-oping — which still proves the
+    // post-positional --overview never reached action validation: the
+    // error names the gate flag, never "choose exactly one report action".
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .args([
             "--sessions",
@@ -359,16 +363,15 @@ fn no_baseline_gate_is_a_boolean_not_a_value_flag() {
         .output()
         .expect("run agenttrace CLI");
     assert!(
-        output.status.success(),
-        "trailing post-positional flags must be ignored, not validated: {:?}",
+        !output.status.success(),
+        "--no-baseline-gate without --baseline must fail loudly, got {:?}",
         output
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("SESSION\tHEALTH\tDATA"),
-        "the session list must print, got {stdout:?}"
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--no-baseline-gate requires --baseline"),
+        "the inapplicable gate flag must be named in the error: {stderr:?}"
+    );
     assert!(
         !stderr.contains("choose exactly one report action"),
         "the post-positional --overview must never reach action validation"

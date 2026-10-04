@@ -59,7 +59,17 @@ pub enum ReportLanguage {
 }
 
 impl ReportLanguage {
-    fn t(self, en: &'static str, zh: &'static str) -> &'static str {
+    /// rm-085: translate a short UI label. English is returned verbatim, so
+    /// En output stays byte-identical to pre-localization renderers.
+    pub fn t(self, en: &'static str, zh: &'static str) -> &'static str {
+        match self {
+            Self::En => en,
+            Self::Zh => zh,
+        }
+    }
+
+    /// rm-085: translate a label whose text is formatted at runtime.
+    pub fn t_owned(self, en: String, zh: String) -> String {
         match self {
             Self::En => en,
             Self::Zh => zh,
@@ -568,36 +578,53 @@ pub fn report_overview_text_with_context(
     data_health: &crate::DataHealth,
     range: crate::TimeRange,
     includes_preserved_history: bool,
+    language: ReportLanguage,
 ) -> String {
     let scope = report_scope(sessions, range, includes_preserved_history);
     let audit = cost_audit(sessions);
-    let mut out = report_overview_text(overview, sessions);
-    out.push_str("\n── Scope and confidence ──\n");
+    let mut out = report_overview_text_with_language(overview, sessions, language);
     out.push_str(&format!(
-        "  Range: {} | sessions: {} | {} to {}\n",
-        scope.range, scope.sessions_in_scope, scope.earliest_session_at, scope.latest_session_at
+        "\n── {} ──\n",
+        language.t("Scope and confidence", "范围与置信度")
+    ));
+    out.push_str(&format!(
+        "  {}: {} | {}: {} | {} {} {}\n",
+        language.t("Range", "范围"),
+        scope.range,
+        language.t("sessions", "会话"),
+        scope.sessions_in_scope,
+        scope.earliest_session_at,
+        language.t("to", "至"),
+        scope.latest_session_at
     ));
     // Out-of-scope sessions are disclosed instead of shrinking the
     // `discovered` denominator (pass-8 F8-2).
     out.push_str(&format!(
-        "  Parse: {} | confidence: {}\n",
+        "  {}: {} | {}: {}\n",
+        language.t("Parse", "解析"),
         parse_coverage_phrase(data_health, ", "),
+        language.t("confidence", "置信度"),
         data_health.confidence
     ));
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
-            "  Dropped lines: {}\n",
+            "  {}: {}\n",
+            language.t("Dropped lines", "丢弃行"),
             line_skips_cell(&data_health.line_skips)
         ));
     }
     out.push_str(&format!(
-        "  Pricing: {} | exact={} fallback={} unknown={}\n",
+        "  {}: {} | {}={} {}={} {}={}\n",
+        language.t("Pricing", "定价"),
         audit.pricing_source,
+        language.t("exact", "精确"),
         audit.pricing_coverage.priced_sessions,
+        language.t("fallback", "回退"),
         audit.pricing_coverage.fallback_priced_sessions,
+        language.t("unknown", "未知"),
         audit.pricing_coverage.unpriced_or_unknown_sessions
     ));
-    render_recommendations_text(&mut out, &recommendations(sessions));
+    render_recommendations_text(&mut out, &recommendations(sessions), language);
     out
 }
 
@@ -607,19 +634,61 @@ pub fn report_overview_markdown_with_context(
     data_health: &crate::DataHealth,
     range: crate::TimeRange,
     includes_preserved_history: bool,
+    language: ReportLanguage,
 ) -> String {
     let scope = report_scope(sessions, range, includes_preserved_history);
     let audit = cost_audit(sessions);
-    let mut out = report_overview_markdown(overview, sessions);
-    out.push_str("\n## Scope and confidence\n\n| Field | Value |\n|---|---|\n");
-    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", scope.range, scope.earliest_session_at, scope.latest_session_at, parse_coverage_phrase(data_health, "; "), data_health.confidence, markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
+    let mut out = report_overview_markdown_with_language(overview, sessions, language);
+    out.push_str(&format!(
+        "\n## {}\n\n| {} | {} |\n|---|---|\n",
+        language.t("Scope and confidence", "范围与置信度"),
+        language.t("Field", "字段"),
+        language.t("Value", "数值")
+    ));
+    out.push_str(&format!(
+        "| {} | {} |\n",
+        language.t("Range", "范围"),
+        scope.range
+    ));
+    out.push_str(&format!(
+        "| {} | {} → {} |\n",
+        language.t("Session window", "会话窗口"),
+        scope.earliest_session_at,
+        scope.latest_session_at
+    ));
+    out.push_str(&format!(
+        "| {} | {} |\n",
+        language.t("Parse coverage", "解析覆盖率"),
+        parse_coverage_phrase(data_health, "; ")
+    ));
+    out.push_str(&format!(
+        "| {} | {} |\n",
+        language.t("Confidence", "置信度"),
+        data_health.confidence
+    ));
+    out.push_str(&format!(
+        "| {} | {} |\n",
+        language.t("Pricing", "定价"),
+        markdown_cell(&audit.pricing_source)
+    ));
+    out.push_str(&format!(
+        "| {} | {}: {}; {}: {}; {}: {} |\n",
+        language.t("Pricing coverage", "定价覆盖"),
+        language.t("exact", "精确"),
+        audit.pricing_coverage.priced_sessions,
+        language.t("fallback", "回退"),
+        audit.pricing_coverage.fallback_priced_sessions,
+        language.t("unknown", "未知"),
+        audit.pricing_coverage.unpriced_or_unknown_sessions
+    ));
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
-            "| Dropped lines | {} |\n",
+            "| {} | {} |\n",
+            language.t("Dropped lines", "丢弃行"),
             markdown_cell(&line_skips_cell(&data_health.line_skips))
         ));
     }
-    render_recommendations_markdown(&mut out, &recommendations(sessions));
+    render_recommendations_markdown(&mut out, &recommendations(sessions), language);
     out
 }
 
@@ -629,20 +698,51 @@ pub fn report_overview_html_with_context(
     data_health: &crate::DataHealth,
     range: crate::TimeRange,
     includes_preserved_history: bool,
+    language: ReportLanguage,
 ) -> String {
     let scope = report_scope(sessions, range, includes_preserved_history);
     let audit = cost_audit(sessions);
     let recommendations = recommendations(sessions);
-    let mut appendix = String::from("<section><h2>Scope and confidence</h2><table><tbody>");
-    appendix.push_str(&format!("<tr><th>Range</th><td>{}</td></tr><tr><th>Session window</th><td>{} → {}</td></tr><tr><th>Parse coverage</th><td>{}</td></tr><tr><th>Confidence</th><td>{}</td></tr><tr><th>Pricing</th><td>{}</td></tr>", html_escape(&scope.range), html_escape(&scope.earliest_session_at), html_escape(&scope.latest_session_at), html_escape(&parse_coverage_phrase(data_health, "; ")), html_escape(&data_health.confidence), html_escape(&audit.pricing_source)));
+    let mut appendix = String::new();
+    appendix.push_str(&format!(
+        "<section><h2>{}</h2><table><tbody>",
+        language.t("Scope and confidence", "范围与置信度")
+    ));
+    appendix.push_str(&format!(
+        "<tr><th>{}</th><td>{}</td></tr>",
+        language.t("Range", "范围"),
+        html_escape(&scope.range)
+    ));
+    appendix.push_str(&format!(
+        "<tr><th>{}</th><td>{} → {}</td></tr>",
+        language.t("Session window", "会话窗口"),
+        html_escape(&scope.earliest_session_at),
+        html_escape(&scope.latest_session_at)
+    ));
+    appendix.push_str(&format!(
+        "<tr><th>{}</th><td>{}</td></tr>",
+        language.t("Parse coverage", "解析覆盖率"),
+        html_escape(&parse_coverage_phrase(data_health, "; "))
+    ));
+    appendix.push_str(&format!(
+        "<tr><th>{}</th><td>{}</td></tr>",
+        language.t("Confidence", "置信度"),
+        html_escape(&data_health.confidence)
+    ));
+    appendix.push_str(&format!(
+        "<tr><th>{}</th><td>{}</td></tr>",
+        language.t("Pricing", "定价"),
+        html_escape(&audit.pricing_source)
+    ));
     if !data_health.line_skips.is_empty() {
         appendix.push_str(&format!(
-            "<tr><th>Dropped lines</th><td>{}</td></tr>",
+            "<tr><th>{}</th><td>{}</td></tr>",
+            language.t("Dropped lines", "丢弃行"),
             html_escape(&line_skips_cell(&data_health.line_skips))
         ));
     }
     appendix.push_str("</tbody></table></section>");
-    appendix.push_str("<section><h2>Prioritized recommendations</h2><table><thead><tr><th>Priority</th><th>Finding</th><th>Impact</th><th>Action</th></tr></thead><tbody>");
+    appendix.push_str(&format!("<section><h2>{}</h2><table><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>", language.t("Prioritized recommendations", "优先建议"), language.t("Priority", "优先级"), language.t("Finding", "发现"), language.t("Impact", "影响"), language.t("Action", "行动")));
     for item in recommendations.iter().take(12) {
         appendix.push_str(&format!(
             "<tr><td>{}</td><td>{}: {}</td><td>${:.4}; {} tokens; {}</td><td>{}</td></tr>",
@@ -656,34 +756,60 @@ pub fn report_overview_html_with_context(
         ));
     }
     appendix.push_str("</tbody></table></section>");
-    report_overview_html(overview, sessions).replacen("</main>", &(appendix + "</main>"), 1)
+    report_overview_html_with_language(overview, sessions, language).replacen(
+        "</main>",
+        &(appendix + "</main>"),
+        1,
+    )
 }
 
-fn render_recommendations_text(out: &mut String, items: &[crate::Recommendation]) {
+fn render_recommendations_text(
+    out: &mut String,
+    items: &[crate::Recommendation],
+    language: ReportLanguage,
+) {
     if items.is_empty() {
         return;
     }
-    out.push_str("\n── Prioritized recommendations ──\n");
+    out.push_str(&format!(
+        "\n── {} ──\n",
+        language.t("Prioritized recommendations", "优先建议")
+    ));
     for item in items.iter().take(12) {
         out.push_str(&format!(
-            "  [{}] {} — {} | ${:.4}, {} tokens | {}\n    Action: {}\n    Verify: {}\n",
+            "  [{}] {} — {} | ${:.4}, {} {} | {}\n    {}: {}\n    {}: {}\n",
             item.priority,
             item.title,
             item.rationale,
             item.estimated_savings_usd,
             item.estimated_savings_tokens,
+            language.t("tokens", "Token"),
             item.confidence,
+            language.t("Action", "行动"),
             item.action,
+            language.t("Verify", "验证"),
             item.validation_command
         ));
     }
 }
 
-fn render_recommendations_markdown(out: &mut String, items: &[crate::Recommendation]) {
+fn render_recommendations_markdown(
+    out: &mut String,
+    items: &[crate::Recommendation],
+    language: ReportLanguage,
+) {
     if items.is_empty() {
         return;
     }
-    out.push_str("\n## Prioritized recommendations\n\n| Priority | Finding | Estimated impact | Confidence | Action |\n|---|---|---:|---|---|\n");
+    out.push_str(&format!(
+        "\n## {}\n\n| {} | {} | {} | {} | {} |\n|---|---|---:|---|---|\n",
+        language.t("Prioritized recommendations", "优先建议"),
+        language.t("Priority", "优先级"),
+        language.t("Finding", "发现"),
+        language.t("Estimated impact", "预估影响"),
+        language.t("Confidence", "置信度"),
+        language.t("Action", "行动")
+    ));
     for item in items.iter().take(12) {
         out.push_str(&format!(
             "| {} | {} | ${:.4}; {} tokens | {} | {} |\n",
@@ -765,6 +891,18 @@ pub fn add_baseline_comparison(
 }
 
 pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String {
+    report_overview_text_with_language(overview, sessions, ReportLanguage::En)
+}
+
+/// rm-085: overview text report, localized. English output is byte-identical
+/// to the pre-localization renderer; generated analysis prose (incident
+/// labels, cost-driver notes) remains English this cycle and is disclosed in
+/// README's --lang table.
+pub fn report_overview_text_with_language(
+    overview: &Overview,
+    sessions: &[Session],
+    language: ReportLanguage,
+) -> String {
     let ordered = canonical_sessions(sessions);
     let authority = overview_authority_summary(&ordered);
     let sep = "━".repeat(70);
@@ -773,8 +911,11 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     out.push_str(&sep);
     out.push('\n');
     out.push_str(&format!(
-        "  AGENTTRACE v{} — Global Overview  ({} Sessions)\n",
-        VERSION, overview.total_sessions
+        "  AGENTTRACE v{} — {}  ({} {})\n",
+        VERSION,
+        language.t("Global Overview", "全局总览"),
+        overview.total_sessions,
+        language.t("Sessions", "个会话")
     ));
     out.push_str(&sep);
     out.push_str("\n\n");
@@ -789,32 +930,40 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         .checked_div(overview.total_sessions)
         .unwrap_or(0);
     out.push_str(&format!(
-        "  Total Sessions:     {}\n",
+        "  {}:     {}\n",
+        language.t("Total Sessions", "会话总数"),
         overview.total_sessions
     ));
     out.push_str(&format!(
-        "  🟢 Healthy:   {} ({}%)\n",
+        "  🟢 {}:   {} ({}%)\n",
+        language.t("Healthy", "健康"),
         format_count(overview.healthy),
         healthy_pct
     ));
     out.push_str(&format!(
-        "  🟡 Warning:   {} ({}%)\n",
+        "  🟡 {}:   {} ({}%)\n",
+        language.t("Warning", "警告"),
         format_count(overview.warning),
         warning_pct
     ));
     out.push_str(&format!(
-        "  🔴 Critical:   {} ({}%)\n",
+        "  🔴 {}:   {} ({}%)\n",
+        language.t("Critical", "严重"),
         format_count(overview.critical),
         critical_pct
     ));
     out.push_str(&format!(
-        "  💰 Total estimated cost:      {}\n\n",
+        "  💰 {}:      {}\n\n",
+        language.t("Total estimated cost", "预估总成本"),
         format_cost(overview.total_cost)
     ));
 
     let timelines = overview_incident_timelines(&ordered, 3);
     if !timelines.is_empty() {
-        out.push_str("  ── Incident timeline ──\n");
+        out.push_str(&format!(
+            "  ── {} ──\n",
+            language.t("Incident timeline", "事件时间线")
+        ));
         let mut rendered = 0;
         'timeline: for timeline in timelines {
             for item in timeline.items {
@@ -834,13 +983,20 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     }
 
     if authority.has_data {
-        out.push_str("  ── Tool authority ──\n");
+        out.push_str(&format!(
+            "  ── {} ──\n",
+            language.t("Tool authority", "工具权限")
+        ));
         if !authority.highest.is_empty() {
-            out.push_str(&format!("    Highest category: {}\n", authority.highest));
+            out.push_str(&format!(
+                "    {}: {}\n",
+                language.t("Highest category", "最高权限类别"),
+                authority.highest
+            ));
         }
         if !authority.counts.is_empty() {
             for line in text_wrapped_key_values(
-                "Authority category counts",
+                language.t("Authority category counts", "权限类别计数"),
                 &text_authority_count_values(&authority.counts),
                 96,
             ) {
@@ -849,7 +1005,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         }
         if !authority.high_tools.is_empty() {
             for line in text_wrapped_key_values(
-                "High-authority tools",
+                language.t("High-authority tools", "高权限工具"),
                 &text_tool_values(&authority.top_high_tools()),
                 96,
             ) {
@@ -861,7 +1017,10 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
 
     let notes = overview_cost_driver_notes(&ordered, 3);
     if !notes.is_empty() {
-        out.push_str("  ── Possible cost drivers ──\n");
+        out.push_str(&format!(
+            "  ── {} ──\n",
+            language.t("Possible cost drivers", "可能的成本驱动因素")
+        ));
         for note in notes {
             out.push_str(&format!(
                 "    {:<30} {}\n",
@@ -872,40 +1031,54 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         out.push('\n');
     }
 
-    out.push_str("  ── By Agent ──\n");
+    out.push_str(&format!(
+        "  ── {} ──\n",
+        language.t("By Agent", "按代理统计")
+    ));
     for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
-            "    {:<30} {:>4} Sessions  {:>8}\n",
+            "    {:<30} {:>4} {}  {:>8}\n",
             tool_display_name(&agent),
             format_count(group.sessions),
+            language.t("Sessions", "个会话"),
             format_cost(group.cost)
         ));
     }
     out.push('\n');
 
-    out.push_str("  ── By Model ──\n");
+    out.push_str(&format!(
+        "  ── {} ──\n",
+        language.t("By Model", "按模型统计")
+    ));
     for (model, group) in overview_text_model_groups(&overview.by_model)
         .into_iter()
         .take(8)
     {
         out.push_str(&format!(
-            "    {:<25} {:>4} Sessions  {:>8}\n",
+            "    {:<25} {:>4} {}  {:>8}\n",
             model,
             format_count(group.sessions),
+            language.t("Sessions", "个会话"),
             format_cost(group.cost)
         ));
     }
     out.push('\n');
 
-    out.push_str("  ── Recent Anomalies ──\n");
+    out.push_str(&format!(
+        "  ── {} ──\n",
+        language.t("Recent Anomalies", "近期异常")
+    ));
     if overview.anomalies_top.is_empty() {
-        out.push_str("    ✅ No anomalies\n");
+        out.push_str(&format!(
+            "    ✅ {}\n",
+            language.t("No anomalies", "无异常")
+        ));
     } else {
         for anomaly in overview.anomalies_top.iter().take(8) {
             out.push_str(&format!(
                 "    ⚠️  {:<30} {}\n",
                 text_cell(&anomaly.session, 30),
-                anomaly_type_label(&anomaly.kind)
+                anomaly_type_label_for_language(&anomaly.kind, language)
             ));
         }
     }
@@ -916,65 +1089,107 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
 }
 
 pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> String {
+    report_overview_markdown_with_language(overview, sessions, ReportLanguage::En)
+}
+
+/// rm-085: overview markdown report, localized (English output is
+/// byte-identical to the pre-localization renderer).
+pub fn report_overview_markdown_with_language(
+    overview: &Overview,
+    sessions: &[Session],
+    language: ReportLanguage,
+) -> String {
     let ordered = canonical_sessions(sessions);
     let summary = overview_summary(overview, &ordered);
     let authority = overview_authority_summary(&ordered);
     let trend = analyze_health_trend(sessions);
     let mut out = String::new();
 
-    out.push_str("# agenttrace overview\n\n");
-    out.push_str("| Metric | Value |\n|---|---:|\n");
     out.push_str(&format!(
-        "| Sessions | {} |\n",
+        "# agenttrace {}\n\n",
+        language.t("overview", "总览")
+    ));
+    out.push_str(&format!(
+        "| {} | {} |\n|---|---:|\n",
+        language.t("Metric", "指标"),
+        language.t("Value", "数值")
+    ));
+    out.push_str(&format!(
+        "| {} | {} |\n",
+        language.t("Sessions", "会话数"),
         format_count(overview.total_sessions)
     ));
     out.push_str(&format!(
-        "| Healthy / Warning / Critical | {} / {} / {} |\n",
+        "| {} / {} / {} | {} / {} / {} |\n",
+        language.t("Healthy", "健康"),
+        language.t("Warning", "警告"),
+        language.t("Critical", "严重"),
         format_count(overview.healthy),
         format_count(overview.warning),
         format_count(overview.critical)
     ));
     out.push_str(&format!(
-        "| Average health | {:.1} |\n",
+        "| {} | {:.1} |\n",
+        language.t("Average health", "平均健康分"),
         number_obj(&summary, "avg_health")
     ));
     out.push_str(&format!(
-        "| Health Trend | {} |\n",
+        "| {} | {} |\n",
+        language.t("Health Trend", "健康趋势"),
         markdown_cell(&trend.message)
     ));
     out.push_str(&format!(
-        "| Total estimated cost | {} |\n",
+        "| {} | {} |\n",
+        language.t("Total estimated cost", "预估总成本"),
         format_cost(overview.total_cost)
     ));
     out.push_str(&format!(
-        "| Total tokens | {} |\n",
+        "| {} | {} |\n",
+        language.t("Total tokens", "Token 总数"),
         format_tokens(number_obj(&summary, "total_tokens") as i64)
     ));
     out.push_str(&format!(
-        "| Tool failures | {:.0} / {:.0} ({:.1}%) |\n\n",
+        "| {} | {:.0} / {:.0} ({:.1}%) |\n\n",
+        language.t("Tool failures", "工具失败"),
         number_obj(&summary, "tool_failures"),
         number_obj(&summary, "tool_calls"),
         number_obj(&summary, "tool_fail_rate")
     ));
 
     if authority.has_data {
-        out.push_str("## Tool authority\n\n");
-        out.push_str("| Metric | Value |\n|---|---:|\n");
+        out.push_str(&format!(
+            "## {}\n\n",
+            language.t("Tool authority", "工具权限")
+        ));
+        out.push_str(&format!(
+            "| {} | {} |\n|---|---:|\n",
+            language.t("Metric", "指标"),
+            language.t("Value", "数值")
+        ));
         if !authority.highest.is_empty() {
             out.push_str(&format!(
-                "| Highest category | `{}` |\n",
+                "| {} | `{}` |\n",
+                language.t("Highest category", "最高权限类别"),
                 markdown_inline_code(&authority.highest)
             ));
         }
         if !authority.high_tools.is_empty() {
             out.push_str(&format!(
-                "| High-authority tools | {} |\n",
+                "| {} | {} |\n",
+                language.t("High-authority tools", "高权限工具"),
                 report_markdown_code_list(&authority.top_high_tools())
             ));
         }
         if !authority.counts.is_empty() {
-            out.push_str("\n### Authority category counts\n\n");
-            out.push_str("| Authority category | Count |\n|---|---:|\n");
+            out.push_str(&format!(
+                "\n### {}\n\n",
+                language.t("Authority category counts", "权限类别计数")
+            ));
+            out.push_str(&format!(
+                "| {} | {} |\n|---|---:|\n",
+                language.t("Authority category", "权限类别"),
+                language.t("Count", "计数")
+            ));
             for item in &authority.counts {
                 out.push_str(&format!(
                     "| `{}` | {} |\n",
@@ -988,7 +1203,10 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
 
     let cost_notes = overview_cost_driver_notes(&ordered, 6);
     if !cost_notes.is_empty() {
-        out.push_str("## Possible cost drivers\n\n");
+        out.push_str(&format!(
+            "## {}\n\n",
+            language.t("Possible cost drivers", "可能的成本驱动因素")
+        ));
         for note in cost_notes {
             out.push_str(&format!(
                 "- **{}**: {}\n",
@@ -999,12 +1217,24 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         out.push('\n');
     }
 
-    out.push_str("## Incident timeline\n\n");
+    out.push_str(&format!(
+        "## {}\n\n",
+        language.t("Incident timeline", "事件时间线")
+    ));
     let timelines = overview_incident_timelines(&ordered, 6);
     if timelines.is_empty() {
-        out.push_str("No incident timeline evidence yet.\n\n");
+        out.push_str(&format!(
+            "{}\n\n",
+            language.t("No incident timeline evidence yet.", "尚无事件时间线证据。")
+        ));
     } else {
-        out.push_str("| Session | Signal | Evidence | Severity |\n|---|---|---|---|\n");
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n|---|---|---|---|\n",
+            language.t("Session", "会话"),
+            language.t("Signal", "信号"),
+            language.t("Evidence", "证据"),
+            language.t("Severity", "严重度")
+        ));
         for timeline in timelines {
             for item in timeline.items {
                 out.push_str(&format!(
@@ -1012,15 +1242,20 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
                     markdown_cell(&timeline.session),
                     markdown_cell(&item.label),
                     markdown_cell(&item.detail),
-                    markdown_cell(&severity_label(&item.severity))
+                    markdown_cell(&severity_label_for_language(&item.severity, language))
                 ));
             }
         }
         out.push('\n');
     }
 
-    out.push_str("## By agent\n\n");
-    out.push_str("| Agent | Sessions | Cost |\n|---|---:|---:|\n");
+    out.push_str(&format!("## {}\n\n", language.t("By agent", "按代理统计")));
+    out.push_str(&format!(
+        "| {} | {} | {} |\n|---|---:|---:|\n",
+        language.t("Agent", "代理"),
+        language.t("Sessions", "会话数"),
+        language.t("Cost", "成本")
+    ));
     for (agent, group) in sorted_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
@@ -1030,10 +1265,19 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         ));
     }
 
-    out.push_str("\n## Recent sessions\n\n");
-    out.push_str(
-        "| Session | Source | Model | Health | Cost | Anomalies |\n|---|---|---|---:|---:|---:|\n",
-    );
+    out.push_str(&format!(
+        "\n## {}\n\n",
+        language.t("Recent sessions", "近期会话")
+    ));
+    out.push_str(&format!(
+        "| {} | {} | {} | {} | {} | {} |\n|---|---|---|---:|---:|---:|\n",
+        language.t("Session", "会话"),
+        language.t("Source", "来源"),
+        language.t("Model", "模型"),
+        language.t("Health", "健康分"),
+        language.t("Cost", "成本"),
+        language.t("Anomalies", "异常")
+    ));
     for session in ordered.iter().take(10) {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
@@ -1046,17 +1290,28 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         ));
     }
 
-    out.push_str("\n## Recent anomalies\n\n");
+    out.push_str(&format!(
+        "\n## {}\n\n",
+        language.t("Recent anomalies", "近期异常")
+    ));
     if overview.anomalies_top.is_empty() {
-        out.push_str("No anomalies detected.\n");
+        out.push_str(&format!(
+            "{}\n",
+            language.t("No anomalies detected.", "未检测到异常。")
+        ));
         return out;
     }
-    out.push_str("| Session | Type | Age |\n|---|---|---|\n");
+    out.push_str(&format!(
+        "| {} | {} | {} |\n|---|---|---|\n",
+        language.t("Session", "会话"),
+        language.t("Type", "类型"),
+        language.t("Age", "生成时间")
+    ));
     for anomaly in overview.anomalies_top.iter().take(10) {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
             markdown_cell(&anomaly.session),
-            markdown_cell(&anomaly_type_label(&anomaly.kind)),
+            markdown_cell(&anomaly_type_label_for_language(&anomaly.kind, language)),
             markdown_cell(&anomaly.age)
         ));
     }
@@ -1064,6 +1319,17 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
 }
 
 pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String {
+    report_overview_html_with_language(overview, sessions, ReportLanguage::En)
+}
+
+/// rm-085: overview HTML report, localized (English output is byte-identical
+/// to the pre-localization renderer; the html/@lang attribute follows the
+/// report language).
+pub fn report_overview_html_with_language(
+    overview: &Overview,
+    sessions: &[Session],
+    language: ReportLanguage,
+) -> String {
     let ordered = canonical_sessions(sessions);
     let summary = overview_summary(overview, &ordered);
     let authority = overview_authority_summary(&ordered);
@@ -1078,11 +1344,22 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     };
 
     w("<!doctype html>".to_string());
-    w("<html lang=\"en\">".to_string());
+    w(format!(
+        "<html lang=\"{}\">",
+        if language == ReportLanguage::Zh {
+            "zh"
+        } else {
+            "en"
+        }
+    ));
     w("<head>".to_string());
     w("<meta charset=\"utf-8\">".to_string());
     w("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">".to_string());
-    w("<title>agenttrace overview</title>".to_string());
+    w(format!(
+        "<title>agenttrace {}</title>",
+        language.t("overview", "总览")
+    )
+    .to_string());
     w("<link rel=\"icon\" href=\"data:,\">".to_string());
     w("<style>".to_string());
     w(":root{color-scheme:dark;--bg:#07090b;--panel:#101419;--line:#273039;--text:#f4f0dd;--muted:#a9a391;--green:#54ff00;--cyan:#00d8ff;--amber:#ffb000;--red:#ff4a4a}".to_string());
@@ -1096,49 +1373,76 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     w("<body>".to_string());
     w("<main>".to_string());
     w("<header>".to_string());
-    w("<div><div class=\"brand\">agenttrace</div><h1>AI agent session overview</h1><p>Static report generated from local coding-agent traces.</p></div>".to_string());
     w(format!(
-        "<div class=\"meta\">v{}<br>{} Sessions<br><code>agenttrace --overview -f html</code></div>",
+        "<div><div class=\"brand\">agenttrace</div><h1>{}</h1><p>{}</p></div>",
+        language.t("AI agent session overview", "AI 代理会话总览"),
+        language.t(
+            "Static report generated from local coding-agent traces.",
+            "基于本地编码代理轨迹生成的静态报告。"
+        )
+    ));
+    w(format!(
+        "<div class=\"meta\">v{}<br>{} {}<br><code>agenttrace --overview -f html</code></div>",
         html_escape(VERSION),
-        overview.total_sessions
+        overview.total_sessions,
+        language.t("Sessions", "个会话")
     ));
     w("</header>".to_string());
     w("<div class=\"grid\" aria-label=\"summary metrics\">".to_string());
     w(format!(
-        "<div class=\"metric\"><span>Sessions</span><strong>{}</strong><p>{} Healthy / {} Warning / {} Critical</p></div>",
-        overview.total_sessions, overview.healthy, overview.warning, overview.critical
+        "<div class=\"metric\"><span>{}</span><strong>{}</strong><p>{} {} / {} {} / {} {}</p></div>",
+        language.t("Sessions", "会话数"),
+        overview.total_sessions,
+        overview.healthy,
+        language.t("Healthy", "健康"),
+        overview.warning,
+        language.t("Warning", "警告"),
+        overview.critical,
+        language.t("Critical", "严重")
     ));
     w(format!(
-        "<div class=\"metric\"><span>Total tokens</span><strong>{}</strong><p>+ live</p></div>",
-        format_tokens(number_obj(&summary, "total_tokens") as i64)
+        "<div class=\"metric\"><span>{}</span><strong>{}</strong><p>+ {}</p></div>",
+        language.t("Total tokens", "Token 总数"),
+        format_tokens(number_obj(&summary, "total_tokens") as i64),
+        language.t("live", "实时")
     ));
     w(format!(
-        "<div class=\"metric\"><span>Average health</span><strong>{:.1}</strong><p>Fleet quality score</p></div>",
-        number_obj(&summary, "avg_health")
+        "<div class=\"metric\"><span>{}</span><strong>{:.1}</strong><p>{}</p></div>",
+        language.t("Average health", "平均健康分"),
+        number_obj(&summary, "avg_health"),
+        language.t("Fleet quality score", "整体质量分")
     ));
     w(format!(
-        "<div class=\"metric\"><span>Total estimated cost</span><strong>{}</strong><p>Estimated session cost</p></div>",
-        format_cost(overview.total_cost)
+        "<div class=\"metric\"><span>{}</span><strong>{}</strong><p>{}</p></div>",
+        language.t("Total estimated cost", "预估总成本"),
+        format_cost(overview.total_cost),
+        language.t("Estimated session cost", "会话成本预估")
     ));
     w(format!(
-        "<div class=\"metric {}\"><span>Tool failures</span><strong>{:.0}/{:.0}</strong><p>{:.1}% failure rate</p></div>",
+        "<div class=\"metric {}\"><span>{}</span><strong>{:.0}/{:.0}</strong><p>{} {:.1}%</p></div>",
         html_escape(failure_class(number_obj(&summary, "tool_fail_rate"))),
+        language.t("Tool failures", "工具失败"),
         number_obj(&summary, "tool_failures"),
         number_obj(&summary, "tool_calls"),
+        language.t("failure rate", "失败率"),
         number_obj(&summary, "tool_fail_rate")
     ));
     w("</div>".to_string());
 
     if authority.has_data {
-        w("<section><h2>Tool authority</h2>".to_string());
+        w(format!(
+            "<section><h2>{}</h2>",
+            language.t("Tool authority", "工具权限")
+        ));
         if !authority.highest.is_empty() {
             w(format!(
-                "<p><strong>Highest category</strong>: <code>{}</code></p>",
+                "<p><strong>{}</strong>: <code>{}</code></p>",
+                language.t("Highest category", "最高权限类别"),
                 html_escape(&authority.highest)
             ));
         }
         if !authority.counts.is_empty() {
-            w("<table><caption>Authority category counts</caption><thead><tr><th>Authority category</th><th class=\"num\">Count</th></tr></thead><tbody>".to_string());
+            w(format!("<table><caption>{}</caption><thead><tr><th>{}</th><th class=\"num\">{}</th></tr></thead><tbody>", language.t("Authority category counts", "权限类别计数"), language.t("Authority category", "权限类别"), language.t("Count", "计数")));
             for item in &authority.counts {
                 w(format!(
                     "<tr><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
@@ -1150,7 +1454,8 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
         }
         if !authority.high_tools.is_empty() {
             w(format!(
-                "<p><strong>High-authority tools</strong>: {}</p>",
+                "<p><strong>{}</strong>: {}</p>",
+                language.t("High-authority tools", "高权限工具"),
                 report_html_code_list(&authority.top_high_tools())
             ));
         }
@@ -1159,7 +1464,12 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
 
     let cost_notes = overview_cost_driver_notes(&ordered, 8);
     if !cost_notes.is_empty() {
-        w("<section><h2>Possible cost drivers</h2><table><thead><tr><th>Session</th><th>Evidence</th></tr></thead><tbody>".to_string());
+        w(format!(
+            "<section><h2>{}</h2><table><thead><tr><th>{}</th><th>{}</th></tr></thead><tbody>",
+            language.t("Possible cost drivers", "可能的成本驱动因素"),
+            language.t("Session", "会话"),
+            language.t("Evidence", "证据")
+        ));
         for note in cost_notes {
             w(format!(
                 "<tr><td>{}</td><td>{}</td></tr>",
@@ -1171,17 +1481,30 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     }
     if ordered.len() > 1 {
         w(format!(
-            "<section><h2>Health Trend</h2><p>{}</p></section>",
+            "<section><h2>{}</h2><p>{}</p></section>",
+            language.t("Health Trend", "健康趋势"),
             html_escape(&trend.message)
         ));
     }
 
-    w("<section><h2>Incident timeline</h2>".to_string());
+    w(format!(
+        "<section><h2>{}</h2>",
+        language.t("Incident timeline", "事件时间线")
+    ));
     let timelines = overview_incident_timelines(&ordered, 8);
     if timelines.is_empty() {
-        w("<p>No incident timeline evidence yet.</p>".to_string());
+        w(format!(
+            "<p>{}</p>",
+            language.t("No incident timeline evidence yet.", "尚无事件时间线证据。")
+        ));
     } else {
-        w("<table><thead><tr><th>Session</th><th>Signal</th><th>Evidence</th><th>Severity</th></tr></thead><tbody>".to_string());
+        w(format!(
+            "<table><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>",
+            language.t("Session", "会话"),
+            language.t("Signal", "信号"),
+            language.t("Evidence", "证据"),
+            language.t("Severity", "严重度")
+        ));
         for timeline in timelines {
             for item in timeline.items {
                 w(format!(
@@ -1189,7 +1512,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
                     html_escape(&timeline.session),
                     html_escape(&item.label),
                     html_escape(&item.detail),
-                    html_escape(&severity_label(&item.severity))
+                    html_escape(&severity_label_for_language(&item.severity, language))
                 ));
             }
         }
@@ -1197,7 +1520,17 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     }
     w("</section>".to_string());
 
-    w("<section><h2>Recent sessions</h2><table><thead><tr><th>Session</th><th>Source</th><th>Model</th><th class=\"num\">Total tokens</th><th class=\"num\">Cost</th><th class=\"num\">Health</th><th class=\"num\">Anomalies</th></tr></thead><tbody>".to_string());
+    w(format!(
+        "<section><h2>{}</h2><table><thead><tr><th>{}</th><th>{}</th><th>{}</th><th class=\"num\">{}</th><th class=\"num\">{}</th><th class=\"num\">{}</th><th class=\"num\">{}</th></tr></thead><tbody>",
+        language.t("Recent sessions", "近期会话"),
+        language.t("Session", "会话"),
+        language.t("Source", "来源"),
+        language.t("Model", "模型"),
+        language.t("Total tokens", "Token 总数"),
+        language.t("Cost", "成本"),
+        language.t("Health", "健康分"),
+        language.t("Anomalies", "异常")
+    ));
     for session in ordered.iter().take(20) {
         w(format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num {}\">{}</td><td class=\"num\">{}</td></tr>",
@@ -1213,7 +1546,13 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     }
     w("</tbody></table></section>".to_string());
 
-    w("<section><h2>By agent</h2><table><thead><tr><th>Agent</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
+    w(format!(
+        "<section><h2>{}</h2><table><thead><tr><th>{}</th><th class=\"num\">{}</th><th class=\"num\">{}</th></tr></thead><tbody>",
+        language.t("By agent", "按代理统计"),
+        language.t("Agent", "代理"),
+        language.t("Sessions", "会话数"),
+        language.t("Cost", "成本")
+    ));
     for (agent, group) in agents {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
@@ -1224,7 +1563,13 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     }
     w("</tbody></table></section>".to_string());
 
-    w("<section><h2>By model</h2><table><thead><tr><th>Model</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
+    w(format!(
+        "<section><h2>{}</h2><table><thead><tr><th>{}</th><th class=\"num\">{}</th><th class=\"num\">{}</th></tr></thead><tbody>",
+        language.t("By model", "按模型统计"),
+        language.t("Model", "模型"),
+        language.t("Sessions", "会话数"),
+        language.t("Cost", "成本")
+    ));
     for (model, group) in models.iter().take(12) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
@@ -1235,19 +1580,27 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     }
     w("</tbody></table></section>".to_string());
 
-    w("<section><h2>Recent anomalies</h2>".to_string());
+    w(format!(
+        "<section><h2>{}</h2>",
+        language.t("Recent anomalies", "近期异常")
+    ));
     if overview.anomalies_top.is_empty() {
-        w("<p>No anomalies detected.</p>".to_string());
+        w(format!(
+            "<p>{}</p>",
+            language.t("No anomalies detected.", "未检测到异常。")
+        ));
     } else {
-        w(
-            "<table><thead><tr><th>Session</th><th>Type</th><th>Age</th></tr></thead><tbody>"
-                .to_string(),
-        );
+        w(format!(
+            "<table><thead><tr><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>",
+            language.t("Session", "会话"),
+            language.t("Type", "类型"),
+            language.t("Age", "生成时间")
+        ));
         for anomaly in overview.anomalies_top.iter().take(20) {
             w(format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
                 html_escape(&anomaly.session),
-                html_escape(&anomaly_type_label(&anomaly.kind)),
+                html_escape(&anomaly_type_label_for_language(&anomaly.kind, language)),
                 html_escape(&anomaly.age)
             ));
         }
@@ -1407,10 +1760,6 @@ fn anomaly_emoji(severity: &str) -> &'static str {
     }
 }
 
-fn severity_label(severity: &str) -> String {
-    severity_label_for_language(severity, ReportLanguage::En)
-}
-
 fn severity_label_for_language(severity: &str, language: ReportLanguage) -> String {
     match severity.to_ascii_lowercase().as_str() {
         "critical" => language.t("CRITICAL", "严重").to_string(),
@@ -1419,10 +1768,6 @@ fn severity_label_for_language(severity: &str, language: ReportLanguage) -> Stri
         "good" | "low" => language.t("LOW", "低").to_string(),
         _ => severity.to_ascii_uppercase(),
     }
-}
-
-fn anomaly_type_label(kind: &str) -> String {
-    anomaly_type_label_for_language(kind, ReportLanguage::En)
 }
 
 fn anomaly_type_label_for_language(kind: &str, language: ReportLanguage) -> String {
@@ -2630,6 +2975,133 @@ mod tests {
         let sessions = vec![session.clone(), session];
         let summary = overview_summary(&crate::Overview::default(), &sessions);
         assert_eq!(summary["total_tokens"].as_i64(), Some(i64::MAX));
+    }
+
+    /// rm-085 fixtures: every localized overview renderer must (a) actually
+    /// translate under Zh and (b) stay byte-identical to the pre-localization
+    /// English output — the `report_overview_*` shims pin that by delegation.
+    fn language_overview_fixture() -> Overview {
+        Overview {
+            total_sessions: 3,
+            total_cost: 0.05,
+            healthy: 2,
+            warning: 1,
+            critical: 0,
+            by_agent: BTreeMap::from([(
+                "claude_code".to_string(),
+                GroupOverview {
+                    sessions: 2,
+                    cost: 0.04,
+                },
+            )]),
+            by_model: BTreeMap::from([(
+                "claude-sonnet-4".to_string(),
+                GroupOverview {
+                    sessions: 2,
+                    cost: 0.04,
+                },
+            )]),
+            by_project: BTreeMap::new(),
+            anomalies_top: vec![crate::AnomalyTop {
+                session: "adversarial".to_string(),
+                kind: "cost".to_string(),
+                age: "2d".to_string(),
+                severity: "warning".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn overview_text_zh_translates_labels_and_en_shim_is_untouched() {
+        let overview = language_overview_fixture();
+        let en = report_overview_text_with_language(&overview, &[], ReportLanguage::En);
+        assert!(en.contains("Global Overview  (3 Sessions)"));
+        assert!(en.contains("Total Sessions:"));
+        assert!(en.contains("── By Agent ──"));
+        // The pre-localization entry point delegates to the En variant.
+        assert_eq!(report_overview_text(&overview, &[]), en);
+
+        let zh = report_overview_text_with_language(&overview, &[], ReportLanguage::Zh);
+        assert!(zh.contains("全局总览  (3 个会话)"));
+        assert!(zh.contains("会话总数:"));
+        assert!(zh.contains("── 按代理统计 ──"));
+        assert!(zh.contains("按模型统计"));
+        assert!(!zh.contains("Global Overview"));
+        assert!(!zh.contains("Total Sessions:"));
+    }
+
+    #[test]
+    fn overview_markdown_zh_translates_tables_and_en_shim_is_untouched() {
+        let overview = language_overview_fixture();
+        let en = report_overview_markdown_with_language(&overview, &[], ReportLanguage::En);
+        assert!(en.starts_with("# agenttrace overview\n"));
+        assert!(en.contains("| Metric | Value |"));
+        assert!(en.contains("## By agent"));
+        assert_eq!(report_overview_markdown(&overview, &[]), en);
+
+        let zh = report_overview_markdown_with_language(&overview, &[], ReportLanguage::Zh);
+        assert!(zh.starts_with("# agenttrace 总览\n"));
+        assert!(zh.contains("| 指标 | 数值 |"));
+        assert!(zh.contains("## 按代理统计"));
+        assert!(zh.contains("近期异常"));
+        assert!(!zh.contains("| Metric | Value |"));
+    }
+
+    #[test]
+    fn overview_html_zh_sets_lang_attr_and_translates_sections() {
+        let overview = language_overview_fixture();
+        let en = report_overview_html_with_language(&overview, &[], ReportLanguage::En);
+        assert!(en.contains("<html lang=\"en\">"));
+        assert!(en.contains("<title>agenttrace overview</title>"));
+        assert!(en.contains("<h2>Recent anomalies</h2>"));
+        assert_eq!(report_overview_html(&overview, &[]), en);
+
+        let zh = report_overview_html_with_language(&overview, &[], ReportLanguage::Zh);
+        assert!(zh.contains("<html lang=\"zh\">"));
+        assert!(zh.contains("<title>agenttrace 总览</title>"));
+        assert!(zh.contains("<h2>近期异常</h2>"));
+        assert!(zh.contains("AI 代理会话总览"));
+        assert!(!zh.contains("<h2>Recent anomalies</h2>"));
+    }
+
+    #[test]
+    fn overview_context_appendix_translates_scope_and_recommendations() {
+        let overview = language_overview_fixture();
+        let session = Session {
+            name: "adversarial".to_string(),
+            path: "/tmp/adversarial.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let health = crate::DataHealth::default();
+        let en = report_overview_text_with_context(
+            &overview,
+            &[session.clone()],
+            &health,
+            crate::TimeRange::All,
+            false,
+            ReportLanguage::En,
+        );
+        assert!(en.contains("── Scope and confidence ──"));
+        assert!(en.contains("Range: all"));
+        assert!(en.contains("Pricing:"));
+
+        let zh = report_overview_text_with_context(
+            &overview,
+            &[session],
+            &health,
+            crate::TimeRange::All,
+            false,
+            ReportLanguage::Zh,
+        );
+        assert!(zh.contains("── 范围与置信度 ──"));
+        assert!(zh.contains("范围: all"));
+        assert!(zh.contains("定价:"));
+        assert!(!zh.contains("── Scope and confidence ──"));
     }
 
     #[test]

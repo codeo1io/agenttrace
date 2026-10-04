@@ -108,20 +108,42 @@ fn write_string_array_json(out: &mut String, values: &[String], base_indent: usi
 }
 
 pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
-    let mut out = format!("Search results: {:?} ({})\n", query, results.len());
+    report_search_text_with_language(results, query, crate::ReportLanguage::En)
+}
+
+/// rm-085: search text report, localized (English output is byte-identical
+/// to the pre-localization renderer).
+pub fn report_search_text_with_language(
+    results: &[SearchResult],
+    query: &str,
+    language: crate::ReportLanguage,
+) -> String {
+    let mut out = format!(
+        "{}: {:?} ({})\n",
+        language.t("Search results", "搜索结果"),
+        query,
+        results.len()
+    );
     if results.is_empty() {
-        out.push_str("No matching session metadata found.\n");
+        out.push_str(&format!(
+            "{}\n",
+            language.t(
+                "No matching session metadata found.",
+                "未找到匹配的会话元数据。"
+            )
+        ));
         return out;
     }
     for result in results {
         out.push_str(&format!(
-            "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
+            "\n{}  {}  {}  health={}  {}  {} {}\n",
             result.name,
             result.source_tool,
             result.model,
             result.health,
             format_cost(result.cost),
-            format_tokens(result.tokens)
+            format_tokens(result.tokens),
+            language.t("TOKENS", "Token")
         ));
         if !result.cwd.is_empty() {
             out.push_str(&format!("  cwd: {}\n", result.cwd));
@@ -280,5 +302,38 @@ mod tests {
         let report = report_search_json(&[result]);
         assert!(report.contains("\"cost\": 0,"));
         assert!(!report.contains("\"cost\": 0.0,"));
+    }
+
+    #[test]
+    fn search_text_zh_translates_header_and_en_shim_is_untouched() {
+        let result = SearchResult {
+            name: "session".to_string(),
+            path: "/tmp/session.jsonl".to_string(),
+            cwd: String::new(),
+            source_tool: "pi".to_string(),
+            model: "mimo-v2.5-pro".to_string(),
+            health: 88,
+            cost: 0.5,
+            tokens: 42,
+            matches: vec!["tool argument: error".to_string()],
+        };
+
+        let en =
+            report_search_text_with_language(&[result.clone()], "error", crate::ReportLanguage::En);
+        assert!(en.starts_with("Search results: \"error\" (1)"));
+        assert!(en.contains(" TOKENS\n"));
+        assert_eq!(report_search_text(&[result.clone()], "error"), en);
+
+        let zh = report_search_text_with_language(&[result], "error", crate::ReportLanguage::Zh);
+        assert!(zh.starts_with("搜索结果: \"error\" (1)"));
+        assert!(zh.contains(" 42 Token\n"));
+        assert!(!zh.contains("Search results"));
+    }
+
+    #[test]
+    fn search_text_zh_empty_results_translate_the_no_match_line() {
+        let zh = report_search_text_with_language(&[], "zzz", crate::ReportLanguage::Zh);
+        assert!(zh.contains("未找到匹配的会话元数据。"));
+        assert!(!zh.contains("No matching session metadata found."));
     }
 }

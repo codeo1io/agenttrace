@@ -7,7 +7,7 @@ use agenttrace_core::{
     render_test_match, render_waste_report_with_language, report_compare_json,
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_text_with_context, report_search_json, report_search_text,
+    report_overview_text_with_context, report_search_json, report_search_text_with_language,
     report_text_with_language, search_sessions, session_capability, tool_fail_rate, total_tokens,
     update_pricing, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
     TimeRange, VERSION,
@@ -180,6 +180,7 @@ fn run() -> anyhow::Result<()> {
     // host command it dispatches before action validation; unlike it,
     // this is an explicit user action that may fail loudly. It is fully
     // offline unless --fetch explicitly opts into the network.
+    validate_language_support(&args)?;
     if args.path.as_deref() == Some("upstream") {
         let report = upstream::status_report(&args.format, args.fetch)?;
         write_stdout(&report)?;
@@ -187,6 +188,7 @@ fn run() -> anyhow::Result<()> {
     }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
+    validate_flag_applicability(&args)?;
     if args.sample == Some(0) {
         bail!("--sample must be at least 1");
     }
@@ -205,19 +207,25 @@ fn run() -> anyhow::Result<()> {
 
     if args.clear_cache {
         agenttrace_core::clear_session_cache()?;
-        write_stdout("Session cache cleared.\n")?;
+        write_stdout(language.t("Session cache cleared.\n", "会话缓存已清除。\n"))?;
         if !has_session_action(&args) {
             return Ok(());
         }
     }
 
     if args.update_pricing {
-        write_stdout("Downloading pricing from LiteLLM...\n")?;
+        write_stdout(language.t(
+            "Downloading pricing from LiteLLM...\n",
+            "正在从 LiteLLM 下载定价…\n",
+        ))?;
         let count = update_pricing()?;
-        write_stdout(&format!("Loaded {count} model prices\n"))?;
-        write_stdout(&format!(
-            "Cache saved: {}\n",
-            pricing_cache_path().display()
+        write_stdout(&language.t_owned(
+            format!("Loaded {count} model prices\n"),
+            format!("已加载 {count} 个模型价格\n"),
+        ))?;
+        write_stdout(&language.t_owned(
+            format!("Cache saved: {}\n", pricing_cache_path().display()),
+            format!("缓存已保存：{}\n", pricing_cache_path().display()),
         ))?;
         if !has_post_pricing_action(&args) {
             return Ok(());
@@ -259,10 +267,6 @@ fn run() -> anyhow::Result<()> {
             Some(&args.lang),
         );
     }
-    if args.baseline.is_some() && !args.overview {
-        bail!("--baseline requires --overview -f json");
-    }
-
     if args.audit
         || args.recommend
         || args.mcp_governance
@@ -400,7 +404,7 @@ fn run() -> anyhow::Result<()> {
 
     if args.sessions || args.diagnostics || args.inspect.is_some() {
         if args.sessions {
-            let out = render_session_list(&sessions, &args.format, args.limit);
+            let out = render_session_list(&sessions, &args.format, args.limit, language);
             write_output(&args.output, &(out.clone() + "\n"))?;
             write_stdout(&out)?;
             return Ok(());
@@ -430,7 +434,7 @@ fn run() -> anyhow::Result<()> {
         let out = if args.format == "json" {
             report_search_json(&results)
         } else {
-            report_search_text(&results, query)
+            report_search_text_with_language(&results, query, language)
         };
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
@@ -477,6 +481,7 @@ fn run() -> anyhow::Result<()> {
                 &health,
                 range,
                 args.include_history,
+                language,
             ),
             "html" => report_overview_html_with_context(
                 &overview,
@@ -484,6 +489,7 @@ fn run() -> anyhow::Result<()> {
                 &health,
                 range,
                 args.include_history,
+                language,
             ),
             _ => report_overview_text_with_context(
                 &overview,
@@ -491,13 +497,13 @@ fn run() -> anyhow::Result<()> {
                 &health,
                 range,
                 args.include_history,
+                language,
             ),
         };
         let mut baseline_breaches = None;
         if let Some(baseline) = args.baseline.as_deref() {
-            if args.format != "json" {
-                bail!("--baseline requires --overview -f json");
-            }
+            // Applicability (json format + --overview) is enforced up front by
+            // FLAG_APPLICABILITY; the baseline regression gate itself runs here.
             let (compared, breaches) = add_baseline_comparison(
                 &out,
                 baseline,
@@ -1064,13 +1070,22 @@ fn matches_number(value: f64, filter: &str) -> bool {
     false
 }
 
-fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
+fn render_session_list(
+    sessions: &[Session],
+    format: &str,
+    limit: usize,
+    language: ReportLanguage,
+) -> String {
     let sessions = sessions.iter().take(limit).collect::<Vec<_>>();
     if format == "json" {
         return serde_json::to_string_pretty(&sessions).expect("sessions serialize");
     }
-    let mut lines =
-        vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
+    let mut lines = vec![language
+        .t(
+            "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES",
+            "会话\t健康\t数据\t来源\t模型\t成本\tToken\t失败\t异常",
+        )
+        .to_string()];
     lines.extend(sessions.into_iter().map(|session| {
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
@@ -1104,16 +1119,26 @@ fn render_diagnostics(
         }))?);
     }
     let mut out = report_text_with_language(session, language);
-    out.push_str("\nDiagnostics\n-----------\n");
+    out.push_str(&format!(
+        "\n{}\n-----------\n",
+        language.t("Diagnostics", "诊断报告")
+    ));
     out.push_str(&serde_json::to_string_pretty(&session.diagnostics)?);
     if alert.triggered {
         out.push_str(&format!(
-            "\nCost alert [{}]: {}",
-            alert.level, alert.message
+            "\n{} [{}]: {}",
+            language.t("Cost alert", "成本警报"),
+            alert.level,
+            alert.message
         ));
     }
     for fix in fixes {
-        out.push_str(&format!("\nFix [{}]: {}", fix.severity, fix.action));
+        out.push_str(&format!(
+            "\n{} [{}]: {}",
+            language.t("Fix", "修复"),
+            fix.severity,
+            fix.action
+        ));
     }
     Ok(out)
 }
@@ -1162,6 +1187,94 @@ fn has_session_action(args: &Args) -> bool {
             .as_deref()
             .map(|query| !query.trim().is_empty())
             .unwrap_or(false)
+}
+
+/// Session report actions whose view is filtered by --anomaly and the other
+/// view filters: every report action except --baseline (which is not an
+/// action of its own, just a modifier validated by FLAG_APPLICABILITY).
+fn has_session_view_action(args: &Args) -> bool {
+    has_session_action(args) && args.baseline.is_none()
+}
+
+/// rm-085: --lang must never silently no-op. Non-English output is only
+/// produced by renderers that actually thread ReportLanguage through their
+/// output. Every other action+format combination used to render English
+/// while rc-staying green; reject it loudly instead. Stderr diagnostics and
+/// gate output stay English regardless (CI gates grep for them); the
+/// `statusline` host command is language-neutral by contract and never
+/// fails the host.
+fn validate_language_support(args: &Args) -> anyhow::Result<()> {
+    if matches!(report_language(&args.lang)?, ReportLanguage::En) {
+        return Ok(());
+    }
+    if args.path.as_deref() == Some("upstream") {
+        bail!("--lang zh is not supported for upstream reports");
+    }
+    // TUI without a report action: run_with_language threads the language.
+    if !has_session_action(args) {
+        if args.demo {
+            bail!("--lang zh is not supported for the --demo TUI (use the TUI without --demo, or a report action)");
+        }
+        if args.doctor {
+            bail!("--lang zh is not supported for --doctor (the environment health walkthrough is English-only)");
+        }
+        if args.list_models {
+            bail!("--lang zh is not supported for --list-models (the model list is English-only)");
+        }
+        if args.test_match {
+            bail!("--lang zh is not supported for --test-match (the match test output is English-only)");
+        }
+        if args.statusline_report {
+            bail!("--lang zh is not supported for --statusline-report (the statusline contract is English-only)");
+        }
+        if args.version {
+            bail!("--lang zh is not supported for --version");
+        }
+        return Ok(());
+    }
+    // Single-session reports: text and json (report_json_with_language
+    // translates prose values in the JSON).
+    if args.latest || args.path.is_some() {
+        return Ok(());
+    }
+    if args.waste || (args.compare && args.format != "json") {
+        return Ok(());
+    }
+    if args.diagnostics || args.inspect.is_some() {
+        if args.format == "json" {
+            bail!("--lang zh is not supported for -f json diagnostics (fix suggestions stay English; use text output)");
+        }
+        return Ok(());
+    }
+    if args.sessions {
+        if args.format == "json" {
+            bail!("--lang zh is not supported for --sessions -f json (the JSON is a machine contract; use text output)");
+        }
+        return Ok(());
+    }
+    if args
+        .search
+        .as_deref()
+        .map(|query| !query.trim().is_empty())
+        .unwrap_or(false)
+    {
+        if args.format == "json" {
+            bail!("--lang zh is not supported for --search -f json (the JSON is a machine contract; use text output)");
+        }
+        return Ok(());
+    }
+    if args.overview {
+        if args.format == "json" {
+            bail!("--lang zh is not supported for --overview -f json (the JSON is a machine contract; use text, markdown or html)");
+        }
+        return Ok(());
+    }
+    // Governance reports render serde_json values with English prose; the
+    // TUI demo, --doctor, --list-models, --test-match and --statusline-report
+    // are not translated either.
+    bail!(
+        "--lang zh is not supported for this action (supported: --latest, --diagnostics, --inspect, --waste, --compare text, --search text, --sessions text, --overview text/markdown/html, the TUI, --clear-cache, --update-pricing)"
+    );
 }
 
 fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
@@ -1216,6 +1329,95 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     }
     if args.search.is_some() && args.search_limit == 0 {
         bail!("--search-limit must be at least 1");
+    }
+    Ok(())
+}
+
+/// One row of the flag→action applicability table (rm-246).
+/// A flag that is *provided* while its action is not selected used to be a
+/// silent no-op — the process stayed green while nothing was gated, compared
+/// or filtered. `provided` answers "did the user supply this flag?" (default
+/// values do not count); `applies` answers "does the flag have an effect on
+/// the currently selected action+format?". To extend the table (e.g. --range
+/// in rm-244's lane), append a `FlagApplicability` entry — no validator
+/// changes needed.
+struct FlagApplicability {
+    flag: &'static str,
+    provided: fn(&Args) -> bool,
+    applies: fn(&Args) -> bool,
+    requirement: &'static str,
+}
+
+const FLAG_APPLICABILITY: &[FlagApplicability] = &[
+    FlagApplicability {
+        flag: "--baseline",
+        provided: |a| a.baseline.is_some(),
+        applies: |a| a.overview && a.format == "json",
+        requirement: "requires --overview -f json",
+    },
+    FlagApplicability {
+        flag: "--baseline-max-duration-delta-pct",
+        provided: |a| a.baseline_max_duration_delta_pct != 0.0,
+        applies: |a| a.baseline.is_some(),
+        requirement: "requires --baseline",
+    },
+    FlagApplicability {
+        flag: "--baseline-max-cost-delta-pct",
+        provided: |a| a.baseline_max_cost_delta_pct != 0.0,
+        applies: |a| a.baseline.is_some(),
+        requirement: "requires --baseline",
+    },
+    FlagApplicability {
+        flag: "--baseline-max-token-delta-pct",
+        provided: |a| a.baseline_max_token_delta_pct != 0.0,
+        applies: |a| a.baseline.is_some(),
+        requirement: "requires --baseline",
+    },
+    FlagApplicability {
+        flag: "--no-baseline-gate",
+        provided: |a| a.no_baseline_gate,
+        applies: |a| a.baseline.is_some(),
+        requirement: "requires --baseline (it opts out of the baseline regression gate)",
+    },
+    FlagApplicability {
+        flag: "--fail-under-health",
+        provided: |a| a.fail_under_health != 0,
+        applies: |a| a.overview,
+        requirement: "requires --overview (the gate evaluates overview reports only)",
+    },
+    FlagApplicability {
+        flag: "--fail-on-critical",
+        provided: |a| a.fail_on_critical,
+        applies: |a| a.overview,
+        requirement: "requires --overview (the gate evaluates overview reports only)",
+    },
+    FlagApplicability {
+        flag: "--max-tool-fail-rate",
+        provided: |a| a.max_tool_fail_rate.is_some(),
+        applies: |a| a.overview,
+        requirement: "requires --overview (the gate evaluates overview reports only)",
+    },
+    FlagApplicability {
+        flag: "-m/--model",
+        provided: |a| a.model != "default",
+        applies: |a| a.compare && a.format != "json",
+        requirement: "applies only to --compare text output (it labels the compared model in text comparison reports)",
+    },
+    FlagApplicability {
+        flag: "--anomaly",
+        provided: |a| !a.anomaly.is_empty(),
+        applies: |a| has_session_view_action(a),
+        requirement: "requires a session report action (it filters the session view)",
+    },
+];
+
+/// Reject provided-but-inapplicable flags loudly (rm-246) instead of letting
+/// them silently no-op into an rc0 report.
+fn validate_flag_applicability(args: &Args) -> anyhow::Result<()> {
+    for rule in FLAG_APPLICABILITY {
+        if (rule.provided)(args) && !(rule.applies)(args) {
+            bail!("{} {}", rule.flag, rule.requirement);
+        }
     }
     Ok(())
 }
@@ -1329,7 +1531,9 @@ mod tests {
         let filtered = prepare_cli_view(vec![healthy, critical], &args).expect("filter");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "critical");
-        assert!(render_session_list(&filtered, "json", 20).contains("\"critical\""));
+        assert!(
+            render_session_list(&filtered, "json", 20, ReportLanguage::En).contains("\"critical\"")
+        );
         let diagnostics = render_diagnostics(&filtered[0], &filtered, "json", ReportLanguage::En)
             .expect("diagnostics");
         assert!(diagnostics.contains("\"diagnostics\""));
@@ -1612,6 +1816,237 @@ mod tests {
         assert!(validate_gate_thresholds(&args).is_err());
         args.max_tool_fail_rate = Some(100.0);
         assert!(validate_gate_thresholds(&args).is_ok());
+    }
+
+    #[test]
+    fn flag_applicability_rejects_inapplicable_combos() {
+        // rm-246: each row of the table, provided while its action is absent,
+        // must fail loudly naming the flag and its requirement instead of
+        // silently no-oping into an rc0 report.
+        let cases: Vec<(&str, Args)> = vec![
+            ("--fail-under-health without --overview", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.sessions = true;
+                a.fail_under_health = 80;
+                a
+            }),
+            ("--max-tool-fail-rate without --overview", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.sessions = true;
+                a.max_tool_fail_rate = Some(50.0);
+                a
+            }),
+            ("--fail-on-critical without --overview", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.sessions = true;
+                a.fail_on_critical = true;
+                a
+            }),
+            ("--no-baseline-gate without --baseline", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.no_baseline_gate = true;
+                a
+            }),
+            ("--baseline-max-cost-delta-pct without --baseline", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.baseline_max_cost_delta_pct = 10.0;
+                a
+            }),
+            ("--baseline with text format keeps legacy message", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.format = "text".to_string();
+                a.baseline = Some("base.json".to_string());
+                a
+            }),
+            ("-m/--model without --compare", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.model = "gpt-4.1".to_string();
+                a
+            }),
+            ("--anomaly without a session view action", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.doctor = true;
+                a.anomaly = "error".to_string();
+                a
+            }),
+        ];
+        let expected = [
+            "--fail-under-health requires --overview",
+            "--max-tool-fail-rate requires --overview",
+            "--fail-on-critical requires --overview",
+            "--no-baseline-gate requires --baseline",
+            "--baseline-max-cost-delta-pct requires --baseline",
+            "--baseline requires --overview -f json",
+            "-m/--model applies only to --compare text output",
+            "--anomaly requires a session report action",
+        ];
+        for ((label, args), message) in cases.iter().zip(expected.iter()) {
+            let err = validate_flag_applicability(args)
+                .expect_err(label)
+                .to_string();
+            assert!(err.contains(message), "{label}: got {err:?}");
+        }
+    }
+
+    #[test]
+    fn flag_applicability_passes_valid_combos() {
+        let mut a = compare_args(None);
+        a.compare = false;
+        a.overview = true;
+        a.format = "json".to_string();
+        a.fail_under_health = 80;
+        a.max_tool_fail_rate = Some(50.0);
+        a.fail_on_critical = true;
+        a.baseline = Some("base.json".to_string());
+        a.baseline_max_cost_delta_pct = 10.0;
+        a.no_baseline_gate = true;
+        assert!(validate_flag_applicability(&a).is_ok());
+
+        let mut b = compare_args(None);
+        b.anomaly = "error".to_string();
+        assert!(validate_flag_applicability(&b).is_ok());
+
+        let mut c = compare_args(None);
+        c.model = "gpt-4.1".to_string();
+        c.format = "text".to_string();
+        assert!(validate_flag_applicability(&c).is_ok());
+    }
+
+    #[test]
+    fn language_support_rejects_untranslated_combos() {
+        let cases: Vec<(&str, Args)> = vec![
+            ("overview json is a machine contract", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.format = "json".to_string();
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("sessions json is a machine contract", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.sessions = true;
+                a.format = "json".to_string();
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("doctor is English-only", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.doctor = true;
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("demo TUI is English-only", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.demo = true;
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("upstream reports are English-only", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.path = Some("upstream".to_string());
+                a.lang = "zh".to_string();
+                a
+            }),
+        ];
+        for (label, args) in &cases {
+            assert!(validate_language_support(args).is_err(), "{label}");
+        }
+    }
+
+    #[test]
+    fn language_support_passes_translated_combos() {
+        let cases: Vec<(&str, Args)> = vec![
+            ("overview text", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.format = "text".to_string();
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("overview markdown", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.format = "markdown".to_string();
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("overview html", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.overview = true;
+                a.format = "html".to_string();
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("sessions text", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.sessions = true;
+                a.format = "text".to_string();
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("search text", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.search = Some("q".to_string());
+                a.format = "text".to_string();
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("latest json", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.latest = true;
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("waste text", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.waste = true;
+                a.lang = "zh".to_string();
+                a
+            }),
+            ("TUI without an action", {
+                let mut a = compare_args(None);
+                a.compare = false;
+                a.lang = "zh".to_string();
+                a
+            }),
+        ];
+        for (label, args) in &cases {
+            assert!(validate_language_support(args).is_ok(), "{label}");
+        }
+    }
+
+    #[test]
+    fn session_list_header_is_translated_under_zh() {
+        let healthy = session("healthy", "/tmp/healthy", "2026-01-02T00:00:00Z");
+        let en = render_session_list(&[healthy.clone()], "text", 20, ReportLanguage::En);
+        assert!(en.contains("SESSION\tHEALTH\tDATA\tSOURCE\tMODEL"));
+        let zh = render_session_list(&[healthy], "text", 20, ReportLanguage::Zh);
+        assert!(zh.contains("会话\t健康\t数据\t来源\t模型"));
+        assert!(!zh.contains("SESSION\tHEALTH"));
     }
 
     fn write_compare_session(path: &std::path::Path, idx: usize) {

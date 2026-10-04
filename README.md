@@ -160,6 +160,28 @@ it never filters aggregates, audit totals, or recommendations. Governance
 reports are unbounded by default — use `--sample N` for an explicitly
 disclosed bound.
 
+### Language selection (`--lang`)
+
+`--lang en` (default) and `--lang zh` select the report language. Chinese
+output is rendered by the report paths that fully thread the language:
+
+- `--overview` in text, markdown, or html
+- `--sessions` and `--search` in text format
+- `--latest`/session paths (text and json: json translates prose values)
+- `--diagnostics`/`--inspect` in text format
+- `--waste`, `--compare` in text format
+- the interactive TUI
+- `--clear-cache` and `--update-pricing` status lines
+
+Every other combination **fails loudly with a non-zero exit** (exit code 1,
+like every other argument error) instead of silently rendering English: `-f json` machine contracts (the JSON schema and
+its English prose values are a contract CI greps), `--doctor`, `--demo`,
+`--list-models`, `--test-match`, `--statusline-report`, and upstream status
+reports. Error diagnostics and gate output stay English regardless, so CI
+gates keep working unchanged. Generated analysis prose inside otherwise
+translated reports (incident labels, cost-driver notes, health-trend text)
+remains English for now.
+
 ### Statusline capture
 
 Subscription limit windows (`5h`/`7d` usage and reset times) and Claude
