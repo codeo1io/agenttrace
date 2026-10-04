@@ -341,12 +341,18 @@ fn no_baseline_gate_is_a_boolean_not_a_value_flag() {
     // independently): `--no-baseline-gate` was registered in
     // `flag_takes_value`, so the Go-flag shim consumed the following
     // positional as its value and kept scanning instead of stopping at
-    // the first positional. Go semantics: flags after the session path
-    // are ignored. With the misregistration,
+    // the first positional. With the misregistration,
     // `--sessions --no-baseline-gate <fixture> --overview` let the
     // post-positional `--overview` through and the run died on
-    // "choose exactly one report action"; with the fix the trailing
-    // flag is ignored and the session list prints.
+    // "choose exactly one report action".
+    //
+    // rm-247 (cycle 3) flipped the tail contract deliberately: flags
+    // after the positional are now a LOUD usage error instead of being
+    // silently ignored, because silent deletion made documented
+    // invocations lie (`<file> -o out.txt` exited 0 without writing
+    // anything). The rejection must name the dropped flag, must exit 2
+    // (clap usage-error convention), and the flag must still never
+    // reach action validation.
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .args([
             "--sessions",
@@ -358,9 +364,38 @@ fn no_baseline_gate_is_a_boolean_not_a_value_flag() {
         ])
         .output()
         .expect("run agenttrace CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "flags after the positional are a loud usage error: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--overview"),
+        "the rejection must name the dropped flag, got {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("choose exactly one report action"),
+        "the post-positional --overview must never reach action validation"
+    );
+
+    // The original boolean registration still holds: with flags placed
+    // before the positional, `--no-baseline-gate` must not swallow the
+    // fixture as its value, and the session list prints.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--sessions",
+            "--no-baseline-gate",
+            generated_fixture("detailed-tool-steps.jsonl")
+                .to_str()
+                .expect("fixture path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
     assert!(
         output.status.success(),
-        "trailing post-positional flags must be ignored, not validated: {:?}",
+        "flags before the positional must parse: {:?}",
         output
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -368,11 +403,139 @@ fn no_baseline_gate_is_a_boolean_not_a_value_flag() {
         stdout.contains("SESSION\tHEALTH\tDATA"),
         "the session list must print, got {stdout:?}"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !stderr.contains("choose exactly one report action"),
-        "the post-positional --overview must never reach action validation"
+}
+
+#[test]
+fn positional_path_hits_the_gate_like_the_dash_d_control() {
+    // Cycle-3 review F1 (attempt 3fb3e39d): rm-246's acceptance requires
+    // a committed regression pinning the positional-path gate exit code
+    // against the `-d` control. The unit truth-table pins the guard
+    // predicate only — a re-introduced earlier single-session dispatch
+    // in run() would pass it and silently skip the gate again. This
+    // test pins the END-TO-END contract: identical fixture, identical
+    // gate verdict, only the path-delivery form differs, and neither
+    // form may exit 0.
+    let fixture = generated_fixture("detailed-tool-steps.jsonl"); // health 70
+    let control_dir =
+        std::env::temp_dir().join(format!("agenttrace-rm246-reviewfix-{}", std::process::id()));
+    std::fs::create_dir_all(&control_dir).expect("create control dir");
+    let control_file = control_dir.join("detailed-tool-steps.jsonl");
+    std::fs::copy(&fixture, &control_file).expect("copy fixture into control dir");
+
+    fn gate_verdict(stderr: &str) -> &str {
+        stderr
+            .lines()
+            .find(|line| line.starts_with("Gate failed:"))
+            .unwrap_or_else(|| panic!("expected a gate verdict on stderr, got {stderr:?}"))
+    }
+
+    let positional = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--overview",
+            "--fail-under-health",
+            "100",
+            fixture.to_str().expect("fixture path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI (positional form)");
+    assert_eq!(
+        positional.status.code(),
+        Some(2),
+        "a positional session path must not dodge the quality gate: {:?}",
+        positional
     );
+    let positional_stderr = String::from_utf8_lossy(&positional.stderr);
+    let positional_verdict = gate_verdict(&positional_stderr);
+
+    let control = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--overview",
+            "--fail-under-health",
+            "100",
+            "-d",
+            control_dir.to_str().expect("control dir is valid UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI (-d control form)");
+    assert_eq!(
+        control.status.code(),
+        Some(2),
+        "the -d control must keep failing the gate: {:?}",
+        control
+    );
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    let control_verdict = gate_verdict(&control_stderr);
+
+    assert_eq!(
+        positional_verdict, control_verdict,
+        "positional and -d forms must yield the identical gate verdict"
+    );
+    assert!(
+        positional_verdict.contains("70.0") && positional_verdict.contains("below 100"),
+        "verdict must name the failing average, got {positional_verdict:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&control_dir);
+}
+
+#[test]
+fn flags_after_the_positional_are_rejected_end_to_end() {
+    // Cycle-3 review F2 (attempt 3fb3e39d): the shim-unit tests pin the
+    // rejection mechanism flag-agnostically, but the two documented PoCs
+    // (`<file> -o out.txt` writing nothing; `<file> --clear-cache`
+    // no-op'ing) deserve end-to-end pins: the binary must exit 2 naming
+    // the dropped flag, and a rejected `-o` must leave no artifact.
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+    let out_path = std::env::temp_dir().join(format!(
+        "agenttrace-rm247-reviewfix-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&out_path);
+
+    let dropped_o = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            fixture.to_str().expect("fixture path is valid UTF-8"),
+            "-o",
+            out_path.to_str().expect("out path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI (-o after positional)");
+    assert_eq!(
+        dropped_o.status.code(),
+        Some(2),
+        "`-o` after the positional must be a loud usage error: {:?}",
+        dropped_o
+    );
+    let stderr = String::from_utf8_lossy(&dropped_o.stderr);
+    assert!(
+        stderr.contains("-o") && stderr.contains("silently dropped"),
+        "the rejection must name the dropped `-o` tail, got {stderr:?}"
+    );
+    assert!(
+        !out_path.exists(),
+        "a rejected `-o` must not create its output file"
+    );
+
+    let dropped_clear_cache = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            fixture.to_str().expect("fixture path is valid UTF-8"),
+            "--clear-cache",
+        ])
+        .output()
+        .expect("run agenttrace CLI (--clear-cache after positional)");
+    assert_eq!(
+        dropped_clear_cache.status.code(),
+        Some(2),
+        "`--clear-cache` after the positional must be a loud usage error: {:?}",
+        dropped_clear_cache
+    );
+    let stderr = String::from_utf8_lossy(&dropped_clear_cache.stderr);
+    assert!(
+        stderr.contains("--clear-cache"),
+        "the rejection must name `--clear-cache`, got {stderr:?}"
+    );
+
+    let _ = std::fs::remove_file(&out_path);
 }
 
 #[test]

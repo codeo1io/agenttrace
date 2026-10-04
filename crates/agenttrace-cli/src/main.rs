@@ -18,7 +18,7 @@ use clap::Parser;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 mod upstream;
@@ -159,7 +159,14 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let args = Args::parse_from(go_flag_compatible_args(std::env::args_os()));
+    // rm-247: flags after the positional session path used to be
+    // silently dropped by the Go-flag shim; reject them loudly
+    // instead (exit 2, the clap usage-error convention).
+    let argv = go_flag_compatible_args(std::env::args_os()).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    });
+    let args = Args::parse_from(argv);
     // --version must win over argument validation, including action
     // validation: `--lang fr --version` used to fail in report_language()
     // and `--overview --version` in validate_primary_action() before the
@@ -375,11 +382,7 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if (args.latest || args.path.is_some())
-        && !args.sessions
-        && !args.diagnostics
-        && args.inspect.is_none()
-    {
+    if single_session_report_requested(&args) {
         let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
         let session =
             latest_session(&sessions).context("No sessions match the requested filters")?;
@@ -703,7 +706,7 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn go_flag_compatible_args<I>(args: I) -> Vec<OsString>
+fn go_flag_compatible_args<I>(args: I) -> anyhow::Result<Vec<OsString>>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -735,7 +738,29 @@ where
         out.push(arg);
     }
 
-    out
+    // rm-247: this shim stops at the first positional, so anything left
+    // on the command line is dropped without clap ever seeing it.
+    // Dropping flags silently made documented invocations lie
+    // (`sessions.jsonl -o out.txt` exited 0 without writing anything,
+    // `sessions.jsonl --clear-cache` left the cache untouched), so name
+    // the dropped arguments and fail loudly. Plain extra positionals
+    // stay tolerated: they are not flags, and the Go-style contract
+    // only ever documented flag handling.
+    let dropped: Vec<OsString> = args.collect();
+    if let Some(flag) = dropped.iter().find(|arg| !is_go_flag_positional(arg)) {
+        let tail = dropped
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        bail!(
+            "flag `{}` follows the positional session path and would be silently dropped \
+             (dropped: `{tail}`); place flags before the positional path",
+            flag.to_string_lossy()
+        );
+    }
+
+    Ok(out)
 }
 
 fn is_go_flag_positional(arg: &OsString) -> bool {
@@ -907,10 +932,34 @@ fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, content)?;
+        // rm-250: stage through a unique temp sibling and rename into
+        // place, so a crash or Ctrl-C mid-write never leaves a
+        // truncated report at the destination (same pattern as the
+        // session-cache and history persistence writers).
+        let temp = unique_temp_sibling(path);
+        let staged = fs::write(&temp, content).and_then(|()| fs::rename(&temp, path));
+        if let Err(error) = staged {
+            let _ = fs::remove_file(&temp);
+            return Err(error).context("writing report output file");
+        }
         eprintln!("Saved: {}", path.display());
     }
     Ok(())
+}
+
+/// Unique per-process, per-call temp sibling of `path` for atomic `-o`
+/// writes (rm-250). Mirrors `session_cache::unique_temp_path` (pass-6
+/// P6-3); that helper is `pub(crate)`, and the core crate is owned by a
+/// sibling lane, so the pattern is duplicated here instead of widened.
+fn unique_temp_sibling(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agenttrace-report");
+    path.with_file_name(format!("{name}.tmp.{}.{}", std::process::id(), sequence))
 }
 
 fn prepare_cli_view(mut sessions: Vec<Session>, args: &Args) -> anyhow::Result<Vec<Session>> {
@@ -1164,6 +1213,25 @@ fn has_session_action(args: &Args) -> bool {
             .unwrap_or(false)
 }
 
+/// rm-246 (assess N1): the single-session report is the DEFAULT
+/// action. It renders only when the invocation selects a session
+/// without asking for any report action, because an explicit action
+/// must win: routing a positional path (or `--latest`) into
+/// `--overview`/`--search` lets those branches — and the `--fail-*`
+/// gates — actually run, instead of silently rendering a
+/// single-session report that skips the gate entirely
+/// (`--overview --fail-under-health 100 <file>` used to exit 0).
+/// Actions dispatched earlier in `run()` (--statusline, --compare,
+/// --audit, --waste, …) never reach this decision point.
+fn single_session_report_requested(args: &Args) -> bool {
+    (args.latest || args.path.is_some())
+        && !args.sessions
+        && !args.diagnostics
+        && args.inspect.is_none()
+        && args.search.is_none()
+        && !args.overview
+}
+
 fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
     // --fetch only means something for the upstream command; staying
     // silent about it elsewhere would let a typo'd invocation report
@@ -1340,21 +1408,58 @@ mod tests {
     }
 
     #[test]
-    fn go_flag_compatible_args_ignore_flags_after_positional_path() {
-        let args = go_flag_compatible_args([
+    fn go_flag_compatible_args_rejects_flags_after_positional_path() {
+        // rm-247 (was `ignore_flags_after_positional_path`): silent
+        // deletion made documented invocations lie — `sessions.jsonl
+        // -f json` "worked" while -f vanished, `sessions.jsonl -o
+        // out.txt` exited 0 without writing anything, and gate flags
+        // after the positional never reached the gate. The shim now
+        // rejects the dropped tail loudly, naming the arguments.
+        let error = go_flag_compatible_args([
             OsString::from("agenttrace"),
             OsString::from("session.jsonl"),
             OsString::from("-f"),
             OsString::from("json"),
-        ]);
+        ])
+        .expect_err("flags after the positional must be rejected");
 
+        let message = error.to_string();
+        assert!(
+            message.contains("`-f`"),
+            "names the dropped flag: {message}"
+        );
+        assert!(
+            message.contains("`-f json`"),
+            "names the dropped tail: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_tolerates_extra_positionals_after_the_path() {
+        // Only flags are rejected after the positional; plain extra
+        // positionals keep the historical Go-style tolerance.
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("a.jsonl"),
+            OsString::from("b.jsonl"),
+        ])
+        .expect("plain extra positionals are not flags");
         assert_eq!(
             args,
-            vec![
-                OsString::from("agenttrace"),
-                OsString::from("session.jsonl")
-            ]
+            vec![OsString::from("agenttrace"), OsString::from("a.jsonl"),]
         );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_rejects_flags_after_double_dash_path() {
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--"),
+            OsString::from("session.jsonl"),
+            OsString::from("--clear-cache"),
+        ])
+        .expect_err("flags after a `--` path must be rejected too");
+        assert!(error.to_string().contains("`--clear-cache`"));
     }
 
     #[test]
@@ -1364,7 +1469,8 @@ mod tests {
             OsString::from("-f"),
             OsString::from("json"),
             OsString::from("session.jsonl"),
-        ]);
+        ])
+        .expect("flags before the positional are kept");
 
         assert_eq!(
             args,
@@ -1388,7 +1494,8 @@ mod tests {
             OsString::from("20"),
             OsString::from("-f"),
             OsString::from("json"),
-        ]);
+        ])
+        .expect("value flags keep parsing");
         assert_eq!(
             args,
             vec![
@@ -1418,7 +1525,8 @@ mod tests {
             OsString::from("--overview"),
             OsString::from("-f"),
             OsString::from("json"),
-        ]);
+        ])
+        .expect("leading placement");
         assert_eq!(
             args,
             vec![
@@ -1440,7 +1548,8 @@ mod tests {
             OsString::from("-f"),
             OsString::from("json"),
             OsString::from("--no-baseline-gate"),
-        ]);
+        ])
+        .expect("trailing placement before any positional");
         assert_eq!(
             args,
             vec![
@@ -1464,6 +1573,108 @@ mod tests {
         args.latest = true;
         args.diagnostics = true;
         assert!(validate_primary_action(&args).is_ok());
+    }
+
+    #[test]
+    fn single_session_report_yields_to_explicit_actions() {
+        // rm-246 (assess N1): a positional session path (or --latest)
+        // used to render the single-session report even when
+        // --overview/--search was asked for, silently skipping the
+        // overview quality gate (`--overview --fail-under-health 100
+        // <file>` exited 0). Explicit actions now route the path into
+        // the corpus loader instead. Actions dispatched before this
+        // decision (--compare/--audit/--waste/…) never reach it.
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.path = Some("session.jsonl".into());
+        assert!(single_session_report_requested(&args));
+
+        args.overview = true;
+        assert!(!single_session_report_requested(&args));
+        args.overview = false;
+
+        args.search = Some("tokens".into());
+        assert!(!single_session_report_requested(&args));
+        args.search = None;
+
+        args.sessions = true;
+        assert!(!single_session_report_requested(&args));
+        args.sessions = false;
+
+        args.latest = true;
+        assert!(single_session_report_requested(&args));
+        args.diagnostics = true;
+        assert!(!single_session_report_requested(&args));
+    }
+
+    #[test]
+    fn flag_takes_value_covers_every_value_taking_clap_flag() {
+        // rm-247 canary: flag_takes_value is a hand-maintained list.
+        // When a value-taking flag is missing from it, the shim treats
+        // the flag's VALUE as the first positional and the truncation
+        // point moves — exactly the A11-5 failure mode. Derive the
+        // expected set from the clap definition so drift fails here
+        // instead of in production argv.
+        use clap::CommandFactory;
+
+        let mut missing: Vec<String> = Vec::new();
+        for arg in Args::command().get_arguments() {
+            let takes_values = arg
+                .get_num_args()
+                .map(|range| range.takes_values())
+                .unwrap_or(false);
+            if !takes_values {
+                continue;
+            }
+            if let Some(short) = arg.get_short() {
+                let token = format!("-{short}");
+                if !flag_takes_value(&OsString::from(&token)) {
+                    missing.push(token);
+                }
+            }
+            if let Some(long) = arg.get_long() {
+                let token = format!("--{long}");
+                if !flag_takes_value(&OsString::from(&token)) {
+                    missing.push(token);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "value-taking flags missing from flag_takes_value (their values would be \
+             swallowed as positionals): {missing:?}"
+        );
+    }
+
+    #[test]
+    fn write_output_stages_atomically_and_leaves_no_temp_residue() {
+        // rm-250: -o must stage through a temp sibling and rename, so a
+        // crash mid-write never leaves a truncated report and no temp
+        // files survive any exit path.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-write-output-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+
+        let target = dir.join("report.txt");
+        write_output(&Some(target.clone()), "body\n").expect("write");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "body\n");
+
+        // Failing rename (destination occupied by a directory) must
+        // clean the staged temp file.
+        let occupied = dir.join("occupied");
+        fs::create_dir_all(&occupied).unwrap();
+        assert!(write_output(&Some(occupied), "body\n").is_err());
+
+        let residue: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(residue.is_empty(), "temp residue left behind: {residue:?}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
