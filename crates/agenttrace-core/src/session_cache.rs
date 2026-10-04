@@ -77,8 +77,17 @@ pub const MAX_SESSION_CACHE_DIR_BYTES: usize = MAX_SESSION_CACHE_BYTES / 8;
 /// Walk-semantics version for cached directory listings. Bumped when the
 /// discovery walk's directory set changes so stale listings are dropped
 /// once at load (see `load_session_cache`). v2: symlinked child
-/// directories are followed (Codex `#42135`, cycle 7).
-const DIR_LISTING_WALK_VERSION: i64 = 2;
+/// directories are followed (Codex `#42135`, cycle 7). v3: npm/package
+/// manifests are no longer admitted (rm-370, cycle 4) — the cached replay
+/// extends `listing.files` verbatim instead of re-running the admission
+/// predicates, and a v2 listing still names `package-lock.json`,
+/// `models-store.json`, and `*.lock` as files plus `npm` roots as child
+/// directories, so a warm journal keeps feeding the walk the manifest
+/// noise the blocklist exists to remove. The session-cache schema
+/// version cannot cover this one: schema 22 already shipped (rm-400/401)
+/// with the pre-blocklist walker, so a schema-22 journal can still carry
+/// stale v2 listings.
+const DIR_LISTING_WALK_VERSION: i64 = 3;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")

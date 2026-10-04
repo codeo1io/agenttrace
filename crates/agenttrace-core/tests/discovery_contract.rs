@@ -892,9 +892,11 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
+        // v22 (run 2c2db6f5, rm-400/401): parser-semantics fixes bump the
+        // schema so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(21)
+            Some(22)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1058,9 +1060,11 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
 
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
+        // The stale v3 cache must be rewritten at the current schema
+        // version (v22 — see the rm-400/401 bump note in session_cache.rs).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(21)
+            Some(22)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -2773,6 +2777,176 @@ fn single_root_discovery_keeps_listed_paths() {
         );
         let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn custom_dir_walk_skips_npm_and_package_manifests() {
+    // rm-370 (cycle 4): custom `-d` walks must not admit npm/package
+    // manifests as session candidates. Live evidence: `-d ~/.pi --doctor`
+    // reported 157 failed rows whose samples were
+    // `agent-cliproxy-only/models-store.json`,
+    // `agent-cliproxy-only/npm/package-lock.json`, and
+    // `agent/npm/package-lock.json`.
+    let root = temp_root("agenttrace-manifest-noise");
+    fs::create_dir_all(root.join("agent/npm")).expect("create npm dir");
+    fs::create_dir_all(root.join("agent-cliproxy-only")).expect("create cliproxy dir");
+    fs::create_dir_all(root.join("sessions")).expect("create sessions dir");
+    fs::write(root.join("agent/npm/package-lock.json"), "{}").expect("write package-lock");
+    fs::write(root.join("agent-cliproxy-only/models-store.json"), "{}")
+        .expect("write models-store");
+    fs::write(root.join("sessions/yarn.lock"), "{}").expect("write yarn lock");
+    let session_path = root.join("sessions/session.jsonl");
+    fs::write(&session_path, SAMPLE_JSONL).expect("write session");
+    // Aider's exact-name history keeps its admission (guarded for the
+    // aider-lane contract).
+    let aider_path = root.join(".aider.chat.history.md");
+    fs::write(&aider_path, "# aider chat started at 2026-05-02 10:00:00\n")
+        .expect("write aider history");
+
+    with_session_cache(&root.join("cache"), || {
+        let files = find_session_files(Some(&root));
+        assert!(
+            files.contains(&session_path),
+            "the real session must be found: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("package-lock.json")),
+            "package-lock.json must not be admitted as a session: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("models-store.json")),
+            "models-store.json must not be admitted as a session: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|path| path.ends_with("yarn.lock")),
+            "*.lock manifests must not be admitted as sessions: {files:?}"
+        );
+        assert!(
+            files.contains(&aider_path),
+            "aider exact-name history keeps its admission: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn manifest_blocklist_leaves_auto_discovery_admission_unchanged() {
+    // rm-370 (cycle 4): the manifest blocklist is aimed at custom `-d`
+    // walks; the auto-discovery lane registers `<root>/<child>/sessions`
+    // only, so its admission set must be unchanged by the blocklist.
+    let root = temp_root("agenttrace-manifest-auto");
+    let home = root.join("home");
+    let sessions = home.join(".pi/agent/sessions");
+    fs::create_dir_all(&sessions).expect("create pi sessions dir");
+    fs::create_dir_all(home.join(".pi/agent/npm")).expect("create pi npm dir");
+    let session_path = sessions.join("pi-session.jsonl");
+    fs::write(&session_path, SAMPLE_JSONL).expect("write pi session");
+
+    with_home(&home, || {
+        let files = find_session_files(None);
+        assert_eq!(
+            files,
+            vec![session_path.clone()],
+            "auto discovery must keep finding the one real session and nothing else: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
+    // rm-370 + the walk-version bump (cycle 4 integration review): the
+    // cached replay in `walk_session_files_cached` extends `listing.files`
+    // verbatim, so a journal written by the pre-blocklist walker keeps
+    // offering npm/package manifests to the loading lane as candidate
+    // session files (doctor's own walk is uncached, but `-d` loads and
+    // `--overview` ride the cached finder). The session-cache schema
+    // version cannot retire those listings — schema 22 already shipped
+    // with the pre-blocklist walker — so the listing walk version is the
+    // only invalidation. Pin both halves: a stale (v2) listing that names
+    // a manifest is not replayed, and the journal is rewritten at the
+    // current walk version.
+    let root = temp_root("agenttrace-manifest-warm-cache");
+    fs::create_dir_all(root.join("agent")).expect("create agent dir");
+    fs::create_dir_all(root.join("sessions")).expect("create sessions dir");
+    // Placed directly under `agent/`: the pre-blocklist walker stored this
+    // file in `agent`'s own listing (`.json` suffix, no skip rule), which
+    // is the same row `-d ~/.pi --doctor` rendered as a parse failure.
+    let manifest_path = root.join("agent/package-lock.json");
+    fs::write(&manifest_path, "{}").expect("write package-lock");
+    let session_path = root.join("sessions/session.jsonl");
+    fs::write(&session_path, SAMPLE_JSONL).expect("write session");
+
+    with_session_cache(&root.join("cache"), || {
+        // Prime a warm journal through the loading lane (the plain walk
+        // never reads listings; loads persist them) so the doc carries
+        // the live schema version and real, manifest-free listings.
+        let primed = load_sessions_from_dir(Some(&root));
+        assert_eq!(primed.len(), 1, "one real session parsed: {primed:?}");
+        let primed_files = find_session_files(Some(&root));
+        assert!(
+            !primed_files
+                .iter()
+                .any(|path| path.ends_with("package-lock.json")),
+            "the current walker must not admit the manifest: {primed_files:?}"
+        );
+
+        // Rewind the journal to the pre-blocklist walker: same schema
+        // version, walk version 2, and `agent`'s listing naming the
+        // manifest — the journal shape an older binary writes.
+        let journal = session_cache_path();
+        let raw = fs::read_to_string(&journal).expect("read primed journal");
+        let mut doc: Value = serde_json::from_str(&raw).expect("journal json");
+        doc["dir_listing_version"] = serde_json::json!(2);
+        let agent_dir = root.join("agent");
+        let dirs = doc
+            .get_mut("dirs")
+            .and_then(Value::as_object_mut)
+            .expect("dirs member");
+        dirs.insert(
+            agent_dir.to_string_lossy().to_string(),
+            serde_json::json!({
+                "mod_time": file_mod_time_nanos_for_test(
+                    &fs::metadata(&agent_dir).expect("agent dir metadata")
+                ),
+                "files": [manifest_path.to_string_lossy().to_string()],
+                "dirs": [],
+            }),
+        );
+        fs::write(
+            &journal,
+            serde_json::to_string(&doc).expect("serialize rewound journal"),
+        )
+        .expect("write rewound journal");
+
+        let replayed = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        assert_eq!(
+            replayed.sessions.len(),
+            1,
+            "the manifest must not surface as a parsed session"
+        );
+        assert_eq!(
+            replayed.discovered, 1,
+            "a warm listing written by the pre-blocklist walker must not keep offering npm manifests as session candidates (discovered {}): {:?}",
+            replayed.discovered, find_session_files(Some(&root))
+        );
+        assert_eq!(
+            replayed.skipped, 0,
+            "the manifest must not be counted as a skipped/unparseable session file"
+        );
+
+        let raw = fs::read_to_string(&journal).expect("read rewritten journal");
+        let doc: Value = serde_json::from_str(&raw).expect("rewritten journal json");
+        assert_ne!(
+            doc.pointer("/dir_listing_version").and_then(Value::as_i64),
+            Some(2),
+            "the journal must be rewritten at the current walk version"
+        );
     });
 
     let _ = fs::remove_dir_all(root);
