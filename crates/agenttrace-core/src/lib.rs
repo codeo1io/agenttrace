@@ -2,6 +2,7 @@ mod demo;
 mod diagnostics;
 mod discovery;
 mod doctor;
+mod filters;
 mod governance;
 mod history;
 mod insights;
@@ -35,6 +36,10 @@ pub use discovery::{
     KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
 };
 pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
+pub use filters::{
+    matches_numeric_filter, parse_finite_f64, parse_numeric_filter, parse_numeric_filter_i32,
+    NumericFilterOp,
+};
 pub use governance::{
     context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance,
     recommendations, session_cost_audit, ContextTrend, ContextTrendTotals, CostAudit,

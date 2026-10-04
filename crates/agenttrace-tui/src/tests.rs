@@ -2029,3 +2029,29 @@ fn efficiency_panel_renders_statusline_limits_and_cache_causes() {
         );
     });
 }
+
+#[test]
+fn numeric_filters_share_the_finite_core_dialect() {
+    // rm-364: `:cost` / `:health` / `:context` parsing routes through the
+    // shared core validator — non-finite thresholds are rejected instead of
+    // silently matching nothing (`>=NaN`) or everything (`<=inf`), and a bare
+    // number still means `>=`.
+    for bad in [">=NaN", "<=inf", ">=inf", ">=1e400", ">=abc", ""] {
+        assert!(parse_cost_filter(bad).is_none(), "{bad:?} must be invalid");
+    }
+    assert_eq!(parse_cost_filter("0.10"), Some((CostOp::Gte, 0.10)));
+    assert_eq!(parse_cost_filter(">=0.10"), Some((CostOp::Gte, 0.10)));
+    assert_eq!(parse_cost_filter(">= 0.10"), Some((CostOp::Gte, 0.10)));
+
+    for bad in [">=79.5", "5.5", ">=nan", "<=inf", ">=1e400", "abc", ""] {
+        assert!(
+            parse_numeric_i32_filter(bad).is_none(),
+            "{bad:?} must be invalid"
+        );
+    }
+    assert_eq!(parse_numeric_i32_filter("80"), Some((CostOp::Gte, 80)));
+    assert_eq!(parse_numeric_i32_filter("<80"), Some((CostOp::Lt, 80)));
+
+    assert_eq!(parse_health_filter("good"), Some(()));
+    assert!(parse_health_filter(">=NaN").is_none());
+}

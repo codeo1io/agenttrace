@@ -12,7 +12,7 @@ Use the same scope controls for every report:
 agenttrace --range 30d --project storefront --source claude_code
 ```
 
-Supported controls include `--range today|7d|30d|all`, `--project`, `--source`, `--model-filter`, `--query`, `--health`, `--cost`, `--anomaly`, `--sort`, `--order`, and `--limit`.
+Supported controls include `--range today|7d|30d|all`, `--project`, `--source`, `--model-filter`, `--query`, `--health`, `--cost`, `--anomaly`, `--sort`, `--order`, and `--limit`. `--health` and `--cost` share one numeric dialect: an optional `>=`, `<=`, `>`, `<`, or `=` operator plus a finite number, where a bare number means `>=` (`--cost 0.5` is the same as `--cost '>=0.5'`, in the TUI `:cost`/`:health` filters too); non-finite values such as `NaN`, `inf`, or `1e400` are rejected as invalid filters instead of silently matching nothing or everything.
 
 By default every governance report audits **every** session in scope, and the
 report discloses its coverage: `audited_sessions` / `total_sessions` /

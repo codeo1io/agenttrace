@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::*;
+use agenttrace_core::{parse_numeric_filter, parse_numeric_filter_i32, NumericFilterOp};
 
 pub(super) fn session_matches(session: &Session, query: &str) -> bool {
     contains(&session.name, query)
@@ -95,29 +96,26 @@ pub(super) fn matches_issue_filter(session: &Session, filter: &str) -> bool {
 }
 
 pub(super) fn parse_numeric_i32_filter(filter: &str) -> Option<(CostOp, i32)> {
-    let (op, value) = parse_operator_value(filter)?;
-    value.parse::<i32>().ok().map(|value| (op, value))
+    let (op, value) = parse_numeric_filter_i32(filter)?;
+    Some((cost_op(op), value))
 }
 
 pub(super) fn parse_cost_filter(filter: &str) -> Option<(CostOp, f64)> {
-    let (op, value) = parse_operator_value(filter.trim())?;
-    value.parse::<f64>().ok().map(|value| (op, value))
+    let (op, value) = parse_numeric_filter(filter.trim())?;
+    Some((cost_op(op), value))
 }
 
-pub(super) fn parse_operator_value(filter: &str) -> Option<(CostOp, &str)> {
-    let filter = filter.trim();
-    for (prefix, op) in [
-        (">=", CostOp::Gte),
-        ("<=", CostOp::Lte),
-        (">", CostOp::Gt),
-        ("<", CostOp::Lt),
-        ("=", CostOp::Eq),
-    ] {
-        if let Some(value) = filter.strip_prefix(prefix) {
-            return Some((op, value.trim()));
-        }
+/// Numeric filters share the core dialect (rm-364): finite thresholds only,
+/// bare number meaning `>=`. Non-finite values (`NaN`, `±inf`, `1e400`) are
+/// rejected instead of silently matching nothing or everything.
+fn cost_op(op: NumericFilterOp) -> CostOp {
+    match op {
+        NumericFilterOp::Gte => CostOp::Gte,
+        NumericFilterOp::Lte => CostOp::Lte,
+        NumericFilterOp::Gt => CostOp::Gt,
+        NumericFilterOp::Lt => CostOp::Lt,
+        NumericFilterOp::Eq => CostOp::Eq,
     }
-    filter.parse::<f64>().ok().map(|_| (CostOp::Gte, filter))
 }
 
 pub(super) fn compare_i32(left: i32, op: CostOp, right: i32) -> bool {

@@ -2,15 +2,15 @@ use agenttrace_core::{
     add_baseline_comparison, average_health, compute_overview, context_trends, cost_audit,
     data_health, data_health_scoped, delivery_evidence_with_git, demo_sessions,
     evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
-    load_sessions_with_options, mcp_governance, parse_file, predict_cost_anomaly,
-    pricing_cache_path, recommendations, render_doctor_report, render_model_pricing_list,
-    render_test_match, render_waste_report_with_language, report_compare_json,
-    report_json_with_language, report_overview_html_with_context,
-    report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, search_sessions, session_capability, tool_fail_rate, total_tokens,
-    update_pricing, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
-    TimeRange, VERSION,
+    load_sessions_with_options, matches_numeric_filter, mcp_governance, parse_file,
+    parse_numeric_filter, predict_cost_anomaly, pricing_cache_path, recommendations,
+    render_doctor_report, render_model_pricing_list, render_test_match,
+    render_waste_report_with_language, report_compare_json, report_json_with_language,
+    report_overview_html_with_context, report_overview_json_with_context,
+    report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
+    report_search_text, report_text_with_language, search_sessions, session_capability,
+    tool_fail_rate, total_tokens, update_pricing, BaselineThresholds, LoadOptions, LoadReport,
+    ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -1032,36 +1032,16 @@ fn validate_view_filters(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Numeric filters share the core dialect (rm-364): an optional operator plus
+/// a finite number, bare number meaning `>=`. Non-finite thresholds
+/// (`NaN`, `±inf`, `1e400`) are invalid, so a typo can no longer silently
+/// match nothing or everything.
 fn valid_number_filter(filter: &str) -> bool {
-    [">=", "<=", ">", "<", "="]
-        .iter()
-        .find_map(|prefix| filter.strip_prefix(prefix))
-        .is_some_and(|value| value.parse::<f64>().is_ok())
+    parse_numeric_filter(filter).is_some()
 }
 
 fn matches_number(value: f64, filter: &str) -> bool {
-    let filter = filter.trim();
-    if filter.is_empty() {
-        return true;
-    }
-    for (prefix, compare) in [
-        (
-            ">=",
-            std::cmp::Ordering::is_ge as fn(std::cmp::Ordering) -> bool,
-        ),
-        ("<=", std::cmp::Ordering::is_le),
-        (">", std::cmp::Ordering::is_gt),
-        ("<", std::cmp::Ordering::is_lt),
-        ("=", std::cmp::Ordering::is_eq),
-    ] {
-        if let Some(raw) = filter.strip_prefix(prefix) {
-            return raw
-                .parse::<f64>()
-                .ok()
-                .is_some_and(|target| compare(value.total_cmp(&target)));
-        }
-    }
-    false
+    matches_numeric_filter(value, filter)
 }
 
 fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
