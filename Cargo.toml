@@ -9,7 +9,13 @@ resolver = "2"
 [workspace.package]
 version = "0.0.0-dev"
 edition = "2021"
-rust-version = "1.80"
+# rm-386: the declared floor was 1.80 while the dependency graph has
+# required ~1.88 for a while (ratatui 0.30 -> ratatui-crossterm 0.1.2 and
+# zeroize 1.9.0 are edition-2024 crates with rust_version 1.88). A false
+# floor tells builders "1.80 works" when it cannot even compile the
+# deps. Upstream raised theirs to 1.85 (#303); this fork's real floor is
+# higher. `cargo +1.80.1 check` must fail loudly at this guard.
+rust-version = "1.88"
 license = "MIT"
 description = "Local-first TUI and reports for AI coding-agent session history, cost, tokens, time, and slow-run diagnosis."
 repository = "https://github.com/luoyuctl/agenttrace"
