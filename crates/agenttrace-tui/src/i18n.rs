@@ -172,8 +172,13 @@ pub(super) fn provenance_label(value: &str, language: Language) -> &'static str 
         "calculated_from_tokens" => pick(language, "calculated from tokens", "根据 token 重算"),
         "calculated_per_message_tokens" => pick(
             language,
-            "calculated per SQLite message tokens",
-            "按 SQLite 消息 token 计算",
+            "calculated per message tokens",
+            "按消息 token 计算",
+        ),
+        "calculated_from_tokens_with_recorded_cost" => pick(
+            language,
+            "calculated from tokens + recorded cost",
+            "根据 token 计算 + 记录成本",
         ),
         "tool_arguments" => pick(language, "found in tool arguments", "从工具参数中提取"),
         "unavailable" | "" => pick(language, "not available", "没有数据"),
