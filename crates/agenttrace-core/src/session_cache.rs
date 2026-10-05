@@ -5,7 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 22;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 23;
+// Bumped 22 -> 23 (run 66a7d797, rm-450): the workbuddy input-basis
+// disclosure adds metrics.line_skips counters that warm v22 snapshots
+// don't carry, so cached sessions would silently omit the very
+// disclosure this batch exists to surface (rm-230 convention:
+// parser-semantics changes bump the schema so cached sessions
+// regenerate under corrected accounting). Entries regenerate once on
+// next scan.
 // Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
 // kimi_cli usage-alias fix and the Codex compaction pairing fix change
 // reported totals for unchanged files, so warm v21 entries carry the

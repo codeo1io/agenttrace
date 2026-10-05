@@ -1,0 +1,3 @@
+{"type":"function_call","name":"bash","arguments":"{}","sessionId":"wb-basis-mismatch","cwd":"/tmp/proj","callId":"c1"}
+{"type":"message","role":"user","content":[{"type":"text","text":"run the thing"}],"sessionId":"wb-basis-mismatch","cwd":"/tmp/proj","message":{"role":"user","usage":{"input_tokens":1000,"output_tokens":50,"cache_read_input_tokens":1500}}}
+{"type":"function_call_result","output":"done","callId":"c1","sessionId":"wb-basis-mismatch","cwd":"/tmp/proj"}

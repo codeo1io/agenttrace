@@ -81,6 +81,9 @@ jobs:
       - name: Lockfile enforcement (cargo --locked)
         run: scripts/ci/check-locked-cargo.sh
 
+      - name: Installer ref drift gate
+        run: scripts/ci/check-install-ref-drift.sh
+
       - name: Save cargo target
         run: |
           KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
