@@ -69,15 +69,16 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 23 and the SQLite snapshot is schema 7; the
+The session cache is schema 24 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
-kimi_cli wire aliases and Codex compaction usage records — so cached
-sessions regenerate under the corrected totals, and to 23 when
+kimi_cli wire aliases and Codex compaction usage records — to 23 when
 present-but-zero usage blocks began counting as disclosed measured zeros
-(rm-408) so cached sessions written before that fix regain the disclosure
-instead of defaulting it back to 0; the SQLite snapshot to 7
+(rm-408), and to 24 when pi-journal disclosure counters, upstream
+recorded-cost passthrough and per-block multi-model pricing joined the
+persisted metrics (rm-436/437/438), so cached sessions regenerate under
+the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are

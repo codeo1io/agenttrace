@@ -37,14 +37,16 @@ impl BaselineBreaches {
     }
 }
 
-/// Renders per-reason parse-line losses (pass-7 P7-1) for report
-/// surfaces: `unparseable_line=1, event_schema=2`, or empty when the
-/// parse was clean so report bytes stay unchanged for clean corpora.
-fn line_skips_cell(skips: &BTreeMap<String, usize>) -> String {
-    if skips.is_empty() {
+/// Renders a key=counter map for report surfaces: parse-line losses
+/// (`unparseable_line=1, event_schema=2`, pass-7 P7-1) and journal
+/// disclosures (`pi_branches=2, pi_usage_entry:cache_warm=1`,
+/// rm-436/rm-437). Empty input renders empty so report bytes stay
+/// unchanged for clean corpora.
+fn counts_cell(counts: &BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
         return String::new();
     }
-    skips
+    counts
         .iter()
         .map(|(reason, count)| format!("{reason}={count}"))
         .collect::<Vec<_>>()
@@ -615,7 +617,13 @@ pub fn report_overview_text_with_context(
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
             "  Dropped lines: {}\n",
-            line_skips_cell(&data_health.line_skips)
+            counts_cell(&data_health.line_skips)
+        ));
+    }
+    if !data_health.disclosures.is_empty() {
+        out.push_str(&format!(
+            "  Journal disclosures: {}\n",
+            counts_cell(&data_health.disclosures)
         ));
     }
     out.push_str(&format!(
@@ -644,7 +652,13 @@ pub fn report_overview_markdown_with_context(
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
             "| Dropped lines | {} |\n",
-            markdown_cell(&line_skips_cell(&data_health.line_skips))
+            markdown_cell(&counts_cell(&data_health.line_skips))
+        ));
+    }
+    if !data_health.disclosures.is_empty() {
+        out.push_str(&format!(
+            "| Journal disclosures | {} |\n",
+            markdown_cell(&counts_cell(&data_health.disclosures))
         ));
     }
     render_recommendations_markdown(&mut out, &recommendations(sessions));
@@ -666,7 +680,13 @@ pub fn report_overview_html_with_context(
     if !data_health.line_skips.is_empty() {
         appendix.push_str(&format!(
             "<tr><th>Dropped lines</th><td>{}</td></tr>",
-            html_escape(&line_skips_cell(&data_health.line_skips))
+            html_escape(&counts_cell(&data_health.line_skips))
+        ));
+    }
+    if !data_health.disclosures.is_empty() {
+        appendix.push_str(&format!(
+            "<tr><th>Journal disclosures</th><td>{}</td></tr>",
+            html_escape(&counts_cell(&data_health.disclosures))
         ));
     }
     appendix.push_str("</tbody></table></section>");

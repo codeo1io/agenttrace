@@ -1,10 +1,15 @@
 //! pi-family journal format contract (rm-423).
 //!
-//! Upstream (`@earendil-works/pi-coding-agent`) is a PRIVATE repository
-//! that shipped 1.0.0 -> 1.0.1 -> 1.0.2 within four days (observed
-//! 2026-10-04; GitHub releases+tags APIs return 404), so there is no
-//! release-notes channel that could warn about journal-format drift.
-//! These tests pin the wire shapes the parser sniffs and extracts.
+//! Upstream (`@earendil-works/pi-coding-agent`) shipped 1.0.0 ->
+//! 1.0.1 -> 1.0.2 within four days (observed 2026-10-04) and went
+//! PUBLIC that same day — rm-423's original PRIVATE/404 premise was
+//! amended at the run-6403d975 integration per that run's research
+//! pass-12 rider (releases+tags APIs live; a versioned session-format
+//! spec ships at `packages/coding-agent/docs/session-format.md`).
+//! Nothing in this repo watches that channel yet, so journal-format
+//! drift still arrives unannounced here: these tests remain the
+//! drift tripwire, pinning the wire shapes the parser sniffs and
+//! extracts, now diffable against the published spec.
 //! Every fixture is asserted at three levels — raw header keys, message
 //! wire keys, and extracted metrics — and every assertion names the
 //! offending key, so a drift failure points at the contract that moved
@@ -20,10 +25,13 @@
 //!
 //! Known-divergence pins (deliberately NOT fixed here; each belongs to
 //! its own roadmap item):
-//! - `model_change` carries the wire key `modelId`, while the parser
-//!   reads `model` — the handler is dead and model attribution stays
-//!   with the message-level `model`. Pinned as-is; the fix is a
-//!   separate change unit (see the parser arm).
+//! - `model_change` wire key: RESOLVED — rm-438 (run 6403d975, landed
+//!   at its integration) made the handler read `modelId` (with `model`
+//!   honored as a legacy spelling), so the former dead-handler
+//!   divergence pin was flipped by intent, not drift, as this header
+//!   requires. The wire key is pinned positively below and the
+//!   attribution/repricing behavior end to end in
+//!   `pi_usage_tree_accounting.rs` (rm-436/437/438 batch).
 //! - `branch_summary`/`compaction` entries are currently surfaced as
 //!   assistant turns (the omp arm routes them through the message
 //!   path). PINNED by
@@ -132,17 +140,40 @@ fn pi_v3_journal_message_usage_and_model_contract() {
     assert_eq!(session.metrics.tokens_output, 1000, "key 'output'");
     assert_eq!(session.metrics.tokens_cache_r, 25000, "key 'cacheRead'");
     assert_eq!(session.metrics.tokens_cache_w, 5000, "key 'cacheWrite'");
+    // rm-438 (landed at the run 6403d975 integration): the handler is
+    // LIVE — `modelId` is the wire key and `model` stays a legacy
+    // spelling — so the session no longer reports (and prices at) the
+    // pre-switch model. The usage block still attributes to its own
+    // message-level `model` (pinned by the per-block cost below), and
+    // the session row discloses the mix as `multiple` per the
+    // parser-agnostic per-block rule instead of silently billing the
+    // sonnet block at the post-switch model's rate.
     assert_eq!(
-        session.metrics.model_used, "claude-sonnet-4-20250514",
-        "{PI_V3}: contract drift — message-level key 'model' no longer drives attribution"
+        session.metrics.model_used, "multiple",
+        "{PI_V3}: contract drift — a switched session must disclose the model mix, not name the pre-switch model"
+    );
+    let sonnet = agenttrace_core::lookup_price("claude-sonnet-4-20250514");
+    let expected_block_cost = 500.0 / 1e6 * sonnet.input
+        + 1000.0 / 1e6 * sonnet.output
+        + 25000.0 / 1e6 * sonnet.cr
+        + 5000.0 / 1e6 * sonnet.cw;
+    assert!(
+        (session.metrics.cost_estimated - agenttrace_core::round4(expected_block_cost)).abs()
+            < 1e-9,
+        "{PI_V3}: message-level key 'model' no longer drives pricing attribution: got {} want {}",
+        session.metrics.cost_estimated,
+        expected_block_cost
     );
     assert!(
         session.metrics.cost_estimated > 0.0,
         "{PI_V3}: contract drift — usage no longer yields a priced cost"
     );
-    // Known-divergence pin: model_change carries the wire key 'modelId';
-    // the parser reads 'model', so attribution must stay with the
-    // message-level model (haiku must NOT take over).
+    // rm-438 (landed at the run 6403d975 integration): the handler is
+    // LIVE — `modelId` is the wire key and `model` stays a legacy
+    // spelling. Pin the switch end to end on this fixture's own
+    // model_change: a model-less post-switch assistant message must
+    // attribute to the switched model, not the pre-switch one (the
+    // former dead-handler divergence pin is retired above).
     let model_change = fixture(PI_V3)
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("json"))
@@ -152,9 +183,28 @@ fn pi_v3_journal_message_usage_and_model_contract() {
         model_change.get("modelId").is_some(),
         "{PI_V3}: contract drift — model_change no longer carries key 'modelId'"
     );
+    let switched_model = model_change
+        .get("modelId")
+        .and_then(Value::as_str)
+        .expect("modelId is a string")
+        .to_string();
+    let switched = format!(
+        "{parent}\n{{\"id\": \"00000000-0000-4000-8000-000000000007\", \"parentId\": \"00000000-0000-4000-8000-000000000006\", \"timestamp\": \"2026-10-04T07:16:48.300Z\", \"message\": {{\"role\": \"assistant\", \"content\": [{{\"type\": \"text\", \"text\": \"after the switch\"}}], \"timestamp\": \"2026-10-04T07:16:48.300Z\"}}, \"type\": \"message\"}}",
+        parent = fixture(PI_V3)
+    );
+    let switched_session = parse_raw_session("pi-v3-switch", PI_V3, &switched)
+        .unwrap_or_else(|error| panic!("{PI_V3}: post-switch extension no longer parses: {error}"));
+    assert_ne!(
+        switched_session.metrics.model_used, "claude-sonnet-4-20250514",
+        "{PI_V3}: model_change 'modelId' no longer applies — the handler went dead again"
+    );
     assert_eq!(
-        session.metrics.model_used, "claude-sonnet-4-20250514",
-        "{PI_V3}: dead 'model' handler changed behavior — model_change now applies"
+        switched_session.metrics.model_used, "multiple",
+        "{PI_V3}: post-switch attribution must disclose the mix (switched {switched_model}, usage claude-sonnet-4-20250514)"
+    );
+    assert_eq!(
+        switched_session.metrics.assistant_turns, 2,
+        "{PI_V3}: the model-less post-switch assistant message must still count as a turn"
     );
 }
 

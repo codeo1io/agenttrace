@@ -163,6 +163,16 @@ pub struct DataHealth {
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
+    /// Parse-time journal disclosures aggregated across sessions
+    /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
+    /// `pi_branches`, `pi_entry_skipped:<type>`,
+    /// `pi_message_role:<role>`. Facts the journal documents that the
+    /// accounting deliberately does not count (or counts across all
+    /// branches), kept visible instead of silently dropped. Empty for
+    /// corpora without such journals, so clean report bytes are
+    /// unchanged.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub disclosures: BTreeMap<String, usize>,
     /// Sessions whose estimated cost is not a finite number (poisoned
     /// or overflowing pricing inputs). Their costs render as null in
     /// reports; the count keeps the corruption visible (pass-8 F8-5).
@@ -599,6 +609,15 @@ fn data_health_from_parts(
             *line_skips.entry(reason.clone()).or_insert(0) += count;
         }
     }
+    // rm-436/rm-437: aggregate per-session disclosure counters the same
+    // way line_skips aggregates, so journal-level facts surface once per
+    // corpus instead of per session.
+    let mut disclosures = BTreeMap::new();
+    for session in sessions {
+        for (key, count) in &session.metrics.disclosure_counters {
+            *disclosures.entry(key.clone()).or_insert(0) += count;
+        }
+    }
     let non_finite_costs = sessions
         .iter()
         .filter(|s| !s.metrics.cost_estimated.is_finite())
@@ -645,6 +664,7 @@ fn data_health_from_parts(
         stored_totals_delta_tokens,
         unknown_time_sessions,
         line_skips,
+        disclosures,
         non_finite_costs,
         with_duration: sessions
             .iter()

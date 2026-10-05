@@ -152,6 +152,30 @@ pub struct Event {
         deserialize_with = "deserialize_string"
     )]
     pub source_tool: String,
+    /// Upstream-recorded USD cost for THIS event's usage block, when the
+    /// source journal recorded it (pi `type:"usage"` entries carry
+    /// `usage.cost.total`, rm-436). Beats the catalog estimate: the
+    /// recorded tokens are excluded from the catalog formula and
+    /// priced at this value instead. Set programmatically by the pi
+    /// parser only; never deserialized from foreign journals.
+    #[serde(
+        skip_deserializing,
+        rename = "RecordedCostUSD",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub recorded_cost_usd: Option<f64>,
+    /// Parse-time disclosure counters riding on this event (pi-family
+    /// journals, rm-436/rm-437): `pi_usage_entry:<kind>`,
+    /// `pi_branches`, `pi_entry_skipped:<type>`,
+    /// `pi_message_role:<role>`. Aggregated onto session metrics and
+    /// data_health so documented-but-uncounted journal facts stay
+    /// visible. Never conversation content.
+    #[serde(
+        skip_deserializing,
+        rename = "DisclosureCounters",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub disclosure_counters: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -363,11 +387,31 @@ pub struct Metrics {
     /// the text-estimate fallback (absent usage keeps that path).
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub zero_usage_events: usize,
+    /// USD cost the source journal recorded for usage blocks (pi
+    /// `type:"usage"` entries carrying `usage.cost.total`, rm-436).
+    /// Those tokens are excluded from the catalog formula and added at
+    /// face value instead of being estimated at the session model's
+    /// rate.
+    #[serde(skip_serializing_if = "zero_usd")]
+    pub upstream_cost_usd: f64,
+    /// Parse-time disclosure counters (pi-family journals,
+    /// rm-436/rm-437): `pi_usage_entry:<kind>` per usage-entry kind,
+    /// `pi_branches` when a v2/v3 tree journal has more than one
+    /// branch end, `pi_entry_skipped:<type>` /
+    /// `pi_message_role:<role>` for documented shapes the accounting
+    /// intentionally does not count. Empty for journals without
+    /// disclosures.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub disclosure_counters: BTreeMap<String, usize>,
     pub provenance: MetricProvenance,
 }
 
 fn usize_is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+fn zero_usd(value: &f64) -> bool {
+    *value == 0.0
 }
 
 /// rm-408: a present usage block whose recognized values are all zero.
@@ -747,6 +791,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     metrics.provenance.tool_results = "unavailable".to_string();
     metrics.provenance.files = "unavailable".to_string();
     metrics.provenance.pricing_source = pricing::pricing_source_for(model);
+    // rm-436/rm-438 pricing state consumed by the cost formula below:
+    // which models produced usage blocks, and which token classes
+    // already carry an upstream-recorded cost.
+    let mut usage_models: BTreeSet<String> = BTreeSet::new();
+    let mut upstream_priced_input = 0i64;
+    let mut upstream_priced_output = 0i64;
+    let mut upstream_priced_cache_w = 0i64;
+    let mut upstream_priced_cache_r = 0i64;
 
     for event in events {
         if metrics.source_tool.is_empty()
@@ -766,6 +818,13 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // corrupt token counts can never wrap into negative totals.
         let usage_tokens = |key: &str| -> i64 { event.usage.get(key).copied().unwrap_or(0).max(0) };
 
+        // rm-436/rm-437: aggregate parse-time disclosure counters onto
+        // the session (pi-family journals). Counters are facts about
+        // the journal, never conversation content.
+        for (key, value) in &event.disclosure_counters {
+            *metrics.disclosure_counters.entry(key.clone()).or_insert(0) += *value as usize;
+        }
+
         match event.role.as_str() {
             "session_meta" | "meta" => {
                 if !event.usage.is_empty() {
@@ -783,6 +842,29 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
                     metrics.tokens_cache_r = metrics
                         .tokens_cache_r
+                        .saturating_add(usage_tokens("cache_read_input_tokens"));
+                    if !event.model_used.is_empty() && event.model_used != "unknown" {
+                        usage_models.insert(event.model_used.clone());
+                    }
+                }
+                // rm-436 (review 06e542d5 F-C): an upstream-recorded
+                // cost is honored even when the usage block carries
+                // no token class at all (pi cache_warm with zeroed
+                // classes) — a PRESENT cost must not be silently
+                // zeroed for lacking tokens. The token exclusions
+                // below add zero for an empty map.
+                if let Some(cost) = event
+                    .recorded_cost_usd
+                    .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                {
+                    metrics.upstream_cost_usd += cost;
+                    upstream_priced_input =
+                        upstream_priced_input.saturating_add(usage_tokens("input_tokens"));
+                    upstream_priced_output =
+                        upstream_priced_output.saturating_add(usage_tokens("output_tokens"));
+                    upstream_priced_cache_w = upstream_priced_cache_w
+                        .saturating_add(usage_tokens("cache_creation_input_tokens"));
+                    upstream_priced_cache_r = upstream_priced_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
                 }
             }
@@ -890,12 +972,98 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     if metrics.tool_calls_ok > max_ok {
         metrics.tool_calls_ok = max_ok;
     }
-    metrics.cost_estimated = round4(
-        metrics.tokens_input as f64 / 1e6 * price.input
-            + metrics.tokens_output as f64 / 1e6 * price.output
-            + metrics.tokens_cache_w as f64 / 1e6 * price.cw
-            + metrics.tokens_cache_r as f64 / 1e6 * price.cr,
+    // rm-436: tokens whose cost the source journal recorded (pi
+    // `type:"usage"` entries carrying `usage.cost.total`) were already
+    // added to the class totals above for visibility; exclude them from
+    // the catalog formula so they are priced exactly once, at the
+    // recorded value, instead of being estimated at the session
+    // model's rate on top of the recorded cost.
+    let catalog_cost = round4(
+        metrics.tokens_input.saturating_sub(upstream_priced_input) as f64 / 1e6 * price.input
+            + metrics.tokens_output.saturating_sub(upstream_priced_output) as f64 / 1e6
+                * price.output
+            + metrics
+                .tokens_cache_w
+                .saturating_sub(upstream_priced_cache_w) as f64
+                / 1e6
+                * price.cw
+            + metrics
+                .tokens_cache_r
+                .saturating_sub(upstream_priced_cache_r) as f64
+                / 1e6
+                * price.cr,
     );
+    // rm-438: when the usage blocks themselves disagree about which
+    // model produced them (pi model_change journals), pricing the whole
+    // session at the first model's rate silently misprices every
+    // post-switch block. Price each block with the model that produced
+    // it instead, mirroring the SQLite aggregate: per-block pricing,
+    // model_used "multiple", and a disclosure instead of a silent
+    // single-model estimate. Integration of run 6403d975 widened the
+    // trigger to usage-vs-session disagreement: a switched session
+    // whose usage blocks all name the pre-switch model (post-switch
+    // turns without usage) is a mixed session too — billing its one
+    // block at the post-switch session rate would misprice it the
+    // same way, per the parser-agnostic rule the batch itself states
+    // ("any journal family whose usage-bearing events carry model
+    // attribution prices each block at its own model").
+    let session_model_is_real = !matches!(model, "" | "default" | "unknown");
+    let usage_blocks_multi_model = usage_models.len() > 1
+        || (!usage_models.is_empty()
+            && session_model_is_real
+            && !usage_models.iter().any(|usage_model| usage_model == model));
+    metrics.cost_estimated = if usage_blocks_multi_model {
+        // Recorded costs were accumulated into upstream_cost_usd above;
+        // start from them and add per-block catalog pricing for the rest.
+        let mut per_block_cost = metrics.upstream_cost_usd;
+        for event in events
+            .iter()
+            .filter(|event| matches!(event.role.as_str(), "session_meta" | "meta"))
+            .filter(|event| !event.usage.is_empty())
+        {
+            if event
+                .recorded_cost_usd
+                .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+            {
+                continue;
+            }
+            let block_price = if event.model_used.is_empty() || event.model_used == "unknown" {
+                price.clone()
+            } else {
+                pricing::lookup_price(&event.model_used)
+            };
+            per_block_cost += event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
+                / 1e6
+                * block_price.input
+                + event
+                    .usage
+                    .get("output_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as f64
+                    / 1e6
+                    * block_price.output
+                + event
+                    .usage
+                    .get("cache_creation_input_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as f64
+                    / 1e6
+                    * block_price.cw
+                + event
+                    .usage
+                    .get("cache_read_input_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as f64
+                    / 1e6
+                    * block_price.cr;
+        }
+        round4(per_block_cost)
+    } else {
+        round4(catalog_cost + metrics.upstream_cost_usd)
+    };
     // rm-046: a class pinned at i64::MAX means accumulation saturated —
     // the total is a clamp, not an exact sum, and the provenance must
     // say so instead of claiming precise arithmetic.
@@ -909,10 +1077,29 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     .contains(&i64::MAX)
     {
         "calculated_from_tokens_clamped"
+    } else if usage_blocks_multi_model {
+        "calculated_per_message_tokens"
+    } else if metrics.upstream_cost_usd > 0.0 {
+        "calculated_from_tokens_with_recorded_cost"
     } else {
         "calculated_from_tokens"
     }
     .to_string();
+    if usage_blocks_multi_model {
+        metrics.model_used = "multiple".to_string();
+        // Per-block cost seeds from the upstream-recorded total, so the
+        // mixed-model row keeps the recorded-cost hint the single-model
+        // row gets (review fix F3).
+        metrics.provenance.pricing_source = if metrics.upstream_cost_usd > 0.0 {
+            "multiple models (priced per usage block) + recorded cost"
+        } else {
+            "multiple models (priced per usage block)"
+        }
+        .to_string();
+    } else if metrics.upstream_cost_usd > 0.0 {
+        metrics.provenance.pricing_source =
+            format!("{} + recorded cost", metrics.provenance.pricing_source);
+    }
     metrics
 }
 

@@ -1410,6 +1410,51 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut seen_header = false;
+    // rm-438 (integration of run 6403d975): whether a model_change
+    // entry actually moved the tracked model, and where the header
+    // meta event lives. session_from_events derives the session model
+    // from the FIRST model-bearing event, and a pre-switch
+    // usage-bearing message's session_meta event is scanned before the
+    // model_change meta — without the stamp below, a switched session
+    // whose post-switch turns carry no usage keeps reporting (and
+    // pricing at) the pre-switch model, exactly the silent
+    // misattribution rm-438 exists to fix.
+    let mut model_change_applied = false;
+    let mut header_meta_index: Option<usize> = None;
+    // rm-436/rm-437: parse-time disclosure counters. Attached to the
+    // header meta event (or a dedicated meta event when no header
+    // exists) so documented-but-uncounted journal facts surface in
+    // data_health and --doctor instead of vanishing into the parser.
+    let mut counters: BTreeMap<String, i64> = BTreeMap::new();
+    // rm-437 (first cut): v2/v3 journals identify every entry (`id`)
+    // and its parent (`parentId`), so the tree shape is knowable.
+    // Count branch ends — leaf ids that no other entry references as
+    // its parentId. A linear session has exactly one; a journal with
+    // sibling branches has more. Counted over BODY entries only
+    // (everything after the first `type:"session"` header, mirroring
+    // the loop below): the header's own id is a root, never a branch
+    // end, and pre-header junk lines must not count either. This
+    // first cut still counts ALL branches in the spend and only
+    // discloses the shape; active-branch replay is deliberately out
+    // of scope.
+    let body_start = objs
+        .iter()
+        .position(|obj| string(obj.get("type")) == Some("session"))
+        .map_or(0, |position| position + 1);
+    let referenced_parents: BTreeSet<&str> = objs[body_start..]
+        .iter()
+        .filter_map(|obj| string(obj.get("parentId")).filter(|value| !value.is_empty()))
+        .collect();
+    let branch_ends = objs[body_start..]
+        .iter()
+        .filter(|obj| {
+            string(obj.get("id"))
+                .is_some_and(|id| !id.is_empty() && !referenced_parents.contains(id))
+        })
+        .count();
+    if branch_ends > 1 {
+        counters.insert("pi_branches".to_string(), branch_ends as i64);
+    }
 
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
@@ -1428,6 +1473,7 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
             }
             seen_header = true;
             if let Some(cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty()) {
+                header_meta_index = Some(meta_events.len());
                 meta_events.push(Event {
                     role: "meta".to_string(),
                     cwd: cwd.to_string(),
@@ -1444,7 +1490,9 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                 let Some(message) = obj.get("message").and_then(Value::as_object) else {
                     continue;
                 };
-                for event in oh_my_pi_message_events(message, ts, &mut model, &source_tool) {
+                for event in
+                    oh_my_pi_message_events(message, ts, &mut model, &source_tool, &mut counters)
+                {
                     if event.role == "meta" {
                         meta_events.push(event);
                     } else {
@@ -1466,11 +1514,30 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                 }
             }
             "model_change" => {
-                if let Some(next_model) = string(obj.get("model")).filter(|value| !value.is_empty())
-                {
+                // rm-438: the wire key is `modelId` — verified against
+                // the @earendil-works/pi-coding-agent 1.0.2 dist
+                // (session-manager.js appendModelChange(provider,
+                // modelId)) and the versioned session-format spec.
+                // Reading `model` alone left this handler dead on real
+                // journals, so every model-less assistant message and
+                // usage block after a switch kept the previous model
+                // for attribution and pricing. `model` stays as a
+                // legacy fallback for pre-rename writers; the provider
+                // rides along in the content for context.
+                let next_model = string(obj.get("modelId"))
+                    .or_else(|| string(obj.get("model")))
+                    .filter(|value| !value.is_empty());
+                if let Some(next_model) = next_model {
+                    let provider = string(obj.get("provider")).unwrap_or("");
+                    model_change_applied = true;
                     model = next_model.to_string();
                     meta_events.push(Event {
                         role: "meta".to_string(),
+                        content: if provider.is_empty() {
+                            format!("model change: {model}")
+                        } else {
+                            format!("model change: {provider} → {model}")
+                        },
                         timestamp: ts.to_string(),
                         model_used: model.clone(),
                         source_tool: source_tool.clone(),
@@ -1491,7 +1558,61 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                     });
                 }
             }
-            _ => {}
+            // rm-436: standalone usage entries. The wire shape (spec +
+            // 1.0.2 dist appendUsage(kind, provider, model, usage))
+            // carries its own provider/model and a usage block with
+            // cacheRead/cacheWrite plus an upstream-recorded cost. The
+            // old catch-all dropped them whole: cache_warm spend was
+            // invisible (PoC: 150 tokens reported where the spec-true
+            // total was 50,150 + $0.015). Counted here, attributed to
+            // the entry's own model (session-tracked model as
+            // fallback), per-kind disclosed; an unknown kind counts as
+            // normal usage under its own kind string.
+            "usage" => {
+                let kind = string(obj.get("kind"))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("unknown");
+                *counters
+                    .entry(disclosure_key("pi_usage_entry", kind))
+                    .or_insert(0) += 1;
+                let entry_model = string(obj.get("model"))
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| model.clone());
+                let usage = oh_my_pi_usage(obj.get("usage"));
+                let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"));
+                // F-C (review 06e542d5): an entry whose usage block
+                // carries no token class at all can still record a
+                // real upstream cost — emit the meta event whenever
+                // EITHER signal exists, so a PRESENT cost is never
+                // silently zeroed for lacking tokens.
+                if usage.is_some() || recorded_cost_usd.is_some() {
+                    meta_events.push(Event {
+                        role: "meta".to_string(),
+                        timestamp: ts.to_string(),
+                        usage: usage.unwrap_or_default(),
+                        model_used: entry_model,
+                        recorded_cost_usd,
+                        source_tool: source_tool.clone(),
+                        ..Event::default()
+                    });
+                }
+            }
+            other => {
+                // rm-436 counter family (rm-437 evidence): every other
+                // documented-but-uncounted entry type stays visible as
+                // `pi_entry_skipped:<type>` instead of silently
+                // dropping on the floor (v3 `custom`, `label`,
+                // `session_info`, `thinking_level_change`,
+                // `context_edit`, ...). A line with NO type at all has
+                // nothing to name and stays uncounted (mirrors the
+                // role arm's empty guard).
+                if !other.is_empty() {
+                    *counters
+                        .entry(disclosure_key("pi_entry_skipped", other))
+                        .or_insert(0) += 1;
+                }
+            }
         }
     }
 
@@ -1502,6 +1623,50 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
         bail!("oh_my_pi: no parseable events");
     }
     meta_events.extend(events);
+    if model_change_applied {
+        // The header meta event is the session-level carrier: carrying
+        // the FINAL tracked model keeps `session_from_events`'s
+        // first-model-wins scan truthful for switched journals without
+        // touching the scan (other formats keep their behavior). The
+        // model_change meta events stay in place for disclosure.
+        match header_meta_index {
+            Some(index) => {
+                meta_events[index].model_used = model.clone();
+            }
+            None => meta_events.insert(
+                0,
+                Event {
+                    role: "meta".to_string(),
+                    model_used: model.clone(),
+                    source_tool: source_tool.clone(),
+                    ..Event::default()
+                },
+            ),
+        }
+    }
+    if !counters.is_empty() {
+        // One carrier event, never one counter per entry: attach to
+        // the header meta event when it exists (the only meta event
+        // with a cwd) so events_total does not grow with disclosures.
+        // A journal whose header carries no cwd has no such event —
+        // synthesize one carrier instead of panicking on a lookup that
+        // can never hit.
+        let carrier = match meta_events
+            .iter_mut()
+            .find(|event| event.role == "meta" && !event.cwd.is_empty())
+        {
+            Some(carrier) => carrier,
+            None => {
+                meta_events.push(Event {
+                    role: "meta".to_string(),
+                    source_tool: source_tool.clone(),
+                    ..Event::default()
+                });
+                meta_events.last_mut().expect("carrier event just pushed")
+            }
+        };
+        carrier.disclosure_counters = counters;
+    }
     Ok(meta_events)
 }
 
@@ -1527,11 +1692,44 @@ fn pi_source_for_path(path: &str) -> String {
     }
 }
 
+/// pi `type:"usage"` entries carry a recorded cost block
+/// (`usage.cost.total`, USD). Returned only when finite and
+/// non-negative; anything else is treated as absent (rm-436): a
+/// missing or corrupt cost must not silently zero real spend.
+fn oh_my_pi_recorded_cost_usd(usage: Option<&Value>) -> Option<f64> {
+    let total = usage?
+        .as_object()?
+        .get("cost")?
+        .as_object()?
+        .get("total")?
+        .as_f64()?;
+    (total.is_finite() && total >= 0.0).then_some(total)
+}
+
+/// rm-436 counter-family keys embed journal-authored strings (usage
+/// `kind`, entry `type`, message `role`). The counters are facts, not
+/// conversation content — but the keys still reach every report
+/// surface (doctor text, overview text/markdown/HTML, JSON, the
+/// session cache), so the shared control-character sanitizer applies
+/// at MINT time (cycle-7 review F1 / review 06e542d5 F-A): control
+/// bytes (C0/C1/DEL — exactly `char::is_control`) become U+FFFD
+/// here, once, and every consumer is covered — a hostile `kind`
+/// carries neither an ESC/OSC terminal-injection sequence nor a
+/// newline that breaks the one-line text contract. Printable tails
+/// legitimately survive; the contract targets control bytes only.
+fn disclosure_key(prefix: &str, value: &str) -> String {
+    format!(
+        "{prefix}:{}",
+        crate::statusline::sanitize_line_segment(value)
+    )
+}
+
 fn oh_my_pi_message_events(
     message: &Map<String, Value>,
     entry_ts: &str,
     model: &mut String,
     source_tool: &str,
+    counters: &mut BTreeMap<String, i64>,
 ) -> Vec<Event> {
     let role = string(message.get("role")).unwrap_or("");
     let ts = oh_my_pi_timestamp(message.get("timestamp"), entry_ts);
@@ -1602,7 +1800,16 @@ fn oh_my_pi_message_events(
             source_tool: source_tool.to_string(),
             ..Event::default()
         }),
-        _ => {}
+        other => {
+            // rm-436 counter family: message roles without an accounting
+            // arm (v3 additions, fork extensions) stay visible as
+            // `pi_message_role:<role>` instead of silently vanishing.
+            if !other.is_empty() {
+                *counters
+                    .entry(disclosure_key("pi_message_role", other))
+                    .or_insert(0) += 1;
+            }
+        }
     }
     events
 }

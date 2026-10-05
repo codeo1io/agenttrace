@@ -5,7 +5,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 23;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
+// Bumped 23 -> 24 (integration of run 6403d975, rm-436/437/438): the
+// pi journal accounting batch (disclosure counters, upstream
+// recorded-cost passthrough, per-block multi-model pricing) changed
+// derived Metrics semantics, so v23 entries carry the pre-fix pi
+// totals — the wrong numbers rm-436 exists to fix — with no
+// disclosure line, and nothing regenerates them until each source
+// file changes again. The batch landed against schema 21 and bumped
+// it to 22 there (review fix F1); integration re-bases the bump onto
+// the already-advanced ceiling (22 was rm-400/rm-401, 23 was rm-408)
+// per the rm-230 convention: parser-semantics changes bump the schema
+// so cached sessions regenerate under corrected accounting. v24
+// invalidates them once: entries regenerate on the next scan.
 // Bumped 22 -> 23 (cycle-1 review fix, run 555a174d, rm-408): GoMetrics
 // gained `zero_usage_events` with `#[serde(default)]`, so a warm v22
 // entry written before rm-408 still parses as fresh (size+mtime
@@ -258,6 +270,19 @@ struct GoMetrics {
         skip_serializing_if = "crate::usize_is_zero"
     )]
     zero_usage_events: usize,
+    /// rm-436: USD cost the source journal recorded for usage blocks;
+    /// round-trips so a cached session keeps its recorded-cost pricing
+    /// instead of reverting to the catalog estimate on cache hit.
+    #[serde(default, rename = "UpstreamCostUSD")]
+    upstream_cost_usd: f64,
+    /// rm-436/rm-437: parse-time disclosure counters (pi journals),
+    /// round-tripped so cache hits keep disclosing.
+    #[serde(
+        default,
+        rename = "DisclosureCounters",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    disclosure_counters: BTreeMap<String, usize>,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
 }
@@ -1323,6 +1348,8 @@ impl GoMetrics {
             stored_totals_delta: metrics.stored_totals_delta,
             line_skips: metrics.line_skips.clone(),
             zero_usage_events: metrics.zero_usage_events,
+            upstream_cost_usd: metrics.upstream_cost_usd,
+            disclosure_counters: metrics.disclosure_counters.clone(),
             provenance: metrics.provenance.clone(),
         }
     }
@@ -1361,6 +1388,8 @@ impl GoMetrics {
             stored_totals_delta: self.stored_totals_delta,
             line_skips: self.line_skips.clone(),
             zero_usage_events: self.zero_usage_events,
+            upstream_cost_usd: self.upstream_cost_usd,
+            disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
         }
     }

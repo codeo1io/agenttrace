@@ -24,6 +24,14 @@ pub struct DoctorReport {
     /// zeros; the share is surfaced so a present-zero corpus never reads
     /// as clean.
     pub zero_usage: DoctorZeroUsageReport,
+    /// Parse-time journal disclosures aggregated over scanned sessions
+    /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
+    /// `pi_branches`, `pi_entry_skipped:<type>`,
+    /// `pi_message_role:<role>`. Journal facts the accounting
+    /// deliberately does not count, kept visible; empty for corpora
+    /// without such journals.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub disclosures: BTreeMap<String, usize>,
     /// On-disk size of `sessions.json`, zero when absent.
     pub cache_size_bytes: u64,
     /// The hard bounds `save_session_cache` enforces before serializing
@@ -119,12 +127,14 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     };
     let mut project_decode = DoctorProjectDecodeReport::default();
     let mut zero_usage = DoctorZeroUsageReport::default();
+    let mut disclosures = BTreeMap::new();
     let directories = doctor_directories(
         dir,
         &files,
         &sqlite_sessions,
         &mut project_decode,
         &mut zero_usage,
+        &mut disclosures,
     );
     let mut report = DoctorReport {
         version: VERSION.to_string(),
@@ -145,6 +155,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         session_files: files.len(),
         project_decode,
         zero_usage,
+        disclosures,
         directories,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
@@ -298,6 +309,7 @@ fn doctor_directories(
     sqlite_sessions: &[Session],
     project_decode: &mut DoctorProjectDecodeReport,
     zero_usage: &mut DoctorZeroUsageReport,
+    disclosures: &mut BTreeMap<String, usize>,
 ) -> Vec<DoctorDirReport> {
     let mut cache = load_session_cache();
     if let Some(dir) = dir {
@@ -309,6 +321,7 @@ fn doctor_directories(
             &mut cache,
             project_decode,
             zero_usage,
+            disclosures,
         )];
     }
 
@@ -338,9 +351,18 @@ fn doctor_directories(
             &mut cache,
             project_decode,
             zero_usage,
+            disclosures,
         ));
     }
     dirs.extend(doctor_sqlite_directories(sqlite_sessions));
+    // SQLite-backed sessions never flow through doctor_dir_report; fold
+    // their disclosure counters in directly so every scanned session
+    // discloses identically regardless of backing store.
+    for session in sqlite_sessions {
+        for (key, count) in &session.metrics.disclosure_counters {
+            *disclosures.entry(key.clone()).or_insert(0) += count;
+        }
+    }
     dirs
 }
 
@@ -351,6 +373,7 @@ fn doctor_dir_report(
     cache: &mut crate::SessionCache,
     project_decode: &mut DoctorProjectDecodeReport,
     zero_usage: &mut DoctorZeroUsageReport,
+    disclosures: &mut BTreeMap<String, usize>,
 ) -> DoctorDirReport {
     let mut parsed = 0;
     let mut cache_hits = 0;
@@ -374,6 +397,13 @@ fn doctor_dir_report(
         if let Some(session) = session {
             collect_project_decode(project_decode, &session);
             collect_zero_usage(zero_usage, &session);
+            // rm-436/rm-437: cache-hit and freshly parsed sessions
+            // disclose identically — the counters round-trip through
+            // the session cache (GoMetrics), so a warm doctor scan
+            // cannot silently lose them.
+            for (key, count) in &session.metrics.disclosure_counters {
+                *disclosures.entry(key.clone()).or_insert(0) += count;
+            }
         }
     }
     DoctorDirReport {
@@ -556,6 +586,17 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     ));
     for sample in &report.zero_usage.samples {
         out.push_str(&format!("    {sample}\n"));
+    }
+    if !report.disclosures.is_empty() {
+        out.push_str(&format!(
+            "Journal disclosures: {}\n",
+            report
+                .disclosures
+                .iter()
+                .map(|(key, count)| format!("{key}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
