@@ -59,7 +59,12 @@ happen after this phase; the next cycle's assessment carries them.
   (78/0 each), and a single-test `--exact` probe showed green, and the fixture audit
   explained why: discovery_contract's SAMPLE_JSONL has no all-zero usage, so the new
   optional cache field stays absent via `skip_serializing_if` — optional-field additions
-  do not move cache-byte tests on corpora that never exercise them.
+  do not move cache-byte tests on corpora that never exercise them. AMENDED at review
+  fix 2bff960d: the writes-side reading was half the story. On READS the same
+  `#[serde(default)]` lets a warm pre-field v22 cache serve the counter as 0 — clean
+  zeros — which is why the fix bumped SESSION_CACHE_SCHEMA_VERSION 22 → 23 (rm-230
+  convention, review 342a1349 F1) instead of trusting the default; pinned red-first by
+  `stale_schema_22_cache_cannot_mask_the_disclosure`.
 - **PR-5 — Empty `validation.full_command` → mirror ci.yml, but re-verify the mirror's
   basis.** The a0407d88 mirror-ci.sh extraction was reused only after confirming
   `git diff --stat b0e12d44..HEAD -- .github/workflows/ci.yml` is empty (byte-identical

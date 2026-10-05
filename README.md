@@ -125,9 +125,13 @@ Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,ze
 REPORT `{input_tokens: 0, output_tokens: 0, …}` are counted as measured
 zeros and flagged `zero_usage_reported` in provenance instead of reading
 as clean or silently falling back to the text estimate (absent usage
-keeps `estimated_from_text`). `--doctor` aggregates the corpus share.
+keeps `estimated_from_text`). `--doctor` aggregates the share over the
+discovered session-transcript census (SQLite-backed agent databases are
+not part of this census yet).
 Overview sections (`--overview` required): `# summary`, `# by_model`,
-`# by_provider`, `# by_task_type`, `# by_cost_driver`.
+`# by_provider`, `# by_task_type`. `-f csv` outside this composable set
+bails loudly (`csv format requires --overview or --sessions`) instead of
+silently rendering the text report.
 
 ### Governance reports
 

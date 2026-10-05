@@ -143,3 +143,50 @@ fn csv_output_is_byte_deterministic_across_runs() {
     assert_eq!(first_overview, second_overview);
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
+    // rm-409 review fix: `-f csv` is composable with exactly --overview
+    // and --sessions (the README column contract). Everything else used
+    // to fall through to a silent TEXT render — the incoherence the
+    // markdown/html guard exists to prevent. Pin the loud bail, with the
+    // pre-existing markdown guard as the contrast arm.
+    let dir = fixture_dir(
+        "guard",
+        &[
+            user_line("check the billing please"),
+            assistant_line(ALL_ZERO, CLAUDE_MODEL),
+        ],
+    );
+    for (args, needle) in [
+        (
+            &["--latest", "-f", "csv"][..],
+            "csv format requires --overview or --sessions",
+        ),
+        (
+            &["--doctor", "-f", "csv"][..],
+            "csv format requires --overview or --sessions",
+        ),
+        (
+            &["--latest", "-f", "markdown"][..],
+            "markdown and html formats require --overview",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(args)
+            .arg("-d")
+            .arg(&dir)
+            .output()
+            .expect("run agenttrace CLI");
+        assert!(
+            !output.status.success(),
+            "`{args:?}` should bail instead of silently rendering"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+        assert!(
+            stderr.contains(needle),
+            "expected `{needle}` in stderr, got: {stderr}"
+        );
+    }
+    fs::remove_dir_all(dir).ok();
+}

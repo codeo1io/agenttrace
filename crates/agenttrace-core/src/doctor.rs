@@ -444,6 +444,21 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
         "Ready: run `agenttrace` for the TUI or `agenttrace --overview -f json` for automation."
             .to_string(),
     ];
+    // rm-408: present-zero usage is counted as measured, so the corpus
+    // share belongs in the recommendations — not folded into "clean".
+    // This push sits ABOVE the demo early-return (review F8): demo
+    // sessions carry real all-zero usage blocks (the demo corpus reports
+    // 200 sessions / 200 events), and a demo doctor that counted them
+    // but stayed silent about the share would break the same
+    // never-report-clean-zeros-silently contract.
+    if report.zero_usage.events > 0 {
+        recommendations.push(format!(
+            "{} of {} session(s) contain client-reported all-zero usage blocks ({} event(s) total), counted as measured zeros and flagged `zero_usage_reported` in provenance; check the recording client's version if the share is high.",
+            report.zero_usage.sessions,
+            report.sessions.max(report.zero_usage.sessions),
+            report.zero_usage.events
+        ));
+    }
     if demo {
         recommendations.push(
             "Demo sessions use a temporary directory, so cache reuse is not expected in this mode."
@@ -476,16 +491,6 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
         }
         note.push_str("; transcripts that record a cwd attribute exactly — prefer exporting those, or see `--doctor` samples above");
         recommendations.push(note);
-    }
-    // rm-408: present-zero usage is counted as measured, so the corpus
-    // share belongs in the recommendations — not folded into "clean".
-    if report.zero_usage.events > 0 {
-        recommendations.push(format!(
-            "{} of {} session(s) contain client-reported all-zero usage blocks ({} event(s) total), counted as measured zeros and flagged `zero_usage_reported` in provenance; check the recording client's version if the share is high.",
-            report.zero_usage.sessions,
-            report.sessions.max(report.zero_usage.sessions),
-            report.zero_usage.events
-        ));
     }
     recommendations
 }

@@ -110,3 +110,98 @@ fn mixed_session_counts_only_the_zero_blocks() {
     assert_eq!(session.metrics.tokens_cache_r, 3);
     fs::remove_file(path).ok();
 }
+
+// Review fix (attempt 2bff960d, review 342a1349 F1): the warm-cache half
+// of the contract. `zero_usage_events` deserializes with a default, so a
+// cache written before rm-408 (schema 22, field absent) parses as fresh —
+// size+mtime fingerprint unchanged, schema version equal — while
+// defaulting the counter to 0: doctor then reports clean zeros for
+// exactly the historical sessions the disclosure exists to flag. The
+// 22 → 23 schema bump retires those entries once (rm-230 convention).
+// This is the review's PoC pinned as a regression: on a tree where the
+// const is still 22 the hand-written v22 entry below IS served and the
+// first assertion fails.
+#[test]
+fn stale_schema_22_cache_cannot_mask_the_disclosure() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = std::env::temp_dir().join("at-zero-usage-stale-v22");
+    let _ = fs::remove_dir_all(&root);
+    let sessions_dir = root.join("sessions");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    let session_path = sessions_dir.join("session.jsonl");
+    fs::write(
+        &session_path,
+        [user_line(), assistant_line("5", Some(ALL_ZERO))].join("\n") + "\n",
+    )
+    .expect("write fixture");
+
+    // Hand-write the exact shape the pre-rm-408 release wrote: schema 22,
+    // entry fingerprint FRESH against the file (matching mod_time/size),
+    // cached session WITHOUT the zero_usage_events field.
+    let metadata = fs::metadata(&session_path).expect("stat fixture");
+    let mod_time = metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec();
+    let session_path_str = session_path.to_string_lossy().to_string();
+    let mut entries = serde_json::Map::new();
+    entries.insert(
+        session_path_str.clone(),
+        serde_json::json!({
+            "mod_time": mod_time,
+            "size": metadata.len() as i64,
+            "session": {
+                "Name": "stale",
+                "Path": session_path_str,
+                "Metrics": {
+                    "SourceTool": "hermes_jsonl",
+                    "ModelUsed": "cached-model",
+                    "SessionStart": "2026-10-04T01:00:00Z",
+                    "ToolArgUsage": {},
+                },
+                "Health": 91,
+                "ToolWarnings": [],
+                "Diagnostics": {},
+            },
+        }),
+    );
+    let cache = serde_json::json!({
+        "schema_version": 22,
+        "entries": serde_json::Value::Object(entries),
+    });
+    fs::write(root.join("sessions.json"), cache.to_string()).expect("write stale v22 cache");
+
+    with_session_cache_dir(&root, || {
+        let sessions = agenttrace_core::load_sessions_from_dir(Some(&sessions_dir));
+        assert_eq!(sessions.len(), 1, "one session discovered");
+        assert_eq!(
+            sessions[0].metrics.zero_usage_events, 1,
+            "the fresh-fingerprint v22 entry must NOT be served: the source's \
+             all-zero usage block would read back as clean zeros"
+        );
+        assert!(
+            sessions[0]
+                .metrics
+                .provenance
+                .tokens
+                .contains("zero_usage_reported:1"),
+            "re-parsed from source, so the flag is present: got {}",
+            sessions[0].metrics.provenance.tokens
+        );
+        assert_ne!(
+            sessions[0].name, "stale",
+            "second tripwire: the cached Name proves the entry was served"
+        );
+    });
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn with_session_cache_dir(cache: &std::path::Path, f: impl FnOnce()) {
+    let key = "AGENTTRACE_SESSION_CACHE_DIR";
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, cache);
+    f();
+    match previous {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}

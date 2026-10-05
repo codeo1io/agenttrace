@@ -208,6 +208,15 @@ fn run() -> anyhow::Result<()> {
     {
         bail!("markdown and html formats require --overview or a governance report action");
     }
+    // rm-409 (review fix): csv's composable set is exactly --overview and
+    // --sessions (the README column contract); every other report shape
+    // renders text/json, so `-f csv` on them previously fell through to a
+    // silent TEXT render — the same incoherence the guard above exists to
+    // prevent for markdown/html. Bail loudly instead (--latest, <path>,
+    // --doctor, --diagnostics, and the governance actions included).
+    if args.format == "csv" && !(args.overview || args.sessions) {
+        bail!("csv format requires --overview or --sessions");
+    }
     validate_range_applicability(&args)?;
 
     let language = report_language(&args.lang)?;
