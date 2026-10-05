@@ -496,7 +496,19 @@ pub fn report_scope(
     let mut earliest = None;
     let mut latest = None;
     for session in sessions {
-        if let Some(time) = parse_ts(&session.metrics.session_start) {
+        // rm-507 (run d6432dd5, assess 8ee739a8 F3): the scope brackets
+        // the activity window, so each session contributes BOTH its
+        // start and its end to BOTH bounds — folding `session_start`
+        // alone reported latest=00:00 beside metrics.session_end=01:30
+        // ("Range: … 00:00:00Z to 00:00:00Z" over a session that ran
+        // 1h 30m).
+        for time in [
+            parse_ts(&session.metrics.session_start),
+            parse_ts(&session.metrics.session_end),
+        ]
+        .into_iter()
+        .flatten()
+        {
             earliest = Some(earliest.map_or(time, |current: DateTime<Utc>| current.min(time)));
             latest = Some(latest.map_or(time, |current: DateTime<Utc>| current.max(time)));
         }
@@ -936,5 +948,28 @@ mod tests {
         assert!(TimeRange::Today
             .since(now)
             .is_some_and(|start| start <= now));
+    }
+
+    #[test]
+    fn report_scope_folds_session_end_into_both_bounds() {
+        // rm-507 (run d6432dd5, assess 8ee739a8 F3): the fold used
+        // `session_start` only, so a session spanning 00:00→01:30
+        // reported "Range: ... 00:00:00Z to 00:00:00Z" beside "over
+        // 1h 30m", and the JSON scope block carried
+        // latest_session_at=00:00 while metrics.session_end=01:30.
+        // The scope must bracket the activity window: each session
+        // contributes both its start and its end to both bounds.
+        let mut session = session_at("/tmp/w", "/tmp/w/p.jsonl");
+        session.metrics.session_start = "2026-10-04T00:00:00Z".to_string();
+        session.metrics.session_end = "2026-10-04T01:30:00Z".to_string();
+        let scope = report_scope(&[session], TimeRange::All, true);
+        assert_eq!(
+            scope.earliest_session_at, "2026-10-04T00:00:00Z",
+            "earliest stays at the session start"
+        );
+        assert_eq!(
+            scope.latest_session_at, "2026-10-04T01:30:00Z",
+            "latest must fold the session end, not the start alone"
+        );
     }
 }

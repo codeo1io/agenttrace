@@ -1206,3 +1206,45 @@ fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+#[cfg(unix)]
+#[test]
+fn positional_path_that_exists_but_is_not_a_regular_file_names_the_reason() {
+    // rm-212 (run d6432dd5): a positional path that exists but is not a
+    // regular file used to fall through to "session path does not
+    // exist" — misleading for a FIFO, socket, or device. The error must
+    // name the real reason. A unix socket is the cheapest special file
+    // `std` can create.
+    use std::os::unix::net::UnixListener;
+
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-positional-special-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("make work dir");
+    let socket = work.join("evil.jsonl");
+    UnixListener::bind(&socket).expect("bind socket");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--overview")
+        .arg(socket.to_str().expect("socket path is valid UTF-8"))
+        .output()
+        .expect("run positional special file");
+
+    assert!(
+        !output.status.success(),
+        "a special file must not parse as a session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not a regular file"),
+        "the error must name the real reason, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not exist"),
+        "the path exists — the not-exist wording is wrong, got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}

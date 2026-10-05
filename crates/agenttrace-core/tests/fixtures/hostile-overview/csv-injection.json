@@ -1,0 +1,12 @@
+{
+  "model": "\t=HYPERLINK(\"http://evil.example/pwn\";\"open billing summary\")",
+  "session_id": "hostile-csv",
+  "session_start": "2026-10-01T00:00:00Z",
+  "last_updated": "2026-10-01T01:00:00Z",
+  "platform": "poc",
+  "usage": {"input_tokens": 1200, "output_tokens": 300},
+  "messages": [
+    {"role": "user", "content": "hello", "timestamp": "2026-10-01T00:00:00Z"},
+    {"role": "assistant", "content": "hi", "timestamp": "2026-10-01T00:05:00Z"}
+  ]
+}

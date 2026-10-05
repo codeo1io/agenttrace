@@ -112,7 +112,14 @@ agenttrace
 `-f csv` emits RFC 4180 (CRLF rows, `""`-doubled quotes) with one table per
 section, marker-comment headers, and a leading apostrophe guard on
 formula-looking cells (a name or model id like `=SUM(A1)` or
-`=cmd|' /C …'!A0` renders as `'=SUM(A1)` — spreadsheet-safe, byte-stable
+`=cmd|' /C …'!A0` renders as `'=SUM(A1)` — and the guard covers the full
+OWASP CSV-injection set: cells led by a delimiter Excel honors inside
+quotes (TAB/CR/LF) or a full-width `＝＋－＠` operator get the same text
+marker, while bare numbers stay importable as values. Transcript-derived
+labels (model/provider/task-type group keys) are control-byte-sanitized
+at this lane's render entry first — every control byte becomes U+FFFD —
+so an OSC/ANSI escape in a model id can never ride a csv cell. All of it
+spreadsheet-safe, byte-stable
 across runs, announcements on stderr so stdout stays pure):
 
 ```bash

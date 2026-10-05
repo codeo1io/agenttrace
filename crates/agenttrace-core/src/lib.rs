@@ -573,6 +573,23 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
             metrics.provenance.tokens, zero_usage_events
         );
     }
+    // rm-408 negative arm (run d6432dd5, assess 8ee739a8 F4): `analyze`
+    // clamps each usage key with `.max(0)`, so a hostile or buggy
+    // transcript reporting negative usage used to read back as a clean
+    // zero-spend session. Count the clamped events at this same choke
+    // point and disclose them additively — the landed markers
+    // (`zero_usage_reported`, `calculated_from_tokens_clamped`) keep
+    // their meanings.
+    let negative_usage_clamped = events
+        .iter()
+        .filter(|event| event.usage.values().any(|value| *value < 0))
+        .count();
+    if negative_usage_clamped > 0 {
+        metrics.provenance.tokens = format!(
+            "{}+negative_usage_clamped:{}",
+            metrics.provenance.tokens, negative_usage_clamped
+        );
+    }
     let display_name = session_display_name(name, &events);
     metrics.provenance.naming = if display_name != name {
         "first_user_request"

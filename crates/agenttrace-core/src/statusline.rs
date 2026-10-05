@@ -269,8 +269,9 @@ fn render_status_line(payload: &Value) -> String {
 /// (search text output, session text reports, the --sessions TSV, and
 /// --doctor disclosure samples); JSON output paths deliberately skip it
 /// because JSON escaping already encodes control bytes losslessly, and
-/// markdown/HTML renderers apply their own escaping before this class
-/// applies. Printable CSI/OSC tails may legitimately survive — only the
+/// markdown/HTML renderers sanitize at their own render entries (the
+/// rm-506 arm: `strip_terminal_control` composes inside
+/// `markdown_cell` and `html_escape` in `reports.rs`). Printable CSI/OSC tails may legitimately survive — only the
 /// control bytes themselves (ESC, BEL, …) are neutralized.
 pub fn sanitize_line_segment(segment: &str) -> String {
     segment

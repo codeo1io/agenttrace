@@ -96,8 +96,15 @@ pub const MAX_SESSION_CACHE_DIR_BYTES: usize = MAX_SESSION_CACHE_BYTES / 8;
 /// noise the blocklist exists to remove. The session-cache schema
 /// version cannot cover this one: schema 22 already shipped (rm-400/401)
 /// with the pre-blocklist walker, so a schema-22 journal can still carry
-/// stale v2 listings.
-const DIR_LISTING_WALK_VERSION: i64 = 3;
+/// stale v2 listings. v4 (rm-212, run d6432dd5): walk admission became
+/// type-aware — name-admitted non-regular files (FIFOs, sockets,
+/// device symlinks) are skipped before the parse path. A v3 journal
+/// still lists those verbatim, and replay extends `listing.files`
+/// verbatim too, so warm caches written by pre-gate binaries must be
+/// re-walked (bumped here, NOT in `SESSION_CACHE_SCHEMA_VERSION`:
+/// listing invalidation is this const's whole job, and the session
+/// schema version belongs to the parser lane).
+const DIR_LISTING_WALK_VERSION: i64 = 4;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")
