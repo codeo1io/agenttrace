@@ -2,22 +2,22 @@ use agenttrace_core::{
     add_baseline_comparison, average_health, compute_overview, context_trends, cost_audit,
     data_health, data_health_scoped, delivery_evidence_with_git, demo_sessions,
     evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first, list_pricing,
-    load_sessions_with_options, lookup_price, mcp_governance, parse_file, predict_cost_anomaly,
-    pricing_cache_path, pricing_source, recommendations, render_doctor_report,
-    render_model_pricing_list, render_test_match, render_waste_report_with_language,
-    report_compare_json, report_json_with_language, report_overview_html_with_context,
-    report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
-    tool_fail_rate, total_tokens, update_pricing, BaselineThresholds, LoadOptions, LoadReport,
-    ReportLanguage, Session, TimeRange, VERSION,
+    load_sessions_with_options, lookup_price, mcp_governance, parse_file, parse_stdin_bytes,
+    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
+    render_doctor_report, render_model_pricing_list, render_test_match,
+    render_waste_report_with_language, report_compare_json, report_json_with_language,
+    report_overview_html_with_context, report_overview_json_with_context,
+    report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
+    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
+    session_capability, tool_fail_rate, total_tokens, update_pricing, BaselineThresholds,
+    LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
 use clap::Parser;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -28,6 +28,9 @@ mod upstream;
 #[command(name = "agenttrace")]
 #[command(about = "TUI observability for AI coding agent sessions")]
 struct Args {
+    /// Session file to analyze (`-` reads one session stream from
+    /// stdin through the same parser; stdin sessions are ephemeral and
+    /// never touch the session cache)
     path: Option<String>,
     #[arg(
         short = 'f',
@@ -861,6 +864,28 @@ where
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
+        // rm-505: `statusline` and `upstream` are keyword host commands
+        // (dispatched in run()), not session paths. `--help` following
+        // them used to die here as a "flag follows the positional
+        // session path" error with no help route at all — even though
+        // `--help` itself teaches both keywords. Give each keyword a
+        // real help route, and a keyword-scoped usage error instead of
+        // the mislabel for other dropped flags.
+        let positional = out.last().map(|arg| arg.to_string_lossy().to_string());
+        if positional.as_deref() == Some("statusline") || positional.as_deref() == Some("upstream")
+        {
+            let keyword = positional.unwrap_or_default();
+            if dropped.iter().any(|arg| arg == "--help" || arg == "-h") {
+                write_stdout(&keyword_help_text(&keyword))?;
+                std::process::exit(0);
+            }
+            bail!(
+                "flag `{}` follows the `{keyword}` keyword and would be silently dropped \
+                 (dropped: `{tail}`); `{keyword}` takes no flags after it — place flags \
+                 before the keyword, or run `agenttrace {keyword} --help`",
+                flag.to_string_lossy()
+            );
+        }
         bail!(
             "flag `{}` follows the positional session path and would be silently dropped \
              (dropped: `{tail}`); place flags before the positional path",
@@ -869,6 +894,50 @@ where
     }
 
     Ok(out)
+}
+
+/// Per-keyword help (rm-505): the two host keywords dispatch as the
+/// positional path slot, so clap never renders help for them. Keep the
+/// text aligned with the flag doc comments in `Args` and the guides.
+fn keyword_help_text(keyword: &str) -> String {
+    match keyword {
+        "statusline" => concat!(
+            "`agenttrace statusline` — Claude Code statusLine host command\n",
+            "\n",
+            "Reads the Claude Code statusline payload from stdin, renders\n",
+            "one status line for the host terminal, and appends a capture\n",
+            "record to the statusline journal (report on that journal with\n",
+            "--statusline-report). Designed to be wired into Claude Code's\n",
+            "statusLine setting; it must never fail the host — on any problem\n",
+            "it prints a minimal fallback line and exits 0 (diagnostics go to\n",
+            "stderr only).\n",
+            "\n",
+            "This keyword takes no flags. Related surface:\n",
+            "  --statusline-report   report on the capture journal instead of\n",
+            "                        hosting the status line (place it BEFORE\n",
+            "                        the keyword; flags after it are rejected)\n",
+            "\n",
+            "See docs/guides/statusline-capture.md.\n",
+        ),
+        "upstream" => concat!(
+            "`agenttrace upstream` — repository status host command (rm-024)\n",
+            "\n",
+            "Reports fork-vs-upstream drift: ahead/behind/diverged counts,\n",
+            "new upstream releases, and refs age. Fully offline by default;\n",
+            "pass --fetch to refresh remote-tracking refs (git fetch) and\n",
+            "probe the npm registry first. Place flags BEFORE the keyword;\n",
+            "flags after it are rejected.\n",
+            "\n",
+            "Examples:\n",
+            "  agenttrace upstream\n",
+            "  agenttrace -f json upstream\n",
+            "  agenttrace --fetch upstream\n",
+            "\n",
+            "See docs/guides/upstream-status.md.\n",
+        ),
+        _ => "",
+    }
+    .to_string()
 }
 
 fn is_go_flag_positional(arg: &OsString) -> bool {
@@ -955,6 +1024,22 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         return Ok((prepare_explicit_sessions(demo_sessions()?, args)?, None));
     }
     if let Some(path) = args.path.as_deref() {
+        // rm-503: `-` reads ONE session stream from stdin through the
+        // same decode/parse path as a named file — only the byte source
+        // differs. stdin sessions are ephemeral: like every explicit
+        // single-file load they never touch the session cache (neither
+        // read nor write), which `--help` discloses. `-d` stays a
+        // separate multi-session lane and is out of scope here.
+        if path == "-" {
+            let mut raw = Vec::new();
+            io::stdin()
+                .read_to_end(&mut raw)
+                .context("read session from stdin")?;
+            return Ok((
+                prepare_explicit_sessions(vec![parse_stdin_bytes(raw)?], args)?,
+                None,
+            ));
+        }
         let path = PathBuf::from(path);
         if path.is_file() {
             return Ok((
