@@ -892,13 +892,14 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v24 (rm-436/437/438 pi journal accounting; 23 was rm-408,
+        // v25 (rm-450 workbuddy input-basis disclosure; 24 was
+        // rm-436/437/438 pi journal accounting, 23 was rm-408,
         // 22 was run 2c2db6f5 rm-400/401): parser-semantics fixes bump
         // the schema so warm entries regenerate under corrected
         // accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(24)
+            Some(25)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1063,11 +1064,13 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v24 — see the rm-436/437/438, rm-408 and rm-400/401
-        // bump notes in session_cache.rs).
+        // version (v25 — see the rm-450, rm-436/437/438, rm-408 and
+        // rm-400/401 bump notes in session_cache.rs; the workbuddy
+        // input-basis disclosure is what carried 24 -> 25 at this
+        // integration, re-based off the campaign's 22 -> 23 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(24)
+            Some(25)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))

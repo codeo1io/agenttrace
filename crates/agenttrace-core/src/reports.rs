@@ -46,11 +46,24 @@ fn counts_cell(counts: &BTreeMap<String, usize>) -> String {
     if counts.is_empty() {
         return String::new();
     }
-    counts
+    let rendered = counts
         .iter()
         .map(|(reason, count)| format!("{reason}={count}"))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    // rm-450 provenance: the workbuddy input-basis counters only carry
+    // their meaning alongside the assumption that produced them; clean
+    // corpora keep byte-identical report output.
+    if counts
+        .keys()
+        .any(|reason| reason.starts_with("workbuddy_input_basis:"))
+    {
+        format!(
+            "{rendered} (input basis assumed cache-inclusive; a zeroed input suggests the transcript reports a cache-exclusive basis — upstream luoyuctl/agenttrace#310)"
+        )
+    } else {
+        rendered
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3111,5 +3124,32 @@ mod tests {
                 "{name} must not inline a percentile index; use crate::percentile"
             );
         }
+    }
+
+    #[test]
+    fn counts_cell_appends_workbuddy_basis_provenance_only_when_present() {
+        // rm-450: the workbuddy input-basis counters carry their meaning
+        // only alongside the assumption that produced them; the note rides
+        // the cell so every text-family overview format discloses it,
+        // while clean corpora keep byte-identical output. (The cell was
+        // generalized to counts_cell by run 6403d975's rm-436/437/438
+        // disclosures column; the note ports onto it unchanged.)
+        let mut skips = BTreeMap::new();
+        assert_eq!(counts_cell(&skips), "");
+        skips.insert("event_schema".to_string(), 2);
+        assert_eq!(
+            counts_cell(&skips),
+            "event_schema=2",
+            "no note without workbuddy keys"
+        );
+        skips.insert("workbuddy_input_basis:cache_subtracted".to_string(), 1);
+        skips.insert(
+            "workbuddy_input_basis:zeroed_suspected_mismatch".to_string(),
+            1,
+        );
+        let cell = counts_cell(&skips);
+        assert!(cell.contains("workbuddy_input_basis:zeroed_suspected_mismatch=1"));
+        assert!(cell.contains("upstream luoyuctl/agenttrace#310"));
+        assert!(cell.contains("cache-inclusive"));
     }
 }

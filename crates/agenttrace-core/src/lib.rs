@@ -378,6 +378,10 @@ pub struct Metrics {
     pub stored_totals_delta: i64,
     /// Parse lines lost inside this session's source file, by reason
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
+    /// Also carries the rm-450 workbuddy basis-disclosure counters
+    /// (`workbuddy_input_basis:*`), which disclose an assumption rather
+    /// than a lost line and ride this channel so they aggregate and
+    /// degrade confidence the same way.
     /// Empty for clean parses.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
@@ -799,6 +803,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let mut upstream_priced_output = 0i64;
     let mut upstream_priced_cache_w = 0i64;
     let mut upstream_priced_cache_r = 0i64;
+    // rm-450 disclosure counters, in the pass-7 line_skips family so they
+    // ride the existing DataHealth aggregation and confidence degradation.
+    let mut line_skips: BTreeMap<String, usize> = BTreeMap::new();
 
     for event in events {
         if metrics.source_tool.is_empty()
@@ -845,6 +852,26 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
                     if !event.model_used.is_empty() && event.model_used != "unknown" {
                         usage_models.insert(event.model_used.clone());
+                    }
+                    // Workbuddy basis disclosure (upstream #310): the
+                    // workbuddy lane subtracts cache_read_input_tokens from
+                    // input_tokens assuming a cache-INCLUSIVE input basis.
+                    // Disclose every subtraction; when the subtraction
+                    // zeroes the input, flag the suspected basis mismatch
+                    // instead of silently reporting 0.
+                    if event.source_tool == "workbuddy"
+                        && usage_tokens("cache_read_input_tokens") > 0
+                    {
+                        *line_skips
+                            .entry("workbuddy_input_basis:cache_subtracted".to_string())
+                            .or_insert(0) += 1;
+                        if usage_tokens("input_tokens") == 0 {
+                            *line_skips
+                                .entry(
+                                    "workbuddy_input_basis:zeroed_suspected_mismatch".to_string(),
+                                )
+                                .or_insert(0) += 1;
+                        }
                     }
                 }
                 // rm-436 (review 06e542d5 F-C): an upstream-recorded
@@ -1099,6 +1126,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     } else if metrics.upstream_cost_usd > 0.0 {
         metrics.provenance.pricing_source =
             format!("{} + recorded cost", metrics.provenance.pricing_source);
+    }
+    if !line_skips.is_empty() {
+        metrics.line_skips = line_skips;
     }
     metrics
 }
@@ -2834,5 +2864,136 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         }
+    }
+
+    // ---- rm-450: workbuddy input-basis disclosure (upstream #310) ----
+
+    fn wb_meta_event(usage: BTreeMap<String, i64>) -> Event {
+        Event {
+            role: "meta".to_string(),
+            source_tool: "workbuddy".to_string(),
+            usage,
+            ..Event::default()
+        }
+    }
+
+    #[test]
+    fn workbuddy_basis_disclosure_flags_suspected_mismatch() {
+        // Post-parser shape of a basis mismatch: input_tokens 1000 with
+        // cache_read 1500 clamps to 0 -- the silent zero this batch exists
+        // to disclose.
+        let usage: BTreeMap<String, i64> = [
+            ("input_tokens", 0),
+            ("output_tokens", 50),
+            ("cache_read_input_tokens", 1500),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let metrics = analyze(&[wb_meta_event(usage)], "gpt-5");
+        assert_eq!(
+            metrics
+                .line_skips
+                .get("workbuddy_input_basis:cache_subtracted"),
+            Some(&1)
+        );
+        assert_eq!(
+            metrics
+                .line_skips
+                .get("workbuddy_input_basis:zeroed_suspected_mismatch"),
+            Some(&1)
+        );
+        assert_eq!(metrics.tokens_input, 0);
+        assert_eq!(metrics.tokens_cache_r, 1500);
+    }
+
+    #[test]
+    fn workbuddy_basis_disclosure_counts_plain_subtraction() {
+        // Cache-inclusive basis: the subtraction fires but leaves a
+        // positive input -- disclose the subtraction, no mismatch flag.
+        let usage: BTreeMap<String, i64> = [
+            ("input_tokens", 500),
+            ("output_tokens", 50),
+            ("cache_read_input_tokens", 1500),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let metrics = analyze(&[wb_meta_event(usage)], "gpt-5");
+        assert_eq!(
+            metrics
+                .line_skips
+                .get("workbuddy_input_basis:cache_subtracted"),
+            Some(&1)
+        );
+        assert!(!metrics
+            .line_skips
+            .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
+    }
+
+    #[test]
+    fn workbuddy_basis_disclosure_ignores_other_sources_and_no_cache() {
+        // cache_read on a non-workbuddy meta event is the normal Claude
+        // shape and must NOT trip the workbuddy disclosure; a workbuddy
+        // usage without cache_read leaves line_skips empty entirely.
+        let claude_usage: BTreeMap<String, i64> =
+            [("input_tokens", 500), ("cache_read_input_tokens", 1500)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+        let mut e = wb_meta_event(claude_usage);
+        e.source_tool = "claude_code".to_string();
+        let metrics = analyze(&[e], "gpt-5");
+        assert!(metrics.line_skips.is_empty());
+
+        let plain_usage: BTreeMap<String, i64> = [("input_tokens", 500)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let metrics = analyze(&[wb_meta_event(plain_usage)], "gpt-5");
+        assert!(metrics.line_skips.is_empty());
+    }
+
+    #[test]
+    fn workbuddy_basis_disclosure_end_to_end_from_fixtures() {
+        // Fixture shape mirrors real workbuddy transcripts: message-level
+        // usage under the detector's type/sessionId/cwd keys.
+        let mismatch = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/workbuddy/usage-basis-mismatch.jsonl"
+        ))
+        .expect("fixture");
+        let session = parse_raw_session("wb-mismatch", "wb-mismatch.jsonl", &mismatch)
+            .expect("parses as workbuddy");
+        assert_eq!(session.metrics.source_tool, "workbuddy");
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("workbuddy_input_basis:zeroed_suspected_mismatch"),
+            Some(&1)
+        );
+        assert_eq!(session.metrics.tokens_input, 0);
+        assert_eq!(session.metrics.tokens_cache_r, 1500);
+
+        let inclusive = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/workbuddy/usage-basis-inclusive.jsonl"
+        ))
+        .expect("fixture");
+        let session = parse_raw_session("wb-inclusive", "wb-inclusive.jsonl", &inclusive)
+            .expect("parses as workbuddy");
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("workbuddy_input_basis:cache_subtracted"),
+            Some(&1)
+        );
+        assert!(!session
+            .metrics
+            .line_skips
+            .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
+        assert_eq!(session.metrics.tokens_input, 500);
     }
 }

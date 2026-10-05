@@ -161,6 +161,11 @@ pub struct DataHealth {
     pub unknown_time_sessions: usize,
     /// Parse lines lost inside otherwise-parsed sessions, by reason
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
+    /// The rm-450 workbuddy input-basis disclosure counters
+    /// (`workbuddy_input_basis:cache_subtracted`,
+    /// `workbuddy_input_basis:zeroed_suspected_mismatch`) ride the same
+    /// map — they disclose an assumption, not a loss, but keep the same
+    /// aggregation and confidence-degradation path.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
     /// Parse-time journal disclosures aggregated across sessions

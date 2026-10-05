@@ -5,7 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 25;
+// Bumped 24 -> 25 (integration of run 66a7d797, rm-450): the
+// workbuddy input-basis disclosure adds metrics.line_skips counters
+// that warm v24 snapshots don't carry, so cached sessions would
+// silently omit the very disclosure this batch exists to surface
+// (rm-230 convention: parser-semantics changes bump the schema so
+// cached sessions regenerate under corrected accounting). The batch
+// landed against schema 22 and bumped it to 23 there; integration
+// re-bases the bump onto the already-advanced ceiling (23 was
+// rm-408, 24 was rm-436/437/438) per the same convention. Entries
+// regenerate once on next scan.
 // Bumped 23 -> 24 (integration of run 6403d975, rm-436/437/438): the
 // pi journal accounting batch (disclosure counters, upstream
 // recorded-cost passthrough, per-block multi-model pricing) changed
