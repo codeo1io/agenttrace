@@ -164,7 +164,17 @@ pub(super) fn capability_label(capability: &str, language: Language) -> &'static
 }
 
 pub(super) fn provenance_label(value: &str, language: Language) -> &'static str {
-    match value {
+    // rm-054 taxonomy values can carry `+key:value` disclosure
+    // suffixes: rm-408 (run 555a174d) appends
+    // `+zero_usage_reported:<N>` to `provenance.tokens` when a session
+    // reports all-zero usage blocks. Translate the taxonomy BASE — the
+    // suffix is machine-readable disclosure that rides the data
+    // surfaces (JSON provenance, `--doctor`, the CSV column) — so a
+    // flagged session keeps its "recorded by the agent" label instead
+    // of degrading to "source unknown" exactly when it is flagged
+    // (integration review decfa879).
+    let base = value.split('+').next().unwrap_or("");
+    match base {
         "reported_by_agent" => pick(language, "recorded by the agent", "Agent 直接记录"),
         "estimated_from_text" => pick(language, "estimated from text", "根据文本估算"),
         "timestamp_span" => pick(language, "calculated from timestamps", "根据时间戳计算"),

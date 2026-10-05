@@ -5,7 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 22;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 23;
+// Bumped 22 -> 23 (cycle-1 review fix, run 555a174d, rm-408): GoMetrics
+// gained `zero_usage_events` with `#[serde(default)]`, so a warm v22
+// entry written before rm-408 still parses as fresh (size+mtime
+// fingerprint unchanged, schema version equal) while the new counter
+// defaults to 0 — the disclosure then reports clean zeros for exactly
+// the historical sessions it exists to flag. Per the rm-230 convention
+// the bump invalidates those entries once so they regenerate under the
+// rm-408 accounting. Proven red-first by the review 342a1349 warm-cache
+// PoC (a stripped v22 cache served a zero-usage session as clean) and
+// pinned by `stale_schema_22_cache_cannot_mask_the_disclosure`.
 // Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
 // kimi_cli usage-alias fix and the Codex compaction pairing fix change
 // reported totals for unchanged files, so warm v21 entries carry the
@@ -240,6 +250,14 @@ struct GoMetrics {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     line_skips: BTreeMap<String, usize>,
+    /// rm-408: present-but-zero usage events, preserved across cache
+    /// round-trips so the disclosure survives a warm cache.
+    #[serde(
+        default,
+        rename = "ZeroUsageEvents",
+        skip_serializing_if = "crate::usize_is_zero"
+    )]
+    zero_usage_events: usize,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
 }
@@ -1304,6 +1322,7 @@ impl GoMetrics {
             cost_estimated: metrics.cost_estimated,
             stored_totals_delta: metrics.stored_totals_delta,
             line_skips: metrics.line_skips.clone(),
+            zero_usage_events: metrics.zero_usage_events,
             provenance: metrics.provenance.clone(),
         }
     }
@@ -1341,6 +1360,7 @@ impl GoMetrics {
             cost_estimated: self.cost_estimated,
             stored_totals_delta: self.stored_totals_delta,
             line_skips: self.line_skips.clone(),
+            zero_usage_events: self.zero_usage_events,
             provenance: self.provenance,
         }
     }

@@ -69,9 +69,14 @@ jobs:
         if: always()
         run: agenttrace --overview -f markdown || true
 
-      - name: Session-level breakdown (report-only)
+      # `--sessions` renders TSV text, JSON, or CSV — markdown requires
+      # `--overview`, so this breakdown leg uses the CSV statement export
+      # (rm-409): machine-readable, RFC 4180, inside `-f csv`'s composable
+      # set. The previous `-f markdown` leg always bailed at the format
+      # guard and never produced output (integration review decfa879).
+      - name: Session-level breakdown (report-only, CSV)
         if: always()
-        run: agenttrace --sessions -f markdown || true
+        run: agenttrace --sessions -f csv || true
 
       # actions/upload-artifact v7.0.0
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f

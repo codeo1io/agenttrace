@@ -107,6 +107,32 @@ auditable after the fact.
 agenttrace
 ```
 
+### CSV statement export (rm-409)
+
+`-f csv` emits RFC 4180 (CRLF rows, `""`-doubled quotes) with one table per
+section, marker-comment headers, and a leading apostrophe guard on
+formula-looking cells (a name or model id like `=SUM(A1)` or
+`=cmd|' /C …'!A0` renders as `'=SUM(A1)` — spreadsheet-safe, byte-stable
+across runs, announcements on stderr so stdout stays pure):
+
+```bash
+agenttrace --sessions -f csv
+agenttrace --overview -f csv
+```
+
+Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events`.
+`zero_usage_events` carries the rm-408 disclosure: transcripts that
+REPORT `{input_tokens: 0, output_tokens: 0, …}` are counted as measured
+zeros and flagged `zero_usage_reported` in provenance instead of reading
+as clean or silently falling back to the text estimate (absent usage
+keeps `estimated_from_text`). `--doctor` aggregates the share over the
+discovered session-transcript census (SQLite-backed agent databases are
+not part of this census yet).
+Overview sections (`--overview` required): `# summary`, `# by_model`,
+`# by_provider`, `# by_task_type`. `-f csv` outside this composable set
+bails loudly (`csv format requires --overview or --sessions`) instead of
+silently rendering the text report.
+
 ### Governance reports
 
 ```bash

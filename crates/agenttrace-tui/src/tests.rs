@@ -1631,10 +1631,11 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 22 (rm-400/rm-401 bump): a warm entry is reused only
+                // Schema 23 (rm-408 zero-usage disclosure; 22 was the
+                // rm-400/rm-401 bump): a warm entry is reused only
                 // when it carries the current schema version, so this fixture
                 // tracks SESSION_CACHE_SCHEMA_VERSION.
-                r#"{{"schema_version":22,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":23,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
@@ -2031,4 +2032,27 @@ fn efficiency_panel_renders_statusline_limits_and_cache_causes() {
             "cache-miss causes must render: {with}"
         );
     });
+}
+
+#[test]
+fn provenance_label_translates_the_taxonomy_base_behind_disclosure_suffixes() {
+    // Integration review decfa879 (semantic conflict between rm-408's
+    // `+zero_usage_reported:<N>` provenance suffix and this exact-match
+    // label table): the Data-quality and inspect panels must keep
+    // translating the rm-054 taxonomy BASE of a suffixed value instead
+    // of degrading to "source unknown" for exactly the sessions the
+    // disclosure flags.
+    assert_eq!(
+        i18n::provenance_label("reported_by_agent+zero_usage_reported:2", Language::En),
+        i18n::provenance_label("reported_by_agent", Language::En)
+    );
+    assert_eq!(
+        i18n::provenance_label("estimated_from_text+zero_usage_reported:1", Language::Zh),
+        i18n::provenance_label("estimated_from_text", Language::Zh)
+    );
+    // Unknown bases keep the fallback arm, suffix or not.
+    assert_eq!(
+        i18n::provenance_label("mystery+zero_usage_reported:1", Language::En),
+        i18n::provenance_label("mystery", Language::En)
+    );
 }

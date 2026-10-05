@@ -19,6 +19,11 @@ pub struct DoctorReport {
     /// rm-381 disclosure: outcomes of reversing `-`-encoded agent project
     /// directory names for scanned sessions without a `cwd`.
     pub project_decode: DoctorProjectDecodeReport,
+    /// rm-408 disclosure: sessions whose transcripts REPORT all-zero
+    /// usage blocks, and how many events carry them. Counted as measured
+    /// zeros; the share is surfaced so a present-zero corpus never reads
+    /// as clean.
+    pub zero_usage: DoctorZeroUsageReport,
     /// On-disk size of `sessions.json`, zero when absent.
     pub cache_size_bytes: u64,
     /// The hard bounds `save_session_cache` enforces before serializing
@@ -113,7 +118,14 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         "auto-discovery"
     };
     let mut project_decode = DoctorProjectDecodeReport::default();
-    let directories = doctor_directories(dir, &files, &sqlite_sessions, &mut project_decode);
+    let mut zero_usage = DoctorZeroUsageReport::default();
+    let directories = doctor_directories(
+        dir,
+        &files,
+        &sqlite_sessions,
+        &mut project_decode,
+        &mut zero_usage,
+    );
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -132,6 +144,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
         project_decode,
+        zero_usage,
         directories,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
@@ -144,6 +157,22 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
     report
+}
+
+fn collect_zero_usage(out: &mut DoctorZeroUsageReport, session: &Session) {
+    let events = session.metrics.zero_usage_events;
+    if events == 0 {
+        return;
+    }
+    out.sessions += 1;
+    out.events += events;
+    if out.samples.len() < 6 {
+        out.samples.push(format!(
+            "{}: {} all-zero usage block(s) counted as measured",
+            crate::statusline::sanitize_line_segment(&session.name),
+            events
+        ));
+    }
 }
 
 /// Aggregate of [`crate::insights::project_decode_status`] over the scanned
@@ -159,6 +188,19 @@ pub struct DoctorProjectDecodeReport {
     pub unresolved: usize,
     /// Up to six sanitized examples (ambiguous and unresolved interleaved,
     /// in scan order).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<String>,
+}
+
+/// rm-408 disclosure aggregated over the scanned corpus: sessions whose
+/// transcripts carry client-REPORTED all-zero usage blocks, and the event
+/// count. Counted as measured zeros — surfaced so the share is visible
+/// instead of reading as clean usage.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DoctorZeroUsageReport {
+    pub sessions: usize,
+    pub events: usize,
+    /// Up to six sanitized `session: N block(s)` examples in scan order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<String>,
 }
@@ -255,6 +297,7 @@ fn doctor_directories(
     files: &[PathBuf],
     sqlite_sessions: &[Session],
     project_decode: &mut DoctorProjectDecodeReport,
+    zero_usage: &mut DoctorZeroUsageReport,
 ) -> Vec<DoctorDirReport> {
     let mut cache = load_session_cache();
     if let Some(dir) = dir {
@@ -265,6 +308,7 @@ fn doctor_directories(
             files,
             &mut cache,
             project_decode,
+            zero_usage,
         )];
     }
 
@@ -293,6 +337,7 @@ fn doctor_directories(
             &matching,
             &mut cache,
             project_decode,
+            zero_usage,
         ));
     }
     dirs.extend(doctor_sqlite_directories(sqlite_sessions));
@@ -305,6 +350,7 @@ fn doctor_dir_report(
     files: &[PathBuf],
     cache: &mut crate::SessionCache,
     project_decode: &mut DoctorProjectDecodeReport,
+    zero_usage: &mut DoctorZeroUsageReport,
 ) -> DoctorDirReport {
     let mut parsed = 0;
     let mut cache_hits = 0;
@@ -327,6 +373,7 @@ fn doctor_dir_report(
         };
         if let Some(session) = session {
             collect_project_decode(project_decode, &session);
+            collect_zero_usage(zero_usage, &session);
         }
     }
     DoctorDirReport {
@@ -415,6 +462,21 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
         "Ready: run `agenttrace` for the TUI or `agenttrace --overview -f json` for automation."
             .to_string(),
     ];
+    // rm-408: present-zero usage is counted as measured, so the corpus
+    // share belongs in the recommendations — not folded into "clean".
+    // This push sits ABOVE the demo early-return (review F8): demo
+    // sessions carry real all-zero usage blocks (the demo corpus reports
+    // 200 sessions / 200 events), and a demo doctor that counted them
+    // but stayed silent about the share would break the same
+    // never-report-clean-zeros-silently contract.
+    if report.zero_usage.events > 0 {
+        recommendations.push(format!(
+            "{} of {} session(s) contain client-reported all-zero usage blocks ({} event(s) total), counted as measured zeros and flagged `zero_usage_reported` in provenance; check the recording client's version if the share is high.",
+            report.zero_usage.sessions,
+            report.sessions.max(report.zero_usage.sessions),
+            report.zero_usage.events
+        ));
+    }
     if demo {
         recommendations.push(
             "Demo sessions use a temporary directory, so cache reuse is not expected in this mode."
@@ -486,6 +548,13 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.project_decode.unresolved
     ));
     for sample in &report.project_decode.samples {
+        out.push_str(&format!("    {sample}\n"));
+    }
+    out.push_str(&format!(
+        "Zero-usage reports: {} session(s), {} event(s) counted as measured zeros (rm-408)\n",
+        report.zero_usage.sessions, report.zero_usage.events
+    ));
+    for sample in &report.zero_usage.samples {
         out.push_str(&format!("    {sample}\n"));
     }
     out.push_str("\nProviders:\n");

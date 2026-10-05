@@ -357,7 +357,26 @@ pub struct Metrics {
     /// Empty for clean parses.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
+    /// rm-408: usage blocks the transcript REPORTED as all zero
+    /// (recognized keys, no positive values). Counted as measured
+    /// zeros and disclosed — never silently clean, never rerouted to
+    /// the text-estimate fallback (absent usage keeps that path).
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub zero_usage_events: usize,
     pub provenance: MetricProvenance,
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// rm-408: a present usage block whose recognized values are all zero.
+/// Every parser attaches zeros through `usage_from_value_with_keys`
+/// (which inserts explicit `0` values), so a non-empty all-zero map is
+/// exactly the client-reported-zero population — the one stated rule
+/// across formats instead of per-format accidents.
+pub fn usage_is_all_zero(usage: &BTreeMap<String, i64>) -> bool {
+    !usage.is_empty() && usage.values().all(|value| *value == 0)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -540,6 +559,20 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
         }
     }
     let mut metrics = analyze(&events, &model);
+    // rm-408 disclosure (arm a): count present-but-zero usage blocks at
+    // the one choke point every format passes through, and flag them in
+    // the provenance string so no surface reports clean zeros silently.
+    let zero_usage_events = events
+        .iter()
+        .filter(|event| usage_is_all_zero(&event.usage))
+        .count();
+    if zero_usage_events > 0 {
+        metrics.zero_usage_events = zero_usage_events;
+        metrics.provenance.tokens = format!(
+            "{}+zero_usage_reported:{}",
+            metrics.provenance.tokens, zero_usage_events
+        );
+    }
     let display_name = session_display_name(name, &events);
     metrics.provenance.naming = if display_name != name {
         "first_user_request"
