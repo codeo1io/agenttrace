@@ -366,3 +366,35 @@ fn fetch_flag_without_the_upstream_command_is_rejected() {
         stderr(&output)
     );
 }
+
+#[test]
+fn unsupported_formats_bail_instead_of_silently_rendering_text() {
+    // rm-507: the `upstream` dispatch runs before the CLI's format gates,
+    // so `-f csv|markdown|md|html upstream` used to fall through to the
+    // text report rc 0 — a silent lie about the format contract. The
+    // dispatch now bails naming the supported set (text|json), the same
+    // strict-flag posture as the rm-409 csv guard. The bail happens
+    // before any git work, so no fixture repository is needed.
+    let tmp = std::env::temp_dir().join("agenttrace-upstream-format-gate");
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    for format in ["csv", "markdown", "md", "html"] {
+        let output = run_cli(&tmp, &["-f", format, "upstream"]);
+        assert!(
+            !output.status.success(),
+            "`-f {format} upstream` must not succeed"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("-f csv is not supported by `agenttrace upstream`")
+                || err.contains(&format!(
+                    "-f {format} is not supported by `agenttrace upstream`"
+                )),
+            "error names the format: {err}"
+        );
+        assert!(
+            err.contains("supported formats: text, json"),
+            "error names the supported set: {err}"
+        );
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+}

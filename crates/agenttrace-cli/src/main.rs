@@ -189,6 +189,18 @@ fn run() -> anyhow::Result<()> {
     // this is an explicit user action that may fail loudly. It is fully
     // offline unless --fetch explicitly opts into the network.
     if args.path.as_deref() == Some("upstream") {
+        // rm-507: this dispatch runs BEFORE the format gates below, so
+        // `-f csv|markdown|md|html upstream` used to silently render the
+        // text report rc 0 — the exact incoherence those guards exist to
+        // prevent. `upstream` renders text|json only; apply the same
+        // strict-flag posture here (bail naming the set) instead of the
+        // silent fallback in the old `status_report` match.
+        if !matches!(args.format.as_str(), "text" | "json") {
+            bail!(
+                "-f {} is not supported by `agenttrace upstream`; supported formats: text, json",
+                args.format
+            );
+        }
         let report = upstream::status_report(&args.format, args.fetch)?;
         write_stdout(&report)?;
         return Ok(());
@@ -1310,16 +1322,23 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             .collect::<Vec<_>>();
         return csv_export::sessions_csv(&rows);
     }
-    let mut lines =
-        vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
+    let mut lines = vec![
+        "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES\tZERO_USAGE"
+            .to_string(),
+    ];
     lines.extend(sessions.into_iter().map(|session| {
         // rm-383: name, source tool, and model are
         // transcript-derived; sanitize them for terminal display and TSV
         // row integrity (assess PoC: a crafted session name carried a raw
         // OSC-52 clipboard-write byte-for-byte into the --sessions TSV).
         // JSON output escapes control bytes losslessly and stays untouched.
+        //
+        // rm-408 residual: the default view carries the same zero-usage
+        // disclosure as the csv statement (zero_usage_events) — the
+        // first surface a user sees must not read all-zero transcripts
+        // as clean when they reported zero.
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}",
             sanitize_line_segment(&session.name),
             session.health,
             session_capability(session),
@@ -1328,7 +1347,8 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,
-            session.anomalies.len()
+            session.anomalies.len(),
+            session.metrics.zero_usage_events
         )
     }));
     lines.join("\n")

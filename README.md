@@ -110,10 +110,19 @@ agenttrace
 ### CSV statement export (rm-409)
 
 `-f csv` emits RFC 4180 (CRLF rows, `""`-doubled quotes) with one table per
-section, marker-comment headers, and a leading apostrophe guard on
-formula-looking cells (a name or model id like `=SUM(A1)` or
-`=cmd|' /C …'!A0` renders as `'=SUM(A1)` — spreadsheet-safe, byte-stable
-across runs, announcements on stderr so stdout stays pure):
+section, marker-comment headers, a leading UTF-8 BOM so Excel detects the
+encoding (CJK model and session names import instead of mojibaking through
+ANSI decode), and a leading apostrophe guard on formula-looking cells: a
+name or model id like `=SUM(A1)`, `=cmd|' /C …'!A0`, or a cell LED by any
+whitespace (space/TAB/CR/LF, NBSP, full-width U+3000 — spreadsheet
+importers trim those before formula parsing) renders as `'=SUM(A1)`. Only
+finite bare numbers stay unguarded (`inf`/`NaN` parse as numbers in Rust
+but are spreadsheet operands, so they get the guard too). Transcript-
+derived cells — session rows AND the overview group keys (`by_model`,
+`by_provider`, `by_task_type` names are model ids) — pass the fork's
+control-byte sanitizer first (OSC/ANSI/C0 become U+FFFD; the payload
+stays visible, inert). Output is byte-stable across runs, announcements
+on stderr so stdout stays pure:
 
 ```bash
 agenttrace --sessions -f csv
@@ -132,6 +141,15 @@ Overview sections (`--overview` required): `# summary`, `# by_model`,
 `# by_provider`, `# by_task_type`. `-f csv` outside this composable set
 bails loudly (`csv format requires --overview or --sessions`) instead of
 silently rendering the text report.
+
+The default `--sessions` TSV view carries the same rm-408 disclosure as
+its last column (`ZERO_USAGE`), so the first surface a user sees never
+reads reported-zero transcripts as clean.
+
+`agenttrace upstream` renders `text` and `json` only; every other `-f`
+value bails (`-f csv is not supported by \`agenttrace upstream\`;
+supported formats: text, json`) instead of silently rendering the text
+report.
 
 ### Governance reports
 

@@ -12,13 +12,27 @@
 //! - RFC 4180: cells containing comma/quote/newline/CR are
 //!   double-quoted with inner quotes doubled; rows end with CRLF.
 //! - rm-383 control-byte sanitation composes BEFORE quoting, so
-//!   transcript-derived cells never carry OSC/ANSI escapes.
+//!   transcript-derived cells never carry OSC/ANSI escapes. Session
+//!   rows are sanitized by their builders in `main.rs`; the rm-506
+//!   rule extends the same guarantee to the OVERVIEW GROUP KEYS this
+//!   module renders itself (`by_model` / `by_provider` /
+//!   `by_task_type` names are transcript-derived model ids), so every
+//!   cell this module emits has passed `sanitize_line_segment`.
 //! - Spreadsheet formula injection: a cell starting with `=`, `+`, `@`,
-//!   or a non-numeric `-` gets a leading `'` (the `'` is preserved by
-//!   Excel/LibreOffice as a text marker, not cell content). Plain
-//!   numbers stay bare so cost/token columns import as values.
+//!   a non-numeric `-`, or ANY leading whitespace (space/TAB/CR/LF,
+//!   NBSP, full-width U+3000, U+FEFF — spreadsheet importers trim
+//!   these before formula parsing; the OWASP CSV-injection set) gets a
+//!   leading `'` (preserved by Excel/LibreOffice as a text marker, not
+//!   cell content). Only FINITE bare numbers stay unguarded: Rust's
+//!   f64 parser accepts `inf`/`NaN`, which are formula operands, not
+//!   values (rm-506 closed that hole in the numeric exemption).
+//! - rm-409 residual: csv output begins with a UTF-8 BOM (U+FEFF) so
+//!   Excel detects UTF-8 and the CJK model/session names import
+//!   instead of mojibaking through ANSI decode. JSON and TSV lanes are
+//!   byte-identical to before — the BOM belongs to the csv statement
+//!   contract only.
 
-use agenttrace_core::Overview;
+use agenttrace_core::{sanitize_line_segment, Overview};
 
 /// One `--sessions -f csv` row; mirrors the TSV columns plus the
 /// rm-408 disclosure column, so the statement never reports clean
@@ -41,7 +55,9 @@ pub struct SessionCsvRow {
 }
 
 pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
-    let mut out = table(
+    // rm-409 residual: BOM first so Excel decodes UTF-8 (CJK names).
+    let mut out = String::from("\u{feff}");
+    out.push_str(&table(
         "sessions",
         &[
             "session",
@@ -55,7 +71,7 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             "anomalies",
             "zero_usage_events",
         ],
-    );
+    ));
     for row in rows {
         out.push_str(&csv_row(&[
             &row.session,
@@ -74,10 +90,12 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
 }
 
 pub fn overview_csv(overview: &Overview) -> String {
-    let mut out = table(
+    // rm-409 residual: BOM first so Excel decodes UTF-8 (CJK model ids).
+    let mut out = String::from("\u{feff}");
+    out.push_str(&table(
         "summary",
         &["sessions", "healthy", "warning", "critical", "cost"],
-    );
+    ));
     out.push_str(&csv_row(&[
         &overview.total_sessions.to_string(),
         &overview.healthy.to_string(),
@@ -95,7 +113,11 @@ pub fn overview_csv(overview: &Overview) -> String {
         out.push_str(&table(name, &["name", "sessions", "cost"]));
         for (group, entry) in rows {
             out.push_str(&csv_row(&[
-                group,
+                // rm-506: group keys are transcript-derived model ids —
+                // sanitize at the render boundary, exactly like the
+                // text/markdown/html arms (session rows are already
+                // sanitized by their builders in main.rs).
+                &sanitize_line_segment(group),
                 &entry.sessions.to_string(),
                 &format!("{:.4}", entry.cost),
             ]));
@@ -108,7 +130,7 @@ pub fn overview_csv(overview: &Overview) -> String {
         ));
         for (task_type, entry) in &overview.by_task_type {
             out.push_str(&csv_row(&[
-                task_type,
+                &sanitize_line_segment(task_type),
                 &entry.sessions.to_string(),
                 &format!("{:.4}", entry.cost),
                 &entry.tokens_input.to_string(),
@@ -159,18 +181,18 @@ fn csv_cell(raw: &str) -> String {
     quoted
 }
 
-/// Prefixes spreadsheet-formula-looking cells with `'`. Bare numbers
-/// (including negatives such as `-1.5`) are exempt so numeric columns
-/// still import as values.
+/// Prefixes spreadsheet-formula-looking cells with `'`. Bare FINITE
+/// numbers (including negatives such as `-1.5`) are exempt so numeric
+/// columns import as values; `inf`/`NaN` parse as f64 in Rust but are
+/// operands, not values, so the exemption is finite-only (rm-506).
 fn guard_formula(raw: &str) -> String {
-    let looks_numeric = raw.parse::<f64>().is_ok();
-    if looks_numeric {
+    let looks_finite_numeric = raw.parse::<f64>().is_ok_and(f64::is_finite);
+    if looks_finite_numeric {
         return raw.to_string();
     }
-    let starts_formula = raw
-        .chars()
-        .next()
-        .is_some_and(|first| matches!(first, '=' | '+' | '@' | '-'));
+    let starts_formula = raw.chars().next().is_some_and(|first| {
+        matches!(first, '=' | '+' | '@' | '-' | '\u{feff}') || first.is_whitespace()
+    });
     if starts_formula {
         format!("'{raw}")
     } else {
@@ -208,6 +230,31 @@ mod tests {
     }
 
     #[test]
+    fn guard_covers_whitespace_led_and_non_finite_cells() {
+        // rm-506: spreadsheet importers TRIM leading whitespace before
+        // formula parsing, so a space/TAB/NBSP/full-width-space-led cell
+        // is as injectable as a `=`-led one; and Rust's f64 parser
+        // accepts inf/NaN, which used to slip through the numeric
+        // exemption. Both now get the `'` guard.
+        assert_eq!(csv_cell(" =cmd|/C calc!A0"), "' =cmd|/C calc!A0");
+        assert_eq!(csv_cell("\t=cmd|/C calc!A0"), "'\t=cmd|/C calc!A0");
+        assert_eq!(csv_cell("\u{00a0}=SUM(A1)"), "'\u{00a0}=SUM(A1)");
+        assert_eq!(csv_cell("\u{3000}=SUM(A1)"), "'\u{3000}=SUM(A1)");
+        assert_eq!(csv_cell("\u{feff}=SUM(A1)"), "'\u{feff}=SUM(A1)");
+        // Non-finite f64 parses no longer take the numeric fast-path: a
+        // leading operator now reaches the formula guard. Bare `inf`/`NaN`
+        // carry no leading operator, so they stay inert text.
+        assert_eq!(csv_cell("-inf"), "'-inf");
+        assert_eq!(csv_cell("+inf"), "'+inf");
+        assert_eq!(csv_cell("inf"), "inf");
+        assert_eq!(csv_cell("NaN"), "NaN");
+        // The finite exemption still holds for real numeric columns.
+        assert_eq!(csv_cell("-1.5"), "-1.5");
+        assert_eq!(csv_cell("900"), "900");
+        assert_eq!(csv_cell("0.0"), "0.0");
+    }
+
+    #[test]
     fn sessions_csv_has_header_and_crlf_rows() {
         let out = sessions_csv(&[SessionCsvRow {
             session: "fix the \"bug\", today".to_string(),
@@ -222,7 +269,9 @@ mod tests {
             zero_usage_events: 2,
         }]);
         let lines: Vec<&str> = out.split("\r\n").collect();
-        assert_eq!(lines[0], "# sessions");
+        // rm-409 residual: BOM leads the csv statement so Excel detects UTF-8.
+        assert!(out.starts_with('\u{feff}'));
+        assert_eq!(lines[0], "\u{feff}# sessions");
         assert_eq!(
             lines[1],
             "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events"
@@ -250,11 +299,45 @@ mod tests {
         );
         let out = overview_csv(&overview);
         let lines: Vec<&str> = out.split("\r\n").collect();
-        assert_eq!(lines[0], "# summary");
+        assert!(out.starts_with('\u{feff}'));
+        assert_eq!(lines[0], "\u{feff}# summary");
         assert_eq!(lines[1], "sessions,healthy,warning,critical,cost");
         assert_eq!(lines[2], "3,0,0,0,2.5000");
         assert!(out.contains("# by_model"));
         assert!(out.contains("claude-sonnet-4-5,2,2.0000"));
         assert!(!out.contains("# by_provider")); // empty sections omitted
+    }
+
+    #[test]
+    fn overview_csv_sanitizes_transcript_derived_group_keys() {
+        // rm-506: group keys are model ids — transcript-controlled. The
+        // assess PoC (\t=cmd|/C calc!A0) must arrive as U+FFFD-led and
+        // OSC-52 must never ride the csv statement into Excel.
+        let mut overview = Overview::default();
+        overview.by_model.insert(
+            "\t=cmd|/C calc!A0".to_string(),
+            agenttrace_core::GroupOverview {
+                sessions: 1,
+                cost: 0.0,
+            },
+        );
+        overview.by_provider.insert(
+            "\u{1b}]52;c;aGVsbG8=\u{0007}".to_string(),
+            agenttrace_core::GroupOverview {
+                sessions: 1,
+                cost: 0.0,
+            },
+        );
+        let out = overview_csv(&overview);
+        assert!(
+            out.contains("\u{fffd}=cmd|/C calc!A0,1,0.0000"),
+            "tab-DDE model key sanitized then rendered: {out:?}"
+        );
+        assert!(!out.contains("\t="), "no raw TAB-led payload: {out:?}");
+        assert!(!out.contains('\u{1b}') && !out.contains('\u{0007}'));
+        assert!(
+            out.contains("]52;c;aGVsbG8="),
+            "payload stays visible, inert"
+        );
     }
 }

@@ -19,6 +19,9 @@
 //! the npm registry; both network touches happen only behind that
 //! explicit flag. No new crate dependencies: `git` (and optionally
 //! `curl`) run as subprocesses, so the CLI crate stays network-free.
+//!
+//! Formats: `text` and `json` only (rm-507) — every other `-f` value
+//! bails loudly instead of silently rendering the text report.
 
 use anyhow::{anyhow, bail};
 use serde_json::json;
@@ -81,7 +84,14 @@ pub fn status_report(format: &str, fetch: bool) -> anyhow::Result<String> {
     let status = collect_status(fetch)?;
     Ok(match format {
         "json" => status.to_json()?,
-        _ => status.to_text(),
+        "text" => status.to_text(),
+        // rm-507: no silent text fallback. The CLI dispatch names
+        // text|json as the supported set for `agenttrace upstream`; this
+        // arm keeps library callers to the same contract instead of
+        // quietly rendering text for `-f csv|markdown|html upstream`.
+        other => bail!(
+            "-f {other} is not supported by `agenttrace upstream`; supported formats: text, json"
+        ),
     })
 }
 

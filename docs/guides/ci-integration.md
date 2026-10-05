@@ -100,12 +100,39 @@ jobs:
   agenttrace:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      # actions/checkout v7.0.0 — pinned like the example workflow this
+      # guide mirrors (mutable tags can be moved after the fact).
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
       - name: Install agenttrace
         run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | AGENTTRACE_INSTALL_DIR="$HOME/.local/bin" sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # rm-417 residual: this guide teaches the same supply-chain rule
+          # examples/github-actions/agenttrace-health-gate.yml enforces (gated
+          # by scripts/ci/check-example-workflows.sh): never curl|sh from a
+          # moving ref — pin a release tag and verify the published checksum.
+          # Checksums below are the ones published in the v0.9.0 release
+          # notes, same as the example workflow.
+          set -euo pipefail
+          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          case "$(uname -m)" in
+            x86_64)          ARCH=amd64 ;;
+            aarch64 | arm64) ARCH=arm64 ;;
+          esac
+          ASSET="agenttrace-${OS}-${ARCH}"
+          case "${OS}-${ARCH}" in
+            linux-amd64)  SUM=ff26324f2114e1757babbbb9d7d0729f80d58073224dd20729c893e6d70a7ad8 ;;
+            linux-arm64)  SUM=253bd6c5e2f659477f057ff4ff28728823259eac9cf3e14328d75ba936f6f40f ;;
+            darwin-amd64) SUM=af84d9fe5770f2fc93c8125491e87ecea7fb93c7188c668347445341fa6f5a66 ;;
+            darwin-arm64) SUM=f29fe44bb5039f5441d79fe53c6893788685914f48910083c88ed7337141c2b3 ;;
+          esac
+          ASSET_PATH="${RUNNER_TEMP}/${ASSET}"
+          curl -fsSL --max-time 120 -o "${ASSET_PATH}" \
+            "https://github.com/luoyuctl/agenttrace/releases/download/v0.9.0/${ASSET}"
+          echo "${SUM}  ${ASSET_PATH}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/agenttrace-bin"
+          install -m 0755 "${ASSET_PATH}" "${RUNNER_TEMP}/agenttrace-bin/agenttrace"
+          echo "${RUNNER_TEMP}/agenttrace-bin" >> "$GITHUB_PATH"
       - name: Check agent session health
         run: |
           agenttrace --overview -f json \
@@ -132,7 +159,8 @@ jobs:
         run: |
           agenttrace --overview -f markdown -o agenttrace-overview.md || true
           agenttrace --overview -f html -o agenttrace-overview.html || true
-      - uses: actions/upload-artifact@v7
+      # actions/upload-artifact v7.0.0 — pinned like the example workflow.
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         if: always()
         with:
           name: agenttrace-overview

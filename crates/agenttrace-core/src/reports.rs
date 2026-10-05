@@ -925,7 +925,9 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
             "    {:<30} {:>4} Sessions  {:>8}\n",
-            tool_display_name(&agent),
+            // rm-506: group keys are transcript-derived; every arm
+            // renders them through the shared sanitizer.
+            sanitize_line_segment(&tool_display_name(&agent)),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -939,7 +941,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            model,
+            sanitize_line_segment(&model),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -956,7 +958,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            provider,
+            sanitize_line_segment(&provider),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -967,7 +969,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     for (task_type, group) in &overview.by_task_type {
         out.push_str(&format!(
             "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
-            task_type,
+            sanitize_line_segment(task_type),
             format_count(group.sessions),
             format_cost(group.cost),
             format_tokens(group.tokens_input),
@@ -1103,7 +1105,9 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     for (agent, group) in sorted_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
-            markdown_cell(&tool_display_name(&agent)),
+            // rm-506: group keys are sanitized before markdown_cell's
+            // printable-HTML escapes (rm-403 order: control bytes first).
+            markdown_cell(&sanitize_line_segment(&tool_display_name(&agent))),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -1115,7 +1119,7 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     for (provider, group) in sorted_model_groups(&overview.by_provider) {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
-            markdown_cell(&provider),
+            markdown_cell(&sanitize_line_segment(&provider)),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -1128,7 +1132,7 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     for (task_type, group) in &overview.by_task_type {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
-            markdown_cell(task_type),
+            markdown_cell(&sanitize_line_segment(task_type)),
             format_count(group.sessions),
             format_tokens(group.tokens_input),
             format_tokens(group.tokens_output),
@@ -1158,9 +1162,13 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     for session in ordered.iter().take(10) {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} |\n",
-            markdown_cell(&session.name),
-            markdown_cell(&tool_display_name(&session.metrics.source_tool)),
-            markdown_cell(&session.metrics.model_used),
+            // rm-239/rm-506: session fields are transcript-derived; the
+            // md arm sanitizes before markdown_cell's escapes.
+            markdown_cell(&sanitize_line_segment(&session.name)),
+            markdown_cell(&sanitize_line_segment(&tool_display_name(
+                &session.metrics.source_tool
+            ))),
+            markdown_cell(&sanitize_line_segment(&session.metrics.model_used)),
             session.health,
             format_cost(session.metrics.cost_estimated),
             format_count(session.anomalies.len())
@@ -1323,9 +1331,11 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     for session in ordered.iter().take(20) {
         w(format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num {}\">{}</td><td class=\"num\">{}</td></tr>",
-            html_escape(&session.name),
-            html_escape(&tool_display_name(&session.metrics.source_tool)),
-            html_escape(&session.metrics.model_used),
+            html_escape(&sanitize_line_segment(&session.name)),
+            html_escape(&sanitize_line_segment(&tool_display_name(
+                &session.metrics.source_tool
+            ))),
+            html_escape(&sanitize_line_segment(&session.metrics.model_used)),
             format_tokens(total_tokens(session)),
             format_cost(session.metrics.cost_estimated),
             html_escape(health_class(session.health)),
@@ -1339,7 +1349,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     for (agent, group) in agents {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-            html_escape(&tool_display_name(&agent)),
+            html_escape(&sanitize_line_segment(&tool_display_name(&agent))),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -1350,7 +1360,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     for (model, group) in models.iter().take(12) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-            html_escape(model),
+            html_escape(&sanitize_line_segment(model)),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -1362,7 +1372,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     for (provider, group) in providers.iter().take(12) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-            html_escape(provider),
+            html_escape(&sanitize_line_segment(provider)),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -1373,7 +1383,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     for (task_type, group) in &overview.by_task_type {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-            html_escape(task_type),
+            html_escape(&sanitize_line_segment(task_type)),
             format_count(group.sessions),
             format_tokens(group.tokens_input),
             format_tokens(group.tokens_output),
@@ -2695,6 +2705,13 @@ fn text_wrapped_key_values(label: &str, values: &[String], limit: usize) -> Vec<
 }
 
 fn text_cell(value: &str, limit: usize) -> String {
+    // rm-239 residual + rm-506: every text-lane cell is transcript-derived;
+    // control bytes (C0/DEL/C1) become U+FFFD BEFORE the whitespace squash
+    // so a leading TAB stays visible-and-inert ("\u{FFFD}=cmd…") instead
+    // of being silently eaten by split_whitespace. sanitize_line_segment is
+    // THE shared helper (same one statusline and the --sessions TSV use) —
+    // not a per-site copy.
+    let value = sanitize_line_segment(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
@@ -2929,6 +2946,110 @@ mod tests {
         );
         assert!(text.contains('\u{FFFD}'));
         assert!(text.contains("]52;c;aGVsbG8="));
+    }
+
+    #[test]
+    fn text_cell_sanitizes_before_the_whitespace_squash() {
+        // rm-239 residual: the incident-timeline session cell (and every
+        // other text-lane cell) routes through text_cell. Sanitization must
+        // run BEFORE split_whitespace, or a leading TAB is silently eaten —
+        // visible-and-inert (U+FFFD-led) is the honest render, not absence.
+        assert_eq!(
+            text_cell("\t=cmd|/C calc!A0", 30),
+            "\u{FFFD}=cmd|/C calc!A0"
+        );
+        let osc = "\u{001b}]52;c;aGVsbG8=\u{0007}";
+        let cell = text_cell(osc, 30);
+        assert!(!cell.contains('\u{001b}') && !cell.contains('\u{0007}'));
+        assert!(cell.contains("]52;c;aGVsbG8="));
+    }
+
+    #[test]
+    fn overview_group_keys_are_sanitized_in_every_render_arm() {
+        // rm-506: group keys (by_model/by_provider/by_task_type/by_agent)
+        // are transcript-derived model ids — the assess PoC drove a tab-led
+        // DDE payload byte-identical into `-f csv`, and the sibling assesses
+        // re-derived OSC-52 surviving `-f text`. Every arm renders keys
+        // through the shared sanitizer: control bytes become U+FFFD,
+        // payload stays visible-and-inert. JSON output stays lossless and
+        // untouched (serde escapes control bytes itself).
+        let hostile_model = "\t=cmd|/C calc!A0";
+        let hostile_provider = "\u{001b}]52;c;aGVsbG8=\u{0007}";
+        let hostile_task = "coding\u{001b}[2J";
+        let mut overview = Overview::default();
+        overview.by_model.insert(
+            hostile_model.to_string(),
+            GroupOverview {
+                sessions: 1,
+                cost: 0.0,
+            },
+        );
+        overview.by_provider.insert(
+            hostile_provider.to_string(),
+            GroupOverview {
+                sessions: 1,
+                cost: 0.0,
+            },
+        );
+        overview.by_task_type.insert(
+            hostile_task.to_string(),
+            TaskTypeOverview {
+                sessions: 1,
+                cost: 0.0,
+                tokens_input: 0,
+                tokens_output: 0,
+            },
+        );
+
+        let text = report_overview_text(&overview, &[]);
+        assert!(!text.contains('\u{001b}') && !text.contains('\u{0007}'));
+        assert!(
+            text.contains("\u{FFFD}=cmd|/C calc!A0"),
+            "text by_model: {text:?}"
+        );
+        assert!(
+            text.contains("]52;c;aGVsbG8="),
+            "text by_provider payload visible"
+        );
+        assert!(!text.contains("coding\u{001b}"), "text by_task sanitized");
+
+        let markdown = report_overview_markdown(&overview, &[]);
+        assert!(!markdown.contains('\u{001b}') && !markdown.contains('\u{0007}'));
+        // The md arm has no by_model table (agents/providers/tasks only);
+        // provider/task keys carry the sanitized form.
+        assert!(!markdown.contains("\t=cmd"), "no raw TAB-led key in md");
+        assert!(markdown.contains("]52;c;aGVsbG8="));
+        assert!(!markdown.contains("coding\u{001b}"));
+
+        let html = report_overview_html(&overview, &[]);
+        assert!(!html.contains('\u{001b}') && !html.contains('\u{0007}'));
+        assert!(html.contains("]52;c;aGVsbG8="));
+        assert!(!html.contains("coding\u{001b}"));
+    }
+
+    #[test]
+    fn overview_json_stays_lossless_for_hostile_group_keys() {
+        // rm-506 hard constraint: sanitization is a RENDER-boundary rule.
+        // The JSON arm must keep the raw key (serde escapes control bytes
+        // losslessly) — byte-identical to before this batch.
+        let hostile = "\t=cmd|/C calc!A0";
+        let mut overview = Overview::default();
+        overview.by_model.insert(
+            hostile.to_string(),
+            GroupOverview {
+                sessions: 1,
+                cost: 0.0,
+            },
+        );
+        let json = report_overview_json(&overview, &[]);
+        assert!(
+            json.contains("\\t=cmd|/C calc!A0"),
+            "JSON carries the escaped raw key losslessly: {json:?}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+            "JSON stays valid while carrying the raw key"
+        );
     }
 
     #[test]
