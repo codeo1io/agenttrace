@@ -1741,4 +1741,23 @@ mod tests {
             "provider label must round-trip with its entry"
         );
     }
+
+    /// rm-404: PRIVACY.md must enumerate the pricing download URL, derived
+    /// from this module's own `PRICING_URL` const so the pin cannot drift
+    /// from the code that performs the download (mirrors rm-086's
+    /// `privacy_disclosure_lists_every_artifact` pin in session_cache).
+    #[test]
+    fn privacy_disclosure_names_the_pricing_download_url() {
+        let privacy =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
+                .expect("PRIVACY.md readable");
+        assert!(
+            privacy.contains(PRICING_URL),
+            "PRIVACY.md must enumerate the --update-pricing download URL {PRICING_URL}"
+        );
+        assert!(
+            !privacy.contains("only exception"),
+            "PRIVACY.md must not claim --update-pricing is the only network touch (--fetch upstream also touches the network)"
+        );
+    }
 }

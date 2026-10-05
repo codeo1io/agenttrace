@@ -640,7 +640,7 @@ pub fn report_overview_markdown_with_context(
     let audit = cost_audit(sessions);
     let mut out = report_overview_markdown(overview, sessions);
     out.push_str("\n## Scope and confidence\n\n| Field | Value |\n|---|---|\n");
-    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", scope.range, scope.earliest_session_at, scope.latest_session_at, parse_coverage_phrase(data_health, "; "), data_health.confidence, markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
+    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", markdown_cell(&scope.range), markdown_cell(&scope.earliest_session_at), markdown_cell(&scope.latest_session_at), markdown_cell(&parse_coverage_phrase(data_health, "; ")), markdown_cell(&data_health.confidence), markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
             "| Dropped lines | {} |\n",
@@ -2793,10 +2793,33 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
     phrase
 }
 
+/// Escapes a transcript-derived string for a plain GFM table cell (rm-403).
+///
+/// Policy: plain cells render as inline markdown, and inline markdown may
+/// carry raw HTML — every HTML metacharacter (`&`, `<`, `>`) in a cell value
+/// is entity-escaped, mirroring the HTML report arm's `html_escape` for text
+/// nodes, before the pipe/newline table-safety escapes run. The `<br>` this
+/// function emits itself is the only raw HTML a plain cell may contain.
+///
+/// Merge note: the control-byte sanitizer family (fc197c5e's lane) must run
+/// BEFORE the entity escape at merge time — control bytes first, then
+/// printable HTML — so both byte classes die in one pass.
 fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', "<br>")
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
 }
 
+/// Escapes a transcript-derived string for a GFM inline code span (rm-403).
+///
+/// Policy: code spans need no HTML entity escaping — spec-compliant markdown
+/// renderers escape code-span contents themselves, and pre-escaping would
+/// corrupt legitimate display (`&lt;img&gt;` would render literally instead of
+/// `<img>`). Backticks are stripped to keep the span closed; pipe and newline
+/// are made table-safe for spans emitted inside cells.
 fn markdown_inline_code(value: &str) -> String {
     value
         .replace('`', "'")

@@ -34,6 +34,15 @@ const DEFAULT_REF: &str = "master";
 /// itself ships no npm manifest; the registry is the source of truth.
 const NPM_PACKAGE: &str = "@zack78/agenttrace";
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@zack78%2fagenttrace/latest";
+
+/// One-line network disclosure for the `--fetch` path (rm-404). Lists every
+/// network touch the flag triggers, derived from the same constants the code
+/// uses, so the disclosure cannot drift from the behavior it describes.
+fn fetch_disclosure_line(remote_url: &str) -> String {
+    format!(
+        "network: --fetch upstream is opt-in — `git fetch {remote_url}` plus one HTTPS request to {NPM_REGISTRY_URL} (see PRIVACY.md)"
+    )
+}
 /// Text view caps the unported commit list; JSON carries all of them.
 const MAX_UNPORTED_LISTED: usize = 20;
 
@@ -97,6 +106,9 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         Err(_) => bail!("no '{remote}' remote configured (git remote add {remote} <url>)"),
     };
     if fetch {
+        // rm-404: PRIVACY.md promises fully-offline-by-default, so every opt-in
+        // network touch announces itself on stderr before any request goes out.
+        eprintln!("{}", fetch_disclosure_line(&remote_url));
         fetch_remote(&remote)?;
     }
     let tracking = format!("refs/remotes/{remote}/{ref_name}");
@@ -582,5 +594,48 @@ mod tests {
         assert_eq!(age_phrase(Some(120)), "2min old");
         assert_eq!(age_phrase(Some(7_200)), "2h old");
         assert_eq!(age_phrase(Some(172_800)), "2d old");
+    }
+
+    /// rm-404: PRIVACY.md must enumerate every opt-in network touch this
+    /// module performs, derived from the same constants the code uses
+    /// (mirrors rm-086's `privacy_disclosure_lists_every_artifact` pin in
+    /// core). If a new network touch lands here, this fails until
+    /// PRIVACY.md names it.
+    #[test]
+    fn privacy_disclosure_lists_every_network_touch() {
+        let privacy =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../PRIVACY.md"))
+                .expect("PRIVACY.md readable");
+
+        // The npm registry probe URL, constructor-derived from the const.
+        assert!(
+            privacy.contains(NPM_REGISTRY_URL),
+            "PRIVACY.md must name the npm registry probe URL {NPM_REGISTRY_URL}"
+        );
+
+        // The git fetch touch and its trigger flag.
+        assert!(
+            privacy.contains("git fetch") && privacy.contains("--fetch upstream"),
+            "PRIVACY.md must name the `git fetch` touch and its `--fetch upstream` trigger"
+        );
+
+        // The false "only exception" phrasing must stay dead.
+        assert!(
+            !privacy.contains("only exception"),
+            "PRIVACY.md must not claim --update-pricing is the only network exception"
+        );
+
+        // The runtime disclosure line lists both touches, derived from the
+        // same constants the fetch path uses.
+        let line = fetch_disclosure_line("https://github.com/example/upstream.git");
+        assert!(line.contains("git fetch"), "disclosure must name git fetch");
+        assert!(
+            line.contains(NPM_REGISTRY_URL),
+            "disclosure must name the npm probe URL"
+        );
+        assert!(
+            line.contains("PRIVACY.md"),
+            "disclosure must point at PRIVACY.md"
+        );
     }
 }

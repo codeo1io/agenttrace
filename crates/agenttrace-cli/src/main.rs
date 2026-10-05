@@ -231,7 +231,11 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.update_pricing {
-        announce("Downloading pricing from LiteLLM...\n")?;
+        // Network-touch announcement, on stderr per PRIVACY.md ("announced on
+        // stderr at the moment it happens"): stdout may be redirected to a
+        // file or pipe and the announcement must still reach the terminal —
+        // mirrors upstream.rs's `--fetch` disclosure (rm-404, review finding 1).
+        eprintln!("Downloading pricing from LiteLLM...");
         let count = update_pricing()?;
         announce(&format!("Loaded {count} model prices\n"))?;
         announce(&format!(
@@ -1518,6 +1522,23 @@ mod tests {
     use super::*;
     use agenttrace_core::Metrics;
     use std::io::Write;
+
+    #[test]
+    fn pricing_download_announcement_goes_to_stderr() {
+        // rm-404, review finding 1 (0145eeb5): PRIVACY.md promises every
+        // network touch is "announced on stderr at the moment it happens".
+        // The --update-pricing download announcement must be an eprintln, not
+        // a write_stdout — piped/redirected stdout must not swallow it.
+        let main_src = include_str!("main.rs");
+        assert!(
+            main_src.contains("eprintln!(\"Downloading pricing from LiteLLM...\")"),
+            "the pricing download announcement must go to stderr (PRIVACY.md)"
+        );
+        assert!(
+            !main_src.contains("write_stdout(\"Downloading pricing"),
+            "the pricing download announcement must not write to stdout"
+        );
+    }
 
     #[test]
     fn report_language_accepts_supported_values_and_rejects_the_rest() {

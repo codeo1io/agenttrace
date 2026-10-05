@@ -1,36 +1,81 @@
-name: Agenttrace
+name: agenttrace health gate
 
 on:
-  pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
 
 jobs:
-  health-gate:
+  agenttrace-health-gate:
+    # Self-hosted runner with agent session logs from the agents working on
+    # this repository (the default ~/.claude and friends).
     runs-on: self-hosted
+
     steps:
-      - uses: actions/checkout@v6
-      - name: Install agenttrace
+      # actions/checkout v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+
+      # rm-405: install a PINNED release binary and verify it against the
+      # checksum published in that release (v0.9.0). Do not curl|sh from a
+      # moving branch head, and do not track `releases/latest`.
+      - name: Install agenttrace v0.9.0 (pinned, checksummed)
         run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | AGENTTRACE_INSTALL_DIR="$HOME/.local/bin" sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          case "$(uname -m)" in
+            x86_64)             ARCH=amd64 ;;
+            aarch64 | arm64)    ARCH=arm64 ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          ASSET="agenttrace-${OS}-${ARCH}"
+          case "${OS}-${ARCH}" in
+            linux-amd64)  SUM=ff26324f2114e1757babbbb9d7d0729f80d58073224dd20729c893e6d70a7ad8 ;;
+            linux-arm64)  SUM=253bd6c5e2f659477f057ff4ff28728823259eac9cf3e14328d75ba936f6f40f ;;
+            darwin-amd64) SUM=af84d9fe5770f2fc93c8125491e87ecea7fb93c7188c668347445341fa6f5a66 ;;
+            darwin-arm64) SUM=f29fe44bb5039f5441d79fe53c6893788685914f48910083c88ed7337141c2b3 ;;
+            *) echo "unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;;
+          esac
+          ASSET_PATH="${RUNNER_TEMP}/${ASSET}"
+          curl -fsSL --max-time 120 -o "${ASSET_PATH}" \
+            "https://github.com/luoyuctl/agenttrace/releases/download/v0.9.0/${ASSET}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "${SUM}  ${ASSET_PATH}" | sha256sum -c -
+          else
+            echo "${SUM}  ${ASSET_PATH}" | shasum -a 256 -c -
+          fi
+          mkdir -p "${RUNNER_TEMP}/agenttrace-bin"
+          install -m 0755 "${ASSET_PATH}" "${RUNNER_TEMP}/agenttrace-bin/agenttrace"
+          echo "${RUNNER_TEMP}/agenttrace-bin" >> "${GITHUB_PATH}"
+
+      # The gate itself: this step MUST be able to fail the job — no
+      # `|| true` here. If health drops under the threshold or any session
+      # is critical, this workflow run goes red.
       - name: Check agent session health
         run: |
+          set -euo pipefail
           agenttrace --overview -f json \
             --fail-under-health 80 \
             --fail-on-critical \
             --max-tool-fail-rate 15 \
             -o agenttrace-overview.json
-      - name: Write shareable reports
+
+      # Report-only views below: they run even when the gate above failed
+      # (`if: always()`) so the artifacts explain WHY, and they tolerate
+      # their own failures (`|| true`) because the job verdict is already
+      # owned by the gate step.
+      - name: Shareable markdown overview (report-only)
         if: always()
-        run: |
-          agenttrace --overview -f markdown -o agenttrace-overview.md || true
-          agenttrace --overview -f html -o agenttrace-overview.html || true
-      - uses: actions/upload-artifact@v7
+        run: agenttrace --overview -f markdown || true
+
+      - name: Session-level breakdown (report-only)
+        if: always()
+        run: agenttrace --sessions -f markdown || true
+
+      # actions/upload-artifact v7.0.0
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         if: always()
         with:
-          name: agenttrace-overview
-          path: |
-            agenttrace-overview.json
-            agenttrace-overview.md
-            agenttrace-overview.html
+          name: agenttrace-reports
+          path: agenttrace-overview.json
