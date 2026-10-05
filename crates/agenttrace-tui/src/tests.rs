@@ -624,6 +624,70 @@ fn simplified_navigation_uses_three_areas_and_command_palette_key() {
 }
 
 #[test]
+fn unicode_case_folding_matches_non_ascii_queries() {
+    // rm-016: the live-search filter is case-insensitive by contract, and
+    // ASCII-only folding on either side (query fold here in
+    // refresh_filtered, value fold in filters::contains) missed every
+    // case-variant non-ASCII query. Both folds are now Unicode-aware.
+    // Full-width Latin and the Turkish dotted-I rule stay out of scope by
+    // the rm-016 acceptance note.
+    let mut app = App::new(
+        vec![
+            session(
+                "café résumé",
+                "claude_code",
+                "claude-sonnet-4",
+                90,
+                0.01,
+                "rg",
+            ),
+            session("billing", "codex_cli", "gpt-5", 95, 0.02, "read_file"),
+        ],
+        "test",
+        None,
+    );
+    for query in ["CAFÉ RÉSUMÉ", "Café Résumé", "café résumé"] {
+        app.clear_filters();
+        app.input = query.to_string();
+        app.apply_search_input();
+        assert_eq!(
+            app.filtered.len(),
+            1,
+            "query {query:?} must match the accented session"
+        );
+        assert!(app.sessions[app.filtered[0]].name.contains("café résumé"));
+    }
+    // The reverse direction: a session stored in upper case, queried in
+    // lower case (value-side fold).
+    let mut upper = App::new(
+        vec![session(
+            "ИНЖЕНЕР-АНАЛИЗ",
+            "claude_code",
+            "gpt-5",
+            90,
+            0.01,
+            "bash",
+        )],
+        "test",
+        None,
+    );
+    upper.clear_filters();
+    upper.input = "инженер-анализ".to_string();
+    upper.apply_search_input();
+    assert_eq!(
+        upper.filtered.len(),
+        1,
+        "Cyrillic value-side fold must match"
+    );
+    // Out of scope by design: full-width Latin is a width mapping, not a
+    // case fold — 'ＣＡＦÉ' must not match 'café résumé'.
+    app.clear_filters();
+    app.input = "ＣＡＦÉ".to_string();
+    app.apply_search_input();
+    assert!(app.filtered.is_empty());
+}
+
+#[test]
 fn live_search_paste_and_escape_restore_the_previous_filter() {
     let mut app = App::new(
         vec![
@@ -1631,10 +1695,10 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 22 (rm-400/rm-401 bump): a warm entry is reused only
-                // when it carries the current schema version, so this fixture
-                // tracks SESSION_CACHE_SCHEMA_VERSION.
-                r#"{{"schema_version":22,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                // Schema 23 (rm-445 parser-semantics bump): a warm entry is
+                // reused only when it carries the current schema version, so
+                // this fixture tracks SESSION_CACHE_SCHEMA_VERSION.
+                r#"{{"schema_version":23,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

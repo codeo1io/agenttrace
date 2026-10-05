@@ -115,6 +115,26 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some(events) = parse_antigravity_trajectory(raw) {
             return session_from_events(name, path, events);
         }
+        // rm-445: Claude Code exports saved as JSON arrays (the newer
+        // dual-key session_id/sessionId transcripts) reach this block
+        // only after the qwen value classifier rejects them with the
+        // upstream-#304 guard. Reuse the claude transcript probe over
+        // the array elements so these attribute to claude_code instead
+        // of degenerating to the generic array-of-Events reader at the
+        // bottom of this function (which counted the lines but no
+        // roles, tokens, or pricing — `generic`/`default`/$0). The
+        // probe's own validation gates this: only arrays whose elements
+        // parse as claude transcript lines match, and the qwen, openclaw,
+        // hermes, and antigravity value formats all probe earlier.
+        if let Value::Array(elements) = value {
+            let array_objs: Vec<JsonObject> = elements
+                .iter()
+                .filter_map(|element| element.as_object().cloned())
+                .collect();
+            if let Some(events) = parse_claude_code_jsonl(&array_objs) {
+                return session_from_events(name, path, events);
+            }
+        }
     }
     if parsed_value.is_none() {
         if let Some((events, parse_counters)) = parse_codex_rollout_jsonl(raw) {
@@ -1721,10 +1741,20 @@ fn carries_claude_evidence(obj: &Map<String, Value>) -> bool {
 fn is_qwen_code_value(value: &Value) -> bool {
     match value {
         Value::Object(obj) => is_qwen_code_event(obj) || is_qwen_code_json_output(obj),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(Value::as_object)
-            .any(is_qwen_code_event),
+        Value::Array(items) => {
+            // Review F3 (run 2d37535d independent_review 204c55f4): the
+            // `.any` alone carried no file-level claude veto, unlike the
+            // line-form twin is_qwen_code_jsonl (rm-345), so a mixed
+            // [qwen line, claude dual-key line] array classified wholesale
+            // qwen_code and swallowed the claude line. Same rule as the
+            // twin: one claude-evidence carrier anywhere disqualifies the
+            // whole array; it then falls through dispatch to the
+            // claude-array probe (or generic) instead of qwen.
+            let objs: Vec<&Map<String, Value>> =
+                items.iter().filter_map(Value::as_object).collect();
+            objs.iter().any(|obj| is_qwen_code_event(obj))
+                && !objs.iter().any(|obj| carries_claude_evidence(obj))
+        }
         _ => false,
     }
 }
@@ -1759,6 +1789,17 @@ fn is_qwen_code_event(obj: &Map<String, Value>) -> bool {
         typ,
         "system" | "user" | "assistant" | "result" | "stream_event"
     ) {
+        return false;
+    }
+    // rm-445 (mirrors upstream luoyuctl/agenttrace #304, 2026-10-04):
+    // newer Claude Code transcripts carry BOTH `session_id` and
+    // `sessionId`; Qwen Code only ever writes the snake_case key. The
+    // value path (single objects and JSON arrays, via is_qwen_code_value)
+    // used to classify dual-key transcripts as qwen_code through the
+    // session_id arm below — the line form was already covered by
+    // rm-345's file-level carries_claude_evidence guard — so reject any
+    // object carrying the camelCase key before the snake_case check runs.
+    if obj.contains_key("sessionId") {
         return false;
     }
     if obj.contains_key("session_id") {
@@ -5643,6 +5684,37 @@ mod tests {
         let map = oh_my_pi_usage(Some(&usage)).expect("usage map");
         assert_eq!(map.get("input_tokens"), Some(&100));
         assert_eq!(map.get("output_tokens"), Some(&50));
+    }
+
+    #[test]
+    fn qwen_value_rejects_mixed_arrays() {
+        // Review F3: the Array arm must mirror the line-form twin's
+        // file-level veto (is_qwen_code_jsonl, rm-345). A mixed array —
+        // one genuine qwen line plus one claude dual-key line — used to
+        // classify wholesale qwen_code, swallowing the claude line's
+        // accounting (live PoC: mixed.json → qwen_code/default/$0).
+        let qwen_line = serde_json::json!({
+            "type": "user",
+            "session_id": "q-mixed-1",
+            "prompt": "hello",
+            "response": "world",
+        });
+        let claude_line = serde_json::json!({
+            "session_id": "c-mixed-2",
+            "sessionId": "c-mixed-2",
+            "type": "assistant",
+            "message": {"role": "assistant"},
+        });
+        let mixed = Value::Array(vec![qwen_line, claude_line]);
+        assert!(!is_qwen_code_value(&mixed));
+        // A pure-qwen array still classifies qwen (the veto is not a
+        // blanket rejection).
+        let pure = Value::Array(vec![serde_json::json!({
+            "type": "user",
+            "session_id": "q-pure-1",
+            "prompt": "hello",
+        })]);
+        assert!(is_qwen_code_value(&pure));
     }
 
     #[test]

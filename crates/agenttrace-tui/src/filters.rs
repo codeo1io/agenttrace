@@ -360,7 +360,12 @@ pub(super) fn cmp_f64(a: f64, b: f64) -> Ordering {
 }
 
 pub(super) fn contains(value: &str, query: &str) -> bool {
-    value.to_ascii_lowercase().contains(query)
+    // rm-016: Unicode-aware fold — callers pre-fold the query with the
+    // same rule (app.rs refresh_filtered for text search, structured
+    // filter values via apply_structured_search), so both sides of the
+    // match lower with full Unicode mappings. ASCII folding here missed
+    // case-variant non-ASCII queries ('CAFÉ' never matched 'café').
+    value.to_lowercase().contains(query)
 }
 
 pub(super) fn status_width(width: u16) -> usize {

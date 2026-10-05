@@ -6,7 +6,15 @@ use crate::{
 use std::collections::BTreeSet;
 
 pub fn search_sessions(sessions: &[Session], query: &str, limit: usize) -> Vec<SearchResult> {
-    let query = query.trim().to_ascii_lowercase();
+    // rm-016: Unicode-aware case folding on BOTH sides of the match —
+    // the CLI --search contract says case-insensitive, and ASCII-only
+    // folding silently missed every case-variant non-ASCII query
+    // (--search 'CAFÉ RÉSUMÉ' vs a 'café résumé' session returned 0
+    // hits). Out of scope by design (documented in rm-016): full-width
+    // Latin ('ＡＢＣ' stays distinct from 'abc' — that is a width
+    // normalization, not a case fold) and the Turkish dotted-I
+    // locale rule (Rust's lowering is locale-independent).
+    let query = query.trim().to_lowercase();
     if query.is_empty() {
         return Vec::new();
     }
@@ -229,7 +237,10 @@ fn add_match(
     if value.is_empty() {
         return;
     }
-    if value.to_ascii_lowercase().contains(query) {
+    // rm-016: Unicode-aware fold, kept symmetric with the query fold in
+    // search_sessions above (ASCII value folding missed case-variant
+    // non-ASCII metadata like model or file names with accents).
+    if value.to_lowercase().contains(query) {
         let item = format!("{}: {}", label, value);
         if seen.insert(item.clone()) {
             matches.push(item);
@@ -275,6 +286,52 @@ mod tests {
         assert!(matches.contains(&"tool argument: go test ./internal/billing".to_string()));
         assert!(matches.len() <= 8);
         assert!(!matches.iter().any(|item| item.starts_with("tool_arg:")));
+    }
+
+    #[test]
+    fn unicode_case_folding_matches_non_ascii_queries() {
+        // rm-016: the --search contract is case-insensitive, and ASCII-only
+        // folding silently missed every case-variant non-ASCII query —
+        // `--search 'CAFÉ RÉSUMÉ'` returned 0 hits against a session whose
+        // derived name was 'café résumé' (assess PoC on the utf8 corpus).
+        // Both sides of the match now fold with full Unicode mappings.
+        let session = |name: &str| Session {
+            name: name.to_string(),
+            path: "/tmp/utf8.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                source_tool: "claude_code".to_string(),
+                model_used: "claude-sonnet-4".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let lower = session("café résumé");
+        let upper = session("CAFÉ RÉSUMÉ");
+
+        assert_eq!(
+            search_sessions(std::slice::from_ref(&lower), "CAFÉ RÉSUMÉ", 10).len(),
+            1
+        );
+        assert_eq!(
+            search_sessions(std::slice::from_ref(&upper), "café résumé", 10).len(),
+            1
+        );
+        // Cyrillic folds too (the rm-016 acceptance example).
+        let cyrillic = session("инженер-анализ");
+        assert_eq!(search_sessions(&[cyrillic], "ИНЖЕНЕР-АНАЛИЗ", 10).len(), 1);
+        // ASCII behavior is unchanged: case-insensitive, still matches.
+        assert_eq!(
+            search_sessions(std::slice::from_ref(&lower), "CAFÉ", 10).len(),
+            1
+        );
+        // Out of scope by design (documented in rm-016): full-width Latin
+        // is a width mapping, not a case fold — 'ＣＡＦÉ' must NOT match
+        // ASCII/case-folded 'café'.
+        assert_eq!(search_sessions(&[lower], "ＣＡＦÉ", 10).len(), 0);
     }
 
     #[test]

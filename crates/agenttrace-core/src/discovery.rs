@@ -412,10 +412,10 @@ fn matches_project_filter(session: &Session, filter: &str) -> bool {
 }
 
 fn matches_filter(value: &str, filter: &str) -> bool {
-    filter.trim().is_empty()
-        || value
-            .to_ascii_lowercase()
-            .contains(&filter.trim().to_ascii_lowercase())
+    // rm-016 + review F1: project display names/roots are user text, so
+    // fold Unicode-aware on both sides (was ASCII-only, same defect class
+    // as the --query filter the review caught live).
+    filter.trim().is_empty() || value.to_lowercase().contains(&filter.trim().to_lowercase())
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {

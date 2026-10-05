@@ -1234,8 +1234,21 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .or_default();
         task_type_entry.sessions += 1;
         task_type_entry.cost += session.metrics.cost_estimated;
-        task_type_entry.tokens_input += session.metrics.tokens_input.max(0);
-        task_type_entry.tokens_output += session.metrics.tokens_output.max(0);
+        // rm-446: the report-side token accumulators saturate instead of
+        // overflowing — a hostile session carrying i64::MAX token fields
+        // used to panic debug builds ('attempt to add with overflow' at
+        // this exact site) and silently wrap per-task-type totals to zero
+        // in release; the per-session clamp convention (rm-046) now covers
+        // the aggregation side too. Census of this function's `+=` sites:
+        // these two are the only i64 accumulators fed by hostile-
+        // controllable metric fields; session/cost counters are usize +1
+        // (bounded by real directory size) and f64 (IEEE, no wrap).
+        task_type_entry.tokens_input = task_type_entry
+            .tokens_input
+            .saturating_add(session.metrics.tokens_input.max(0));
+        task_type_entry.tokens_output = task_type_entry
+            .tokens_output
+            .saturating_add(session.metrics.tokens_output.max(0));
 
         let project_entry = overview
             .by_project
@@ -1949,6 +1962,13 @@ mod tests {
         assert!(session.metrics.cost_estimated >= 0.0);
     }
 
+    // NOTE (attempt 6018c8db): the rm-446 saturation test below this block
+    // pre-existed this session — a prior attempt of this phase died with
+    // no result in the spool after landing only that test. It was audited
+    // line-by-line against the fix at compute_overview_iter (assertions
+    // verified by hand) and adopted; the duplicate written by this attempt
+    // was removed in its favor (it also pins by_task_type.len() == 1).
+
     #[test]
     fn clamped_token_totals_flag_the_cost_provenance() {
         // rm-046: a class pinned at i64::MAX means accumulation
@@ -2002,6 +2022,38 @@ mod tests {
         session.metrics.tokens_cache_w = 5;
         session.metrics.tokens_cache_r = 5;
         assert_eq!(total_tokens(&session), i64::MAX);
+    }
+
+    #[test]
+    fn overview_task_type_tokens_saturate_instead_of_overflowing() {
+        // rm-446: report-side aggregation over hostile magnitudes. Two
+        // sessions in the same task-type bucket each carrying i64::MAX
+        // token fields used to overflow the by_task_type accumulator —
+        // debug builds panicked ('attempt to add with overflow' at the
+        // compute_overview_iter site, killing --overview/--audit/
+        // --recommend/--mcp-governance/--context-trends alike) while
+        // release builds silently wrapped per-type totals to zero. The
+        // report side now clamps like the per-session side (rm-046):
+        // i64::MAX + i64::MAX stays at i64::MAX, finite and non-negative.
+        let first = session_from_events("first", "first.jsonl", vec![Event::default()])
+            .expect("first session");
+        let mut first = first;
+        first.metrics.tokens_input = i64::MAX;
+        first.metrics.tokens_output = i64::MAX;
+        let second = session_from_events("second", "second.jsonl", vec![Event::default()])
+            .expect("second session");
+        let mut second = second;
+        second.metrics.tokens_input = i64::MAX;
+        second.metrics.tokens_output = 7;
+        let overview = compute_overview(&[first, second]);
+        assert_eq!(overview.by_task_type.len(), 1);
+        let entry = overview
+            .by_task_type
+            .values()
+            .next()
+            .expect("task-type entry");
+        assert_eq!(entry.tokens_input, i64::MAX);
+        assert_eq!(entry.tokens_output, i64::MAX);
     }
 
     #[test]

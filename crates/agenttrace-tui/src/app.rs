@@ -561,7 +561,12 @@ impl App {
     }
 
     fn apply_structured_search(&mut self, value: &str) -> bool {
-        let lower = value.trim().to_ascii_lowercase();
+        // rm-016: Unicode-aware fold — the structured input carries
+        // user-text values (source/model/anomaly filter values), and
+        // filters::contains now folds the value side with full Unicode
+        // mappings, so the stored filter value must fold the same way.
+        // Keyword matching below is ASCII-only and unaffected.
+        let lower = value.trim().to_lowercase();
         let mut fields = lower.splitn(2, char::is_whitespace);
         let key = fields.next().unwrap_or("");
         let rest = fields.next().unwrap_or("").trim();
@@ -1358,7 +1363,10 @@ impl App {
     }
 
     fn refresh_filtered(&mut self) {
-        let query = self.query.trim().to_ascii_lowercase();
+        // rm-016: Unicode-aware query fold, symmetric with filters::contains
+        // — the TUI text filter is case-insensitive and ASCII-only folding
+        // missed case-variant non-ASCII queries.
+        let query = self.query.trim().to_lowercase();
         let now = chrono::Utc::now();
         self.filtered = self
             .sessions

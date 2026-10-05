@@ -5,7 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 22;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 23;
+// Bumped 22 -> 23 (run 2d37535d cycle 1, rm-445): the dual-key
+// (session_id + sessionId) classifier fix changes parsed source/model/
+// tokens for value-path Claude Code transcripts, and warm v22 entries
+// demonstrably carry qwen-misclassified rows for those files (the
+// roadmap re-verify had to defeat the path-keyed cache with fresh
+// corpus copies to see the pre-fix outputs), so cached sessions must
+// regenerate under corrected accounting (the rm-230 convention:
+// parser-semantics changes bump the schema). Provenance note: the fork
+// reached 22 via the rm-400/rm-401 integration; upstream's own 21 -> 22
+// bump for their #304 is a different lineage and does not collide with
+// this fork-local numbering.
 // Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
 // kimi_cli usage-alias fix and the Codex compaction pairing fix change
 // reported totals for unchanged files, so warm v21 entries carry the

@@ -1125,15 +1125,18 @@ fn prepare_cli_view(mut sessions: Vec<Session>, args: &Args) -> anyhow::Result<V
             && matches_number(session.metrics.cost_estimated, &args.cost)
             && (args.anomaly.is_empty()
                 || session.anomalies.iter().any(|item| {
+                    // rm-016 + review F1: anomaly kind/detail are user-facing
+                    // text — fold Unicode-aware on both sides ("any" stays an
+                    // ASCII keyword comparison).
                     args.anomaly.eq_ignore_ascii_case("any")
                         || item
                             .kind
-                            .to_ascii_lowercase()
-                            .contains(&args.anomaly.to_ascii_lowercase())
+                            .to_lowercase()
+                            .contains(&args.anomaly.to_lowercase())
                         || item
                             .detail
-                            .to_ascii_lowercase()
-                            .contains(&args.anomaly.to_ascii_lowercase())
+                            .to_lowercase()
+                            .contains(&args.anomaly.to_lowercase())
                 }))
     });
     let descending = match args.order.as_str() {
@@ -1187,7 +1190,10 @@ fn prepare_cli_view(mut sessions: Vec<Session>, args: &Args) -> anyhow::Result<V
 }
 
 fn matches_text(session: &Session, query: &str) -> bool {
-    let query = query.trim().to_ascii_lowercase();
+    // rm-016 + review F1: user text, so Unicode-aware folding (PR-5) —
+    // `--query 'CAFÉ'` used to miss a session named 'café …' because both
+    // sides were ASCII-folded while --search had already been fixed.
+    let query = query.trim().to_lowercase();
     query.is_empty()
         || [
             session.name.as_str(),
@@ -1197,16 +1203,15 @@ fn matches_text(session: &Session, query: &str) -> bool {
             session.metrics.model_used.as_str(),
         ]
         .iter()
-        .any(|value| value.to_ascii_lowercase().contains(&query))
+        .any(|value| value.to_lowercase().contains(&query))
         || session
             .metrics
             .tool_usage
             .keys()
             .chain(session.metrics.file_usage.keys())
-            .any(|value| value.to_ascii_lowercase().contains(&query))
+            .any(|value| value.to_lowercase().contains(&query))
         || session.anomalies.iter().any(|item| {
-            item.kind.to_ascii_lowercase().contains(&query)
-                || item.detail.to_ascii_lowercase().contains(&query)
+            item.kind.to_lowercase().contains(&query) || item.detail.to_lowercase().contains(&query)
         })
 }
 
@@ -2021,6 +2026,19 @@ mod tests {
         let mut file = fs::File::create(&path).expect("create temp session");
         writeln!(file, "{content}").expect("write temp session");
         path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn sessions_query_filter_folds_unicode() {
+        // rm-016 + review F1: --query is user text (PR-5), so it must fold
+        // Unicode-aware — 'CAFÉ' used to miss a session named 'café …'
+        // while --search had already been fixed (live review PoC).
+        let s = session("café résumé", "/tmp/utf8.jsonl", "2026-01-01T00:00:00Z");
+        assert!(matches_text(&s, "CAFÉ"));
+        assert!(matches_text(&s, "Résumé"));
+        assert!(matches_text(&s, "résumé"));
+        assert!(matches_text(&s, "  CAFÉ  "));
+        assert!(!matches_text(&s, "nomatch"));
     }
 
     fn session(name: &str, path: &str, session_start: &str) -> Session {

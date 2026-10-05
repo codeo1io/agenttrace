@@ -896,7 +896,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // schema so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(22)
+            Some(23) // rm-445 parser-semantics bump (schema 23)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1064,7 +1064,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         // version (v22 — see the rm-400/401 bump note in session_cache.rs).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(22)
+            Some(23) // rm-445 parser-semantics bump (schema 23)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1335,6 +1335,49 @@ fn rust_parses_fixture_formats_used_by_compare_gate() {
             1,
             1,
             175,
+        ),
+        // rm-445: the same preamble corpus with dual session_id/sessionId
+        // keys (newer Claude Code exports). The line form was already
+        // covered by rm-345's file-level guard — pinned here so the guard
+        // pair cannot regress independently — while the value-path shapes
+        // (JSON array saved as .json, JSON array saved as .jsonl, and a
+        // bare dual-key object) were misclassified as qwen_code before the
+        // upstream-#304-mirroring guard in is_qwen_code_event.
+        (
+            "testdata/claude-code-dual-session-id.jsonl",
+            "claude_code",
+            "claude-sonnet-4",
+            1,
+            1,
+            1,
+            175,
+        ),
+        (
+            "testdata/claude-code-dual-session-id-array.json",
+            "claude_code",
+            "claude-sonnet-4",
+            1,
+            1,
+            1,
+            175,
+        ),
+        (
+            "testdata/claude-code-dual-session-id-array.jsonl",
+            "claude_code",
+            "claude-sonnet-4",
+            1,
+            1,
+            1,
+            175,
+        ),
+        (
+            "testdata/claude-code-dual-session-id-object.json",
+            "claude_code",
+            "default",
+            1,
+            0,
+            0,
+            6,
         ),
         (
             "testdata/copilot-attrs-map.jsonl",
