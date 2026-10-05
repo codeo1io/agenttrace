@@ -925,7 +925,9 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
             "    {:<30} {:>4} Sessions  {:>8}\n",
-            tool_display_name(&agent),
+            // rm-239: agent keys are transcript-derived; same rule as the
+            // other group-key rows (see By Model).
+            sanitize_line_segment(&tool_display_name(&agent)),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -939,7 +941,11 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            model,
+            // rm-239: group keys are transcript-derived (session/model
+            // strings); sanitize the raw row label like every other
+            // text-renderer field — text_cell is not used here because the
+            // column must not truncate long model names.
+            sanitize_line_segment(&model),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -956,7 +962,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            provider,
+            sanitize_line_segment(&provider),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -967,7 +973,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     for (task_type, group) in &overview.by_task_type {
         out.push_str(&format!(
             "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
-            task_type,
+            sanitize_line_segment(task_type),
             format_count(group.sessions),
             format_cost(group.cost),
             format_tokens(group.tokens_input),
@@ -2621,9 +2627,14 @@ fn report_html_code_list(values: &[String]) -> String {
 }
 
 fn html_escape(value: &str) -> String {
+    // rm-239: entity escaping alone still emitted raw control bytes — a
+    // crafted session/model string carried ESC into <td> cells and <code>
+    // lists (assess PoC 2026-10-05: 2 raw-ESC lines in `-f html`). Control
+    // bytes are replaced in the same pass, never rendered.
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
+            _ if ch.is_control() => out.push('\u{FFFD}'),
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
@@ -2695,7 +2706,11 @@ fn text_wrapped_key_values(label: &str, values: &[String], limit: usize) -> Vec<
 }
 
 fn text_cell(value: &str, limit: usize) -> String {
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    // rm-239: the whitespace squash keeps column geometry but only removes
+    // the whitespace subset — every remaining control byte (ESC and friends)
+    // rode straight to the terminal. Same helper and rule as rm-383's
+    // session-report fields: control bytes are replaced, never rendered.
+    let value = sanitize_line_segment(&value.split_whitespace().collect::<Vec<_>>().join(" "));
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
     } else {
@@ -2794,14 +2809,21 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 }
 
 fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', "<br>")
+    // rm-239: the markdown lane's only rewrites were pipes and newlines —
+    // a raw ESC rode straight into table cells (assess PoC 2026-10-05: 1
+    // raw-ESC line in `-f markdown`). The newline→<br> rewrite runs FIRST
+    // so it survives sanitization; every other control byte is replaced.
+    sanitize_line_segment(&value.replace('|', "\\|").replace('\n', "<br>"))
 }
 
 fn markdown_inline_code(value: &str) -> String {
-    value
-        .replace('`', "'")
-        .replace('|', "\\|")
-        .replace('\n', "<br>")
+    // rm-239: same rule as markdown_cell — see its comment.
+    sanitize_line_segment(
+        &value
+            .replace('`', "'")
+            .replace('|', "\\|")
+            .replace('\n', "<br>"),
+    )
 }
 
 fn report_markdown_code_list(values: &[String]) -> String {
@@ -3050,6 +3072,75 @@ mod tests {
         assert!(
             !source.contains("\nfn percentile("),
             "reports.rs must not re-declare percentile; use crate::percentile"
+        );
+    }
+
+    // --- rm-239: no overview report lane emits control bytes --------------
+
+    fn hostile_key_overview() -> Overview {
+        // Group keys are transcript-derived (session/model strings). At
+        // ea5c41e the overview lanes rendered them raw: assess PoC
+        // 2026-10-05 counted raw-ESC lines text/markdown/html/json =
+        // 1/1/2/0 on a crafted journal (the stale rm-239 acceptance
+        // clause claimed markdown/html were already safe).
+        let hostile = "mod\u{1b}]52;c;!\u{7}el";
+        Overview {
+            total_sessions: 1,
+            by_agent: BTreeMap::from([(hostile.to_string(), GroupOverview::default())]),
+            by_model: BTreeMap::from([(hostile.to_string(), GroupOverview::default())]),
+            by_provider: BTreeMap::from([(hostile.to_string(), GroupOverview::default())]),
+            by_task_type: BTreeMap::from([(hostile.to_string(), TaskTypeOverview::default())]),
+            ..Overview::default()
+        }
+    }
+
+    #[test]
+    fn overview_text_lane_replaces_control_bytes_in_group_keys() {
+        let text = report_overview_text(&hostile_key_overview(), &[]);
+        let offenders: Vec<char> = text
+            .chars()
+            .filter(|ch| ch.is_control() && *ch != '\n')
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "text lane must never emit a control byte other than its own newlines; got {offenders:?}"
+        );
+        assert!(
+            text.contains("mod\u{FFFD}]52;c;!\u{FFFD}el"),
+            "the label is replaced, not dropped — printed truth"
+        );
+    }
+
+    #[test]
+    fn overview_markdown_lane_replaces_control_bytes_in_group_keys() {
+        let markdown = report_overview_markdown(&hostile_key_overview(), &[]);
+        assert!(
+            markdown.chars().all(|ch| !ch.is_control() || ch == '\n'),
+            "markdown lane must never emit a control byte other than its own newlines"
+        );
+        assert!(markdown.contains("mod\u{FFFD}]52;c;!\u{FFFD}el"));
+    }
+
+    #[test]
+    fn overview_html_lane_replaces_control_bytes_in_group_keys() {
+        let html = report_overview_html(&hostile_key_overview(), &[]);
+        assert!(
+            html.chars().all(|ch| !ch.is_control() || ch == '\n'),
+            "html lane must never emit a control byte other than its own newlines"
+        );
+        assert!(html.contains("mod\u{FFFD}]52;c;!\u{FFFD}el"));
+    }
+
+    #[test]
+    fn overview_json_lane_stays_lossless_for_control_bytes() {
+        // The JSON lane is machine consumption: it stays byte-faithful
+        // (serde escapes ESC as \u001b, DEL-class bytes as \u0007 — the
+        // key survives exactly, not replaced). The rm-239 sweep
+        // sanitizes at the render boundary only.
+        let json = report_overview_json(&hostile_key_overview(), &[]);
+        assert!(
+            json.contains("mod\\u001b]52;c;!\\u0007el"),
+            "json lane must keep the hostile group key losslessly"
         );
     }
 }

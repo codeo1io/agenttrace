@@ -131,8 +131,18 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     }
     let objs = jsonl_objects(raw).collect::<Vec<_>>();
     if parsed_value.is_none() {
-        let probes: [JsonlProbe; 5] = [
-            parse_workbuddy_jsonl,
+        // workbuddy parses outside the probe array — first, exactly where
+        // it used to sit — because it carries its own disclosure channel
+        // for usage-accounting decisions (rm-497): basis-clamped inputs and
+        // usage blocks dropped on line types the netting never consults.
+        if let Some((events, usage_disclosure)) = parse_workbuddy_jsonl(&objs) {
+            let mut session = session_from_events(name, path, events)?;
+            for (key, count) in usage_disclosure {
+                *session.metrics.line_skips.entry(key).or_insert(0) += count;
+            }
+            return Ok(session);
+        }
+        let probes: [JsonlProbe; 4] = [
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
             parse_claude_transcript_jsonl,
@@ -782,7 +792,7 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     non_empty(events)
 }
 
-fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
+fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, BTreeMap<String, usize>)> {
     if !objs.iter().any(|entry| {
         matches!(
             string(entry.get("type")),
@@ -795,6 +805,11 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut latest_usage = None;
+    // rm-497: workbuddy usage accounting is a set of decisions (netting,
+    // clamping, which line types are consulted) — every firing that could
+    // change a reported number lands here and surfaces as per-session
+    // parse diagnostics, the same channel as rm-400/rm-401.
+    let mut usage_disclosure: BTreeMap<String, usize> = BTreeMap::new();
     for entry in objs.iter() {
         if let Some(next) = entry
             .get("providerData")
@@ -825,9 +840,16 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         ..Event::default()
                     });
                 }
-                latest_usage = workbuddy_usage(entry).or(latest_usage);
+                latest_usage = workbuddy_usage(entry, &mut usage_disclosure).or(latest_usage);
             }
             "reasoning" => {
+                // rm-497: usage blocks riding reasoning lines were silently
+                // ignored — disclose the drop instead of losing it quietly.
+                if workbuddy_usage_value(entry).is_some() {
+                    *usage_disclosure
+                        .entry("workbuddy_usage_dropped:reasoning".to_string())
+                        .or_insert(0) += 1;
+                }
                 let reasoning = workbuddy_content(
                     entry
                         .get("content")
@@ -847,7 +869,7 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 }
             }
             "function_call" => {
-                latest_usage = workbuddy_usage(entry).or(latest_usage);
+                latest_usage = workbuddy_usage(entry, &mut usage_disclosure).or(latest_usage);
                 events.push(Event {
                     role: "assistant".to_string(),
                     timestamp,
@@ -862,17 +884,26 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     ..Event::default()
                 });
             }
-            "function_call_result" => events.push(Event {
-                role: "tool".to_string(),
-                content: jsonish(entry.get("output")),
-                timestamp,
-                cwd,
-                tool_call_id: string(entry.get("callId")).unwrap_or("").to_string(),
-                is_error: string(entry.get("status")).is_some_and(|status| status != "completed"),
-                model_used: model.clone(),
-                source_tool: "workbuddy".to_string(),
-                ..Event::default()
-            }),
+            "function_call_result" => {
+                // rm-497: same disclosure for result-carried usage blocks.
+                if workbuddy_usage_value(entry).is_some() {
+                    *usage_disclosure
+                        .entry("workbuddy_usage_dropped:function_call_result".to_string())
+                        .or_insert(0) += 1;
+                }
+                events.push(Event {
+                    role: "tool".to_string(),
+                    content: jsonish(entry.get("output")),
+                    timestamp,
+                    cwd,
+                    tool_call_id: string(entry.get("callId")).unwrap_or("").to_string(),
+                    is_error: string(entry.get("status"))
+                        .is_some_and(|status| status != "completed"),
+                    model_used: model.clone(),
+                    source_tool: "workbuddy".to_string(),
+                    ..Event::default()
+                })
+            }
             _ => {}
         }
     }
@@ -888,7 +919,7 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             },
         );
     }
-    non_empty(events)
+    non_empty(events).map(|events| (events, usage_disclosure))
 }
 
 fn workbuddy_content(value: Option<&Value>) -> String {
@@ -901,14 +932,32 @@ fn workbuddy_content(value: Option<&Value>) -> String {
         .join("\n")
 }
 
-fn workbuddy_usage(entry: &Map<String, Value>) -> Option<TokenUsage> {
-    let mut usage = entry
+fn workbuddy_usage_value(entry: &Map<String, Value>) -> Option<&Value> {
+    entry
         .get("message")
         .and_then(|message| message.get("usage"))
         .or_else(|| entry.get("providerData").and_then(|data| data.get("usage")))
-        .and_then(usage_from_value)?;
+}
+
+fn workbuddy_usage(
+    entry: &Map<String, Value>,
+    disclosure: &mut BTreeMap<String, usize>,
+) -> Option<TokenUsage> {
+    let mut usage = workbuddy_usage_value(entry).and_then(usage_from_value)?;
     let cached = usage.get("cache_read_input_tokens").copied().unwrap_or(0);
     if let Some(input) = usage.get_mut("input_tokens") {
+        // rm-497: the vendor basis is unstated — when the reported
+        // `input_tokens` is smaller than `cache_read_input_tokens` the
+        // netting below clamps input to zero, and pre-rm-497 that clamp was
+        // silent: cost was then priced on cache reads alone with zero
+        // counters (live PoC: input 50 / cache_read 5000 -> tokens_input 0,
+        // cost on cache alone). Upstream issue #310 names the same basis
+        // question. Disclose every firing as a per-session diagnostic.
+        if *input < cached {
+            *disclosure
+                .entry("workbuddy_usage_basis_clamped".to_string())
+                .or_insert(0) += 1;
+        }
         // `saturating_sub`: adversarial magnitudes clamp input_tokens to
         // i64::MIN, where a plain subtraction underflows (debug panic) or
         // wraps to a huge positive that survives `.max(0)` (release).
@@ -5510,9 +5559,14 @@ mod tests {
                 }
             }
         });
-        let usage = workbuddy_usage(value.as_object().expect("object")).expect("usage");
+        let mut disclosure = std::collections::BTreeMap::new();
+        let usage =
+            workbuddy_usage(value.as_object().expect("object"), &mut disclosure).expect("usage");
         assert_eq!(usage.get("input_tokens"), Some(&0));
         assert_eq!(usage.get("output_tokens"), Some(&10));
+        // rm-497: the adversarial clamp is also a basis mismatch
+        // (i64::MIN < any cache read) and must be disclosed, not silent.
+        assert_eq!(disclosure.get("workbuddy_usage_basis_clamped"), Some(&1));
     }
 
     #[test]
@@ -5913,6 +5967,157 @@ mod tests {
             Some(&1),
             "a zero-valued matched field is still a wire-shape signal"
         );
+    }
+
+    // --- workbuddy usage-basis disclosure (rm-497;
+    // renumbered at integration) -----------------------------------------
+
+    fn workbuddy_basis_corpus(input: i64, cache_read: i64, output: i64) -> String {
+        // Cycle-3 research PoC corpus (run 1f12309adc31): the vendor basis
+        // of workbuddy `input_tokens` is unstated (upstream #310) and the
+        // parser nets it against `cache_read_input_tokens`; when the two
+        // disagree the clamp used to zero input silently.
+        let lines = [
+            serde_json::json!({
+                "type": "message",
+                "sessionId": "s1",
+                "cwd": "/home/user/proj",
+                "timestamp": 1,
+                "message": {
+                    "usage": {
+                        "input_tokens": input,
+                        "cache_read_input_tokens": cache_read,
+                        "output_tokens": output
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "function_call",
+                "sessionId": "s1",
+                "cwd": "/home/user/proj",
+                "timestamp": 2,
+                "callId": "c1",
+                "name": "shell",
+                "arguments": "{}"
+            }),
+        ];
+        lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn workbuddy_usage_basis_clamp_is_disclosed_in_parse_diagnostics() {
+        // Red-first pin of the live PoC: input 50 / cache_read 5000 kept
+        // tokens_input at 0 with ZERO counters at ea5c41e (cost was then
+        // priced on cache reads alone). The netting semantics are
+        // unchanged — the clamp now fires a visible counter.
+        let session = parse_raw_session(
+            "workbuddy",
+            "basis-clamped.jsonl",
+            &workbuddy_basis_corpus(50, 5000, 40),
+        )
+        .expect("workbuddy session parses");
+        assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+        assert_eq!(
+            session.metrics.tokens_input, 0,
+            "the clamp itself is unchanged — disclosure only"
+        );
+        assert_eq!(session.metrics.tokens_cache_r, 5000);
+        assert_eq!(session.metrics.tokens_output, 40);
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("workbuddy_usage_basis_clamped"),
+            Some(&1),
+            "a basis mismatch must surface as a parse diagnostic, not a silent zero"
+        );
+    }
+
+    #[test]
+    fn workbuddy_usage_netting_contract_control() {
+        // Vendor-basis control (gross input): 175 reported, 40 served from
+        // cache -> net input 135. The clean net fires nothing: clean
+        // corpora keep byte-identical reports (line_skips stays empty).
+        let session = parse_raw_session(
+            "workbuddy",
+            "basis-includes.jsonl",
+            &workbuddy_basis_corpus(175, 40, 40),
+        )
+        .expect("workbuddy session parses");
+        assert_eq!(session.metrics.tokens_input, 135);
+        assert_eq!(session.metrics.tokens_output, 40);
+        assert!(
+            session.metrics.line_skips.is_empty(),
+            "no clamp and no dropped usage on a well-formed gross-basis journal"
+        );
+    }
+
+    #[test]
+    fn workbuddy_usage_on_unconsulted_lines_is_disclosed_dropped() {
+        // Usage blocks riding reasoning / function_call_result lines were
+        // silently ignored (workbuddy_usage was consulted in the message
+        // and function_call arms only). They stay uncounted — metrics
+        // neutrality — but the drop is now a visible parse decision.
+        let lines = [
+            serde_json::json!({
+                "type": "message",
+                "sessionId": "s1",
+                "cwd": "/home/user/proj",
+                "timestamp": 1,
+                "message": {
+                    "content": [{"text": "hello"}],
+                    "usage": {"input_tokens": 100, "cache_read_input_tokens": 10, "output_tokens": 20}
+                }
+            }),
+            serde_json::json!({
+                "type": "reasoning",
+                "sessionId": "s1",
+                "cwd": "/home/user/proj",
+                "timestamp": 2,
+                "rawContent": "thinking",
+                "providerData": {"usage": {"input_tokens": 5, "output_tokens": 5}}
+            }),
+            serde_json::json!({
+                "type": "function_call_result",
+                "sessionId": "s1",
+                "cwd": "/home/user/proj",
+                "timestamp": 3,
+                "callId": "c1",
+                "status": "completed",
+                "output": "done",
+                "providerData": {"usage": {"input_tokens": 7}}
+            }),
+        ];
+        let raw = lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_raw_session("workbuddy", "usage-on-result.jsonl", &raw)
+            .expect("workbuddy session parses");
+        assert_eq!(session.metrics.tokens_input, 90, "100 gross - 10 cache");
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("workbuddy_usage_dropped:reasoning"),
+            Some(&1)
+        );
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("workbuddy_usage_dropped:function_call_result"),
+            Some(&1)
+        );
+        assert!(!session
+            .metrics
+            .line_skips
+            .contains_key("workbuddy_usage_basis_clamped"));
     }
 
     // --- codex token_usage_record across compaction (rm-401;

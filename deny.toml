@@ -15,6 +15,14 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# rm-498: the unsound class must be a policy decision, not an accident of
+# scope defaults. cargo-deny's default unsound scope excludes transitive
+# dependencies, which kept RUSTSEC-2026-0253 (lru <=0.18.1, reached here via
+# ratatui -> ratatui-core -> lru) invisible to this gate while the advisory
+# db already contained it (reproduced red-first: repo config -> `advisories
+# ok`, one added line `unsound = "all"` -> FAILED). Keep this explicit even
+# while the lock is clean so the class is denied by policy, not by luck.
+unsound = "all"
 ignore = []
 
 [licenses]
