@@ -356,47 +356,7 @@ fn run() -> anyhow::Result<()> {
         // stderr on a corpus the same flags condemn. Honor them here too:
         // the report still prints, the failures and evidence go to stderr,
         // and the process exits 2.
-        let overview = compute_overview(&sessions);
-        let failures = evaluate_overview_gate(
-            &overview,
-            &sessions,
-            args.fail_under_health,
-            args.fail_on_critical,
-            args.max_tool_fail_rate,
-        );
-        if !failures.is_empty() {
-            for failure in failures {
-                eprintln!("Gate failed: {failure}");
-            }
-            eprintln!("Local evidence:");
-            eprintln!("- avg health: {:.1}", average_health(&sessions));
-            eprintln!("- critical sessions: {}", overview.critical);
-            eprintln!("- tool fail rate: {:.1}%", tool_fail_rate(&sessions));
-            if let Some(session) = sessions.iter().min_by(|left, right| {
-                left.health
-                    .cmp(&right.health)
-                    .then_with(|| left.path.cmp(&right.path))
-                    .then_with(|| left.name.cmp(&right.name))
-            }) {
-                eprintln!("- lowest-health session: {}", session.path);
-            }
-            let inspect = if args.demo {
-                format!(
-                    "agenttrace --demo {} -f json",
-                    governance_inspect_flag(&args)
-                )
-            } else if let Some(dir) = args.dir.as_deref() {
-                format!(
-                    "agenttrace -d {:?} {} -f json",
-                    dir,
-                    governance_inspect_flag(&args)
-                )
-            } else {
-                format!("agenttrace {} -f json", governance_inspect_flag(&args))
-            };
-            eprintln!("- inspect: `{inspect}`");
-            std::process::exit(2);
-        }
+        enforce_report_gates(&args, &sessions);
         return Ok(());
     }
 
@@ -450,6 +410,13 @@ fn run() -> anyhow::Result<()> {
         };
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
+        // rm-486: the compare branch's own comment (above) claims the same
+        // coverage contract as the governance branch, but it returned Ok(())
+        // without ever evaluating the --fail-* gates — a gated `--compare`
+        // exited rc0 on a corpus the same flags condemn on every sibling
+        // report. Route it through the shared gate enforcement so a CI gate
+        // built on --compare cannot pass silently.
+        enforce_report_gates(&args, &sessions);
         return Ok(());
     }
 
@@ -655,6 +622,52 @@ fn run() -> anyhow::Result<()> {
     }
 
     bail!("no report action selected")
+}
+
+/// rm-486: the --fail-* report gate, evaluated identically by every report
+/// path that documents it (governance branch, --overview, and --compare).
+/// Prints the failures plus local evidence to stderr and exits 2; returns
+/// normally when the corpus passes.
+fn enforce_report_gates(args: &Args, sessions: &[Session]) {
+    let overview = compute_overview(sessions);
+    let failures = evaluate_overview_gate(
+        &overview,
+        sessions,
+        args.fail_under_health,
+        args.fail_on_critical,
+        args.max_tool_fail_rate,
+    );
+    if failures.is_empty() {
+        return;
+    }
+    for failure in failures {
+        eprintln!("Gate failed: {failure}");
+    }
+    eprintln!("Local evidence:");
+    eprintln!("- avg health: {:.1}", average_health(sessions));
+    eprintln!("- critical sessions: {}", overview.critical);
+    eprintln!("- tool fail rate: {:.1}%", tool_fail_rate(sessions));
+    if let Some(session) = sessions.iter().min_by(|left, right| {
+        left.health
+            .cmp(&right.health)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.name.cmp(&right.name))
+    }) {
+        eprintln!("- lowest-health session: {}", session.path);
+    }
+    let inspect = if args.demo {
+        format!("agenttrace --demo {} -f json", governance_inspect_flag(&args))
+    } else if let Some(dir) = args.dir.as_deref() {
+        format!(
+            "agenttrace -d {:?} {} -f json",
+            dir,
+            governance_inspect_flag(&args)
+        )
+    } else {
+        format!("agenttrace {} -f json", governance_inspect_flag(&args))
+    };
+    eprintln!("- inspect: `{inspect}`");
+    std::process::exit(2);
 }
 
 fn write_stderr(value: &str) -> anyhow::Result<()> {

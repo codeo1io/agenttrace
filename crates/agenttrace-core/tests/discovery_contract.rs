@@ -730,6 +730,90 @@ fn rust_parses_copilot_session_state() {
 }
 
 #[test]
+fn rust_counts_copilot_total_nano_aiu_when_model_metrics_empty() {
+    // rm-485: a resumed Copilot session can shut down with empty/partial
+    // modelMetrics while the session-wide totalNanoAiu counter carries the
+    // whole session (ccusage #1823: a real user lost 38% of billed credits
+    // to exactly this shape). The credit counter must surface as cost-only
+    // attribution: 1 072 006 230 000 nano-AIU = 1072.00623 credits ≈ $10.72.
+    let root = temp_root("agenttrace-rust-copilot-credit-gap");
+    fs::create_dir_all(&root).expect("create copilot temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"user.message","timestamp":"2026-05-07T10:00:01Z","data":{"content":"resume please"}}
+{"type":"session.shutdown","timestamp":"2026-05-07T10:00:04Z","data":{"modelMetrics":{},"totalNanoAiu":1072006230000}}
+"#,
+    )
+    .expect("write copilot credit-gap session");
+
+    let parsed = parse_file(&path).expect("parse copilot credit-gap session");
+    assert_eq!(parsed.metrics.source_tool, "copilot_cli");
+    assert!((parsed.metrics.credit_usd - 10.7200623).abs() < 1e-9);
+    // cost_estimated is round4'd: max(credit 10.7200623, modelMetrics 0).
+    assert!((parsed.metrics.cost_estimated - 10.7201).abs() < 1e-6);
+    assert_eq!(parsed.metrics.provenance.cost, "calculated_from_copilot_credits");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_counts_copilot_usage_checkpoint_on_open_sessions() {
+    // rm-485: usage_checkpoint records are the only usage surface on
+    // sessions that never shut down cleanly (killed terminals, crashes).
+    // Per-model usage from the freshest checkpoint must surface, and the
+    // credit counter converts at 1 AIU = 1 AI credit = $0.01:
+    // 500 000 000 000 nano-AIU = 500 credits = $5.00.
+    let root = temp_root("agenttrace-rust-copilot-checkpoint");
+    fs::create_dir_all(&root).expect("create copilot temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"user.message","timestamp":"2026-05-07T10:00:01Z","data":{"content":"still open"}}
+{"type":"session.usage_checkpoint","timestamp":"2026-05-07T10:05:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":20,"outputTokens":5}}},"totalNanoAiu":500000000000}}
+"#,
+    )
+    .expect("write copilot checkpoint session");
+
+    let parsed = parse_file(&path).expect("parse copilot checkpoint session");
+    assert_eq!(parsed.metrics.source_tool, "copilot_cli");
+    assert_eq!(parsed.metrics.tokens_input, 20);
+    assert_eq!(parsed.metrics.tokens_output, 5);
+    assert!((parsed.metrics.credit_usd - 5.0).abs() < 1e-9);
+    assert!((parsed.metrics.cost_estimated - 5.0).abs() < 1e-9);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_attributes_meta_only_sessions_to_their_family() {
+    // rm-490: a session whose every event is meta (a codex journal of pure
+    // token_usage_record lines) used to end with source_tool "" and render
+    // an empty-name `by_agent` bucket. The session-level attribution must
+    // fall back to the family the parser already stamped.
+    let root = temp_root("agenttrace-rust-meta-only-family");
+    fs::create_dir_all(&root).expect("create meta-only temp dir");
+    let path = root.join("rollout.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session_meta","payload":{"id":"c1","timestamp":"2026-05-07T10:00:00Z"}}
+{"type":"token_usage_record","payload":{"timestamp":"2026-05-07T10:00:10Z","input_tokens":10,"output_tokens":20}}
+"#,
+    )
+    .expect("write codex meta-only session");
+
+    let parsed = parse_file(&path).expect("parse codex meta-only session");
+    assert_eq!(parsed.metrics.source_tool, "codex_cli");
+    // Token totals stay zero by design: unpaired token_usage_records count
+    // for diagnostics only (rm-401 — their usage already lives in the
+    // cumulative snapshots). The rm-490 claim is attribution, not counting.
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_parses_kimi_wire_session() {
     let root = temp_root("agenttrace-rust-kimi-wire");
     fs::create_dir_all(&root).expect("create kimi temp dir");

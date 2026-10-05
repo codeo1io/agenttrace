@@ -224,6 +224,11 @@ struct GoMetrics {
     duration_sec: f64,
     #[serde(default, rename = "CostEstimated")]
     cost_estimated: f64,
+    /// rm-485: session-wide cost-only credit total (USD) for adapters whose
+    /// billing truth is a credit counter (Copilot totalNanoAiu). Defaulted
+    // so pre-existing cache rows deserialize unchanged.
+    #[serde(default, rename = "CreditUsd")]
+    credit_usd: f64,
     #[serde(default, rename = "StoredTotalsDelta")]
     stored_totals_delta: i64,
     /// Parse lines lost inside the session source, by reason (pass-7
@@ -1259,6 +1264,7 @@ impl GoMetrics {
             session_end: metrics.session_end.clone(),
             duration_sec: metrics.duration_sec,
             cost_estimated: metrics.cost_estimated,
+            credit_usd: metrics.credit_usd,
             stored_totals_delta: metrics.stored_totals_delta,
             line_skips: metrics.line_skips.clone(),
             provenance: metrics.provenance.clone(),
@@ -1296,6 +1302,7 @@ impl GoMetrics {
             session_end: self.session_end,
             duration_sec: self.duration_sec,
             cost_estimated: self.cost_estimated,
+            credit_usd: self.credit_usd,
             stored_totals_delta: self.stored_totals_delta,
             line_skips: self.line_skips.clone(),
             provenance: self.provenance,
