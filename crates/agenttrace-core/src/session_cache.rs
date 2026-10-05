@@ -103,12 +103,28 @@ pub struct SessionCache {
     raw_entries: BTreeMap<String, Value>,
     dirs: BTreeMap<String, DirCacheEntry>,
     dirty: bool,
+    /// rm-196: identity of the pricing inputs this scan is running under
+    /// (`pricing::pricing_fingerprint()` — cached-catalog file fingerprint,
+    /// bundled snapshot version, or user override in force). Never trusted
+    /// from the journal: it is recomputed from the live environment so a
+    /// catalog change invalidates warm entries. Empty string means "not
+    /// computed yet" (e.g. a `Default` cache); the accessor fills it on
+    /// first use, and a real fingerprint is never empty.
+    pricing_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
     mod_time: i64,
     size: i64,
+    /// rm-196: the pricing fingerprint the baked cost and provenance were
+    /// computed under. `serde(default)` keeps legacy schema-22 entries
+    /// loadable; the empty default never matches a live fingerprint, so a
+    /// pre-rm-196 journal is re-priced exactly once and then re-stamped
+    /// (the rm-230 regenerate-on-semantics-change convention, applied via
+    /// field presence instead of a schema bump).
+    #[serde(default)]
+    pricing_fingerprint: String,
     session: GoSession,
 }
 
@@ -116,6 +132,7 @@ struct CacheEntry {
 struct CacheEntryHeader {
     mod_time: i64,
     size: i64,
+    pricing_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +147,12 @@ struct SqliteSnapshot {
     database: FileFingerprint,
     wal: Option<FileFingerprint>,
     shm: Option<FileFingerprint>,
+    /// rm-196: pricing identity the snapshot's baked costs were computed
+    /// under (see `CacheEntry::pricing_fingerprint`). A database whose
+    /// bytes are unchanged still serves stale costs when the pricing
+    /// catalog changed, so a mismatched snapshot is dropped and rebuilt.
+    #[serde(default)]
+    pricing_fingerprint: String,
     sessions: Vec<GoSession>,
 }
 
@@ -350,6 +373,11 @@ fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Ve
         || snapshot.database != file_fingerprint(database)?
         || snapshot.wal != file_fingerprint(&sqlite_wal_path(database))
         || snapshot.shm != file_fingerprint(&sqlite_shm_path(database))
+        // rm-196: an unchanged database still serves stale costs when the
+        // pricing catalog changed since the snapshot was written; drop it
+        // and re-price. Legacy snapshots (no fingerprint field) never
+        // match, so they are rebuilt once.
+        || snapshot.pricing_fingerprint != crate::pricing::pricing_fingerprint()
     {
         return None;
     }
@@ -383,6 +411,7 @@ fn store_sqlite_snapshot_at(
         database: file_fingerprint(database).ok_or_else(|| anyhow::anyhow!("database missing"))?,
         wal: file_fingerprint(&sqlite_wal_path(database)),
         shm: file_fingerprint(&sqlite_shm_path(database)),
+        pricing_fingerprint: crate::pricing::pricing_fingerprint(),
         sessions: sessions.iter().map(GoSession::from_session).collect(),
     };
     let tmp = unique_temp_path(path);
@@ -664,6 +693,18 @@ impl SessionCache {
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty
     }
+
+    /// rm-196: the pricing identity entries are validated against and
+    /// stamped with. Computed lazily (and at most once per cache) so a
+    /// `Default`-constructed or failed-load cache still prices under the
+    /// live catalog instead of stamping entries with a blank identity that
+    /// would match nothing and force re-parsing every run.
+    fn pricing_fingerprint(&mut self) -> &str {
+        if self.pricing_fingerprint.is_empty() {
+            self.pricing_fingerprint = crate::pricing::pricing_fingerprint();
+        }
+        &self.pricing_fingerprint
+    }
 }
 
 pub(crate) fn cached_dir_listing(dir: &Path, cache: &mut SessionCache) -> Option<CachedDirListing> {
@@ -721,6 +762,14 @@ fn decode_cache_entry_header(value: &Value) -> Option<CacheEntryHeader> {
     Some(CacheEntryHeader {
         mod_time: value.get("mod_time")?.as_i64()?,
         size: value.get("size")?.as_i64()?,
+        // Legacy entries predate rm-196 and carry no fingerprint; the
+        // empty default fails the freshness comparison below and is
+        // re-priced once.
+        pricing_fingerprint: value
+            .get("pricing_fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -729,6 +778,7 @@ fn cached_entry_header(path: &str, cache: &mut SessionCache) -> Option<CacheEntr
         return Some(CacheEntryHeader {
             mod_time: entry.mod_time,
             size: entry.size,
+            pricing_fingerprint: entry.pricing_fingerprint.clone(),
         });
     }
     cache
@@ -1104,7 +1154,13 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
 pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> {
     let key = cache_key(path);
     let header = cached_entry_header(&key, cache)?;
-    if !is_fresh(path, &header) {
+    // rm-196: freshness is artifact identity AND pricing identity. A warm
+    // entry replays the cost and the provenance label baked at store
+    // time, so a catalog change (user override swapped in, pricing cache
+    // refreshed, bundled snapshot bumped) must invalidate exactly like a
+    // byte change to the artifact does.
+    let pricing_now = cache.pricing_fingerprint().to_owned();
+    if !is_fresh(path, &header) || header.pricing_fingerprint != pricing_now {
         delete_cached_session_key(&key, cache);
         return None;
     }
@@ -1131,11 +1187,13 @@ pub fn store_session(
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(path)?;
     let key = cache_key(path);
+    let pricing_fingerprint = cache.pricing_fingerprint().to_owned();
     cache.entries.insert(
         key.clone(),
         CacheEntry {
             mod_time: file_mod_time_nanos(&metadata),
             size: metadata.len() as i64,
+            pricing_fingerprint,
             session: GoSession::from_session(session),
         },
     );
@@ -1351,13 +1409,13 @@ fn is_fresh(path: &Path, entry: &CacheEntryHeader) -> bool {
 }
 
 #[cfg(unix)]
-fn file_mod_time_nanos(metadata: &fs::Metadata) -> i64 {
+pub(crate) fn file_mod_time_nanos(metadata: &fs::Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
     metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec()
 }
 
 #[cfg(not(unix))]
-fn file_mod_time_nanos(metadata: &fs::Metadata) -> i64 {
+pub(crate) fn file_mod_time_nanos(metadata: &fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()
@@ -2077,6 +2135,7 @@ mod tests {
                     CacheEntry {
                         mod_time: 900_000 + i * 1_000,
                         size: 1,
+                        pricing_fingerprint: "catalog-probe".to_string(),
                         session,
                     },
                 );
@@ -2407,6 +2466,179 @@ mod tests {
             "sessions.json must be owner-only, got {:o}",
             mode & 0o777
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn warm_cache_test_session(path: &Path) -> Session {
+        Session {
+            name: "warm".to_string(),
+            path: path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn warm_entry_tracks_the_pricing_fingerprint() {
+        // rm-196: a warm entry replays the cost and provenance baked at
+        // store time, so freshness must cover pricing identity, not just
+        // artifact bytes. The catalog fingerprint is pinned directly (the
+        // live value depends on the environment), which keeps this test
+        // about the comparison mechanics.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm196-fingerprint-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let artifact = root.join("journal.jsonl");
+        fs::write(&artifact, b"{}\n").expect("write artifact");
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            pricing_fingerprint: "catalog-a".to_string(),
+            ..Default::default()
+        };
+        store_session(&artifact, &warm_cache_test_session(&artifact), &mut cache)
+            .expect("store session");
+        let key = cache_key(&artifact);
+        assert_eq!(
+            cache.entries[&key].pricing_fingerprint, "catalog-a",
+            "store_session must stamp the fingerprint the entry was priced under"
+        );
+        assert!(
+            cached_session(&artifact, &mut cache).is_some(),
+            "same catalog fingerprint keeps the warm entry"
+        );
+
+        // The artifact is untouched; only the catalog changed.
+        cache.pricing_fingerprint = "catalog-b".to_string();
+        assert!(
+            cached_session(&artifact, &mut cache).is_none(),
+            "a catalog change must invalidate the warm entry without an artifact change"
+        );
+        assert!(
+            !cache.entries.contains_key(&key) && !cache.raw_entries.contains_key(&key),
+            "the stale entry is deleted, not merely ignored"
+        );
+
+        // A rescan re-stores under the new catalog; flipping back
+        // invalidates again (bidirectional truthfulness, one re-parse per
+        // catalog switch, stability in between).
+        store_session(&artifact, &warm_cache_test_session(&artifact), &mut cache)
+            .expect("restored session");
+        assert!(cached_session(&artifact, &mut cache).is_some());
+        cache.pricing_fingerprint = "catalog-a".to_string();
+        assert!(
+            cached_session(&artifact, &mut cache).is_none(),
+            "returning to a previous catalog must also re-price"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_entry_without_pricing_fingerprint_is_rejected() {
+        // Schema-22 journals predate rm-196 and carry mod_time/size only.
+        // They must load (no schema bump) but fail the pricing comparison,
+        // re-price once, and then behave like any stamped entry.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm196-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let artifact = root.join("journal.jsonl");
+        fs::write(&artifact, b"{}\n").expect("write artifact");
+        let metadata = fs::metadata(&artifact).expect("stat artifact");
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            pricing_fingerprint: "catalog-now".to_string(),
+            ..Default::default()
+        };
+        let key = cache_key(&artifact);
+        cache.raw_entries.insert(
+            key.clone(),
+            serde_json::json!({
+                // Artifact identity matches exactly; pricing identity is
+                // absent, exactly as a pre-rm-196 journal would have it.
+                "mod_time": file_mod_time_nanos(&metadata),
+                "size": metadata.len() as i64,
+                "session": {},
+            }),
+        );
+        assert!(
+            cached_session(&artifact, &mut cache).is_none(),
+            "a legacy entry must be re-priced even though the artifact is unchanged"
+        );
+        assert!(
+            !cache.raw_entries.contains_key(&key),
+            "the legacy entry is dropped from the journal on first read"
+        );
+        store_session(&artifact, &warm_cache_test_session(&artifact), &mut cache)
+            .expect("store session");
+        assert!(
+            cached_session(&artifact, &mut cache).is_some(),
+            "after the one-time re-price the entry is warm again"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_snapshot_tracks_the_pricing_fingerprint() {
+        // rm-196: an unchanged SQLite database would otherwise keep serving
+        // costs baked under a previous catalog. Store stamps the current
+        // pricing fingerprint; a foreign fingerprint must drop the snapshot
+        // even when the database fingerprints still match.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm196-sqlite-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let database = root.join("state.db");
+        fs::write(&database, b"db").expect("write database");
+        let snapshot_path = root.join("snapshot.json");
+        let session = warm_cache_test_session(&database);
+        store_sqlite_snapshot_at(&database, &snapshot_path, std::slice::from_ref(&session))
+            .expect("store snapshot");
+
+        // Pin the environment (the fingerprint reads AGENTTRACE_PRICING_FILE
+        // and the cache dir) so store and load agree regardless of sibling
+        // tests (shared env lock, see lib.rs `test_env`).
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("XDG_CACHE_HOME");
+        let prior_override = std::env::var_os("AGENTTRACE_PRICING_FILE");
+        std::env::set_var("XDG_CACHE_HOME", &root);
+        std::env::remove_var("AGENTTRACE_PRICING_FILE");
+        store_sqlite_snapshot_at(&database, &snapshot_path, &[session])
+            .expect("re-store snapshot under pinned env");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot_path).is_some(),
+            "a snapshot priced under the live catalog stays warm"
+        );
+        let mut doc = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&snapshot_path).expect("read snapshot"),
+        )
+        .expect("parse snapshot");
+        doc["pricing_fingerprint"] = serde_json::json!("some-other-catalog");
+        fs::write(&snapshot_path, serde_json::to_vec(&doc).expect("serialize"))
+            .expect("write snapshot");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot_path).is_none(),
+            "a database-unchanged snapshot priced under another catalog must be rebuilt"
+        );
+        match prior_cache {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prior_override {
+            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
+            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+        }
+        drop(_env);
         let _ = fs::remove_dir_all(root);
     }
 }

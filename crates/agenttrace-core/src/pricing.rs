@@ -232,6 +232,53 @@ pub fn pricing_cache_path() -> PathBuf {
     user_cache_dir().join("agenttrace").join("pricing.json")
 }
 
+/// rm-196: identity of the pricing inputs currently in force, used by the
+/// session cache to decide whether a warm entry's baked cost and
+/// provenance are still true. The fingerprint is derived from the same
+/// signals `load_catalog_for_current_env` feeds on, without parsing any
+/// catalog: content changes move mtime or size, and the bundled snapshot
+/// carries its date (bumped with every snapshot refresh by contract; the
+/// byte length guards a refresh that misses the date bump). Staleness of
+/// the cached catalog is deliberately excluded — `load_pricing_cache`
+/// serves a stale file at unchanged prices, so flipping that label must
+/// not invalidate warm sessions. Computed on demand (two `stat` calls at
+/// most), never cached across the journal: the journal is exactly where
+/// the staleness would hide. The stat arms are content-blind by
+/// construction — a same-size replacement with a preserved mtime (`cp -p`,
+/// `touch -r`, `tar -x --mtimes`, backup restore) does NOT re-price,
+/// matching the artifact freshness convention; only the bundled arm is
+/// content-derived (snapshot date + byte length).
+pub fn pricing_fingerprint() -> String {
+    let base = match std::fs::metadata(pricing_cache_path()) {
+        Ok(metadata) => format!(
+            "cache:{}:{}",
+            crate::session_cache::file_mod_time_nanos(&metadata),
+            metadata.len()
+        ),
+        Err(_) => format!(
+            "bundled:{}:{}",
+            PRICING_SNAPSHOT_DATE,
+            PRICING_SNAPSHOT_JSON.len()
+        ),
+    };
+    let overrides = match std::env::var_os("AGENTTRACE_PRICING_FILE") {
+        None => "none".to_string(),
+        Some(path) => match std::fs::metadata(&path) {
+            Ok(metadata) => format!(
+                "{}:{}:{}",
+                path.to_string_lossy(),
+                crate::session_cache::file_mod_time_nanos(&metadata),
+                metadata.len()
+            ),
+            // Requested but unreadable: overrides are not active, yet the
+            // path is still part of the identity so a file appearing (or
+            // being fixed) at the same path re-prices warm sessions.
+            Err(_) => format!("{}:missing", path.to_string_lossy()),
+        },
+    };
+    format!("{base}+override:{overrides}")
+}
+
 pub fn update_pricing() -> anyhow::Result<usize> {
     let (raw, converted) = download_pricing(Duration::from_secs(30))?;
     write_pricing_cache(&raw)?;
