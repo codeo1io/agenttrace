@@ -282,17 +282,15 @@ pub(super) fn total_duration<T: Borrow<Session>>(sessions: &[T]) -> f64 {
 }
 
 pub(super) fn p95_gap<T: Borrow<Session>>(sessions: &[T]) -> f64 {
+    // rm-411: the p95 index rule is the ONE house definition
+    // (agenttrace_core::percentile), never a hand-rolled twin.
     let mut gaps = sessions
         .iter()
         .flat_map(|session| session.borrow().metrics.gaps_sec.iter().copied())
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect::<Vec<_>>();
-    if gaps.is_empty() {
-        return 0.0;
-    }
     gaps.sort_by(f64::total_cmp);
-    let index = ((gaps.len() as f64) * 0.95) as usize;
-    gaps[index.min(gaps.len() - 1)]
+    agenttrace_core::percentile(&gaps, 0.95)
 }
 
 pub(super) fn health_color(health: i32) -> Color {

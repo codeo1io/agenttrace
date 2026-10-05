@@ -1,0 +1,39 @@
+# Cycle-1 compound record — run 6557b823 (agenttrace)
+
+Date: 2026-10-04 · Phase: compound (attempt 7df916893) · Lane: run worktree `run-6557b823835b-6557b823` @ ef8e2de9 (run's dispatched base), uncommitted: 7 code files (batch rm-411/rm-412) + ROADMAP.md (mint delta + this phase's flips) + CHANGELOG.md (this phase).
+
+## Cycle outcome (pre-review evidence chain)
+
+Batch "silent divergences made loud — one percentile definition, one `-d` contract": rm-411 (lead, correctness 72.0) + rm-412 (rider, correctness 56.0). Chain: assess e0e5211b (5 fresh findings F1–F5 + 4 re-verified; executable PoC p95_sec=19 vs house 20) → research 73dca414 (world state; upstream unmoved 4th check) → roadmap 7a9ef53c (minted rm-411..416 past the full claim landscape; +38 ROADMAP delta) → prioritize 3ec03712 (impact/risk/effort/dependency/collision; rm-413..416 de-selections evidence-backed) → stewardship 11cf4289 (CU-A/CU-B/CU-C contract, separation hints) → implement 24da260c (red-first PoC rerun, 7 files, 329/0) → targeted_tests b76a4ab2 (234/0 focused across the 5 impacted suites + fmt/clippy + behavioral rc probes) → full_tests 2a1feaa4 (ci.yml full+deny mirror, 20/20 steps rc0, 329/0 tests, release build green).
+
+Roadmap accounting: compound flips ONLY rm-411/rm-412 candidate→implemented with implementation-evidence appends (mint rule: rm-413..416 stay candidates). CHANGELOG gains 2 Fixed entries. Post-compound census recorded below under Verification.
+
+## Prevention rules (reusable, fleet-scoped — new this cycle)
+
+- **PR-G — Pattern-census duplicate definitions, not consumer-census.** The defect class "N copies of a rule" must be censused by the PATTERN (the constant + index arithmetic, e.g. `* 0.95` trunc/ceil expressions over every `crates/**/src/*.rs`), not by tracing known consumers. This cycle: the assess census tracked four copies (one divergent nearest-rank twin plus three unpinned trunc twins); implementation — censusing by pattern — found a fifth (tui `shared.rs:284`) that the consumer-trace missed because nothing had audited shared.rs's exports. The landed workspace-scan pin now enforces the census mechanically — extend that pin (don't fork it) when the next "one definition" rule lands.
+- **PR-H — Meta-tests that scan source for forbidden patterns must not self-match.** Needles built from plain literals appear verbatim in the test's own source and the scan fails on itself. Assemble needles via `concat!` fragments (this cycle's percentile pin) or runtime concatenation (b11a1f3a's pin probes) — both forms are now in-tree; copy one of them rather than re-deriving.
+- **PR-I — Validation phases re-assert tree identity, then copy the dispatch digest verbatim.** When the validation turn changes nothing executable (verify: `git status --porcelain` + `git diff --stat` + HEAD identical before/after), the dispatch-time `validation:v1` digest is the correct declaration; the fold gate re-derives and rejects stale declarations. Held twice this run (targeted + full). Complement: the engine's `changed_testable_surfaces` derivation sees only committed diffs — an uncommitted implement delta yields `required_scope: none`; declare `targeted` over the actual delta or the gate attests a falsehood (fleet memory #16311, minted from this run).
+- **PR-J — /tmp scratch is NOT durable across phases on this host.** The assess phase's /tmp tree (fixtures, gate logs, PoC) was swept before implement. Key acceptance artifacts must be re-created on demand (PoC rebuilt identically at implement) or mirrored into the delegate spool (full_tests mirrored its logs). The "code blue" convention: PoCs under /tmp get rebuilt; evidence logs get copied into `<attempt>-scratch/` at the phase that produces them.
+- **PR-K — read test counts from file-logged full `test result:` lines, never from a `tail` under output-corruption conditions.** This cycle initially recorded "`cargo test -p agenttrace-tui` reports 0 tests"; review 2d85940d disproved it — the default form runs all 46 lib tests, and the 0 was a doc-test result line misread during a dropped-output incident (PR-J conditions). The 0-vs-46 distinction lives in complete result lines read from the log file; anything shorter is a guess.
+
+## Residuals and next-cycle context
+
+Candidates minted this cycle remain for cycle 2 (full rows in ROADMAP.md; de-selection rationale in delegate/3ec03712…-scratch/prioritization-cycle1.md):
+
+- **rm-413 compaction visibility (58.0)** — deferred on its own CONFIDENCE CAVEAT: pin the CC `type:"summary"` schema from a real compacted transcript BEFORE the CC arm (zero such lines in the host's 330-transcript corpus); composes with 41263f58's uncommitted census band (rm-406/407) — sequence after that lands.
+- **rm-414 TUI attribution dimensions (52.0)** — hard-blocked at a pre-ceiling base: the required core aggregation (`by_provider`/`by_task_type`, rm-245 band) is ceiling-only (origin/master lib.rs:406/:409; 0 hits at base). Implement only from a rebased base.
+- **rm-415 composite action (45.0)** — needs release infra (tag v1 from a release commit) + folds with uncommitted rm-405; carries the rc2-vs-clap-usage exit-contract rider (rm-346).
+- **rm-416 SECURITY.md fork-true channel (40.0)** — needs GitHub private-vulnerability-reporting verification on the (private) codeo1io repo at implement time; keep in sync with unlanded rm-017 install surfaces.
+- Prior-cycle leads still open and untouched here: rm-411's routing covers all FIVE hand-rolled copies (census corrected by review 2d85940d F2: assess's four — one divergent twin + three unpinned trunc copies — plus shared.rs found at implement); F2 (unbounded git probe, governance.rs:779) is rm-242 on unmerged `fork/conductor/run-0d4873946498` (10 s bound) — consume at fold, do not re-implement; F4 (rm-305 cession note misstates scope — unit-insane per-token arm implemented nowhere) needs a row amendment at ITS landing; R1–R4 (markdown injection HIGH, NaN filters, example workflow, SECURITY.md) belong to sibling bands in flight (rm-403..410 class).
+
+## Integration handoff (commit gate)
+
+- Merge rm-411's subject BY TITLE with 16bbd3ae's independently-documented A1 row (duplicate documentation; one implementation — this one).
+- **f22ff7d1's unmerged one-percentile delta is SUPERSEDED by this implementation** — do not double-apply; its docs/solutions prose may still be worth folding as narrative.
+- The two validation digests this run: targeted (b76a4ab2) and full (2a1feaa4) both declared `validation:v1:1524c91a3e97839010b3b59fc99b1ebd6177786bb354a81717b5573506a8a32f` (validation-only turns; tree identity asserted each time). Fill the rows' `validation:v1:<sha>` placeholders at shipping-PR time with whatever the integrated tree's gate derives.
+- Changed-file set expected at fold: the 7 code files (24da260c) + ROADMAP.md (mint + flips) + CHANGELOG.md (2 entries) + THIS record = 10 files total (9 tracked-modified plus this new tracked file); the review-fix fold (2d85940d findings F1–F5 → edits landed by attempt b554ebfc, which died provider-dead before reporting; verified, completed and re-validated by c1dc5953 — pin red-checked with a planted decoy) additionally touches reports.rs pin needles, diagnostics.rs straddling fixture, and the wording corrections above within those same files. Nothing else; no repo-root scratch.
+
+## Verification (this phase, no test execution per compound policy)
+
+- Post-flip census (grep over ROADMAP.md): rm-411 and rm-412 now `status: implemented`; rm-413..416 still `status: candidate`; no duplicate ids (unique `- id:` count unchanged at 141 by mint census method); CHANGELOG 2 new Fixed entries under Unreleased.
+- Diff pair in `delegate/7df91689…-scratch/`: `ROADMAP.minted.md` (pre-flip postimage, sha256 f8341cf0…) + `roadmap-compound.diff` (minted→compounded) — consume the (base, diff) pair, not bare postimages (fleet PR-F).

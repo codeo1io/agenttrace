@@ -3728,20 +3728,20 @@ pub(super) fn total_duration<T: Borrow<Session>>(sessions: &[T]) -> f64 {
 }
 
 pub(super) fn p95_gap<T: Borrow<Session>>(sessions: &[T]) -> f64 {
+    // rm-411: the p95 index rule is the ONE house definition
+    // (agenttrace_core::percentile), never a hand-rolled twin.
     let mut gaps: Vec<f64> = sessions
         .iter()
         .flat_map(|session| session.borrow().metrics.gaps_sec.iter().copied())
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect();
-    if gaps.is_empty() {
-        return 0.0;
-    }
     gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let index = ((gaps.len() as f64) * 0.95) as usize;
-    gaps[index.min(gaps.len() - 1)]
+    agenttrace_core::percentile(&gaps, 0.95)
 }
 
 pub(super) fn session_p95_gap(session: &Session) -> f64 {
+    // rm-411: routed through the house percentile like every other
+    // p95 surface (trunc at len*p; empty input yields 0.0 there).
     let mut gaps = session
         .metrics
         .gaps_sec
@@ -3749,12 +3749,8 @@ pub(super) fn session_p95_gap(session: &Session) -> f64 {
         .copied()
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect::<Vec<_>>();
-    if gaps.is_empty() {
-        return 0.0;
-    }
     gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let index = ((gaps.len() as f64) * 0.95) as usize;
-    gaps[index.min(gaps.len() - 1)]
+    agenttrace_core::percentile(&gaps, 0.95)
 }
 
 pub(super) fn tool_success_rate(session: &Session) -> f64 {

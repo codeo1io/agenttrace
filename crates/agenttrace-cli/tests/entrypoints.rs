@@ -613,6 +613,71 @@ fn pricing_override_success_discloses_applied_overrides() {
 }
 
 #[test]
+fn doctor_honors_the_same_dir_guard_as_sessions() {
+    // rm-412 (run 6557b823): --doctor used to exit 0 on a typo'd -d
+    // ("Mode: custom directory"). One -d contract: rc2 + the same
+    // message family the sessions path already enforces.
+    let missing = std::env::temp_dir().join(format!("at-rm412-missing-{}", std::process::id()));
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--doctor", "-d", missing.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace doctor with missing -d");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "bad request class, same as the sessions path: {stderr}"
+    );
+    assert!(
+        stderr.contains("session directory does not exist"),
+        "message family must match the sessions path: {stderr}"
+    );
+    assert!(
+        !stdout_of(&out).contains("Mode: custom directory"),
+        "a typo'd dir must not render a doctor report: {}",
+        stdout_of(&out)
+    );
+
+    // File-as-dir: same class, same helper arm.
+    let file = std::env::temp_dir().join(format!("at-rm412-file-{}", std::process::id()));
+    std::fs::write(&file, b"not a directory").expect("write file-as-dir fixture");
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--doctor", "-d", file.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace doctor on file-as-dir");
+    let _ = std::fs::remove_file(&file);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "file-as-dir is a bad request on --doctor too: {stderr}"
+    );
+    assert!(
+        stderr.contains("-d/--dir is not a directory"),
+        "message must name the file-as-dir case: {stderr}"
+    );
+
+    // A valid directory keeps today's rc0 doctor behavior.
+    let empty = std::env::temp_dir().join(format!("at-rm412-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).expect("create empty dir");
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--doctor", "-d", empty.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace doctor on a valid empty dir");
+    let _ = std::fs::remove_dir(&empty);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "valid directory must keep the rc0 doctor report: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn stdout_of(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+#[test]
 fn nonexistent_session_dir_exits_two_with_distinct_message() {
     let missing = std::env::temp_dir().join(format!("at-cycle4-b2-missing-{}", std::process::id()));
     let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))

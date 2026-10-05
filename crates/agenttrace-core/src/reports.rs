@@ -2812,17 +2812,95 @@ mod tests {
     fn crate_percentile_is_the_only_percentile_and_matches_go() {
         // Pass-8 F8-6: reports.rs used to carry a second, divergent
         // percentile ((len-1)*p, rounded) next to the Go-pinned len*p
-        // definition — p95 of 20 values differed (19 vs 20). The local
-        // copy is gone; both call sites must land on the crate
-        // definition pinned by `percentile_matches_go_index_rule`.
+        // definition — p95 of 20 values differed (19 vs 20). rm-411
+        // (run 6557b823) then found diagnostics.rs carrying a
+        // nearest-rank ceil(len*0.95)-1 twin for tool p95_sec and the
+        // tui crate hand-rolling p95_gap copies. Every call site now
+        // lands on the one definition pinned by
+        // `percentile_matches_go_index_rule`, and this pin scans EVERY
+        // workspace source file: no crate may re-declare the house
+        // helper (outside lib.rs, the house) or hand-roll a p95 index
+        // rule — route through crate::percentile. Review 2d85940d (F1)
+        // widened the needles past exact formatting: the helper-name
+        // needle now matches regardless of a `pub`/`pub(crate)` prefix
+        // or indentation, the arithmetic needles match spacing-free
+        // cast and ceil forms, and the house file must carry EXACTLY
+        // ONE declaration (not merely "at least one"). Residual,
+        // known: a re-declared helper with a fully parametrized body
+        // (probability passed in, literal-free) still evades substring
+        // pinning — the workspace census plus this pin is the defense,
+        // not substring magic.
         let values: Vec<f64> = (1..=20).map(|v| v as f64).collect();
         assert_eq!(crate::percentile(&values, 0.95), 20.0);
         assert_eq!(crate::percentile(&values, 0.50), 11.0);
         assert_eq!(crate::percentile(&[], 0.95), 0.0);
+        // Needles are assembled from fragments so this test file
+        // never contains the contiguous patterns it scans for.
+        let redeclared = concat!("fn percen", "tile(");
+        let hand_trunc = concat!(".95)", " as ");
+        let hand_ceil = concat!(".95)", ".ceil()");
+        let house = std::path::Path::new("agenttrace-core")
+            .join("src")
+            .join("lib.rs");
+        let mut offenders = Vec::new();
+        for path in workspace_src_files() {
+            let source = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("unreadable source file {}: {error}", path.display())
+            });
+            if path.ends_with(&house) {
+                // The house definition is the ONE allowed occurrence of
+                // the helper name in the whole workspace.
+                let count = source.match_indices(redeclared).count();
+                if count != 1 {
+                    offenders.push(format!(
+                        "{} carries {count} helper declarations, expected exactly 1",
+                        path.display()
+                    ));
+                }
+            } else if source.contains(redeclared) {
+                offenders.push(format!("{} re-declares the house helper", path.display()));
+            }
+            if source.contains(hand_trunc) || source.contains(hand_ceil) {
+                offenders.push(format!("{} hand-rolls a p95 index rule", path.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "one percentile definition per tool — route through crate::percentile: {offenders:#?}"
+        );
+        // The original pass-8 file-scope guard stays as a fast signal,
+        // now over the same widened needles.
         let source = include_str!("reports.rs");
         assert!(
-            !source.contains("\nfn percentile("),
-            "reports.rs must not re-declare percentile; use crate::percentile"
+            !source.contains(redeclared)
+                && !source.contains(hand_trunc)
+                && !source.contains(hand_ceil),
+            "reports.rs must not re-declare or hand-roll percentile; use crate::percentile"
         );
+    }
+
+    /// Every .rs file under the workspace's `crates/` tree — the
+    /// surface the one-percentile-definition pin scans (rm-411).
+    fn workspace_src_files() -> Vec<std::path::PathBuf> {
+        let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        root.pop();
+        root.pop(); // workspace root (crates/agenttrace-core -> ..)
+        let mut files = Vec::new();
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
     }
 }

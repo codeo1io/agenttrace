@@ -249,6 +249,11 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.doctor {
+        // rm-412 (run 6557b823): --doctor used to accept a typo'd -d
+        // silently (rc0, "Mode: custom directory"). One -d contract:
+        // every action that honors -d validates it through the same
+        // helper as the sessions path.
+        guard_dir_override(args.dir.as_deref());
         let doctor_dir = args.dir.as_deref().map(PathBuf::from);
         let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
         write_output(&args.output, &out)?;
@@ -860,6 +865,29 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
     load_sessions_report(args).map(|(sessions, _)| sessions)
 }
 
+/// rm-412 (run 6557b823): the ONE `-d/--dir` guard, shared by every
+/// action that honors a directory override (sessions/report paths via
+/// `load_sessions_report`, `--doctor` via the dispatch). Same message
+/// family, same exit code: 2 = the request itself is wrong (typo'd or
+/// file-as-dir path); 1 = the directory is fine but nothing matched.
+/// A second validator with different strings would re-open the
+/// silent-typo acceptance this closed.
+fn guard_dir_override(dir: Option<&str>) {
+    let Some(dir) = dir else {
+        return;
+    };
+    let path = Path::new(dir);
+    if !path.exists() {
+        eprintln!("agenttrace: session directory does not exist: {dir}");
+        eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
+        std::process::exit(2);
+    }
+    if !path.is_dir() {
+        eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
+        std::process::exit(2);
+    }
+}
+
 fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
     if args.demo {
         return Ok((prepare_explicit_sessions(demo_sessions()?, args)?, None));
@@ -891,18 +919,8 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // "No session files found in …" error as a genuinely empty
     // directory — the two need different messages and different exit
     // codes (2 = the request itself is wrong; 1 = nothing matched).
-    if let Some(dir) = args.dir.as_deref() {
-        let path = Path::new(dir);
-        if !path.exists() {
-            eprintln!("agenttrace: session directory does not exist: {dir}");
-            eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
-            std::process::exit(2);
-        }
-        if !path.is_dir() {
-            eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
-            std::process::exit(2);
-        }
-    }
+    // rm-412: the check lives in one helper shared with --doctor.
+    guard_dir_override(args.dir.as_deref());
     let range = parse_range(args)?;
     let report = load_sessions_with_options(
         dir.as_deref(),

@@ -294,6 +294,9 @@ fn cmp_cost(left: &Session, right: &Session) -> std::cmp::Ordering {
 }
 
 fn p95_gap(session: &Session) -> f64 {
+    // rm-411: the p95 index rule is the ONE house definition
+    // (`crate::percentile`, trunc at len*p), never a hand-rolled
+    // twin — inputs pre-sorted here, empty handled by the house fn.
     let mut gaps = session
         .metrics
         .gaps_sec
@@ -302,10 +305,7 @@ fn p95_gap(session: &Session) -> f64 {
         .filter(|value| value.is_finite() && *value > 0.0)
         .collect::<Vec<_>>();
     gaps.sort_by(f64::total_cmp);
-    let index = ((gaps.len() as f64) * 0.95) as usize;
-    gaps.get(index.min(gaps.len().saturating_sub(1)))
-        .copied()
-        .unwrap_or(0.0)
+    crate::percentile(&gaps, 0.95)
 }
 
 pub(crate) fn analyze_diagnostics(events: &[Event], metrics: &Metrics) -> Diagnostics {
@@ -821,10 +821,11 @@ fn tool_latencies(events: &[Event]) -> Vec<ToolLatency> {
             } else {
                 values.iter().sum::<f64>() / values.len() as f64
             };
-            let p95_sec = values
-                .get(((values.len() as f64 * 0.95).ceil() as usize).saturating_sub(1))
-                .copied()
-                .unwrap_or(0.0);
+            // rm-411: house percentile (trunc at len*p) — this used
+            // to be a nearest-rank ceil(len*0.95)-1 twin that read one
+            // bucket low at every integral len*0.95 (20 calls of 1..20s
+            // reported p95_sec=19 beside a house value of 20).
+            let p95_sec = crate::percentile(&values, 0.95);
             ToolLatency {
                 tool_name,
                 count,
@@ -1043,6 +1044,160 @@ mod tests {
             .stuck_patterns
             .iter()
             .any(|item| item.pattern == "repeated_response"));
+    }
+
+    #[test]
+    fn tool_p95_sec_uses_house_percentile_at_integral_boundaries() {
+        // rm-411: the house rule truncates at len*p, so p95 reads
+        // index 19 of 20 samples and index 38 of 40 samples — exactly
+        // the boundary class where the deleted nearest-rank twin read
+        // one bucket low (19 instead of 20, 38 instead of 39).
+        fn probe_p95(calls: usize) -> ToolLatency {
+            let ts = |second: usize| {
+                format!(
+                    "2026-01-01T{:02}:{:02}:{:02}Z",
+                    second / 3600,
+                    (second % 3600) / 60,
+                    second % 60
+                )
+            };
+            let mut events = Vec::new();
+            for k in 1..=calls {
+                // duration k seconds: call at second k, result at 2k
+                events.push(Event {
+                    role: "assistant".to_string(),
+                    timestamp: ts(k),
+                    tool_calls: vec![ToolCall {
+                        id: format!("probe-{k}"),
+                        name: "probe".to_string(),
+                        args: "{}".to_string(),
+                    }],
+                    ..Event::default()
+                });
+                events.push(Event {
+                    role: "tool".to_string(),
+                    tool_call_id: format!("probe-{k}"),
+                    content: "ok".to_string(),
+                    timestamp: ts(k * 2),
+                    ..Event::default()
+                });
+            }
+            let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+            diagnostics
+                .tool_latencies
+                .into_iter()
+                .find(|latency| latency.tool_name == "probe")
+                .expect("probe latency row")
+        }
+        let twenty = probe_p95(20);
+        assert_eq!(twenty.count, 20);
+        assert_eq!(twenty.max_sec, 20.0);
+        assert_eq!(twenty.p95_sec, 20.0, "house trunc rule: index 19");
+        assert!(!twenty.is_slow, "20s p95 stays under the 30s advisory");
+        let forty = probe_p95(40);
+        assert_eq!(forty.count, 40);
+        assert_eq!(forty.p95_sec, 39.0, "house trunc rule: index 38");
+        assert!(forty.is_slow, "39s p95 crosses the 30s advisory");
+    }
+
+    #[test]
+    fn straddling_series_flips_the_is_slow_advisory_across_the_rule_change() {
+        // rm-411 (review 2d85940d F3): the boundary fixtures above pin
+        // the numeric semantics; THIS fixture pins the user-visible
+        // consequence — the advisory flip. On 19 fast calls (2s) plus
+        // one slow call (31s), the deleted nearest-rank twin read
+        // p95 2.0 (ceil(20*0.95)-1 = index 18 → 2.0, NOT slow) while
+        // the house trunc rule reads index 19 → 31.0 (SLOW). The
+        // slow outlier was invisible to the advisory under the old
+        // rule; the house rule surfaces it.
+        let ts = |second: usize| {
+            format!(
+                "2026-01-01T{:02}:{:02}:{:02}Z",
+                second / 3600,
+                (second % 3600) / 60,
+                second % 60
+            )
+        };
+        let durations: Vec<usize> = std::iter::repeat(2)
+            .take(19)
+            .chain(std::iter::once(31))
+            .collect();
+        let mut events = Vec::new();
+        let mut clock = 0;
+        for (k, duration) in durations.iter().enumerate() {
+            let id = format!("probe-{k}");
+            events.push(Event {
+                role: "assistant".to_string(),
+                timestamp: ts(clock),
+                tool_calls: vec![ToolCall {
+                    id: id.clone(),
+                    name: "probe".to_string(),
+                    args: "{}".to_string(),
+                }],
+                ..Event::default()
+            });
+            clock += duration;
+            events.push(Event {
+                role: "tool".to_string(),
+                tool_call_id: id,
+                content: "ok".to_string(),
+                timestamp: ts(clock),
+                ..Event::default()
+            });
+        }
+        let diagnostics = analyze_diagnostics(&events, &Metrics::default());
+        let latency = diagnostics
+            .tool_latencies
+            .into_iter()
+            .find(|latency| latency.tool_name == "probe")
+            .expect("probe latency row");
+        assert_eq!(latency.count, 20);
+        assert_eq!(latency.max_sec, 31.0);
+        assert_eq!(
+            latency.p95_sec, 31.0,
+            "house trunc rule: index 19 is the 31s outlier"
+        );
+        assert!(
+            latency.is_slow,
+            "the 31s outlier must trip the advisory — the deleted twin read 2.0 and missed it"
+        );
+    }
+
+    #[test]
+    fn p95_gap_uses_house_percentile_and_filters_junk() {
+        // rm-411: the gap twin shares the ONE house rule; non-positive
+        // and non-finite gaps must stay excluded from the sample.
+        let session_with_gaps = |gaps: Vec<f64>| Session {
+            name: "gaps".to_string(),
+            path: "/tmp/gaps".to_string(),
+            metrics: Metrics {
+                gaps_sec: gaps,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+            cwd: String::new(),
+        };
+        assert_eq!(
+            p95_gap(&session_with_gaps((1..=20).map(|v| v as f64).collect())),
+            20.0,
+            "house index 19 of 20 samples"
+        );
+        assert_eq!(
+            p95_gap(&session_with_gaps((1..=40).map(|v| v as f64).collect())),
+            39.0,
+            "house index 38 of 40 samples"
+        );
+        assert_eq!(p95_gap(&session_with_gaps(vec![])), 0.0);
+        let mut junk = vec![f64::NAN, -5.0, 0.0, f64::INFINITY];
+        junk.extend((1..=20).map(|v| v as f64));
+        assert_eq!(
+            p95_gap(&session_with_gaps(junk)),
+            20.0,
+            "junk gaps excluded; 20 real samples remain"
+        );
     }
 
     #[test]

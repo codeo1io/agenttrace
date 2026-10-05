@@ -1415,11 +1415,16 @@ fn parse_ts(value: &str) -> Option<DateTime<Utc>> {
         .map(|ts| ts.and_utc())
 }
 
-pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
-    // The single percentile definition for the whole crate (pass-8
-    // F8-6): truncating at len*p, pinned as Go-compatible by
+pub fn percentile(sorted: &[f64], p: f64) -> f64 {
+    // The single percentile definition for the whole WORKSPACE (pass-8
+    // F8-6, rm-411): truncating at len*p, pinned as Go-compatible by
     // `percentile_matches_go_index_rule`. reports.rs used to carry a
-    // divergent (len-1)*p-rounding copy (20 vs 19 at p=0.95).
+    // divergent (len-1)*p-rounding copy (20 vs 19 at p=0.95); rm-411
+    // additionally routed diagnostics.rs' nearest-rank tool p95_sec
+    // and the tui hand-rolled p95_gap copies here, and the pin
+    // (`crate_percentile_is_the_only_percentile_and_matches_go`)
+    // became a workspace-source scan, so no crate may re-declare or
+    // hand-roll an index rule again.
     if sorted.is_empty() {
         return 0.0;
     }
