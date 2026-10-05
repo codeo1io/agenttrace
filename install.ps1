@@ -7,14 +7,41 @@ param(
     [string]$InstallDir = "$env:LOCALAPPDATA\agenttrace"
 )
 
+# Upstream #315: allow pinning the installed version from the environment
+# (AGENTTRACE_VERSION) instead of editing the script — CI and air-gapped
+# hosts rely on it.
+if ($env:AGENTTRACE_VERSION) {
+    $Version = $env:AGENTTRACE_VERSION
+}
+
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
-# Detect architecture
-$ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-    "X64"   { "amd64" }
-    "Arm64" { "arm64" }
-    default { throw "Unsupported architecture: $_" }
+# Detect architecture (upstream #314 fix class): in interactive
+# PowerShell 5.1, PSReadLine 2.0.0 loads a type-proxy assembly that
+# shadows [System.Runtime.InteropServices.RuntimeInformation], so the
+# primary probe can throw "Unsupported architecture: " on perfectly
+# supported hosts. Fall back to the plain PROCESSOR_ARCHITEW6432 /
+# PROCESSOR_ARCHITECTURE environment strings, which never lie about the
+# real process architecture.
+$ARCH = $null
+try {
+    $runtimeArch = [string][System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+    switch ($runtimeArch) {
+        "X64"   { $ARCH = "amd64" }
+        "Arm64" { $ARCH = "arm64" }
+        default { $ARCH = $null }
+    }
+} catch {
+    $ARCH = $null
+}
+if (-not $ARCH) {
+    $envArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    switch ($envArch) {
+        "AMD64" { $ARCH = "amd64" }
+        "ARM64" { $ARCH = "arm64" }
+        default { throw "Unsupported architecture: $envArch" }
+    }
 }
 
 Write-Host "🔍 Fetching latest release..." -ForegroundColor Cyan
