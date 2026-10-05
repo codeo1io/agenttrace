@@ -27,7 +27,11 @@ mod upstream;
 #[command(name = "agenttrace")]
 #[command(about = "TUI observability for AI coding agent sessions")]
 struct Args {
+    /// Session file to operate on instead of scanning (or a host
+    /// command: `statusline`, `upstream`)
     path: Option<String>,
+    /// Output format for reports: text (default), json, markdown, md,
+    /// or html
     #[arg(
         short = 'f',
         long = "format",
@@ -38,115 +42,178 @@ struct Args {
     /// Session directory to scan instead of auto-discovered agent homes
     #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
+    /// Cross-session comparison report of the matched sessions
+    /// against one model profile (-m)
     #[arg(long)]
     compare: bool,
+    /// Cost audit report for the matched sessions
     #[arg(long)]
     audit: bool,
+    /// Recommendations report for the matched sessions
     #[arg(long = "recommend")]
     recommend: bool,
+    /// MCP governance report: server and tool usage with risk findings
     #[arg(long = "mcp-governance")]
     mcp_governance: bool,
+    /// Context-window usage trends across the matched sessions
     #[arg(long = "context-trends")]
     context_trends: bool,
+    /// Delivery evidence report: work products and git signals
     #[arg(long = "delivery-evidence")]
     delivery_evidence: bool,
+    /// Aggregate overview of the matched sessions: costs, models, task
+    /// types, health
     #[arg(long)]
     overview: bool,
+    /// List the matched sessions one line each (table, or a JSON
+    /// array with -f json)
     #[arg(long)]
     sessions: bool,
+    /// Health diagnostics for one session: the most severe known
+    /// issue across the matched sessions (first-hit wins). --latest or
+    /// an --inspect rank picks the session; otherwise the first
+    /// matched session is shown.
     #[arg(long)]
     diagnostics: bool,
+    /// Show the Nth session of the attention list in full detail
+    /// (rank starts at 1). The list holds at most six sessions, one
+    /// per tier — critical errors, anomalies, tool failures, cost,
+    /// latency — so rank 1 is the unhealthiest, not the most
+    /// expensive.
     #[arg(long)]
     inspect: Option<usize>,
+    /// Model name the --compare report benchmarks the matched
+    /// sessions against
     #[arg(short = 'm', default_value = "default")]
     model: String,
+    /// Write the report to this file in addition to stdout (both
+    /// outputs are produced)
     #[arg(short = 'o')]
     output: Option<PathBuf>,
+    /// Report on the most recent matched session only
     #[arg(long)]
     latest: bool,
+    /// Token waste analysis for the matched sessions (cache misses,
+    /// redundant reads)
     #[arg(long)]
     waste: bool,
+    /// List the model pricing table agenttrace would use
     #[arg(long = "list-models")]
     list_models: bool,
+    /// Refresh the bundled model pricing snapshot from the LiteLLM
+    /// database
     #[arg(long = "update-pricing")]
     update_pricing: bool,
+    /// Debug aid: show how discovery admission rules match each
+    /// session file
     #[arg(long = "test-match")]
     test_match: bool,
-    /// Report on the Claude Code statusline capture journal (candidate
-    /// 53, cycle 7): limit-pressure windows, reset crossings, and
-    /// per-session prompt-cache miss causes recorded by
-    /// `agenttrace statusline`.
+    /// Report on the Claude Code statusline capture journal
+    /// (`agenttrace statusline`): limit-pressure windows, reset
+    /// crossings, and per-session prompt-cache miss causes.
     #[arg(long = "statusline-report")]
     statusline_report: bool,
     /// `agenttrace upstream`: refresh the remote-tracking refs from the
     /// network via `git fetch` (and probe the npm registry) before
     /// reporting fork-vs-upstream drift. Without it, `agenttrace
-    /// upstream` is fully offline (rm-024).
+    /// upstream` is fully offline.
     #[arg(long)]
     fetch: bool,
+    /// Print the agenttrace version and exit
     #[arg(long)]
     version: bool,
+    /// Run against the bundled demo corpus instead of real sessions
     #[arg(long)]
     demo: bool,
+    /// Environment check: agent homes, session stores, and tool
+    /// availability
     #[arg(long)]
     doctor: bool,
+    /// Search session transcripts and metadata for this query
     #[arg(long)]
     search: Option<String>,
+    /// Maximum number of --search matches to show
     #[arg(long = "search-limit", default_value_t = 20)]
     search_limit: usize,
+    /// Exit 1 when the health score is below this value
     #[arg(long = "fail-under-health", default_value_t = 0)]
     fail_under_health: i32,
+    /// Exit 1 when a critical anomaly is present
     #[arg(long = "fail-on-critical")]
     fail_on_critical: bool,
+    /// Exit 1 when the tool failure rate exceeds this fraction
+    /// (0.0-1.0)
     #[arg(long = "max-tool-fail-rate")]
     max_tool_fail_rate: Option<f64>,
+    /// Baseline overview JSON to compare this --overview run against
     #[arg(long)]
     baseline: Option<String>,
+    /// Allowed session-duration drift vs baseline before the gate
+    /// fails (percent)
     #[arg(long = "baseline-max-duration-delta-pct", default_value_t = 0.0)]
     baseline_max_duration_delta_pct: f64,
+    /// Allowed cost drift vs baseline before the gate fails (percent)
     #[arg(long = "baseline-max-cost-delta-pct", default_value_t = 0.0)]
     baseline_max_cost_delta_pct: f64,
+    /// Allowed token drift vs baseline before the gate fails
+    /// (percent)
     #[arg(long = "baseline-max-token-delta-pct", default_value_t = 0.0)]
     baseline_max_token_delta_pct: f64,
     /// Opt out of the baseline regression gate: keep the comparison in the
-    /// report but do not fail the run (exit 2) on a threshold breach
-    /// (pass-7 P7-3).
+    /// report but do not fail the run (exit 2) on a threshold breach.
     #[arg(long = "no-baseline-gate")]
     no_baseline_gate: bool,
+    /// Output language for translated report surfaces (en or zh)
     #[arg(long = "lang", default_value = "en", value_name = "en|zh")]
     lang: String,
+    /// Keep only sessions in this time window: today, 7d, 30d, or all
     #[arg(long, default_value = "all")]
     range: String,
+    /// Keep only sessions whose project path contains this substring
     #[arg(long, default_value = "")]
     project: String,
+    /// Keep only sessions whose source tool contains this substring
     #[arg(long, default_value = "")]
     source: String,
+    /// Keep only sessions whose model name contains this substring
     #[arg(long = "model-filter", default_value = "")]
     model_filter: String,
+    /// Keep only sessions whose name, path, cwd, model, tools, or
+    /// anomalies contain this text
     #[arg(long, default_value = "")]
     query: String,
+    /// Keep only sessions at this health tier: healthy/good, warn,
+    /// crit/critical, or a bound like >=80
     #[arg(long, default_value = "")]
     health: String,
+    /// Keep only sessions matching this cost comparison, e.g. >0.50
     #[arg(long, default_value = "")]
     cost: String,
+    /// Keep only sessions with an anomaly matching this text (or "any")
     #[arg(long, default_value = "")]
     anomaly: String,
+    /// Row order for list views: recent, health, cost, turns,
+    /// failures, source, name, or anomalies
     #[arg(long, default_value = "recent")]
     sort: String,
+    /// Row order direction for list views: asc or desc
     #[arg(long, default_value = "desc")]
     order: String,
+    /// Maximum rows to show in list views (aggregates stay unbounded)
     #[arg(long, default_value_t = 20)]
     limit: usize,
     /// Explicitly bound governance reports to the newest N sessions.
     /// Governance reports audit every matching session by default;
-    /// sampling is always disclosed via audited_sessions/total_sessions
-    /// (pass-8 F8-1).
+    /// sampling is always disclosed via audited_sessions/total_sessions.
     #[arg(long)]
     sample: Option<usize>,
+    /// Delete the session parse cache before running
     #[arg(long = "clear-cache")]
     clear_cache: bool,
+    /// Persist this run's derived sessions for later trend comparisons
     #[arg(long = "preserve-history")]
     preserve_history: bool,
+    /// Merge previously preserved derived sessions into this run
     #[arg(long = "include-history")]
     include_history: bool,
 }
@@ -479,11 +546,19 @@ fn run() -> anyhow::Result<()> {
     let (sessions, load_report) = load_sessions_report(&args)?;
     let sessions = prepare_cli_view(sessions, &args)?;
     if sessions.is_empty() {
+        // rm-500: even when the listing ends up empty, the degradation
+        // is disclosed before the no-match error can hide it.
+        if args.sessions {
+            print_sessions_load_disclosure(load_report.as_ref());
+        }
         bail!("No sessions match the requested filters");
     }
 
     if args.sessions || args.diagnostics || args.inspect.is_some() {
         if args.sessions {
+            // rm-500: a degraded listing is disclosed, never silently
+            // shrunken — before the table itself is written.
+            print_sessions_load_disclosure(load_report.as_ref());
             let out = render_session_list(&sessions, &args.format, args.limit);
             write_output(&args.output, &(out.clone() + "\n"))?;
             write_stdout(&out)?;
@@ -991,6 +1066,13 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     );
     let sessions = report.sessions.clone();
     if sessions.is_empty() {
+        // rm-500: shrinking to zero is the most extreme silent
+        // degradation, and it happens INSIDE this builder — the
+        // empty-branch disclosure in run() never sees it. Name what
+        // was dropped before the no-match error buries it.
+        if args.sessions {
+            print_sessions_load_disclosure(Some(&report));
+        }
         if report.discovered == 0 {
             match args.dir.as_deref() {
                 Some(dir) => bail!(
@@ -1266,6 +1348,80 @@ fn matches_number(value: f64, filter: &str) -> bool {
         }
     }
     false
+}
+
+/// rm-500: how many degraded-source names a disclosure line shows at
+/// most before folding the rest into a count.
+const DISCLOSED_SOURCE_NAME_CAP: usize = 6;
+
+/// rm-500: `--sessions` must disclose what it silently excludes:
+/// walk-admitted files that failed to parse and sqlite-backed stores
+/// that exist but cannot be read. The note goes to stderr so every
+/// format's stdout stays a single parseable document (the rm-301
+/// purity lineage) — it is never a stdout preamble.
+fn print_sessions_load_disclosure(report: Option<&LoadReport>) {
+    let Some(report) = report else {
+        return;
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if report.skipped > 0 || !report.unparsed_files.is_empty() {
+        // rm-500 review F4: names come from the filesystem — strip
+        // control bytes before echoing them back (repo convention:
+        // sanitize_line_segment replaces control characters with
+        // U+FFFD, so a hostile filename cannot smuggle a terminal
+        // escape sequence through the disclosure note).
+        let shown: Vec<String> = report
+            .unparsed_files
+            .iter()
+            .take(DISCLOSED_SOURCE_NAME_CAP)
+            .map(|name| agenttrace_core::sanitize_line_segment(name))
+            .collect();
+        let mut part = format!(
+            "{} unparseable session file{}",
+            report.skipped,
+            if report.skipped == 1 { "" } else { "s" }
+        );
+        if !shown.is_empty() {
+            part.push_str(&format!(" ({})", shown.join(", ")));
+        }
+        let hidden = report.skipped.saturating_sub(shown.len());
+        if hidden > 0 {
+            part.push_str(&format!(" (+{hidden} more)"));
+        }
+        parts.push(part);
+    }
+    if !report.failed_stores.is_empty() {
+        let shown: Vec<String> = report
+            .failed_stores
+            .iter()
+            .take(DISCLOSED_SOURCE_NAME_CAP)
+            .map(|store| agenttrace_core::sanitize_line_segment(store))
+            .collect();
+        let mut part = format!(
+            "{} unreadable sqlite store{}",
+            report.failed_stores.len(),
+            if report.failed_stores.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        part.push_str(&format!(" ({})", shown.join("; ")));
+        let hidden = report.failed_stores.len().saturating_sub(shown.len());
+        if hidden > 0 {
+            part.push_str(&format!(" (+{hidden} more)"));
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return;
+    }
+    let total = report.skipped + report.failed_stores.len();
+    eprintln!(
+        "Note: {total} session source{} skipped from this listing: {}",
+        if total == 1 { "" } else { "s" },
+        parts.join("; ")
+    );
 }
 
 fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {

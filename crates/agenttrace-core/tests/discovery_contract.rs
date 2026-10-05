@@ -44,6 +44,55 @@ fn seed_home_with_opencode_db(home: &std::path::Path, db_path: &std::path::Path)
 }
 
 #[test]
+fn drifted_opencode_store_is_disclosed_not_cached_as_empty() {
+    // rm-500 review F1: a valid-sqlite opencode.db without the `session`
+    // table is schema drift, not absence — the loader must record the
+    // failure in LoadReport.failed_stores and skip the snapshot (a
+    // `sessions: []` cache entry would hide the drift forever) while
+    // healthy file-backed sessions still load alongside it.
+    let root = temp_root("agenttrace-rm500-opencode-drift");
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let claude = home.join(".claude").join("projects").join("probe");
+    fs::create_dir_all(&claude).expect("claude tree");
+    fs::write(claude.join("ok.jsonl"), SAMPLE_JSONL).expect("healthy fixture");
+    let opencode_dir = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&opencode_dir).expect("opencode tree");
+    let db = Connection::open(opencode_dir.join("opencode.db")).expect("open drift fixture");
+    db.execute_batch("create table unrelated(x);")
+        .expect("seed non-session table");
+    drop(db);
+
+    with_home_and_cache(&home, &cache, || {
+        let report = load_sessions_with_options(None, &LoadOptions::default());
+        assert!(!report.sessions.is_empty(), "healthy sessions still load");
+        assert_eq!(
+            report.failed_stores.len(),
+            1,
+            "drifted opencode store is disclosed: {:?}",
+            report.failed_stores
+        );
+        assert!(
+            report.failed_stores[0].contains("opencode.db"),
+            "names the store: {}",
+            report.failed_stores[0]
+        );
+        if let Ok(entries) = fs::read_dir(&cache) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.contains("opencode"),
+                    "no empty-success snapshot for the drifted store: {name}"
+                );
+            }
+        }
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn adversarial_sqlite_overflow_db_neither_panics_nor_wraps() {
     // P5-1 reproducer: two assistant messages with i64::MAX input tokens
     // made the per-session accumulator `agg.input_tokens += input`
@@ -2947,6 +2996,78 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
             Some(2),
             "the journal must be rewritten at the current walk version"
         );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// rm-500: the load report must NAME the files behind `skipped`, not
+/// only count them, so a listing can disclose what it silently drops.
+#[test]
+fn load_report_names_unparsed_files_instead_of_only_counting() {
+    let root = temp_root("agenttrace-rm500-unparsed");
+    fs::create_dir_all(&root).expect("tempdir");
+    fs::write(root.join("ok.jsonl"), SAMPLE_JSONL).expect("healthy fixture");
+    fs::write(root.join("malformed.jsonl"), "not a session journal\n").expect("broken fixture");
+
+    with_session_cache(&root.join("cache"), || {
+        let report = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        assert!(!report.sessions.is_empty(), "healthy fixture must load");
+        assert_eq!(report.skipped, 1, "broken fixture counted as skipped");
+        assert_eq!(
+            report.unparsed_files,
+            vec![root.join("malformed.jsonl").display().to_string()],
+            "the skipped file must be named for disclosure"
+        );
+        assert!(
+            report.failed_stores.is_empty(),
+            "dir mode has no stores to fail"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// rm-500 arm (a): a sqlite store that exists but cannot be read must
+/// surface as `failed_stores`, never as silent absence.
+#[test]
+fn poisoned_hermes_store_is_disclosed_not_swallowed() {
+    let root = temp_root("agenttrace-rm500-poisoned-store");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".claude").join("projects").join("p")).expect("claude tree");
+    fs::create_dir_all(home.join(".hermes")).expect("hermes tree");
+    fs::write(
+        home.join(".claude")
+            .join("projects")
+            .join("p")
+            .join("ok.jsonl"),
+        SAMPLE_JSONL,
+    )
+    .expect("healthy fixture");
+    fs::write(
+        home.join(".hermes").join("state.db"),
+        "not a sqlite database\n",
+    )
+    .expect("poison fixture");
+
+    with_home_and_cache(&home, &root.join("cache"), || {
+        let report = load_sessions_with_options(None, &LoadOptions::default());
+        assert!(
+            !report.sessions.is_empty(),
+            "file-backed sessions must still load"
+        );
+        assert_eq!(
+            report.failed_stores.len(),
+            1,
+            "unreadable store must be reported: {:?}",
+            report.failed_stores
+        );
+        assert!(
+            report.failed_stores[0].contains("state.db"),
+            "failure names the store: {}",
+            report.failed_stores[0]
+        );
+        assert!(report.unparsed_files.is_empty());
     });
 
     let _ = fs::remove_dir_all(root);

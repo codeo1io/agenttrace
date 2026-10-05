@@ -1,0 +1,4 @@
+{"role":"user","content":"ship the disclosure feature","timestamp":"2026-10-05T08:00:00Z","ModelUsed":"gpt-5","SourceTool":"generic"}
+{"role":"assistant","content":"listing the parsed sessions honestly","timestamp":"2026-10-05T08:00:01Z","ModelUsed":"gpt-5","SourceTool":"generic"}
+{"role":"user","content":"and show what failed to parse","timestamp":"2026-10-05T08:00:02Z","ModelUsed":"gpt-5","SourceTool":"generic"}
+{"role":"assistant","content":"naming every skipped source","timestamp":"2026-10-05T08:00:03Z","ModelUsed":"gpt-5","SourceTool":"generic"}

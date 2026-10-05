@@ -62,17 +62,43 @@ pub fn load_sqlite_backed_sessions() -> Vec<Session> {
 }
 
 pub(crate) fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) -> Vec<Session> {
+    load_sqlite_backed_sessions_since_with_failures(since).0
+}
+
+/// rm-500: the disclosing loader. A store that exists but cannot be
+/// read (locked, corrupt, schema-drifted) is a different fact from an
+/// absent one, yet both used to return an empty vec, so listings
+/// silently shrank. Callers that render listings consume the failure
+/// list and disclose it; `load_sqlite_backed_sessions` (doctor's lane)
+/// keeps the legacy swallowing behavior.
+pub(crate) fn load_sqlite_backed_sessions_since_with_failures(
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, Vec<String>) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut sessions = Vec::new();
+    let mut failures = Vec::new();
     for path in hermes_state_db_paths(&home) {
-        sessions.extend(load_hermes_sqlite_sessions(&path, since));
+        sessions.extend(load_hermes_sqlite_sessions(&path, since, &mut failures));
     }
     for path in opencode_db_paths(&home) {
-        sessions.extend(load_opencode_sqlite_sessions(&path, since));
+        sessions.extend(load_opencode_sqlite_sessions(&path, since, &mut failures));
     }
-    sessions
+    (sessions, failures)
+}
+
+/// rm-500: one-line, path-qualified failure text for a store that
+/// exists but cannot be read. rusqlite messages are normally
+/// single-line; the whitespace collapse keeps list-view output row-safe
+/// if one ever is not.
+fn store_failure(path: &Path, stage: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "{}: {}: {}",
+        path.display(),
+        stage,
+        error.to_string().replace(['\n', '\r', '\t'], " ")
+    )
 }
 
 pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
@@ -154,21 +180,43 @@ fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
     )
 }
 
-fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn load_hermes_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    failures: &mut Vec<String>,
+) -> Vec<Session> {
     if !sqlite_file_exists(path) {
+        // rm-500: absence is not a failure — an unreadable store must
+        // stay distinguishable from a missing one.
         return Vec::new();
     }
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "hermes") {
         return filter_since(sessions, since);
     }
-    let sessions = query_hermes_sqlite_sessions(path, None);
+    // rm-500: only a store that was actually queried gets a snapshot.
+    // Caching the empty result of a failed query made the failure
+    // invisible on every later run (the snapshot hit returned empty
+    // with no error path to walk).
+    let Some(sessions) = query_hermes_sqlite_sessions(path, None, failures) else {
+        return Vec::new();
+    };
     let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
     filter_since(sessions, since)
 }
 
-fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
-    let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
+/// rm-500: `None` means the store could not be read (a failure was
+/// recorded); `Some` means it was queried, even if it holds no sessions.
+fn query_hermes_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    failures: &mut Vec<String>,
+) -> Option<Vec<Session>> {
+    let db = match open_sqlite_read_only(path) {
+        Ok(db) => db,
+        Err(error) => {
+            failures.push(store_failure(path, "open failed", &error));
+            return None;
+        }
     };
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
     let tool_outcomes = hermes_tool_outcome_counts(&db);
@@ -182,11 +230,15 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, {cwd} from sessions \
          where (?1 is null or started_at >= ?1 or started_at is null or started_at <= 0)"
     );
-    let Ok(mut stmt) = db.prepare(&sql) else {
-        return Vec::new();
+    let mut stmt = match db.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            failures.push(store_failure(path, "query prepare failed", &error));
+            return None;
+        }
     };
     let since_unix = since.map(|value| value.timestamp() as f64);
-    let Ok(rows) = stmt.query_map([since_unix], |row| {
+    let rows = match stmt.query_map([since_unix], |row| {
         Ok(SqliteSessionAgg {
             id: row.get::<_, String>(0)?,
             model: string_or(row.get::<_, Option<String>>(1)?, "default"),
@@ -203,77 +255,110 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             path: path.to_string_lossy().to_string(),
             ..SqliteSessionAgg::default()
         })
-    }) else {
-        return Vec::new();
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.push(store_failure(path, "query failed", &error));
+            return None;
+        }
     };
 
-    rows.filter_map(Result::ok)
-        .map(|mut agg| {
-            if !agg.model.is_empty() {
-                agg.models.insert(agg.model.clone());
-            }
-            if let Some(counts) = roles.get(&agg.id) {
-                agg.user_messages = counts.user;
-                agg.assistant_turns = counts.assistant;
-            }
-            if let Some(outcomes) = tool_outcomes.get(&agg.id) {
-                // rm-198: the hermes session row records only the number
-                // of tool calls, never their outcome. The outcome split
-                // comes from the messages table instead (observed result
-                // rows, minus the ones hermes renders as tool errors),
-                // matching the parser convention that ok+fail counts
-                // observed results while tool_calls_total counts calls.
-                agg.tool_results = outcomes.results;
-                agg.tool_calls_fail = outcomes.failures;
-                agg.tool_calls_ok = outcomes.results.saturating_sub(outcomes.failures);
-                agg.tool_calls_total = agg.tool_calls_total.max(outcomes.results);
-            } else if let Some(counts) = roles.get(&agg.id) {
-                // No content column (or no tool rows): an outcome split
-                // cannot be derived, so report the observed result count
-                // without fabricating a success split.
-                agg.tool_results = counts.tool;
-            }
-            session_from_sqlite_agg(agg)
-        })
-        .collect()
+    Some(
+        rows.filter_map(Result::ok)
+            .map(|mut agg| {
+                if !agg.model.is_empty() {
+                    agg.models.insert(agg.model.clone());
+                }
+                if let Some(counts) = roles.get(&agg.id) {
+                    agg.user_messages = counts.user;
+                    agg.assistant_turns = counts.assistant;
+                }
+                if let Some(outcomes) = tool_outcomes.get(&agg.id) {
+                    // rm-198: the hermes session row records only the number
+                    // of tool calls, never their outcome. The outcome split
+                    // comes from the messages table instead (observed result
+                    // rows, minus the ones hermes renders as tool errors),
+                    // matching the parser convention that ok+fail counts
+                    // observed results while tool_calls_total counts calls.
+                    agg.tool_results = outcomes.results;
+                    agg.tool_calls_fail = outcomes.failures;
+                    agg.tool_calls_ok = outcomes.results.saturating_sub(outcomes.failures);
+                    agg.tool_calls_total = agg.tool_calls_total.max(outcomes.results);
+                } else if let Some(counts) = roles.get(&agg.id) {
+                    // No content column (or no tool rows): an outcome split
+                    // cannot be derived, so report the observed result count
+                    // without fabricating a success split.
+                    agg.tool_results = counts.tool;
+                }
+                session_from_sqlite_agg(agg)
+            })
+            .collect(),
+    )
 }
 
-fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn load_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    failures: &mut Vec<String>,
+) -> Vec<Session> {
     if !sqlite_file_exists(path) {
+        // rm-500: absence is not a failure.
         return Vec::new();
     }
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
         return filter_since(sessions, since);
     }
-    let sessions = query_opencode_sqlite_sessions(path, None);
+    // rm-500: see load_hermes_sqlite_sessions — a failed query must
+    // not be snapshotted as an empty success.
+    let Some(sessions) = query_opencode_sqlite_sessions(path, None, failures) else {
+        return Vec::new();
+    };
     let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
     filter_since(sessions, since)
 }
 
-fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
-    let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
+/// rm-500: `None` means open/prepare/query failure at this store —
+/// callers must NOT snapshot it as an empty success.
+fn query_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    failures: &mut Vec<String>,
+) -> Option<Vec<Session>> {
+    let db = match open_sqlite_read_only(path) {
+        Ok(db) => db,
+        Err(error) => {
+            failures.push(store_failure(path, "open failed", &error));
+            return None;
+        }
     };
-    let mut aggs = opencode_sqlite_session_rows(&db, path, since);
+    // rm-500 review F1: a prepare/query failure surfaces through
+    // `failures` and `None` here, so the loader skips the snapshot
+    // (no empty-success cache). The enrichment helpers below stay
+    // lenient on purpose — missing message/part tables are schema
+    // variants that do not block the session rows; this row lane is
+    // the disclosure point.
+    let mut aggs = opencode_sqlite_session_rows(&db, path, since, failures)?;
     if aggs.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     add_opencode_sqlite_messages(&db, &mut aggs);
     add_opencode_sqlite_parts(&db, &mut aggs);
     capture_opencode_user_text(&db, &mut aggs);
 
-    aggs.into_values()
-        .map(|mut agg| {
-            if agg.model.is_empty() {
-                agg.model = "default".to_string();
-            }
-            if agg.events == 0 {
-                agg.events = agg.user_messages + agg.assistant_turns + agg.tool_calls_total;
-            }
-            apply_opencode_stored_totals(&mut agg);
-            session_from_sqlite_agg(agg)
-        })
-        .collect()
+    Some(
+        aggs.into_values()
+            .map(|mut agg| {
+                if agg.model.is_empty() {
+                    agg.model = "default".to_string();
+                }
+                if agg.events == 0 {
+                    agg.events = agg.user_messages + agg.assistant_turns + agg.tool_calls_total;
+                }
+                apply_opencode_stored_totals(&mut agg);
+                session_from_sqlite_agg(agg)
+            })
+            .collect(),
+    )
 }
 
 /// Prefer the authoritative totals recorded on the session row over
@@ -354,7 +439,8 @@ fn opencode_sqlite_session_rows(
     db: &Connection,
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> HashMap<String, SqliteSessionAgg> {
+    failures: &mut Vec<String>,
+) -> Option<HashMap<String, SqliteSessionAgg>> {
     let directory = if sqlite_has_column(db, "session", "directory") {
         "directory"
     } else {
@@ -401,11 +487,18 @@ fn opencode_sqlite_session_rows(
         "select id, title, time_created, time_updated, {directory}, {stored_select} from session \
          where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
-    let Ok(mut stmt) = db.prepare(&sql) else {
-        return HashMap::new();
+    // rm-500 review F1: prepare failure (e.g. `no such table: session`)
+    // is schema drift or corruption at the expected opencode store
+    // path — not absence. Recorded as a failure, `None` (skip snapshot).
+    let mut stmt = match db.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            failures.push(store_failure(path, "query prepare failed", &error));
+            return None;
+        }
     };
     let since_millis = since.map(|value| value.timestamp_millis());
-    let Ok(rows) = stmt.query_map([since_millis], |row| {
+    let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
         Ok((
             id.clone(),
@@ -430,10 +523,14 @@ fn opencode_sqlite_session_rows(
                 ..SqliteSessionAgg::default()
             },
         ))
-    }) else {
-        return HashMap::new();
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.push(store_failure(path, "query failed", &error));
+            return None;
+        }
     };
-    rows.filter_map(Result::ok).collect()
+    Some(rows.filter_map(Result::ok).collect())
 }
 
 fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
@@ -994,7 +1091,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions =
+            query_hermes_sqlite_sessions(&path, None, &mut Vec::new()).expect("fixture queries");
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 2, "both fixture sessions must load");
 
@@ -1036,7 +1134,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions =
+            query_hermes_sqlite_sessions(&path, None, &mut Vec::new()).expect("fixture queries");
         std::fs::remove_dir_all(&root).ok();
 
         // s1: ok 1 / fail 1 -> 50% across the corpus (s2 contributes no
@@ -1056,5 +1155,100 @@ mod tests {
                 .any(|message| message.contains("tool failure rate")),
             "--max-tool-fail-rate must trip on hermes-sourced failures: {failures:?}"
         );
+    }
+
+    /// rm-500: an unreadable store is a fact, not an absence. The
+    /// failure-vs-absence distinction is the whole contract behind
+    /// `--sessions` disclosure.
+    #[test]
+    fn poisoned_store_records_failure_while_absence_stays_silent() {
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm500-open-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let poisoned = root.join("state.db");
+        std::fs::write(&poisoned, b"not a sqlite database").expect("poison fixture");
+
+        let mut failures = Vec::new();
+        let sessions = load_hermes_sqlite_sessions(&poisoned, None, &mut failures);
+        assert!(sessions.is_empty());
+        assert_eq!(failures.len(), 1, "unreadable store must be recorded");
+        assert!(failures[0].contains("state.db"), "names the store");
+        assert!(failures[0].contains("failed"), "says what failed");
+
+        // Absence is not a failure: a home without the store records
+        // nothing, so a listing over a bare machine stays clean.
+        let mut absent = Vec::new();
+        let none = load_hermes_sqlite_sessions(&root.join("missing.db"), None, &mut absent);
+        assert!(none.is_empty());
+        assert!(absent.is_empty(), "absence recorded as failure: {absent:?}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// rm-500 arm (b): schema drift must surface at the prepare stage —
+    /// a sqlite file without the sessions table is not "no sessions".
+    #[test]
+    fn schema_drifted_store_records_prepare_failure() {
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm500-drift-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = root.join("state.db");
+        let db = Connection::open(&path).expect("open drift fixture");
+        db.execute_batch("create table other(x);")
+            .expect("seed table");
+        drop(db);
+
+        let mut failures = Vec::new();
+        let sessions = query_hermes_sqlite_sessions(&path, None, &mut failures);
+        assert!(sessions.is_none(), "drifted store must report failure");
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("query prepare failed"),
+            "names the stage: {}",
+            failures[0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// rm-500 review F1: the opencode row lane must mirror the hermes
+    /// lane — a valid-sqlite store whose `session` table cannot be
+    /// prepared is schema drift, recorded as a failure and returned as
+    /// `None` (skip snapshot), never an empty map cached as an empty
+    /// success. Red-first: pre-fix, prepare fell into `HashMap::new()`
+    /// and the caller wrote a `sessions: []` snapshot.
+    #[test]
+    fn opencode_drifted_store_records_prepare_failure_not_empty_success() {
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm500-ocdrift-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = root.join("opencode.db");
+        let db = Connection::open(&path).expect("open drift fixture");
+        db.execute_batch("create table unrelated(x);")
+            .expect("seed table");
+        drop(db);
+
+        let mut failures = Vec::new();
+        let sessions = query_opencode_sqlite_sessions(&path, None, &mut failures);
+        assert!(
+            sessions.is_none(),
+            "drifted opencode store must report failure"
+        );
+        assert_eq!(failures.len(), 1, "exactly one failure: {failures:?}");
+        assert!(
+            failures[0].contains("opencode.db"),
+            "names the store: {}",
+            failures[0]
+        );
+        assert!(
+            failures[0].contains("query prepare failed"),
+            "names the stage: {}",
+            failures[0]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

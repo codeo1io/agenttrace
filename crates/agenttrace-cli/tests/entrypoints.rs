@@ -1206,3 +1206,183 @@ fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// rm-500: `--sessions` must disclose sources it silently dropped —
+/// stdout stays a single parseable document, stderr names the files.
+/// Fixtures: testdata/generated/disclosure (healthy.jsonl,
+/// malformed.jsonl, poisoned-store.db).
+#[test]
+fn sessions_discloses_unparseable_sources() {
+    let disclosure_dir = generated_fixture("disclosure/healthy.jsonl")
+        .parent()
+        .expect("fixture dir")
+        .to_path_buf();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--sessions")
+        .arg("-d")
+        .arg(&disclosure_dir)
+        .output()
+        .expect("spawn agenttrace");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "disclosure is a note, not a failure"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ship the disclosure feature"),
+        "listing keeps the parsed session: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Note:"),
+        "stdout must stay a single parseable document: {stdout}"
+    );
+    assert!(
+        stderr.contains("skipped"),
+        "disclosure must say what was skipped: {stderr}"
+    );
+    assert!(
+        stderr.contains("malformed.jsonl"),
+        "disclosure must name the file: {stderr}"
+    );
+    assert!(
+        !stderr.contains("healthy.jsonl"),
+        "only skipped sources are named"
+    );
+}
+
+/// rm-500 arm (3): when every walk-admitted file fails to parse the
+/// listing shrinks to zero — the degradation must still be named
+/// before the no-match error buries it.
+#[test]
+fn sessions_discloses_when_listing_shrinks_to_zero() {
+    let only_bad =
+        std::env::temp_dir().join(format!("agenttrace-cli-rm500-zero-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&only_bad);
+    std::fs::create_dir_all(&only_bad).expect("scratch dir");
+    std::fs::copy(
+        generated_fixture("disclosure/malformed.jsonl"),
+        only_bad.join("malformed.jsonl"),
+    )
+    .expect("copy broken fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--sessions")
+        .arg("-d")
+        .arg(&only_bad)
+        .output()
+        .expect("spawn agenttrace");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an all-unparseable dir is still a no-match, not a crash"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Note:"),
+        "shrink-to-zero must still disclose: {stderr}"
+    );
+    assert!(
+        stderr.contains("malformed.jsonl"),
+        "disclosure must name the dropped file: {stderr}"
+    );
+    assert!(
+        stderr.contains("No sessions match"),
+        "the no-match error stays after the note: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&only_bad);
+}
+
+/// rm-500 wiring site 3 (review F5): when a filter empties the listing
+/// while a source was actually skipped, the skipped source must still
+/// be disclosed — the degradation happened, the filter only hid the
+/// rows that were left.
+#[test]
+fn sessions_discloses_skipped_sources_when_filters_empty_the_listing() {
+    let dir = generated_fixture("disclosure");
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--sessions")
+        .arg("-d")
+        .arg(&dir)
+        .arg("--query")
+        .arg("zzz-definitely-no-such-match")
+        .output()
+        .expect("spawn agenttrace");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a filter that matches nothing is a no-match exit"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Note:"),
+        "skipped sources are disclosed even when the listing filters to empty: {stderr}"
+    );
+    assert!(
+        stderr.contains("malformed.jsonl"),
+        "the skipped source is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("No sessions match"),
+        "the no-match error stays after the note: {stderr}"
+    );
+}
+
+/// rm-500 arm (a): an unreadable sqlite store shrinks `--sessions` to
+/// zero disclosure today — it must be named instead.
+#[test]
+fn sessions_discloses_unreadable_sqlite_store() {
+    let work =
+        std::env::temp_dir().join(format!("agenttrace-cli-rm500-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let home = work.join("home");
+    std::fs::create_dir_all(home.join(".hermes")).expect("hermes tree");
+    std::fs::create_dir_all(home.join(".claude").join("projects").join("p")).expect("claude tree");
+    std::fs::copy(
+        generated_fixture("disclosure/healthy.jsonl"),
+        home.join(".claude")
+            .join("projects")
+            .join("p")
+            .join("ok.jsonl"),
+    )
+    .expect("copy healthy fixture");
+    std::fs::copy(
+        generated_fixture("disclosure/poisoned-store.db"),
+        home.join(".hermes").join("state.db"),
+    )
+    .expect("copy poison fixture");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--sessions")
+        .env("HOME", &home)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", work.join("cache"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .output()
+        .expect("spawn agenttrace");
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ship the disclosure feature"),
+        "file-backed sessions still listed: {stdout}"
+    );
+    assert!(
+        stderr.contains("unreadable sqlite store"),
+        "store failure disclosed: {stderr}"
+    );
+    assert!(
+        stderr.contains("state.db"),
+        "store failure names the file: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}

@@ -36,7 +36,22 @@ pub struct LoadReport {
     pub parsed: usize,
     pub skipped: usize,
     pub cache_hits: usize,
+    /// rm-500: names for the files behind `skipped` (capped at
+    /// [`UNPARSED_FILE_NAME_CAP`]). The counter counts them; the names
+    /// let a listing disclose the degradation instead of silently
+    /// shrinking.
+    pub unparsed_files: Vec<String>,
+    /// rm-500: sqlite-backed stores that exist but could not be read
+    /// (locked, corrupt, schema-drifted). Absence records nothing —
+    /// failure must stay distinguishable from absence.
+    pub failed_stores: Vec<String>,
 }
+
+/// rm-500: cap on the file names retained in
+/// [`LoadReport::unparsed_files`]. `skipped` keeps the exact count;
+/// the cap bounds memory when a hostile corpus floods the walk with
+/// unparseable files.
+pub const UNPARSED_FILE_NAME_CAP: usize = 64;
 
 #[derive(Debug, Clone, Default)]
 pub struct LoadProgress {
@@ -287,6 +302,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
+    // rm-500: names for the files behind `skipped` (capped) and for
+    // sqlite-backed stores that exist but cannot be read.
+    let mut unparsed_files: Vec<String> = Vec::new();
+    let mut failed_stores: Vec<String> = Vec::new();
     // Slots hold (parsed session, came from cache); progress is still emitted in file order.
     let mut slots: Vec<Option<(Option<Session>, bool)>> = Vec::with_capacity(files.len());
     let mut misses = Vec::new();
@@ -336,7 +355,15 @@ pub fn load_sessions_with_progress_from_cache_mode(
                     (Some(session), false) => {
                         let _ = store_session(&files[next], session, cache);
                     }
-                    (None, _) => skipped += 1,
+                    (None, _) => {
+                        // rm-500: a walk-admitted file that failed to
+                        // parse is data the listing silently dropped —
+                        // keep its name so --sessions can disclose it.
+                        skipped += 1;
+                        if unparsed_files.len() < UNPARSED_FILE_NAME_CAP {
+                            unparsed_files.push(files[next].display().to_string());
+                        }
+                    }
                 }
                 report_load_progress(
                     result,
@@ -362,9 +389,14 @@ pub fn load_sessions_with_progress_from_cache_mode(
         let _ = save_session_cache(cache);
     }
     if dir.is_none() {
-        sessions.extend(crate::sqlite_sessions::load_sqlite_backed_sessions_since(
-            options.since,
-        ));
+        // rm-500: an unreadable store is not an absent one — keep the
+        // failure detail so --sessions can disclose it. The doctor
+        // lane (load_sqlite_backed_sessions) keeps the swallowing
+        // behavior by design.
+        let (sqlite_sessions, store_failures) =
+            crate::sqlite_sessions::load_sqlite_backed_sessions_since_with_failures(options.since);
+        sessions.extend(sqlite_sessions);
+        failed_stores.extend(store_failures);
     }
     if options.preserve_history {
         let _ = preserve_derived_history(&sessions);
@@ -398,6 +430,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sessions,
         discovered,
         cache_hits,
+        unparsed_files,
+        failed_stores,
     }
 }
 
