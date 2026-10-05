@@ -296,3 +296,21 @@ one place
   report semantics, release surfaces, and Pages artifacts. (#118)
 - Documented the launch-kit validation gates and release consistency checklist
   for public demo and install surfaces. (#115, #121)
+
+<!--
+  no-changelog-section markers (scripts/ci/check-plugin-version.sh, per-tag
+  arm rm-303): releases shipped before that arm existed, whose tags are
+  merged into every branch but whose changes never got a dedicated section
+  at release time. Reasons below are taken from each tag's own commit
+  (git log -1 <tag>). Recorded 2026-10-05, run 4a688257 full_tests
+  b163e538: the gate began failing only after a wholesale tag fetch made
+  these refs visible to `git tag --merged HEAD`; nothing about the releases
+  themselves changed.
+-->
+<!-- no-changelog-section: v0.7.2: release only decoupled the Pages checks from the release version (3f6252a); CI wiring, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.3: release only fixed npm tarball publishing (739a6c3); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.4: release only configured npm auth before publishing (2462045); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.5: re-tag of v0.7.4's npm-auth fix on the same commit (2462045); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.6: release only published the npm launcher under the zack78 scope (e20a224); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.7: release only fixed release-channel script permissions (cd33203); CI plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.8.0: upstream merge "Improve pricing provenance and TUI session exploration (#280)" (b964a74) shipped without a dedicated section; its user-visible changes are covered by the v0.8.1 and v0.9.0 sections that follow it -->

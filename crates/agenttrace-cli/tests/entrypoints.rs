@@ -1206,3 +1206,162 @@ fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// ---------------------------------------------------------------------------
+// rm-503 / rm-505 (cycle 4, run adcef255d604): CLI entry-surface honesty.
+// ---------------------------------------------------------------------------
+
+use std::io::Write as _;
+use std::process::Stdio;
+
+fn stdin_dash_overview_bytes(fixture: &std::path::Path) -> Vec<u8> {
+    let payload = std::fs::read(fixture).expect("fixture must be readable");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agenttrace for stdin probe");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(&payload)
+        .expect("pipe fixture bytes");
+    let out = child.wait_with_output().expect("collect stdin run");
+    assert!(
+        out.status.success(),
+        "`--overview -` must succeed on piped session bytes: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn stdin_dash_overview_is_byte_identical_to_the_same_file() {
+    // rm-503 pinning test: `-` must be a pure byte-source swap — the
+    // rendered report for a session piped on stdin must equal the report
+    // for the same session named as a file, byte for byte.
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+    let via_file = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--overview",
+            fixture.to_str().expect("fixture path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run file-mode baseline");
+    assert!(
+        via_file.status.success(),
+        "file-mode baseline must succeed: {}",
+        String::from_utf8_lossy(&via_file.stderr)
+    );
+    let via_stdin = stdin_dash_overview_bytes(&fixture);
+    assert_eq!(
+        via_file.stdout, via_stdin,
+        "`--overview -` output must be byte-identical to the file path"
+    );
+}
+
+#[test]
+fn stdin_dash_empty_input_fails_like_an_empty_file() {
+    // rm-503: empty stdin is the empty-session error class (rc1), the
+    // same failure an empty named file produces — not a hang, not a
+    // zero-session success.
+    let empty = std::env::temp_dir().join("agenttrace-stdin-empty-probe.jsonl");
+    std::fs::write(&empty, b"").expect("write empty probe file");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn empty-stdin probe");
+    drop(child.stdin.take()); // close the pipe: EOF
+    let out = child.wait_with_output().expect("collect empty-stdin run");
+    assert_eq!(
+        Some(1),
+        out.status.code(),
+        "empty stdin must exit rc1, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("empty session"),
+        "stderr must name the empty-session class: {stderr}"
+    );
+
+    let via_file = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", empty.to_str().expect("tmp path")])
+        .output()
+        .expect("run empty-file baseline");
+    assert_eq!(Some(1), via_file.status.code());
+    let _ = std::fs::remove_file(&empty);
+}
+
+#[test]
+fn keyword_host_commands_have_real_help_routes() {
+    // rm-505: `statusline` and `upstream` are documented host keywords,
+    // but `<keyword> --help` used to exit 2 with a mislabeled
+    // "flag follows the positional session path" error and no help
+    // route at all. Both keywords now render per-command help at rc0,
+    // with `-h` parity.
+    for keyword in ["statusline", "upstream"] {
+        for help_flag in ["--help", "-h"] {
+            let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+                .args([keyword, help_flag])
+                .output()
+                .expect("run keyword help probe");
+            assert_eq!(
+                Some(0),
+                out.status.code(),
+                "`{keyword} {help_flag}` must exit rc0, got {:?}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains(&format!("`agenttrace {keyword}`")),
+                "keyword help must name the command: {stdout}"
+            );
+            assert!(
+                stdout.contains("flags after it are rejected"),
+                "keyword help must state the no-flags-after contract: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
+fn keyword_bad_flag_error_names_the_keyword_not_a_session_path() {
+    // rm-505: a bad flag after a keyword is still rc2 (the dropped-flag
+    // discipline stands), but the error must be keyword-scoped usage —
+    // not the "positional session path" mislabel — and must point at
+    // the keyword's help route.
+    for keyword in ["statusline", "upstream"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args([keyword, "--bogus-flag"])
+            .output()
+            .expect("run keyword bad-flag probe");
+        assert_eq!(
+            Some(2),
+            out.status.code(),
+            "`{keyword} --bogus-flag` must stay rc2, got {:?}",
+            out.status
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("follows the `{keyword}` keyword")),
+            "error must scope to the keyword: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("agenttrace {keyword} --help")),
+            "error must point at the keyword help route: {stderr}"
+        );
+        assert!(
+            !stderr.contains("positional session path"),
+            "error must not mislabel the keyword as a session path: {stderr}"
+        );
+    }
+}

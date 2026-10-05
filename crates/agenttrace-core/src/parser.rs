@@ -22,13 +22,23 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     }
     let raw =
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
+    let name = session_name(path);
+    let path_text = path.to_string_lossy().to_string();
+    parse_session_bytes(raw, &path_text, &name)
+}
+
+/// Decode + parse one session stream (rm-503): the shared tail of
+/// `parse_file` past the byte read. Encoding guards keep the exact
+/// wording the file path produced, with `label` standing in for the
+/// path so stdin failures read `session file <stdin> is …`.
+fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<Session> {
     // Windows tooling (notably PowerShell 5.1's `>` redirection) writes
     // UTF-16 with a BOM by default; name the encoding instead of failing
     // with a generic read error (pass-7 P7-2).
     if raw.starts_with(&[0xFF, 0xFE]) || raw.starts_with(&[0xFE, 0xFF]) {
         bail!(
             "session file {} is UTF-16 encoded; convert it to UTF-8 and retry",
-            path.display()
+            label
         );
     }
     // Codex ≥0.152 stores rollouts as zstd frames (magic 28 B5 2F FD,
@@ -37,17 +47,22 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     // (pass-7 research, candidate 44 minimum).
     if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         bail!(
-            "session file {} is zstd-compressed (Codex rollout format); decompress it to JSONL first (e.g. `zstd -d {} -o {}.jsonl`)",
-            path.display(),
-            path.display(),
-            path.display()
+            "session file {} is zstd-compressed (Codex rollout format); decompress it to JSONL first (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+            label
         );
     }
     let raw = String::from_utf8(raw)
-        .with_context(|| format!("read session file {} (not valid UTF-8)", path.display()))?;
-    let name = session_name(path);
-    let path_text = path.to_string_lossy().to_string();
-    parse_raw_session(&name, &path_text, &raw)
+        .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
+    parse_raw_session(name, label, &raw)
+}
+
+/// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):
+/// the same decode and parse path as a named file with the byte source
+/// swapped. The `<stdin>` label is display-only — no file is ever
+/// touched for it — and stdin sessions are ephemeral, so callers keep
+/// them out of the session cache.
+pub fn parse_stdin_bytes(raw: Vec<u8>) -> anyhow::Result<Session> {
+    parse_session_bytes(raw, "<stdin>", "stdin")
 }
 
 fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
