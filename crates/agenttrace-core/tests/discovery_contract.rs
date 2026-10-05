@@ -2951,3 +2951,67 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn oversized_transcripts_are_skipped_loudly_under_the_admission_cap() {
+    // rm-448 cap arm: a file over LoadOptions::max_transcript_bytes is
+    // refused BEFORE any whole-file read — counted in `skipped`, named with
+    // its on-disk size in LoadReport::oversized, never parsed, and never
+    // persisted to the session cache (a later load with the cap raised
+    // still re-parses it from disk). Contrast the pre-cap behavior in the
+    // assess PoC: a 195 MB transcript drove peak RSS to 449 MB across the
+    // 16-worker pool and a capped-memory run died on a bare allocation
+    // abort (/tmp/at-assess-7197/poc-mem/).
+    let root = std::env::temp_dir().join(format!(
+        "agenttrace-oversized-cap-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::create_dir_all(&root).expect("create test dir");
+    let small = root.join("small.jsonl");
+    let big = root.join("big.jsonl");
+    fs::write(&small, SAMPLE_JSONL).expect("write small session");
+    // Still a fully valid session file; padded past the 1 KiB test cap
+    // via a transcript-derived field so a wrongly-admitted parse succeeds
+    // and the assertions below fail rather than mask the gap.
+    let padded = SAMPLE_JSONL.replace(
+        "claude-sonnet-4",
+        &format!("claude-sonnet-4-{}", "x".repeat(2000)),
+    );
+    fs::write(&big, padded).expect("write oversized session");
+
+    with_session_cache(&root.join("cache"), || {
+        let report = load_sessions_with_options(
+            Some(&root),
+            &LoadOptions {
+                max_transcript_bytes: Some(1024),
+                ..Default::default()
+            },
+        );
+        assert_eq!(report.sessions.len(), 1, "only the under-cap file may load");
+        assert_eq!(report.sessions[0].name, "Inspect billing export.");
+        assert_eq!(report.discovered, 2);
+        assert_eq!(report.skipped, 1, "the oversized file counts as skipped");
+        assert_eq!(report.oversized.len(), 1);
+        assert!(
+            report.oversized[0].0.ends_with("big.jsonl"),
+            "skip must name the file: {:?}",
+            report.oversized
+        );
+        assert!(report.oversized[0].1 > 1024);
+
+        // The skip was not persisted as a parsed session: with the cap
+        // raised both files load through the same (still-warm) cache dir.
+        let report = load_sessions_with_options(
+            Some(&root),
+            &LoadOptions {
+                max_transcript_bytes: Some(u64::MAX),
+                ..Default::default()
+            },
+        );
+        assert_eq!(report.sessions.len(), 2);
+        assert!(report.oversized.is_empty());
+    });
+
+    let _ = fs::remove_dir_all(root);
+}

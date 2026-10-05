@@ -925,7 +925,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
         out.push_str(&format!(
             "    {:<30} {:>4} Sessions  {:>8}\n",
-            tool_display_name(&agent),
+            sanitize_line_segment(&tool_display_name(&agent)),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -939,7 +939,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            model,
+            sanitize_line_segment(&model),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -956,7 +956,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            provider,
+            sanitize_line_segment(&provider),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -967,7 +967,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     for (task_type, group) in &overview.by_task_type {
         out.push_str(&format!(
             "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
-            task_type,
+            sanitize_line_segment(task_type),
             format_count(group.sessions),
             format_cost(group.cost),
             format_tokens(group.tokens_input),
@@ -2620,7 +2620,14 @@ fn report_html_code_list(values: &[String]) -> String {
         .join(", ")
 }
 
-fn html_escape(value: &str) -> String {
+/// Escape a transcript-derived string for safe interpolation into HTML in
+/// **both** body and attribute contexts (rm-452: the CLI's former local
+/// escaper handled only `&`, `<`, `>` — fine for `<pre>` bodies, a trap for
+/// any future attribute-context use). Escapes the five HTML-significant
+/// characters; control bytes are NOT rewritten here (they are inert in HTML
+/// body context and out of scope for this escaper; the text/markdown lanes
+/// own control-byte sanitization via `sanitize_line_segment`).
+pub fn html_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -2695,6 +2702,10 @@ fn text_wrapped_key_values(label: &str, values: &[String], limit: usize) -> Vec<
 }
 
 fn text_cell(value: &str, limit: usize) -> String {
+    // rm-239: transcript-derived cells route through the landed statusline
+    // sanitizer contract (control bytes -> U+FFFD) before squash/truncate,
+    // so no lane can emit a raw CSI/OSC sequence into the terminal.
+    let value = sanitize_line_segment(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
@@ -2794,11 +2805,21 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 }
 
 fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', "<br>")
+    // rm-239: same shared sanitizer contract as the text lanes; control
+    // bytes become U+FFFD before the pipe/newline markdown escaping.
+    sanitize_line_segment(value)
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
 }
 
 fn markdown_inline_code(value: &str) -> String {
-    value
+    // rm-239 review fix (F1): inline-code cells render transcript-derived
+    // values too — the high-authority tool list ships raw tool names from
+    // `metrics.tool_usage`. Same shared sanitizer contract as
+    // `markdown_cell`: control bytes become U+FFFD before any markdown
+    // escaping, so a crafted tool name cannot smuggle a raw CSI sequence
+    // into the markdown lane. The json lane stays transcript-exact.
+    sanitize_line_segment(value)
         .replace('`', "'")
         .replace('|', "\\|")
         .replace('\n', "<br>")
@@ -2906,6 +2927,77 @@ mod tests {
         );
         assert!(text.contains('\u{FFFD}'));
         assert!(text.contains("]52;c;aGVsbG8="));
+    }
+
+    #[test]
+    fn overview_text_and_markdown_lanes_sanitize_transcript_derived_labels() {
+        // rm-239: assess PoC (/tmp/at-assess-7197/poc-ansi2/) — the By
+        // Model text rows rendered a raw CSI color sequence byte-for-byte
+        // and the markdown session-table model cell passed control bytes
+        // through untouched. Grouping labels are transcript-derived the
+        // same way tool names are (rm-383); the text and markdown lanes now
+        // route through the shared sanitize_line_segment contract. The
+        // JSON data lane stays transcript-exact (serde escaping is
+        // serialization, not sanitization).
+        let metrics = Metrics {
+            model_used: "\u{001b}[31mRED\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
+            tool_usage: BTreeMap::from([(
+                // rm-239 review fix (F1): the classifier keys "git push" to
+                // git_write, so this crafted name lands in the High-authority
+                // tools list — the markdown lane used to render it through
+                // markdown_inline_code with the raw CSI bytes intact.
+                "git push\u{001b}[38;5;9mPWNED\u{001b}[0m".to_string(),
+                3,
+            )]),
+            ..Metrics::default()
+        };
+        let session = Session {
+            name: "csi\u{001b}[31mRED".to_string(),
+            path: "/tmp/csi.jsonl".to_string(),
+            cwd: String::new(),
+            metrics,
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let sessions = vec![session.clone()];
+        let overview = crate::compute_overview(&sessions);
+
+        let text = report_overview_text(&overview, &sessions);
+        assert!(
+            !text.contains('\u{001b}') && !text.contains('\u{0007}'),
+            "no raw ESC/BEL bytes in the text lanes: {text:?}"
+        );
+        assert!(text.contains('\u{FFFD}'));
+        assert!(text.contains("]52;c;aGVsbG8="));
+
+        let markdown = report_overview_markdown(&overview, &sessions);
+        assert!(
+            !markdown.contains('\u{001b}') && !markdown.contains('\u{0007}'),
+            "no raw ESC/BEL bytes in markdown cells: {markdown:?}"
+        );
+        assert!(markdown.contains('\u{FFFD}'));
+
+        let json = report_json(&session);
+        assert!(
+            json.contains("u001b"),
+            "json lane keeps the transcript-exact model string: {json}"
+        );
+
+        // rm-239 review fix (F1): pin that the crafted high-authority tool
+        // name actually reaches both rendered lanes sanitized — the fixture
+        // is self-checking, so it cannot silently stop exercising the
+        // inline-code path (text lane was already safe via text_tool_values;
+        // markdown went raw through markdown_inline_code).
+        assert!(
+            text.contains("git push\u{FFFD}"),
+            "high-authority tool list is sanitized in the text lane: {text}"
+        );
+        assert!(
+            markdown.contains("git push\u{FFFD}"),
+            "high-authority tool list is sanitized in the markdown lane: {markdown}"
+        );
     }
 
     #[test]

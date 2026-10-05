@@ -55,8 +55,8 @@ pub use pricing::{
     render_model_pricing_list, render_test_match, update_pricing,
 };
 pub use reports::{
-    add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
-    report_json, report_json_with_language, report_overview_html,
+    add_baseline_comparison, html_escape, report_compare, report_compare_json,
+    report_compare_with_language, report_json, report_json_with_language, report_overview_html,
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_text, report_overview_text_with_context,

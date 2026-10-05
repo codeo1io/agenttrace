@@ -48,6 +48,16 @@ It helps you answer:
 
 ## Real local run
 
+Every transcript file is read whole when parsed. During directory
+discovery and `--dir` loads, admission is bounded: files over 256 MiB
+each are skipped with a note naming the file and its size (rm-448), and
+`AGENTTRACE_MAX_TRANSCRIPT_BYTES` raises or lowers that cap (an invalid
+or zero value falls back to the default). Directly named transcripts
+(`--file` / positional paths) and `--doctor` still parse the named file
+without the size check (doctor-side bounding is tracked as rm-367).
+Worst case the 16-worker parse pool holds ~16 × 256 MiB ≈ 4 GiB of
+admitted transcript bytes in flight; lower the cap to shrink that budget.
+
 ```bash
 agenttrace
 ```

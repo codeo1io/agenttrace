@@ -792,10 +792,10 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
 }
 
 fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    // rm-452: thin delegation to core's five-entity escaper (attribute-
+    // context safe) instead of a local three-entity copy that silently
+    // diverged from the HTML report renderer.
+    agenttrace_core::html_escape(value)
 }
 
 fn go_flag_compatible_args<I>(args: I) -> anyhow::Result<Vec<OsString>>
@@ -987,8 +987,17 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
             model: args.model_filter.clone(),
             include_history: args.include_history,
             preserve_history: args.preserve_history,
+            // rm-448: None -> AGENTTRACE_MAX_TRANSCRIPT_BYTES -> 256 MiB
+            // default; oversized files are skipped before any whole-file
+            // read and disclosed below, never a bare allocation abort.
+            max_transcript_bytes: None,
         },
     );
+    for (path, size) in &report.oversized {
+        eprintln!(
+            "note: skipped {path} ({size} bytes exceeds the transcript size cap; set AGENTTRACE_MAX_TRANSCRIPT_BYTES higher to admit it)"
+        );
+    }
     let sessions = report.sessions.clone();
     if sessions.is_empty() {
         if report.discovered == 0 {
@@ -2175,5 +2184,13 @@ mod tests {
         args.overview = true;
         args.range = "7d".to_string();
         assert!(validate_range_applicability(&args).is_ok());
+    }
+    #[test]
+    fn cli_html_escaping_is_attribute_safe() {
+        // rm-452: the CLI's local escaper handled only & < > — safe for the
+        // <pre> body context it was written for, but a silent quote-breakout
+        // trap for any future attribute-context use. It now delegates to the
+        // core five-entity escaper (reports::html_escape).
+        assert_eq!(escape_html("a\"b'c&<d>"), "a&#34;b&#39;c&amp;&lt;d&gt;");
     }
 }

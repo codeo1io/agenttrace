@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Transcript parsing is memory-bounded per file with a loud skip (rm-448, cap arm): parsing reads each admitted transcript whole, so a hostile or runaway file (assess PoC: a 195 MB transcript drove peak RSS to 449 MB across the 16-worker parse pool, and a memory-capped run died on a bare allocation abort) could dominate RSS. Files are now admitted by on-disk size before any read — default 256 MiB, overridable via `AGENTTRACE_MAX_TRANSCRIPT_BYTES` (invalid or zero values fall back to the default); admission applies to the directory-discovery and `--dir` load lanes, while directly named transcripts (`--file` / positional) and `--doctor` parse the named file without the size check (doctor-side bounding is tracked as rm-367). Worst-case concurrent budget with the 16-worker parse pool is ~16 × 256 MiB ≈ 4 GiB of admitted transcript bytes in flight. A refused file counts in the parse-coverage skip totals, is never persisted to the session cache, and the CLI prints `note: skipped <path> (<size> bytes exceeds the transcript size cap; …)` instead of aborting. The streaming rewrite of the parser remains a separate roadmap arm.
+- Text and markdown report lanes sanitize transcript-derived labels (rm-239): the overview's By Agent / By Model / By Provider / By Task text rows and the markdown session-table / summary cells rendered transcript strings raw, so a crafted CSI color or OSC-52 clipboard-write sequence in a model or tool name reached the terminal byte-for-byte (assess PoC: `cat -v` showed `^[[31mRED` in both the text and markdown outputs). Those lanes now route through the landed `sanitize_line_segment` contract (control bytes → U+FFFD, printable tails preserved), completing the sweep the sessions table started — review round 1 extended it to the markdown inline-code cells (the high-authority tool list still passed a crafted tool name's raw CSI sequence through); the JSON and HTML lanes are unchanged (serde escaping / entity escaping) and stay transcript-exact.
+- The CLI's HTML escaper is attribute-safe (rm-452): `escape_html` in the CLI handled only `&`, `<`, `>` while the core renderer escaped quotes too — a silent quote-breakout trap for any future attribute-context use. The CLI escaper now delegates to the core five-entity `reports::html_escape` (`&#34;`/`&#39;`), so both cannot diverge again.
+
 ### Fixed
 
 - Flat-transcript sessions pair tool results with their calls (rm-230): the flat Claude-transcript parser arm dropped the `tool_use_id` → `tool_call_id` join key, so every tool call in that format was reported as `unmatched` and fed the high-severity latency-review filter even when its result was present. Explicit ids are now preserved verbatim on both sides and id-less entries pair positionally per tool, so a present result no longer counts as unmatched — and one tool's genuinely missing result is no longer masked by another tool's surplus result. The session cache schema was bumped (20 → 21) so previously cached sessions regenerate under the corrected pairing.
@@ -290,3 +296,12 @@ one place
   report semantics, release surfaces, and Pages artifacts. (#118)
 - Documented the launch-kit validation gates and release consistency checklist
   for public demo and install surfaces. (#115, #121)
+
+<!-- no-changelog-section: v0.7.2: upstream-side retro tag of pre-fork lineage commit 3f6252a (fix: decouple pages checks from release version); this changelog's release chain jumps v0.7.1 -> v0.8.1 and never carried a v0.7.2 section -->
+
+<!-- no-changelog-section: v0.7.3: upstream release 739a6c3 (fix: publish npm tarball as a file); upstream-side release whose section this changelog never carried -->
+<!-- no-changelog-section: v0.7.4: upstream release 2462045 (fix: configure npm auth before publishing); upstream-side release whose section this changelog never carried -->
+<!-- no-changelog-section: v0.7.5: upstream re-tag of 2462045 (same npm auth fix); upstream-side release whose section this changelog never carried -->
+<!-- no-changelog-section: v0.7.6: upstream release e20a224 (publish npm launcher under zack78 scope); upstream-side release whose section this changelog never carried -->
+<!-- no-changelog-section: v0.7.7: upstream release cd33203 (fix release channel script permissions); upstream-side release whose section this changelog never carried -->
+<!-- no-changelog-section: v0.8.0: upstream release b964a74 (pricing provenance / TUI session exploration); this changelog carries the subsequent v0.8.1 fork section; upstream-side release whose section this changelog never carried -->

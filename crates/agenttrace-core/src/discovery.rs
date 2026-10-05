@@ -27,6 +27,33 @@ pub struct LoadOptions {
     pub model: String,
     pub include_history: bool,
     pub preserve_history: bool,
+    /// Per-file transcript admission cap in bytes (rm-448, cap arm).
+    /// `None` defers to `AGENTTRACE_MAX_TRANSCRIPT_BYTES` and then
+    /// [`DEFAULT_MAX_TRANSCRIPT_BYTES`]. Files over the cap are skipped
+    /// before any whole-file read and disclosed via `LoadReport::oversized`.
+    pub max_transcript_bytes: Option<u64>,
+}
+
+/// Default per-file transcript admission cap: 256 MiB. Legitimate session
+/// transcripts sit orders of magnitude below this; the cap exists because
+/// parsing reads each admitted file whole (parser.rs `parse_file`), so a
+/// runaway or hostile file sized past this bound would otherwise dominate
+/// RSS for every worker in the 16-wide parse pool. Stated worst-case
+/// budget (rm-448 acceptance): the pool is capped at 16 workers, so at
+/// most ~16 × 256 MiB ≈ 4 GiB of admitted transcript bytes are held in
+/// flight at once; lower `AGENTTRACE_MAX_TRANSCRIPT_BYTES` to shrink it.
+pub const DEFAULT_MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Resolve the per-file transcript admission cap (rm-448 cap arm): an
+/// explicit `LoadOptions::max_transcript_bytes` wins, then a positive
+/// integer `AGENTTRACE_MAX_TRANSCRIPT_BYTES`, then the default. Invalid or
+/// zero env values fall back to the default rather than disabling the cap.
+pub fn max_transcript_bytes() -> u64 {
+    std::env::var("AGENTTRACE_MAX_TRANSCRIPT_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_MAX_TRANSCRIPT_BYTES)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +63,10 @@ pub struct LoadReport {
     pub parsed: usize,
     pub skipped: usize,
     pub cache_hits: usize,
+    /// Files skipped by the per-file transcript admission cap (rm-448):
+    /// `(path, on-disk size in bytes)`. Counted in `skipped` and disclosed
+    /// by the CLI; never silently dropped.
+    pub oversized: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -299,6 +330,29 @@ pub fn load_sessions_with_progress_from_cache_mode(
             }
         }
     }
+    // rm-448 cap arm: admit by on-disk size before any whole-file read so a
+    // hostile or runaway transcript can never blow up the parse pool.
+    // Skips are loud (LoadReport::oversized names file and size) and are
+    // never persisted as parsed sessions to the cache.
+    let max_bytes = options
+        .max_transcript_bytes
+        .unwrap_or_else(max_transcript_bytes);
+    let mut oversized: Vec<(String, u64)> = Vec::new();
+    let mut admissible: Vec<usize> = Vec::new();
+    for &index in &misses {
+        match fs::metadata(&files[index]) {
+            Ok(meta) if meta.len() > max_bytes => {
+                oversized.push((files[index].display().to_string(), meta.len()));
+                // Mark the slot as a completed skip (not a pending hole) so
+                // the in-order drain barrier below advances past it instead
+                // of stalling every later file behind the skip.
+                slots[index] = Some((None, false));
+            }
+            _ => admissible.push(index),
+        }
+    }
+    misses = admissible;
+    oversized.sort();
     // Largest files first so one huge rollout does not become the tail of the parse.
     misses.sort_by_cached_key(|index| {
         std::cmp::Reverse(fs::metadata(&files[*index]).map_or(0, |meta| meta.len()))
@@ -398,6 +452,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sessions,
         discovered,
         cache_hits,
+        oversized,
     }
 }
 
