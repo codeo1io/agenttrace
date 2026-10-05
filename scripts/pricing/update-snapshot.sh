@@ -37,6 +37,17 @@ for key, value in data.items():
         "mode": "chat",
         "litellm_provider": value.get("litellm_provider") or "",
     }
+    # Vendor context window and deprecation date ride along when the
+    # source carries them (rm-231 / rm-419). The source file is literally
+    # named model_prices_and_context_WINDOW.json — the context-window
+    # field used to be the one thing this trim dropped. Zero/empty
+    # values are omitted so "carries a window" stays greppable.
+    max_input = value.get("max_input_tokens")
+    if isinstance(max_input, int) and max_input > 0:
+        keep[key]["max_input_tokens"] = max_input
+    deprecation = value.get("deprecation_date")
+    if isinstance(deprecation, str) and deprecation.strip():
+        keep[key]["deprecation_date"] = deprecation.strip()
 snapshot = {
     "_snapshot": {
         "source": "BerriAI/litellm model_prices_and_context_window.json",

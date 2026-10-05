@@ -14,17 +14,28 @@ const PRICING_URL: &str =
 /// fully offline by default. Regenerate with `scripts/pricing/update-snapshot.sh`
 /// and keep `PRICING_SNAPSHOT_DATE` in sync with the date it prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-09-13";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-04";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 pub struct Price {
     pub input: f64,
     pub output: f64,
     pub cw: f64,
     pub cr: f64,
+    /// Vendor context window in input tokens (LiteLLM
+    /// `max_input_tokens`), when the catalog entry carries one (rm-231).
+    /// Absent on override files and pre-2026-10 snapshots; `skip`
+    /// keeps serialized pricing output byte-identical for models
+    /// without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    /// Vendor deprecation date (LiteLLM `deprecation_date`, ISO
+    /// YYYY-MM-DD), when the entry carries one (rm-419).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecation_date: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +43,12 @@ pub struct PricingCatalog {
     pub entries: BTreeMap<String, Price>,
     pub aliases: BTreeMap<String, String>,
     pub source: String,
+    /// The catalog's own vintage as YYYYMMDD (rm-419): the bundled
+    /// snapshot's pinned date, a cached catalog's fetch date, or today
+    /// for a just-refreshed remote fetch. Deprecation disclosure
+    /// compares model deprecation dates against THIS — never the wall
+    /// clock — so report bytes stay stable for a given catalog.
+    pub reference_date: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +65,10 @@ struct LiteLlmModel {
     mode: String,
     #[serde(default, rename = "litellm_provider")]
     provider: String,
+    #[serde(default, rename = "max_input_tokens")]
+    max_input_tokens: Option<u64>,
+    #[serde(default, rename = "deprecation_date")]
+    deprecation_date: Option<String>,
 }
 
 pub fn lookup_price(model: &str) -> Price {
@@ -72,17 +93,18 @@ pub fn list_pricing() -> BTreeMap<String, Price> {
     entries.remove("default");
     let catalog = pricing_catalog();
     for (name, price) in &catalog.entries {
-        entries.insert(name.clone(), *price);
+        entries.insert(name.clone(), price.clone());
     }
     entries
 }
 
 pub fn default_price() -> Price {
-    builtin_pricing().get("default").copied().unwrap_or(Price {
+    builtin_pricing().get("default").cloned().unwrap_or(Price {
         input: 3.0,
         output: 15.0,
         cw: 0.0,
         cr: 0.0,
+        ..Default::default()
     })
 }
 
@@ -124,11 +146,130 @@ pub fn bundled_snapshot_age_days() -> Option<i64> {
     Some((chrono::Utc::now().date_naive() - date).num_days().max(0))
 }
 
+/// Parse an ISO `YYYY-MM-DD` string into a comparable YYYYMMDD integer
+/// (digit-ordering makes the integer order the date order).
+fn iso_to_ymd(iso: &str) -> Option<u32> {
+    let digits: String = iso.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 8 {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn ymd_to_iso(ymd: u32) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        ymd / 10000,
+        (ymd / 100) % 100,
+        ymd % 100
+    )
+}
+
+fn today_ymd() -> Option<u32> {
+    chrono::Utc::now().format("%Y%m%d").to_string().parse().ok()
+}
+
+/// True when the entry's vendor deprecation date is on or before the
+/// catalog's own vintage — i.e. the vendor has already retired the
+/// model by the catalog's reference point (rm-419). Clock-free by
+/// construction: both dates come from the catalog itself.
+fn past_deprecated(price: &Price, reference_ymd: u32) -> bool {
+    price
+        .deprecation_date
+        .as_deref()
+        .and_then(iso_to_ymd)
+        .is_some_and(|ymd| ymd <= reference_ymd)
+}
+
+/// Count bundled-snapshot models past their vendor deprecation date
+/// relative to the snapshot's own date, plus the oldest such date
+/// (rm-419). The anchor is the snapshot date, so the census is a
+/// property of the vendored file, never of when the binary runs.
+pub fn bundled_snapshot_deprecated() -> (usize, Option<String>) {
+    static CENSUS: OnceLock<(usize, Option<String>)> = OnceLock::new();
+    CENSUS
+        .get_or_init(|| {
+            let entries = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+            let reference = iso_to_ymd(PRICING_SNAPSHOT_DATE).unwrap_or(0);
+            let mut count = 0;
+            let mut oldest: Option<u32> = None;
+            for price in entries.values() {
+                let Some(ymd) = price.deprecation_date.as_deref().and_then(iso_to_ymd) else {
+                    continue;
+                };
+                if ymd <= reference {
+                    count += 1;
+                    if !oldest.is_some_and(|current| ymd >= current) {
+                        oldest = Some(ymd);
+                    }
+                }
+            }
+            (count, oldest.map(ymd_to_iso))
+        })
+        .clone()
+}
+
+/// Resolve a model's vendor context window (input-token cap) from the
+/// active catalog (rm-231). Returns `None` when the model has no
+/// catalog entry or the entry carries no window; callers fall back to
+/// the documented name-substring ladder and must label the resulting
+/// utilization as an estimate.
+pub fn lookup_context_window(model: &str) -> Option<u64> {
+    lookup_context_window_in(model, pricing_catalog())
+}
+
+fn lookup_context_window_in(model: &str, catalog: &PricingCatalog) -> Option<u64> {
+    let resolved = resolve_alias(model, &catalog.aliases);
+    let key = matching_catalog_key(&resolved, &catalog.entries)?;
+    catalog
+        .entries
+        .get(&key)
+        .and_then(|price| price.max_input_tokens.filter(|window| *window > 0))
+}
+
+/// Stable identity of the active pricing catalog (rm-196): a 64-bit
+/// FNV-1a digest over the catalog's entries and aliases. The session
+/// cache keys its freshness on this so a catalog change (snapshot bump
+/// on upgrade, `--update-pricing` refresh, override edit) invalidates
+/// cached per-session costs, while identical catalogs keep every cache
+/// hit. Deliberately excludes `source` (cache vs cache(stale) flips
+/// with file age, not content) and `reference_date` (a same-content
+/// refresh must not trigger a pointless re-price).
+pub fn catalog_identity() -> &'static str {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+    IDENTITY.get_or_init(|| catalog_identity_of(pricing_catalog()))
+}
+
+pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
+    fn fnv1a(bytes: &[u8], state: u64) -> u64 {
+        bytes.iter().fold(state, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (name, price) in &catalog.entries {
+        hash = fnv1a(name.as_bytes(), hash);
+        for value in [price.input, price.output, price.cw, price.cr] {
+            hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+        }
+        hash = fnv1a(&price.max_input_tokens.unwrap_or(0).to_le_bytes(), hash);
+        hash = fnv1a(
+            price.deprecation_date.as_deref().unwrap_or("").as_bytes(),
+            hash,
+        );
+    }
+    for (alias, target) in &catalog.aliases {
+        hash = fnv1a(alias.as_bytes(), hash);
+        hash = fnv1a(target.as_bytes(), hash);
+    }
+    format!("{hash:016x}")
+}
+
 fn catalog_source(catalog: &PricingCatalog) -> String {
     // Labels are deliberately clock-free: identical inputs must produce
     // byte-identical reports (see scripts/ci/check-deterministic-output.sh).
     // The previous labels embedded cache/fetch timestamps.
-    match catalog.source.as_str() {
+    let label = match catalog.source.as_str() {
         "cache" => "LiteLLM (cached catalog)".to_string(),
         "cache(stale)" => {
             "LiteLLM (cached catalog, stale; run --update-pricing to refresh)".to_string()
@@ -136,7 +277,25 @@ fn catalog_source(catalog: &PricingCatalog) -> String {
         "remote" => "LiteLLM (just refreshed)".to_string(),
         "snapshot" => format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)"),
         _ => "built-in fallback (run --update-pricing for the latest catalog)".to_string(),
+    };
+    // Deprecation census (rm-419): disclose how much of the priced set
+    // the vendor has already retired, anchored to the catalog's own
+    // vintage so the suffix is a property of the catalog, not of when
+    // the binary runs. Empty catalogs keep the legacy label untouched.
+    if let Some(reference) = catalog.reference_date {
+        let deprecated = catalog
+            .entries
+            .values()
+            .filter(|price| past_deprecated(price, reference))
+            .count();
+        if deprecated > 0 {
+            return format!(
+                "{label}; {deprecated} of {} priced models past vendor deprecation",
+                catalog.entries.len()
+            );
+        }
     }
+    label
 }
 
 pub fn pricing_source_for(model: &str) -> String {
@@ -155,9 +314,40 @@ fn pricing_source_for_catalog(
         return "built-in fallback".to_string();
     };
     if override_models.contains(&key) {
-        "user override".to_string()
+        // rm-419: a user-set rate keeps the vendor retirement
+        // disclosure — the status is catalog knowledge, not a rate
+        // claim, so it carries no "unverified" qualifier.
+        catalog
+            .entries
+            .get(&key)
+            .zip(catalog.reference_date)
+            .filter(|(price, reference)| past_deprecated(price, *reference))
+            .map(|(price, _)| {
+                format!(
+                    "user override; model deprecated {}",
+                    price.deprecation_date.as_deref().unwrap_or("unknown date")
+                )
+            })
+            .unwrap_or_else(|| "user override".to_string())
     } else if normalized != resolved {
         format!("{} via user override alias", catalog_source(catalog))
+    } else if let Some(reference) = catalog.reference_date {
+        // Deprecation disclosure (rm-419): a session priced on a model
+        // the vendor has already retired (per this catalog's vintage)
+        // says so at the rate's provenance line instead of silently
+        // billing at catalog rates.
+        match catalog
+            .entries
+            .get(&key)
+            .filter(|price| past_deprecated(price, reference))
+        {
+            Some(price) => format!(
+                "{}; model deprecated {} (rate unverified)",
+                catalog_source(catalog),
+                price.deprecation_date.as_deref().unwrap_or("unknown date")
+            ),
+            None => catalog_source(catalog),
+        }
     } else {
         catalog_source(catalog)
     }
@@ -177,6 +367,7 @@ pub fn update_pricing() -> anyhow::Result<usize> {
         entries,
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
+        reference_date: today_ymd(),
     };
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
@@ -297,20 +488,46 @@ fn fallback_catalog() -> PricingCatalog {
             entries: builtin_pricing(),
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
+            reference_date: None,
         };
     }
     PricingCatalog {
         entries,
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
+        reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
     }
 }
 
 fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
     let mut override_models = BTreeSet::new();
     if let Some((prices, aliases)) = load_pricing_overrides() {
-        override_models.extend(prices.keys().cloned());
-        catalog.entries.extend(prices);
+        for (name, mut override_price) in prices {
+            // rm-231/rm-419: override files usually carry only the four
+            // rate fields (`max_input_tokens`/`deprecation_date` serde
+            // default to None), and the previous wholesale
+            // `entries.extend(prices)` replaced the whole entry — so a
+            // user correcting a stale rate on a 1M-window model
+            // silently regressed it to the 200k substring ladder and
+            // dropped the deprecation disclosure. Backfill the
+            // descriptive fields the override leaves unset; an override
+            // that sets `max_input_tokens: 0` still clears the window
+            // on purpose (0 is filtered out at lookup time).
+            if override_price.max_input_tokens.is_none()
+                || override_price.deprecation_date.is_none()
+            {
+                if let Some(catalog_price) = catalog.entries.get(&name) {
+                    if override_price.max_input_tokens.is_none() {
+                        override_price.max_input_tokens = catalog_price.max_input_tokens;
+                    }
+                    if override_price.deprecation_date.is_none() {
+                        override_price.deprecation_date = catalog_price.deprecation_date.clone();
+                    }
+                }
+            }
+            override_models.insert(name.clone());
+            catalog.entries.insert(name, override_price);
+        }
         catalog.aliases.extend(aliases);
     }
     override_models
@@ -334,7 +551,24 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         entries,
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
+        // A cached catalog's vintage is its fetch date (rm-419); when
+        // the provenance stamp is missing (pre-rm-167 cache) fall back
+        // to the bundled snapshot date as a conservative anchor.
+        reference_date: pricing_cache_vintage_ymd(&path)
+            .or_else(|| iso_to_ymd(PRICING_SNAPSHOT_DATE)),
     })
+}
+
+/// YYYYMMDD of the fetch recorded in a pricing cache's provenance
+/// stamp (`pricing.meta.json`, rm-167).
+fn pricing_cache_vintage_ymd(cache_path: &Path) -> Option<u32> {
+    let raw = std::fs::read(cache_path.with_extension("meta.json")).ok()?;
+    let meta: PricingCacheMeta = serde_json::from_slice(&raw).ok()?;
+    chrono::DateTime::from_timestamp(meta.fetched_at_unix as i64, 0)?
+        .format("%Y%m%d")
+        .to_string()
+        .parse()
+        .ok()
 }
 
 fn pricing_override_models() -> &'static BTreeSet<String> {
@@ -416,15 +650,15 @@ fn write_pricing_cache_at(path: &Path, raw: &str) -> anyhow::Result<()> {
 
 fn lookup_price_in(model: &str, entries: &BTreeMap<String, Price>) -> Price {
     if let Some(key) = matching_catalog_key(model, entries) {
-        return entries.get(&key).copied().unwrap_or_default();
+        return entries.get(&key).cloned().unwrap_or_default();
     }
     let builtin = builtin_pricing();
     for variant in match_variants(model) {
         if let Some(price) = builtin.get(&variant) {
-            return *price;
+            return price.clone();
         }
     }
-    builtin.get("default").copied().unwrap_or_default()
+    builtin.get("default").cloned().unwrap_or_default()
 }
 
 fn matching_catalog_key(model: &str, entries: &BTreeMap<String, Price>) -> Option<String> {
@@ -499,6 +733,16 @@ fn convert_litellm(raw: &[u8]) -> BTreeMap<String, Price> {
             output: model.output_cost * 1e6,
             cw: model.cache_write_cost * 1e6,
             cr: model.cache_read_cost * 1e6,
+            // Vendor context window and deprecation date ride along
+            // when the source carries them (rm-231 / rm-419); zero or
+            // empty values normalize to absent.
+            max_input_tokens: model.max_input_tokens.filter(|window| *window > 0),
+            deprecation_date: model
+                .deprecation_date
+                .as_deref()
+                .map(str::trim)
+                .filter(|date| !date.is_empty())
+                .map(str::to_string),
         };
         // Hostile or overflowing catalog rates must not reach costing:
         // the 1e6 scaling can turn a near-f64-max per-token cost into
@@ -643,6 +887,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 25.0,
                 cw: 6.25,
                 cr: 0.50,
+                ..Default::default()
             },
         ),
         (
@@ -652,6 +897,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 25.0,
                 cw: 6.25,
                 cr: 0.50,
+                ..Default::default()
             },
         ),
         (
@@ -661,6 +907,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 25.0,
                 cw: 6.25,
                 cr: 0.50,
+                ..Default::default()
             },
         ),
         (
@@ -670,6 +917,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 25.0,
                 cw: 6.25,
                 cr: 0.50,
+                ..Default::default()
             },
         ),
         (
@@ -679,6 +927,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 25.0,
                 cw: 6.25,
                 cr: 0.50,
+                ..Default::default()
             },
         ),
         (
@@ -688,6 +937,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 75.0,
                 cw: 18.75,
                 cr: 1.50,
+                ..Default::default()
             },
         ),
         (
@@ -697,6 +947,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 3.75,
                 cr: 0.30,
+                ..Default::default()
             },
         ),
         (
@@ -706,6 +957,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 3.75,
                 cr: 0.30,
+                ..Default::default()
             },
         ),
         (
@@ -715,6 +967,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 3.75,
                 cr: 0.30,
+                ..Default::default()
             },
         ),
         (
@@ -724,6 +977,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 3.75,
                 cr: 0.30,
+                ..Default::default()
             },
         ),
         (
@@ -733,6 +987,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 3.75,
                 cr: 0.30,
+                ..Default::default()
             },
         ),
         (
@@ -742,6 +997,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 5.0,
                 cw: 1.25,
                 cr: 0.10,
+                ..Default::default()
             },
         ),
         (
@@ -751,6 +1007,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 5.0,
                 cw: 1.25,
                 cr: 0.10,
+                ..Default::default()
             },
         ),
         (
@@ -760,6 +1017,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 4.0,
                 cw: 1.0,
                 cr: 0.08,
+                ..Default::default()
             },
         ),
         (
@@ -769,6 +1027,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 12.0,
                 cw: 0.0,
                 cr: 0.20,
+                ..Default::default()
             },
         ),
         (
@@ -778,6 +1037,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 3.0,
                 cw: 0.0,
                 cr: 0.05,
+                ..Default::default()
             },
         ),
         (
@@ -787,6 +1047,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 10.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -796,6 +1057,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.60,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -805,6 +1067,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 30.0,
                 cw: 0.0,
                 cr: 0.50,
+                ..Default::default()
             },
         ),
         (
@@ -814,6 +1077,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 0.0,
                 cr: 0.25,
+                ..Default::default()
             },
         ),
         (
@@ -823,6 +1087,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -832,6 +1097,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 4.5,
                 cw: 0.0,
                 cr: 0.075,
+                ..Default::default()
             },
         ),
         (
@@ -841,6 +1107,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 14.0,
                 cw: 0.0,
                 cr: 0.175,
+                ..Default::default()
             },
         ),
         (
@@ -850,6 +1117,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 14.0,
                 cw: 0.0,
                 cr: 0.175,
+                ..Default::default()
             },
         ),
         (
@@ -859,6 +1127,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 10.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -868,6 +1137,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -877,6 +1147,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.0,
                 cw: 0.0,
                 cr: 0.025,
+                ..Default::default()
             },
         ),
         (
@@ -886,6 +1157,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 8.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -895,6 +1167,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 1.60,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -904,6 +1177,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.40,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -913,6 +1187,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.87,
                 cw: 0.0,
                 cr: 0.003625,
+                ..Default::default()
             },
         ),
         (
@@ -922,6 +1197,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.28,
                 cw: 0.0,
                 cr: 0.0028,
+                ..Default::default()
             },
         ),
         (
@@ -931,6 +1207,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 1.10,
                 cw: 0.07,
                 cr: 0.014,
+                ..Default::default()
             },
         ),
         (
@@ -940,6 +1217,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.19,
                 cw: 0.14,
                 cr: 0.028,
+                ..Default::default()
             },
         ),
         (
@@ -949,6 +1227,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 3.20,
                 cw: 0.0,
                 cr: 0.20,
+                ..Default::default()
             },
         ),
         (
@@ -958,6 +1237,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 4.0,
                 cw: 0.0,
                 cr: 0.24,
+                ..Default::default()
             },
         ),
         (
@@ -967,6 +1247,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 4.40,
                 cw: 0.0,
                 cr: 0.26,
+                ..Default::default()
             },
         ),
         (
@@ -976,6 +1257,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 3.0,
                 cw: 0.0,
                 cr: 0.10,
+                ..Default::default()
             },
         ),
         (
@@ -985,6 +1267,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 4.0,
                 cw: 0.0,
                 cr: 0.16,
+                ..Default::default()
             },
         ),
         (
@@ -994,6 +1277,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.30,
                 cw: 0.0,
                 cr: 0.02,
+                ..Default::default()
             },
         ),
         (
@@ -1003,6 +1287,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1012,6 +1297,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.40,
                 cw: 0.375,
                 cr: 0.03,
+                ..Default::default()
             },
         ),
         (
@@ -1021,6 +1307,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.40,
                 cw: 0.375,
                 cr: 0.03,
+                ..Default::default()
             },
         ),
         (
@@ -1030,6 +1317,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.40,
                 cw: 0.375,
                 cr: 0.03,
+                ..Default::default()
             },
         ),
         (
@@ -1039,6 +1327,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 1.20,
                 cw: 0.375,
                 cr: 0.03,
+                ..Default::default()
             },
         ),
         (
@@ -1048,6 +1337,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.40,
                 cw: 0.375,
                 cr: 0.03,
+                ..Default::default()
             },
         ),
         (
@@ -1057,6 +1347,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.40,
                 cw: 0.375,
                 cr: 0.03,
+                ..Default::default()
             },
         ),
         (
@@ -1066,6 +1357,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 1.95,
                 cw: 0.40625,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1075,6 +1367,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 1.95,
                 cw: 0.40625,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1084,6 +1377,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 2.40,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1093,6 +1387,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1102,6 +1397,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1111,6 +1407,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1120,6 +1417,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 1.50,
                 cw: 0.0,
                 cr: 0.02,
+                ..Default::default()
             },
         ),
         (
@@ -1129,6 +1427,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 1.50,
                 cw: 0.0,
                 cr: 0.02,
+                ..Default::default()
             },
         ),
         (
@@ -1138,6 +1437,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 0.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1147,6 +1447,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
         (
@@ -1156,6 +1457,7 @@ fn builtin_pricing() -> BTreeMap<String, Price> {
                 output: 15.0,
                 cw: 0.0,
                 cr: 0.0,
+                ..Default::default()
             },
         ),
     ]
@@ -1392,6 +1694,7 @@ mod tests {
             entries: BTreeMap::new(),
             aliases: BTreeMap::new(),
             source: source.to_string(),
+            reference_date: None,
         };
         assert_eq!(
             catalog_source(&catalog("cache")),
@@ -1442,6 +1745,7 @@ mod tests {
             ]),
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
+            reference_date: None,
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
         assert!(
@@ -1492,6 +1796,357 @@ mod tests {
         assert!(
             !catalog.contains_key("poisoned-model"),
             "entries whose scaled price is non-finite are dropped"
+        );
+    }
+
+    #[test]
+    fn bundled_snapshot_carries_context_windows_and_deprecation_dates() {
+        // rm-231 / rm-419 ingestion: the trimmed snapshot must keep the
+        // vendor context window (the source file is literally named
+        // model_prices_and_context_window.json) and the deprecation
+        // date. Zero-value windows and blank dates normalize to absent.
+        let catalog = fallback_catalog();
+        let with_window = catalog
+            .entries
+            .values()
+            .filter(|price| price.max_input_tokens.is_some())
+            .count();
+        let with_deprecation = catalog
+            .entries
+            .values()
+            .filter(|price| price.deprecation_date.is_some())
+            .count();
+        // The conversion dedups provider-prefixed duplicates down to
+        // one entry per normalized model name, so the thresholds sit
+        // well under the raw file counts (2,990 / 463) while still
+        // failing loudly if ingestion ever drops the fields again.
+        assert!(
+            with_window > 1_200,
+            "expected the bulk of the priced catalog to carry windows, got {with_window}"
+        );
+        assert!(
+            with_deprecation > 100,
+            "expected a substantial deprecated-model cohort, got {with_deprecation}"
+        );
+        // The 1M-window default class (rm-231's motivating case).
+        assert_eq!(
+            catalog.entries["claude-sonnet-4-5"].max_input_tokens,
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn context_window_lookup_resolves_catalog_entries_and_misses_cleanly() {
+        // rm-231: the denominator resolver. A catalog hit returns the
+        // vendor window; an unknown model misses with None so the
+        // caller can take the labeled fallback ladder. A zero window
+        // (malformed source) must behave like an absent one.
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "wide-model".to_string(),
+                    Price {
+                        max_input_tokens: Some(2_000_000),
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "zero-window-model".to_string(),
+                    Price {
+                        max_input_tokens: Some(0),
+                        ..Price::default()
+                    },
+                ),
+            ]),
+            aliases: BTreeMap::from([("wide-alias".to_string(), "wide-model".to_string())]),
+            source: "cache".to_string(),
+            reference_date: None,
+        };
+        assert_eq!(
+            lookup_context_window_in("wide-model", &catalog),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            lookup_context_window_in("wide-alias", &catalog),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            lookup_context_window_in("wide-model-2", &catalog),
+            Some(2_000_000),
+            "minor-version variant matching must still apply to window lookups"
+        );
+        assert_eq!(
+            lookup_context_window_in("zero-window-model", &catalog),
+            None
+        );
+        assert_eq!(lookup_context_window_in("unknown-model", &catalog), None);
+    }
+
+    #[test]
+    fn deprecated_models_disclose_their_rate_status() {
+        // rm-419: a session priced on a model the vendor has already
+        // retired (per the catalog's own vintage) says so at the rate's
+        // provenance line; a future-dated deprecation does not.
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "retired-model".to_string(),
+                    Price {
+                        deprecation_date: Some("2025-01-01".to_string()),
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "sunset-later-model".to_string(),
+                    Price {
+                        deprecation_date: Some("2026-11-30".to_string()),
+                        ..Price::default()
+                    },
+                ),
+            ]),
+            aliases: BTreeMap::new(),
+            source: "snapshot".to_string(),
+            reference_date: Some(2026_1004),
+        };
+        let overrides = BTreeSet::new();
+        let retired = pricing_source_for_catalog("retired-model", &catalog, &overrides);
+        // The per-model disclosure composes with the aggregate census
+        // the base label already carries (both are catalog properties).
+        assert_eq!(
+            retired,
+            format!(
+                "LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled); 1 of 2 priced models past vendor deprecation; model deprecated 2025-01-01 (rate unverified)"
+            )
+        );
+        let active = pricing_source_for_catalog("sunset-later-model", &catalog, &overrides);
+        assert_eq!(
+            active,
+            format!(
+                "LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled); 1 of 2 priced models past vendor deprecation"
+            ),
+            "future-dated deprecations must not mark the session's own model"
+        );
+    }
+
+    #[test]
+    fn catalog_source_discloses_the_deprecation_census() {
+        // rm-419: the aggregate provenance line discloses how much of
+        // the priced set the vendor has already retired, anchored to
+        // the catalog's own vintage. Catalogs without a vintage (the
+        // built-in fallback) keep the legacy label byte-identical.
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "retired-model".to_string(),
+                    Price {
+                        deprecation_date: Some("2025-01-01".to_string()),
+                        ..Price::default()
+                    },
+                ),
+                ("current-model".to_string(), Price::default()),
+            ]),
+            aliases: BTreeMap::new(),
+            source: "cache".to_string(),
+            reference_date: Some(2026_1004),
+        };
+        assert_eq!(
+            catalog_source(&catalog),
+            "LiteLLM (cached catalog); 1 of 2 priced models past vendor deprecation"
+        );
+        let unvintaged = PricingCatalog {
+            entries: catalog.entries.clone(),
+            aliases: BTreeMap::new(),
+            source: "builtin".to_string(),
+            reference_date: None,
+        };
+        assert_eq!(
+            catalog_source(&unvintaged),
+            "built-in fallback (run --update-pricing for the latest catalog)"
+        );
+    }
+
+    #[test]
+    fn catalog_identity_is_stable_and_content_sensitive() {
+        // rm-196: the session cache keys its freshness on this digest.
+        // It must be stable for identical content, change on any price
+        // or alias change, and deliberately ignore the source label —
+        // cache vs cache(stale) flips with file age, not content, so
+        // counting it would trigger pointless full re-prices.
+        let base = PricingCatalog {
+            entries: BTreeMap::from([(
+                "model-a".to_string(),
+                Price {
+                    input: 3.0,
+                    output: 15.0,
+                    ..Price::default()
+                },
+            )]),
+            aliases: BTreeMap::new(),
+            source: "cache".to_string(),
+            reference_date: None,
+        };
+        let same_content = PricingCatalog {
+            source: "cache(stale)".to_string(),
+            reference_date: Some(2026_1004),
+            ..base.clone()
+        };
+        assert_eq!(
+            catalog_identity_of(&base),
+            catalog_identity_of(&same_content),
+            "source and reference_date must not affect the identity"
+        );
+        let repriced = PricingCatalog {
+            entries: BTreeMap::from([(
+                "model-a".to_string(),
+                Price {
+                    input: 3.5,
+                    output: 15.0,
+                    ..Price::default()
+                },
+            )]),
+            ..base.clone()
+        };
+        assert_ne!(catalog_identity_of(&base), catalog_identity_of(&repriced));
+        let aliased = PricingCatalog {
+            aliases: BTreeMap::from([("alias".to_string(), "model-a".to_string())]),
+            ..base.clone()
+        };
+        assert_ne!(catalog_identity_of(&base), catalog_identity_of(&aliased));
+        let windowed = PricingCatalog {
+            entries: BTreeMap::from([(
+                "model-a".to_string(),
+                Price {
+                    input: 3.0,
+                    output: 15.0,
+                    max_input_tokens: Some(200_000),
+                    ..Price::default()
+                },
+            )]),
+            ..base.clone()
+        };
+        assert_ne!(catalog_identity_of(&base), catalog_identity_of(&windowed));
+    }
+
+    #[test]
+    fn bundled_snapshot_deprecation_census_is_deterministic() {
+        // rm-419: the census anchors to the snapshot's own date, so it
+        // is a property of the vendored file and stable across calls
+        // and environments.
+        let (count, oldest) = bundled_snapshot_deprecated();
+        assert!(count > 0, "the 2026-10 snapshot carries retired models");
+        let oldest = oldest.expect("a non-empty census has an oldest date");
+        assert_eq!(oldest.len(), 10, "ISO YYYY-MM-DD shape: {oldest}");
+        assert!(oldest.as_str() <= PRICING_SNAPSHOT_DATE);
+        assert_eq!(
+            (count, Some(oldest)),
+            bundled_snapshot_deprecated(),
+            "the census must be idempotent"
+        );
+    }
+
+    #[test]
+    fn price_overrides_backfill_context_window_and_deprecation() {
+        // rm-231/rm-419 regression (review F3): a price override used
+        // to replace the whole Price, so correcting a rate on a
+        // 1M-window deprecated model regressed it to the 200k
+        // substring ladder and dropped the deprecation disclosure —
+        // exactly the defect the batch fixes, reintroduced for
+        // override users. Partial overrides now backfill the
+        // descriptive fields; an explicit zero window still clears it.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-override-backfill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let override_file = root.join("pricing.json");
+        std::fs::write(
+            &override_file,
+            serde_json::json!({
+                "prices": {
+                    "wide-retired": {"input": 4.0, "output": 20.0, "cw": 5.0, "cr": 0.5},
+                    "explicitly-clear-window": {"input": 1.0, "output": 2.0, "cw": 0.0, "cr": 0.0, "max_input_tokens": 0},
+                    "brand-new-model": {"input": 2.0, "output": 4.0, "cw": 0.0, "cr": 0.0}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write override file");
+
+        let mut catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "wide-retired".to_string(),
+                    Price {
+                        input: 3.0,
+                        output: 15.0,
+                        max_input_tokens: Some(1_000_000),
+                        deprecation_date: Some("2025-01-01".to_string()),
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "explicitly-clear-window".to_string(),
+                    Price {
+                        input: 3.0,
+                        output: 15.0,
+                        max_input_tokens: Some(500_000),
+                        ..Price::default()
+                    },
+                ),
+            ]),
+            aliases: BTreeMap::new(),
+            source: "cache".to_string(),
+            reference_date: Some(2026_1004),
+        };
+
+        let _env = crate::test_env::lock_env();
+        let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
+        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        let override_models = apply_pricing_overrides(&mut catalog);
+        match prior_file {
+            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
+            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+
+        let backfilled = &catalog.entries["wide-retired"];
+        assert_eq!(backfilled.input, 4.0, "the override rate must win");
+        assert_eq!(backfilled.output, 20.0);
+        assert_eq!(
+            backfilled.max_input_tokens,
+            Some(1_000_000),
+            "a rate-only override must not regress the vendor window"
+        );
+        assert_eq!(
+            backfilled.deprecation_date,
+            Some("2025-01-01".to_string()),
+            "a rate-only override must not drop the deprecation date"
+        );
+        assert_eq!(
+            lookup_context_window_in("wide-retired", &catalog),
+            Some(1_000_000),
+            "the end-to-end rm-231 denominator must survive an override"
+        );
+        assert_eq!(
+            pricing_source_for_catalog("wide-retired", &catalog, &override_models),
+            "user override; model deprecated 2025-01-01",
+            "an overridden retired model keeps its retirement disclosure"
+        );
+        assert_eq!(
+            catalog.entries["explicitly-clear-window"].max_input_tokens,
+            Some(0),
+            "an explicit zero window is an intentional clear, never backfilled"
+        );
+        assert_eq!(
+            lookup_context_window_in("explicitly-clear-window", &catalog),
+            None,
+            "a cleared window falls back to the labeled ladder"
+        );
+        assert_eq!(
+            catalog.entries["brand-new-model"].max_input_tokens, None,
+            "an override for an unknown model has nothing to backfill from"
         );
     }
 }

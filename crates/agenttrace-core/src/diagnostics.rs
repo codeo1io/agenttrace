@@ -77,6 +77,15 @@ pub struct ContextUtilization {
     pub utilization_pct: f64,
     pub risk_level: String,
     pub suggestion: String,
+    /// Where the context-window denominator came from (rm-231):
+    /// `"catalog"` — the model's vendor window (LiteLLM
+    /// `max_input_tokens`) from the active pricing catalog;
+    /// `"fallback"` — the documented name-substring ladder, used only
+    /// when the catalog cannot resolve the model, in which case the
+    /// utilization is an estimate, never a measured fraction. Empty on
+    /// sessions diagnosed before this field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub window_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,8 +855,28 @@ fn tool_latencies(events: &[Event]) -> Vec<ToolLatency> {
 }
 
 fn context_utilization(events: &[Event], model: &str) -> ContextUtilization {
+    // Denominator ladder (rm-231): (1) the model's vendor context window
+    // from the active pricing catalog (LiteLLM `max_input_tokens`, carried
+    // since the 2026-10-04 snapshot — 1M-window Claude models used to be
+    // divided by a name-substring 200k guess); (2) the legacy
+    // name-substring ladder for models the catalog cannot resolve,
+    // labeled `window_source: "fallback"` so the estimate is disclosed
+    // instead of silently asserted. The numerator is deliberately
+    // untouched (see rm-436 for the separate numerator defect).
+    let (total, window_source) = match crate::pricing::lookup_context_window(model) {
+        Some(window) => (window as usize, "catalog"),
+        None => (fallback_context_window(model), "fallback"),
+    };
+    context_utilization_with(events, total, window_source)
+}
+
+/// Documented fallback ladder for models the active pricing catalog
+/// cannot resolve (rm-231). Order matters: gemini first (the only
+/// 1M-token class reachable by substring), then claude, then the
+/// gpt/deepseek 128k class, else the conservative default.
+fn fallback_context_window(model: &str) -> usize {
     let lower = model.to_ascii_lowercase();
-    let total: usize = if lower.contains("gemini") {
+    if lower.contains("gemini") {
         1_048_576
     } else if lower.contains("claude") {
         200_000
@@ -855,7 +884,14 @@ fn context_utilization(events: &[Event], model: &str) -> ContextUtilization {
         128_000
     } else {
         131_072
-    };
+    }
+}
+
+fn context_utilization_with(
+    events: &[Event],
+    total: usize,
+    window_source: &str,
+) -> ContextUtilization {
     let tools = events
         .iter()
         .flat_map(|event| &event.tool_calls)
@@ -892,6 +928,7 @@ fn context_utilization(events: &[Event], model: &str) -> ContextUtilization {
         } else {
             String::new()
         },
+        window_source: window_source.to_string(),
     }
 }
 
@@ -1427,5 +1464,54 @@ mod tests {
             diagnostics: Diagnostics::default(),
             cwd: String::new(),
         }
+    }
+
+    #[test]
+    fn context_utilization_divides_by_the_1m_vendor_window() {
+        // rm-231 golden: a 1M-window Claude model (the fork's default
+        // class since CC 2.1.284) used to be divided by the
+        // name-substring 200k guess, overstating utilization ~5x. With
+        // the catalog window the same history lands far from the
+        // critical threshold.
+        let events = vec![Event {
+            role: "assistant".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            content: "x".repeat(40_000),
+            ..Event::default()
+        }];
+        let utilization = context_utilization_with(&events, 1_000_000, "catalog");
+        // tools = max(unique tools, 8) * 300 = 2_400; history = 40_000/2;
+        // system = 12_000.
+        assert_eq!(utilization.tool_definitions, 2_400);
+        assert_eq!(utilization.conversation_history, 20_000);
+        assert_eq!(utilization.system_prompt, 12_000);
+        let used = 2_400 + 20_000 + 12_000;
+        assert_eq!(utilization.estimated_total, 1_000_000);
+        assert_eq!(utilization.available_for_task, 1_000_000 - used);
+        assert!((utilization.utilization_pct - used as f64 / 1_000_000.0 * 100.0).abs() < 1e-9);
+        assert_eq!(utilization.risk_level, "good");
+        assert_eq!(utilization.window_source, "catalog");
+    }
+
+    #[test]
+    fn context_utilization_labels_the_substring_ladder_as_fallback() {
+        // rm-231: models the catalog cannot resolve keep the documented
+        // ladder, but the estimate is disclosed via `window_source`
+        // instead of being silently asserted as the real window.
+        let events = vec![Event::default()];
+        let utilization = context_utilization_with(&events, 131_072, "fallback");
+        assert_eq!(utilization.estimated_total, 131_072);
+        assert_eq!(utilization.window_source, "fallback");
+    }
+
+    #[test]
+    fn fallback_context_window_ladder_is_unchanged_for_offline_models() {
+        // The legacy ladder itself must stay stable: it is now the
+        // documented fallback, not the primary denominator.
+        assert_eq!(fallback_context_window("gemini-2.5-pro"), 1_048_576);
+        assert_eq!(fallback_context_window("claude-opus-4-6"), 200_000);
+        assert_eq!(fallback_context_window("gpt-5.2"), 128_000);
+        assert_eq!(fallback_context_window("deepseek-v4"), 128_000);
+        assert_eq!(fallback_context_window("totally-unknown"), 131_072);
     }
 }

@@ -97,6 +97,12 @@ struct SqliteSnapshot {
     wal: Option<FileFingerprint>,
     shm: Option<FileFingerprint>,
     sessions: Vec<GoSession>,
+    /// Pricing-catalog identity the snapshot was priced under (rm-196).
+    /// `None` on snapshots written before the field existed: accepted
+    /// once and stamped at the next store; a mismatched `Some` drops
+    /// the snapshot so the sessions re-price.
+    #[serde(default)]
+    pricing_catalog_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +322,10 @@ fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Ve
         || snapshot.database != file_fingerprint(database)?
         || snapshot.wal != file_fingerprint(&sqlite_wal_path(database))
         || snapshot.shm != file_fingerprint(&sqlite_shm_path(database))
+        || matches!(
+            &snapshot.pricing_catalog_id,
+            Some(stamped) if stamped != crate::pricing::catalog_identity()
+        )
     {
         return None;
     }
@@ -350,6 +360,7 @@ fn store_sqlite_snapshot_at(
         wal: file_fingerprint(&sqlite_wal_path(database)),
         shm: file_fingerprint(&sqlite_shm_path(database)),
         sessions: sessions.iter().map(GoSession::from_session).collect(),
+        pricing_catalog_id: Some(crate::pricing::catalog_identity().to_string()),
     };
     let tmp = unique_temp_path(path);
     write_private(&tmp, &serde_json::to_vec(&snapshot)?)?;
@@ -502,17 +513,34 @@ pub fn load_session_cache() -> SessionCache {
             ..SessionCache::default()
         };
     }
-    let raw_entries = doc
-        .get("entries")
-        .and_then(Value::as_object)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|(_, value)| decode_cache_entry_header(value).is_some())
-                .map(|(path, value)| (path.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Pricing-catalog identity (rm-196): cached per-session costs are
+    // only valid for the catalog that priced them — the file
+    // fingerprints alone cannot tell a catalog refresh from an
+    // untouched session. A stamped id that disagrees with the active
+    // catalog (snapshot bump on upgrade, `--update-pricing` refresh,
+    // override edit) drops every entry once so they re-price; an
+    // unstamped legacy cache is accepted as-is and stamped at the next
+    // save, so upgrading alone never forces a full rescan.
+    let pricing_catalog_id = crate::pricing::catalog_identity().to_string();
+    let pricing_matches = doc
+        .get("pricing_catalog_id")
+        .and_then(Value::as_str)
+        .map(|stamped| stamped == pricing_catalog_id)
+        .unwrap_or(true);
+    let raw_entries = if pricing_matches {
+        doc.get("entries")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(_, value)| decode_cache_entry_header(value).is_some())
+                    .map(|(path, value)| (path.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
     // Directory listings are versioned by walk semantics: v2 follows
     // symlinked child directories (Codex `#42135`, cycle 7), so listings
     // written by the older walker — which silently omitted them — are
@@ -541,7 +569,9 @@ pub fn load_session_cache() -> SessionCache {
         path,
         raw_entries,
         dirs,
-        dirty: listing_stale,
+        // A catalog mismatch dirties the cache so the emptied entry map
+        // is persisted with the new id at the next save (rm-196).
+        dirty: listing_stale || !pricing_matches,
         ..SessionCache::default()
     };
     // Dead-path eviction (pass-8 F8-3): entries whose source file no
@@ -888,6 +918,10 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
     doc.insert(
         "dir_listing_version".to_string(),
         Value::Number(DIR_LISTING_WALK_VERSION.into()),
+    );
+    doc.insert(
+        "pricing_catalog_id".to_string(),
+        Value::String(crate::pricing::catalog_identity().to_string()),
     );
     let mut entries = Map::new();
     for (path, value) in &cache.raw_entries {
@@ -1835,6 +1869,101 @@ mod tests {
         write_journal(true);
         let cache = load_session_cache();
         assert_eq!(cache.dirs.len(), 1, "current-version listings survive");
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pricing_catalog_refresh_invalidates_cached_costs_once() {
+        // rm-196: the cache's file fingerprints (mod_time+size) cannot
+        // tell a pricing-catalog refresh from an untouched session, so
+        // cached per-session costs used to survive snapshot bumps and
+        // --update-pricing refreshes at stale rates. The journal now
+        // stamps the active catalog identity; a stamp that disagrees
+        // with the live catalog drops every entry once (they re-price),
+        // an unstamped legacy journal is accepted as-is, and the same
+        // stamp keeps every hit.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-id-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("sessions.json");
+        // The entry path must exist on disk or load-time pruning would
+        // remove it for an unrelated reason.
+        let session_file = root.join("session.jsonl");
+        fs::write(&session_file, b"{}\n").expect("write session file");
+        let stamp = |pricing_catalog_id: Option<&str>| {
+            let mut doc = serde_json::Map::new();
+            doc.insert(
+                "schema_version".to_string(),
+                serde_json::json!(SESSION_CACHE_SCHEMA_VERSION),
+            );
+            if let Some(id) = pricing_catalog_id {
+                doc.insert("pricing_catalog_id".to_string(), serde_json::json!(id));
+            }
+            doc.insert(
+                "entries".to_string(),
+                serde_json::json!({
+                    session_file.to_string_lossy().to_string(): {
+                        "mod_time": 1,
+                        "size": 1,
+                    }
+                }),
+            );
+            doc.insert("dirs".to_string(), serde_json::json!({}));
+            fs::write(
+                &journal,
+                serde_json::to_string(&doc).expect("serialize journal"),
+            )
+            .expect("write journal");
+        };
+
+        // Shared env lock (see lib.rs `test_env`): the load path reads
+        // the live pricing catalog for its identity stamp.
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // The identity read here is whatever the process's active
+        // catalog computes; the test only needs internal consistency
+        // between the stamp and the loader, never a specific value.
+        let live_id = crate::pricing::catalog_identity().to_string();
+
+        stamp(Some("0123456789abcdef"));
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.raw_entries.len(),
+            0,
+            "a journal stamped with a foreign catalog id must re-price"
+        );
+        assert!(
+            cache.dirty,
+            "the invalidation must persist the emptied journal"
+        );
+
+        stamp(Some(&live_id));
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.raw_entries.len(),
+            1,
+            "a journal stamped with the active catalog id keeps its hits"
+        );
+        assert!(!cache.dirty, "a matching stamp must not dirty the journal");
+
+        stamp(None);
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.raw_entries.len(),
+            1,
+            "an unstamped legacy journal is accepted, not mass-invalidated"
+        );
+
         match prior_cache {
             Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
             None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
