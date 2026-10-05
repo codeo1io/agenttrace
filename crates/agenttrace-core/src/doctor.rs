@@ -139,7 +139,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             crate::pricing::bundled_snapshot_date(),
             crate::pricing::bundled_snapshot_model_count(),
             crate::pricing::bundled_snapshot_age_days().unwrap_or(-1)
-        ),
+        ) + &doctor_deprecation_suffix(),
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
@@ -192,6 +192,24 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
                 ));
             }
         }
+    }
+}
+
+/// Deprecation disclosure for the doctor pricing line (rm-419):
+/// `N` bundled models are past their vendor deprecation date, anchored
+/// to the snapshot's own date so the count is a property of the
+/// vendored file (deterministic across runs), never of when the
+/// binary executes.
+fn doctor_deprecation_suffix() -> String {
+    let (count, oldest) = crate::pricing::bundled_snapshot_deprecated();
+    if count == 0 {
+        return String::new();
+    }
+    match oldest {
+        Some(oldest) => {
+            format!("; {count} priced models past vendor deprecation (oldest {oldest})")
+        }
+        None => format!("; {count} priced models past vendor deprecation"),
     }
 }
 

@@ -1,11 +1,20 @@
 use crate::{parse_jsonl_session, Session};
 
-const DEMO_HEALTHY_SESSION: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
-{"role":"meta","ModelUsed":"claude-sonnet-4","Usage":{"input_tokens":4200,"output_tokens":1800,"cache_read_input_tokens":9000}}
-{"role":"user","content":"Implement the billing export endpoint and keep the patch small.","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
-{"role":"assistant","content":"I will inspect the API shape, add the endpoint, and run the focused tests.","timestamp":"2026-05-02T10:00:04Z","reasoning":"Plan: locate the billing router, reuse the existing CSV serializer, add one route and a focused regression test. Risk is around permissions, so verify auth middleware before editing. Keep the patch narrow: route registration, handler wiring, and one test fixture. After implementation, run only the billing package tests, then a final package-wide smoke to catch integration fallout. If the serializer already handles date ranges, avoid inventing another abstraction and pass through the existing query parser.","tool_calls":[{"id":"t1","name":"rg","args":"billing export"}],"ModelUsed":"claude-sonnet-4"}
+// The demo corpus must keep pricing (and attributing) through the
+// bundled LiteLLM snapshot, never through fallback rates or gateway
+// rows: the models below are chosen so the refreshed catalog still
+// lists each one first-party (anthropic / openai / gemini), which is
+// what tests/attribution_dimensions.rs pins. `claude-sonnet-4-5`
+// replaced the retired `claude-sonnet-4` name at the 2026-10-04
+// snapshot refresh — upstream dropped the first-party row, which
+// silently reassigned the old name to an openrouter gateway row —
+// with byte-identical rates, so every demo cost is unchanged.
+const DEMO_HEALTHY_SESSION: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4-5"}
+{"role":"meta","ModelUsed":"claude-sonnet-4-5","Usage":{"input_tokens":4200,"output_tokens":1800,"cache_read_input_tokens":9000}}
+{"role":"user","content":"Implement the billing export endpoint and keep the patch small.","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4-5"}
+{"role":"assistant","content":"I will inspect the API shape, add the endpoint, and run the focused tests.","timestamp":"2026-05-02T10:00:04Z","reasoning":"Plan: locate the billing router, reuse the existing CSV serializer, add one route and a focused regression test. Risk is around permissions, so verify auth middleware before editing. Keep the patch narrow: route registration, handler wiring, and one test fixture. After implementation, run only the billing package tests, then a final package-wide smoke to catch integration fallout. If the serializer already handles date ranges, avoid inventing another abstraction and pass through the existing query parser.","tool_calls":[{"id":"t1","name":"rg","args":"billing export"}],"ModelUsed":"claude-sonnet-4-5"}
 {"role":"tool","content":"{\"success\":true,\"matches\":4}","tool_call_id":"t1","timestamp":"2026-05-02T10:00:05Z"}
-{"role":"assistant","content":"Endpoint implemented and tests pass.","timestamp":"2026-05-02T10:00:18Z","reasoning":"The route can share the existing report serializer. Permission middleware is already mounted at the group level, so the change stays narrow. The test should assert status, content type, and a representative CSV row instead of snapshotting the full response. That keeps the contract stable without making unrelated fixture changes noisy. I also checked the empty result path because export endpoints often fail there; the existing serializer already emits the header row, so no special case is needed. The final patch is intentionally boring: one route, one handler branch, one regression test, and no new dependency.","tool_calls":[{"id":"t2","name":"go_test","args":"./internal/billing"}],"ModelUsed":"claude-sonnet-4"}
+{"role":"assistant","content":"Endpoint implemented and tests pass.","timestamp":"2026-05-02T10:00:18Z","reasoning":"The route can share the existing report serializer. Permission middleware is already mounted at the group level, so the change stays narrow. The test should assert status, content type, and a representative CSV row instead of snapshotting the full response. That keeps the contract stable without making unrelated fixture changes noisy. I also checked the empty result path because export endpoints often fail there; the existing serializer already emits the header row, so no special case is needed. The final patch is intentionally boring: one route, one handler branch, one regression test, and no new dependency.","tool_calls":[{"id":"t2","name":"go_test","args":"./internal/billing"}],"ModelUsed":"claude-sonnet-4-5"}
 {"role":"tool","content":"{\"success\":true,\"passed\":32}","tool_call_id":"t2","timestamp":"2026-05-02T10:00:24Z"}
 "#;
 
