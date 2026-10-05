@@ -1,0 +1,5 @@
+{"title": "hello world"}
+{"type": "session", "id": "00000000-0000-4000-8000-0000000000a1", "timestamp": "2026-06-20T10:00:00.000Z", "cwd": "/redacted/project"}
+{"id": "00000000-0000-4000-8000-0000000000a2", "timestamp": "2026-06-20T10:00:01.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": "2026-06-20T10:00:01.000Z"}, "type": "message"}
+{"id": "00000000-0000-4000-8000-0000000000a3", "timestamp": "2026-06-20T10:00:02.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}], "timestamp": "2026-06-20T10:00:02.000Z", "usage": {"input_tokens": 100, "output_tokens": 50, "cache_creation_input_tokens": 40, "cache_read_input_tokens": 10, "cost": 0.0025}, "model": "gpt-5"}, "type": "message"}
+{"type": "branch_summary", "id": "00000000-0000-4000-8000-0000000000a4", "timestamp": "2026-06-20T10:00:03.000Z", "summary": "[SYSTEM] branch checkpoint summary of earlier turns (redacted)."}

@@ -3046,10 +3046,27 @@ mod tests {
         assert_eq!(crate::percentile(&values, 0.95), 20.0);
         assert_eq!(crate::percentile(&values, 0.50), 11.0);
         assert_eq!(crate::percentile(&[], 0.95), 0.0);
-        let source = include_str!("reports.rs");
-        assert!(
-            !source.contains("\nfn percentile("),
-            "reports.rs must not re-declare percentile; use crate::percentile"
-        );
+        // rm-420: diagnostics.rs carried an UNSCANNED nearest-rank copy
+        // (ceil-1) that read one rank low at every n ≡ 0 (mod 20) and
+        // disarmed the slow-tool gates. The pin now scans every
+        // percentile-consumer source in the crate, and also rejects the
+        // inlined index arithmetic itself — any future local percentile
+        // must route through crate::percentile. (Probes are concatenated
+        // at runtime so this test's own source does not self-match.)
+        let nearest_rank_probe = ["0.95", ").ceil()"].concat();
+        let trunc_index_probe = ["* 0.95", ") as usize"].concat();
+        for (name, source) in [
+            ("reports.rs", include_str!("reports.rs")),
+            ("diagnostics.rs", include_str!("diagnostics.rs")),
+        ] {
+            assert!(
+                !source.contains("\nfn percentile("),
+                "{name} must not re-declare percentile; use crate::percentile"
+            );
+            assert!(
+                !source.contains(&nearest_rank_probe) && !source.contains(&trunc_index_probe),
+                "{name} must not inline a percentile index; use crate::percentile"
+            );
+        }
     }
 }
