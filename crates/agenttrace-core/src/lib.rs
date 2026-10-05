@@ -5,6 +5,7 @@ mod doctor;
 mod governance;
 mod history;
 mod insights;
+mod otel;
 mod parser;
 mod pricing;
 mod reports;
@@ -49,6 +50,7 @@ pub use insights::{
     session_matches_time_range, DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope,
     SessionComparison, SourceScope, TimeRange,
 };
+pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{parse_file, parse_raw_session};
 pub use pricing::{
     list_pricing, lookup_price, pricing_cache_path, pricing_source, pricing_source_for,
