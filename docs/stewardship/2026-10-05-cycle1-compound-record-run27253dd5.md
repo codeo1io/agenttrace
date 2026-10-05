@@ -71,6 +71,10 @@ crates/agenttrace-tui/src/tests.rs`, `?? crates/agenttrace-cli/tests/warm_cache_
   staleness would hide. Also: include only inputs that can CHANGE the answer (catalog
   mtime/size, override identity), and deliberately exclude inputs that cannot (stale-label
   flips at unchanged prices) — over-invalidation silently reverts warm caches to cold.
+  Correction (independent_review 9e5e41d5 F4, fix 85c8ba5c): the ≤2-stat bound holds for
+  the JSON session-entry path only; every SQLite snapshot store and load stamps its own
+  fingerprint — 2 `stat()`s + one string build per database per direction (review-fold
+  scoping, magnitude immaterial).
 - **PR-S — sub-noise deltas get construction bounds, not host benchmarks.** Run-to-run
   variance on this host is 129–1010 ms for 250-session scans and interleaved ABBA medians
   sign-flip with ordering (321.5 vs 364.5 ms). A delta bounded by construction (≤2 stat() +
