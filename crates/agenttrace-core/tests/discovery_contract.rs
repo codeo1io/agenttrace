@@ -624,9 +624,9 @@ fn rust_parses_workbuddy_messages_tools_usage_and_millis() {
     assert_eq!(parsed.metrics.tool_calls_total, 1);
     assert_eq!(parsed.metrics.tool_calls_ok, 1);
     assert_eq!(parsed.metrics.reasoning_blocks, 1);
-    assert_eq!(parsed.metrics.tokens_input, 40);
-    assert_eq!(parsed.metrics.tokens_output, 30);
-    assert_eq!(parsed.metrics.tokens_cache_r, 80);
+    assert_eq!(parsed.metrics.tokens_input, 80);
+    assert_eq!(parsed.metrics.tokens_output, 50);
+    assert_eq!(parsed.metrics.tokens_cache_r, 140);
     assert_eq!(parsed.metrics.session_start, "2026-07-11T13:50:00Z");
     assert_eq!(parsed.metrics.session_end, "2026-07-11T13:50:04Z");
 
@@ -723,7 +723,10 @@ fn rust_parses_copilot_session_state() {
     assert_eq!(parsed.metrics.model_used, "gpt-5.4");
     assert_eq!(parsed.metrics.tool_calls_total, 1);
     assert_eq!(parsed.metrics.tool_calls_ok, 1);
-    assert_eq!(parsed.metrics.tokens_input, 100);
+    // Upstream #312 (rm-517): the shutdown snapshot is cumulative per model
+    // and gen_ai input counts include cached tokens — 100 input minus the
+    // 40 cached reads leaves 60 uncached.
+    assert_eq!(parsed.metrics.tokens_input, 60);
     assert_eq!(parsed.metrics.tokens_cache_r, 40);
 
     let _ = fs::remove_dir_all(root);
@@ -892,11 +895,12 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v22 (run 2c2db6f5, rm-400/401): parser-semantics fixes bump the
-        // schema so warm entries regenerate under corrected accounting.
+        // v24 (run 95e25b56 cycle 2, rm-517): the upstream #312 token-
+        // accounting port bumps the schema so warm entries regenerate under
+        // corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(22)
+            Some(24)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1061,10 +1065,11 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v22 — see the rm-400/401 bump note in session_cache.rs).
+        // version (v24 — the rm-517 dual renumber for the upstream
+        // #312/v0.10.1 token-accounting port; see session_cache.rs).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(22)
+            Some(24)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1258,7 +1263,9 @@ fn rust_parses_opencode_storage_session() {
     assert_eq!(parsed.metrics.tool_calls_total, 1);
     assert_eq!(parsed.metrics.tool_calls_ok, 1);
     assert_eq!(parsed.metrics.tokens_input, 42);
-    assert_eq!(parsed.metrics.tokens_output, 17);
+    // Upstream #312 (rm-517): opencode's reasoning counter is excluded
+    // from tokens.output, so output = 17 + 5.
+    assert_eq!(parsed.metrics.tokens_output, 22);
     assert_eq!(parsed.metrics.tokens_cache_r, 3);
     assert_eq!(parsed.metrics.tokens_cache_w, 2);
 }
@@ -1398,7 +1405,9 @@ fn rust_codex_rollout_token_counts_use_turn_context_model() {
     assert_eq!(metrics.source_tool, "codex_cli");
     assert_eq!(metrics.tokens_input, 800);
     assert_eq!(metrics.tokens_cache_r, 900);
-    assert_eq!(metrics.tokens_output, 190);
+    // Upstream #312 (rm-517): reasoning_output_tokens is a breakdown of
+    // output_tokens, not an addition — 100 + 60, not 100 + 60 + 30.
+    assert_eq!(metrics.tokens_output, 160);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
 
@@ -1521,6 +1530,7 @@ fn rust_claude_code_jsonl_deduplicates_assistant_usage_snapshots() {
         &session_path,
         r#"{"type":"assistant","timestamp":"2026-05-03T10:00:00Z","message":{"id":"msg_1","role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":7,"cache_creation_input_tokens":3},"content":[{"type":"text","text":"hello"}]}}
 {"type":"assistant","timestamp":"2026-05-03T10:00:01Z","message":{"id":"msg_1","role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":7,"cache_creation_input_tokens":3},"content":[{"type":"tool_use","id":"tool_1","name":"Read","input":{}}]}}
+{"type":"assistant","timestamp":"2026-05-03T10:00:02Z","message":{"id":"msg_1","role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":42,"cache_read_input_tokens":7,"cache_creation_input_tokens":3},"content":[{"type":"text","text":"done"}]}}
 "#,
     )
     .expect("write claude jsonl");
@@ -1528,8 +1538,11 @@ fn rust_claude_code_jsonl_deduplicates_assistant_usage_snapshots() {
     let parsed = parse_file(&session_path).expect("parse claude jsonl");
     let metrics = &parsed.metrics;
     assert_eq!(metrics.source_tool, "claude_code");
+    // Upstream #312 (rm-517): streaming writes one row per content block, each
+    // repeating the message's usage with a growing output count — fold them
+    // into one meta event per message id, taking the per-field max.
     assert_eq!(metrics.tokens_input, 100);
-    assert_eq!(metrics.tokens_output, 10);
+    assert_eq!(metrics.tokens_output, 42);
     assert_eq!(metrics.tokens_cache_r, 7);
     assert_eq!(metrics.tokens_cache_w, 3);
     assert_eq!(metrics.tool_calls_total, 1);
@@ -1844,7 +1857,9 @@ fn rust_parses_qwen_code_stream_jsonl() {
     assert_eq!(metrics.assistant_turns, 1);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
-    assert_eq!(metrics.tokens_input, 120);
+    // Upstream #312 (rm-517): cached reads are included in input_tokens,
+    // so input carries only the uncached 110 of 120.
+    assert_eq!(metrics.tokens_input, 110);
     assert_eq!(metrics.tokens_output, 45);
     assert_eq!(metrics.tokens_cache_r, 10);
     assert_eq!(metrics.tokens_cache_w, 5);
@@ -1888,7 +1903,9 @@ fn rust_parses_qwen_code_json_object_output() {
     let parsed = parse_file(&session_path).expect("parse qwen object");
     assert_eq!(parsed.metrics.source_tool, "qwen_code");
     assert_eq!(parsed.metrics.assistant_turns, 1);
-    assert_eq!(parsed.metrics.tokens_input, 31);
+    // Upstream #312 (rm-517): cached reads are inside the input count,
+    // so input carries only the uncached 27.
+    assert_eq!(parsed.metrics.tokens_input, 27);
     assert_eq!(parsed.metrics.tokens_output, 9);
     assert_eq!(parsed.metrics.tokens_cache_r, 4);
 
@@ -1944,78 +1961,6 @@ fn rust_discovers_qwen_project_chat_files() {
         assert!(doc
             .pointer(&format!("/dirs/{}", escape_json_pointer(&chat_dir)))
             .is_some());
-    });
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn rust_discovers_gemini_cli_tmp_chats_and_checkpoints() {
-    // CU-18: ~/.gemini/tmp (<session-id>/chats|checkpoints/*.json) is the
-    // Gemini CLI session store the README promises; until now it was not a
-    // discovery root at all.
-    let root = temp_root("agenttrace-rust-gemini-tmp");
-    let home = root.join("home");
-    let chats = home
-        .join(".gemini")
-        .join("tmp")
-        .join("sess-1")
-        .join("chats");
-    let checkpoints = home
-        .join(".gemini")
-        .join("tmp")
-        .join("sess-1")
-        .join("checkpoints");
-    let cache_dir = home.join("cache");
-    fs::create_dir_all(&chats).expect("create chats dir");
-    fs::create_dir_all(&checkpoints).expect("create checkpoints dir");
-    let chat_path = chats.join("chat.json");
-    let checkpoint_path = checkpoints.join("cp.json");
-    fs::write(
-        &chat_path,
-        r#"{"checkpoint":{"model":"gemini-2.5-flash","conversation":[{"role":"user","timestamp":"2026-01-02T10:00:00Z","parts":[{"text":"List the failing tests."}]}],"tokenUsage":{"inputTokens":80,"outputTokens":20,"thoughtsTokenCount":40}}}"#,
-    )
-    .expect("write gemini chat");
-    fs::write(
-        &checkpoint_path,
-        r#"{"checkpoint":{"model":"gemini-2.5-pro","conversation":[{"role":"user","timestamp":"2026-01-02T11:00:00Z","parts":[{"text":"Checkpoint."}]}],"tokenUsage":{"inputTokens":8,"outputTokens":2}}}"#,
-    )
-    .expect("write gemini checkpoint");
-
-    with_home_and_cache(&home, &cache_dir, || {
-        let files = find_session_files(None);
-        assert!(
-            files.contains(&chat_path),
-            "chats/*.json must be discovered: {files:?}"
-        );
-        assert!(
-            files.contains(&checkpoint_path),
-            "checkpoints/*.json must be discovered: {files:?}"
-        );
-
-        let sessions = load_sessions_from_dir(None);
-        assert!(
-            sessions.len() >= 2,
-            "both gemini tmp sessions must load: {}",
-            sessions.len()
-        );
-        let thoughts = sessions
-            .iter()
-            .find(|session| session.path == chat_path.to_string_lossy())
-            .expect("chat session loaded");
-        assert_eq!(thoughts.metrics.source_tool, "gemini_cli");
-        assert_eq!(thoughts.metrics.tokens_input, 80);
-        assert_eq!(thoughts.metrics.tokens_output, 60);
-        assert_eq!(
-            thoughts.metrics.tokens_reasoning, 40,
-            "thoughtsTokenCount must reach the reasoning breakdown (CU-20)"
-        );
-        let plain = sessions
-            .iter()
-            .find(|session| session.path == checkpoint_path.to_string_lossy())
-            .expect("checkpoint session loaded");
-        assert_eq!(plain.metrics.source_tool, "gemini_cli");
-        assert_eq!(plain.metrics.tokens_reasoning, 0);
     });
 
     let _ = fs::remove_dir_all(root);

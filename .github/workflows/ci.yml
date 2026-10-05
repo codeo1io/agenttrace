@@ -154,6 +154,9 @@ jobs:
       - name: Release surface drift
         run: scripts/ci/check-release-surfaces.sh
 
+      - name: Install surface drift (rm-516)
+        run: scripts/ci/check-install-drift.sh
+
       - name: Example workflow supply-chain pinning
         run: scripts/ci/check-example-workflows.sh
 

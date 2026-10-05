@@ -5,7 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 22;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
+// Bumped 22 -> 24 (run 95e25b56 cycle 2, rm-517 — upstream #312/v0.10.1
+// token-accounting port): CC streams fold per message id (max per field),
+// Codex counts each distinct total_token_usage once and stops adding
+// reasoning_output_tokens into output, Copilot session.shutdown keeps one
+// cumulative snapshot per model with cache subtracted from input, the OTEL
+// arm gates usage on per-request chat spans and accepts both cache-attribute
+// spellings, WorkBuddy counts every (messageId, usage) pair, Qwen switches
+// to first-number semantics with cached reads subtracted from input, and
+// opencode folds its reasoning counter into output. Gemini-format support
+// is gone entirely. Warm v22 entries carry the pre-port totals this batch
+// exists to correct (rm-230 convention), so they regenerate once. Upstream
+// renumbered 23 (their #311) and 24 (their #312) in one release; the fork
+// takes both in a single step and reserves 23 unused so the numbers stay
+// aligned with upstream from here on.
 // Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
 // kimi_cli usage-alias fix and the Codex compaction pairing fix change
 // reported totals for unchanged files, so warm v21 entries carry the

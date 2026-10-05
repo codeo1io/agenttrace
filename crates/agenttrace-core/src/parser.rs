@@ -186,9 +186,6 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some(events) = parse_cursor_export(&value) {
             return session_from_events(name, path, events);
         }
-        if let Some(events) = parse_gemini_value(&value) {
-            return session_from_events(name, path, events);
-        }
         if let Some(events) = parse_kimi_value(&value) {
             return session_from_events(name, path, events);
         }
@@ -213,6 +210,9 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         return None;
     }
     let mut events = Vec::new();
+    // modelMetrics are cumulative for the session and every resume writes another
+    // shutdown snapshot, so only the latest one per model counts (#312).
+    let mut shutdown_usage: BTreeMap<String, (String, BTreeMap<String, i64>)> = BTreeMap::new();
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
@@ -282,17 +282,7 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 {
                     for (model, metric) in metrics {
                         if let Some(usage) = metric.get("usage").and_then(usage_from_value) {
-                            events.insert(
-                                0,
-                                Event {
-                                    role: "meta".to_string(),
-                                    timestamp: timestamp.clone(),
-                                    usage,
-                                    model_used: model.clone(),
-                                    source_tool: "copilot_cli".to_string(),
-                                    ..Event::default()
-                                },
-                            );
+                            shutdown_usage.insert(model.clone(), (timestamp.clone(), usage));
                         }
                     }
                 }
@@ -300,6 +290,20 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             _ => {}
         }
     }
+    let usage_events = shutdown_usage
+        .into_iter()
+        .map(|(model, (timestamp, mut usage))| {
+            subtract_cached_input(&mut usage);
+            Event {
+                role: "meta".to_string(),
+                timestamp,
+                usage,
+                model_used: model,
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            }
+        });
+    events.splice(0..0, usage_events);
     non_empty(events)
 }
 
@@ -794,7 +798,9 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     }
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
-    let mut latest_usage = None;
+    // `messageId` identifies a turn; one usage event per turn, but every record
+    // counts (the CLI reports final usage per message, not a running total; #311).
+    let mut seen_usage = BTreeSet::new();
     for entry in objs.iter() {
         if let Some(next) = entry
             .get("providerData")
@@ -810,6 +816,27 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             .map(timestamp_millis)
             .unwrap_or_default();
         let cwd = string(entry.get("cwd")).unwrap_or("").to_string();
+        if let Some(usage) = workbuddy_usage(entry) {
+            let message_id = entry
+                .get("providerData")
+                .and_then(|provider_data| provider_data.get("messageId"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if seen_usage.insert((message_id.to_string(), format!("{usage:?}"))) {
+                let timestamp = timestamp.clone();
+                events.insert(
+                    0,
+                    Event {
+                        role: "meta".to_string(),
+                        timestamp,
+                        usage,
+                        model_used: model.clone(),
+                        source_tool: "workbuddy".to_string(),
+                        ..Event::default()
+                    },
+                );
+            }
+        }
         match string(entry.get("type")).unwrap_or("") {
             "message" => {
                 let role = string(entry.get("role")).unwrap_or("");
@@ -825,7 +852,6 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         ..Event::default()
                     });
                 }
-                latest_usage = workbuddy_usage(entry).or(latest_usage);
             }
             "reasoning" => {
                 let reasoning = workbuddy_content(
@@ -847,7 +873,6 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 }
             }
             "function_call" => {
-                latest_usage = workbuddy_usage(entry).or(latest_usage);
                 events.push(Event {
                     role: "assistant".to_string(),
                     timestamp,
@@ -875,18 +900,6 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             }),
             _ => {}
         }
-    }
-    if let Some(usage) = latest_usage {
-        events.insert(
-            0,
-            Event {
-                role: "meta".to_string(),
-                usage,
-                model_used: model,
-                source_tool: "workbuddy".to_string(),
-                ..Event::default()
-            },
-        );
     }
     non_empty(events)
 }
@@ -2110,11 +2123,19 @@ fn qwen_tool_result_events(raw: Option<&Value>, ts: &str, model: &str) -> Vec<Ev
 fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let obj = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
-    let input = sum_numbers(
+    // First-number semantics (upstream #312, rm-517): the spellings below are
+    // aliases for the same counter, not additive fields — summing them
+    // double-counts. Cached reads are already included in the input count, so
+    // leave only the uncached part in input_tokens.
+    let cache_read = first_number(
+        obj,
+        &["cache_read_input_tokens", "cacheRead", "cached_tokens"],
+    );
+    let input = first_number(
         obj,
         &["input_tokens", "prompt_tokens", "input", "promptTokenCount"],
-    );
-    let output = sum_numbers(
+    ) - cache_read;
+    let output = first_number(
         obj,
         &[
             "output_tokens",
@@ -2124,11 +2145,11 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
         ],
     );
     // Thinking tokens are billed at the output rate but reported
-    // separately from candidates/completion tokens (Gemini
-    // usageMetadata.thoughtsTokenCount and the OpenAI-compatible
-    // reasoning_tokens aliases); fold them into output and keep the
+    // separately from candidates/completion tokens (the
+    // OpenAI-compatible reasoning_tokens aliases and Gemini-era
+    // thoughtsTokenCount spellings); fold them into output and keep the
     // breakdown for the audit (pass-9 CU-20).
-    let reasoning = sum_numbers(
+    let reasoning = first_number(
         obj,
         &[
             "thoughtsTokenCount",
@@ -2138,11 +2159,7 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
         ],
     );
     let output = output.saturating_add(reasoning);
-    let cache_read = sum_numbers(
-        obj,
-        &["cache_read_input_tokens", "cacheRead", "cached_tokens"],
-    );
-    let cache_write = sum_numbers(obj, &["cache_creation_input_tokens", "cacheWrite"]);
+    let cache_write = first_number(obj, &["cache_creation_input_tokens", "cacheWrite"]);
     if input > 0 {
         usage.insert("input_tokens".to_string(), input);
     }
@@ -2169,30 +2186,29 @@ fn qwen_stats_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
         let Some(tokens) = model_stats.get("tokens").and_then(Value::as_object) else {
             continue;
         };
-        add_usage_value(&mut usage, "input_tokens", tokens.get("input"));
-        add_usage_value(&mut usage, "input_tokens", tokens.get("input_tokens"));
-        add_usage_value(&mut usage, "output_tokens", tokens.get("output"));
-        add_usage_value(&mut usage, "output_tokens", tokens.get("output_tokens"));
-        add_usage_value(
-            &mut usage,
-            "cache_read_input_tokens",
-            tokens.get("cacheRead"),
-        );
-        add_usage_value(
-            &mut usage,
-            "cache_read_input_tokens",
-            tokens.get("cache_read_input_tokens"),
-        );
-        add_usage_value(
-            &mut usage,
-            "cache_creation_input_tokens",
-            tokens.get("cacheWrite"),
-        );
-        add_usage_value(
-            &mut usage,
-            "cache_creation_input_tokens",
-            tokens.get("cache_creation_input_tokens"),
-        );
+        // First-number semantics (upstream #312, rm-517): `input` and
+        // `input_tokens` (etc.) are aliases of one counter, and cached
+        // reads are already inside the input count.
+        let cache_read = first_number(tokens, &["cacheRead", "cache_read_input_tokens"]);
+        let input = first_number(tokens, &["input", "input_tokens"]) - cache_read;
+        let output = first_number(tokens, &["output", "output_tokens"]);
+        let cache_write = first_number(tokens, &["cacheWrite", "cache_creation_input_tokens"]);
+        if input > 0 {
+            *usage.entry("input_tokens".to_string()).or_insert(0) += input;
+        }
+        if output > 0 {
+            *usage.entry("output_tokens".to_string()).or_insert(0) += output;
+        }
+        if cache_read > 0 {
+            *usage
+                .entry("cache_read_input_tokens".to_string())
+                .or_insert(0) += cache_read;
+        }
+        if cache_write > 0 {
+            *usage
+                .entry("cache_creation_input_tokens".to_string())
+                .or_insert(0) += cache_write;
+        }
     }
     non_empty_usage(usage)
 }
@@ -2201,34 +2217,35 @@ fn qwen_model_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let model_usage = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
     for model_stats in model_usage.values().filter_map(Value::as_object) {
-        add_usage_value(&mut usage, "input_tokens", model_stats.get("inputTokens"));
-        add_usage_value(&mut usage, "input_tokens", model_stats.get("input_tokens"));
-        add_usage_value(&mut usage, "output_tokens", model_stats.get("outputTokens"));
-        add_usage_value(
-            &mut usage,
-            "output_tokens",
-            model_stats.get("output_tokens"),
+        // First-number semantics (upstream #312, rm-517): camelCase and
+        // snake_case spellings are aliases of one counter; cached reads
+        // are already inside the input count.
+        let cache_read = first_number(
+            model_stats,
+            &["cacheReadInputTokens", "cache_read_input_tokens"],
         );
-        add_usage_value(
-            &mut usage,
-            "cache_read_input_tokens",
-            model_stats.get("cacheReadInputTokens"),
+        let input = first_number(model_stats, &["inputTokens", "input_tokens"]) - cache_read;
+        let output = first_number(model_stats, &["outputTokens", "output_tokens"]);
+        let cache_write = first_number(
+            model_stats,
+            &["cacheCreationInputTokens", "cache_creation_input_tokens"],
         );
-        add_usage_value(
-            &mut usage,
-            "cache_read_input_tokens",
-            model_stats.get("cache_read_input_tokens"),
-        );
-        add_usage_value(
-            &mut usage,
-            "cache_creation_input_tokens",
-            model_stats.get("cacheCreationInputTokens"),
-        );
-        add_usage_value(
-            &mut usage,
-            "cache_creation_input_tokens",
-            model_stats.get("cache_creation_input_tokens"),
-        );
+        if input > 0 {
+            *usage.entry("input_tokens".to_string()).or_insert(0) += input;
+        }
+        if output > 0 {
+            *usage.entry("output_tokens".to_string()).or_insert(0) += output;
+        }
+        if cache_read > 0 {
+            *usage
+                .entry("cache_read_input_tokens".to_string())
+                .or_insert(0) += cache_read;
+        }
+        if cache_write > 0 {
+            *usage
+                .entry("cache_creation_input_tokens".to_string())
+                .or_insert(0) += cache_write;
+        }
     }
     non_empty_usage(usage)
 }
@@ -2262,7 +2279,7 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_codex = false;
-    let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
+    let mut codex_totals = CodexTotals::default();
     // rm-047: the head-probe fast path used to discard lines invisibly;
     // count every skip so parse diagnostics can surface it. rm-401
     // widened the map to the compaction-usage decisions too.
@@ -2336,10 +2353,9 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     continue;
                 };
                 if string(payload.get("type")) == Some("token_count") {
-                    if let Some((usage, next_total)) =
-                        codex_token_count_usage(payload.get("info"), prev_token_total.as_ref())
+                    if let Some(usage) =
+                        codex_token_count_usage(payload.get("info"), &mut codex_totals)
                     {
-                        prev_token_total = next_total;
                         events.push(Event {
                             role: "meta".to_string(),
                             timestamp: ts,
@@ -2510,24 +2526,24 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             .copied()
             .unwrap_or(0);
         let input = (record.usage.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-        let output = record
+        // reasoning_output_tokens is a breakdown of output_tokens, not an
+        // addition to it (upstream #312, rm-517; was rm-162's saturating
+        // fold). Keep it visible as the session's reasoning breakdown.
+        let output = record.usage.get("output_tokens").copied().unwrap_or(0);
+        let reasoning = record
             .usage
-            .get("output_tokens")
+            .get("reasoning_output_tokens")
             .copied()
-            .unwrap_or(0)
-            .saturating_add(
-                record
-                    .usage
-                    .get("reasoning_output_tokens")
-                    .copied()
-                    .unwrap_or(0),
-            );
-        let usage = BTreeMap::from([
+            .unwrap_or(0);
+        let mut usage = BTreeMap::from([
             ("input_tokens".to_string(), input),
             ("output_tokens".to_string(), output),
             ("cache_creation_input_tokens".to_string(), cache_write),
             ("cache_read_input_tokens".to_string(), cache_read),
         ]);
+        if reasoning > 0 {
+            usage.insert("reasoning_tokens".to_string(), reasoning);
+        }
         events.push(Event {
             role: "meta".to_string(),
             timestamp: record.timestamp.clone(),
@@ -2582,22 +2598,31 @@ fn json_key_present(line: &str, needle: &str) -> bool {
     false
 }
 
+/// Codex `token_count` events carry `last_token_usage` (the call that just
+/// finished) and `total_token_usage` (a running total). The total is not
+/// monotonic: compaction resets it, forks inherit the parent's total, and the
+/// same total is re-emitted on rate-limit-only updates. Count `last_token_usage`
+/// once per distinct total, falling back to the delta from the previous total
+/// when `last` is missing (upstream #312 / rm-517).
 fn codex_token_count_usage(
     raw_info: Option<&Value>,
-    prev_total: Option<&TokenUsage>,
-) -> Option<(TokenUsage, Option<TokenUsage>)> {
+    totals: &mut CodexTotals,
+) -> Option<TokenUsage> {
     let info = raw_info?.as_object()?;
     let total = token_usage_map(info.get("total_token_usage"));
-    let (counts, next_total) = if !total.is_empty() {
-        // rm-162 / upstream #286: keep the high-water mark as `prev` so a
-        // post-compaction rewind followed by a rebound is not counted twice.
-        let delta = token_usage_delta(&total, prev_total);
-        (delta, Some(token_usage_high_water(&total, prev_total)))
+    let last = token_usage_map(info.get("last_token_usage"));
+    let counts = if total.is_empty() {
+        last
     } else {
-        (
-            token_usage_map(info.get("last_token_usage")),
-            prev_total.cloned(),
-        )
+        let prev = totals.prev.replace(total.clone());
+        if !totals.seen.insert(total.clone()) {
+            return None;
+        }
+        if usage_has_values(&last) {
+            last
+        } else {
+            token_usage_delta(&total, prev.as_ref())
+        }
     };
     if counts.is_empty() || !usage_has_values(&counts) {
         return None;
@@ -2612,21 +2637,22 @@ fn codex_token_count_usage(
         .copied()
         .unwrap_or(0);
     let input = (counts.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-    // Saturating (rm-162): two legal in-range counters can sum past i64::MAX
-    // on adversarial journals; plain `+` panicked in debug and wrapped negative
-    // in release. Sibling sums at sum_numbers already saturate for the same reason.
-    let output = counts
-        .get("output_tokens")
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(counts.get("reasoning_output_tokens").copied().unwrap_or(0));
+    // reasoning_output_tokens is a breakdown of output_tokens, not an
+    // addition to it (upstream #312; was rm-162's saturating add).
+    let output = counts.get("output_tokens").copied().unwrap_or(0);
 
     let mut usage = BTreeMap::new();
     usage.insert("input_tokens".to_string(), input);
     usage.insert("output_tokens".to_string(), output);
     usage.insert("cache_creation_input_tokens".to_string(), cache_write);
     usage.insert("cache_read_input_tokens".to_string(), cache_read);
-    Some((usage, next_total))
+    Some(usage)
+}
+
+#[derive(Default)]
+struct CodexTotals {
+    prev: Option<TokenUsage>,
+    seen: BTreeSet<TokenUsage>,
 }
 
 fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
@@ -2649,18 +2675,6 @@ fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
             .map(|value| ((*key).to_string(), value))
     })
     .collect()
-}
-
-// Codex can briefly rewind total_token_usage (e.g. after compaction) and then
-// climb back; tracking the high-water mark keeps the rebound from being counted
-// twice. Ported from upstream #286 (rm-035, renumbered rm-162 at integration).
-fn token_usage_high_water(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
-    let mut merged = prev.cloned().unwrap_or_default();
-    for (key, value) in cur {
-        let slot = merged.entry(key.clone()).or_insert(0);
-        *slot = (*slot).max(*value);
-    }
-    merged
 }
 
 fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
@@ -2687,6 +2701,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_claude = false;
+    let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_usage_snapshots = BTreeSet::new();
     let mut cwd = String::new();
     for obj in objs.iter() {
@@ -2725,24 +2740,49 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     }
                 }
                 if let Some(usage_value) = message.get("usage") {
+                    // Streaming writes one row per content block, each repeating
+                    // the message's usage with a growing output count. Fold them
+                    // into one meta event per message id so input/cache are counted
+                    // once, taking the per-field max across repeats (upstream #312,
+                    // rm-517). Id-less rows keep the fork's snapshot dedup so
+                    // duplicate partials from older logs still count once.
                     let message_id = string(message.get("id")).unwrap_or("");
-                    let usage_key = if message_id.is_empty() {
-                        String::new()
-                    } else {
-                        serde_json::to_string(usage_value)
-                            .map(|usage| format!("{message_id}:{usage}"))
-                            .unwrap_or_default()
-                    };
-                    if usage_key.is_empty() || seen_usage_snapshots.insert(usage_key) {
+                    if !message_id.is_empty() {
                         if let Some(usage) = usage_from_value(usage_value) {
-                            events.push(Event {
-                                role: "meta".to_string(),
-                                timestamp: ts.clone(),
-                                usage,
-                                model_used: model.clone(),
-                                source_tool: "claude_code".to_string(),
-                                ..Event::default()
-                            });
+                            match usage_by_message.entry(message_id.to_string()) {
+                                std::collections::btree_map::Entry::Occupied(occupied) => {
+                                    let index = *occupied.get();
+                                    for (key, value) in usage {
+                                        let slot = events[index].usage.entry(key).or_insert(0);
+                                        *slot = (*slot).max(value);
+                                    }
+                                }
+                                std::collections::btree_map::Entry::Vacant(vacant) => {
+                                    vacant.insert(events.len());
+                                    events.push(Event {
+                                        role: "meta".to_string(),
+                                        timestamp: ts.clone(),
+                                        usage,
+                                        model_used: model.clone(),
+                                        source_tool: "claude_code".to_string(),
+                                        ..Event::default()
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        let usage_key = serde_json::to_string(usage_value).unwrap_or_default();
+                        if seen_usage_snapshots.insert(usage_key) {
+                            if let Some(usage) = usage_from_value(usage_value) {
+                                events.push(Event {
+                                    role: "meta".to_string(),
+                                    timestamp: ts.clone(),
+                                    usage,
+                                    model_used: model.clone(),
+                                    source_tool: "claude_code".to_string(),
+                                    ..Event::default()
+                                });
+                            }
                         }
                     }
                 }
@@ -2884,8 +2924,13 @@ fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         }
         let ts = copilot_timestamp(span.get("startTimeUnixNano"));
         let usage = copilot_usage(span);
+        // `invoke_agent` spans repeat the session totals of their `chat` children;
+        // only the per-request `chat` spans carry usage that can be summed
+        // (upstream #312, rm-517).
+        let is_chat = name == "chat.completion"
+            || copilot_string_attr(span, "gen_ai.operation.name").as_deref() == Some("chat");
         match name {
-            "chat.completion" => {
+            _ if is_chat => {
                 let content = copilot_span_content(span);
                 if !content.is_empty() {
                     events.push(Event {
@@ -2962,21 +3007,17 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
     }
     let model = string(doc.get("model")).unwrap_or("unknown").to_string();
     let mut events = Vec::new();
-    if let Some(usage) = doc.get("usage").and_then(usage_from_value) {
-        events.push(Event {
-            role: "meta".to_string(),
-            usage,
-            model_used: model.clone(),
-            source_tool: "kimi_cli".to_string(),
-            ..Event::default()
-        });
-    }
-    if let Some(usage) = doc
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("usage"))
-        .and_then(usage_from_value)
-    {
+    // API responses can repeat the same usage object in `usage` and in
+    // `metadata.usage`; they are aliases of one counter, so only one
+    // counts (upstream #312, rm-517) — prefer the top-level spelling and
+    // fall back to metadata for schemas that only carry it there.
+    let usage = doc.get("usage").and_then(usage_from_value).or_else(|| {
+        doc.get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("usage"))
+            .and_then(usage_from_value)
+    });
+    if let Some(usage) = usage {
         events.push(Event {
             role: "meta".to_string(),
             usage,
@@ -3243,157 +3284,6 @@ fn cursor_composer_message_events(composer: &Map<String, Value>, fallback_ts: &s
         });
     }
     events
-}
-
-fn parse_gemini_value(value: &Value) -> Option<Vec<Event>> {
-    let mut events = Vec::new();
-    let mut model = "unknown".to_string();
-    parse_gemini_object(value, &mut model, &mut events);
-    if events.is_empty() {
-        if let Some(arr) = value.as_array() {
-            parse_gemini_array(arr, "", &model, &mut events);
-        }
-    }
-    non_empty(events)
-}
-
-fn parse_gemini_object(value: &Value, model: &mut String, events: &mut Vec<Event>) {
-    let Some(obj) = value.as_object() else {
-        return;
-    };
-    for key in ["modelVersion", "model", "modelId"] {
-        if let Some(value) = string(obj.get(key)) {
-            if !value.is_empty() {
-                *model = value.to_string();
-            }
-        }
-    }
-    for key in ["usageMetadata", "usage", "tokenUsage"] {
-        if let Some(usage) = obj.get(key).and_then(gemini_usage) {
-            events.push(Event {
-                role: "meta".to_string(),
-                usage,
-                model_used: model.clone(),
-                source_tool: "gemini_cli".to_string(),
-                ..Event::default()
-            });
-        }
-    }
-    let fallback_ts = string(obj.get("timestamp")).unwrap_or("");
-    if let Some(contents) = obj.get("contents").and_then(Value::as_array) {
-        parse_gemini_array(contents, fallback_ts, model, events);
-    }
-    for key in [
-        "history",
-        "messages",
-        "conversation",
-        "clientHistory",
-        "chatHistory",
-    ] {
-        if let Some(contents) = obj.get(key).and_then(Value::as_array) {
-            parse_gemini_array(contents, fallback_ts, model, events);
-        }
-    }
-    if let Some(candidates) = obj.get("candidates").and_then(Value::as_array) {
-        for candidate in candidates {
-            if let Some(content) = candidate.get("content").and_then(Value::as_object) {
-                parse_gemini_content_object(content, fallback_ts, model, events);
-            }
-        }
-    }
-    if obj.contains_key("parts") {
-        parse_gemini_content_object(obj, fallback_ts, model, events);
-    }
-    for key in ["checkpoint", "session", "chat"] {
-        if let Some(nested) = obj.get(key) {
-            parse_gemini_object(nested, model, events);
-        }
-    }
-}
-
-fn parse_gemini_array(items: &[Value], fallback_ts: &str, model: &str, events: &mut Vec<Event>) {
-    for item in items {
-        if let Some(item) = item.as_object() {
-            parse_gemini_content_object(item, fallback_ts, model, events);
-        }
-    }
-}
-
-fn parse_gemini_content_object(
-    obj: &Map<String, Value>,
-    fallback_ts: &str,
-    model: &str,
-    events: &mut Vec<Event>,
-) {
-    let role = gemini_role(string(obj.get("role")).unwrap_or(""));
-    let ts = string(obj.get("timestamp")).unwrap_or(fallback_ts);
-    let Some(parts) = obj.get("parts").and_then(Value::as_array) else {
-        return;
-    };
-    for part in parts {
-        let Some(part) = part.as_object() else {
-            continue;
-        };
-        if let Some(text) = string(part.get("text")) {
-            if part
-                .get("thought")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                events.push(Event {
-                    role: "assistant".to_string(),
-                    reasoning: text.to_string(),
-                    timestamp: ts.to_string(),
-                    model_used: model.to_string(),
-                    source_tool: "gemini_cli".to_string(),
-                    ..Event::default()
-                });
-            } else {
-                events.push(Event {
-                    role: role.clone(),
-                    content: text.to_string(),
-                    timestamp: ts.to_string(),
-                    model_used: model.to_string(),
-                    source_tool: "gemini_cli".to_string(),
-                    ..Event::default()
-                });
-            }
-        }
-        if let Some(function_call) = part.get("functionCall").and_then(Value::as_object) {
-            let name = string(function_call.get("name")).unwrap_or("").to_string();
-            let args = jsonish(function_call.get("args"));
-            if !name.is_empty() || !args.is_empty() {
-                events.push(Event {
-                    role: "assistant".to_string(),
-                    timestamp: ts.to_string(),
-                    tool_calls: vec![ToolCall {
-                        name,
-                        args,
-                        ..ToolCall::default()
-                    }],
-                    model_used: model.to_string(),
-                    source_tool: "gemini_cli".to_string(),
-                    ..Event::default()
-                });
-            }
-        }
-        if let Some(function_response) = part.get("functionResponse").and_then(Value::as_object) {
-            let name = string(function_response.get("name"))
-                .unwrap_or("")
-                .to_string();
-            let content = jsonish(function_response.get("response"));
-            if !name.is_empty() || !content.is_empty() {
-                events.push(Event {
-                    role: "tool".to_string(),
-                    content,
-                    timestamp: ts.to_string(),
-                    tool_call_id: name,
-                    source_tool: "gemini_cli".to_string(),
-                    ..Event::default()
-                });
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -3775,6 +3665,9 @@ fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -
     };
     add_usage_value(usage, "input_tokens", tokens.get("input"));
     add_usage_value(usage, "output_tokens", tokens.get("output"));
+    // opencode reports thinking in a separate `reasoning` counter and
+    // excludes it from `output` (upstream #312, rm-517).
+    add_usage_value(usage, "output_tokens", tokens.get("reasoning"));
     if let Some(cache) = tokens.get("cache").and_then(Value::as_object) {
         add_usage_value(usage, "cache_read_input_tokens", cache.get("read"));
         add_usage_value(usage, "cache_creation_input_tokens", cache.get("write"));
@@ -4009,13 +3902,6 @@ fn cursor_role(role: &str) -> String {
     }
 }
 
-fn gemini_role(role: &str) -> String {
-    match role {
-        "model" => "assistant".to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn cline_role(role: &str) -> String {
     match role.to_ascii_lowercase().as_str() {
         "human" => "user".to_string(),
@@ -4083,73 +3969,6 @@ fn timestamp_millis_nanos(ms: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
         .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
         .unwrap_or_default()
-}
-
-fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
-    let obj = value.as_object()?;
-    let mut usage = BTreeMap::new();
-    usage.insert(
-        "input_tokens".to_string(),
-        first_number(
-            obj,
-            &[
-                "promptTokenCount",
-                "inputTokenCount",
-                "inputTokens",
-                "input_tokens",
-                "prompt_tokens",
-            ],
-        ),
-    );
-    usage.insert(
-        "output_tokens".to_string(),
-        first_number(
-            obj,
-            &[
-                "candidatesTokenCount",
-                "outputTokenCount",
-                "outputTokens",
-                "output_tokens",
-                "completion_tokens",
-            ],
-        )
-        .saturating_add(first_number(
-            obj,
-            &[
-                "thoughtsTokenCount",
-                "thinkingTokenCount",
-                "thinking_tokens",
-                "reasoning_tokens",
-            ],
-        )),
-    );
-    // Thinking tokens are billed at the output rate but reported
-    // separately by the API (Gemini usageMetadata.thoughtsTokenCount);
-    // folded above, broken out here for the audit (pass-9 CU-20).
-    let reasoning = first_number(
-        obj,
-        &[
-            "thoughtsTokenCount",
-            "thinkingTokenCount",
-            "thinking_tokens",
-            "reasoning_tokens",
-        ],
-    );
-    if reasoning > 0 {
-        usage.insert("reasoning_tokens".to_string(), reasoning);
-    }
-    usage.insert(
-        "cache_read_input_tokens".to_string(),
-        first_number(
-            obj,
-            &[
-                "cachedContentTokenCount",
-                "cacheReadInputTokens",
-                "cache_read_input_tokens",
-            ],
-        ),
-    );
-    Some(usage)
 }
 
 fn first_number(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
@@ -4570,23 +4389,51 @@ fn tool_result_content(block: &Map<String, Value>) -> String {
 
 fn copilot_usage(span: &Map<String, Value>) -> BTreeMap<String, i64> {
     let mut usage = BTreeMap::new();
-    for (target, key) in [
-        ("input_tokens", "gen_ai.usage.input_tokens"),
-        ("output_tokens", "gen_ai.usage.output_tokens"),
+    // Input side accepts both GenAI spellings: the nested
+    // `gen_ai.usage.cache_read.input_tokens` convention attribute and the flat
+    // `gen_ai.usage.cache_read_input_tokens` one (rm-519a / upstream #312).
+    for (target, keys) in [
+        ("input_tokens", &["gen_ai.usage.input_tokens"][..]),
+        ("output_tokens", &["gen_ai.usage.output_tokens"][..]),
         (
             "cache_creation_input_tokens",
-            "gen_ai.usage.cache_creation_input_tokens",
+            &[
+                "gen_ai.usage.cache_creation.input_tokens",
+                "gen_ai.usage.cache_creation_input_tokens",
+            ][..],
         ),
         (
             "cache_read_input_tokens",
-            "gen_ai.usage.cache_read_input_tokens",
+            &[
+                "gen_ai.usage.cache_read.input_tokens",
+                "gen_ai.usage.cache_read_input_tokens",
+            ][..],
         ),
     ] {
-        if let Some(value) = copilot_i64_attr(span, key).filter(|value| *value > 0) {
+        if let Some(value) = keys
+            .iter()
+            .find_map(|key| copilot_i64_attr(span, key))
+            .filter(|value| *value > 0)
+        {
             usage.insert(target.to_string(), value);
         }
     }
+    // GenAI semantic conventions count cached tokens inside gen_ai.usage.input_tokens.
+    subtract_cached_input(&mut usage);
     usage
+}
+
+/// For sources whose input count already includes cache reads and writes, leave only the
+/// uncached part in `input_tokens` so cost is not charged twice (upstream #312, rm-517).
+fn subtract_cached_input(usage: &mut BTreeMap<String, i64>) {
+    let cached = usage.get("cache_read_input_tokens").copied().unwrap_or(0)
+        + usage
+            .get("cache_creation_input_tokens")
+            .copied()
+            .unwrap_or(0);
+    if let Some(input) = usage.get_mut("input_tokens") {
+        *input = (*input - cached).max(0);
+    }
 }
 
 fn copilot_span_content(span: &Map<String, Value>) -> String {
@@ -4881,14 +4728,19 @@ mod tests {
         .join("\n");
         let session =
             parse_raw_session("codex", "rollout.jsonl", &raw).expect("codex rollout parses");
-        // True per-event deltas: (1000, 400, 250) + (0, 0, 160) + (100, 80,
-        // 180). Input is net of cache reads, so the single-counted total is
-        // exactly the final cumulative input minus cached (1100 - 480):
-        // 620 input / 480 cache read / 590 output. The pre-fix raw-total
-        // accounting yields 870 input / 630 cache read here.
-        assert_eq!(session.metrics.tokens_input, 620);
-        assert_eq!(session.metrics.tokens_cache_r, 480);
-        assert_eq!(session.metrics.tokens_output, 590);
+        // Upstream #312 (rm-517) semantics: exact-repeat totals count once
+        // (seen-set), each distinct total counts its delta from the
+        // previous distinct total, and last_token_usage is preferred when
+        // present. The rewind event here is a distinct total whose
+        // per-key delta clamps to zero, so it adds nothing — but the
+        // rebound is measured from the rewound total, so the re-climb
+        // counts again: 600 + 0 + 270 input (net of cache reads),
+        // 400 + 0 + 230 cache read, 200 + 150 + 150 output. The fork's
+        // earlier high-water mark (which made the rebound free) is
+        // superseded by the upstream reference behavior.
+        assert_eq!(session.metrics.tokens_input, 870);
+        assert_eq!(session.metrics.tokens_cache_r, 630);
+        assert_eq!(session.metrics.tokens_output, 500);
         assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
     }
 
@@ -4999,43 +4851,41 @@ mod tests {
     }
 
     #[test]
-    fn codex_usage_sums_saturate_instead_of_overflowing() {
-        // rm-162: output_tokens + reasoning_output_tokens can each carry a
-        // legal in-range i64 whose sum overflows on adversarial journals;
-        // plain `+` panicked in debug and wrapped negative in release.
-        // Saturating addition clamps at i64::MAX, matching sum_numbers.
+    fn codex_reasoning_tokens_are_a_breakdown_not_an_addition() {
+        // upstream #312 / rm-517: reasoning_output_tokens is included in
+        // output_tokens by Codex, so it must not be added again (was
+        // rm-162's saturating add). last_token_usage carries per-request
+        // counts.
         let info = serde_json::json!({
             "last_token_usage": {
                 "input_tokens": 10,
-                "output_tokens": i64::MAX,
-                "reasoning_output_tokens": i64::MAX
+                "output_tokens": 40,
+                "reasoning_output_tokens": 15
             }
         });
-        let (usage, _) = codex_token_count_usage(Some(&info), None).expect("usage event");
+        let mut totals = CodexTotals::default();
+        let usage = codex_token_count_usage(Some(&info), &mut totals).expect("usage event");
         assert_eq!(usage["input_tokens"], 10);
-        assert_eq!(usage["output_tokens"], i64::MAX);
+        assert_eq!(usage["output_tokens"], 40);
     }
 
     #[test]
-    fn codex_usage_rewind_uses_high_water_mark() {
-        // rm-162 / upstream #286: Codex can briefly rewind
-        // total_token_usage after compaction and then climb back. Without
-        // the high-water mark every token up to the old mark is counted
-        // twice on the rebound; with it, only the climb past it counts.
+    fn codex_total_token_snapshots_count_once() {
+        // upstream #312 / rm-517: total_token_usage repeats the same
+        // running total on every event_msg; a repeat counts nothing, a
+        // climb counts only the climb (was rm-162's high-water mark).
         let step = |total_input: i64| {
             serde_json::json!({
                 "total_token_usage": {"input_tokens": total_input}
             })
         };
-        let (first, prev) = codex_token_count_usage(Some(&step(2500)), None).expect("first event");
+        let mut totals = CodexTotals::default();
+        let first = codex_token_count_usage(Some(&step(2500)), &mut totals).expect("first event");
         assert_eq!(first["input_tokens"], 2500);
-        // Rewind to 1000 fabricates no usage (empty delta -> no event),
-        // and preserves the 2500 high-water mark as `prev`.
-        let rewound = codex_token_count_usage(Some(&step(1000)), prev.as_ref());
-        assert!(rewound.is_none());
-        // Rebound to 3000 counts only the 500-token climb past the mark.
-        let (rebound, _) =
-            codex_token_count_usage(Some(&step(3000)), prev.as_ref()).expect("rebound event");
+        // The same running total repeated emits nothing.
+        assert!(codex_token_count_usage(Some(&step(2500)), &mut totals).is_none());
+        // The climb to 3000 counts only the 500-token climb.
+        let rebound = codex_token_count_usage(Some(&step(3000)), &mut totals).expect("climb event");
         assert_eq!(rebound["input_tokens"], 500);
     }
 
@@ -5409,10 +5259,11 @@ mod tests {
 
     #[test]
     fn thinking_tokens_fold_into_output_and_break_out_at_every_usage_site() {
-        // CU-20: thoughtsTokenCount (Gemini), thinkingTokenCount and the
-        // OpenAI-compatible reasoning aliases are billed at the output
-        // rate, so they fold into output_tokens and are additionally
-        // reported as reasoning_tokens for the audit.
+        // CU-20: thinkingTokenCount and the OpenAI-compatible reasoning
+        // aliases are billed at the output rate, so they fold into
+        // output_tokens and are additionally reported as reasoning_tokens
+        // for the audit. (Gemini-format support was removed with upstream
+        // #312 / rm-517; the camel spellings live on in qwen aliases.)
         let qwen = qwen_usage(Some(&serde_json::json!({
             "output_tokens": 10,
             "reasoning_tokens": 5
@@ -5420,16 +5271,6 @@ mod tests {
         .expect("qwen usage");
         assert_eq!(qwen["output_tokens"], 15);
         assert_eq!(qwen["reasoning_tokens"], 5);
-
-        let gemini = gemini_usage(&serde_json::json!({
-            "promptTokenCount": 100,
-            "candidatesTokenCount": 20,
-            "thoughtsTokenCount": 40
-        }))
-        .expect("gemini usage");
-        assert_eq!(gemini["input_tokens"], 100);
-        assert_eq!(gemini["output_tokens"], 60);
-        assert_eq!(gemini["reasoning_tokens"], 40);
 
         let generic = usage_from_value(&serde_json::json!({
             "prompt_tokens": 10,
@@ -5453,28 +5294,31 @@ mod tests {
 
     #[test]
     fn thinking_tokens_reach_the_session_metrics_breakdown() {
-        // End to end through the Gemini checkpoint parser: the folded
-        // number lands in metrics.tokens_output and the breakdown in
-        // metrics.tokens_reasoning (pass-9 CU-20).
+        // End to end through the qwen chat parser: the folded number
+        // lands in metrics.tokens_output and the breakdown in
+        // metrics.tokens_reasoning (pass-9 CU-20; re-anchored off the
+        // Gemini checkpoint format when that support was removed with
+        // upstream #312 / rm-517).
         let raw = serde_json::json!({
-            "checkpoint": {
-                "model": "gemini-2.5-flash",
-                "conversation": [
-                    {
-                        "role": "user",
-                        "timestamp": "2026-01-02T10:00:00Z",
-                        "parts": [{"text": "Resume this checkpoint."}]
-                    }
-                ],
-                "tokenUsage": {
-                    "inputTokens": 80,
-                    "outputTokens": 20,
+            "type": "assistant",
+            "uuid": "u1",
+            "session_id": "cp",
+            "timestamp": "2026-01-02T10:00:00Z",
+            "message": {
+                "id": "m1",
+                "type": "message",
+                "role": "assistant",
+                "model": "qwen3-coder-plus",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {
+                    "prompt_tokens": 80,
+                    "completion_tokens": 20,
                     "thoughtsTokenCount": 40
                 }
             }
         })
         .to_string();
-        let session = parse_raw_session("cp", "chats/cp.json", &raw).expect("checkpoint parses");
+        let session = parse_raw_session("cp", "chats/cp.jsonl", &raw).expect("checkpoint parses");
         assert_eq!(session.metrics.tokens_input, 80);
         assert_eq!(
             session.metrics.tokens_output, 60,
@@ -5948,12 +5792,13 @@ mod tests {
             &codex_compaction_corpus("resp_comp_42"),
         )
         .expect("codex rollout parses");
-        // Snapshots: 400 net input + 600 cache + 550 out, then a
-        // 200-climb giving 0 net input + 200 cache + 160 out. Compaction
-        // turn: 200 net input + 300 cache + 200 out.
+        // Snapshots: 400 net input + 600 cache + 400 out (reasoning is a
+        // breakdown of output under upstream #312 / rm-517, not an
+        // addition), then a 200-climb giving 0 net input + 200 cache +
+        // 120 out. Compaction turn: 200 net input + 300 cache + 200 out.
         assert_eq!(session.metrics.tokens_input, 600);
         assert_eq!(session.metrics.tokens_cache_r, 1_100);
-        assert_eq!(session.metrics.tokens_output, 910);
+        assert_eq!(session.metrics.tokens_output, 720);
         assert_eq!(
             session
                 .metrics
@@ -5985,10 +5830,13 @@ mod tests {
             .join("\n");
         let session = parse_raw_session("codex", "rollout-compaction-replayed.jsonl", &raw)
             .expect("codex rollout parses");
-        // 1000 from the snapshot + 700 net from the record, exactly once.
+        // 1000 from the snapshot + 700 net from the record, exactly once;
+        // output 500 with reasoning 120 kept as a breakdown (upstream
+        // #312 / rm-517 — no longer folded into output).
         assert_eq!(session.metrics.tokens_input, 1_700);
         assert_eq!(session.metrics.tokens_cache_r, 800);
-        assert_eq!(session.metrics.tokens_output, 620);
+        assert_eq!(session.metrics.tokens_output, 500);
+        assert_eq!(session.metrics.tokens_reasoning, 120);
         assert_eq!(
             session
                 .metrics
@@ -6019,13 +5867,14 @@ mod tests {
             &codex_compaction_corpus("resp_ordinary"),
         )
         .expect("codex rollout parses");
-        // Snapshot totals only (the 1,910 shape); the unpaired record
-        // adds nothing.
+        // Snapshot totals only (the 1,720 shape; reasoning tokens are a
+        // breakdown of output under upstream #312 / rm-517); the unpaired
+        // record adds nothing.
         assert_eq!(
             session.metrics.tokens_input
                 + session.metrics.tokens_cache_r
                 + session.metrics.tokens_output,
-            1_910
+            1_720
         );
         assert_eq!(
             session
@@ -6062,10 +5911,14 @@ mod tests {
             .join("\n");
         let session = parse_raw_session("codex", "rollout-compaction-hwm.jsonl", &raw)
             .expect("codex rollout parses");
-        // 2500 (first snapshot) + 5000 (the record, standalone) + 500
-        // (rebound past the 2500 mark). If the record had advanced the
-        // baseline the rebound would count 0.
-        assert_eq!(session.metrics.tokens_input, 8_000);
+        // 2500 (first snapshot) + 5000 (the record, standalone) + 0 (the
+        // rewind is a distinct total whose delta clamps to zero) + 2000
+        // (the rebound delta measured from the rewound total, upstream
+        // #312 / rm-517). The record still never becomes the totals
+        // baseline — prev only tracks token_count snapshots — but the
+        // high-water protection on rebounds is superseded by the
+        // upstream reference behavior.
+        assert_eq!(session.metrics.tokens_input, 9_500);
         assert_eq!(
             session
                 .metrics

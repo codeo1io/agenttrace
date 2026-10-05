@@ -22,11 +22,13 @@
 //! disclosed in parse diagnostics. The second test now pins the FIXED totals
 //! — flipping it back to the pre-fix numbers is the regression gate. Note the
 //! parser's codex decomposition counts NET input (gross input minus cached)
-//! with cache tracked separately and reasoning folded into output, so the
-//! pinned numbers are expressed in that decomposition, not the gross-input
-//! arithmetic of the original verdict; the post-compaction rewound snapshot
-//! stays refused by the rm-162/#286 high-water guard (no double count), so
-//! the post-compaction window's own usage remains its own follow-up class.
+//! with cache tracked separately and reasoning kept as a breakdown (upstream
+//! #312 / rm-517), so the pinned numbers are expressed in that decomposition,
+//! not the gross-input arithmetic of the original verdict. The
+//! post-compaction rewound snapshot is a distinct cumulative whose
+//! last_token_usage (the window's own 600 in / 100 out) now counts — the
+//! rm-162/#286 high-water refusal is superseded by the upstream reference
+//! semantics — while exact repeats of a seen cumulative still count once.
 
 use agenttrace_core::parse_raw_session;
 use std::fs;
@@ -80,25 +82,26 @@ fn remote_compaction_usage_is_counted_after_the_fix() {
     //   post-compaction (count)     in  600 / out 100
     //
     //   pre-fix agenttrace report   in 1000 / cache   0 / out 200 / rea   0
-    //   post-fix (this pin)         in 1700 / cache 800 / out 620 / rea   0
+    //   post-fix (this pin)         in 2300 / cache 800 / out 600 / rea 120
     //
-    // The compaction turn's record is now counted once in the parser's codex
+    // The compaction turn's record is counted once in the parser's codex
     // decomposition: net input 1500-800=700 beside turn 1's 1000, cache_read
-    // 800 tracked separately, output 300 with reasoning 120 folded in (420
-    // beside turn 1's 200). The post-compaction snapshot (700 cumulative)
-    // still sits below the rm-162/#286 high-water mark (1200), so the rewind
-    // guard refuses it — no double count — leaving the post-compaction
-    // window's own usage (600 in / 100 out) as its own follow-up class, not
-    // silently eaten. Dropping back to the pre-fix row above is exactly the
-    // regression this pin exists to catch.
+    // 800 tracked separately, output 300 with reasoning 120 kept as a
+    // breakdown (upstream #312 / rm-517; no longer folded into output). The
+    // post-compaction snapshot is a distinct cumulative and its
+    // last_token_usage (600 in / 100 out) now counts under the upstream
+    // reference semantics — the rm-162/#286 high-water refusal is
+    // superseded, exact repeats of a seen cumulative still count once.
+    // Dropping back to the pre-fix row above is exactly the regression
+    // this pin exists to catch.
     let reported = parse_fixture("remote-compaction.jsonl");
     assert_eq!(
         reported,
         Usage {
-            input: 1700,
+            input: 2300,
             cache_r: 800,
-            output: 620,
-            reasoning: 0,
+            output: 600,
+            reasoning: 120,
         }
     );
     eprintln!(

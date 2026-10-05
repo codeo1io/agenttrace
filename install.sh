@@ -10,7 +10,7 @@ REPO="luoyuctl/agenttrace"
 # clone time is not what this installer was tested against. Keep in
 # lockstep with the newest published release tag; override for forks or
 # testing with AGENTTRACE_SOURCE_REF (tag or branch name).
-REF="${AGENTTRACE_SOURCE_REF:-v0.9.0}"
+REF="${AGENTTRACE_SOURCE_REF:-v0.10.1}"
 # Install receipt for the source-build fallback (rm-051): records the
 # exact ref that was built, so an install can be audited later.
 INSTALL_RECEIPT="${AGENTTRACE_INSTALL_RECEIPT:-${XDG_DATA_HOME:-$HOME/.local/share}/agenttrace/install-receipt}"
