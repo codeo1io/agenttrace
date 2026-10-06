@@ -57,6 +57,16 @@ report from a partial repository, and a slow `git` can never masquerade
 as "not inside a git repository" — only a probe that actually ran and
 failed counts as a missing prerequisite.
 
+Every remote-derived free-form string — the remote URL, the last-sync
+commit subject, the unported commit subjects, and the registry-probed
+npm state — is sanitized at the render boundary (rm-594): control
+bytes become `U+FFFD`, so a hostile upstream cannot carry an OSC-52
+clipboard write or a CSI sequence onto your terminal through this
+view. Printable text is untouched, fields git itself constrains (tag
+names, the `%cs` date, area labels, operator-chosen remote names) stay
+raw, and `-f json` keeps the exact upstream bytes behind JSON's
+lossless control-byte escaping.
+
 Like the rest of the CLI, flags follow Go-style placement: they must
 precede the positional command, so `agenttrace -f json upstream` and
 `agenttrace --fetch upstream` parse, while anything after `upstream` is
