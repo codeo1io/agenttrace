@@ -901,19 +901,37 @@ fn workbuddy_content(value: Option<&Value>) -> String {
         .join("\n")
 }
 
+/// For sources whose `input_tokens` already includes the given cache counts, leave only
+/// the uncached part in `input_tokens` so cost is not charged twice. Each cache count is
+/// clamped to what is left of the input, so a ledger whose cached part exceeds its input
+/// neither goes negative nor inflates the total beyond what the source reported
+/// (upstream PR #316, ccusage `cached.min(input)` semantics). `remaining` starts at
+/// `input.max(0)`, so adversarial magnitudes that clamp `input_tokens` to i64::MIN leave
+/// every cache count at 0 instead of underflowing.
+fn subtract_cached_input(usage: &mut BTreeMap<String, i64>, cache_keys: &[&str]) {
+    let Some(input) = usage.get("input_tokens").copied() else {
+        return;
+    };
+    let mut remaining = input.max(0);
+    for key in cache_keys {
+        if let Some(value) = usage.get_mut(*key) {
+            *value = (*value).clamp(0, remaining);
+            remaining -= *value;
+        }
+    }
+    usage.insert("input_tokens".to_string(), remaining);
+}
+
 fn workbuddy_usage(entry: &Map<String, Value>) -> Option<TokenUsage> {
     let mut usage = entry
         .get("message")
         .and_then(|message| message.get("usage"))
         .or_else(|| entry.get("providerData").and_then(|data| data.get("usage")))
         .and_then(usage_from_value)?;
-    let cached = usage.get("cache_read_input_tokens").copied().unwrap_or(0);
-    if let Some(input) = usage.get_mut("input_tokens") {
-        // `saturating_sub`: adversarial magnitudes clamp input_tokens to
-        // i64::MIN, where a plain subtraction underflows (debug panic) or
-        // wraps to a huge positive that survives `.max(0)` (release).
-        *input = input.saturating_sub(cached).max(0);
-    }
+    // WorkBuddy only reports cache reads. The Copilot/OTel arms adopt the
+    // same helper with both cache keys when their #312 basis port lands
+    // (sibling lane); this batch (rm-529) ports the WorkBuddy clamp only.
+    subtract_cached_input(&mut usage, &["cache_read_input_tokens"]);
     Some(usage)
 }
 
@@ -5719,7 +5737,29 @@ mod tests {
         });
         let usage = workbuddy_usage(value.as_object().expect("object")).expect("usage");
         assert_eq!(usage.get("input_tokens"), Some(&0));
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&0));
         assert_eq!(usage.get("output_tokens"), Some(&10));
+    }
+
+    #[test]
+    fn workbuddy_usage_clamps_cache_read_above_input() {
+        // WorkBuddy `input_tokens` is cache-INCLUSIVE. A cache_read above the
+        // reported input is a basis mismatch: the cached part must clamp to
+        // the input so the session total never exceeds what the source
+        // recorded (100 vs the old 0 + 150 = 150) — port of upstream PR #316.
+        let value = serde_json::json!({
+            "message": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_input_tokens": 150
+                }
+            }
+        });
+        let usage = workbuddy_usage(value.as_object().expect("object")).expect("usage");
+        assert_eq!(usage.get("input_tokens"), Some(&0));
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&100));
+        assert_eq!(usage.get("output_tokens"), Some(&20));
     }
 
     #[test]

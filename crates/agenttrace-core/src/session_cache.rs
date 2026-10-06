@@ -5,7 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 26;
+// Bumped 24 -> 26 (run 66e75e39, rm-529 'Clamp cache counts to
+// cache-inclusive input (port upstream open PR #316)'):
+// the WorkBuddy cache clamp changes derived usage maps for ledgers whose
+// cache_read exceeds the cache-inclusive input, so warm v24 entries carry
+// the inflated totals this batch exists to fix and nothing regenerates them
+// until each source file changes again (rm-230 convention: parser-semantics
+// changes bump the schema so cached sessions regenerate under corrected
+// accounting). Skips 25: the landed ceiling past this run's base
+// 1511547 already bumped 24 -> 25 (e389f1a, integration of run
+// 66a7d797, rm-450, workbuddy input-basis disclosure); taking 26
+// re-bases this bump onto the already-advanced ceiling exactly as
+// that landing did. Upstream diverged long ago (26 pre-#316, 27 with it) — the
+// fork ladder is documented here for the rm-513 merge-hazard rungs. Entries
+// regenerate once on next scan.
 // Bumped 23 -> 24 (integration of run 6403d975, rm-436/437/438): the
 // pi journal accounting batch (disclosure counters, upstream
 // recorded-cost passthrough, per-block multi-model pricing) changed
