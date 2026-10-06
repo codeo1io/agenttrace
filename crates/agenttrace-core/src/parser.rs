@@ -2274,24 +2274,30 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     // the loop.
     let mut usage_records: Vec<CodexUsageRecord> = Vec::new();
     let mut compaction_response_ids: BTreeSet<String> = BTreeSet::new();
-    let lines = raw
-        .lines()
-        .filter(|line| {
-            if codex_line_is_ignorable(line) {
-                *counters
-                    .entry("codex_ignorable_line".to_string())
-                    .or_insert(0) += 1;
-                false
-            } else {
-                true
-            }
-        })
-        .filter_map(|line| parse_jsonl_value_lenient(line.trim()))
-        .filter_map(|value| match value {
+    // rm-449: custom_tool_call payloads carry an explicit status; a
+    // call that did not complete marks its (later) output as an error,
+    // the way other parsers surface tool failures.
+    let mut failed_custom_calls: BTreeSet<String> = BTreeSet::new();
+    // A plain for-loop, not a filter-closure iterator chain: rm-449's
+    // in-loop disclosure counters share `counters` with the ignorable-line
+    // count, and a closure holding the mutable borrow across the whole
+    // iteration would forbid both (E0499). Streaming one line at a time is
+    // kept — collecting the parsed objects would pin a whole journal in
+    // memory, which the adversarial 8 MiB single-line corpus exercises.
+    for line in raw.lines() {
+        if codex_line_is_ignorable(line) {
+            *counters
+                .entry("codex_ignorable_line".to_string())
+                .or_insert(0) += 1;
+            continue;
+        }
+        let obj = match parse_jsonl_value_lenient(line.trim()).and_then(|value| match value {
             Value::Object(obj) => Some(obj),
             _ => None,
-        });
-    for obj in lines {
+        }) {
+            Some(obj) => obj,
+            None => continue,
+        };
         let typ = string(obj.get("type")).unwrap_or("");
         let ts = string(obj.get("timestamp")).unwrap_or("").to_string();
         match typ {
@@ -2437,7 +2443,98 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                             ..Event::default()
                         });
                     }
-                    _ => {}
+                    "custom_tool_call" => {
+                        // rm-449 (run b1ff12f8, cycle 2): the custom-tools
+                        // wire. The newest real codex rollouts (2026-09-26,
+                        // glm-5.x proxy catalog) carry 7-20 of these per
+                        // session and ZERO classic function_calls, so those
+                        // sessions parsed as tool_calls_total=0 while real
+                        // tool work happened — the entire tool-waste,
+                        // tool-failure, and authority lens was blind. Mirror
+                        // the function_call arm (same ToolCall shape; the
+                        // JS-source `input` string feeds args/tool_usage the
+                        // way `arguments` did) and remember a
+                        // non-"completed" status so the paired output counts
+                        // as a failure instead of a silent success.
+                        let status = string(payload.get("status")).unwrap_or("completed");
+                        let call_id = string(payload.get("call_id")).unwrap_or("").to_string();
+                        if status != "completed" {
+                            failed_custom_calls.insert(call_id.clone());
+                        }
+                        events.push(Event {
+                            role: "assistant".to_string(),
+                            timestamp: ts,
+                            tool_calls: vec![ToolCall {
+                                id: call_id,
+                                name: string(payload.get("name")).unwrap_or("").to_string(),
+                                args: jsonish(payload.get("input")),
+                            }],
+                            model_used: model.clone(),
+                            source_tool: "codex_cli".to_string(),
+                            ..Event::default()
+                        });
+                    }
+                    "custom_tool_call_output" => {
+                        let call_id = string(payload.get("call_id")).unwrap_or("").to_string();
+                        events.push(Event {
+                            role: "tool".to_string(),
+                            timestamp: ts,
+                            tool_call_id: call_id.clone(),
+                            content: jsonish(payload.get("output")),
+                            is_error: failed_custom_calls.contains(&call_id),
+                            source_tool: "codex_cli".to_string(),
+                            ..Event::default()
+                        });
+                    }
+                    "reasoning" => {
+                        // rm-449: standalone reasoning items — the rollout
+                        // records them WITHOUT a sibling message item, with
+                        // the readable text in summary[] summary_text blocks
+                        // (`content` is null; the raw thought ships
+                        // encrypted). Emit the same assistant-reasoning
+                        // event shape the message arm uses, so
+                        // reasoning_blocks/reasoning_chars and the
+                        // assistant-turn census see custom-tools sessions
+                        // (they used to read 0 while the file carried 3-9
+                        // reasoning items per session).
+                        let mut texts = Vec::new();
+                        if let Some(Value::Array(blocks)) = payload.get("summary") {
+                            for block in blocks {
+                                let Some(block) = block.as_object() else {
+                                    continue;
+                                };
+                                match string(block.get("type")).unwrap_or("") {
+                                    "summary_text" | "text" => {
+                                        if let Some(text) =
+                                            string(block.get("text")).filter(|t| !t.is_empty())
+                                        {
+                                            texts.push(text.to_string());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        for text in texts {
+                            events.push(Event {
+                                role: "assistant".to_string(),
+                                timestamp: ts.clone(),
+                                reasoning: text,
+                                model_used: model.clone(),
+                                source_tool: "codex_cli".to_string(),
+                                ..Event::default()
+                            });
+                        }
+                    }
+                    unknown_payload => {
+                        // rm-449 acceptance (4): future wire growth must be
+                        // visible, not silent — the custom-tools gap hid for
+                        // a month because unknown payload types incremented
+                        // nothing (rm-401 widened-channel precedent).
+                        *counters
+                            .entry(format!("codex_unmatched_response_item:{unknown_payload}"))
+                            .or_insert(0) += 1;
+                    }
                 }
             }
             "compacted" => {
@@ -2465,6 +2562,22 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 if let Some(record) = obj.get("payload") {
                     collect_codex_usage_record(record, &mut usage_records, &ts);
                 }
+            }
+            "world_state" => {
+                // rm-449 acceptance (3): sub-registry metadata observed in
+                // the 2026-09-26 rollouts — neither tool nor message, but a
+                // real top-level type on disk. Explicitly ignored AND
+                // counted, so the line is disclosed in parse diagnostics
+                // rather than silently dropped.
+                saw_codex = true;
+                *counters.entry("codex_world_state".to_string()).or_insert(0) += 1;
+            }
+            unknown_top_level if !unknown_top_level.is_empty() => {
+                // rm-449: same disclosure duty as the response_item arm —
+                // an unrecognized top-level type is drift, not noise.
+                *counters
+                    .entry(format!("codex_unmatched_type:{unknown_top_level}"))
+                    .or_insert(0) += 1;
             }
             _ => {}
         }
@@ -4995,6 +5108,169 @@ mod tests {
             session.metrics.line_skips.get("codex_ignorable_line"),
             Some(&2),
             "skipped codex chatter is visible in parse diagnostics"
+        );
+    }
+
+    #[test]
+    fn codex_custom_tools_rollout_parses_calls_reasoning_and_disclosure() {
+        // rm-449 (run b1ff12f8, cycle 2): the custom-tools wire. Real
+        // rollouts (2026-09-26 census: 7-20 custom_tool_call pairs per
+        // session, ZERO classic function_calls) carry all their tool work
+        // in response_item/custom_tool_call + custom_tool_call_output and
+        // their reasoning in standalone response_item/reasoning items —
+        // every one of which fell to the `_ => {}` arm, so the newest
+        // real sessions reported tool_calls_total=0, tool_results=0,
+        // reasoning_blocks=0. The vendored, sanitized fixture (see
+        // tests/fixtures/codex-custom-tools/README.md for provenance,
+        // census, and the sha256 pin) is the golden corpus: the pinned
+        // totals below are the fixture's live-measured post-fix values,
+        // and the scrub is metrics-neutral against the unsanitized
+        // original.
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-custom-tools/rollout.jsonl"
+        ))
+        .expect("vendored codex custom-tools fixture ships with the crate");
+        let session = parse_raw_session("codex", "rollout.jsonl", &raw).expect("rollout parses");
+        assert_eq!(session.metrics.source_tool, "codex_cli");
+        assert_eq!(session.metrics.model_used, "glm-5.2");
+        // Census pin: 7 custom_tool_call pairs => 7 calls, 7 results,
+        // every one completed (no failure status in the real corpus).
+        assert_eq!(session.metrics.tool_calls_total, 7);
+        assert_eq!(session.metrics.tool_results, 7);
+        assert_eq!(session.metrics.tool_calls_ok, 7);
+        assert_eq!(session.metrics.tool_calls_fail, 0);
+        assert_eq!(session.metrics.tool_usage.get("exec"), Some(&7));
+        // Census pin: 5 standalone reasoning items => 5 reasoning
+        // blocks (the message arm contributes none here — this file's
+        // reasoning lives outside messages).
+        assert_eq!(session.metrics.reasoning_blocks, 5);
+        // Reported usage pins (token_count snapshots are preserved by
+        // the sanitizer): 23,312 in / 9,790 out / 192,128 cache read.
+        assert_eq!(session.metrics.tokens_input, 23_312);
+        assert_eq!(session.metrics.tokens_output, 9_790);
+        assert_eq!(session.metrics.tokens_cache_r, 192_128);
+        // Disclosure pins: world_state is explicitly ignored AND counted
+        // (1 in the census), and nothing in this real-shape fixture is
+        // unmatched — every response_item payload type it carries is
+        // handled, so the unmatched-disclosure counters must be absent.
+        assert_eq!(
+            session.metrics.line_skips.get("codex_world_state"),
+            Some(&1)
+        );
+        let unmatched: Vec<&String> = session
+            .metrics
+            .line_skips
+            .keys()
+            .filter(|key| key.starts_with("codex_unmatched"))
+            .collect();
+        assert_eq!(
+            unmatched,
+            Vec::<&String>::new(),
+            "a handled real-shape corpus must disclose nothing as unmatched"
+        );
+    }
+
+    #[test]
+    fn codex_custom_tool_failure_status_marks_paired_output_as_error() {
+        // rm-449: custom_tool_call carries an explicit `status`; a call
+        // that did not complete must surface as a tool FAILURE through
+        // its paired output, the way other parsers report tool errors —
+        // not as a silent success. (The vendored corpus is all
+        // `completed`, so the failure arm is pinned synthetically.)
+        let meta = serde_json::json!({
+            "timestamp": "2026-09-26T20:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/probe", "model": "gpt-5.3-codex"}
+        })
+        .to_string();
+        let call = |status: &str, call_id: &str, ts: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "status": status,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": "echo probe"
+                }
+            })
+            .to_string()
+        };
+        let output = |call_id: &str, ts: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": [{"type": "input_text", "text": "timed out"}]
+                }
+            })
+            .to_string()
+        };
+        let raw = [
+            meta,
+            call("completed", "call_good", "2026-09-26T20:00:01Z"),
+            output("call_good", "2026-09-26T20:00:02Z"),
+            call("failed", "call_bad", "2026-09-26T20:00:03Z"),
+            output("call_bad", "2026-09-26T20:00:04Z"),
+        ]
+        .join("\n");
+        let session = parse_raw_session("codex", "rollout.jsonl", &raw).expect("rollout parses");
+        assert_eq!(session.metrics.tool_calls_total, 2);
+        assert_eq!(session.metrics.tool_results, 2);
+        assert_eq!(session.metrics.tool_calls_fail, 1);
+        assert_eq!(session.metrics.tool_calls_ok, 1);
+        assert_eq!(
+            session.metrics.provenance.tool_results, "reported_by_agent",
+            "an agent-reported failure status is reported, not inferred"
+        );
+    }
+
+    #[test]
+    fn codex_unknown_wire_shapes_are_disclosed_not_silent() {
+        // rm-449 acceptance: future wire growth must be visible, not
+        // silent — the custom-tools gap hid for a month because unknown
+        // payload types incremented nothing (rm-401 precedent). An
+        // unknown response_item payload type and an unknown top-level
+        // type each land in parse diagnostics under a named counter.
+        let meta = serde_json::json!({
+            "timestamp": "2026-09-26T20:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/probe", "model": "gpt-5.3-codex"}
+        })
+        .to_string();
+        let future_item = serde_json::json!({
+            "timestamp": "2026-09-26T20:00:01Z",
+            "type": "response_item",
+            "payload": {"type": "future_widget", "payload": {"opaque": true}}
+        })
+        .to_string();
+        let future_top = serde_json::json!({
+            "timestamp": "2026-09-26T20:00:02Z",
+            "type": "future_envelope",
+            "payload": {"opaque": true}
+        })
+        .to_string();
+        let raw = [meta, future_item, future_top].join("\n");
+        let session = parse_raw_session("codex", "rollout.jsonl", &raw).expect("rollout parses");
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_unmatched_response_item:future_widget"),
+            Some(&1),
+            "unknown response_item payload types are disclosed by name"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_unmatched_type:future_envelope"),
+            Some(&1),
+            "unknown top-level types are disclosed by name"
         );
     }
 

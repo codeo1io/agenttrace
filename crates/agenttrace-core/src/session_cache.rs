@@ -5,7 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 22;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 23;
+// Bumped 22 -> 23 (run b1ff12f8, cycle 2, rm-449): the Codex
+// custom-tools response items are now parsed — custom_tool_call /
+// custom_tool_call_output pairs count as tool calls and results
+// (with an agent-reported failure status surfacing as an error),
+// standalone reasoning items count as reasoning blocks, and world_state
+// lines are disclosed as an ignorable counter — so the newest real
+// rollouts stop reporting tool_calls_total=0 while carrying 7-20 tool
+// pairs. Reported totals change for unchanged files, which warm v22
+// entries still carry pre-fix (the rm-230 convention: parser-semantics
+// changes bump the schema so cached sessions regenerate under corrected
+// accounting). Entries regenerate once on next scan.
 // Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
 // kimi_cli usage-alias fix and the Codex compaction pairing fix change
 // reported totals for unchanged files, so warm v21 entries carry the

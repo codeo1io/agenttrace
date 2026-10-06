@@ -69,12 +69,14 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 22 and the SQLite snapshot is schema 7; the
+The session cache is schema 23 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
-corrected, then to 22 when per-format usage accounting was corrected —
-kimi_cli wire aliases and Codex compaction usage records — so cached
-sessions regenerate under the corrected totals; the SQLite snapshot to 7
+corrected, then to 22 when per-format usage accounting was corrected
+— kimi_cli wire aliases and Codex compaction usage records — and to 23
+when Codex custom-tools response items began counting as tool calls,
+results, and reasoning — so cached sessions regenerate under the
+corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
@@ -135,6 +137,31 @@ seconds per repository root, and a probe that overruns the cap is
 treated as unavailable — that root degrades to the tool-authority
 heuristic and the report says so. A repository that answers slowly
 slows the report by at most that cap.
+
+## Waste report
+
+```bash
+agenttrace --waste -f json
+```
+
+The waste report scores the newest matching session for cache
+efficiency, tool-call bloat, retry-loop spend, and stuck patterns. In
+JSON it carries the same verdicts the text banner does, as data (schema
+`agenttrace.waste.v1`): `waste_score` (0–100), `waste_level`,
+`total_wasted_cost`, `loop_waste_percent`, `session_cost`, `cache`
+(`rating`, `hit_rate_percent`, `cache_read_tokens`,
+`total_input_tokens`, `wasted_cost`, `suggestion`), `tool_bloat`
+(`tools_per_turn`, `bloat_score`, `bloat_level`, `top_bloat[]`),
+`stuck_patterns[]`, `summary`, and `top_actions[]`.
+
+Per-tool `allocated_cost` figures share the text report's caveat: they
+are a share of the session-level estimate, not measured per-tool spend.
+
+The format matrix is consistent across report actions: `-f json` is
+honored everywhere the format guard admits it (the waste report
+included), while `-f markdown` and `-f html` are the overview and
+governance surfaces — `--waste -f markdown` is rejected with the guard's
+error naming those actions instead of silently rendering text.
 
 ## Overview appendix
 

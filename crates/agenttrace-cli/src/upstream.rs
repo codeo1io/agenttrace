@@ -20,13 +20,124 @@
 //! explicit flag. No new crate dependencies: `git` (and optionally
 //! `curl`) run as subprocesses, so the CLI crate stays network-free.
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::SystemTime;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
+
+/// rm-450 (run b1ff12f8, cycle 2): every `git` subprocess this module
+/// spawns runs under a stated deadline, mirroring governance.rs's
+/// GIT_PROBE_TIMEOUT pattern (spawn, drain both pipes on helper
+/// threads, poll `try_wait`, kill at the deadline). Local probes take
+/// the governance ten-second local class; the opt-in network `git
+/// fetch` takes the thirty-second network class the pricing download
+/// already uses, because fetching upstream refs can legitimately take
+/// longer than a local rev-parse. A subprocess that overruns its
+/// deadline is a terminal error naming the deadline and the git
+/// operation — never a silent partial report and never a hang.
+const UPSTREAM_GIT_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a bounded subprocess did not produce its output. `Timeout` is
+/// distinguished from `Failed`/`Spawn` so the fail-fast prerequisite
+/// probes in `collect_status` cannot misreport a wedged git as "not
+/// inside a git repository": only a probe that actually ran and failed
+/// counts as a missing prerequisite.
+#[derive(Debug)]
+enum GitRunError {
+    /// The deadline passed and the child was killed. `op` is the
+    /// human-named operation (e.g. `git fetch upstream --quiet`).
+    Timeout { op: String, bound: Duration },
+    /// The child ran to completion and exited non-zero.
+    Failed { op: String, message: String },
+    /// The child could not be spawned at all (e.g. no git on PATH).
+    Spawn { op: String, message: String },
+}
+
+impl std::fmt::Display for GitRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitRunError::Timeout { op, bound } => {
+                write!(
+                    f,
+                    "{op} timed out after {}s and was killed",
+                    bound.as_secs()
+                )
+            }
+            GitRunError::Failed { op, message } => write!(f, "{op} failed: {message}"),
+            GitRunError::Spawn { op, message } => write!(f, "failed to spawn {op}: {message}"),
+        }
+    }
+}
+
+/// Runs a subprocess under a wall-clock deadline and returns
+/// `(status, stdout, stderr)`. Both pipes are drained on helper threads
+/// because `read_to_end` blocks: draining on the polling thread could
+/// deadlock against a child whose pipe buffer fills, turning a fast
+/// child into a spurious timeout (the governance.rs
+/// `wait_child_bounded` comment states the same contract). On deadline
+/// the child is killed and the drains are joined so no thread
+/// outlives the call.
+fn run_bounded(
+    program: &str,
+    args: &[&str],
+    bound: Duration,
+) -> Result<(std::process::ExitStatus, String, String), GitRunError> {
+    let op = format!("{program} {}", args.join(" "));
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| GitRunError::Spawn {
+            op: op.clone(),
+            message: err.to_string(),
+        })?;
+    let stdout = spawn_drain(child.stdout.take());
+    let stderr = spawn_drain(child.stderr.take());
+    let deadline = Instant::now() + bound;
+    let status = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout.join();
+            let _ = stderr.join();
+            return Err(GitRunError::Timeout { op, bound });
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = drained_text(stdout);
+    let stderr = drained_text(stderr);
+    if !status.success() {
+        return Err(GitRunError::Failed {
+            op,
+            message: snippet(&stderr),
+        });
+    }
+    Ok((status, stdout, stderr))
+}
+
+fn spawn_drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = pipe {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+fn drained_text(handle: std::thread::JoinHandle<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&handle.join().unwrap_or_default()).to_string()
+}
 
 const DEFAULT_REMOTE: &str = "upstream";
 const DEFAULT_REF: &str = "master";
@@ -88,20 +199,28 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
     let remote = remote_name();
     let ref_name = ref_name();
 
-    // Fail fast with the same hints scripts/upstream-delta gives.
-    if git(&["rev-parse", "--show-toplevel"]).is_err() {
-        bail!("not inside a git repository");
+    // Fail fast with the same hints scripts/upstream-delta gives. rm-450:
+    // only a probe that RAN and failed counts as a missing prerequisite —
+    // a probe that timed out is terminal (named deadline), so a wedged
+    // git can never masquerade as "not inside a git repository".
+    match git_bounded(&["rev-parse", "--show-toplevel"]) {
+        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
+        Err(_) => bail!("not inside a git repository"),
+        Ok(_) => {}
     }
-    let remote_url = match git(&["remote", "get-url", &remote]) {
-        Ok(url) => url,
+    let remote_url = match git_bounded(&["remote", "get-url", &remote]) {
+        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
         Err(_) => bail!("no '{remote}' remote configured (git remote add {remote} <url>)"),
+        Ok(url) => url,
     };
     if fetch {
         fetch_remote(&remote)?;
     }
     let tracking = format!("refs/remotes/{remote}/{ref_name}");
-    if git(&["rev-parse", "--verify", &tracking]).is_err() {
-        bail!("no remote-tracking ref {tracking}; run agenttrace --fetch upstream");
+    match git_bounded(&["rev-parse", "--verify", &tracking]) {
+        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
+        Err(_) => bail!("no remote-tracking ref {tracking}; run agenttrace --fetch upstream"),
+        Ok(_) => {}
     }
 
     let local_head = git(&["rev-parse", "HEAD"])?;
@@ -109,9 +228,10 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         Ok(branch) if branch != "HEAD" => Some(branch),
         _ => None,
     };
-    let merge_base = match git(&["merge-base", "HEAD", &tracking]) {
-        Ok(base) => base,
+    let merge_base = match git_bounded(&["merge-base", "HEAD", &tracking]) {
+        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
         Err(_) => bail!("no common history with {remote}/{ref_name}"),
+        Ok(base) => base,
     };
 
     let ahead = git(&["rev-list", "--count", &format!("{merge_base}..HEAD")])?
@@ -182,36 +302,41 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
 }
 
 fn fetch_remote(remote: &str) -> anyhow::Result<()> {
-    let output = Command::new("git")
-        .args(["fetch", remote, "--quiet"])
-        .output()
-        .map_err(|err| anyhow!("failed to spawn git fetch: {err}"))?;
-    if !output.status.success() {
-        bail!(
-            "git fetch {remote} failed: {}",
-            snippet(&String::from_utf8_lossy(&output.stderr))
-        );
+    // rm-450: `--fetch` is this module's one opt-in network action and it
+    // used to wait on `Command::output()` without a bound — a wedged
+    // fetch (hung remote, stale mount) hung the whole CLI. It now runs
+    // under UPSTREAM_FETCH_TIMEOUT; a timeout is terminal and names the
+    // deadline, the operation, and the remote.
+    match run_bounded("git", &["fetch", remote, "--quiet"], UPSTREAM_FETCH_TIMEOUT) {
+        Ok(_) => Ok(()),
+        Err(GitRunError::Timeout { op, bound }) => bail!(
+            "{op} timed out after {}s (UPSTREAM_FETCH_TIMEOUT): the fetch was killed; \
+             retry when the remote is reachable — no drift numbers are reported from a partial fetch",
+            bound.as_secs()
+        ),
+        Err(other) => bail!("{other}"),
     }
-    Ok(())
+}
+
+/// Runs git bounded by UPSTREAM_GIT_TIMEOUT and returns trimmed stdout;
+/// errors carry the command and a stderr snippet so a failed probe is
+/// diagnosable from the report, and a timeout names its deadline.
+fn git_bounded(args: &[&str]) -> Result<String, GitRunError> {
+    let (_, stdout, _) = run_bounded("git", args, UPSTREAM_GIT_TIMEOUT)?;
+    Ok(stdout.trim_end().to_string())
 }
 
 /// Runs git and returns trimmed stdout; errors carry the command and a
 /// stderr snippet so a failed probe is diagnosable from the report.
 fn git(args: &[&str]) -> anyhow::Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|err| anyhow!("failed to spawn git: {err}"))?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            snippet(&String::from_utf8_lossy(&output.stderr))
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string())
+    git_bounded(args).map_err(|err| match err {
+        GitRunError::Timeout { op, bound } => anyhow::anyhow!(
+            "{op} timed out after {}s (UPSTREAM_GIT_TIMEOUT): the probe was killed — \
+             the upstream report is aborted, never rendered from a partial repository",
+            bound.as_secs()
+        ),
+        other => anyhow::anyhow!("{other}"),
+    })
 }
 
 fn snippet(text: &str) -> String {
@@ -457,6 +582,84 @@ fn short(sha: &str, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_subprocess_timeouts_are_pinned_to_the_stated_classes() {
+        // rm-450: the two deadline classes are contract, not tuning —
+        // local git probes share governance.rs's ten-second local class
+        // (GIT_PROBE_TIMEOUT), and the opt-in network fetch takes the
+        // thirty-second network class the pricing download uses. If a
+        // change here is intentional, update the error strings and
+        // docs/guides/upstream-status.md in the same commit.
+        assert_eq!(UPSTREAM_GIT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(UPSTREAM_FETCH_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn run_bounded_kills_a_slow_child_at_the_deadline() {
+        // A child that ignores the deadline is killed and surfaced as a
+        // named Timeout — never a hang. `sleep 5` under a 300ms bound
+        // must return well before the child's natural lifetime.
+        let started = Instant::now();
+        let result = run_bounded("sleep", &["5"], Duration::from_millis(300));
+        match result {
+            Err(GitRunError::Timeout { op, bound }) => {
+                assert!(op.contains("sleep"), "timeout names the operation: {op}");
+                assert_eq!(bound, Duration::from_millis(300));
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the deadline, not the child's lifetime, bounds the wait"
+        );
+    }
+
+    #[test]
+    fn run_bounded_returns_output_for_a_fast_child() {
+        let (_, stdout, _) = run_bounded("git", &["--version"], UPSTREAM_GIT_TIMEOUT)
+            .expect("git --version runs inside the bound");
+        assert!(
+            stdout.contains("git version"),
+            "stdout is drained intact: {stdout}"
+        );
+    }
+
+    #[test]
+    fn run_bounded_distinguishes_failure_from_timeout() {
+        // A probe that runs and fails is Failed (snippeted stderr); only
+        // a deadline overrun is Timeout — the distinction the fail-fast
+        // prerequisite probes rely on.
+        match run_bounded(
+            "git",
+            &["rev-parse", "--verify", "agenttrace-no-such-ref"],
+            UPSTREAM_GIT_TIMEOUT,
+        ) {
+            Err(GitRunError::Failed { op, message }) => {
+                assert!(
+                    op.contains("rev-parse"),
+                    "failure names the operation: {op}"
+                );
+                assert!(!message.is_empty(), "failure carries a stderr snippet");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bounded_surfaces_a_missing_binary_as_spawn() {
+        match run_bounded(
+            "agenttrace-definitely-absent-binary",
+            &["--version"],
+            UPSTREAM_GIT_TIMEOUT,
+        ) {
+            Err(GitRunError::Spawn { op, message }) => {
+                assert!(op.contains("agenttrace-definitely-absent-binary"));
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
 
     #[test]
     fn classify_area_maps_the_named_reporting_areas() {
