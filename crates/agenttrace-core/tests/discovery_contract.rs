@@ -2,7 +2,7 @@ use agenttrace_core::{
     build_doctor_report, data_health, data_health_scoped, find_session_files,
     load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress, parse_file,
     render_waste_report, search_sessions, session_cache_path, session_capability, total_tokens,
-    LoadOptions,
+    LoadOptions, SESSION_CACHE_SCHEMA_VERSION,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -892,13 +892,14 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v24 (rm-436/437/438 pi journal accounting; 23 was rm-408,
-        // 22 was run 2c2db6f5 rm-400/401): parser-semantics fixes bump
-        // the schema so warm entries regenerate under corrected
-        // accounting.
+        // Parser-semantics fixes bump the schema so warm entries
+        // regenerate under corrected accounting (v25 = rm-520
+        // recorded-cost basis; 24 = rm-436/437/438; 23 = rm-408; 22 =
+        // rm-400/401). Asserting the exported constant keeps this
+        // contract honest across future bumps.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(24)
+            Some(SESSION_CACHE_SCHEMA_VERSION)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1063,11 +1064,10 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v24 — see the rm-436/437/438, rm-408 and rm-400/401
-        // bump notes in session_cache.rs).
+        // version (v25 — see the bump notes in session_cache.rs).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(24)
+            Some(SESSION_CACHE_SCHEMA_VERSION)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))

@@ -1631,15 +1631,16 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 24 (rm-436/437/438 pi journal accounting;
-                // 23 was the rm-408 zero-usage bump, 22 the
-                // rm-400/rm-401 bump): a warm entry is reused only
-                // when it carries the current schema version, so this fixture
-                // tracks SESSION_CACHE_SCHEMA_VERSION.
-                r#"{{"schema_version":24,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                // A warm entry is reused only when it carries the
+                // current schema version, so this fixture interpolates
+                // SESSION_CACHE_SCHEMA_VERSION and cannot rot on a
+                // bump (last hand-bump was 24, rm-436/437/438; 25 is
+                // rm-520's recorded-cost-basis persistence).
+                r#"{{"schema_version":{3},"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
-                metadata.len()
+                metadata.len(),
+                agenttrace_core::SESSION_CACHE_SCHEMA_VERSION
             ),
         )
         .expect("write cache");

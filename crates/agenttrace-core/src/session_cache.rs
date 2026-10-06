@@ -5,7 +5,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 25;
+// Bumped 24 -> 25 (rm-520, run ac14e52c): Metrics now persist which
+// token classes carry upstream-recorded cost
+// (`upstream_priced_*`), the basis the audit's cost recompute needs.
+// v24 entries lack the split — a warm cache would hand the audit a
+// recorded-cost session with `upstream_cost_usd > 0` and all-zero
+// priced classes, resurrecting the false drift note this batch
+// fixes (catalog × all tokens + recorded vs the stored catalog ×
+// unpriced + recorded). Dropping the cache once re-parses journals
+// and repopulates the basis; no migration can reconstruct it.
 // Bumped 23 -> 24 (integration of run 6403d975, rm-436/437/438): the
 // pi journal accounting batch (disclosure counters, upstream
 // recorded-cost passthrough, per-block multi-model pricing) changed
@@ -275,6 +284,19 @@ struct GoMetrics {
     /// instead of reverting to the catalog estimate on cache hit.
     #[serde(default, rename = "UpstreamCostUSD")]
     upstream_cost_usd: f64,
+    /// rm-520: token classes already carrying that upstream-recorded
+    /// cost (excluded from the catalog formula in Metrics). Round-
+    /// tripped so the audit's rm-436-basis recompute survives a cache
+    /// hit; v24 caches lacking them are dropped by the schema bump
+    /// above rather than silently priced wrong.
+    #[serde(default, rename = "UpstreamPricedInput")]
+    upstream_priced_input: i64,
+    #[serde(default, rename = "UpstreamPricedOutput")]
+    upstream_priced_output: i64,
+    #[serde(default, rename = "UpstreamPricedCacheW")]
+    upstream_priced_cache_w: i64,
+    #[serde(default, rename = "UpstreamPricedCacheR")]
+    upstream_priced_cache_r: i64,
     /// rm-436/rm-437: parse-time disclosure counters (pi journals),
     /// round-tripped so cache hits keep disclosing.
     #[serde(
@@ -1349,6 +1371,10 @@ impl GoMetrics {
             line_skips: metrics.line_skips.clone(),
             zero_usage_events: metrics.zero_usage_events,
             upstream_cost_usd: metrics.upstream_cost_usd,
+            upstream_priced_input: metrics.upstream_priced_input,
+            upstream_priced_output: metrics.upstream_priced_output,
+            upstream_priced_cache_w: metrics.upstream_priced_cache_w,
+            upstream_priced_cache_r: metrics.upstream_priced_cache_r,
             disclosure_counters: metrics.disclosure_counters.clone(),
             provenance: metrics.provenance.clone(),
         }
@@ -1389,6 +1415,10 @@ impl GoMetrics {
             line_skips: self.line_skips.clone(),
             zero_usage_events: self.zero_usage_events,
             upstream_cost_usd: self.upstream_cost_usd,
+            upstream_priced_input: self.upstream_priced_input,
+            upstream_priced_output: self.upstream_priced_output,
+            upstream_priced_cache_w: self.upstream_priced_cache_w,
+            upstream_priced_cache_r: self.upstream_priced_cache_r,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
         }

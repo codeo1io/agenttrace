@@ -18,8 +18,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agenttrace_core::{
-    build_doctor_report, compute_overview, data_health, lookup_price, parse_file,
-    render_doctor_report, report_overview_markdown_with_context, round4, Session, TimeRange,
+    build_doctor_report, compute_overview, cost_audit, data_health, lookup_price, parse_file,
+    render_doctor_report, report_overview_markdown_with_context, round4, session_cost_audit,
+    Session, TimeRange,
 };
 
 /// A pi v3 journal whose cache-warm usage entry was invisible before
@@ -235,6 +236,23 @@ const ZERO_TOKEN_RECORDED_COST: &str = concat!(
 /// Scratch dir per call (atomic sequence, not `line!()`, which is
 /// macro-site invariant): the doctor test scans its whole dir, so a
 /// shared dir would fold other tests' fixtures into its aggregate.
+/// rm-520 golden: a recorded-cost session whose stored estimate the
+/// old audit misjudged (assess PoC F1). The usage entry carries 1M
+/// input tokens and a journal-recorded $5.00; gpt-5's catalog prices
+/// input at $1.25/M, so a catalog-only recompute reported $1.25
+/// against the recorded $5.00 and false-tripped the drift note. Under
+/// rm-436 semantics the stored number is exact — the audit must
+/// recompute on the same basis.
+const USAGE_RECORDED_COST_GPT5: &str = concat!(
+    r#"{"type": "session", "version": 3, "id": "s-1", "timestamp": "2026-10-04T10:00:00.000Z", "cwd": "/tmp/x"}"#,
+    "\n",
+    r#"{"type": "message", "id": "11", "parentId": null, "timestamp": "2026-10-04T10:00:01.000Z", "message": {"role": "user", "content": "hi", "timestamp": 1733234401000}}"#,
+    "\n",
+    r#"{"type": "message", "id": "21", "parentId": "11", "timestamp": "2026-10-04T10:00:02.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 1733234401000, "model": "gpt-5"}}"#,
+    "\n",
+    r#"{"type": "usage", "id": "31", "parentId": "21", "timestamp": "2026-10-04T10:00:05.000Z", "kind": "cache_warm", "provider": "openai", "model": "gpt-5", "usage": {"input": 1000000, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"input": 5.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 5.0}}}"#,
+);
+
 fn scratch_dir() -> PathBuf {
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -805,4 +823,103 @@ fn zero_token_usage_entry_still_passes_recorded_cost() {
         "the entry is still disclosed: {:?}",
         metrics.disclosure_counters
     );
+}
+
+#[test]
+fn audit_recomputes_recorded_cost_sessions_end_to_end() {
+    // rm-520: from a pi v3 journal through the audit — the parse
+    // produces the rm-436 basis (recorded USD plus which classes it
+    // priced), and the audit's current estimate must match the stored
+    // one instead of reporting a catalog-only $1.25 against a
+    // recorded $5.00 (assess PoC F1).
+    let session = parsed("usage-recorded-cost-gpt5.jsonl", USAGE_RECORDED_COST_GPT5);
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, 1_000_000, "usage-entry input tokens");
+    assert_eq!(metrics.upstream_priced_input, 1_000_000, "priced upstream");
+    assert_eq!(metrics.upstream_priced_output, 0);
+    assert!(
+        (metrics.upstream_cost_usd - 5.0).abs() < 1e-9,
+        "recorded cost carried"
+    );
+    assert!(
+        (metrics.cost_estimated - 5.0).abs() < 1e-9,
+        "stored = catalog × unpriced + recorded = 5.0"
+    );
+    assert_eq!(
+        metrics.provenance.cost,
+        "calculated_from_tokens_with_recorded_cost"
+    );
+
+    let audit = session_cost_audit(&session);
+    assert!(
+        (audit.stored_estimated_cost_usd - 5.0).abs() < 1e-9,
+        "stored round-trips"
+    );
+    let current = audit.estimated_cost_usd.expect("current recompute");
+    assert!(
+        (current - 5.0).abs() < 0.0001,
+        "rm-436 basis, not catalog-only 1.25: {current}"
+    );
+    assert!(
+        !audit
+            .pricing_note
+            .contains("current rates recalculate a different total"),
+        "no false drift on a recorded-cost session: {}",
+        audit.pricing_note
+    );
+    assert!(
+        audit
+            .component_cost_usd
+            .as_ref()
+            .is_some_and(|components| components.total == current),
+        "recorded USD rides in the component total"
+    );
+
+    // The corpus arm and the top-level totals inherit the same basis.
+    let corpus = cost_audit(&[session]);
+    assert_eq!(corpus.by_provider_model.len(), 1);
+    let row = &corpus.by_provider_model[0];
+    assert!((row.stored_estimated_cost_usd - 5.0).abs() < 1e-9);
+    let current = row.estimated_cost_usd.expect("row current computed");
+    assert!((current - 5.0).abs() < 0.0001, "row basis: {current}");
+    assert!(!row.pricing_note.contains("current rates recalculate"));
+    assert!(
+        corpus
+            .current_estimated_cost_usd
+            .is_some_and(|total| (total - 5.0).abs() < 0.0001),
+        "top-level current total folds the corrected rows"
+    );
+}
+
+#[test]
+fn audit_labels_per_block_multi_model_sessions_exactly() {
+    // rm-521: MODEL_CHANGE prices each block at its own model
+    // (rm-438), so model_used is "multiple" while the stored total is
+    // exact — the audit note must not claim SQLite aggregation (the
+    // pre-fix behavior on the assess PoC F2 corpus, pi-pi-v3).
+    let session = parsed("model-change.jsonl", MODEL_CHANGE);
+    assert_eq!(session.metrics.model_used, "multiple");
+    assert!(session
+        .metrics
+        .provenance
+        .pricing_source
+        .contains("priced per usage block"));
+    let audit = session_cost_audit(&session);
+    assert_eq!(
+        audit.pricing_note,
+        "multiple models, priced per usage block; per-model totals exact"
+    );
+    assert!(!audit.pricing_note.contains("SQLite"));
+
+    // Corpus rows of per-block sessions carry the same corrected
+    // label; multi-model rows stay unpriced (no single rate).
+    let corpus = cost_audit(&[session]);
+    assert_eq!(corpus.by_provider_model.len(), 1);
+    let row = &corpus.by_provider_model[0];
+    assert_eq!(
+        row.pricing_note,
+        "multiple models, priced per usage block; per-model totals exact"
+    );
+    assert!(row.estimated_cost_usd.is_none());
+    assert!(row.rates_per_million_usd.is_none());
 }
