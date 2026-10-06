@@ -979,7 +979,9 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v27 (integration of run b1ff12f8, rm-542 Codex custom-tools
+        // v28 (run 91833f02 cycle 2, rm-616 generic-lane model/usage
+        // truth — model_used alias + counted-lane fold; 27 was the
+        // integration of run b1ff12f8, rm-542 Codex custom-tools
         // parse coverage, re-based off the campaign's 22 -> 23 bump;
         // 26 was the rm-485 copilot session-wide credit accounting,
         // 25 the rm-450 workbuddy input-basis disclosure, 24 the
@@ -988,7 +990,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1153,14 +1155,14 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v27 — see the rm-542, rm-485, rm-450,
+        // version (v28 — see the rm-616, rm-542, rm-485, rm-450,
         // rm-436/437/438, rm-408 and rm-400/401 bump notes in
-        // session_cache.rs; the Codex custom-tools parse coverage is
-        // what carried 26 -> 27 at this integration, re-based off the
-        // campaign's 22 -> 23 bump).
+        // session_cache.rs; the generic-lane model/usage truth is
+        // what carried 27 -> 28 at this review fix, re-based on the
+        // rm-542 integration's 26 -> 27).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
