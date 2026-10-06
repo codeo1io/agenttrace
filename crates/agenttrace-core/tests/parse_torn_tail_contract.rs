@@ -1,0 +1,167 @@
+//! rm-526 contract: lines a format parser could not parse are disclosed,
+//! never silently dropped. `jsonl_objects` used to filter-map away any
+//! line failing both the strict and the lenient parse with no counter,
+//! and every format-specific parser consumed that iterator — so a torn
+//! tail (a writer crash mid-object, the read side of the hazard rm-250
+//! hardened the writers against) vanished whole: the session parsed
+//! green with `skipped: 0`, `data_health` stayed empty and confident,
+//! and on the PoC corpus the dropped line carried the session's ONLY
+//! usage record, silently undercounting tokens and cost.
+//!
+//! The contrast pair below pins the distinction the acceptance names:
+//! the torn twin discloses `unparseable_line` through the same
+//! `metrics.line_skips` channel the codex parser and the generic
+//! fallback (P7-1) already use, while the intact twin counts the usage —
+//! proving the drop is the reader swallowing corruption, not
+//! misclassification. Downstream surfaces are pinned too: `data_health`
+//! renders the reason and drops confidence per the disclosure policy,
+//! and `--doctor` folds `line_skips` into its journal disclosures.
+
+use agenttrace_core::{build_doctor_report, data_health, parse_file};
+use std::fs;
+use std::path::PathBuf;
+
+fn head_lines() -> [String; 4] {
+    [
+        r#"{"type":"user","message":{"role":"user","content":"first question"},"timestamp":"2026-10-01T10:00:00Z"}"#
+            .to_string(),
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answer one"}]},"timestamp":"2026-10-01T09:58:00Z"}"#
+            .to_string(),
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-10-01T10:02:00Z"}"#
+            .to_string(),
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"file1"}]},"timestamp":"2026-10-01T09:57:00Z"}"#
+            .to_string(),
+    ]
+}
+
+/// The PoC's fifth line, complete: the session's only usage record.
+/// Model is the dated, priced id (like the rm-408 fixture) so the intact
+/// twin's `data_health` confidence is not dragged down by fallback
+/// pricing — the test isolates the line-skips channel.
+fn usage_line() -> String {
+    r#"{"type":"assistant","id":"msg_01","model":"claude-sonnet-4-5-20250929","message":{"id":"msg_01","role":"assistant","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":50,"cache_creation_input_tokens":10}},"timestamp":"2026-10-01T10:03:00Z"}"#
+        .to_string()
+}
+
+/// The same line as a torn tail: cut mid-object where the writer crashed.
+fn torn_usage_line() -> String {
+    usage_line()[..usage_line().len() - 120].to_string()
+}
+
+fn fixture(tag: &str, lines: &[String]) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("at-torn-tail-{tag}.jsonl"));
+    fs::write(&path, lines.join("\n") + "\n").expect("write fixture");
+    path
+}
+
+#[test]
+fn torn_tail_line_is_disclosed_not_dropped() {
+    let torn = parse_file(&fixture(
+        "torn",
+        &[head_lines().to_vec(), vec![torn_usage_line()]].concat(),
+    ))
+    .expect("torn journal still parses — that is the hazard");
+    // The torn line was counted, not swallowed.
+    assert_eq!(
+        torn.metrics.line_skips.get("unparseable_line"),
+        Some(&1),
+        "torn tail must be disclosed: {:?}",
+        torn.metrics.line_skips
+    );
+    // And it took the session's only usage record with it.
+    assert!(
+        torn.metrics.tokens_input < 100,
+        "torn usage must not leak in: {}",
+        torn.metrics.tokens_input
+    );
+
+    // The intact twin counts the usage the torn tail dropped.
+    let intact = parse_file(&fixture(
+        "intact",
+        &[head_lines().to_vec(), vec![usage_line()]].concat(),
+    ))
+    .expect("intact journal parses");
+    assert!(
+        !intact.metrics.line_skips.contains_key("unparseable_line"),
+        "intact twin discloses nothing: {:?}",
+        intact.metrics.line_skips
+    );
+    assert_eq!(intact.metrics.tokens_input, 100);
+    assert_eq!(intact.metrics.tokens_output, 20);
+
+    // data_health drops confidence and names the reason (insights.rs
+    // already renders `line_skips` in every report surface).
+    let health = data_health(&[torn], 1, 0);
+    assert_eq!(
+        health.line_skips.get("unparseable_line"),
+        Some(&1),
+        "data_health carries the disclosure: {:?}",
+        health.line_skips
+    );
+    assert_eq!(health.confidence, "low");
+    let healthy = data_health(&[intact], 1, 0);
+    assert_eq!(healthy.confidence, "high");
+}
+
+#[test]
+fn non_object_jsonl_line_is_disclosed_not_dropped() {
+    // The second silent drop class inside `jsonl_objects`: a line that
+    // parses as JSON but is not an object never reached any parser.
+    let corpus = [head_lines().to_vec(), vec!["\"orphan\"".to_string()]].concat();
+    let session = parse_file(&fixture("nonobject", &corpus)).expect("parses");
+    assert_eq!(
+        session.metrics.line_skips.get("non_object_line"),
+        Some(&1),
+        "non-object line must be disclosed: {:?}",
+        session.metrics.line_skips
+    );
+}
+
+#[test]
+fn doctor_folds_line_skips_into_journal_disclosures() {
+    // rm-526's doctor half: `line_skips` reaches --doctor's disclosures
+    // (the map the text report prints as "Journal disclosures" and the
+    // JSON report exposes as `disclosures`) — previously only
+    // `disclosure_counters` were folded in, so parse failures were
+    // invisible to doctor entirely.
+    let dir = std::env::temp_dir().join(format!("at-torn-tail-doctor-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir");
+    fs::write(
+        dir.join("torn.jsonl"),
+        [head_lines().to_vec(), vec![torn_usage_line()]]
+            .concat()
+            .join("\n")
+            + "\n",
+    )
+    .expect("write fixture");
+
+    let report = build_doctor_report(Some(&dir), false);
+    // The scratch dir holds only the torn fixture, so the top-level
+    // aggregate is exactly its disclosure.
+    assert_eq!(
+        report.disclosures.get("unparseable_line"),
+        Some(&1),
+        "doctor aggregates the line-skips disclosure: {:?}",
+        report.disclosures
+    );
+    assert!(
+        report.directories.iter().any(|entry| entry.files > 0),
+        "doctor scanned the scratch dir: {:?}",
+        report
+            .directories
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    // And the user-visible render prints it in the Journal disclosures
+    // block (the same arm the pi counters use).
+    let text = agenttrace_core::render_doctor_report(Some(&dir), false, "text")
+        .expect("doctor text render");
+    assert!(
+        text.contains("Journal disclosures:") && text.contains("unparseable_line=1"),
+        "text render shows the disclosure:\n{text}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

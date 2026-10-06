@@ -517,15 +517,32 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
                 "agenttrace --context-trends --project <project> -f json",
             ));
         }
+        // rm-528: severity follows measured latency only. An unmatched
+        // tool_use is a pairing defect (torn tail, crashed session, call
+        // still in flight — rm-004's taxonomy, upstream #296 keeps them
+        // separate the same way), not timeout evidence: rating it high
+        // let a zero-latency phantom outrank — and via the
+        // (category, title) dedupe, displace — a measured p95 > 30s row
+        // from another session. High requires `is_slow` (the same > 30s
+        // gate the diagnostics feed uses); unmatched-only sessions stay
+        // disclosed at medium. Selection prefers a measured slow tool
+        // over the first unmatched row when both exist.
         if let Some(slow) = session
             .diagnostics
             .tool_latencies
             .iter()
-            .find(|item| item.is_slow || item.unmatched > 0)
+            .find(|item| item.is_slow)
+            .or_else(|| {
+                session
+                    .diagnostics
+                    .tool_latencies
+                    .iter()
+                    .find(|item| item.unmatched > 0)
+            })
         {
             items.push(recommendation(
                 "slow-tool",
-                if slow.unmatched > 0 { "high" } else { "medium" },
+                if slow.is_slow { "high" } else { "medium" },
                 "latency",
                 "Bound slow tool execution",
                 "A tool exceeded the latency threshold or returned without a result.".to_string(),
@@ -1153,6 +1170,80 @@ mod tests {
         let items = recommendations(&[looping, pressured]);
         assert_eq!(items[0].category, "context");
         assert_eq!(items[0].priority, "P0");
+    }
+
+    #[test]
+    fn unmatched_tool_evidence_never_outranks_measured_slow_tool_latency() {
+        // rm-528: severity used to follow `unmatched > 0`, so a torn
+        // tail with p95=0.0s (no latency data at all) rated P1/high
+        // while a measured p95 > 30s tool rated P2/medium — and the
+        // (category, title) dedupe let the phantom displace the
+        // measured row. Measured latency is now the only path to high;
+        // unmatched evidence stays disclosed at medium.
+        let torn = |name: &str| {
+            let mut session = session(name);
+            session.diagnostics.tool_latencies = vec![crate::diagnostics::ToolLatency {
+                tool_name: "Bash".to_string(),
+                count: 1,
+                avg_sec: 0.0,
+                p95_sec: 0.0,
+                max_sec: 0.0,
+                min_sec: 0.0,
+                unmatched: 1,
+                is_slow: false,
+            }];
+            session
+        };
+        let measured = |name: &str| {
+            let mut session = session(name);
+            session.diagnostics.tool_latencies = vec![crate::diagnostics::ToolLatency {
+                tool_name: "Mcp__deploy__release".to_string(),
+                count: 5,
+                avg_sec: 31.0,
+                p95_sec: 35.0,
+                max_sec: 40.0,
+                min_sec: 29.0,
+                unmatched: 0,
+                is_slow: true,
+            }];
+            session
+        };
+        let items = recommendations(&[torn("torn")]);
+        let item = items
+            .iter()
+            .find(|item| item.id == "slow-tool")
+            .expect("phantom still gets a slow-tool row");
+        assert_eq!(item.severity, "medium");
+        assert_eq!(item.priority, "P2");
+        assert!(
+            item.evidence
+                .iter()
+                .any(|line| line.contains("unmatched=1")),
+            "the phantom stays disclosed: {item:?}"
+        );
+        // Both sessions share (category, title): the measured row must
+        // win the dedupe, not the phantom, and hold P1/high with its own
+        // evidence line.
+        let items = recommendations(&[torn("torn"), measured("measured")]);
+        let item = items
+            .iter()
+            .find(|item| item.id == "slow-tool")
+            .expect("paired slow-tool row");
+        assert_eq!(item.severity, "high");
+        assert_eq!(item.priority, "P1");
+        assert!(
+            item.evidence
+                .iter()
+                .any(|line| line.contains("p95=35.0s") && line.contains("unmatched=0")),
+            "evidence names the measured row: {item:?}"
+        );
+        let items = recommendations(&[measured("measured")]);
+        let item = items
+            .iter()
+            .find(|item| item.id == "slow-tool")
+            .expect("measured-only slow-tool row");
+        assert_eq!(item.severity, "high");
+        assert_eq!(item.priority, "P1");
     }
 
     #[test]

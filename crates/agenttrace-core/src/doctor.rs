@@ -27,9 +27,12 @@ pub struct DoctorReport {
     /// Parse-time journal disclosures aggregated over scanned sessions
     /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
     /// `pi_branches`, `pi_entry_skipped:<type>`,
-    /// `pi_message_role:<role>`. Journal facts the accounting
-    /// deliberately does not count, kept visible; empty for corpora
-    /// without such journals.
+    /// `pi_message_role:<role>`, and — since rm-526 — the `line_skips`
+    /// channel (`unparseable_line`, `non_object_line`,
+    /// `codex_ignorable_line`, …): a torn tail now discloses here instead
+    /// of silently vanishing in a format parser. Journal facts the
+    /// accounting deliberately does not count, kept visible; empty for
+    /// corpora without such journals.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosures: BTreeMap<String, usize>,
     /// On-disk size of `sessions.json`, zero when absent.
@@ -362,6 +365,13 @@ fn doctor_directories(
         for (key, count) in &session.metrics.disclosure_counters {
             *disclosures.entry(key.clone()).or_insert(0) += count;
         }
+        // rm-526: `line_skips` (unparseable_line, non_object_line,
+        // event_schema, codex_ignorable_line, …) is a disclosure
+        // channel too — doctor surfaced only disclosure_counters, so
+        // torn tails and format-parser drops were invisible here.
+        for (key, count) in &session.metrics.line_skips {
+            *disclosures.entry(key.clone()).or_insert(0) += count;
+        }
     }
     dirs
 }
@@ -402,6 +412,12 @@ fn doctor_dir_report(
             // the session cache (GoMetrics), so a warm doctor scan
             // cannot silently lose them.
             for (key, count) in &session.metrics.disclosure_counters {
+                *disclosures.entry(key.clone()).or_insert(0) += count;
+            }
+            // rm-526: same fold for line_skips — parse-failure and
+            // drop disclosures (torn tails) reach --doctor through
+            // this channel; they round-trip the cache the same way.
+            for (key, count) in &session.metrics.line_skips {
                 *disclosures.entry(key.clone()).or_insert(0) += count;
             }
         }
