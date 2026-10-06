@@ -331,6 +331,7 @@ mod tests {
         // sit at i64::MAX previously wrapped the shared overview to -2.
         use agenttrace_core::{Metrics, Session};
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "adversarial".to_string(),
             path: "/tmp/adversarial.jsonl".to_string(),
             cwd: String::new(),

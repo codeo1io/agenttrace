@@ -95,7 +95,11 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
+// rm-607 bumped this 7 -> 8: sqlite snapshots now carry the row id
+// (`SqliteSessionID`) the cross-file duplicate-dedup keys on; stale
+// snapshots that predate the field must re-parse rather than serve
+// sessions whose dedup key would be a false, shared "".
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -226,6 +230,15 @@ struct GoSession {
     anomalies: Vec<GoAnomaly>,
     #[serde(default, rename = "Health")]
     health: i32,
+    /// rm-607: the sqlite row id, carried through the snapshot so the
+    /// cross-file dedup key survives caching. Empty for transcript
+    /// sessions, where it is not serialized at all.
+    #[serde(
+        default,
+        rename = "SqliteSessionID",
+        skip_serializing_if = "String::is_empty"
+    )]
+    sqlite_session_id: String,
     #[serde(default, rename = "ToolWarnings")]
     tool_warnings: Vec<GoToolWarning>,
     #[serde(default, rename = "Diagnostics")]
@@ -1292,12 +1305,14 @@ impl GoSession {
                 .map(GoToolWarning::from_tool_warning)
                 .collect(),
             diagnostics: session.diagnostics.clone(),
+            sqlite_session_id: session.sqlite_session_id.clone(),
         }
     }
 
     fn into_session(self, fallback_path: &str) -> Session {
         Session {
             name: self.name,
+            sqlite_session_id: self.sqlite_session_id,
             path: if self.path.is_empty() {
                 fallback_path.to_string()
             } else {
@@ -1532,6 +1547,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -1587,6 +1603,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -1612,6 +1629,7 @@ mod tests {
             &database,
             &snapshot,
             &[Session {
+                sqlite_session_id: String::new(),
                 name: "cached".to_string(),
                 path: database.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -1629,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_eight_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1640,6 +1658,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -1662,11 +1681,12 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version seven (cycle-1 rm-198): hermes tool outcome semantics
-        // changed (ok/fail now derive from the messages table instead of
-        // fabricating ok == tool_call_count), so v6 snapshots carry stale
-        // tool outcome splits and must regenerate.
-        assert_eq!(doc["schema_version"], 7);
+        // Version eight (rm-607): snapshots now carry `SqliteSessionID`,
+        // the cross-file duplicate-dedup key; v7 snapshots predate it and
+        // must regenerate rather than serve sessions whose dedup key
+        // would be a false, shared "". (Version seven itself was cycle-1
+        // rm-198: hermes tool outcome semantics.)
+        assert_eq!(doc["schema_version"], 8);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1678,15 +1698,15 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eight cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(6);
+        old["schema_version"] = serde_json::Value::from(7);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema six json"),
+            serde_json::to_vec(&old).expect("schema seven json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
@@ -1741,6 +1761,7 @@ mod tests {
         fs::create_dir_all(&listed).expect("create listed dir");
 
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "cached".to_string(),
             path: live.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -1805,6 +1826,7 @@ mod tests {
             handle.set_modified(stamp).expect("set deterministic mtime");
             drop(handle);
             let session = Session {
+                sqlite_session_id: String::new(),
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -1894,6 +1916,7 @@ mod tests {
             handle.set_modified(stamp).expect("set deterministic mtime");
             drop(handle);
             let session = Session {
+                sqlite_session_id: String::new(),
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -1973,6 +1996,7 @@ mod tests {
             handle.set_modified(stamp).expect("set deterministic mtime");
             drop(handle);
             let session = Session {
+                sqlite_session_id: String::new(),
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -2025,6 +2049,7 @@ mod tests {
         for (i, path) in paths.iter().enumerate() {
             let file = PathBuf::from(path);
             let session = Session {
+                sqlite_session_id: String::new(),
                 name: format!("session-{i}"),
                 path: path.clone(),
                 cwd: String::new(),
@@ -2193,6 +2218,7 @@ mod tests {
         for i in 0..3i64 {
             let path = format!("/corpus/projects/probe \"quoted-{i}\"\\slash/s-{i}.jsonl");
             let session = GoSession {
+                sqlite_session_id: String::new(),
                 name: format!("session-{i}"),
                 path: path.clone(),
                 ..GoSession::default()
@@ -2678,6 +2704,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "private session".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: "/work/secret".to_string(),

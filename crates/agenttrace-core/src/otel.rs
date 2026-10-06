@@ -186,12 +186,28 @@ fn trace_id_for(session: &Session) -> String {
     session.path.hash(&mut hasher);
     session.name.hash(&mut hasher);
     let h = hasher.finish();
+    // rm-605 review rider: clamp the astronomically unlikely all-zero
+    // hash so no export can carry the OTLP/W3C-reserved all-zero trace
+    // id either (span ids below clamp first; the row's acceptance
+    // covers "trace id derivation" symmetrically).
+    let h = if h == 0 { 1 } else { h };
     format!("{h:016x}{h:016x}")
 }
 
 /// Deterministic 16-hex-char span id derived from a seed.
+/// Deterministic 16-hex span id. rm-605: zero-padding a raw ordinal
+/// made the first span of every export carry the reserved all-zero
+/// spanId (`0000000000000000`) — invalid per OTLP/W3C trace identity
+/// semantics and dropped by collectors. The seed is hashed like the
+/// trace id, and the astronomically unlikely all-zero hash is clamped
+/// so no export can ever carry an invalid span id.
 fn span_id_for(seed: u64) -> String {
-    format!("{seed:016x}")
+    let mut hasher = DefaultHasher::new();
+    "agenttrace-span".hash(&mut hasher);
+    seed.hash(&mut hasher);
+    let h = hasher.finish();
+    let h = if h == 0 { 1 } else { h };
+    format!("{h:016x}")
 }
 
 fn session_span(session: &Session, ordinal: u64) -> Span {

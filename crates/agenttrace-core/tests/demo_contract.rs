@@ -92,6 +92,7 @@ fn overview_high_authority_tools_follow_go_classifier() {
     };
 
     let sessions = vec![Session {
+        sqlite_session_id: String::new(),
         name: "authority".to_string(),
         path: "/tmp/authority.jsonl".to_string(),
         cwd: String::new(),

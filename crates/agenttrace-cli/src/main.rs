@@ -275,6 +275,11 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.doctor {
+        // rm-608: the doctor lane used to early-return before the -d
+        // guard, so a typo'd or file-valued directory reported rc=0
+        // "healthy". Route through the same validation as every other
+        // `-d` consumer before rendering anything.
+        validate_explicit_dir(args.dir.as_deref());
         let doctor_dir = args.dir.as_deref().map(PathBuf::from);
         let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
         write_output(&args.output, &out)?;
@@ -1043,6 +1048,29 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
     load_sessions_report(args).map(|(sessions, _)| sessions)
 }
 
+/// Cycle-4 B2 guard, shared by the report lanes and (via rm-608)
+/// `--doctor`: a typo'd path used to produce the same "No session
+/// files found in …" error as a genuinely empty directory — the two
+/// need different messages and different exit codes (2 = the request
+/// itself is wrong; 1 = nothing matched). `--doctor` previously
+/// skipped this entirely. The TUI launch path still consumes `-d`
+/// without this guard (rm-608 review residual; next-cycle rider).
+fn validate_explicit_dir(dir_arg: Option<&str>) {
+    let Some(dir) = dir_arg else {
+        return;
+    };
+    let path = Path::new(dir);
+    if !path.exists() {
+        eprintln!("agenttrace: session directory does not exist: {dir}");
+        eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
+        std::process::exit(2);
+    }
+    if !path.is_dir() {
+        eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
+        std::process::exit(2);
+    }
+}
+
 fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
     if args.demo {
         return Ok((prepare_explicit_sessions(demo_sessions()?, args)?, None));
@@ -1090,18 +1118,7 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // "No session files found in …" error as a genuinely empty
     // directory — the two need different messages and different exit
     // codes (2 = the request itself is wrong; 1 = nothing matched).
-    if let Some(dir) = args.dir.as_deref() {
-        let path = Path::new(dir);
-        if !path.exists() {
-            eprintln!("agenttrace: session directory does not exist: {dir}");
-            eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
-            std::process::exit(2);
-        }
-        if !path.is_dir() {
-            eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
-            std::process::exit(2);
-        }
-    }
+    validate_explicit_dir(args.dir.as_deref());
     let range = parse_range(args)?;
     let report = load_sessions_with_options(
         dir.as_deref(),
@@ -1731,6 +1748,7 @@ mod tests {
         // renderers neutralize control bytes; JSON output escapes them
         // losslessly and is untouched.
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
             path: "/tmp/osc.jsonl".to_string(),
             cwd: String::new(),
@@ -2188,6 +2206,7 @@ mod tests {
 
     fn session(name: &str, path: &str, session_start: &str) -> Session {
         Session {
+            sqlite_session_id: String::new(),
             name: name.to_string(),
             path: path.to_string(),
             cwd: String::new(),

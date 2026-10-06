@@ -471,6 +471,13 @@ pub struct Session {
     pub health: i32,
     pub tool_warnings: Vec<ToolWarning>,
     pub diagnostics: Diagnostics,
+    /// Upstream row id for sqlite-backed sessions (rm-607): the
+    /// cross-file dedup key when the `opencode*.db` discovery glob picks
+    /// up a backup/sibling database containing the same sessions as the
+    /// canonical one. Empty for transcript-file sessions, where the file
+    /// path is the identity, and omitted from serialized output there.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sqlite_session_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -649,6 +656,7 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
     let tool_warnings = validate_tool_warnings(&events);
     let diagnostics = diagnostics::analyze_diagnostics(&events, &metrics);
     Ok(Session {
+        sqlite_session_id: String::new(),
         name: display_name,
         path: path.to_string(),
         cwd,
@@ -2883,6 +2891,7 @@ mod tests {
     #[test]
     fn session_capability_and_coverage_degrade_with_available_data() {
         let detailed = Session {
+            sqlite_session_id: String::new(),
             metrics: Metrics {
                 tokens_input: 10,
                 duration_sec: 1.0,
@@ -2892,6 +2901,7 @@ mod tests {
             ..test_session()
         };
         let aggregate = Session {
+            sqlite_session_id: String::new(),
             metrics: Metrics {
                 tokens_input: 10,
                 duration_sec: 1.0,
@@ -2927,6 +2937,7 @@ mod tests {
 
     fn test_session() -> Session {
         Session {
+            sqlite_session_id: String::new(),
             name: "test".to_string(),
             path: "test".to_string(),
             cwd: String::new(),

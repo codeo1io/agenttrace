@@ -261,6 +261,7 @@ mod tests {
                 .insert(format!("internal/billing/file-{idx}.go"), 1);
         }
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "billing".to_string(),
             path: "/tmp/billing.jsonl".to_string(),
             cwd: String::new(),

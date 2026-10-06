@@ -1507,3 +1507,48 @@ fn waste_report_format_matrix_pins_every_machine_surface() {
         "rejection names the format's owning actions: {stderr}"
     );
 }
+
+#[test]
+fn doctor_dir_guard_exits_two_like_other_lanes() {
+    // rm-608: `--doctor -d <bad>` used to early-return before the
+    // Cycle-4 B2 guard, so a typo'd directory produced rc=0 and a
+    // healthy-looking report. The doctor lane must route through the
+    // same `-d` validation as every other lane.
+    let missing = std::env::temp_dir().join(format!("at-rm608-missing-{}", std::process::id()));
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--doctor", "-d", missing.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace --doctor with missing -d");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing -d is a bad request (rc 2), not a healthy doctor: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not exist"),
+        "message must say the directory is missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Doctor"),
+        "no report text may be emitted for a bad request: {stderr}"
+    );
+
+    let file = std::env::temp_dir().join(format!("at-rm608-file-{}", std::process::id()));
+    std::fs::write(&file, b"not a directory").expect("create sentinel file");
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--doctor", "-d", file.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace --doctor with file -d");
+    let _ = std::fs::remove_file(&file);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a file where a directory is required is a bad request: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a directory"),
+        "message must name the non-directory: {stderr}"
+    );
+}

@@ -1063,6 +1063,7 @@ mod tests {
 
     fn session(name: &str) -> Session {
         Session {
+            sqlite_session_id: String::new(),
             name: name.to_string(),
             path: format!("/tmp/{name}.jsonl"),
             cwd: "/tmp/project".to_string(),

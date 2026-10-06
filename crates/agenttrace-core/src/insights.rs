@@ -714,6 +714,7 @@ mod tests {
 
     fn session_at(cwd: &str, path: &str) -> Session {
         Session {
+            sqlite_session_id: String::new(),
             name: "s".to_string(),
             path: path.to_string(),
             cwd: cwd.to_string(),

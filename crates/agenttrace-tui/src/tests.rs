@@ -1806,6 +1806,7 @@ fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: 
     };
     metrics.tool_usage.insert(tool.to_string(), 1);
     Session {
+        sqlite_session_id: String::new(),
         name: name.to_string(),
         path: format!("/tmp/{name}.jsonl"),
         cwd: "/tmp".to_string(),

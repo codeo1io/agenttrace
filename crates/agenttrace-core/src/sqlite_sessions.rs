@@ -2,7 +2,7 @@ use crate::{detect_anomalies, health_score, token_cost, Metrics, Session};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
@@ -58,21 +58,83 @@ struct SqliteSessionAgg {
 }
 
 pub fn load_sqlite_backed_sessions() -> Vec<Session> {
-    load_sqlite_backed_sessions_since(None)
+    load_sqlite_backed_sessions_report(None).sessions
 }
 
 pub(crate) fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) -> Vec<Session> {
+    load_sqlite_backed_sessions_report(since).sessions
+}
+
+/// rm-607: a sibling sqlite database (backup, copy, sync artifact)
+/// whose sessions were fully or partly suppressed as cross-file
+/// duplicates of an earlier database. Disclosed by `--doctor` instead
+/// of silently changing the aggregate numbers.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SqliteDuplicateDb {
+    pub path: String,
+    pub duplicate_sessions: usize,
+}
+
+/// rm-607 load outcome: the deduped session union plus the sibling
+/// databases whose rows duplicated an earlier file.
+#[derive(Debug, Default)]
+pub struct SqliteLoadReport {
+    pub sessions: Vec<Session>,
+    pub duplicate_dbs: Vec<SqliteDuplicateDb>,
+}
+
+/// The dedup-aware sqlite union. rm-607: the `opencode*.db` glob (and
+/// the hermes state.db set) can pick up sibling databases containing
+/// the same sessions as the canonical file — a byte-identical backup
+/// used to silently double every aggregate (live PoC: 309 -> 618
+/// sessions on the real corpus). Sessions are deduped by
+/// `(source_tool, sqlite_session_id)`, keeping the first occurrence —
+/// the canonical databases load first — and files that contributed
+/// only duplicates are recorded for the doctor disclosure.
+pub fn load_sqlite_backed_sessions_report(since: Option<DateTime<Utc>>) -> SqliteLoadReport {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
+        return SqliteLoadReport::default();
     };
-    let mut sessions = Vec::new();
+    let mut report = SqliteLoadReport::default();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     for path in hermes_state_db_paths(&home) {
-        sessions.extend(load_hermes_sqlite_sessions(&path, since));
+        let loaded = load_hermes_sqlite_sessions(&path, since);
+        extend_deduped(&mut report, &mut seen, loaded, &path);
     }
     for path in opencode_db_paths(&home) {
-        sessions.extend(load_opencode_sqlite_sessions(&path, since));
+        let loaded = load_opencode_sqlite_sessions(&path, since);
+        extend_deduped(&mut report, &mut seen, loaded, &path);
     }
-    sessions
+    report
+}
+
+/// Merge one database's sessions into the union, counting rows whose
+/// `(source_tool, sqlite_session_id)` identity was already carried by
+/// an earlier file as duplicates of that file.
+fn extend_deduped(
+    report: &mut SqliteLoadReport,
+    seen: &mut HashSet<(String, String)>,
+    loaded: Vec<Session>,
+    path: &Path,
+) {
+    let mut duplicates = 0usize;
+    for session in loaded {
+        let key = (
+            session.metrics.source_tool.clone(),
+            session.sqlite_session_id.clone(),
+        );
+        if seen.insert(key) {
+            report.sessions.push(session);
+        } else {
+            duplicates += 1;
+        }
+    }
+    if duplicates > 0 {
+        report.duplicate_dbs.push(SqliteDuplicateDb {
+            path: path.to_string_lossy().to_string(),
+            duplicate_sessions: duplicates,
+        });
+    }
 }
 
 pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
@@ -125,7 +187,10 @@ fn opencode_db_paths(home: &Path) -> Vec<PathBuf> {
     let Some(dir) = primary.parent() else {
         return vec![primary];
     };
-    let mut paths = std::fs::read_dir(dir)
+    // rm-607: the canonical db loads FIRST so the cross-file session
+    // dedup keeps the primary copy; sibling databases (backups, copies)
+    // sort after it and surrender their duplicate sessions.
+    let mut siblings = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -135,12 +200,13 @@ fn opencode_db_paths(home: &Path) -> Vec<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("opencode") && name.ends_with(".db"))
         })
+        .filter(|path| *path != primary)
         .collect::<Vec<_>>();
-    if paths.is_empty() {
-        paths.push(primary);
-    }
-    paths.sort();
-    paths
+    siblings.sort();
+    let mut ordered = Vec::with_capacity(siblings.len() + 1);
+    ordered.push(primary);
+    ordered.extend(siblings);
+    ordered
 }
 
 fn sqlite_file_exists(path: &Path) -> bool {
@@ -789,6 +855,7 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         metrics.provenance.duration = "timestamp_span".to_string();
     }
     let anomalies = detect_anomalies(&metrics);
+    let sqlite_session_id = agg.id.clone();
     // Research candidate 34: OpenCode fills `title` with a
     // `New session - <timestamp>` placeholder on every session it does
     // not summarize, and that placeholder must not become the session
@@ -818,6 +885,7 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     let health = health_score(&anomalies);
     Session {
         name,
+        sqlite_session_id,
         path: agg.path,
         cwd: agg.cwd,
         metrics,

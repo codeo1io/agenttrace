@@ -616,6 +616,7 @@ mod tests {
     #[test]
     fn waste_report_supports_chinese() {
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "会话".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
@@ -638,6 +639,7 @@ mod tests {
         // condition; the metrics seed must not stack a second entry for
         // the same evidence on top of it.
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "s".to_string(),
             path: "/tmp/s".to_string(),
             cwd: String::new(),
@@ -669,6 +671,7 @@ mod tests {
         // "bash" on a $10 session.)
         use std::collections::BTreeMap;
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "s".to_string(),
             path: "/tmp/s".to_string(),
             cwd: String::new(),

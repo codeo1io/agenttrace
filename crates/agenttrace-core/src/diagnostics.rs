@@ -1274,6 +1274,7 @@ mod tests {
         // (poisoned baseline 1.0 -> ratio 7.5); priced baseline 3.0/turn vs
         // current 7.5/turn is a 2.5x drift -> warning.
         let priced = |name: &str, cost: f64| Session {
+            sqlite_session_id: String::new(),
             name: name.to_string(),
             path: format!("/tmp/{name}"),
             cwd: String::new(),
@@ -1473,6 +1474,7 @@ mod tests {
     #[test]
     fn session_findings_reuse_diagnostic_rules() {
         let mut session = Session {
+            sqlite_session_id: String::new(),
             name: "failed".to_string(),
             path: "failed".to_string(),
             metrics: Metrics {
@@ -1545,6 +1547,7 @@ mod tests {
 
     fn session_with_cost(path: &str, turns: usize, cost: f64) -> Session {
         Session {
+            sqlite_session_id: String::new(),
             name: path.to_string(),
             path: path.to_string(),
             metrics: Metrics {

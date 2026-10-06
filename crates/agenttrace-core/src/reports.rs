@@ -2906,6 +2906,7 @@ mod tests {
         // panicked and release builds printed `total_tokens = -2` — the
         // original F1 symptom.
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "adversarial".to_string(),
             path: "/tmp/adversarial.jsonl".to_string(),
             cwd: String::new(),
@@ -2942,6 +2943,7 @@ mod tests {
             .tool_usage
             .insert("evil\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(), 3);
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
             path: "/tmp/osc.jsonl".to_string(),
             cwd: String::new(),
@@ -2967,6 +2969,7 @@ mod tests {
     #[test]
     fn compare_json_formats_zero_cost_like_go() {
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "session".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
@@ -2991,6 +2994,7 @@ mod tests {
     #[test]
     fn compare_report_truncates_utf8_session_names_on_char_boundaries() {
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "打开中文文件并生成排查报告的长会话名称".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
@@ -3014,6 +3018,7 @@ mod tests {
     #[test]
     fn text_and_compare_reports_support_chinese() {
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "会话".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),

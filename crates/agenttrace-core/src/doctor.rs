@@ -1,6 +1,6 @@
 use crate::{
-    cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
+    cached_session, find_session_files, known_session_dirs, load_session_cache, parse_file,
+    skip_sqlite_backed_file_dir, Session, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -40,6 +40,13 @@ pub struct DoctorReport {
     pub cache_limits: String,
     pub sessions: usize,
     pub session_files: usize,
+    /// rm-607 disclosure: sibling sqlite databases (outside the
+    /// canonical ones) whose sessions were suppressed as cross-file
+    /// duplicates — backups and copies that used to double every
+    /// aggregate before the dedup landed. Empty when no sibling db
+    /// matched the discovery glob.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_duplicate_dbs: Vec<crate::sqlite_sessions::SqliteDuplicateDb>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -113,11 +120,12 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     } else {
         find_session_files(dir)
     };
-    let sqlite_sessions = if dir.is_none() && !demo {
-        load_sqlite_backed_sessions()
+    let sqlite_load = if dir.is_none() && !demo {
+        crate::sqlite_sessions::load_sqlite_backed_sessions_report(None)
     } else {
-        Vec::new()
+        crate::sqlite_sessions::SqliteLoadReport::default()
     };
+    let sqlite_sessions = sqlite_load.sessions;
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
         "demo sessions"
@@ -157,6 +165,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         ),
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
+        sqlite_duplicate_dbs: sqlite_load.duplicate_dbs,
         project_decode,
         zero_usage,
         disclosures,
@@ -598,6 +607,33 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             report.zero_usage.events
         ));
     }
+    // rm-607: sibling sqlite databases suppressed as duplicates are
+    // disclosed, not silently skipped — the numbers are honest but the
+    // user should learn their backups are inside the discovery glob.
+    let duplicate_dbs = report
+        .sqlite_duplicate_dbs
+        .iter()
+        .map(|db| db.path.as_str())
+        .collect::<Vec<_>>()
+        .len();
+    let duplicate_sessions: usize = report
+        .sqlite_duplicate_dbs
+        .iter()
+        .map(|db| db.duplicate_sessions)
+        .sum();
+    if duplicate_sessions > 0 {
+        recommendations.push(format!(
+            "{} session(s) across {} sibling sqlite database(s) ({}) were counted once because they repeat sessions already carried by the canonical database; archive backups outside the agent home to keep discovery unambiguous.",
+            duplicate_sessions,
+            duplicate_dbs,
+            report
+                .sqlite_duplicate_dbs
+                .iter()
+                .map(|db| db.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if demo {
         recommendations.push(
             "Demo sessions use a temporary directory, so cache reuse is not expected in this mode."
@@ -677,6 +713,19 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     ));
     for sample in &report.zero_usage.samples {
         out.push_str(&format!("    {sample}\n"));
+    }
+    if !report.sqlite_duplicate_dbs.is_empty() {
+        out.push_str(&format!(
+            "Duplicate sqlite databases (rm-607): {}\n",
+            report
+                .sqlite_duplicate_dbs
+                .iter()
+                .map(|db| format!(
+                    "    {} — {} duplicate session(s) suppressed, canonical db kept\n",
+                    db.path, db.duplicate_sessions
+                ))
+                .collect::<String>()
+        ));
     }
     if !report.disclosures.is_empty() {
         out.push_str(&format!(
@@ -829,6 +878,7 @@ mod tests {
 
     fn session_at(cwd: &str, path: &str) -> Session {
         Session {
+            sqlite_session_id: String::new(),
             name: "session.jsonl".to_string(),
             path: path.to_string(),
             cwd: cwd.to_string(),

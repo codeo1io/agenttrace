@@ -136,6 +136,7 @@ impl DerivedSession {
     fn into_session(self) -> Session {
         let short_id = self.id.chars().take(8).collect::<String>();
         Session {
+            sqlite_session_id: String::new(),
             name: format!("history-{short_id}"),
             path: format!("history:{}", self.id),
             cwd: self.project,
@@ -175,6 +176,7 @@ mod tests {
     #[test]
     fn preserved_history_contains_only_derived_fields() {
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
@@ -255,6 +257,7 @@ mod tests {
         let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
         std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
         let session = Session {
+            sqlite_session_id: String::new(),
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
