@@ -1,6 +1,6 @@
 use crate::{
-    format_cost, format_tokens, loop_waste_percent, pricing, round4, Metrics, ReportLanguage,
-    Session, VERSION,
+    format_cost, format_tokens, loop_waste_percent, pricing, round4, sanitize_line_segment,
+    Metrics, ReportLanguage, Session, VERSION,
 };
 
 #[derive(Debug, Clone)]
@@ -364,7 +364,11 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         };
         out.push_str(&format!(
             "    {:<25} {:>3}x ~{} ({:.0}% {}){}\n",
-            item.tool_name,
+            // rm-239 rider (d80f6a25): tool names are transcript-derived
+            // and this was the only default text lane with no sanitizer
+            // import at all (assess PoC: `--waste` emitted one OSC-52
+            // clipboard-write sequence from a crafted tool name).
+            sanitize_line_segment(&item.tool_name),
             item.call_count,
             format_cost(item.total_cost),
             share,

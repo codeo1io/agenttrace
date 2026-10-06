@@ -1017,7 +1017,58 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         }
         bail!("No sessions match the requested filters");
     }
+    // rm-534: discovery/-d-walk arm of the input-journal membership
+    // check (`-o <name>.jsonl` colliding with any journal a walk
+    // admitted) — loud BEFORE any bytes are staged.
+    ensure_output_is_not_an_input(args, &sessions)?;
     Ok((sessions, Some(report)))
+}
+
+/// rm-534: `--output` must never be an input journal. write_output
+/// stages through unique-temp + rename (rm-250), so a destination that
+/// resolves onto a just-loaded transcript atomically replaces it with
+/// the rendered report while the process exits 0 (assess b6c398bf PoC:
+/// `--overview -o X.jsonl X.jsonl` => RC=0, journal replaced by the
+/// 35-line report). Membership is checked against the LOADED session
+/// set — explicit positional files and every journal admitted by a `-d`
+/// walk — with both sides resolved, so relative paths and symlinks to
+/// live journals are caught too.
+fn ensure_output_is_not_an_input(args: &Args, sessions: &[Session]) -> anyhow::Result<()> {
+    let Some(output) = args.output.as_deref() else {
+        return Ok(());
+    };
+    let resolved = resolve_output_destination(output);
+    for session in sessions {
+        if let Ok(source) = fs::canonicalize(&session.path) {
+            if source == resolved {
+                bail!(
+                    "--output {} is an input session journal ({}); refusing to overwrite a transcript — choose a different --output destination",
+                    output.display(),
+                    session.path
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve an --output destination the way the write will land it: the
+/// canonical path when it already exists (the collision case — inputs
+/// exist by definition), otherwise the canonical parent plus the file
+/// name. A destination whose parent does not exist yet cannot collide
+/// with a loaded journal, so the relative fallback is safe.
+fn resolve_output_destination(output: &Path) -> PathBuf {
+    if let Ok(existing) = fs::canonicalize(output) {
+        return existing;
+    }
+    let file_name = output.file_name().map(PathBuf::from).unwrap_or_default();
+    match output
+        .parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+    {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(output),
+    }
 }
 
 fn parse_range(args: &Args) -> anyhow::Result<TimeRange> {
@@ -1039,6 +1090,9 @@ fn prepare_explicit_sessions(
     mut sessions: Vec<Session>,
     args: &Args,
 ) -> anyhow::Result<Vec<Session>> {
+    // rm-534: reject --output destinations that ARE an input journal
+    // before any lane work (explicit positional file + demo paths).
+    ensure_output_is_not_an_input(args, &sessions)?;
     if args.preserve_history {
         agenttrace_core::preserve_derived_history(&sessions)?;
     }
@@ -1451,6 +1505,17 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
     // stale data while looking refreshed.
     if args.fetch && args.path.as_deref() != Some("upstream") {
         bail!("--fetch applies only to the upstream command: agenttrace --fetch upstream");
+    }
+    // rm-533: --demo fabricates its entire session set; preserving those
+    // rows would merge fabricated data into the REAL durable history
+    // store (assess b6c398bf PoC: `--demo --preserve-history` wrote 4
+    // rows/$0.8950 into history.json and every later history-consuming
+    // report repeated them). The demo lane stays hermetic: no path may
+    // write demo state to host stores.
+    if args.demo && args.preserve_history {
+        bail!(
+            "--demo cannot be combined with --preserve-history: demo sessions are fabricated and must never be written to the real history store"
+        );
     }
     // rm-341: --baseline gates --overview -f json; --compare never reads
     // it. Rejecting the pair up front replaces two errors that used to
