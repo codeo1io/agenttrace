@@ -19,7 +19,13 @@ out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 mkdir -p "$out_dir/docs"
 
 "$bin" --version >"$out_dir/docs/version.txt"
-"$bin" --doctor -f json >"$out_dir/docs/doctor.json"
+# rm-444: scope the doctor leg to a repo fixture corpus. Without -d
+# it walked the operator's real HOME — >5 minutes with a debug binary
+# on the CI fleet, first read as a gate hang. Every documented
+# command/flag stays exercised (--doctor, -d, -f json); only the input
+# corpus is scoped, mirroring the --demo legs below.
+"$bin" --doctor -d "$repo_root/crates/agenttrace-core/tests/fixtures/pi-oh-my-pi" \
+  -f json >"$out_dir/docs/doctor.json"
 "$bin" --demo --latest -f json >"$out_dir/docs/latest.json"
 "$bin" --demo --latest --lang zh -f json >"$out_dir/docs/latest-zh.json"
 "$bin" --demo --overview -f json >"$out_dir/docs/overview.json"
