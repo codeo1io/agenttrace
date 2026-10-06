@@ -1249,13 +1249,44 @@ fn is_cline_task_dir(path: &std::path::Path) -> bool {
         || path.join("task_metadata.json").is_file()
 }
 
+fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+    // rm-525: sibling of agenttrace-core's session_cache::write_private
+    // (the rm-208 family). -o artifacts are session-derived — --search
+    // hits quote user prompts verbatim — so PRIVACY.md's blanket
+    // owner-only sentence must hold at this choke point too. The mode
+    // is set on the TEMP file because rm-250's rename gives the
+    // destination a fresh inode on every write: a plain `fs::write`
+    // there let the umask (0664 under the common 0002) survive the
+    // rename, and a rewrite over an older artifact resurrected
+    // group/other read. Non-Unix keeps the plain write, mirroring the
+    // rm-208 helper's fallback.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(content.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, content)
+    }
+}
+
 fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     if let Some(path) = path {
         // rm-250 residual (cycle 1): resolve the destination honestly
         // before anything is written. The temp+rename dance used to
         // silently replace a symlink with a regular file (the link's
         // target kept its old bytes) and could not write special
-        // files at all.
+        // files at all. rm-525 rides the same staging point below:
+        // the resolved regular-file lane stages through `write_private`,
+        // so the owner-only guarantee survives the refactor.
         let target = resolve_output_target(path)?;
         write_output_resolved(path, &target, content)?;
     }
@@ -1344,9 +1375,14 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
     // rm-250: stage through a unique temp sibling and rename into
     // place, so a crash or Ctrl-C mid-write never leaves a
     // truncated report at the destination (same pattern as the
-    // session-cache and history persistence writers).
+    // session-cache and history persistence writers). rm-525 (rebased
+    // at integration onto this resolved-target lane): the stage goes
+    // through `write_private`, not a plain `fs::write`, so the temp is
+    // 0600 before the rename — the rename hands the destination a
+    // fresh inode every time, which is what re-tightens a rewrite over
+    // an artifact aged to 0664 (PRIVACY.md's report-artifact sentence).
     let temp = unique_temp_sibling(target);
-    let staged = fs::write(&temp, content).and_then(|()| fs::rename(&temp, target));
+    let staged = write_private(&temp, content).and_then(|()| fs::rename(&temp, target));
     if let Err(error) = staged {
         let _ = fs::remove_file(&temp);
         return Err(error).context("writing report output file");
@@ -2426,6 +2462,37 @@ mod tests {
             "value-taking flags missing from flag_takes_value (their values would be \
              swallowed as positionals): {missing:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_output_creates_owner_only_artifacts() {
+        // rm-525: the -o artifact class is session-derived (--search
+        // hits quote user prompts verbatim), so PRIVACY.md's blanket
+        // 0600 sentence holds at the write_output choke point — fresh
+        // writes AND rewrites: rm-250's rename replaces the inode, so
+        // the temp must already be 0600 and a rewrite over a file aged
+        // to 0664 (by an older build or a deliberate umask) must not
+        // resurrect group/other read.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("at-write-output-mode-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let target = dir.join("report.json");
+        write_output(&Some(target.clone()), "{}\n").expect("write -o artifact");
+        let fresh = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fresh, 0o600,
+            "fresh -o artifact must be owner-only (got {fresh:o})"
+        );
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).expect("age the mode");
+        write_output(&Some(target.clone()), "{}\n").expect("rewrite -o artifact");
+        let rewritten = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            rewritten, 0o600,
+            "a rewrite must not resurrect 0664 (got {rewritten:o})"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

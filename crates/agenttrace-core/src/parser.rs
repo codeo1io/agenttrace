@@ -148,7 +148,26 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             return Ok(session);
         }
     }
-    let objs = jsonl_objects(raw).collect::<Vec<_>>();
+    // rm-526: `jsonl_objects` silently dropped lines that fail both the
+    // strict and the lenient parse, so a torn tail (a writer crash
+    // mid-object — the read side of the hazard rm-250 hardened the
+    // writers against) vanished whole: the session parsed green with
+    // zero skips and its usage undercounted. Count the drops here and
+    // attach them to every session parsed out of `objs`, through the
+    // same `line_skips` channel the codex parser and the generic
+    // fallback already disclose through.
+    let (objs, jsonl_line_skips) = jsonl_objects_counted(raw);
+    let finish = |events: Vec<Event>| -> anyhow::Result<Session> {
+        let mut session = session_from_events(name, path, events)?;
+        for (reason, count) in &jsonl_line_skips {
+            *session
+                .metrics
+                .line_skips
+                .entry(reason.clone())
+                .or_insert(0) += *count;
+        }
+        Ok(session)
+    };
     if parsed_value.is_none() {
         // Workbuddy parses FIRST (probe order) but carries its own
         // disclosure channel for the cache-clamp counter (rm-600,
@@ -159,8 +178,15 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         // as its cache_subtracted / zeroed_suspected_mismatch siblings
         // (landed by the aggregator's meta arm) instead of degrading
         // data_health.confidence and rendering under "Dropped lines".
+        // The session itself still goes through the rm-526 `finish`
+        // closure (re-threaded at the independent review, conflict case
+        // 7a502782): moving workbuddy out of the probe array for its own
+        // counter channel must not lose the jsonl line-skips census — a
+        // torn-tail workbuddy journal discloses `unparseable_line` in
+        // `line_skips` exactly like every other probe-path format, while
+        // its basis counters stay on the non-loss channel.
         if let Some((events, parse_counters)) = parse_workbuddy_jsonl(&objs) {
-            let mut session = session_from_events(name, path, events)?;
+            let mut session = finish(events)?;
             for (key, count) in parse_counters {
                 *session.metrics.disclosure_counters.entry(key).or_insert(0) += count as usize;
             }
@@ -173,13 +199,13 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             parse_copilot_session_jsonl,
         ];
         if let Some(events) = probes.iter().find_map(|probe| probe(&objs)) {
-            return session_from_events(name, path, events);
+            return finish(events);
         }
         // kimi_cli parses outside the probe array — last, exactly where it
         // used to sit — because it carries its own disclosure channel for
         // alias-matched usage fields (rm-400).
         if let Some((events, usage_alias_counts)) = parse_kimi_wire_jsonl(&objs) {
-            let mut session = session_from_events(name, path, events)?;
+            let mut session = finish(events)?;
             for (key, count) in usage_alias_counts {
                 *session
                     .metrics
@@ -191,16 +217,16 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if is_qwen_code_jsonl(&objs) {
-        return session_from_events(name, path, parse_qwen_code_jsonl(&objs)?);
+        return finish(parse_qwen_code_jsonl(&objs)?);
     }
     if is_oh_my_pi_jsonl(&objs) {
-        return session_from_events(name, path, parse_oh_my_pi_jsonl(path, &objs)?);
+        return finish(parse_oh_my_pi_jsonl(path, &objs)?);
     }
     if let Some(events) = parse_claude_code_jsonl(&objs) {
-        return session_from_events(name, path, events);
+        return finish(events);
     }
     if let Some(events) = parse_copilot_jsonl(&objs) {
-        return session_from_events(name, path, events);
+        return finish(events);
     }
     if let Ok(events) = serde_json::from_str::<Vec<Event>>(trimmed) {
         if !events.is_empty() {
@@ -5066,6 +5092,9 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
     let _ = model;
 }
 
+#[cfg(test)] // test-only since rm-526 moved every production caller to
+             // `jsonl_objects_counted`, which discloses the drops instead of
+             // silently filter-mapping them away
 fn jsonl_objects(raw: &str) -> impl Iterator<Item = Map<String, Value>> + '_ {
     raw.lines()
         .filter_map(|line| parse_jsonl_value_lenient(line.trim()))
@@ -5073,6 +5102,29 @@ fn jsonl_objects(raw: &str) -> impl Iterator<Item = Map<String, Value>> + '_ {
             Value::Object(obj) => Some(obj),
             _ => None,
         })
+}
+
+/// Counting sibling of [`jsonl_objects`] (rm-526): returns the objects
+/// plus a `line_skips` map naming every line the iterator dropped —
+/// `unparseable_line` for lines that survive neither the strict nor the
+/// lenient parse (a torn tail), `non_object_line` for bare JSON values
+/// that parse but are not objects. Empty lines stay skipped silently,
+/// matching the generic fallback's `parse_jsonl_session`.
+fn jsonl_objects_counted(raw: &str) -> (Vec<Map<String, Value>>, BTreeMap<String, usize>) {
+    let mut objs = Vec::new();
+    let mut skips: BTreeMap<String, usize> = BTreeMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_jsonl_value_lenient(line) {
+            Some(Value::Object(obj)) => objs.push(obj),
+            Some(_) => *skips.entry("non_object_line".to_string()).or_insert(0) += 1,
+            None => *skips.entry("unparseable_line".to_string()).or_insert(0) += 1,
+        }
+    }
+    (objs, skips)
 }
 
 /// Lenient single-line JSONL parse: strict first, then lone-surrogate
