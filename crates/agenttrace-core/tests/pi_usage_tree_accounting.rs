@@ -806,3 +806,138 @@ fn zero_token_usage_entry_still_passes_recorded_cost() {
         metrics.disclosure_counters
     );
 }
+
+/// rm-551 — the assess PoC shape: one exchange plus one compaction
+/// call whose inline usage block was the whole-context call's real
+/// spend (38000 in / 900 out / $0.0123 upstream-recorded). Schema-
+/// faithful to pi dist `appendCompaction` (type, summary,
+/// tokensBefore, systemMessage, firstKeptEntryId, usage).
+const COMPACTION_SENTINEL: &str = concat!(
+    "{\"id\":\"s1\",\"timestamp\":\"2026-01-04T10:00:00.000Z\",\"type\":\"session\",\"version\":3,\"cwd\":\"/tmp/a\"}\n",
+    "{\"id\":\"a1\",\"parentId\":\"s1\",\"type\":\"message\",\"timestamp\":\"2026-01-04T10:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"continue\"}]}}\n",
+    "{\"id\":\"a2\",\"parentId\":\"a1\",\"type\":\"message\",\"timestamp\":\"2026-01-04T10:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"okay\"}],\"timestamp\":1766625901000,\"usage\":{\"input\":500,\"output\":1000,\"cacheRead\":25000,\"cacheWrite\":5000},\"model\":\"claude-sonnet-4-5\"}}\n",
+    "{\"id\":\"a3\",\"parentId\":\"a2\",\"type\":\"compaction\",\"timestamp\":\"2026-01-04T10:00:03.000Z\",\"summary\":\"compacted the context\",\"tokensBefore\":123,\"systemMessage\":\"sys\",\"firstKeptEntryId\":\"a2\",\"usage\":{\"input\":38000,\"output\":900,\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"input\":0.0123,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0.0123}}}\n"
+);
+
+/// rm-551 — branch_summary entries fold through the same arm; this one
+/// carries usage with NO recorded cost, so the catalog must price its
+/// tokens (nothing is upstream-priced to exclude).
+const BRANCH_SUMMARY_USAGE: &str = concat!(
+    "{\"id\":\"s1\",\"timestamp\":\"2026-01-04T10:00:00.000Z\",\"type\":\"session\",\"version\":3,\"cwd\":\"/tmp/b\"}\n",
+    "{\"id\":\"a1\",\"parentId\":\"s1\",\"type\":\"branch_summary\",\"timestamp\":\"2026-01-04T10:00:01.000Z\",\"summary\":\"branched from s1\",\"usage\":{\"input\":700,\"output\":80,\"cacheRead\":0,\"cacheWrite\":0}}\n"
+);
+
+/// rm-551 — a compaction entry with an empty usage block must fold
+/// NOTHING (no counter, no meta event) while the summary still
+/// lands as a turn: the arm's fold is conditional, not unconditional.
+const COMPACTION_EMPTY_USAGE: &str = concat!(
+    "{\"id\":\"s1\",\"timestamp\":\"2026-01-04T10:00:00.000Z\",\"type\":\"session\",\"version\":3,\"cwd\":\"/tmp/c\"}\n",
+    "{\"id\":\"a1\",\"parentId\":\"s1\",\"type\":\"compaction\",\"timestamp\":\"2026-01-04T10:00:01.000Z\",\"summary\":\"compacted with no usage\",\"tokensBefore\":50,\"usage\":{}}\n"
+);
+
+#[test]
+fn compaction_usage_composes_with_catalog() {
+    // rm-551: the compaction call's inline usage block folds into the
+    // session exactly like the rm-436 standalone usage arm — tokens
+    // counted, upstream-recorded cost riding along, the block's own
+    // tokens excluded from the catalog estimate (upstream-priced) so
+    // nothing is double-charged. Pre-fix this journal reported
+    // cost_estimated ~= the catalog of the exchange alone (the assess
+    // PoC: $0.0023 reported vs ~$0.0143 spec-true).
+    let session = parsed("compaction-sentinel.jsonl", COMPACTION_SENTINEL);
+    let metrics = &session.metrics;
+    assert_eq!(
+        metrics.tokens_input,
+        500 + 38000,
+        "exchange + compaction input"
+    );
+    assert_eq!(metrics.tokens_output, 1000 + 900);
+    assert_eq!(metrics.tokens_cache_r, 25000);
+    assert_eq!(metrics.tokens_cache_w, 5000);
+    // The upstream-priced exclusion is asserted through the catalog
+    // formula itself: expected prices ONLY the exchange's 500/1000/
+    // 25000/5000 — the 38000/900 block is carried at its recorded
+    // $0.0123 instead of being estimated (or double-charged).
+    assert!((metrics.upstream_cost_usd - 0.0123).abs() < 1e-12);
+    let price = lookup_price("claude-sonnet-4-5");
+    let expected = round4(
+        price.input / 1e6 * 500.0
+            + price.output / 1e6 * 1000.0
+            + price.cr / 1e6 * 25000.0
+            + price.cw / 1e6 * 5000.0
+            + 0.0123,
+    );
+    assert!(
+        (metrics.cost_estimated - expected).abs() < 1e-9,
+        "catalog(exchange) + recorded compaction cost: got {} want {}",
+        metrics.cost_estimated,
+        expected
+    );
+    assert_eq!(
+        metrics
+            .disclosure_counters
+            .get("pi_compaction_usage_counted:compaction"),
+        Some(&1),
+        "the fold is disclosed per kind: {:?}",
+        metrics.disclosure_counters
+    );
+    assert_eq!(
+        metrics
+            .disclosure_counters
+            .get("pi_entry_skipped:compaction"),
+        None,
+        "handled types never take the skip channel"
+    );
+    assert_eq!(metrics.assistant_turns, 2, "exchange + compaction summary");
+}
+
+#[test]
+fn branch_summary_usage_catalogs_when_no_recorded_cost() {
+    // rm-551: branch_summary usage without a recorded cost is plain
+    // counted spend — catalog-priced (nothing upstream-priced to
+    // exclude) and disclosed under its own kind.
+    let session = parsed("branch-summary-usage.jsonl", BRANCH_SUMMARY_USAGE);
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, 700);
+    assert_eq!(metrics.tokens_output, 80);
+    assert_eq!(metrics.upstream_cost_usd, 0.0);
+    let price = lookup_price("claude-sonnet-4-5");
+    let expected = round4(price.input / 1e6 * 700.0 + price.output / 1e6 * 80.0);
+    assert!((metrics.cost_estimated - expected).abs() < 1e-9);
+    assert_eq!(
+        metrics
+            .disclosure_counters
+            .get("pi_compaction_usage_counted:branch_summary"),
+        Some(&1)
+    );
+    assert_eq!(metrics.assistant_turns, 1, "the summary itself is a turn");
+}
+
+#[test]
+fn compaction_without_usage_folds_nothing() {
+    // rm-551 guard: an empty usage block must not mint a counter or a
+    // zero-token meta event — the fold fires only when usage or a
+    // recorded cost is actually present.
+    let session = parsed("compaction-empty-usage.jsonl", COMPACTION_EMPTY_USAGE);
+    let metrics = &session.metrics;
+    // No usage block anywhere in this journal, so the pre-existing
+    // absent-usage semantics apply to the summary turn: assistant
+    // content takes the text-estimate fallback on tokens_output
+    // (lib.rs estimate_tokens_from_text — 23-char summary / 4 = 5)
+    // while tokens_input stays 0 (no user message). The fold's
+    // absence must not mint a counter or a zero-token meta event.
+    assert_eq!(
+        metrics.tokens_input, 0,
+        "no usage entry and no user message"
+    );
+    assert_eq!(
+        metrics.tokens_output, 5,
+        "assistant-content text-estimate, pre-existing absent-usage path"
+    );
+    assert_eq!(metrics.upstream_cost_usd, 0.0);
+    assert!(!metrics
+        .disclosure_counters
+        .keys()
+        .any(|k| k.starts_with("pi_compaction_usage_counted")));
+    assert_eq!(metrics.assistant_turns, 1, "the summary still lands");
+}

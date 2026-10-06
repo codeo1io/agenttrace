@@ -1156,12 +1156,20 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
+<<<<<<< ours
         // version (v28 — see the rm-529, rm-542, rm-485, rm-450,
         // rm-436/437/438, rm-408 and rm-400/401 bump notes in
         // session_cache.rs; the #316 cache clamp port is what carried
         // 27 -> 28 at this integration, re-based off the campaign's
         // own 24 -> 26 bump, 25 being already taken on the landed
         // ceiling by rm-450).
+=======
+        // version (v28 — see the rm-551, rm-542, rm-485, rm-450,
+        // rm-436/437/438, rm-408 and rm-400/401 bump notes in
+        // session_cache.rs; the pi compaction usage fold is what
+        // carried 27 -> 28 here, the Codex custom-tools parse carried
+        // 26 -> 27, re-based off the campaign's 22 -> 23 bump).
+>>>>>>> theirs
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(28)

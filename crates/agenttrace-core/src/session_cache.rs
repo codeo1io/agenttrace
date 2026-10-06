@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
+<<<<<<< ours
 // Bumped 27 -> 28 (integration of run 66e75e39, rm-529 'Clamp cache
 // counts to cache-inclusive input (port upstream open PR #316)'):
 // the shared subtract_cached_input clamps each cache count to what is
@@ -23,6 +24,24 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
 // rm-485, 27 was rm-542) exactly as that landing did. Upstream
 // diverged long ago (26 pre-#316, 27 with it) — the fork ladder is
 // documented here for the rm-513 merge-hazard rungs.
+=======
+// Bumped 27 -> 28 (run 4ffc4fbb, rm-551, minted campaign-locally as
+// rm-543): the pi journal's inline compaction/branch_summary usage
+// block is now folded into session accounting (tokens plus the
+// upstream-recorded cost, disclosed per kind as
+// pi_compaction_usage_counted) instead of being dropped while the
+// entry type counted as handled — so sessions with pi compaction
+// entries report HIGHER truthful totals for unchanged files and a
+// warm v27 cache must not keep serving the undercount (PoC $0.0023
+// reported vs ~$0.0143 spec-true; wild census 11,587 compaction
+// entries / 519 usage-bearing). Minted against schema 25 when the
+// landed wall was at rm-540 — slot 26 was rm-485, slot 27 was
+// rm-542's codex custom-tools parse; integration re-bases the bump
+// onto the already-advanced ceiling per the rm-230 convention:
+// parser-semantics changes bump the schema so cached sessions
+// regenerate under corrected accounting. Entries regenerate once on
+// next scan.
+>>>>>>> theirs
 // Bumped 26 -> 27 (integration of run b1ff12f8, rm-542, minted
 // campaign-locally as rm-449): the Codex custom-tools response items are
 // now parsed — custom_tool_call / custom_tool_call_output pairs count as
