@@ -5,7 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 22;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 23;
+// Bumped 22 -> 23 (run 6aaf51aa cycle 3, rm-502): timestamp parsing is
+// unified onto lib.rs `parse_ts` (the lenient single source of truth),
+// so diagnostics derived from RAW event stamps (tool_latencies,
+// trace-step durations) now populate for naive-ISO corpora and the
+// opencode lane accepts fractional naive stamps — Diagnostics are
+// cached inside Session entries, so warm v22 entries would keep
+// reporting the empty analytics the split-brain produced (the rm-230
+// convention: parser-semantics changes bump the schema so cached
+// sessions regenerate under corrected values). Entries regenerate once
+// on next scan.
 // Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
 // kimi_cli usage-alias fix and the Codex compaction pairing fix change
 // reported totals for unchanged files, so warm v21 entries carry the
@@ -220,6 +230,8 @@ struct GoMetrics {
     session_start: String,
     #[serde(default, rename = "SessionEnd")]
     session_end: String,
+    #[serde(default, rename = "NaiveUtcStamps")]
+    naive_utc_stamps: usize,
     #[serde(default, rename = "DurationSec")]
     duration_sec: f64,
     #[serde(default, rename = "CostEstimated")]
@@ -1257,6 +1269,7 @@ impl GoMetrics {
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
+            naive_utc_stamps: metrics.naive_utc_stamps,
             duration_sec: metrics.duration_sec,
             cost_estimated: metrics.cost_estimated,
             stored_totals_delta: metrics.stored_totals_delta,
@@ -1294,6 +1307,7 @@ impl GoMetrics {
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,
+            naive_utc_stamps: self.naive_utc_stamps,
             duration_sec: self.duration_sec,
             cost_estimated: self.cost_estimated,
             stored_totals_delta: self.stored_totals_delta,

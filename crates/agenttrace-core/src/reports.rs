@@ -1,11 +1,10 @@
 use crate::{
     average_health, canonical_sessions, classify_tool_authority, context_trends, cost_audit,
     delivery_evidence, fmt_duration, format_cost, format_count, format_tokens,
-    highest_authority_for_metrics, is_high_authority_category, mcp_governance, recommendations,
-    report_scope, round4, sanitize_line_segment, sorted_keys, sorted_set, total_tokens, Anomaly,
-    GroupOverview, Overview, Session, TaskTypeOverview, ToolCall, VERSION,
+    highest_authority_for_metrics, is_high_authority_category, mcp_governance, parse_ts,
+    recommendations, report_scope, round4, sanitize_line_segment, sorted_keys, sorted_set,
+    total_tokens, Anomaly, GroupOverview, Overview, Session, TaskTypeOverview, ToolCall, VERSION,
 };
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
@@ -2327,8 +2326,8 @@ fn analyze_health_trend_full(sessions: &[Session]) -> FullHealthTrend {
     let mut ordered = sessions.to_vec();
     ordered.sort_by(|a, b| {
         match (
-            parse_rfc3339(&a.metrics.session_start),
-            parse_rfc3339(&b.metrics.session_start),
+            parse_ts(&a.metrics.session_start),
+            parse_ts(&b.metrics.session_start),
         ) {
             (Some(a_ts), Some(b_ts)) if a_ts != b_ts => a_ts.cmp(&b_ts),
             (Some(_), None) => Ordering::Less,
@@ -2756,11 +2755,11 @@ fn truncate_runes(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
-fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|ts| ts.with_timezone(&Utc))
-}
+// NOTE (rm-502): the strict `parse_rfc3339` copy that used to live
+// here was removed — report trend ordering routes through lib.rs
+// `parse_ts` (the single source of timestamp truth), so naive-ISO
+// sessions sort exactly like RFC 3339 ones instead of being ordered
+// as unknown-time.
 
 /// Human-readable parse-coverage phrase shared by the text, Markdown,
 /// and HTML overview renderers (`sep` is ", " or "; ").
@@ -2772,7 +2771,10 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 /// instead of a nonsensical "1410/364 parsed" (pass-8 F8-2).
 /// Out-of-scope files are disclosed, never folded into the denominator;
 /// when nothing is out of scope the phrase stays byte-identical to the
-/// pre-cycle-5 rendering (the --demo golden depends on it).
+/// pre-cycle-5 rendering (the --demo golden depends on it). Sessions
+/// carrying naive-ISO stamps (reinterpreted as UTC by the lenient
+/// parse arm) are disclosed the same way (rm-502), so that UTC
+/// assumption never hides behind a plain coverage number.
 fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
     let base = if health.parsed > health.discovered {
         format!(
@@ -2787,6 +2789,12 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
         phrase.push_str(&format!(
             "{} outside range/filters{sep}",
             health.out_of_scope
+        ));
+    }
+    if health.naive_utc_sessions > 0 {
+        phrase.push_str(&format!(
+            "{} naive-UTC timestamp sessions{sep}",
+            health.naive_utc_sessions
         ));
     }
     phrase.push_str(&format!("{} cache hits", health.cache_hits));
@@ -3012,6 +3020,21 @@ mod tests {
             parse_coverage_phrase(&health, ", "),
             "73/364 parsed, 0 skipped, 291 outside range/filters, 330 cache hits"
         );
+        // rm-502: the naive-UTC disclosure is additive — zero keeps the
+        // phrase byte-identical (demo golden), nonzero appends after the
+        // out-of-scope segment and before cache hits.
+        health.naive_utc_sessions = 0;
+        assert_eq!(
+            parse_coverage_phrase(&health, ", "),
+            "73/364 parsed, 0 skipped, 291 outside range/filters, 330 cache hits"
+        );
+        health.naive_utc_sessions = 2;
+        assert_eq!(
+            parse_coverage_phrase(&health, ", "),
+            "73/364 parsed, 0 skipped, 291 outside range/filters, \
+             2 naive-UTC timestamp sessions, 330 cache hits"
+        );
+        health.naive_utc_sessions = 0;
         health.discovered = 364;
         health.parsed = 1410;
         health.out_of_scope = 0;

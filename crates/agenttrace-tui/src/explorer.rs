@@ -2384,9 +2384,10 @@ fn render_timeline_table(frame: &mut Frame<'_>, app: &App, session: &Session, ar
 }
 
 fn step_local_time(value: &str) -> Option<chrono::DateTime<chrono::Local>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|time| time.with_timezone(&chrono::Local))
+    // rm-502: the single source of timestamp truth — naive-ISO step
+    // stamps render as local times exactly like RFC 3339 ones instead
+    // of falling through to the raw-string arm below.
+    agenttrace_core::parse_ts(value).map(|time| time.with_timezone(&chrono::Local))
 }
 
 fn step_status_style(status: &str) -> Style {

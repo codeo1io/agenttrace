@@ -3,8 +3,8 @@ use crate::session_cache::{
     load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
 };
 use crate::{
-    merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
-    Session,
+    merge_preserved_history, parse_file, parse_ts, preserve_derived_history,
+    skip_sqlite_backed_file_dir, Session,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
@@ -377,8 +377,15 @@ pub fn load_sessions_with_progress_from_cache_mode(
         // bucket, N7) instead of being silently dropped from ranged views;
         // data_health counts them via `unknown_time_sessions`.
         options.since.map_or(true, |since| {
-            DateTime::parse_from_rfc3339(&session.metrics.session_start)
-                .map(|time| time.with_timezone(&Utc) >= since)
+            // N7: unknown-time sessions stay visible in time-ranged
+            // views (they surface in data_health as unknown_time_sessions)
+            // rather than being dropped for an unparseable start.
+            // rm-502: naive-ISO starts parse through the shared lenient
+            // arm (lib.rs parse_ts) exactly like ingest does, so the
+            // since-filter never disagrees with --overview about which
+            // sessions exist in time.
+            parse_ts(&session.metrics.session_start)
+                .map(|time| time >= since)
                 .unwrap_or(true)
         }) && matches_project_filter(session, &options.project)
             && matches_filter(&session.metrics.source_tool, &options.source)

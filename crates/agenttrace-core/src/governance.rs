@@ -1,5 +1,6 @@
 use crate::{
-    pricing, project_name, resolve_project, round4, session_capability, total_tokens, Session,
+    parse_ts, pricing, project_name, resolve_project, round4, session_capability, total_tokens,
+    Session,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -870,10 +871,10 @@ fn delivery_level_rank(level: &str) -> u8 {
 }
 
 fn commits_for_session<'a>(commits: &'a [GitCommit], session: &Session) -> Vec<&'a GitCommit> {
-    let Some(start) = parse_timestamp(&session.metrics.session_start) else {
+    let Some(start) = parse_ts(&session.metrics.session_start) else {
         return Vec::new();
     };
-    let end = parse_timestamp(&session.metrics.session_end).unwrap_or(start);
+    let end = parse_ts(&session.metrics.session_end).unwrap_or(start);
     let start = start - Duration::minutes(2);
     let end = end + Duration::minutes(5);
     commits
@@ -882,11 +883,10 @@ fn commits_for_session<'a>(commits: &'a [GitCommit], session: &Session) -> Vec<&
         .collect()
 }
 
-fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|value| value.with_timezone(&Utc))
-}
+// NOTE (rm-502): the strict `parse_timestamp` copy that used to live
+// here was removed — governance commit windows route through lib.rs
+// `parse_ts` (the single source of timestamp truth), so naive-ISO
+// sessions match their commits exactly like RFC 3339 ones.
 
 fn normalized_model(model: &str) -> String {
     if model.trim().is_empty() {

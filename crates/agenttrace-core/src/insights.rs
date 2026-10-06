@@ -159,6 +159,12 @@ pub struct DataHealth {
     /// Sessions whose start time is unknown (empty or unparseable). They
     /// stay visible in time-ranged views instead of being dropped.
     pub unknown_time_sessions: usize,
+    /// Sessions whose logs carried naive-ISO timestamps (no `Z`/offset);
+    /// ingest reinterpreted those stamps as UTC through the lenient parse
+    /// arm (rm-502). Counted from per-session event stamps so reports and
+    /// the parse-coverage phrase disclose the reinterpretation instead
+    /// of hiding it behind `confidence: high`.
+    pub naive_utc_sessions: usize,
     /// Parse lines lost inside otherwise-parsed sessions, by reason
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -593,6 +599,10 @@ fn data_health_from_parts(
         .iter()
         .filter(|s| parse_ts(&s.metrics.session_start).is_none())
         .count();
+    let naive_utc_sessions = sessions
+        .iter()
+        .filter(|s| s.metrics.naive_utc_stamps > 0)
+        .count();
     let mut line_skips = BTreeMap::new();
     for session in sessions {
         for (reason, count) in &session.metrics.line_skips {
@@ -644,6 +654,7 @@ fn data_health_from_parts(
         stored_totals_sessions,
         stored_totals_delta_tokens,
         unknown_time_sessions,
+        naive_utc_sessions,
         line_skips,
         non_finite_costs,
         with_duration: sessions
