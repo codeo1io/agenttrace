@@ -105,18 +105,70 @@ pub fn render_doctor_report(
     }
 }
 
-pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
+/// Discovery inputs for [`build_doctor_report`] after the rm-596 demo
+/// gate: the session-cache report, its on-disk size, the walked session
+/// files, and the non-file sessions (SQLite-backed, or the bundled demo
+/// corpus under `--demo`).
+struct DoctorDiscovery {
+    cache: SessionCacheReport,
+    cache_size_bytes: u64,
+    files: Vec<PathBuf>,
+    sessions: Vec<Session>,
+}
+
+/// rm-596: the single demo gate for the doctor report's discovery lanes.
+/// `--doctor --demo` used to gate only the SQLite lane, so the file
+/// discovery lane walked the operator's REAL corpus while the report was
+/// labeled "demo sessions" — real session counts, real project paths,
+/// and a full home walk disclosed under a demo label. Under `demo` every
+/// host-derived lane now short-circuits here: the file lane walks
+/// nothing, the session lane carries the bundled [`crate::demo_sessions`]
+/// corpus, and the session-cache lane reports its path with zeroed
+/// counts (the shape [`doctor_statusline_report`]'s demo arm
+/// established), so a demo report reads no operator state beyond path
+/// strings.
+fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
+    if demo {
+        return DoctorDiscovery {
+            cache: SessionCacheReport {
+                path: session_cache_path(),
+                entries: BTreeMap::new(),
+                dirs: 0,
+            },
+            cache_size_bytes: 0,
+            files: Vec::new(),
+            sessions: crate::demo_sessions().expect("bundled demo corpus"),
+        };
+    }
     let cache = load_session_cache_report();
+    let cache_size_bytes = std::fs::metadata(&cache.path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let files = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
         find_session_files(dir)
     };
-    let sqlite_sessions = if dir.is_none() && !demo {
+    let sessions = if dir.is_none() {
         load_sqlite_backed_sessions()
     } else {
         Vec::new()
     };
+    DoctorDiscovery {
+        cache,
+        cache_size_bytes,
+        files,
+        sessions,
+    }
+}
+
+pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
+    let DoctorDiscovery {
+        cache,
+        cache_size_bytes,
+        files,
+        sessions,
+    } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
         "demo sessions"
@@ -130,8 +182,9 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     let mut disclosures = BTreeMap::new();
     let directories = doctor_directories(
         dir,
+        demo,
         &files,
-        &sqlite_sessions,
+        &sessions,
         &mut project_decode,
         &mut zero_usage,
         &mut disclosures,
@@ -143,15 +196,13 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_entries: cache.entries.len(),
         cache_dirs: cache.dirs,
         cached_valid,
-        cache_size_bytes: std::fs::metadata(&cache.path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
+        cache_size_bytes,
         cache_limits: format!(
             "entries<={}, bytes<={}",
             crate::session_cache::MAX_SESSION_CACHE_ENTRIES,
             crate::session_cache::MAX_SESSION_CACHE_BYTES
         ),
-        sessions: files.len() + sqlite_sessions.len(),
+        sessions: files.len() + sessions.len(),
         session_files: files.len(),
         project_decode,
         zero_usage,
@@ -305,12 +356,26 @@ fn find_reportable_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
 
 fn doctor_directories(
     dir: Option<&Path>,
+    demo: bool,
     files: &[PathBuf],
-    sqlite_sessions: &[Session],
+    sessions: &[Session],
     project_decode: &mut DoctorProjectDecodeReport,
     zero_usage: &mut DoctorZeroUsageReport,
     disclosures: &mut BTreeMap<String, usize>,
 ) -> Vec<DoctorDirReport> {
+    if demo {
+        // rm-596 demo gate: enumerate no real root — both
+        // `known_session_dirs()` and `doctor_sqlite_directories()` probe
+        // the operator's home (paths, `is_dir()`/`is_file()` checks,
+        // symlink targets). Only the bundled corpus's disclosure counters
+        // are folded so the demo report still exercises that aggregate.
+        for session in sessions {
+            for (key, count) in &session.metrics.disclosure_counters {
+                *disclosures.entry(key.clone()).or_insert(0) += count;
+            }
+        }
+        return Vec::new();
+    }
     let mut cache = load_session_cache();
     if let Some(dir) = dir {
         let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -354,11 +419,12 @@ fn doctor_directories(
             disclosures,
         ));
     }
-    dirs.extend(doctor_sqlite_directories(sqlite_sessions));
-    // SQLite-backed sessions never flow through doctor_dir_report; fold
-    // their disclosure counters in directly so every scanned session
-    // discloses identically regardless of backing store.
-    for session in sqlite_sessions {
+    dirs.extend(doctor_sqlite_directories(sessions));
+    // SQLite-backed sessions (and, under `--demo`, the bundled corpus)
+    // never flow through doctor_dir_report; fold their disclosure
+    // counters in directly so every scanned session discloses
+    // identically regardless of backing store.
+    for session in sessions {
         for (key, count) in &session.metrics.disclosure_counters {
             *disclosures.entry(key.clone()).or_insert(0) += count;
         }
@@ -509,7 +575,7 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
     }
     if demo {
         recommendations.push(
-            "Demo sessions use a temporary directory, so cache reuse is not expected in this mode."
+            "Demo sessions are bundled in memory, so cache reuse does not apply in this mode."
                 .to_string(),
         );
         return recommendations;
