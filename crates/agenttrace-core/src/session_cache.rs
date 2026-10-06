@@ -5,7 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 26;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+// Bumped 26 -> 27 (run cb38b958 cycle 2, rm-538): the workbuddy
+// input-basis disclosures (`workbuddy_input_basis:cache_subtracted`,
+// `workbuddy_input_basis:zeroed_suspected_mismatch`) moved from
+// metrics.line_skips to metrics.disclosure_counters — same counters,
+// different channel — so warm v26 snapshots still serve them under
+// "Dropped lines" with degraded data_health.confidence for sessions
+// whose parse was otherwise exact. The rm-230 convention applies:
+// parser-semantics changes that alter the served report for
+// UNCHANGED files bump the schema so cached sessions regenerate
+// under the corrected channel. Entries regenerate once on next
+// scan.
 // Bumped 25 -> 26 (integration of run 32192d92, rm-485): the copilot
 // session-wide credit accounting (totalNanoAiu on shutdown plus the
 // freshest usage_checkpoint snapshot) raises reported cost for

@@ -589,7 +589,7 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     }
     if !report.disclosures.is_empty() {
         out.push_str(&format!(
-            "Journal disclosures: {}\n",
+            "Disclosed facts: {}\n",
             report
                 .disclosures
                 .iter()

@@ -68,6 +68,7 @@ pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
     cached_session, clear_session_cache, load_cached_sessions, load_cached_sessions_from_cache,
     load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,
+    SESSION_CACHE_SCHEMA_VERSION,
 };
 pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
 pub use statusline::{
@@ -393,10 +394,10 @@ pub struct Metrics {
     pub stored_totals_delta: i64,
     /// Parse lines lost inside this session's source file, by reason
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
-    /// Also carries the rm-450 workbuddy basis-disclosure counters
-    /// (`workbuddy_input_basis:*`), which disclose an assumption rather
-    /// than a lost line and ride this channel so they aggregate and
-    /// degrade confidence the same way.
+    /// Pure parse loss only. Assumption disclosures — including the
+    /// rm-450 workbuddy basis counters (`workbuddy_input_basis:*`) —
+    /// live in `disclosure_counters` (rm-538) so they no longer
+    /// degrade confidence like a lost line would.
     /// Empty for clean parses.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
@@ -413,13 +414,20 @@ pub struct Metrics {
     /// rate.
     #[serde(skip_serializing_if = "zero_usd")]
     pub upstream_cost_usd: f64,
-    /// Parse-time disclosure counters (pi-family journals,
+    /// Parse-time disclosure counters: journal facts the accounting
+    /// keeps visible without treating them as loss (pi-family,
     /// rm-436/rm-437): `pi_usage_entry:<kind>` per usage-entry kind,
     /// `pi_branches` when a v2/v3 tree journal has more than one
     /// branch end, `pi_entry_skipped:<type>` /
     /// `pi_message_role:<role>` for documented shapes the accounting
-    /// intentionally does not count. Empty for journals without
-    /// disclosures.
+    /// intentionally does not count; plus the workbuddy input-basis
+    /// assumption notes (rm-450 minted, rm-538 moved here):
+    /// `workbuddy_input_basis:cache_subtracted` when a priced journal
+    /// already subtracted cache from input, and
+    /// `workbuddy_input_basis:zeroed_suspected_mismatch` when a usage
+    /// block reports cache but zeroes input — assumptions, not lost
+    /// lines, so they never degrade `data_health.confidence` (rm-538).
+    /// Empty for journals without disclosures.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosure_counters: BTreeMap<String, usize>,
     pub provenance: MetricProvenance,
@@ -818,13 +826,11 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let mut upstream_priced_output = 0i64;
     let mut upstream_priced_cache_w = 0i64;
     let mut upstream_priced_cache_r = 0i64;
-    // rm-450 disclosure counters, in the pass-7 line_skips family so they
-    // ride the existing DataHealth aggregation and confidence degradation.
-    let mut line_skips: BTreeMap<String, usize> = BTreeMap::new();
-
-    // rm-490: capture a family fallback before the loop consumes `events` —
-    // meta-only sessions (codex usage journals, copilot metric records)
-    // otherwise end with an empty source_tool.
+    // rm-450 first minted the workbuddy basis disclosures into the
+    // line_skips family so they degraded confidence; rm-538 moves them
+    // to metrics.disclosure_counters — the non-loss disclosure channel
+    // — so they stay visible under the disclosure row without tanking
+    // confidence for an otherwise-exact parse.
     let meta_fallback_source_tool = events
         .iter()
         .find(|event| !event.source_tool.is_empty())
@@ -885,11 +891,13 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     if event.source_tool == "workbuddy"
                         && usage_tokens("cache_read_input_tokens") > 0
                     {
-                        *line_skips
+                        *metrics
+                            .disclosure_counters
                             .entry("workbuddy_input_basis:cache_subtracted".to_string())
                             .or_insert(0) += 1;
                         if usage_tokens("input_tokens") == 0 {
-                            *line_skips
+                            *metrics
+                                .disclosure_counters
                                 .entry(
                                     "workbuddy_input_basis:zeroed_suspected_mismatch".to_string(),
                                 )
@@ -1177,9 +1185,6 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     } else if metrics.upstream_cost_usd > 0.0 {
         metrics.provenance.pricing_source =
             format!("{} + recorded cost", metrics.provenance.pricing_source);
-    }
-    if !line_skips.is_empty() {
-        metrics.line_skips = line_skips;
     }
     metrics
 }
@@ -2948,13 +2953,13 @@ mod tests {
         let metrics = analyze(&[wb_meta_event(usage)], "gpt-5");
         assert_eq!(
             metrics
-                .line_skips
+                .disclosure_counters
                 .get("workbuddy_input_basis:cache_subtracted"),
             Some(&1)
         );
         assert_eq!(
             metrics
-                .line_skips
+                .disclosure_counters
                 .get("workbuddy_input_basis:zeroed_suspected_mismatch"),
             Some(&1)
         );
@@ -2977,12 +2982,12 @@ mod tests {
         let metrics = analyze(&[wb_meta_event(usage)], "gpt-5");
         assert_eq!(
             metrics
-                .line_skips
+                .disclosure_counters
                 .get("workbuddy_input_basis:cache_subtracted"),
             Some(&1)
         );
         assert!(!metrics
-            .line_skips
+            .disclosure_counters
             .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
     }
 
@@ -2990,7 +2995,7 @@ mod tests {
     fn workbuddy_basis_disclosure_ignores_other_sources_and_no_cache() {
         // cache_read on a non-workbuddy meta event is the normal Claude
         // shape and must NOT trip the workbuddy disclosure; a workbuddy
-        // usage without cache_read leaves line_skips empty entirely.
+        // usage without cache_read leaves both channels empty entirely.
         let claude_usage: BTreeMap<String, i64> =
             [("input_tokens", 500), ("cache_read_input_tokens", 1500)]
                 .into_iter()
@@ -3000,6 +3005,7 @@ mod tests {
         e.source_tool = "claude_code".to_string();
         let metrics = analyze(&[e], "gpt-5");
         assert!(metrics.line_skips.is_empty());
+        assert!(metrics.disclosure_counters.is_empty());
 
         let plain_usage: BTreeMap<String, i64> = [("input_tokens", 500)]
             .into_iter()
@@ -3007,6 +3013,7 @@ mod tests {
             .collect();
         let metrics = analyze(&[wb_meta_event(plain_usage)], "gpt-5");
         assert!(metrics.line_skips.is_empty());
+        assert!(metrics.disclosure_counters.is_empty());
     }
 
     #[test]
@@ -3024,7 +3031,7 @@ mod tests {
         assert_eq!(
             session
                 .metrics
-                .line_skips
+                .disclosure_counters
                 .get("workbuddy_input_basis:zeroed_suspected_mismatch"),
             Some(&1)
         );
@@ -3041,13 +3048,13 @@ mod tests {
         assert_eq!(
             session
                 .metrics
-                .line_skips
+                .disclosure_counters
                 .get("workbuddy_input_basis:cache_subtracted"),
             Some(&1)
         );
         assert!(!session
             .metrics
-            .line_skips
+            .disclosure_counters
             .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
         assert_eq!(session.metrics.tokens_input, 500);
     }

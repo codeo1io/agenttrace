@@ -1,3 +1,4 @@
+use agenttrace_core::SESSION_CACHE_SCHEMA_VERSION;
 use agenttrace_core::{
     build_doctor_report, data_health, data_health_scoped, find_session_files,
     load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress, parse_file,
@@ -987,7 +988,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(26)
+            Some(SESSION_CACHE_SCHEMA_VERSION)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1159,7 +1160,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         // 22 -> 23 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(26)
+            Some(SESSION_CACHE_SCHEMA_VERSION)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))

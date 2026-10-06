@@ -220,6 +220,12 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     bail!("unsupported session format: {}", path)
 }
 
+/// Copilot usage-checkpoint snapshot carried between the first pass and the
+/// credit roll-up below: (timestamp, per-model usage rows). The alias exists
+/// to keep the nested tuple under clippy's type_complexity budget — the
+/// shape is exactly what parse_copilot_session_jsonl always used.
+type CheckpointSnapshot = Option<(String, Vec<(String, BTreeMap<String, i64>)>)>;
+
 fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     if !objs
         .iter()
@@ -237,7 +243,7 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // shutdown metrics were emitted at all.
     let mut max_credit_nano: f64 = 0.0;
     let mut shutdown_metrics_emitted = false;
-    let mut checkpoint_snapshot: Option<(String, Vec<(String, BTreeMap<String, i64>)>)> = None;
+    let mut checkpoint_snapshot: CheckpointSnapshot = None;
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();

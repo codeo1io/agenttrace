@@ -677,16 +677,16 @@ fn enforce_report_gates(args: &Args, sessions: &[Session]) {
     let inspect = if args.demo {
         format!(
             "agenttrace --demo {} -f json",
-            governance_inspect_flag(&args)
+            governance_inspect_flag(args)
         )
     } else if let Some(dir) = args.dir.as_deref() {
         format!(
             "agenttrace -d {:?} {} -f json",
             dir,
-            governance_inspect_flag(&args)
+            governance_inspect_flag(args)
         )
     } else {
-        format!("agenttrace {} -f json", governance_inspect_flag(&args))
+        format!("agenttrace {} -f json", governance_inspect_flag(args))
     };
     eprintln!("- inspect: `{inspect}`");
     std::process::exit(2);
