@@ -80,24 +80,39 @@ impl std::fmt::Display for GitRunError {
 /// deadlock against a child whose pipe buffer fills, turning a fast
 /// child into a spurious timeout (the governance.rs
 /// `wait_child_bounded` comment states the same contract). On deadline
-/// the child is killed and the drains are joined so no thread
-/// outlives the call.
+/// the whole process group is killed and the function returns WITHOUT
+/// joining the drain threads (rm-583): the child spawns as its own
+/// group leader, so the kill takes grandchildren down with it — but a
+/// grandchild that escaped the group (setsid) can hold a pipe write-end
+/// forever, and the bound must outrank the drain. The drain threads then
+/// finish on their own when the last write-end closes, exactly the
+/// contract governance's `git_commits` kill-and-return established
+/// (PoC pocD.sh: a fake git spawning pipe-holding orphans kept the old
+/// kill-then-join shape alive 25s past a 10s deadline).
 fn run_bounded(
     program: &str,
     args: &[&str],
     bound: Duration,
 ) -> Result<(std::process::ExitStatus, String, String), GitRunError> {
     let op = format!("{program} {}", args.join(" "));
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| GitRunError::Spawn {
-            op: op.clone(),
-            message: err.to_string(),
-        })?;
+        .stderr(Stdio::piped());
+    // rm-583: own process group so a deadline kill can take the whole
+    // tree down in one signal — killing only the direct child leaves
+    // grandchildren holding the pipe write-ends.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|err| GitRunError::Spawn {
+        op: op.clone(),
+        message: err.to_string(),
+    })?;
     let stdout = spawn_drain(child.stdout.take());
     let stderr = spawn_drain(child.stderr.take());
     let deadline = Instant::now() + bound;
@@ -106,10 +121,11 @@ fn run_bounded(
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_process_tree(&mut child);
             let _ = child.wait();
-            let _ = stdout.join();
-            let _ = stderr.join();
+            // rm-583: no drain joins here — see the doc comment above.
+            // The threads are owned by their JoinHandles and detach;
+            // they finish when the last write-end closes.
             return Err(GitRunError::Timeout { op, bound });
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -123,6 +139,33 @@ fn run_bounded(
         });
     }
     Ok((status, stdout, stderr))
+}
+
+/// rm-583: kill the child's whole process tree. `process_group(0)` at
+/// spawn made the child its own group leader, so signalling the
+/// negated pid takes every descendant that stayed in the group — the
+/// grandchildren that inherit the pipe write-ends die with it instead
+/// of holding the drain threads hostage.
+#[cfg(unix)]
+fn kill_process_tree(child: &mut std::process::Child) {
+    // SAFETY: libc::kill only enqueues a signal; the pid is the child's
+    // own process group (it became the leader at spawn, before exec, so
+    // no grandchild can have raced into it), and the child has not been
+    // reaped yet, so the id cannot be recycled.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    // Belt for a raced setpgid (killpg ESRCH): the direct child must die
+    // regardless of the group outcome.
+    let _ = child.kill();
+}
+
+/// rm-583, non-unix arm: no process-group primitive exists; killing the
+/// direct child is the best available bound and the unjoined drains keep
+/// the call from blocking on whatever survives it.
+#[cfg(not(unix))]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn spawn_drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
@@ -624,6 +667,59 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "the deadline, not the child's lifetime, bounds the wait"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_kills_pipe_holding_grandchildren_at_the_deadline() {
+        // rm-583: the PoC shape (assess pocD.sh) — a hung child that
+        // spawned orphans inheriting the pipe write-ends. Killing only
+        // the direct child left the orphans holding the drains open,
+        // and the unconditional join hung the CLI far past its own
+        // bound (a 10s deadline was still running at 25s). The child
+        // now leads its own process group and the deadline kill
+        // signals the whole group, so the pipes close and the call
+        // returns at the bound instead of when the orphans exit.
+        let started = Instant::now();
+        let result = run_bounded(
+            "sh",
+            &["-c", "sleep 10 & sleep 10"],
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(result, Err(GitRunError::Timeout { .. })),
+            "expected Timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the group kill, not the orphans' lifetime, bounds the wait"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_returns_at_the_deadline_when_a_grandchild_escapes_the_group() {
+        // rm-583's second half: a grandchild that escaped the process
+        // group (setsid — the ssh/askpass/git-remote fetch shape) still
+        // holds the pipe write-ends after the group kill. The bound
+        // must outrank the drain: the call returns at the deadline
+        // WITHOUT joining the drain threads, the same contract
+        // governance's git_commits established (rm-242). The escaped
+        // orphan dies on its own timer; it may never hold the CLI.
+        let started = Instant::now();
+        let result = run_bounded(
+            "sh",
+            &["-c", "setsid sleep 10 & sleep 10"],
+            Duration::from_millis(300),
+        );
+        assert!(
+            matches!(result, Err(GitRunError::Timeout { .. })),
+            "expected Timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "no join may wait out an escaped grandchild"
         );
     }
 

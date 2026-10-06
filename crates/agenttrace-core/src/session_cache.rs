@@ -5,7 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
+// Bumped 27 -> 28 (rm-584/rm-585, run fb1addd5 "truth and bounds"): the
+// copilot per-model MAX fold restores usage that partial shutdowns and
+// partial later checkpoints used to erase (pocA/pocA2: claude-x's 280
+// tokens vanished — tokens_input/output and cost change for UNCHANGED
+// copilot files), and the codex custom-tool failure re-pair plus the
+// empty-type disclosure change tool_calls_fail and line_skips for
+// unchanged codex journals. Warm v27 entries still carry the pre-fix
+// numbers with matching fingerprints — no re-parse, no self-heal — so
+// the schema bumps and every entry regenerates once on next scan per
+// the rm-230 convention (parser-semantics changes bump the schema so
+// cached sessions regenerate under corrected accounting).
 // Bumped 26 -> 27 (integration of run b1ff12f8, rm-542, minted
 // campaign-locally as rm-449): the Codex custom-tools response items are
 // now parsed — custom_tool_call / custom_tool_call_output pairs count as

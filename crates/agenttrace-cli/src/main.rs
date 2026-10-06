@@ -192,6 +192,20 @@ fn run() -> anyhow::Result<()> {
     // this is an explicit user action that may fail loudly. It is fully
     // offline unless --fetch explicitly opts into the network.
     if args.path.as_deref() == Some("upstream") {
+        // rm-583 rider (assess NN1): clap accepts `-o FILE` before the
+        // keyword, but this dispatch prints the report to stdout — the
+        // flag would be silently dropped (rc0, no file written). The
+        // after-keyword form already fails loudly in the argv shim
+        // (rm-505); refuse the before-keyword form symmetrically instead
+        // of letting a succeeding report lie.
+        if let Some(output) = &args.output {
+            bail!(
+                "flag `-o` precedes the `upstream` keyword but the upstream report \
+                 always goes to stdout (dropped: `-o {}`); drop the flag or redirect the \
+                 shell (`agenttrace upstream > FILE`), or run `agenttrace upstream --help`",
+                output.display()
+            );
+        }
         let report = upstream::status_report(&args.format, args.fetch)?;
         write_stdout(&report)?;
         return Ok(());

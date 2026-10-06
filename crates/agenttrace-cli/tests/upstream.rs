@@ -366,3 +366,26 @@ fn fetch_flag_without_the_upstream_command_is_rejected() {
         stderr(&output)
     );
 }
+
+#[test]
+fn output_flag_before_the_upstream_keyword_is_rejected() {
+    // rm-583 rider (assess NN1, folding unlanded rm-574's
+    // loud-otherwise contract): clap accepts `-o FILE` before the
+    // keyword, but the upstream early dispatch prints the report to
+    // stdout — the flag used to be silently dropped on a succeeding
+    // report (rc0, report on stdout, no file, no warning; the
+    // after-keyword form already fails loudly via the argv shim,
+    // rm-505). The before-keyword form refuses symmetrically now.
+    let fixture = Fixture::new("preupo");
+    let output = run_cli(&fixture.fork, &["-o", "upstream-report.txt", "upstream"]);
+    assert!(!output.status.success(), "a dropped -o must fail loudly");
+    assert!(
+        stderr(&output).contains("precedes the `upstream` keyword"),
+        "expected the -o-before-keyword refusal, got {:?}",
+        stderr(&output)
+    );
+    assert!(
+        !fixture.fork.join("upstream-report.txt").exists(),
+        "a refused flag must not also write the report file"
+    );
+}
