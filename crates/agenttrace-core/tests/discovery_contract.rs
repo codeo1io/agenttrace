@@ -983,11 +983,13 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // credit accounting, re-based off the campaign's 22 -> 23 bump;
         // 25 was the rm-450 workbuddy input-basis disclosure, 24 the
         // rm-436/437/438 pi journal accounting, 23 rm-408, 22 was run
-        // 2c2db6f5 rm-400/401): parser-semantics fixes bump the schema
+        // 2c2db6f5 rm-400/401; 26 was rm-485, 27 is the run-7f9c6d24
+        // usage-accounting truthfulness batch rm-551..rm-556):
+        // parser-semantics fixes bump the schema
         // so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(26)
+            Some(27)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1156,10 +1158,11 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         // rm-408 and rm-400/401 bump notes in session_cache.rs; the
         // copilot session-wide credit accounting is what carried
         // 25 -> 26 at this integration, re-based off the campaign's
-        // 22 -> 23 bump).
+        // 22 -> 23 bump; 26 -> 27 is the run-7f9c6d24
+        // usage-accounting truthfulness batch rm-551..rm-556).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(26)
+            Some(27)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1493,7 +1496,12 @@ fn rust_codex_rollout_token_counts_use_turn_context_model() {
     assert_eq!(metrics.source_tool, "codex_cli");
     assert_eq!(metrics.tokens_input, 800);
     assert_eq!(metrics.tokens_cache_r, 900);
-    assert_eq!(metrics.tokens_output, 190);
+    // Dated pin change 2026-10-06 (rm-553, upstream #312): reasoning is a
+    // BREAKDOWN of output_tokens, so each window's output is its raw
+    // output_tokens (100 + 60) with reasoning on its own line (20 + 10)
+    // instead of folded in (190).
+    assert_eq!(metrics.tokens_output, 160);
+    assert_eq!(metrics.tokens_reasoning, 30);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
 
@@ -1939,7 +1947,12 @@ fn rust_parses_qwen_code_stream_jsonl() {
     assert_eq!(metrics.assistant_turns, 1);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
-    assert_eq!(metrics.tokens_input, 120);
+    // rm-552 (2026-10-06, upstream #312): the qwen input aliases are
+    // cache-INCLUSIVE — the 120 input_tokens already contains the 10
+    // cached read tokens, so net input is 110 beside the separate cache
+    // line (the old 120 pin stacked the cached span on top of an input
+    // count that already contained it).
+    assert_eq!(metrics.tokens_input, 110);
     assert_eq!(metrics.tokens_output, 45);
     assert_eq!(metrics.tokens_cache_r, 10);
     assert_eq!(metrics.tokens_cache_w, 5);

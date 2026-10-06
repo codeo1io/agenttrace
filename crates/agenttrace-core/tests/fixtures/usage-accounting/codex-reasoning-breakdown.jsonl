@@ -1,0 +1,2 @@
+{"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x"}}
+{"timestamp":"2026-10-01T09:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":400,"reasoning_output_tokens":150},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":400,"reasoning_output_tokens":150}}}}

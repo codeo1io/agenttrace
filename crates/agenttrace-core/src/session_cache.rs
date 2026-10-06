@@ -5,7 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 26;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+// Bumped 26 -> 27 (run 7f9c6d24 cycle 2, "usage-accounting truthfulness",
+// rm-551..rm-556): the batch corrects derived token totals for
+// UNCHANGED source files — claude streaming per-message-id folding,
+// qwen alias/cache-inclusive basis, codex reasoning double-add and
+// post-compaction forward counting, copilot per-model shutdown
+// tracking and the shutdown timestamp tail — so a warm v26 cache keeps
+// serving the pre-fix totals with matching fingerprints and never
+// re-parses (rm-230 convention: parser-semantics changes bump the
+// schema so cached sessions regenerate under corrected accounting).
+// Entries regenerate once on next scan.
 // Bumped 25 -> 26 (integration of run 32192d92, rm-485): the copilot
 // session-wide credit accounting (totalNanoAiu on shutdown plus the
 // freshest usage_checkpoint snapshot) raises reported cost for

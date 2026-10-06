@@ -1,0 +1,2 @@
+{"type":"user","uuid":"u-1","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}
+{"type":"assistant","uuid":"u-2","timestamp":"2026-10-01T10:00:05Z","message":{"role":"assistant","model":"qwen3-coder-plus","content":[{"type":"text","text":"ok"}],"usage":{"promptTokenCount":1000,"candidatesTokenCount":100,"thoughtsTokenCount":0,"cacheRead":600,"cacheWrite":0}}}

@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 type TokenUsage = BTreeMap<String, i64>;
 type JsonObject = Map<String, Value>;
 type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
+/// Copilot per-model usage snapshot (model -> timestamped usage map), the
+/// shape both `usage_checkpoint` records and `session.shutdown`
+/// `modelMetrics` carry (rm-485/rm-555).
+type CopilotModelUsage = (String, TokenUsage);
 
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
@@ -236,8 +240,19 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // counter seen (checkpoints and shutdown snapshots overlap) and whether
     // shutdown metrics were emitted at all.
     let mut max_credit_nano: f64 = 0.0;
-    let mut shutdown_metrics_emitted = false;
-    let mut checkpoint_snapshot: Option<(String, Vec<(String, BTreeMap<String, i64>)>)> = None;
+    // rm-555: shutdown modelMetrics are per-model cumulative snapshots and
+    // every resume writes another shutdown record. Track the latest record
+    // per model instead of one global "a shutdown emitted" bool — the
+    // bool suppressed the checkpoint models a partial shutdown lacked and
+    // let a stale first resume's totals win (ccusage #1823/#1824; upstream
+    // #312 dedupes "to the latest per model").
+    let mut shutdown_usage: BTreeMap<String, (String, TokenUsage)> = BTreeMap::new();
+    let mut checkpoint_snapshot: Option<(String, Vec<CopilotModelUsage>)> = None;
+    // rm-556: a metrics-less shutdown record still ends the session — its
+    // timestamp is the latest activity and must reach an event, or the
+    // duration loses the tail (the credit event used to ride the
+    // checkpoint's timestamp or the empty default).
+    let mut latest_shutdown_timestamp = String::new();
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
@@ -307,21 +322,19 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 {
                     for (model, metric) in metrics {
                         if let Some(usage) = metric.get("usage").and_then(usage_from_value) {
-                            shutdown_metrics_emitted = true;
-                            events.insert(
-                                0,
-                                Event {
-                                    role: "meta".to_string(),
-                                    timestamp: timestamp.clone(),
-                                    usage,
-                                    model_used: model.clone(),
-                                    source_tool: "copilot_cli".to_string(),
-                                    ..Event::default()
-                                },
-                            );
+                            // rm-555: only the LATER record per model counts
+                            // (a resume re-emits the cumulative snapshot).
+                            let stale = shutdown_usage
+                                .get(model)
+                                .map(|(seen, _)| later_rfc3339(seen, &timestamp) != timestamp)
+                                .unwrap_or(false);
+                            if !stale {
+                                shutdown_usage.insert(model.clone(), (timestamp.clone(), usage));
+                            }
                         }
                     }
                 }
+                latest_shutdown_timestamp = later_rfc3339(&latest_shutdown_timestamp, &timestamp);
                 if let Some(nano) = data
                     .and_then(|data| data.get("totalNanoAiu"))
                     .and_then(Value::as_f64)
@@ -361,33 +374,55 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             _ => {}
         }
     }
-    // rm-485: open/killed sessions never reach shutdown — surface the last
-    // checkpoint's per-model usage instead (shutdown metrics, when present,
-    // win; emitting both would double-count).
-    let credit_timestamp = checkpoint_snapshot
+    // rm-485/rm-555: open/killed sessions never reach shutdown — surface
+    // the last checkpoint's per-model usage for the models no shutdown
+    // record carried (the partial-shutdown shape); when both records carry
+    // a model, the LATER cumulative snapshot wins, so a resume's second
+    // shutdown record replaces the first instead of stacking on it
+    // (emitting both per model would double-count).
+    let checkpoint_timestamp = checkpoint_snapshot
         .as_ref()
         .map(|(timestamp, _)| timestamp.clone())
         .unwrap_or_default();
-    if !shutdown_metrics_emitted {
-        if let Some((timestamp, snapshot)) = checkpoint_snapshot {
-            for (model, usage) in snapshot {
-                events.insert(
-                    0,
-                    Event {
-                        role: "meta".to_string(),
-                        timestamp: timestamp.clone(),
-                        usage,
-                        model_used: model,
-                        source_tool: "copilot_cli".to_string(),
-                        ..Event::default()
-                    },
-                );
-            }
+    let mut per_model: BTreeMap<String, (String, TokenUsage)> = BTreeMap::new();
+    if let Some((timestamp, snapshot)) = checkpoint_snapshot {
+        for (model, usage) in snapshot {
+            per_model.insert(model, (timestamp.clone(), usage));
         }
+    }
+    for (model, (timestamp, usage)) in shutdown_usage {
+        let stale = per_model
+            .get(&model)
+            .map(|(seen, _)| later_rfc3339(seen, &timestamp) != timestamp)
+            .unwrap_or(false);
+        if !stale {
+            per_model.insert(model, (timestamp, usage));
+        }
+    }
+    let mut latest_usage_timestamp = String::new();
+    for (timestamp, _) in per_model.values() {
+        latest_usage_timestamp = later_rfc3339(&latest_usage_timestamp, timestamp);
+    }
+    for (model, (timestamp, usage)) in per_model {
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                timestamp,
+                usage,
+                model_used: model,
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            },
+        );
     }
     // rm-485: emit the session-wide credit counter as a cost-only meta
     // event (1 AIU = 1 AI credit = $0.01 per ccusage #1824 semantics). Max
     // semantics upstream keep repeated snapshots from double-counting.
+    // rm-556: the timestamp is the latest activity across checkpoint and
+    // shutdown records — a metrics-less shutdown at T+20s over messages
+    // ending at T+1s used to leave the duration at 1.0s.
+    let credit_timestamp = later_rfc3339(&checkpoint_timestamp, &latest_shutdown_timestamp);
     if max_credit_nano > 0.0 {
         events.insert(
             0,
@@ -396,6 +431,23 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 timestamp: credit_timestamp,
                 model_used: "unknown".to_string(),
                 credit_usd: max_credit_nano * 0.01 / 1_000_000_000.0,
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            },
+        );
+    } else if !latest_shutdown_timestamp.is_empty()
+        && later_rfc3339(&latest_usage_timestamp, &latest_shutdown_timestamp)
+            == latest_shutdown_timestamp
+    {
+        // rm-556 fallback: a credit-less, metrics-less shutdown record
+        // still ends the session; a bare terminal marker keeps its
+        // timestamp inside the duration span (no usage, so nothing else
+        // in the metrics can move).
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                timestamp: latest_shutdown_timestamp,
                 source_tool: "copilot_cli".to_string(),
                 ..Event::default()
             },
@@ -2415,14 +2467,32 @@ fn qwen_tool_result_events(raw: Option<&Value>, ts: &str, model: &str) -> Vec<Ev
     events
 }
 
+/// Qwen Code builds usage from Gemini-style metadata: the input aliases
+/// (upstream #312: `input_tokens` IS `promptTokenCount`) are cache-
+/// INCLUSIVE and multiple aliases of the same class can BOTH be present,
+/// so each class counts its FIRST present alias — never the sum — and the
+/// cached span rides its own cache-read line beside net input (rm-552:
+/// the old alias SUM double-counted a both-alias stream, and the
+/// inclusive input was stacked on top of the separately-reported cache
+/// span for a 1.7x total). The CU-20 reasoning fold below is unchanged:
+/// thinking counters are billed at the output rate and additionally
+/// broken out as reasoning_tokens.
 fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let obj = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
-    let input = sum_numbers(
+    let cache_read = first_number(
+        obj,
+        &["cache_read_input_tokens", "cacheRead", "cached_tokens"],
+    );
+    // rm-552: net input beside the cache line — the inclusive-basis span
+    // (promptTokenCount/prompt_tokens/input_tokens) already contains the
+    // cached tokens reported separately above.
+    let input = (first_number(
         obj,
         &["input_tokens", "prompt_tokens", "input", "promptTokenCount"],
-    );
-    let output = sum_numbers(
+    ) - cache_read)
+        .max(0);
+    let output = first_number(
         obj,
         &[
             "output_tokens",
@@ -2436,7 +2506,7 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     // usageMetadata.thoughtsTokenCount and the OpenAI-compatible
     // reasoning_tokens aliases); fold them into output and keep the
     // breakdown for the audit (pass-9 CU-20).
-    let reasoning = sum_numbers(
+    let reasoning = first_number(
         obj,
         &[
             "thoughtsTokenCount",
@@ -2446,11 +2516,7 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
         ],
     );
     let output = output.saturating_add(reasoning);
-    let cache_read = sum_numbers(
-        obj,
-        &["cache_read_input_tokens", "cacheRead", "cached_tokens"],
-    );
-    let cache_write = sum_numbers(obj, &["cache_creation_input_tokens", "cacheWrite"]);
+    let cache_write = first_number(obj, &["cache_creation_input_tokens", "cacheWrite"]);
     if input > 0 {
         usage.insert("input_tokens".to_string(), input);
     }
@@ -2570,7 +2636,12 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_codex = false;
-    let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
+    // rm-554 (upstream #312): token_count accounting state — the distinct
+    // running totals already counted plus the most recent total. Replaces
+    // the rm-162/#286 high-water mark, which refused ALL post-compaction
+    // growth inside the old envelope even though those context re-sends
+    // are billed usage.
+    let mut codex_totals = CodexTotals::default();
     // rm-047: the head-probe fast path used to discard lines invisibly;
     // count every skip so parse diagnostics can surface it. rm-401
     // widened the map to the compaction-usage decisions too.
@@ -2644,10 +2715,9 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     continue;
                 };
                 if string(payload.get("type")) == Some("token_count") {
-                    if let Some((usage, next_total)) =
-                        codex_token_count_usage(payload.get("info"), prev_token_total.as_ref())
+                    if let Some(usage) =
+                        codex_token_count_usage(payload.get("info"), &mut codex_totals)
                     {
-                        prev_token_total = next_total;
                         events.push(Event {
                             role: "meta".to_string(),
                             timestamp: ts,
@@ -2783,9 +2853,9 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     // #1821 dedups the copy). Unpaired records describe turns whose usage is
     // already inside the cumulative snapshots, so they count for nothing but
     // stay visible in diagnostics — the class this defect evaded. Counted
-    // usage never touches prev_token_total: the compaction turn is outside
-    // every cumulative snapshot, so feeding it to the high-water baseline
-    // would eat the next snapshot's climb.
+    // usage never touches codex_totals: the compaction turn is outside
+    // every cumulative snapshot, so feeding it to the totals state would
+    // eat the next distinct total's window.
     let mut counted: BTreeSet<&str> = BTreeSet::new();
     for record in &usage_records {
         if record.response_id.is_empty() || !compaction_response_ids.contains(&record.response_id) {
@@ -2892,20 +2962,29 @@ fn json_key_present(line: &str, needle: &str) -> bool {
 
 fn codex_token_count_usage(
     raw_info: Option<&Value>,
-    prev_total: Option<&TokenUsage>,
-) -> Option<(TokenUsage, Option<TokenUsage>)> {
+    totals: &mut CodexTotals,
+) -> Option<TokenUsage> {
     let info = raw_info?.as_object()?;
     let total = token_usage_map(info.get("total_token_usage"));
-    let (counts, next_total) = if !total.is_empty() {
-        // rm-162 / upstream #286: keep the high-water mark as `prev` so a
-        // post-compaction rewind followed by a rebound is not counted twice.
-        let delta = token_usage_delta(&total, prev_total);
-        (delta, Some(token_usage_high_water(&total, prev_total)))
+    let last = token_usage_map(info.get("last_token_usage"));
+    let counts = if total.is_empty() {
+        last
     } else {
-        (
-            token_usage_map(info.get("last_token_usage")),
-            prev_total.cloned(),
-        )
+        let prev = totals.prev.replace(total.clone());
+        if !totals.seen.insert(total.clone()) {
+            // rm-554: the same running total re-emitted (rate-limit-only
+            // update) carries no fresh usage — count nothing.
+            return None;
+        }
+        if usage_has_values(&last) {
+            // The snapshot of the call that just finished IS the fresh
+            // usage this window added (post-compaction windows included).
+            last
+        } else {
+            // No last snapshot in older journals: approximate the window
+            // as the forward delta from the previous distinct total.
+            token_usage_delta(&total, prev.as_ref())
+        }
     };
     if counts.is_empty() || !usage_has_values(&counts) {
         return None;
@@ -2920,21 +2999,36 @@ fn codex_token_count_usage(
         .copied()
         .unwrap_or(0);
     let input = (counts.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-    // Saturating (rm-162): two legal in-range counters can sum past i64::MAX
-    // on adversarial journals; plain `+` panicked in debug and wrapped negative
-    // in release. Sibling sums at sum_numbers already saturate for the same reason.
-    let output = counts
-        .get("output_tokens")
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(counts.get("reasoning_output_tokens").copied().unwrap_or(0));
+    // rm-553 (upstream #312): on the OpenAI wire Codex reports,
+    // reasoning_output_tokens is a BREAKDOWN of output_tokens, not an
+    // addition — the old fold billed every reasoning turn twice. Keep it
+    // on its own reasoning_tokens line (billed at the output rate by CU-20
+    // convention, visible in the metrics breakdown); the rm-401
+    // token_usage_record lane below keeps its deliberate fold.
+    let output = counts.get("output_tokens").copied().unwrap_or(0);
+    let reasoning = counts.get("reasoning_output_tokens").copied().unwrap_or(0);
 
     let mut usage = BTreeMap::new();
     usage.insert("input_tokens".to_string(), input);
     usage.insert("output_tokens".to_string(), output);
+    if reasoning > 0 {
+        usage.insert("reasoning_tokens".to_string(), reasoning);
+    }
     usage.insert("cache_creation_input_tokens".to_string(), cache_write);
     usage.insert("cache_read_input_tokens".to_string(), cache_read);
-    Some((usage, next_total))
+    Some(usage)
+}
+
+/// rm-554 (upstream #312): token_count accounting state — the distinct
+/// running totals already counted and the most recent total. Replaces the
+/// rm-162/#286 high-water mark, which refused all post-compaction growth
+/// inside the old envelope even though those context re-sends are billed
+/// usage (the counters are cumulative and NOT monotonic: compaction resets
+/// them, and the same total re-emits on rate-limit-only updates).
+#[derive(Default)]
+struct CodexTotals {
+    prev: Option<TokenUsage>,
+    seen: BTreeSet<TokenUsage>,
 }
 
 fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
@@ -2960,16 +3054,10 @@ fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
 }
 
 // Codex can briefly rewind total_token_usage (e.g. after compaction) and then
-// climb back; tracking the high-water mark keeps the rebound from being counted
-// twice. Ported from upstream #286 (rm-035, renumbered rm-162 at integration).
-fn token_usage_high_water(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
-    let mut merged = prev.cloned().unwrap_or_default();
-    for (key, value) in cur {
-        let slot = merged.entry(key.clone()).or_insert(0);
-        *slot = (*slot).max(*value);
-    }
-    merged
-}
+// climb back; rm-554 (upstream #312) counts each distinct total's last
+// snapshot once so the post-compaction climb is real usage — this replaced
+// the rm-035/rm-162 high-water helper (upstream #286), which double-refused
+// that window.
 
 fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
     let Some(prev) = prev else {
@@ -2995,7 +3083,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_claude = false;
-    let mut seen_usage_snapshots = BTreeSet::new();
+    // rm-551 (upstream #312): streaming writes one assistant row per
+    // content block, each repeating the message's usage with growing
+    // totals on the SAME message id. Fold re-emissions into ONE meta
+    // event per id, keeping the max per token class (never the sum: a
+    // 5-block stream tripled the reported output). Exact duplicates
+    // collapse to the same values; id-less messages keep the legacy
+    // behavior of counting every emission (pinned by fixture).
+    let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
@@ -3032,17 +3127,19 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         model = next_model.to_string();
                     }
                 }
-                if let Some(usage_value) = message.get("usage") {
+                if let Some(usage) = message.get("usage").and_then(usage_from_value) {
                     let message_id = string(message.get("id")).unwrap_or("");
-                    let usage_key = if message_id.is_empty() {
-                        String::new()
-                    } else {
-                        serde_json::to_string(usage_value)
-                            .map(|usage| format!("{message_id}:{usage}"))
-                            .unwrap_or_default()
-                    };
-                    if usage_key.is_empty() || seen_usage_snapshots.insert(usage_key) {
-                        if let Some(usage) = usage_from_value(usage_value) {
+                    match usage_by_message.get(message_id).copied() {
+                        Some(index) => {
+                            for (key, value) in usage {
+                                let slot = events[index].usage.entry(key).or_insert(0);
+                                *slot = (*slot).max(value);
+                            }
+                        }
+                        None => {
+                            if !message_id.is_empty() {
+                                usage_by_message.insert(message_id.to_string(), events.len());
+                            }
                             events.push(Event {
                                 role: "meta".to_string(),
                                 timestamp: ts.clone(),
@@ -4460,6 +4557,25 @@ fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
     Some(usage)
 }
 
+/// Compare two RFC3339 timestamp strings and return the later one; ties
+/// keep the candidate. Falls back to lexicographic order when either side
+/// fails to parse (rm-556: shutdown/checkpoint records both end sessions,
+/// and the latest activity — not the freshest parse — must win).
+fn later_rfc3339(current: &str, candidate: &str) -> String {
+    let parse = chrono::DateTime::parse_from_rfc3339;
+    let candidate_wins = match (parse(current), parse(candidate)) {
+        (Ok(a), Ok(b)) => b >= a,
+        (Err(_), Ok(_)) => true,
+        (Ok(_), Err(_)) => false,
+        (Err(_), Err(_)) => candidate >= current,
+    };
+    if candidate_wins {
+        candidate.to_string()
+    } else {
+        current.to_string()
+    }
+}
+
 fn first_number(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
     keys.iter()
         .find_map(|key| obj.get(*key))
@@ -5142,14 +5258,20 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn codex_total_usage_rewind_after_compaction_is_single_counted() {
-        // rm-035 (upstream PR #286, be25c4c): Codex rewinds
-        // total_token_usage after compaction and climbs back. The rewind
-        // event still emits (output tokens keep rising), so under raw-total
-        // delta accounting it replaced the previous cumulative with the
-        // rewound input side and the rebound was counted a second time.
-        // High-water accounting keeps the running maximum per token class,
-        // so the rebound back over the old mark is free.
+    fn codex_total_usage_rewind_after_compaction_counts_forward() {
+        // rm-035 (upstream PR #286, be25c4c) → rm-554 (2026-10-06, upstream
+        // #312): Codex rewinds total_token_usage after compaction and
+        // climbs back. The rm-162/#286 high-water mark kept the running
+        // maximum per class, so the rebound back over the old mark was
+        // free — but the compacted context is re-sent and billed after
+        // the reset, so growth from the rewound baseline is real usage.
+        // Each distinct total now counts its forward delta once (these
+        // journals carry no last_token_usage snapshots); the rewind event
+        // itself fabricates nothing (all deltas negative).
+        // Dated pin change 2026-10-06: 620/480/590 → 870/630 with output
+        // decomposed as 500 output + 90 reasoning (reasoning no longer
+        // added to output, rm-553); the two decompositions cost the same
+        // at the output rate.
         let total = |input: i64, cached: i64, output: i64, reasoning: i64| {
             serde_json::json!({
                 "input_tokens": input,
@@ -5189,14 +5311,18 @@ mod tests {
         .join("\n");
         let session =
             parse_raw_session("codex", "rollout.jsonl", &raw).expect("codex rollout parses");
-        // True per-event deltas: (1000, 400, 250) + (0, 0, 160) + (100, 80,
-        // 180). Input is net of cache reads, so the single-counted total is
-        // exactly the final cumulative input minus cached (1100 - 480):
-        // 620 input / 480 cache read / 590 output. The pre-fix raw-total
-        // accounting yields 870 input / 630 cache read here.
-        assert_eq!(session.metrics.tokens_input, 620);
-        assert_eq!(session.metrics.tokens_cache_r, 480);
-        assert_eq!(session.metrics.tokens_output, 590);
+        // Forward deltas from each distinct total: ev1 (1000, 400, 200,
+        // 50); ev2 contributes only the climbing classes (output +150,
+        // reasoning +10); ev3 contributes (input +500 of which cached
+        // +230, output +150, reasoning +30). Input is net of cache reads:
+        // 600 + (500 - 230) = 870 input / 630 cache read / 500 output /
+        // 90 reasoning. The old high-water pin (620/480/590 output-folded)
+        // refused the post-compaction window — the undercount rm-554
+        // removes.
+        assert_eq!(session.metrics.tokens_input, 870);
+        assert_eq!(session.metrics.tokens_cache_r, 630);
+        assert_eq!(session.metrics.tokens_output, 500);
+        assert_eq!(session.metrics.tokens_reasoning, 90);
         assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
     }
 
@@ -5308,10 +5434,11 @@ mod tests {
 
     #[test]
     fn codex_usage_sums_saturate_instead_of_overflowing() {
-        // rm-162: output_tokens + reasoning_output_tokens can each carry a
-        // legal in-range i64 whose sum overflows on adversarial journals;
-        // plain `+` panicked in debug and wrapped negative in release.
-        // Saturating addition clamps at i64::MAX, matching sum_numbers.
+        // rm-162: two legal in-range i64 counters on an adversarial
+        // journal must never wrap or panic. rm-553 (upstream #312) removed
+        // the output+reasoning fold from this lane — reasoning is now a
+        // breakdown on its own line — so each class clamps independently
+        // and the saturation contract lives on unchanged.
         let info = serde_json::json!({
             "last_token_usage": {
                 "input_tokens": 10,
@@ -5319,32 +5446,43 @@ mod tests {
                 "reasoning_output_tokens": i64::MAX
             }
         });
-        let (usage, _) = codex_token_count_usage(Some(&info), None).expect("usage event");
+        let mut totals = CodexTotals::default();
+        let usage = codex_token_count_usage(Some(&info), &mut totals).expect("usage event");
         assert_eq!(usage["input_tokens"], 10);
         assert_eq!(usage["output_tokens"], i64::MAX);
+        assert_eq!(usage["reasoning_tokens"], i64::MAX);
     }
 
     #[test]
-    fn codex_usage_rewind_uses_high_water_mark() {
-        // rm-162 / upstream #286: Codex can briefly rewind
-        // total_token_usage after compaction and then climb back. Without
-        // the high-water mark every token up to the old mark is counted
-        // twice on the rebound; with it, only the climb past it counts.
+    fn codex_usage_counts_forward_across_compaction_resets() {
+        // rm-554 (2026-10-06, upstream #312): Codex rewinds
+        // total_token_usage after compaction and then climbs back. The old
+        // rm-162/#286 high-water mark refused the whole post-compaction
+        // window — but the compacted context is re-sent and billed on every
+        // call after the reset, so growth inside the old envelope is real
+        // usage. Each DISTINCT total now counts once (its `last` snapshot
+        // when present, else the forward delta from the previous total);
+        // a rewind snapshot without `last` still fabricates no usage.
         let step = |total_input: i64| {
             serde_json::json!({
                 "total_token_usage": {"input_tokens": total_input}
             })
         };
-        let (first, prev) = codex_token_count_usage(Some(&step(2500)), None).expect("first event");
+        let mut totals = CodexTotals::default();
+        let first = codex_token_count_usage(Some(&step(2500)), &mut totals).expect("first event");
         assert_eq!(first["input_tokens"], 2500);
-        // Rewind to 1000 fabricates no usage (empty delta -> no event),
-        // and preserves the 2500 high-water mark as `prev`.
-        let rewound = codex_token_count_usage(Some(&step(1000)), prev.as_ref());
+        // Rewind to 1000 fabricates no usage (negative delta -> no event).
+        let rewound = codex_token_count_usage(Some(&step(1000)), &mut totals);
         assert!(rewound.is_none());
-        // Rebound to 3000 counts only the 500-token climb past the mark.
-        let (rebound, _) =
-            codex_token_count_usage(Some(&step(3000)), prev.as_ref()).expect("rebound event");
-        assert_eq!(rebound["input_tokens"], 500);
+        // Rebound to 3000 counts the full 2000-token growth from the reset
+        // baseline — the old pin (500, climb past the old mark only) was
+        // the undercount this defect removes.
+        let rebound =
+            codex_token_count_usage(Some(&step(3000)), &mut totals).expect("rebound event");
+        assert_eq!(rebound["input_tokens"], 2000);
+        // A re-emitted total (rate-limit-only update) counts nothing.
+        let repeated = codex_token_count_usage(Some(&step(3000)), &mut totals);
+        assert!(repeated.is_none());
     }
 
     #[test]
@@ -6256,12 +6394,17 @@ mod tests {
             &codex_compaction_corpus("resp_comp_42"),
         )
         .expect("codex rollout parses");
-        // Snapshots: 400 net input + 600 cache + 550 out, then a
-        // 200-climb giving 0 net input + 200 cache + 160 out. Compaction
-        // turn: 200 net input + 300 cache + 200 out.
+        // Snapshots: 400 net input + 600 cache + 400 out (+150 reasoning
+        // on its own line), then a 200-climb giving 0 net input + 200
+        // cache + 120 out (+40 reasoning). Compaction turn: 200 net input
+        // + 300 cache + 200 out. Dated pin change 2026-10-06 (rm-553,
+        // upstream #312): output dropped 910 → 720 because reasoning is
+        // now a breakdown line (190) instead of folded into output —
+        // the two decompositions cost the same at the output rate.
         assert_eq!(session.metrics.tokens_input, 600);
         assert_eq!(session.metrics.tokens_cache_r, 1_100);
-        assert_eq!(session.metrics.tokens_output, 910);
+        assert_eq!(session.metrics.tokens_output, 720);
+        assert_eq!(session.metrics.tokens_reasoning, 190);
         assert_eq!(
             session
                 .metrics
@@ -6327,13 +6470,16 @@ mod tests {
             &codex_compaction_corpus("resp_ordinary"),
         )
         .expect("codex rollout parses");
-        // Snapshot totals only (the 1,910 shape); the unpaired record
-        // adds nothing.
+        // Snapshot totals only (the 1,720 shape — dated pin change
+        // 2026-10-06, rm-553: 190 reasoning tokens now ride their own
+        // metrics line outside this input+cache+output sum, where the
+        // folded form counted them as 190 more output); the unpaired
+        // record adds nothing.
         assert_eq!(
             session.metrics.tokens_input
                 + session.metrics.tokens_cache_r
                 + session.metrics.tokens_output,
-            1_910
+            1_720
         );
         assert_eq!(
             session
@@ -6349,12 +6495,16 @@ mod tests {
     }
 
     #[test]
-    fn codex_compaction_record_does_not_advance_the_high_water_baseline() {
+    fn codex_compaction_record_does_not_advance_the_totals_baseline() {
         // The compaction turn's usage lives outside every later
         // cumulative snapshot, so it is added standalone — and it must
-        // never become the high-water baseline the snapshots diff
-        // against: a record larger than the running mark would otherwise
-        // eat the next snapshot's climb.
+        // never touch the rm-554 totals state: a record larger than the
+        // running total would otherwise become the baseline the next
+        // distinct total diffs against and eat its window.
+        // Dated pin change 2026-10-06 (rm-554, upstream #312): the rebound
+        // from the rewound 1000 baseline now counts its full growth (2000)
+        // instead of the old mark-relative climb (500), so the pinned
+        // total moved 8000 → 9500.
         let lines = [
             serde_json::json!({"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.3-codex"}}),
             serde_json::json!({"timestamp":"2026-10-01T09:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2500}}}}),
@@ -6370,10 +6520,12 @@ mod tests {
             .join("\n");
         let session = parse_raw_session("codex", "rollout-compaction-hwm.jsonl", &raw)
             .expect("codex rollout parses");
-        // 2500 (first snapshot) + 5000 (the record, standalone) + 500
-        // (rebound past the 2500 mark). If the record had advanced the
-        // baseline the rebound would count 0.
-        assert_eq!(session.metrics.tokens_input, 8_000);
+        // 2500 (first snapshot) + 5000 (the record, standalone) + 2000
+        // (growth from the rewound 1000 baseline to 3000 — billed
+        // post-compaction re-sends, rm-554). If the record had touched
+        // the totals state the final snapshot's window would count 0
+        // (delta from a 5000 baseline).
+        assert_eq!(session.metrics.tokens_input, 9_500);
         assert_eq!(
             session
                 .metrics

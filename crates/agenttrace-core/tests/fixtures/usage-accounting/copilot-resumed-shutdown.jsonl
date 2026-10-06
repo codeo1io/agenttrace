@@ -1,0 +1,5 @@
+{"type":"session.start","timestamp":"2026-01-04T00:00:00Z","data":{"context":{"cwd":"/tmp/r"}}}
+{"type":"user.message","timestamp":"2026-01-04T00:00:01Z","data":{"content":"first leg"}}
+{"type":"session.shutdown","timestamp":"2026-01-04T00:00:20Z","data":{"modelMetrics":{"gpt-5":{"usage":{"inputTokens":500,"outputTokens":50}}},"totalNanoAiu":1000000000}}
+{"type":"user.message","timestamp":"2026-01-04T01:00:01Z","data":{"content":"resumed leg"}}
+{"type":"session.shutdown","timestamp":"2026-01-04T01:00:20Z","data":{"modelMetrics":{"gpt-5":{"usage":{"inputTokens":800,"outputTokens":80}}},"totalNanoAiu":2000000000}}
