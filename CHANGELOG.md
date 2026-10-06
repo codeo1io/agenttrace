@@ -26,6 +26,8 @@
 - Statusline capture (research pass 9 candidate 53): `agenttrace statusline` is a host command for Claude Code's `statusLine` hook that renders the one-line status and tees the raw payload to a bounded local journal (`~/.cache/agenttrace/statusline.jsonl`, 10 MiB cap, newest-whole-lines compaction via temp-file rename, `AGENTTRACE_SESSION_CACHE_DIR` honored, torn lines skipped on read). It never fails the host — valid payload, malformed JSON, and empty stdin all exit 0 with exactly one stdout line, diagnostics to stderr only, stdin bounded at 1 MiB. `--statusline-report` (text and JSON) turns the journal into subscription limit-pressure windows (`5h`/`7d` usage, `resets_at` crossings evidenced by observations on both sides), deduplicated per-session prompt-cache analytics (`hit_ratio`, misses, `miss_causes` such as `tools_changed`), and peaks; `--doctor` reports the journal's health and the TUI Efficiency panel gains a "Subscription limits" block. Captures are deduplicated by exact payload with the count disclosed. Fixtures are schema-faithful to the documented payload contract, not recordings of a real host.
 - `--doctor` discloses the offline pricing snapshot's date, model count, and age ("Pricing snapshot: LiteLLM snapshot 2026-09-13 (bundled, 2755 models, N days old)"), and the bundled snapshot was refreshed from 2026-09-02 (2,458 chat models) to 2026-09-13 (2,755).
 - `docs/guides/statusline-capture.md` documents the host contract, journal schema and retention, and report semantics.
+- Layered configuration file (cycle 1, rm-384): optional knobs `history_dir`, `pricing_file`, and `weekly_budget_usd` resolve through a disclosed precedence chain — CLI flags > `--config PATH` > `./.agenttrace/config.toml` > `~/.config/agenttrace/config.toml` > `AGENTTRACE_*` env > defaults, each layer filling only keys left unset above it (`--history-dir`, `--pricing-file`, `--weekly-budget` win over every file). `--doctor` discloses the probed config paths and every resolved knob's value with its source — on stderr in `-f json` mode, keeping stdout a single JSON object. A config file must be a strict TOML subset: unknown keys, tables, arrays, empty values, single-quoted strings, trailing input after a quoted value, duplicate keys, and non-positive budgets are all rejected with the file, line, and key instead of silently doing nothing.
+- Weekly budget and the `--budget` window-burn view (cycle 1, rm-385): `--weekly-budget <usd>` (flag or config key `weekly_budget_usd`) arms budget rendering on the journal-derived seven-day series — `--budget` prints per-day spend against the weekly total, as text or as a single JSON object under `-f json` (`spend_7d_usd` always; `weekly_budget_usd`/`remaining_usd` exactly when a budget resolves), and `--statusline-report` gains a `Budget: 7d spend $X of $Y` line. Without a budget the view stays honest (`no weekly budget configured`); an empty window renders a positive `$0.00`, never `$-0.00`.
 
 ### Changed
 
@@ -39,6 +41,7 @@
 - The lone-surrogate repair no longer rewrites literal `\\uXXXX` text: escaped-backslash pairs advance together, so `"\\ud800"` (an escaped backslash followed by `ud800`) keeps its literal bytes while a real lone surrogate in the same line still repairs (cycle-3 residual).
 - The SQLite snapshot cache schema was bumped 5 → 6: cycle 3's placeholder-name rewrite shipped while the version stayed at 5, so v5 snapshots could carry stale names under new semantics; they now regenerate (cycle-3 residual).
 - Fixed a `clippy::useless_format` finding in the TUI provider/model row label under the current toolchain.
+- The minimum supported Rust version is now 1.88 (was 1.80; cycle 1, rm-386): `rust-version` matches the dependency-greatest floor, a gated CI lane (schedule/workflow_dispatch) proves the declared floor with `cargo +<floor> check --locked`, and the manifest-alignment gate's expectation moved with it.
 
 ### Added
 
@@ -290,3 +293,21 @@ one place
   report semantics, release surfaces, and Pages artifacts. (#118)
 - Documented the launch-kit validation gates and release consistency checklist
   for public demo and install surfaces. (#115, #121)
+
+<!--
+  no-changelog-section markers (scripts/ci/check-plugin-version.sh, per-tag
+  arm rm-303): releases shipped before that arm existed, whose tags are
+  merged into every branch but whose changes never got a dedicated section
+  at release time. Reasons below are taken from each tag's own commit
+  (git log -1 <tag>). Recorded 2026-10-05, run 4a688257 full_tests
+  b163e538: the gate began failing only after a wholesale tag fetch made
+  these refs visible to `git tag --merged HEAD`; nothing about the releases
+  themselves changed.
+-->
+<!-- no-changelog-section: v0.7.2: release only decoupled the Pages checks from the release version (3f6252a); CI wiring, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.3: release only fixed npm tarball publishing (739a6c3); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.4: release only configured npm auth before publishing (2462045); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.5: re-tag of v0.7.4's npm-auth fix on the same commit (2462045); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.6: release only published the npm launcher under the zack78 scope (e20a224); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.7: release only fixed release-channel script permissions (cd33203); CI plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.8.0: upstream merge "Improve pricing provenance and TUI session exploration (#280)" (b964a74) shipped without a dedicated section; its user-visible changes are covered by the v0.8.1 and v0.9.0 sections that follow it -->

@@ -343,7 +343,7 @@ fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Ses
 /// time-ranged view (N7); only sessions with a known start before the
 /// cutoff are filtered out.
 fn session_within_since(session: &Session, since: Option<DateTime<Utc>>) -> bool {
-    since.map_or(true, |since| {
+    since.is_none_or(|since| {
         DateTime::parse_from_rfc3339(&session.metrics.session_start)
             .map(|time| time.with_timezone(&Utc) >= since)
             .unwrap_or(true)

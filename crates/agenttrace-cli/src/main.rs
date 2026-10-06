@@ -325,8 +325,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.statusline_report {
-        let out =
-            agenttrace_core::render_statusline_report(&args.format, resolved.weekly_budget)?;
+        let out = agenttrace_core::render_statusline_report(&args.format, resolved.weekly_budget)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -335,7 +334,7 @@ fn run() -> anyhow::Result<()> {
     if args.budget {
         // rm-385: the weekly window-burn view — journal-based, no
         // session discovery, mirroring --statusline-report.
-        let out = agenttrace_core::render_budget_view(resolved.weekly_budget)?;
+        let out = agenttrace_core::render_budget_view(&args.format, resolved.weekly_budget)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -951,6 +950,14 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--limit"
             | "--sample"
             | "--inspect"
+            // rm-384: the config-surface flags all take a PATH/value;
+            // without them here their value is mistaken for the
+            // positional session path and every following flag is
+            // rejected as dropped (`--config x.toml --doctor` failed).
+            | "--config"
+            | "--history-dir"
+            | "--pricing-file"
+            | "--weekly-budget"
     )
 }
 
@@ -1135,7 +1142,33 @@ fn resolve_output_target(path: &Path) -> anyhow::Result<PathBuf> {
 /// keep the rm-250 atomic stage-and-rename; character devices take a
 /// direct stream; fifos, sockets, and block devices are refused with
 /// a disclosed reason instead of silently becoming regular files.
+/// `-o` targets that alias our own stdout/stderr: streamed directly.
+/// `/dev/stdout` under a pipeline resolves through `/proc/self/fd/1`
+/// to an anonymous pipe inode — neither a regular file nor a char
+/// device — so the generic lanes would refuse it or try to stage a
+/// temp file under `/proc`. The aliases are intercepted up front and
+/// written through the descriptor instead (assess U3c: `-o
+/// /dev/stdout` must stream the report instead of failing).
+fn is_stdout_alias(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("/dev/stdout")
+            | Some("/dev/stderr")
+            | Some("/dev/fd/1")
+            | Some("/dev/fd/2")
+            | Some("/proc/self/fd/1")
+            | Some("/proc/self/fd/2")
+    )
+}
+
 fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyhow::Result<()> {
+    if is_stdout_alias(requested) {
+        let mut handle = fs::File::create(requested)
+            .with_context(|| format!("opening {}", requested.display()))?;
+        handle.write_all(content.as_bytes())?;
+        eprintln!("Saved: {} (streamed)", requested.display());
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -1163,7 +1196,7 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
     }
     // rm-250: stage through a unique temp sibling and rename into
     // place, so a crash or Ctrl-C mid-write never leaves a
-   // truncated report at the destination (same pattern as the
+    // truncated report at the destination (same pattern as the
     // session-cache and history persistence writers).
     let temp = unique_temp_sibling(target);
     let staged = fs::write(&temp, content).and_then(|()| fs::rename(&temp, target));
@@ -1664,6 +1697,73 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Test-visible Args base: every knob at its neutral default, with
+/// the non-zero CLI defaults real invocations carry (json format,
+/// limit 20, `recent`/`desc` ordering, `en`/`all`). Shared by the
+/// main.rs tests and the config.rs precedence matrix so both build
+/// Args the same way.
+#[cfg(test)]
+pub(crate) fn test_args(dir: Option<String>) -> Args {
+    Args {
+        path: None,
+        format: "json".to_string(),
+        config: None,
+        history_dir: None,
+        pricing_file: None,
+        weekly_budget: None,
+        budget: false,
+        dir,
+        compare: true,
+        audit: false,
+        recommend: false,
+        mcp_governance: false,
+        context_trends: false,
+        delivery_evidence: false,
+        overview: false,
+        sessions: false,
+        diagnostics: false,
+        inspect: None,
+        model: "default".to_string(),
+        output: None,
+        latest: false,
+        waste: false,
+        list_models: false,
+        statusline_report: false,
+        fetch: false,
+        update_pricing: false,
+        test_match: false,
+        version: false,
+        demo: false,
+        doctor: false,
+        search: None,
+        search_limit: 20,
+        fail_under_health: 0,
+        fail_on_critical: false,
+        max_tool_fail_rate: None,
+        baseline: None,
+        baseline_max_duration_delta_pct: 0.0,
+        baseline_max_cost_delta_pct: 0.0,
+        baseline_max_token_delta_pct: 0.0,
+        no_baseline_gate: false,
+        lang: "en".to_string(),
+        range: "all".to_string(),
+        project: String::new(),
+        source: String::new(),
+        model_filter: String::new(),
+        query: String::new(),
+        health: String::new(),
+        cost: String::new(),
+        anomaly: String::new(),
+        sort: "recent".to_string(),
+        order: "desc".to_string(),
+        limit: 20,
+        sample: None,
+        clear_cache: false,
+        preserve_history: false,
+        include_history: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2146,15 +2246,24 @@ mod tests {
         write_output(&Some(link.clone()), "new bytes\n").expect("write via link");
         assert_eq!(fs::read_to_string(&real).unwrap(), "new bytes\n");
         assert!(
-            fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "link must stay a link"
         );
 
         let dangling = dir.join("dangling.md");
         std::os::unix::fs::symlink(dir.join("missing.md"), &dangling).unwrap();
         write_output(&Some(dangling.clone()), "created\n").expect("via dangling link");
-        assert_eq!(fs::read_to_string(dir.join("missing.md")).unwrap(), "created\n");
-        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(dir.join("missing.md")).unwrap(),
+            "created\n"
+        );
+        assert!(fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
 
         let a = dir.join("cycle-a");
         let b = dir.join("cycle-b");
@@ -2177,14 +2286,14 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).expect("scratch dir");
         let fifo = dir.join("fifo");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .expect("mkfifo")
-                .success()
-        );
-        let error = write_output(&Some(fifo.clone()), "x\n").unwrap_err().to_string();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success());
+        let error = write_output(&Some(fifo.clone()), "x\n")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("refusing to write"), "{error}");
         use std::os::unix::fs::FileTypeExt;
         assert!(
@@ -2193,6 +2302,48 @@ mod tests {
         );
         write_output(&Some(PathBuf::from("/dev/null")), "x\n").expect("char device streams");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_output_streams_stdout_aliases_even_under_a_pipe() {
+        // Assess U3c + live PoC A4: `-o /dev/stdout` under a pipeline
+        // resolves through /proc/self/fd/1 to an anonymous pipe inode,
+        // which is neither a regular file nor a char device. The alias
+        // set intercepts it before resolution and streams through the
+        // descriptor, so piping `-o /dev/stdout` into jq keeps working.
+        assert!(is_stdout_alias(Path::new("/dev/stdout")));
+        assert!(is_stdout_alias(Path::new("/proc/self/fd/1")));
+        assert!(is_stdout_alias(Path::new("/dev/fd/2")));
+        assert!(!is_stdout_alias(Path::new("/tmp/out.md")));
+        assert!(!is_stdout_alias(Path::new("/dev/null")));
+    }
+
+    #[test]
+    fn go_flag_compatible_args_know_config_surface_flags_take_values() {
+        // rm-384 regression: the Go-style shim's value-taking flag list
+        // predates the config surface, so `--config x.toml --doctor`
+        // mistook the config path for the positional session path and
+        // rejected every following flag as dropped. All four new flags
+        // must consume their value before the positional scan continues.
+        for flag in ["--config", "--history-dir", "--pricing-file"] {
+            let args = go_flag_compatible_args([
+                OsString::from("agenttrace"),
+                OsString::from(flag),
+                OsString::from("conf.toml"),
+                OsString::from("--doctor"),
+                OsString::from("--demo"),
+            ])
+            .expect("value-taking flags do not end the positional scan");
+            assert_eq!(args.len(), 5, "{flag} keeps the full argv");
+        }
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--weekly-budget"),
+            OsString::from("25"),
+            OsString::from("--budget"),
+        ])
+        .expect("--weekly-budget takes a value");
+        assert_eq!(args.len(), 4);
     }
 
     #[test]
@@ -2209,12 +2360,18 @@ mod tests {
         args.sessions = true;
         args.search_limit = 0;
         let error = validate_gate_thresholds(&args).unwrap_err().to_string();
-        assert!(error.contains("--search-limit must be at least 1 with --sessions"), "{error}");
+        assert!(
+            error.contains("--search-limit must be at least 1 with --sessions"),
+            "{error}"
+        );
 
         let mut args = compare_args(None);
         args.weekly_budget = Some(f64::NAN);
         let error = validate_gate_thresholds(&args).unwrap_err().to_string();
-        assert!(error.contains("--weekly-budget must be a positive finite USD"), "{error}");
+        assert!(
+            error.contains("--weekly-budget must be a positive finite USD"),
+            "{error}"
+        );
 
         let mut args = compare_args(None);
         args.search_limit = 0;
@@ -2292,64 +2449,7 @@ mod tests {
     }
 
     fn compare_args(dir: Option<String>) -> Args {
-        Args {
-            path: None,
-            format: "json".to_string(),
-            config: None,
-            history_dir: None,
-            pricing_file: None,
-            weekly_budget: None,
-            budget: false,
-            dir,
-            compare: true,
-            audit: false,
-            recommend: false,
-            mcp_governance: false,
-            context_trends: false,
-            delivery_evidence: false,
-            overview: false,
-            sessions: false,
-            diagnostics: false,
-            inspect: None,
-            model: "default".to_string(),
-            output: None,
-            latest: false,
-            waste: false,
-            list_models: false,
-            statusline_report: false,
-            fetch: false,
-            update_pricing: false,
-            test_match: false,
-            version: false,
-            demo: false,
-            doctor: false,
-            search: None,
-            search_limit: 20,
-            fail_under_health: 0,
-            fail_on_critical: false,
-            max_tool_fail_rate: None,
-            baseline: None,
-            baseline_max_duration_delta_pct: 0.0,
-            baseline_max_cost_delta_pct: 0.0,
-            baseline_max_token_delta_pct: 0.0,
-            no_baseline_gate: false,
-            lang: "en".to_string(),
-            range: "all".to_string(),
-            project: String::new(),
-            source: String::new(),
-            model_filter: String::new(),
-            query: String::new(),
-            health: String::new(),
-            cost: String::new(),
-            anomaly: String::new(),
-            sort: "recent".to_string(),
-            order: "desc".to_string(),
-            limit: 20,
-            sample: None,
-            clear_cache: false,
-            preserve_history: false,
-            include_history: false,
-        }
+        crate::test_args(dir)
     }
 
     #[test]

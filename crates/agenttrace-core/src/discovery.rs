@@ -376,7 +376,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         // Sessions with an unknown start time stay visible (unknown-time
         // bucket, N7) instead of being silently dropped from ranged views;
         // data_health counts them via `unknown_time_sessions`.
-        options.since.map_or(true, |since| {
+        options.since.is_none_or(|since| {
             DateTime::parse_from_rfc3339(&session.metrics.session_start)
                 .map(|time| time.with_timezone(&Utc) >= since)
                 .unwrap_or(true)

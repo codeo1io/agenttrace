@@ -1206,3 +1206,125 @@ fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+#[test]
+fn env_history_knob_sits_below_config_layers_end_to_end() {
+    // Review 5b9a9470 F3 / rm-384 level 5: the in-suite precedence
+    // matrix pinned the four file/flag layers, but the env level was
+    // demonstrated only by live PoCs — a reordered `or_else` in
+    // history.rs (env above the config override) would have passed
+    // the whole suite silently. These isolated subprocess runs pin
+    // BOTH the disclosure source AND the actual derived-history write
+    // target through core's fallback chain, with a scrubbed
+    // environment (no real HOME, XDG, or project config can leak in).
+    use std::fs;
+    use std::path::PathBuf;
+
+    let root = std::env::temp_dir().join(format!("at-env-level5-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let cfg_home = root.join("cfg");
+    let cwd = root.join("cwd");
+    let scan = root.join("scan");
+    let env_dir = root.join("env-history");
+    let config_dir = root.join("config-history");
+    for dir in [&home, &cfg_home, &cwd, &scan, &env_dir, &config_dir] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+
+    let run = |args: &[&str]| -> std::process::Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+        cmd.env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &cfg_home)
+            .env("AGENTTRACE_HISTORY_DIR", &env_dir)
+            .current_dir(&cwd)
+            .args(args)
+            .output()
+            .expect("run agenttrace")
+    };
+
+    let history_knob = |stderr: &str| -> (String, String) {
+        let value: serde_json::Value =
+            serde_json::from_str(stderr.trim()).expect("disclosure JSON on stderr");
+        let knob = &value["knobs"][0];
+        assert_eq!(knob["key"].as_str(), Some("history_dir"));
+        (
+            knob["value"]
+                .as_str()
+                .expect("history_dir is set")
+                .to_string(),
+            knob["source"].as_str().expect("source is set").to_string(),
+        )
+    };
+
+    // Leg A — no config anywhere, so the env knob IS the effective
+    // level 5: the derived-history write must land in it, and the
+    // disclosure must name env as the source.
+    let preserve = [
+        "--sessions",
+        "--preserve-history",
+        fixture.to_str().unwrap(),
+    ];
+    let output = run(&preserve);
+    assert!(
+        output.status.success(),
+        "leg A preserve run failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        env_dir.join("history.json").is_file(),
+        "env knob must own the derived-history write when no config layer sets history_dir"
+    );
+    let output = run(&["--doctor", "-f", "json", "-d", scan.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "leg A doctor run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (value, source) = history_knob(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(source, "env");
+    assert_eq!(PathBuf::from(&value), env_dir, "disclosed value");
+    // stdout stays a pure JSON document even while the disclosure
+    // goes to stderr.
+    let stdout: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("doctor stdout is one JSON object");
+    assert!(stdout.get("config").is_some() || stdout.is_object());
+
+    // Leg B — a user config file outranks the env knob: the write must
+    // land in the config dir and NOT in the env dir (the swap a
+    // reordered fallback chain would make).
+    let user_config = cfg_home.join("agenttrace");
+    fs::create_dir_all(&user_config).unwrap();
+    fs::write(
+        user_config.join("config.toml"),
+        format!("history_dir = \"{}\"\n", config_dir.display()),
+    )
+    .unwrap();
+    fs::remove_file(env_dir.join("history.json")).unwrap();
+    let output = run(&preserve);
+    assert!(
+        output.status.success(),
+        "leg B preserve run failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        config_dir.join("history.json").is_file(),
+        "config layer must own the write when a user config sets history_dir"
+    );
+    assert!(
+        !env_dir.join("history.json").exists(),
+        "env knob must NOT win over the user config file (reordered fallback chain)"
+    );
+    let output = run(&["--doctor", "-f", "json", "-d", scan.to_str().unwrap()]);
+    assert!(output.status.success());
+    let (value, source) = history_knob(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(source, "config file");
+    assert_eq!(PathBuf::from(&value), config_dir, "disclosed value");
+
+    let _ = fs::remove_dir_all(&root);
+}
