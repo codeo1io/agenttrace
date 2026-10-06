@@ -979,16 +979,19 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v27 (integration of run b1ff12f8, rm-542 Codex custom-tools
-        // parse coverage, re-based off the campaign's 22 -> 23 bump;
-        // 26 was the rm-485 copilot session-wide credit accounting,
-        // 25 the rm-450 workbuddy input-basis disclosure, 24 the
-        // rm-436/437/438 pi journal accounting, 23 rm-408, 22 was run
-        // 2c2db6f5 rm-400/401): parser-semantics fixes bump the schema
-        // so warm entries regenerate under corrected accounting.
+        // v28 (integration of run 66e75e39, rm-529 #316 clamp port,
+        // re-based off the campaign's 24 -> 26 bump, 25 being already
+        // taken on the campaign's landed ceiling by rm-450; 27 was the
+        // rm-542 Codex custom-tools parse coverage re-based off the
+        // campaign's 22 -> 23 bump, 26 the rm-485 copilot session-wide
+        // credit accounting, 25 the rm-450 workbuddy input-basis
+        // disclosure, 24 the rm-436/437/438 pi journal accounting,
+        // 23 rm-408, 22 was run 2c2db6f5 rm-400/401):
+        // parser-semantics fixes bump the schema so warm entries
+        // regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1153,14 +1156,15 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v27 — see the rm-542, rm-485, rm-450,
+        // version (v28 — see the rm-529, rm-542, rm-485, rm-450,
         // rm-436/437/438, rm-408 and rm-400/401 bump notes in
-        // session_cache.rs; the Codex custom-tools parse coverage is
-        // what carried 26 -> 27 at this integration, re-based off the
-        // campaign's 22 -> 23 bump).
+        // session_cache.rs; the #316 cache clamp port is what carried
+        // 27 -> 28 at this integration, re-based off the campaign's
+        // own 24 -> 26 bump, 25 being already taken on the landed
+        // ceiling by rm-450).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1579,6 +1583,31 @@ fn rust_codex_rollout_prefers_cached_input_tokens_like_go() {
     assert_eq!(metrics.tokens_input, 900);
     assert_eq!(metrics.tokens_cache_r, 100);
     assert_eq!(metrics.tokens_output, 10);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_workbuddy_clamps_cache_read_above_input_without_inflating_total() {
+    let root = temp_root("agenttrace-rust-workbuddy-cache-over-input");
+    fs::create_dir_all(&root).expect("create workbuddy temp dir");
+    let session_path = root.join("session.jsonl");
+    fs::write(
+        &session_path,
+        r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}],"timestamp":1783777800000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"agent":"cli"}}
+{"type":"function_call","name":"Read","callId":"c1","arguments":"{}","timestamp":1783777801000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":150}},"providerData":{"model":"glm-5.2","agent":"cli"}}
+"#,
+    )
+    .expect("write workbuddy session");
+
+    let parsed = parse_file(&session_path).expect("parse workbuddy session");
+    let metrics = &parsed.metrics;
+    assert_eq!(metrics.source_tool, "workbuddy");
+    // cache_read above a cache-inclusive input_tokens is a basis mismatch: the cached part
+    // is clamped to the reported input so the total never exceeds what WorkBuddy recorded.
+    assert_eq!(metrics.tokens_input, 0);
+    assert_eq!(metrics.tokens_cache_r, 100);
+    assert_eq!(metrics.tokens_output, 20);
 
     let _ = fs::remove_dir_all(root);
 }

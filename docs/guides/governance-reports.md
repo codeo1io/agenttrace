@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 27 and the SQLite snapshot is schema 7; the
+The session cache is schema 28 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -81,10 +81,11 @@ persisted metrics (rm-436/437/438), to 25 when the workbuddy
 input-basis disclosure counters joined Metrics.line_skips (rm-450), to
 26 when Copilot sessions began counting session-wide credit totals
 (`totalNanoAiu` shutdown reads and `usage_checkpoint` snapshots, rm-485),
-and to 27 when Codex custom-tools response items began counting as tool
+to 27 when Codex custom-tools response items began counting as tool
 calls, results, and reasoning (custom_tool_call/custom_tool_call_output
-pairing and standalone reasoning items, rm-542), so cached sessions
-regenerate under
+pairing and standalone reasoning items, rm-542), and to 28 when
+WorkBuddy cache counts began clamping to the cache-inclusive input (the
+upstream #316 port, rm-529), so cached sessions regenerate under
 the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify

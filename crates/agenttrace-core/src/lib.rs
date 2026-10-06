@@ -2951,8 +2951,11 @@ mod tests {
 
     #[test]
     fn workbuddy_basis_disclosure_flags_suspected_mismatch() {
-        // Post-parser shape of a basis mismatch: input_tokens 1000 with
-        // cache_read 1500 clamps to 0 -- the silent zero this batch exists
+        // Basis mismatch as analyze() sees it: a raw input_tokens 1000
+        // with cache_read 1500 subtracts/clamps the input to 0 (post
+        // rm-529 the parser also clamps the cache count itself, to 1000;
+        // this map keeps 1500 to pin the disclosure logic, which keys on
+        // the zeroed input) -- the silent zero this batch exists
         // to disclose.
         let usage: BTreeMap<String, i64> = [
             ("input_tokens", 0),
@@ -3046,7 +3049,12 @@ mod tests {
             Some(&1)
         );
         assert_eq!(session.metrics.tokens_input, 0);
-        assert_eq!(session.metrics.tokens_cache_r, 1500);
+        // rm-529 clamp (integration 2026-10-06, conflict case
+        // 44cf98cc, re-mint of 4d35cd1e): cache_read clamps to the
+        // reported input (1500 -> 1000 on this fixture), so the
+        // disclosed cache total is the clamped 1000; both
+        // basis-disclosure counters still fire.
+        assert_eq!(session.metrics.tokens_cache_r, 1000);
 
         let inclusive = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
