@@ -152,14 +152,21 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     if parsed_value.is_none() {
         // Workbuddy parses FIRST (probe order) but carries its own
         // disclosure channel for the cache-clamp counter (rm-600,
-        // upstream #316) — exactly like kimi's alias counters below —
-        // so its counters land in line_skips alongside the rm-450
-        // workbuddy_input_basis:* family instead of the generic event
-        // channel.
+        // upstream #316) — exactly like kimi's alias counters below.
+        // rm-538 (integrated 2026-10-06) moved the whole
+        // workbuddy_input_basis:* family onto Metrics.disclosure_counters
+        // — the non-loss channel — so the clamp fact rides the SAME map
+        // as its cache_subtracted / zeroed_suspected_mismatch siblings
+        // (landed by the aggregator's meta arm) instead of degrading
+        // data_health.confidence and rendering under "Dropped lines".
         if let Some((events, parse_counters)) = parse_workbuddy_jsonl(&objs) {
             let mut session = session_from_events(name, path, events)?;
             for (key, count) in parse_counters {
-                *session.metrics.line_skips.entry(key).or_insert(0) += count as usize;
+                *session
+                    .metrics
+                    .disclosure_counters
+                    .entry(key)
+                    .or_insert(0) += count as usize;
             }
             return Ok(session);
         }
@@ -236,6 +243,12 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     bail!("unsupported session format: {}", path)
 }
 
+/// Copilot usage-checkpoint snapshot carried between the first pass and the
+/// credit roll-up below: (timestamp, per-model usage rows). The alias exists
+/// to keep the nested tuple under clippy's type_complexity budget — the
+/// shape is exactly what parse_copilot_session_jsonl always used.
+type CheckpointSnapshot = Option<(String, Vec<(String, BTreeMap<String, i64>)>)>;
+
 fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     if !objs
         .iter()
@@ -253,15 +266,7 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // shutdown metrics were emitted at all.
     let mut max_credit_nano: f64 = 0.0;
     let mut shutdown_metrics_emitted = false;
-    // The tuple mirrors Copilot's usage_checkpoint wire shape one-to-one
-    // (checkpoint id, per-model metric rows); clippy's type_complexity
-    // threshold is cosmetic here — the shape is the journal's, not a
-    // design choice (rm-485; allow added at the 2026-10-06 independent
-    // review of run b1ff12f8's integration, which caught the gate-red
-    // lint landing with f59a67d — same targeted-allow style as
-    // governance.rs's too_many_arguments).
-    #[allow(clippy::type_complexity)]
-    let mut checkpoint_snapshot: Option<(String, Vec<(String, BTreeMap<String, i64>)>)> = None;
+    let mut checkpoint_snapshot: CheckpointSnapshot = None;
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
@@ -1053,15 +1058,19 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
     }
     if has_usage {
         if clamped_records > 0 {
-            // Rides the rm-450 disclosure family (line_skips, like the
-            // cache_subtracted / zeroed_suspected_mismatch siblings):
-            // a record reported more cached tokens than input, so the
-            // cached count was clamped to the source-recorded input —
-            // the session total never exceeds what the source
-            // recorded. Surfaced via the kimi-style parse-counter
-            // channel (see parse_raw_session), not the event channel,
-            // so the whole workbuddy_input_basis:* family lands on ONE
-            // map.
+            // Rides the rm-450 disclosure family — the whole
+            // workbuddy_input_basis:* set lands on
+            // Metrics.disclosure_counters (the non-loss channel;
+            // cache_subtracted / zeroed_suspected_mismatch mint there
+            // via the aggregator's meta arm, and rm-538 routed this
+            // parse-counter lane there too): a record reported more
+            // cached tokens than input, so the cached count was
+            // clamped to the source-recorded input — the session
+            // total never exceeds what the source recorded. Surfaced
+            // via the kimi-style parse-counter channel (see
+            // parse_raw_session), not the event channel, so the
+            // family lands on ONE map and never degrades
+            // data_health.confidence.
             parse_counters.push((
                 "workbuddy_input_basis:cache_clamped".to_string(),
                 clamped_records,

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Assumption disclosures stop masquerading as parse loss (rm-538): the workbuddy input-basis counters (`workbuddy_input_basis:cache_subtracted` — a priced journal that already subtracted cache from input — and `workbuddy_input_basis:zeroed_suspected_mismatch`) rode `Metrics.line_skips`, so an otherwise-exact parse rendered `Dropped lines: workbuddy_input_basis:cache_subtracted=1` beside `confidence: high` arithmetic and — worse — `data_health.confidence: low` in `-f json`: an assumption the accounting kept visible (tokens intentionally left as-is, per the disclosed provenance) mislabeled the corpus as lossy and tripped `--fail-under-health` gates. rm-450 minted that channel deliberately ("aggregate and degrade confidence the same way"); this deliberately reverses the channel choice while keeping the disclosure itself: the counters now live in `Metrics.disclosure_counters` beside the pi-family journal facts, render under the renamed `Disclosed facts:` row (with the existing basis provenance parenthetical) in every arm — text, markdown, HTML, doctor — are aggregated into `data_health.disclosures`, and no longer touch `confidence` (the assess PoC: `confidence: low` + a Dropped-lines row with `exact=1 fallback=0 unknown=0` → `confidence: high`, zero Dropped-lines row, `Disclosed facts: workbuddy_input_basis:cache_subtracted=1`), while real parse loss keeps both the row and the degradation. The session-cache schema was bumped so the channel move is visible on warm corpora — landed as 29 → 30 at integration, re-basing the campaign’s own 26 → 27 bump onto the ceiling since advanced by the Codex custom-tools (27, rm-542), #316 clamp (28, rm-529) and workbuddy-sum/Copilot-adoption (29, rm-600) landings, one invalidation either way (the rm-230 convention); the two Go-compat cache-contract pins now read `SESSION_CACHE_SCHEMA_VERSION` (newly exported from the crate root) instead of a hardcoded `26`, and the markdown render pins moved to the `report_overview_markdown_with_context` arm where the Scope-and-confidence section actually renders. Pinned red-first by `tests/disclosure_channel.rs`: the corpus3 basis shape keeps `line_skips` empty, carries the counter in `disclosure_counters`, stays `confidence: high`, and never mentions the basis key under Dropped lines.
+
 - OTel exports are spec-valid (rm-599, run 99d1c79c cycle 3, minted campaign-locally as rm-541 and rebound at integration): span ids are hash-derived, unique and never the
   all-zero ordinal-0 form the OTLP receiver rejects; non-finite costs are omitted with an
   explicit agenttrace.session.cost_usd_omitted=non-finite disclosure instead of rendering
@@ -16,7 +18,9 @@
   instead of keep-last (3x100-token journals counted 330 of 660, upstream #311), cache_read is clamped to
   cached.min(input) so cache>input journals no longer total past their source (upstream #316 — the landed rm-529 clamp generalized to the bool-returning,
   cache-key-parameterized form so its clamp now discloses via a
-  workbuddy_input_basis:cache_clamped line-skip counter), reasoning
+  workbuddy_input_basis:cache_clamped disclosure counter — moved onto
+  Metrics.disclosure_counters at the rm-538 integration, with its
+  workbuddy_input_basis siblings), reasoning
   and function_call rows contribute their usage, and the Copilot modelMetrics, span and
   usage_checkpoint arms adopt the same clamp (the #312 basis port rm-529 had explicitly
   deferred — one delta-basis rule across both lanes; a Copilot session now totals

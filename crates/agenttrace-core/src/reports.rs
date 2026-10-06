@@ -635,7 +635,7 @@ pub fn report_overview_text_with_context(
     }
     if !data_health.disclosures.is_empty() {
         out.push_str(&format!(
-            "  Journal disclosures: {}\n",
+            "  Disclosed facts: {}\n",
             counts_cell(&data_health.disclosures)
         ));
     }
@@ -670,7 +670,7 @@ pub fn report_overview_markdown_with_context(
     }
     if !data_health.disclosures.is_empty() {
         out.push_str(&format!(
-            "| Journal disclosures | {} |\n",
+            "| Disclosed facts | {} |\n",
             markdown_cell(&counts_cell(&data_health.disclosures))
         ));
     }
@@ -698,7 +698,7 @@ pub fn report_overview_html_with_context(
     }
     if !data_health.disclosures.is_empty() {
         appendix.push_str(&format!(
-            "<tr><th>Journal disclosures</th><td>{}</td></tr>",
+            "<tr><th>Disclosed facts</th><td>{}</td></tr>",
             html_escape(&counts_cell(&data_health.disclosures))
         ));
     }

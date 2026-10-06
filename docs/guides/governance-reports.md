@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 29 and the SQLite snapshot is schema 7; the
+The session cache is schema 30 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -88,8 +88,14 @@ WorkBuddy cache counts began clamping to the cache-inclusive input (the
 upstream #316 port, rm-529), and to 29 when WorkBuddy usage began
 summing across records with reasoning and function_call rows
 contributing their usage (upstream #311) and the shared clamp was
-adopted for Copilot modelMetrics and spans (rm-600), so cached sessions
-regenerate under the corrected totals; the SQLite snapshot to 7
+adopted for Copilot modelMetrics and spans (rm-600), and to 30 when the
+workbuddy input-basis disclosure counters
+(`workbuddy_input_basis:cache_subtracted` /
+`:zeroed_suspected_mismatch`) moved from `Metrics.line_skips` to
+`Metrics.disclosure_counters` — the non-loss disclosure channel — so an
+assumption-disclosure no longer renders under "Dropped lines" or
+degrade `data_health.confidence` (rm-538), so cached sessions
+regenerate under the corrected channel; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are

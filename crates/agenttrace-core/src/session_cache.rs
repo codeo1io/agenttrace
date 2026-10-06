@@ -5,7 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 29;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 30;
+// Bumped 29 -> 30 (integration of run cb38b958, rm-538 'Disclosure-
+// channel truthfulness: split assumption-disclosure from parse-
+// loss'): the workbuddy input-basis disclosures
+// (`workbuddy_input_basis:cache_subtracted`,
+// `workbuddy_input_basis:zeroed_suspected_mismatch`) moved from
+// metrics.line_skips to metrics.disclosure_counters — same counters,
+// different channel — so warm v29 snapshots still serve them under
+// "Dropped lines" with degraded data_health.confidence for sessions
+// whose parse was otherwise exact. The rm-230 convention applies:
+// parser-semantics changes that alter the served report for
+// UNCHANGED files bump the schema so cached sessions regenerate
+// under the corrected channel. The batch landed against its base
+// 67dfdb5 at schema 26 and bumped it to 27 there; integration re-
+// bases the bump onto the already-advanced ceiling (27 was rm-542,
+// 28 was rm-529, 29 was rm-600) per the same convention. Entries
+// regenerate once on next scan.
 // Bumped 28 -> 29 (integration of run 99d1c79c, rm-600 'Port the
 // workbuddy usage arithmetic set (upstream #311 sum, #316 clamp,
 // reasoning-row usage)', minted campaign-locally as rm-542): workbuddy

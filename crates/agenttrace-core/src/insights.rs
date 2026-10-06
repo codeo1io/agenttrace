@@ -161,21 +161,26 @@ pub struct DataHealth {
     pub unknown_time_sessions: usize,
     /// Parse lines lost inside otherwise-parsed sessions, by reason
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
-    /// The rm-450 workbuddy input-basis disclosure counters
-    /// (`workbuddy_input_basis:cache_subtracted`,
-    /// `workbuddy_input_basis:zeroed_suspected_mismatch`) ride the same
-    /// map — they disclose an assumption, not a loss, but keep the same
-    /// aggregation and confidence-degradation path.
+    /// Pure parse loss only — assumption disclosures live in
+    /// `disclosures` (rm-538 moved the rm-450 workbuddy input-basis
+    /// counters there), so nothing in this map is an assumption note
+    /// and nothing here is "kept" rather than lost.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
-    /// Parse-time journal disclosures aggregated across sessions
-    /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
-    /// `pi_branches`, `pi_entry_skipped:<type>`,
-    /// `pi_message_role:<role>`. Facts the journal documents that the
-    /// accounting deliberately does not count (or counts across all
-    /// branches), kept visible instead of silently dropped. Empty for
-    /// corpora without such journals, so clean report bytes are
-    /// unchanged.
+    /// Parse-time disclosure counters aggregated across sessions —
+    /// journal facts and assumptions the accounting keeps visible
+    /// without treating them as loss (rm-436/rm-437, pi-family
+    /// journals): `pi_usage_entry:<kind>`, `pi_branches`,
+    /// `pi_entry_skipped:<type>`, `pi_message_role:<role>`; plus the
+    /// workbuddy input-basis notes (rm-450 minted, rm-538 moved):
+    /// `workbuddy_input_basis:cache_subtracted`,
+    /// `workbuddy_input_basis:zeroed_suspected_mismatch`. Facts the
+    /// journal documents that the accounting deliberately does not
+    /// count (or counts across all branches), plus input-basis
+    /// assumptions, kept visible instead of silently dropped — and
+    /// never degrading `confidence`, which keys on real parse loss
+    /// only (rm-538). Empty for corpora without such journals, so
+    /// clean report bytes are unchanged.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosures: BTreeMap<String, usize>,
     /// Sessions whose estimated cost is not a finite number (poisoned

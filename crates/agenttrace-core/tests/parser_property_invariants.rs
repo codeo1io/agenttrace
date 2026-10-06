@@ -219,7 +219,7 @@ fn usage_accounting_is_invariant_under_key_and_line_order() {
         assert_eq!(
             session
                 .metrics
-                .line_skips
+                .disclosure_counters
                 .get("workbuddy_input_basis:cache_subtracted"),
             Some(&1),
             "case {case} (seed {:#x}): basis disclosure moved",
@@ -351,7 +351,7 @@ fn workbuddy_clamps_cached_above_input_upstream_316() {
     assert_eq!(
         session
             .metrics
-            .line_skips
+            .disclosure_counters
             .get("workbuddy_input_basis:cache_clamped"),
         Some(&1),
         "clamp disclosed, not silent"
