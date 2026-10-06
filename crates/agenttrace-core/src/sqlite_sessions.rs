@@ -57,22 +57,25 @@ struct SqliteSessionAgg {
     first_user_text: String,
 }
 
-pub fn load_sqlite_backed_sessions() -> Vec<Session> {
-    load_sqlite_backed_sessions_since(None)
-}
-
-pub(crate) fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) -> Vec<Session> {
+pub fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) -> (Vec<Session>, usize) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut sessions = Vec::new();
     for path in hermes_state_db_paths(&home) {
         sessions.extend(load_hermes_sqlite_sessions(&path, since));
     }
+    // rm-548: opencode fork copies (`session.parent_id`, pinned in
+    // docs/guides/opencode-fork-marker.md) re-emit their parent's
+    // history, so counting them would double-count usage. They are
+    // excluded here and the count is returned for disclosure.
+    let mut opencode_fork_excluded = 0;
     for path in opencode_db_paths(&home) {
-        sessions.extend(load_opencode_sqlite_sessions(&path, since));
+        let (loaded, excluded) = load_opencode_sqlite_sessions(&path, since);
+        sessions.extend(loaded);
+        opencode_fork_excluded += excluded;
     }
-    sessions
+    (sessions, opencode_fork_excluded)
 }
 
 pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
@@ -238,31 +241,45 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
         .collect()
 }
 
-fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn load_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, usize) {
     if !sqlite_file_exists(path) {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
-    if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
-        return filter_since(sessions, since);
+    if let Some((sessions, fork_excluded)) =
+        crate::session_cache::load_sqlite_snapshot_with_meta(path, "opencode")
+    {
+        return (filter_since(sessions, since), fork_excluded);
     }
-    let sessions = query_opencode_sqlite_sessions(path, None);
-    let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
-    filter_since(sessions, since)
+    let (sessions, fork_excluded) = query_opencode_sqlite_sessions(path, None);
+    let _ = crate::session_cache::store_sqlite_snapshot_with_meta(
+        path,
+        "opencode",
+        &sessions,
+        fork_excluded,
+    );
+    (filter_since(sessions, since), fork_excluded)
 }
 
-fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn query_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, usize) {
     let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    let mut aggs = opencode_sqlite_session_rows(&db, path, since);
+    let (mut aggs, fork_excluded) = opencode_sqlite_session_rows(&db, path, since);
     if aggs.is_empty() {
-        return Vec::new();
+        return (Vec::new(), fork_excluded);
     }
     add_opencode_sqlite_messages(&db, &mut aggs);
     add_opencode_sqlite_parts(&db, &mut aggs);
     capture_opencode_user_text(&db, &mut aggs);
 
-    aggs.into_values()
+    let sessions = aggs
+        .into_values()
         .map(|mut agg| {
             if agg.model.is_empty() {
                 agg.model = "default".to_string();
@@ -273,7 +290,8 @@ fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> 
             apply_opencode_stored_totals(&mut agg);
             session_from_sqlite_agg(agg)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    (sessions, fork_excluded)
 }
 
 /// Prefer the authoritative totals recorded on the session row over
@@ -354,11 +372,20 @@ fn opencode_sqlite_session_rows(
     db: &Connection,
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> HashMap<String, SqliteSessionAgg> {
+) -> (HashMap<String, SqliteSessionAgg>, usize) {
     let directory = if sqlite_has_column(db, "session", "directory") {
         "directory"
     } else {
         "''"
+    };
+    // rm-548: `parent_id` (opencode fork marker, session_parent_idx;
+    // docs/guides/opencode-fork-marker.md) is feature-detected like the
+    // stored-total columns so older databases keep working — missing
+    // column reads as null, which is "not a fork".
+    let parent_column = if sqlite_has_column(db, "session", "parent_id") {
+        "parent_id"
+    } else {
+        "null"
     };
     // Authoritative per-session totals (upstream schema): present columns
     // are selected directly, missing ones become null so the row indices
@@ -398,17 +425,37 @@ fn opencode_sqlite_session_rows(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "select id, title, time_created, time_updated, {directory}, {stored_select} from session \
+        "select id, title, time_created, time_updated, {directory}, {stored_select}, \
+         {parent_column} from session \
          where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
     let Ok(mut stmt) = db.prepare(&sql) else {
-        return HashMap::new();
+        return (HashMap::new(), 0);
     };
     let since_millis = since.map(|value| value.timestamp_millis());
+    // rm-548: fork copies are dropped at the row boundary — a forked
+    // session's messages are a replay of the parent's history, so
+    // aggregating both double-counts usage. Excluded rows are counted
+    // for the disclosure channel instead of dying silently.
+    let mut fork_excluded = 0usize;
     let Ok(rows) = stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
+        // Lenient read, same rule as every other dynamically-typed
+        // column below: a non-TEXT value in the fork column degrades
+        // to "not a fork" instead of failing the row and silently
+        // dropping the whole session from the aggregate.
+        let fork_parent = row
+            .get::<_, Option<rusqlite::types::Value>>(11)
+            .ok()
+            .flatten()
+            .and_then(|value| match value {
+                rusqlite::types::Value::Text(text) => Some(text),
+                _ => None,
+            })
+            .filter(|parent| !parent.is_empty());
         Ok((
             id.clone(),
+            fork_parent,
             SqliteSessionAgg {
                 id,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -431,9 +478,17 @@ fn opencode_sqlite_session_rows(
             },
         ))
     }) else {
-        return HashMap::new();
+        return (HashMap::new(), 0);
     };
-    rows.filter_map(Result::ok).collect()
+    let mut aggs = HashMap::new();
+    for (id, fork_parent, agg) in rows.filter_map(Result::ok) {
+        if fork_parent.is_some() {
+            fork_excluded += 1;
+            continue;
+        }
+        aggs.insert(id, agg);
+    }
+    (aggs, fork_excluded)
 }
 
 fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {

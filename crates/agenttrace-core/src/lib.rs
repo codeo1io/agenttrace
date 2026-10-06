@@ -69,11 +69,12 @@ pub use session_cache::{
     cached_session, clear_session_cache, load_cached_sessions, load_cached_sessions_from_cache,
     load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,
 };
-pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
+pub use sqlite_sessions::{load_sqlite_backed_sessions_since, skip_sqlite_backed_file_dir};
 pub use statusline::{
     load_statusline_insights, render_statusline_report, run_statusline_host, sanitize_line_segment,
-    statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
-    StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
+    sanitize_output_document, statusline_capture_path, statusline_insights,
+    statusline_journal_stats, CapturedStatusline, StatuslineInsights, StatuslineJournalStats,
+    StatuslineRateLimitState,
 };
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language,

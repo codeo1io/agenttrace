@@ -2837,6 +2837,14 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 /// Merge note: the control-byte sanitizer family (fc197c5e's lane) must run
 /// BEFORE the entity escape at merge time — control bytes first, then
 /// printable HTML — so both byte classes die in one pass.
+///
+/// rm-625 (resolved at the CLI boundary): the control-byte neutralization
+/// now happens at the output-dispatch choke point
+/// (`dispatch_sanitize` in agenttrace-cli/main.rs over
+/// `sanitize_output_document`), which covers every non-JSON lane for
+/// every report — including this markdown/html family. Entity escaping
+/// here stays as defense-in-depth; the two layers compose because the
+/// document sanitizer is idempotent.
 fn markdown_cell(value: &str) -> String {
     value
         .replace('&', "&amp;")

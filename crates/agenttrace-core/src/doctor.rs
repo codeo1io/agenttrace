@@ -1,6 +1,6 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
+    load_sqlite_backed_sessions_since, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -107,15 +107,19 @@ pub fn render_doctor_report(
 
 pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     let cache = load_session_cache_report();
-    let files = if dir.is_none() {
+    let (files, opencode_fork_excluded) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        find_session_files(dir)
+        (find_session_files(dir), 0)
     };
-    let sqlite_sessions = if dir.is_none() && !demo {
-        load_sqlite_backed_sessions()
+    let (sqlite_sessions, sqlite_fork_excluded) = if dir.is_none() && !demo {
+        // rm-548 (independent-review fix): the since-loader returns the
+        // opencode fork-exclusion count alongside the sessions so the
+        // doctor inventory can disclose it; the legacy entry point
+        // dropped it on the floor (its own comment says as much).
+        load_sqlite_backed_sessions_since(None)
     } else {
-        Vec::new()
+        (Vec::new(), 0)
     };
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
@@ -136,6 +140,16 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         &mut zero_usage,
         &mut disclosures,
     );
+    let opencode_fork_excluded_total = opencode_fork_excluded + sqlite_fork_excluded;
+    if opencode_fork_excluded_total > 0 {
+        // Same disclosure key the loader/overview lanes use, so
+        // `--doctor` and `--overview` agree on the exclusion instead
+        // of the doctor silently under-counting.
+        disclosures.insert(
+            "opencode_fork_excluded_sessions".to_string(),
+            opencode_fork_excluded_total,
+        );
+    }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -289,9 +303,9 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
+fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     if dir.is_some() {
-        return find_session_files(dir);
+        return (find_session_files(dir), 0);
     }
     let mut out = Vec::new();
     for candidate in crate::discover_session_dirs() {
@@ -300,7 +314,23 @@ fn find_reportable_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
         }
         out.extend(crate::collect_session_files(&candidate));
     }
-    out
+    // rm-548 (independent-review fix): the doctor's auto-discovery
+    // inventory aggregates the same way the CLI loader does — an
+    // opencode fork copy re-emits its parent's history, so counting
+    // both inflates `sessions`/`session_files` — and the exclusion
+    // rides the disclosure channel instead of dying silently here.
+    // An explicit `--dir` keeps every file (the exclusion is
+    // aggregation-only, same rule as the loader).
+    let mut opencode_fork_excluded = 0usize;
+    out.retain(|path| {
+        if crate::discovery::opencode_session_fork_parent(path).is_some() {
+            opencode_fork_excluded += 1;
+            false
+        } else {
+            true
+        }
+    });
+    (out, opencode_fork_excluded)
 }
 
 fn doctor_directories(

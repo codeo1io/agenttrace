@@ -279,6 +279,29 @@ pub fn sanitize_line_segment(segment: &str) -> String {
         .collect()
 }
 
+/// rm-625: document-level variant of [`sanitize_line_segment`] for the
+/// output-dispatch boundary (stdout and every `-o` write). Where the
+/// line-segment helper must kill EVERY control byte (a status line is
+/// one physical line), whole documents legitimately carry layout
+/// bytes: LF, CR and TAB are layout and stay; every other control
+/// byte — ESC (the OSC/CSI introducer), BEL, DEL, and the C1 range —
+/// is neutralized to U+FFFD so terminal emulators never interpret
+/// transcript-derived sequences. Idempotent by construction: U+FFFD is
+/// printable, so already-sanitized documents (including cells that
+/// first went through the rm-383/rm-540 line sanitizer) pass through
+/// unchanged — the two layers compose instead of corrupting.
+pub fn sanitize_output_document(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Appends one capture to the journal, compacting it first when the
 /// retention bound is crossed. Errors are the caller's business (the
 /// host entry point turns them into stderr notes).
@@ -920,6 +943,17 @@ mod tests {
             line.chars().all(|c| !c.is_control()),
             "display_name fallback sanitized: {line:?}"
         );
+        // Review fix: the ST-terminated (ESC \) form of an OSC is
+        // pinned too — not just the BEL form above.
+        let st_form = serde_json::json!({
+            "session_name": "\u{001b}]0;title\u{001b}\\Opus",
+            "model": { "display_name": "Opus" }
+        });
+        let line = render_status_line(&st_form);
+        assert!(
+            line.chars().all(|c| !c.is_control()),
+            "ST-terminated OSC sanitized: {line:?}"
+        );
     }
 
     #[test]
@@ -1121,5 +1155,71 @@ mod tests {
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sanitize_output_document_kills_esc_bel_del_c1_and_keeps_layout() {
+        let poisoned = concat!(
+            "a\u{1b}]52;c;aGVsbG8gd29ybGQ=\u{07}b\u{1b}[2J\u{1b}[Hc\u{7f}d\u{9b}!pe",
+            "\u{1b}]52;c;aGVsbG8gd29ybGQ=\u{1b}\\e",
+        );
+        // The last sequence is the string-terminator (ST, ESC \) form of
+        // the same OSC-52 — an implementation that only handled the
+        // BEL-terminated form would pass without it (review fix).
+        let sanitized = sanitize_output_document(poisoned);
+        assert!(!sanitized
+            .chars()
+            .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control()));
+        // Prefixes survive: the readable name around the sequence is kept,
+        // so reports stay legible after neutralization.
+        assert!(sanitized.starts_with('a') && sanitized.contains('b'));
+        assert_eq!(
+            sanitized.matches('\u{FFFD}').count(),
+            poisoned.chars().filter(|c| c.is_control()).count()
+        );
+        // Layout bytes are document structure, not attacks.
+        assert_eq!(
+            sanitize_output_document("l1\nl2\r\n\tcol\n"),
+            "l1\nl2\r\n\tcol\n"
+        );
+    }
+
+    #[test]
+    fn sanitize_output_document_is_idempotent_and_composes_with_line_segment() {
+        let poisoned = "name\u{1b}[2J and \u{1b}]52;c;AAAA\u{07} tail";
+        let once = sanitize_output_document(poisoned);
+        let twice = sanitize_output_document(&once);
+        assert_eq!(once, twice, "rm-625 choke point must be idempotent");
+        // Composition with the rm-383 line sanitizer (cells sanitized
+        // before the document) must be a fixed point too.
+        let line_first = sanitize_output_document(&sanitize_line_segment(poisoned));
+        assert_eq!(line_first, sanitize_output_document(poisoned));
+        // Tab honesty (review fix): 0x09 is layout for the DOCUMENT
+        // sanitizer — tabs survive it, including mid-line next to a
+        // neutralized escape. The line sanitizer is stricter (a status
+        // line is one line, so it replaces 0x09 too), which is why the
+        // two orders are intentionally NOT byte-equal for tab-bearing
+        // input; both are equally safe.
+        let tabbed = "col1\t\u{1b}[2Jcol2\u{1b}]52;c;AAAA\u{07}\tcol3";
+        let document_only = sanitize_output_document(tabbed);
+        assert_eq!(
+            document_only.matches('\t').count(),
+            2,
+            "tabs are layout for the document sanitizer: {document_only:?}"
+        );
+        assert!(document_only.contains("\u{FFFD}[2Jcol2"));
+        let line_first = sanitize_output_document(&sanitize_line_segment(tabbed));
+        assert!(
+            !line_first.contains('\t'),
+            "the line sanitizer is stricter — tabs die there: {line_first:?}"
+        );
+        for rendered in [&document_only, &line_first] {
+            assert!(
+                !rendered
+                    .chars()
+                    .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r'),
+                "no non-layout control survives either order: {rendered:?}"
+            );
+        }
     }
 }
