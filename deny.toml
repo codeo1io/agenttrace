@@ -15,7 +15,20 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# rm-587 (run d65f72c7, 2026-10-06): cargo-deny v2 lets `informational =
+# "unsound"` advisories through by default, so `check advisories` reported
+# ok while RUSTSEC-2026-0253 (lru use-after-free, patched 0.18.2) sat in
+# the DB with the lock pinned to 0.18.1 — a false clean. Soundness bugs
+# are now considered for the whole tree; the one known hit is carved out
+# below with a removal path.
+unsound = "transitive"
+ignore = [
+    # lru 0.18.1 - LruCache::pop use-after-free/double-free (CWE-416/415),
+    # patched upstream in 0.18.2. The version bump is owned by roadmap row
+    # rm-552 (run 254b2417); drop this entry the moment the lock reaches
+    # >= 0.18.2 (rm-552 targets 0.18.5).
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.18.1 pinned pending the rm-552 (run 254b2417) bump to 0.18.5; remove this entry when the lock reaches >= 0.18.2" },
+]
 
 [licenses]
 version = 2

@@ -1083,6 +1083,16 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                 path.display()
             );
         }
+        // rm-590: exists-but-not-a-regular-file (FIFOs, sockets, device
+        // files like /dev/null) used to fall through to the same message
+        // as a missing path — the two cases need distinct words so a typo
+        // and a non-journal file can be told apart.
+        if path.exists() {
+            bail!(
+                "Error loading {}: positional path exists but is not a regular session journal file (FIFOs, sockets, and device files are not journals); use -d to point at a session directory",
+                path.display()
+            );
+        }
         bail!("session path does not exist: {}", path.display());
     }
     let dir = args.dir.as_deref().map(PathBuf::from);

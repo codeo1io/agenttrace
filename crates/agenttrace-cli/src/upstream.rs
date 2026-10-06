@@ -106,10 +106,17 @@ fn run_bounded(
             break status;
         }
         if Instant::now() >= deadline {
+            // rm-583: the deadline contract outranks drain-thread hygiene. A
+            // killed child's forked helper (git-remote-https and friends)
+            // inherits the pipe write-ends; joining the drains then blocks on
+            // read_to_end until that grandchild exits — unboundedly, voiding
+            // the very bound this function promises. Follow the
+            // governance.rs wait_child_bounded precedent: kill + reap the
+            // child, return the named timeout, and let the two drain threads
+            // die when the orphaned helper finally closes the pipes (or with
+            // the process, which exits on this error path).
             let _ = child.kill();
             let _ = child.wait();
-            let _ = stdout.join();
-            let _ = stderr.join();
             return Err(GitRunError::Timeout { op, bound });
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -624,6 +631,34 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "the deadline, not the child's lifetime, bounds the wait"
+        );
+    }
+
+    #[test]
+    fn run_bounded_timeout_survives_a_grandchild_holding_the_pipes() {
+        // rm-583 regression: a killed child's forked helper (what a wedged
+        // git-remote-https looks like) inherits the pipe write-ends, so
+        // joining the drain threads would block on read_to_end until the
+        // grandchild exits — unboundedly. The named timeout must still
+        // surface near the bound; the leaked drains are accepted (process
+        // exit reaps the orphan holding the pipes).
+        let started = Instant::now();
+        let result = run_bounded(
+            "sh",
+            &["-c", "sleep 30 & exec sleep 30"],
+            Duration::from_secs(1),
+        );
+        match result {
+            Err(GitRunError::Timeout { op, bound }) => {
+                assert!(op.contains("sleep"), "timeout names the operation: {op}");
+                assert_eq!(bound, Duration::from_secs(1));
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "grandchild-held pipes must not block past the bound, took {:?}",
+            started.elapsed()
         );
     }
 
