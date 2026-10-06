@@ -1206,3 +1206,58 @@ fn baseline_delta_pct_flags_reject_nan_and_negative_values() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+#[test]
+fn cli_alias_paths_report_one_session() {
+    // rm-511 (run 250cfd64, cycle 4): one transcript reachable through
+    // a symlink alias must count exactly once end-to-end. Pre-fix this
+    // corpus reported "Total Sessions: 2" and "Session files: 2" for a
+    // single transcript (assess f376d372 F1 live PoC).
+    let dir = std::env::temp_dir().join(format!("agenttrace-cli-rm511-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create corpus dir");
+    let real = dir.join("real.jsonl");
+    std::fs::copy(generated_fixture("detailed-tool-steps.jsonl"), &real)
+        .expect("seed real session");
+    std::os::unix::fs::symlink("real.jsonl", dir.join("link.jsonl")).expect("symlink alias");
+
+    let overview = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "-d", dir.to_str().expect("utf-8 dir")])
+        .output()
+        .expect("run agenttrace CLI overview");
+    assert!(
+        overview.status.success(),
+        "overview failed: {:?}",
+        String::from_utf8_lossy(&overview.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&overview.stdout);
+    let sessions_line = stdout
+        .lines()
+        .find(|line| line.contains("Total Sessions"))
+        .expect("overview prints a Total Sessions line");
+    assert!(
+        sessions_line.trim_end().ends_with('1'),
+        "alias corpus must report exactly one session, got: {sessions_line:?}"
+    );
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--doctor", "-d", dir.to_str().expect("utf-8 dir")])
+        .output()
+        .expect("run agenttrace CLI doctor");
+    assert!(
+        doctor.status.success(),
+        "doctor failed: {:?}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    let files_line = stdout
+        .lines()
+        .find(|line| line.contains("Session files"))
+        .expect("doctor prints a Session files line");
+    assert!(
+        files_line.trim_end().ends_with('1'),
+        "doctor must count the alias once, got: {files_line:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

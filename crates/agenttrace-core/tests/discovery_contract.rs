@@ -1,8 +1,8 @@
 use agenttrace_core::{
-    build_doctor_report, data_health, data_health_scoped, find_session_files,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress, parse_file,
-    render_waste_report, search_sessions, session_cache_path, session_capability, total_tokens,
-    LoadOptions,
+    build_doctor_report, collect_session_files, data_health, data_health_scoped,
+    find_session_files, load_sessions_from_dir, load_sessions_with_options,
+    load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
+    session_cache_path, session_capability, total_tokens, LoadOptions,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -2587,6 +2587,163 @@ fn symlinked_child_directories_are_discovered_and_cycles_terminate() {
             "the cycle links must not duplicate or loop the walk: {names:?}"
         );
     });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+// rm-511 (run 250cfd64, cycle 4): same-file admission for the walk's
+// file arm. One transcript reachable through two paths — a symlink
+// alias or a hardlink alias — used to be collected and parsed twice, so
+// every aggregate double-counted it (assess f376d372 F1; live PoC
+// /tmp/at-assess-f376d372/poc/sym: "Total Sessions: 2" / $0.0022 for a
+// single $0.0011 transcript). Distinct files reached through a
+// symlinked *directory* stay separate — pinned above by
+// `symlinked_child_directories_are_discovered_and_cycles_terminate`
+// at exactly two files, so this admission must not over-collapse.
+
+#[test]
+fn symlinked_session_file_aliases_are_collected_once() {
+    let root = temp_root("agenttrace-rm511-symlink-file");
+    let home = root.join("home");
+    let projects = home.join(".claude").join("projects").join("proj");
+    fs::create_dir_all(&projects).expect("create project dir");
+    fs::write(projects.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    std::os::unix::fs::symlink("real.jsonl", projects.join("link.jsonl"))
+        .expect("symlink session file alias");
+
+    with_home(&home, || {
+        let files = find_session_files(Some(&projects));
+        assert_eq!(
+            files.len(),
+            1,
+            "a symlink alias is not a second session: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn symlinked_session_file_aliases_across_directories_are_collected_once() {
+    // The alias and its target live in different walked directories, so
+    // admission must be walk-scoped rather than per-listing: a
+    // per-directory filter would admit both.
+    let root = temp_root("agenttrace-rm511-symlink-across-dirs");
+    let home = root.join("home");
+    let projects = home.join(".claude").join("projects");
+    let a = projects.join("a");
+    let b = projects.join("b");
+    fs::create_dir_all(&a).expect("create dir a");
+    fs::create_dir_all(&b).expect("create dir b");
+    fs::write(a.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    std::os::unix::fs::symlink("../a/real.jsonl", b.join("link.jsonl"))
+        .expect("symlink across directories");
+
+    with_home(&home, || {
+        let files = find_session_files(Some(&projects));
+        assert_eq!(
+            files.len(),
+            1,
+            "cross-directory alias counts once: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn hardlinked_session_file_aliases_are_collected_once() {
+    // Canonical paths differ for hardlinks; only the shared inode makes
+    // the alias visible. Unix-only, like the symlink fixtures above.
+    let root = temp_root("agenttrace-rm511-hardlink");
+    let home = root.join("home");
+    let projects = home.join(".claude").join("projects").join("proj");
+    fs::create_dir_all(&projects).expect("create project dir");
+    let real = projects.join("real.jsonl");
+    fs::write(&real, SAMPLE_JSONL).expect("write real session");
+    fs::hard_link(&real, projects.join("twin.jsonl")).expect("hardlink session file alias");
+
+    with_home(&home, || {
+        let files = find_session_files(Some(&projects));
+        assert_eq!(
+            files.len(),
+            1,
+            "a hardlink alias is not a second session: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn symlink_only_session_file_still_counts() {
+    // The acceptance contract cuts both ways: when the alias is the only
+    // path inside the walked root and the target lives outside it, the
+    // session must still be counted exactly once — admission must not
+    // drop the lone link.
+    let root = temp_root("agenttrace-rm511-symlink-only");
+    let home = root.join("home");
+    let projects = home.join(".claude").join("projects").join("proj");
+    fs::create_dir_all(&projects).expect("create project dir");
+    let outside = root.join("elsewhere").join("session.jsonl");
+    fs::create_dir_all(outside.parent().expect("parent exists")).expect("create outside dir");
+    fs::write(&outside, SAMPLE_JSONL).expect("write real session outside the root");
+    std::os::unix::fs::symlink(&outside, projects.join("only-link.jsonl"))
+        .expect("symlink to outside file");
+
+    with_home(&home, || {
+        let files = find_session_files(Some(&projects));
+        assert_eq!(
+            files.len(),
+            1,
+            "a symlink-only path still counts exactly once: {files:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn symlinked_session_file_aliases_dedup_on_the_cached_walk() {
+    // The cached walk stores raw per-directory listings and replays
+    // them through the same walk-scoped admission, so warm replay must
+    // match the cold walk without a listing-version bump.
+    let root = temp_root("agenttrace-rm511-symlink-cached");
+    let home = root.join("home");
+    let cache = home.join("cache");
+    let projects = home.join(".claude").join("projects").join("proj");
+    fs::create_dir_all(&projects).expect("create project dir");
+    fs::write(projects.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    std::os::unix::fs::symlink("real.jsonl", projects.join("link.jsonl"))
+        .expect("symlink session file alias");
+
+    with_home_and_cache(&home, &cache, || {
+        let cold = find_session_files(Some(&projects));
+        assert_eq!(cold.len(), 1, "cold cached walk dedups the alias: {cold:?}");
+        let warm = find_session_files(Some(&projects));
+        assert_eq!(
+            warm.len(),
+            1,
+            "warm replay of the raw stored listing dedups too: {warm:?}"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn symlinked_session_file_aliases_dedup_on_the_uncached_walk() {
+    // `collect_session_files` is the doctor path: it bypasses the
+    // session cache entirely, so this pins the uncached walk arm.
+    let root = temp_root("agenttrace-rm511-symlink-uncached");
+    let projects = root.join("proj");
+    fs::create_dir_all(&projects).expect("create project dir");
+    fs::write(projects.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    std::os::unix::fs::symlink("real.jsonl", projects.join("link.jsonl"))
+        .expect("symlink session file alias");
+
+    let files = collect_session_files(&projects);
+    assert_eq!(files.len(), 1, "uncached walk dedups the alias: {files:?}");
 
     let _ = fs::remove_dir_all(root);
 }
