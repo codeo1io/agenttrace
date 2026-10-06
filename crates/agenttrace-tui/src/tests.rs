@@ -1631,8 +1631,11 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 28 (integration of run 66e75e39, rm-529 #316
-                // clamp port — re-based off the campaign's 24 -> 26
+
+                // Schema 29 (integration of run 99d1c79c, rm-600 workbuddy usage
+                // sum + cache clamp + Copilot adoption, upstream #311/#316
+                // — re-based off the campaign's 25 -> 26 bump; 28 was the
+                // rm-529 #316 clamp port — re-based off the campaign's 24 -> 26
                 // bump, 25 being already taken on the landed ceiling by
                 // rm-450; 27 was the rm-542 Codex custom-tools parse
                 // coverage re-based off the campaign's 22 -> 23 bump,
@@ -1647,7 +1650,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":28,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":29,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

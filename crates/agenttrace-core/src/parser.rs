@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 type TokenUsage = BTreeMap<String, i64>;
 type JsonObject = Map<String, Value>;
 type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
+/// Parse-time disclosure counters (kimi-style tuple channel, upstream
+/// #316): clamp facts the aggregator cannot re-derive once the clamped
+/// values have already been summed.
+type ParseCounters = Vec<(String, i64)>;
 
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
@@ -146,8 +150,20 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     }
     let objs = jsonl_objects(raw).collect::<Vec<_>>();
     if parsed_value.is_none() {
-        let probes: [JsonlProbe; 5] = [
-            parse_workbuddy_jsonl,
+        // Workbuddy parses FIRST (probe order) but carries its own
+        // disclosure channel for the cache-clamp counter (rm-600,
+        // upstream #316) — exactly like kimi's alias counters below —
+        // so its counters land in line_skips alongside the rm-450
+        // workbuddy_input_basis:* family instead of the generic event
+        // channel.
+        if let Some((events, parse_counters)) = parse_workbuddy_jsonl(&objs) {
+            let mut session = session_from_events(name, path, events)?;
+            for (key, count) in parse_counters {
+                *session.metrics.line_skips.entry(key).or_insert(0) += count as usize;
+            }
+            return Ok(session);
+        }
+        let probes: [JsonlProbe; 4] = [
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
             parse_claude_transcript_jsonl,
@@ -314,8 +330,18 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     .and_then(Value::as_object)
                 {
                     for (model, metric) in metrics {
-                        if let Some(usage) = metric.get("usage").and_then(usage_from_value) {
+                        if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
                             shutdown_metrics_emitted = true;
+                            // Copilot modelMetrics follow the GenAI
+                            // semconv basis (input_tokens INCLUDES
+                            // cached tokens — upstream #316 treats the
+                            // workbuddy and Copilot lanes alike), so
+                            // normalize to agenttrace's delta basis via
+                            // the shared clamped subtraction (rm-600).
+                            subtract_cached_input(
+                                &mut usage,
+                                &["cache_creation_input_tokens", "cache_read_input_tokens"],
+                            );
                             events.insert(
                                 0,
                                 Event {
@@ -351,7 +377,16 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     .and_then(Value::as_object)
                 {
                     for (model, metric) in metrics {
-                        if let Some(usage) = metric.get("usage").and_then(usage_from_value) {
+                        if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
+                            // rm-485 checkpoints carry the same
+                            // modelMetrics shapes as shutdown — apply
+                            // the same delta-basis clamp so an
+                            // open/killed session totals identically to
+                            // one that shut down cleanly (rm-600).
+                            subtract_cached_input(
+                                &mut usage,
+                                &["cache_creation_input_tokens", "cache_read_input_tokens"],
+                            );
                             snapshot.push((model.clone(), usage));
                         }
                     }
@@ -891,7 +926,7 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     non_empty(events)
 }
 
-fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
+fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounters)> {
     if !objs.iter().any(|entry| {
         matches!(
             string(entry.get("type")),
@@ -903,7 +938,16 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     }
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
-    let mut latest_usage = None;
+    // Parse-time disclosure counters (kimi-style tuple channel,
+    // upstream #316): clamp facts the aggregator cannot re-derive
+    // once the clamped values have already been summed.
+    let mut parse_counters: ParseCounters = Vec::new();
+    // Usage accumulates across records (upstream #311): the previous
+    // keep-last arm reported only the FINAL record's tokens, so a
+    // 100+200+300-input session reported 300 instead of 600.
+    let mut usage_sum: TokenUsage = BTreeMap::new();
+    let mut has_usage = false;
+    let mut clamped_records: i64 = 0;
     for entry in objs.iter() {
         if let Some(next) = entry
             .get("providerData")
@@ -934,9 +978,25 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         ..Event::default()
                     });
                 }
-                latest_usage = workbuddy_usage(entry).or(latest_usage);
+                if let Some((next, clamped)) = workbuddy_usage(entry) {
+                    has_usage = true;
+                    if clamped {
+                        clamped_records += 1;
+                    }
+                    add_usage_into(&mut usage_sum, next);
+                }
             }
             "reasoning" => {
+                // Upstream #311 rider: reasoning records can carry a
+                // usage block too — read it into the sum instead of
+                // silently dropping the record's tokens.
+                if let Some((next, clamped)) = workbuddy_usage(entry) {
+                    has_usage = true;
+                    if clamped {
+                        clamped_records += 1;
+                    }
+                    add_usage_into(&mut usage_sum, next);
+                }
                 let reasoning = workbuddy_content(
                     entry
                         .get("content")
@@ -956,7 +1016,13 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 }
             }
             "function_call" => {
-                latest_usage = workbuddy_usage(entry).or(latest_usage);
+                if let Some((next, clamped)) = workbuddy_usage(entry) {
+                    has_usage = true;
+                    if clamped {
+                        clamped_records += 1;
+                    }
+                    add_usage_into(&mut usage_sum, next);
+                }
                 events.push(Event {
                     role: "assistant".to_string(),
                     timestamp,
@@ -985,19 +1051,34 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             _ => {}
         }
     }
-    if let Some(usage) = latest_usage {
+    if has_usage {
+        if clamped_records > 0 {
+            // Rides the rm-450 disclosure family (line_skips, like the
+            // cache_subtracted / zeroed_suspected_mismatch siblings):
+            // a record reported more cached tokens than input, so the
+            // cached count was clamped to the source-recorded input —
+            // the session total never exceeds what the source
+            // recorded. Surfaced via the kimi-style parse-counter
+            // channel (see parse_raw_session), not the event channel,
+            // so the whole workbuddy_input_basis:* family lands on ONE
+            // map.
+            parse_counters.push((
+                "workbuddy_input_basis:cache_clamped".to_string(),
+                clamped_records,
+            ));
+        }
         events.insert(
             0,
             Event {
                 role: "meta".to_string(),
-                usage,
+                usage: usage_sum,
                 model_used: model,
                 source_tool: "workbuddy".to_string(),
                 ..Event::default()
             },
         );
     }
-    non_empty(events)
+    non_empty(events).map(|events| (events, parse_counters))
 }
 
 fn workbuddy_content(value: Option<&Value>) -> String {
@@ -1010,38 +1091,65 @@ fn workbuddy_content(value: Option<&Value>) -> String {
         .join("\n")
 }
 
-/// For sources whose `input_tokens` already includes the given cache counts, leave only
-/// the uncached part in `input_tokens` so cost is not charged twice. Each cache count is
-/// clamped to what is left of the input, so a ledger whose cached part exceeds its input
-/// neither goes negative nor inflates the total beyond what the source reported
-/// (upstream PR #316, ccusage `cached.min(input)` semantics). `remaining` starts at
-/// `input.max(0)`, so adversarial magnitudes that clamp `input_tokens` to i64::MIN leave
-/// every cache count at 0 instead of underflowing.
-fn subtract_cached_input(usage: &mut BTreeMap<String, i64>, cache_keys: &[&str]) {
+/// Saturating per-key usage accumulation (upstream #311): workbuddy
+/// journals carry one usage block per assistant record and the session
+/// total is their SUM — the previous keep-last arm reported only the
+/// final record's tokens (a 100+200+300-input session reported 300).
+fn add_usage_into(total: &mut TokenUsage, next: TokenUsage) {
+    for (key, value) in next {
+        let slot = total.entry(key).or_insert(0);
+        *slot = slot.saturating_add(value);
+    }
+}
+
+/// Shared cache-subtraction for usage maps whose source reports
+/// `input_tokens` INCLUSIVE of cached tokens — workbuddy records and
+/// GitHub Copilot modelMetrics/spans both follow the GenAI semconv
+/// shape where `gen_ai.usage.input_tokens` includes cached tokens.
+/// Converts the map to agenttrace's delta basis (`tokens_input` and
+/// `tokens_cache_r` are priced as disjoint buckets). Upstream #316
+/// shape: a record may report MORE cached tokens than input
+/// (adversarial or resumed ledgers), so each cache count is clamped to
+/// what is left of the input — the session total can never exceed the
+/// source-recorded input, and a ledger whose cached part exceeds its
+/// input neither goes negative nor double-charges. Returns `true`
+/// when a clamp fired, for the parser's disclosure counters.
+/// `remaining` starts at `input.max(0)`, so adversarial magnitudes
+/// that clamp `input_tokens` to i64::MIN leave every cache count at 0
+/// instead of underflowing; a negative cached count is hostile data,
+/// is zeroed, and contributes nothing (no clamp flag).
+fn subtract_cached_input(usage: &mut TokenUsage, cache_keys: &[&str]) -> bool {
     let Some(input) = usage.get("input_tokens").copied() else {
-        return;
+        return false;
     };
     let mut remaining = input.max(0);
+    let mut clamped = false;
     for key in cache_keys {
         if let Some(value) = usage.get_mut(*key) {
-            *value = (*value).clamp(0, remaining);
+            if *value > remaining {
+                clamped = true;
+                *value = remaining;
+            } else if *value < 0 {
+                *value = 0;
+            }
             remaining -= *value;
         }
     }
     usage.insert("input_tokens".to_string(), remaining);
+    clamped
 }
 
-fn workbuddy_usage(entry: &Map<String, Value>) -> Option<TokenUsage> {
+fn workbuddy_usage(entry: &Map<String, Value>) -> Option<(TokenUsage, bool)> {
     let mut usage = entry
         .get("message")
         .and_then(|message| message.get("usage"))
         .or_else(|| entry.get("providerData").and_then(|data| data.get("usage")))
         .and_then(usage_from_value)?;
-    // WorkBuddy only reports cache reads. The Copilot/OTel arms adopt the
-    // same helper with both cache keys when their #312 basis port lands
-    // (sibling lane); this batch (rm-529) ports the WorkBuddy clamp only.
-    subtract_cached_input(&mut usage, &["cache_read_input_tokens"]);
-    Some(usage)
+    // WorkBuddy only reports cache reads, so the single-key form of the
+    // shared clamp (rm-529's parameterized port); the Copilot arms pass
+    // both cache keys.
+    let clamped = subtract_cached_input(&mut usage, &["cache_read_input_tokens"]);
+    Some((usage, clamped))
 }
 
 fn parse_openclaw_value(value: &Value) -> Option<Vec<Event>> {
@@ -5033,6 +5141,13 @@ fn copilot_usage(span: &Map<String, Value>) -> BTreeMap<String, i64> {
             usage.insert(target.to_string(), value);
         }
     }
+    // Copilot spans follow the GenAI semconv basis (`gen_ai.usage.
+    // input_tokens` INCLUDES cached tokens), so normalize to the delta
+    // basis with the shared clamped subtraction (rm-600).
+    subtract_cached_input(
+        &mut usage,
+        &["cache_creation_input_tokens", "cache_read_input_tokens"],
+    );
     usage
 }
 
@@ -6120,10 +6235,90 @@ mod tests {
                 }
             }
         });
-        let usage = workbuddy_usage(value.as_object().expect("object")).expect("usage");
+        let (usage, clamped) = workbuddy_usage(value.as_object().expect("object")).expect("usage");
         assert_eq!(usage.get("input_tokens"), Some(&0));
         assert_eq!(usage.get("cache_read_input_tokens"), Some(&0));
         assert_eq!(usage.get("output_tokens"), Some(&10));
+        // The negative total clamps the cached count to zero and flags
+        // the clamp (rm-600, upstream #316 shape).
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&0));
+        assert!(clamped);
+    }
+
+    #[test]
+    fn subtract_cached_input_clamps_the_cached_count_to_the_input() {
+        // Upstream #316 live PoC (wb7): a record reports 150 cached
+        // tokens against 100 input — the session total (0 + 150 = 150)
+        // previously EXCEEDED the source-recorded input. Both sides
+        // clamp: input keeps 0 uncached, the cached count drops to 100,
+        // and the sum equals the recorded input exactly.
+        let mut usage: BTreeMap<String, i64> = BTreeMap::from([
+            ("input_tokens".to_string(), 100),
+            ("output_tokens".to_string(), 10),
+            ("cache_read_input_tokens".to_string(), 150),
+        ]);
+        assert!(subtract_cached_input(
+            &mut usage,
+            &["cache_read_input_tokens"]
+        ));
+        assert_eq!(usage.get("input_tokens"), Some(&0));
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&100));
+
+        // In-range records are untouched: cached strictly below input.
+        let mut fine: BTreeMap<String, i64> = BTreeMap::from([
+            ("input_tokens".to_string(), 2000),
+            ("cache_read_input_tokens".to_string(), 1500),
+        ]);
+        assert!(!subtract_cached_input(
+            &mut fine,
+            &["cache_read_input_tokens"]
+        ));
+        assert_eq!(fine.get("input_tokens"), Some(&500));
+        assert_eq!(fine.get("cache_read_input_tokens"), Some(&1500));
+
+        // A hostile negative cached count contributes nothing and never
+        // inflates input.
+        let mut hostile: BTreeMap<String, i64> = BTreeMap::from([
+            ("input_tokens".to_string(), 100),
+            ("cache_read_input_tokens".to_string(), -50),
+        ]);
+        assert!(!subtract_cached_input(
+            &mut hostile,
+            &["cache_read_input_tokens"]
+        ));
+        assert_eq!(hostile.get("input_tokens"), Some(&100));
+        assert_eq!(hostile.get("cache_read_input_tokens"), Some(&0));
+
+        // No cached count at all: untouched.
+        let mut plain: BTreeMap<String, i64> = BTreeMap::from([("input_tokens".to_string(), 42)]);
+        assert!(!subtract_cached_input(
+            &mut plain,
+            &["cache_read_input_tokens"]
+        ));
+        assert_eq!(plain.get("input_tokens"), Some(&42));
+    }
+
+    #[test]
+    fn add_usage_into_sums_saturating_per_key() {
+        let mut total: BTreeMap<String, i64> = BTreeMap::from([("input_tokens".to_string(), 100)]);
+        add_usage_into(
+            &mut total,
+            BTreeMap::from([
+                ("input_tokens".to_string(), 200),
+                ("output_tokens".to_string(), 20),
+            ]),
+        );
+        add_usage_into(
+            &mut total,
+            BTreeMap::from([("input_tokens".to_string(), 300)]),
+        );
+        assert_eq!(total.get("input_tokens"), Some(&600));
+        assert_eq!(total.get("output_tokens"), Some(&20));
+        add_usage_into(
+            &mut total,
+            BTreeMap::from([("input_tokens".to_string(), i64::MAX)]),
+        );
+        assert_eq!(total.get("input_tokens"), Some(&i64::MAX));
     }
 
     #[test]
@@ -6141,10 +6336,11 @@ mod tests {
                 }
             }
         });
-        let usage = workbuddy_usage(value.as_object().expect("object")).expect("usage");
+        let (usage, clamped) = workbuddy_usage(value.as_object().expect("object")).expect("usage");
         assert_eq!(usage.get("input_tokens"), Some(&0));
         assert_eq!(usage.get("cache_read_input_tokens"), Some(&100));
         assert_eq!(usage.get("output_tokens"), Some(&20));
+        assert!(clamped);
     }
 
     #[test]

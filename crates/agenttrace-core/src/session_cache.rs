@@ -5,7 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 29;
+// Bumped 28 -> 29 (integration of run 99d1c79c, rm-600 'Port the
+// workbuddy usage arithmetic set (upstream #311 sum, #316 clamp,
+// reasoning-row usage)', minted campaign-locally as rm-542): workbuddy
+// usage arithmetic now SUMS across records (upstream #311) and clamps
+// the cached count to the source-recorded input (upstream #316 —
+// rm-529's clamp generalized to the bool-returning, cache-key-
+// parameterized form and adopted for the Copilot modelMetrics/span
+// lanes), so cached sessions would silently keep reporting the old
+// keep-last, unclamped totals — the rm-230 convention: a parser-
+// semantics change that alters reported totals for unchanged files
+// must invalidate warm caches. Copilot sessions ride the same shared
+// clamp and re-price identically. The batch landed against its base
+// 40f0ae8 at schema 25 and bumped it to 26 there; integration re-bases
+// the bump onto the already-advanced ceiling (25 was rm-450, 26 was
+// rm-485, 27 was rm-542, 28 was rm-529) per the same convention.
+// Entries regenerate once on next scan.
 // Bumped 27 -> 28 (integration of run 66e75e39, rm-529 'Clamp cache
 // counts to cache-inclusive input (port upstream open PR #316)'):
 // the shared subtract_cached_input clamps each cache count to what is

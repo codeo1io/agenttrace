@@ -624,9 +624,13 @@ fn rust_parses_workbuddy_messages_tools_usage_and_millis() {
     assert_eq!(parsed.metrics.tool_calls_total, 1);
     assert_eq!(parsed.metrics.tool_calls_ok, 1);
     assert_eq!(parsed.metrics.reasoning_blocks, 1);
-    assert_eq!(parsed.metrics.tokens_input, 40);
-    assert_eq!(parsed.metrics.tokens_output, 30);
-    assert_eq!(parsed.metrics.tokens_cache_r, 80);
+    // rm-600 / upstream #311: usage SUMS across records (the keep-last
+    // arm kept only the assistant record: 40/30/80). Both records
+    // carry the inclusive basis, subtracted per record BEFORE summing:
+    // (100-60) + (120-80) = 80 uncached input, 60+80 = 140 cached.
+    assert_eq!(parsed.metrics.tokens_input, 80);
+    assert_eq!(parsed.metrics.tokens_output, 50);
+    assert_eq!(parsed.metrics.tokens_cache_r, 140);
     assert_eq!(parsed.metrics.session_start, "2026-07-11T13:50:00Z");
     assert_eq!(parsed.metrics.session_end, "2026-07-11T13:50:04Z");
 
@@ -723,7 +727,11 @@ fn rust_parses_copilot_session_state() {
     assert_eq!(parsed.metrics.model_used, "gpt-5.4");
     assert_eq!(parsed.metrics.tool_calls_total, 1);
     assert_eq!(parsed.metrics.tool_calls_ok, 1);
-    assert_eq!(parsed.metrics.tokens_input, 100);
+    // Copilot modelMetrics follow the GenAI semconv basis (input_tokens
+    // INCLUDES cached tokens; upstream #316 "workbuddy-copilot" treats
+    // both lanes alike), so the stored 100 is normalized to the delta
+    // basis: 100 inclusive - 40 cached = 60 uncached input.
+    assert_eq!(parsed.metrics.tokens_input, 60);
     assert_eq!(parsed.metrics.tokens_cache_r, 40);
 
     let _ = fs::remove_dir_all(root);
@@ -812,6 +820,32 @@ fn rust_attributes_meta_only_sessions_to_their_family() {
     // Token totals stay zero by design: unpaired token_usage_records count
     // for diagnostics only (rm-401 — their usage already lives in the
     // cumulative snapshots). The rm-490 claim is attribution, not counting.
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn copilot_cache_counts_clamp_when_cached_exceeds_input() {
+    // rm-600 / upstream #316 rider: a Copilot shutdown ledger reports
+    // more cached tokens than input. Both sides clamp — the session
+    // total (input + cache_read) can never exceed the source-recorded
+    // input.
+    let root = temp_root("agenttrace-rust-copilot-clamp");
+    fs::create_dir_all(&root).expect("create copilot clamp temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"user.message","timestamp":"2026-05-07T10:00:01Z","data":{"content":"inspect"}}
+{"type":"session.shutdown","timestamp":"2026-05-07T10:00:04Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":30,"outputTokens":5,"cacheReadTokens":80}}}}}
+"#,
+    )
+    .expect("write copilot clamp session");
+
+    let parsed = parse_file(&path).expect("parse copilot clamp session");
+    assert_eq!(parsed.metrics.tokens_input, 0);
+    assert_eq!(parsed.metrics.tokens_cache_r, 30);
+    assert_eq!(parsed.metrics.tokens_output, 5);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -979,19 +1013,20 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v28 (integration of run 66e75e39, rm-529 #316 clamp port,
-        // re-based off the campaign's 24 -> 26 bump, 25 being already
-        // taken on the campaign's landed ceiling by rm-450; 27 was the
-        // rm-542 Codex custom-tools parse coverage re-based off the
-        // campaign's 22 -> 23 bump, 26 the rm-485 copilot session-wide
-        // credit accounting, 25 the rm-450 workbuddy input-basis
-        // disclosure, 24 the rm-436/437/438 pi journal accounting,
-        // 23 rm-408, 22 was run 2c2db6f5 rm-400/401):
+        // v29 (integration of run 99d1c79c, rm-600 workbuddy usage
+        // sum + cache clamp + Copilot adoption, upstream
+        // #311/#316, re-based off the campaign's 25 -> 26 bump; 28 was
+        // the rm-529 #316 clamp port, 27 was the rm-542 Codex
+        // custom-tools parse coverage re-based off the campaign's
+        // 22 -> 23 bump, 26 the rm-485 copilot session-wide credit
+        // accounting, 25 the rm-450 workbuddy input-basis disclosure,
+        // 24 the rm-436/437/438 pi journal accounting, 23 rm-408,
+        // 22 was run 2c2db6f5 rm-400/401):
         // parser-semantics fixes bump the schema so warm entries
         // regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(28)
+            Some(29)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1156,15 +1191,14 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v28 — see the rm-529, rm-542, rm-485, rm-450,
-        // rm-436/437/438, rm-408 and rm-400/401 bump notes in
-        // session_cache.rs; the #316 cache clamp port is what carried
-        // 27 -> 28 at this integration, re-based off the campaign's
-        // own 24 -> 26 bump, 25 being already taken on the landed
-        // ceiling by rm-450).
+        // version (v29 — see the rm-600, rm-529, rm-542, rm-485,
+        // rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes in
+        // session_cache.rs; the workbuddy usage sum + cache clamp and
+        // its Copilot adoption are what carried 28 -> 29 at this
+        // integration, re-based off the campaign's own 25 -> 26 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(28)
+            Some(29)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
