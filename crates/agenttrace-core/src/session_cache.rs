@@ -5,7 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 26;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+// Bumped 26 -> 27 (run 254b2417, rm-551): the per-model copilot
+// reconciliation (rotation and partial-shutdown shapes no longer
+// drop whole models' cumulative tokens) raises reported totals for
+// UNCHANGED multi-model files, so a warm v26 cache keeps serving
+// snapshot-level totals with matching fingerprints — no re-parse,
+// no self-heal. Same rm-230 convention as every bump below.
+// Entries regenerate once on next scan.
 // Bumped 25 -> 26 (integration of run 32192d92, rm-485): the copilot
 // session-wide credit accounting (totalNanoAiu on shutdown plus the
 // freshest usage_checkpoint snapshot) raises reported cost for

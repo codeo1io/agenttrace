@@ -235,9 +235,21 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // the only usage surface on open/killed sessions). Track the largest
     // counter seen (checkpoints and shutdown snapshots overlap) and whether
     // shutdown metrics were emitted at all.
+    // rm-551: reconcile copilot usage PER MODEL, not per snapshot. A
+    // checkpoint (or shutdown) is the freshest word on exactly the models
+    // it names: it REPLACES those entries and PRESERVES every other
+    // model's last-known values, so a rotation across checkpoints and a
+    // shutdown naming only a subset of the checkpointed models can no
+    // longer drop a model's cumulative tokens wholesale (the assess PoCs;
+    // ccusage #1824's subtract_usage reconciliation keeps the same
+    // per-entry discipline for credits).
+    struct CopilotModelSnapshot {
+        timestamp: String,
+        usage: BTreeMap<String, i64>,
+    }
+    let mut per_model: BTreeMap<String, CopilotModelSnapshot> = BTreeMap::new();
     let mut max_credit_nano: f64 = 0.0;
-    let mut shutdown_metrics_emitted = false;
-    let mut checkpoint_snapshot: Option<(String, Vec<(String, BTreeMap<String, i64>)>)> = None;
+    let mut credit_timestamp = String::new();
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
@@ -301,22 +313,23 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 ..Event::default()
             }),
             "session.shutdown" => {
+                // rm-551: shutdown metrics are the freshest word on the
+                // models they name — they replace those per-model entries
+                // (identical values on a clean shutdown, newer values on a
+                // caught-up one) without touching models the shutdown
+                // omitted. Emission is deferred to the single post-loop
+                // fold so checkpoints and shutdowns share one code path.
                 if let Some(metrics) = data
                     .and_then(|data| data.get("modelMetrics"))
                     .and_then(Value::as_object)
                 {
                     for (model, metric) in metrics {
                         if let Some(usage) = metric.get("usage").and_then(usage_from_value) {
-                            shutdown_metrics_emitted = true;
-                            events.insert(
-                                0,
-                                Event {
-                                    role: "meta".to_string(),
+                            per_model.insert(
+                                model.clone(),
+                                CopilotModelSnapshot {
                                     timestamp: timestamp.clone(),
                                     usage,
-                                    model_used: model.clone(),
-                                    source_tool: "copilot_cli".to_string(),
-                                    ..Event::default()
                                 },
                             );
                         }
@@ -328,62 +341,64 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 {
                     if nano.is_finite() && nano > max_credit_nano {
                         max_credit_nano = nano;
+                        credit_timestamp = timestamp.clone();
                     }
                 }
             }
-            // rm-485: checkpoints carry the same shapes as shutdown metrics
-            // on sessions that never shut down cleanly. Counters may be
-            // re-emitted across checkpoints, so keep only the freshest
-            // snapshot and fold credits with max semantics — summing would
-            // double-count every overlap (ccusage #1824 reconciliation).
+            // rm-485/rm-551: checkpoints carry the same shapes as shutdown
+            // metrics on sessions that never shut down cleanly. Counters
+            // are re-emitted across checkpoints, so a checkpoint replaces
+            // only the per-model entries it names (max semantics per entry,
+            // never a whole-snapshot swap) and credits fold with max
+            // semantics — summing would double-count every overlap
+            // (ccusage #1824 reconciliation).
             "session.usage_checkpoint" => {
-                let mut snapshot = Vec::new();
                 if let Some(metrics) = data
                     .and_then(|data| data.get("modelMetrics"))
                     .and_then(Value::as_object)
                 {
                     for (model, metric) in metrics {
                         if let Some(usage) = metric.get("usage").and_then(usage_from_value) {
-                            snapshot.push((model.clone(), usage));
+                            per_model.insert(
+                                model.clone(),
+                                CopilotModelSnapshot {
+                                    timestamp: timestamp.clone(),
+                                    usage,
+                                },
+                            );
                         }
                     }
                 }
-                checkpoint_snapshot = Some((timestamp.clone(), snapshot));
                 if let Some(nano) = data
                     .and_then(|data| data.get("totalNanoAiu"))
                     .and_then(Value::as_f64)
                 {
                     if nano.is_finite() && nano > max_credit_nano {
                         max_credit_nano = nano;
+                        credit_timestamp = timestamp.clone();
                     }
                 }
             }
             _ => {}
         }
     }
-    // rm-485: open/killed sessions never reach shutdown — surface the last
-    // checkpoint's per-model usage instead (shutdown metrics, when present,
-    // win; emitting both would double-count).
-    let credit_timestamp = checkpoint_snapshot
-        .as_ref()
-        .map(|(timestamp, _)| timestamp.clone())
-        .unwrap_or_default();
-    if !shutdown_metrics_emitted {
-        if let Some((timestamp, snapshot)) = checkpoint_snapshot {
-            for (model, usage) in snapshot {
-                events.insert(
-                    0,
-                    Event {
-                        role: "meta".to_string(),
-                        timestamp: timestamp.clone(),
-                        usage,
-                        model_used: model,
-                        source_tool: "copilot_cli".to_string(),
-                        ..Event::default()
-                    },
-                );
-            }
-        }
+    // rm-551: one meta event per observed model, stamped with the
+    // timestamp that last named it — lib.rs sums across models, prices
+    // each block at its own model (usage_blocks_multi_model) and labels a
+    // multi-model session "multiple", so no model vanishes and none
+    // double-counts (a re-emitted model replaces only its own entry).
+    for (model, snapshot) in &per_model {
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                timestamp: snapshot.timestamp.clone(),
+                usage: snapshot.usage.clone(),
+                model_used: model.clone(),
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            },
+        );
     }
     // rm-485: emit the session-wide credit counter as a cost-only meta
     // event (1 AIU = 1 AI credit = $0.01 per ccusage #1824 semantics). Max
