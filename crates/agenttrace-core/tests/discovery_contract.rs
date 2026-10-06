@@ -3296,3 +3296,22 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+#[cfg(unix)]
+fn discovery_skips_non_regular_session_files() {
+    // rm-212: a fifo or device named *.jsonl inside a session root used to
+    // wedge reads; discovery must admit regular files only.
+    let root = generated_fixture("fifo-skip");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create fixture root");
+    std::fs::write(root.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    let status = std::process::Command::new("mkfifo")
+        .arg(root.join("evil.jsonl"))
+        .status()
+        .expect("mkfifo available");
+    assert!(status.success(), "mkfifo failed");
+    let files = find_session_files(Some(&root));
+    assert_eq!(files.len(), 1, "expected only the regular file: {files:?}");
+    let _ = std::fs::remove_dir_all(root);
+}

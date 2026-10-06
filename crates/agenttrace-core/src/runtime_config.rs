@@ -51,6 +51,14 @@ mod tests {
         // A fresh process state cannot be simulated with OnceLock, so
         // assert the public contract shape: get() never panics and the
         // first set() wins over a second one with different values.
+        // INTEGRATION (2026-10-07, conflict case 2f1198de): installing a
+        // table here redirects every later history_path()/pricing
+        // override read in this process away from their AGENTTRACE_*
+        // env knobs, so this test takes the shared env lock — the
+        // env-steered history tests (history_file_is_owner_only and
+        // run de96d4cc's legacy-fold test) are serialized against the
+        // install instead of racing it for the life of the binary.
+        let _env = crate::test_env::lock_env();
         let first = RuntimeConfigOverrides {
             history_dir: Some(PathBuf::from("/first-history")),
             pricing_file: Some(PathBuf::from("/first-pricing.json")),

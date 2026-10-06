@@ -190,3 +190,220 @@ fn demo_gate_fails_like_current_contract() {
     let failures = evaluate_overview_gate(&overview, &sessions, 80, true, Some(15.0));
     assert!(!failures.is_empty());
 }
+
+#[test]
+fn baseline_non_overview_json_is_rejected_not_zero_filled() {
+    // rm-569: `{"name": "not-an-overview"}` used to zero-fill both summaries
+    // and fabricate a +100% regression; it must fail loudly with attribution.
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-bad-baseline-{}.json",
+        std::process::id()
+    ));
+    fs::write(&path, r#"{"name": "not-an-overview"}"#).expect("write bad baseline");
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("non-overview baseline must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("is not an overview report"),
+        "structural reason missing: {message}"
+    );
+    assert!(
+        message.contains("--baseline"),
+        "flag attribution missing: {message}"
+    );
+    assert!(
+        message.contains(path.to_str().unwrap()),
+        "baseline path missing: {message}"
+    );
+    assert!(
+        message.contains("summary"),
+        "expected shape hint missing: {message}"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn baseline_missing_file_is_attributed_to_the_flag() {
+    // rm-569: a missing baseline must name the flag and the path instead of a
+    // context-free "No such file or directory".
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-missing-baseline-{}.json",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&path);
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("missing baseline must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("--baseline"),
+        "flag attribution missing: {message}"
+    );
+    assert!(
+        message.contains("failed to read baseline file"),
+        "io class missing: {message}"
+    );
+    assert!(
+        message.contains(path.to_str().unwrap()),
+        "baseline path missing: {message}"
+    );
+}
+
+#[test]
+fn baseline_invalid_utf8_is_reported_as_such() {
+    // rm-569: non-UTF-8 bytes must surface as a UTF-8 error, attributed to
+    // --baseline, not as a JSON parse error.
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-nonutf8-baseline-{}.json",
+        std::process::id()
+    ));
+    fs::write(&path, [0xff, 0xfe, 0x00, 0x5a, 0xff]).expect("write non-utf8 baseline");
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("non-utf8 baseline must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("not valid UTF-8"),
+        "utf-8 class missing: {message}"
+    );
+    assert!(
+        message.contains("--baseline"),
+        "flag attribution missing: {message}"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn baseline_version_mismatch_is_rejected() {
+    // rm-569/rm-504: a structurally-valid overview from a different report
+    // version must be rejected instead of comparing across versions.
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let mut baseline: Value = serde_json::from_str(&report).expect("report is json");
+    baseline["version"] = Value::String("0.0.0-other".to_string());
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-versioned-baseline-{}.json",
+        std::process::id()
+    ));
+    fs::write(&path, baseline.to_string()).expect("write versioned baseline");
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("version-mismatched baseline must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("version mismatch"),
+        "version class missing: {message}"
+    );
+    assert!(
+        message.contains("0.0.0-other"),
+        "baseline version missing: {message}"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn baseline_empty_summary_object_is_rejected_not_zero_filled() {
+    // Review fix (rm-569, 2026-10-06): {"summary":{}} used to pass the shape
+    // check and zero-fill its comparisons into a fabricated +100% regression
+    // ("Gate failed" on a healthy corpus).
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-empty-summary-baseline-{}.json",
+        std::process::id()
+    ));
+    fs::write(&path, "{\"summary\":{}}").expect("write empty-summary baseline");
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("empty-summary baseline must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("missing the compared field")
+            && message.contains("total_duration_seconds"),
+        "empty-summary class missing: {message}"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn baseline_without_version_string_is_rejected() {
+    // Review fix (rm-569, 2026-10-06): a baseline without a top-level "version"
+    // used to skip the version cross-check silently.
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let mut baseline: serde_json::Value =
+        serde_json::from_str(&report).expect("report is valid json");
+    baseline
+        .as_object_mut()
+        .expect("report root is an object")
+        .remove("version");
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-unversioned-baseline-{}.json",
+        std::process::id()
+    ));
+    fs::write(&path, baseline.to_string()).expect("write unversioned baseline");
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("unversioned baseline must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("no \"version\" string found"),
+        "unversioned class missing: {message}"
+    );
+    let _ = fs::remove_file(&path);
+}

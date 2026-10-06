@@ -1685,3 +1685,59 @@ fn env_history_knob_sits_below_config_layers_end_to_end() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read_dir sandbox") {
+        let path = entry.expect("sandbox entry").path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn statusline_report_leaves_the_statusline_journal_untouched_e2e() {
+    // Review fix (rm-573, 2026-10-06): end-to-end pin that the report lane never
+    // appends to (or otherwise touches) the real statusline journal, and creates
+    // nothing else under the sandboxed cache/history roots.
+    let sandbox =
+        std::env::temp_dir().join(format!("agenttrace-journal-e2e-{}", std::process::id()));
+    let cache = sandbox.join("cache");
+    std::fs::create_dir_all(&cache).expect("sandbox cache dir");
+    let journal = cache.join("statusline.jsonl");
+    std::fs::write(&journal, "ab").expect("plant journal sentinel");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--statusline-report")
+        .arg("statusline")
+        .env("HOME", &sandbox)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_CONFIG_HOME", sandbox.join("config"))
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .env("AGENTTRACE_HISTORY_DIR", sandbox.join("history"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run agenttrace");
+
+    assert!(
+        out.status.success(),
+        "rc={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&journal).expect("journal after run"),
+        b"ab".to_vec(),
+        "journal must be byte-identical after --statusline-report"
+    );
+    let mut files = Vec::new();
+    collect_files(&sandbox, &mut files);
+    assert_eq!(
+        files,
+        vec![journal.clone()],
+        "no new files may appear under the sandbox: {files:?}"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

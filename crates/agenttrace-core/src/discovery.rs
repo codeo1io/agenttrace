@@ -677,6 +677,12 @@ fn walk_session_files_cached(
         if !is_session_file_name(&name) {
             continue;
         }
+        // rm-212: only regular files (symlinks included) are session
+        // candidates — a fifo or device named *.jsonl inside a session root
+        // would wedge reads and was previously admitted.
+        if !path.is_file() {
+            continue;
+        }
         if !is_special_session_file(&path) {
             continue;
         }
@@ -754,6 +760,12 @@ fn walk_session_files(
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !is_session_file_name(&name) {
+            continue;
+        }
+        // rm-212: only regular files (symlinks included) are session
+        // candidates — a fifo or device named *.jsonl inside a session root
+        // would wedge reads and was previously admitted.
+        if !path.is_file() {
             continue;
         }
         if !is_special_session_file(&path) {

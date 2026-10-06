@@ -758,13 +758,75 @@ fn render_recommendations_markdown(out: &mut String, items: &[crate::Recommendat
     }
 }
 
+/// rm-569: load a `--baseline` file with truthful, attributed errors.
+///
+/// The baseline gate is the CI flagship (docs/guides/ci-integration.md): a
+/// wrong file must fail loudly instead of zero-filling into a fabricated
+/// +100% regression. Input classes covered: unreadable (io error attributed
+/// to the path), non-UTF-8, non-JSON, and valid JSON that is not an overview
+/// report (missing `summary` object). The version cross-check against
+/// the current report lives in `add_baseline_comparison`.
+///
+/// Review fix (2026-10-06): the `version` string and the summary's compared
+/// numeric fields (`total_duration_seconds`, `total_cost`, `total_tokens`) are
+/// required up front, so an empty or partial summary cannot zero-fill its way
+/// into a fabricated +100% regression.
+fn load_baseline_report(baseline_path: &str) -> anyhow::Result<Value> {
+    let baseline_text = match fs::read_to_string(baseline_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            anyhow::bail!("--baseline: {baseline_path} is not valid UTF-8: {err}");
+        }
+        Err(err) => {
+            anyhow::bail!("--baseline: failed to read baseline file {baseline_path}: {err}");
+        }
+    };
+    let baseline: Value = serde_json::from_str(&baseline_text)
+        .map_err(|err| anyhow::anyhow!("--baseline: {baseline_path} is not valid JSON: {err}"))?;
+    let Some(summary) = baseline.get("summary").and_then(Value::as_object) else {
+        anyhow::bail!(
+            "--baseline: {baseline_path} is not an overview report: no \"summary\" object found; \
+             expected the JSON written by `agenttrace --overview -f json -o <baseline>` \
+             (an object with version and summary sections)"
+        );
+    };
+    for key in ["total_duration_seconds", "total_cost", "total_tokens"] {
+        if !summary.get(key).is_some_and(Value::is_number) {
+            anyhow::bail!(
+                "--baseline: {baseline_path} summary is missing the compared field \"{key}\"; \
+                 the comparison would zero-fill it into a fabricated delta — regenerate the \
+                 baseline with `agenttrace --overview -f json -o <baseline>`"
+            );
+        }
+    }
+    if baseline.get("version").and_then(Value::as_str).is_none() {
+        anyhow::bail!(
+            "--baseline: {baseline_path} is not an overview report: no \"version\" string found; \
+             every overview JSON writes one — regenerate it with \
+             `agenttrace --overview -f json -o <baseline>`"
+        );
+    }
+    Ok(baseline)
+}
+
 pub fn add_baseline_comparison(
     report_json: &str,
     baseline_path: &str,
     thresholds: BaselineThresholds,
 ) -> anyhow::Result<(String, BaselineBreaches)> {
     let mut report: Value = serde_json::from_str(report_json)?;
-    let baseline: Value = serde_json::from_str(&fs::read_to_string(baseline_path)?)?;
+    let baseline: Value = load_baseline_report(baseline_path)?;
+    // rm-569/rm-389: a baseline from a different report version can zero-fill
+    // into a fabricated regression; reject the mismatch loudly instead.
+    if let (Some(current), Some(base)) = (report.get("version"), baseline.get("version")) {
+        if current != base {
+            anyhow::bail!(
+                "--baseline: {baseline_path} version mismatch: baseline version {base} \
+                 != current report version {current}; regenerate the baseline with the \
+                 current agenttrace version (--overview -f json -o <baseline>)"
+            );
+        }
+    }
     let summary = report
         .get("summary")
         .and_then(Value::as_object)

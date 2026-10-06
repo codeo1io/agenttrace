@@ -1,7 +1,6 @@
 use crate::{project_name, Anomaly, Diagnostics, Metrics, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -45,6 +44,15 @@ pub fn preserve_derived_history(sessions: &[Session]) -> anyhow::Result<()> {
     let mut records = load_records();
     for session in sessions {
         let record = DerivedSession::from_session(session);
+        // Review fix (2026-10-06): fold away DefaultHasher-era rows describing
+        // this same session, so the file converges on one key per session
+        // instead of accumulating the legacy key beside the pinned one.
+        // Review fix (2026-10-07, round 2 LF5 — disclosed heuristic): era is
+        // unrecoverable (no path stored), so the fold applies to ANY same-
+        // identity row under a different id, including a genuinely distinct
+        // session whose tuple collides (model/end/cost/health excluded) —
+        // see `same_derived_session` for the collision shape.
+        records.retain(|_, other| other.id == record.id || !same_derived_session(other, &record));
         records.insert(record.id.clone(), record);
     }
     let path = history_path();
@@ -67,10 +75,26 @@ pub fn merge_preserved_history(live: &mut Vec<Session>) {
         .iter()
         .map(session_id)
         .collect::<std::collections::BTreeSet<_>>();
+    // Review fix (2026-10-06): a DefaultHasher-era row describes a session we
+    // already have live under its pinned id — the old id can never match (the
+    // original path is not stored in the record, so it cannot be recomputed).
+    // Fold such rows away by identity instead of appending a duplicate
+    // "history-" row (and remember appended records so legacy duplicates of
+    // them are folded too).
+    let mut identities: Vec<DerivedSession> =
+        live.iter().map(DerivedSession::from_session).collect();
     for record in load_records().into_values() {
-        if seen.insert(record.id.clone()) {
-            live.push(record.into_session());
+        if !seen.insert(record.id.clone()) {
+            continue;
         }
+        if identities
+            .iter()
+            .any(|live_record| same_derived_session(live_record, &record))
+        {
+            continue;
+        }
+        identities.push(record.clone());
+        live.push(record.into_session());
     }
 }
 
@@ -110,10 +134,56 @@ fn decode_records(raw: &[u8]) -> BTreeMap<String, DerivedSession> {
 }
 
 fn session_id(session: &Session) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    session.path.hash(&mut hasher);
-    session.metrics.session_start.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // rm-212: FNV-1a 64-bit over a canonical identity string. std's
+    // DefaultHasher (SipHash-1-3) is deterministic today but is NOT
+    // guaranteed stable across Rust releases; ids written into a preserved
+    // history snapshot must dedupe against ids computed by a later build, so
+    // the hash is owned here and pinned by a fixed-vector test. Review fix
+    // (2026-10-06): DefaultHasher-era rows cannot be re-keyed (the original
+    // path is not stored in the record), so `merge_preserved_history` skips
+    // them via `same_derived_session` and `preserve_derived_history` folds
+    // them away — an upgrade neither re-admits them as duplicate "history-"
+    // rows nor leaves both keys in the file.
+    let canonical = format!("{}|{}", session.path, session.metrics.session_start);
+    format!("{:016x}", stable_identity_hash(&canonical))
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn stable_identity_hash(canonical: &str) -> u64 {
+    canonical.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+/// True when two records describe the same underlying session.
+///
+/// Review fix (2026-10-06): records written before the id pinning keyed their
+/// rows with std's DefaultHasher, so a live session's pinned id can never match
+/// them, and the original session path is not stored in the record, so the old
+/// id cannot be recomputed. The derived fields that survive the round-trip
+/// (start, project, source, token counts, duration, cache split) identify the
+/// session well enough to fold such rows away wherever live data is available.
+/// `id` is deliberately excluded: that is exactly what differs.
+///
+/// Review fix (2026-10-07, round 2 LF5 — disclosed heuristic): because era is
+/// unrecoverable, this predicate cannot distinguish a legacy DefaultHasher row
+/// from a genuinely DISTINCT session whose identity tuple collides. The tuple
+/// deliberately excludes model/end/cost/health, so two distinct session files
+/// sharing start+project+source+token counts+cache split+duration (realistically
+/// empty or duplicated shells) fold into one key, dropping the first row.
+/// `merge_preserved_history` shares the same breadth on the dedup side
+/// (skip-only, no deletion). Disclosed on the rm-212 row.
+fn same_derived_session(a: &DerivedSession, b: &DerivedSession) -> bool {
+    a.start == b.start
+        && a.project == b.project
+        && a.source == b.source
+        && a.input == b.input
+        && a.output == b.output
+        && a.cache_write == b.cache_write
+        && a.cache_read == b.cache_read
+        && a.duration == b.duration
 }
 
 impl DerivedSession {
@@ -283,6 +353,133 @@ mod tests {
             "history.json must be owner-only, got {:o}",
             mode & 0o777
         );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stable_identity_hash_pins_fnv1a_vectors() {
+        // rm-212: reference vectors for FNV-1a 64-bit — if std ever changes
+        // hashing again these ids must NOT move.
+        assert_eq!(stable_identity_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(stable_identity_hash("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(stable_identity_hash("foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn session_id_is_deterministic_hex_and_path_sensitive() {
+        let session = Session {
+            name: "secret task".to_string(),
+            path: "/tmp/private/session.jsonl".to_string(),
+            cwd: "/work/project".to_string(),
+            metrics: Metrics {
+                source_tool: "codex_cli".to_string(),
+                model_used: "gpt-5".to_string(),
+                session_start: "2026-07-19T00:00:00Z".to_string(),
+                tokens_input: 10,
+                cost_estimated: 0.01,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 95,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let id = session_id(&session);
+        assert_eq!(id.len(), 16);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(id, session_id(&session));
+
+        let mut other = session.clone();
+        other.path = "/tmp/private/other.jsonl".to_string();
+        assert_ne!(id, session_id(&other));
+    }
+
+    #[test]
+    fn legacy_default_hasher_rows_are_folded_by_identity() {
+        // Review fix (2026-10-06): pre-pinning rows (std DefaultHasher ids)
+        // duplicated against live sessions on `--include-history` and every
+        // `--sessions` run left both keys in the file. Rows whose id disagrees
+        // with `stable_identity_hash(label|timestamp)` are re-keyed at load.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-rekey-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+
+        let session = Session {
+            name: "legacy row".to_string(),
+            path: "/tmp/private/legacy.jsonl".to_string(),
+            cwd: "/work/project".to_string(),
+            metrics: Metrics {
+                source_tool: "codex_cli".to_string(),
+                model_used: "gpt-5".to_string(),
+                session_start: "2026-07-19T00:00:00Z".to_string(),
+                tokens_input: 10,
+                cost_estimated: 0.01,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 95,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let current = session_id(&session);
+        preserve_derived_history(std::slice::from_ref(&session)).expect("seed history file");
+
+        // Simulate the pre-pinning world: same record, but carrying an
+        // old-scheme DefaultHasher id in BOTH the map key and the record's
+        // own id field (that is what a real legacy row looks like).
+        let path = root.join("history.json");
+        let mut file: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read history file"))
+                .expect("history file is a json map");
+        let (key, mut value) = match file.iter().next() {
+            Some((key, value)) => (key.clone(), value.clone()),
+            None => panic!("seeded one record"),
+        };
+        assert_eq!(key, current, "seeded row must use the current id");
+        value.as_object_mut().expect("record is an object").insert(
+            "id".to_string(),
+            serde_json::Value::String("0123456789abcdef".into()),
+        );
+        file.clear();
+        file.insert("0123456789abcdef".to_string(), value);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&file).expect("serialize legacy map"),
+        )
+        .expect("write legacy-keyed history file");
+
+        // Merge must NOT append a duplicate row for the same session...
+        let mut live = vec![session.clone()];
+        merge_preserved_history(&mut live);
+        assert_eq!(
+            live.len(),
+            1,
+            "re-keyed row must dedupe against the live session, got {live:?}"
+        );
+
+        // ...and a preserve cycle must converge the file back to one key.
+        preserve_derived_history(&[session]).expect("re-preserve history");
+        let file: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("re-read history file"))
+                .expect("history file is a json map");
+        assert_eq!(
+            file.keys().collect::<Vec<_>>(),
+            vec![&current],
+            "no duplicate keys after a preserve cycle: {:?}",
+            file.keys().collect::<Vec<_>>()
+        );
+
         match prior {
             Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
             None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
