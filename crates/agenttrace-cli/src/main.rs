@@ -24,6 +24,8 @@ use std::time::SystemTime;
 mod csv_export;
 mod upstream;
 
+mod config;
+
 #[derive(Debug, Parser)]
 #[command(name = "agenttrace")]
 #[command(about = "TUI observability for AI coding agent sessions")]
@@ -86,8 +88,30 @@ struct Args {
     /// network via `git fetch` (and probe the npm registry) before
     /// reporting fork-vs-upstream drift. Without it, `agenttrace
     /// upstream` is fully offline (rm-024).
-    #[arg(long)]
+    #[arg(long = "fetch")]
     fetch: bool,
+    /// Explicit configuration file (rm-384). Layered above the
+    /// project and user config files; a missing file is an error.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Override the history directory: highest precedence, then the
+    /// config files, then `AGENTTRACE_HISTORY_DIR` (rm-384).
+    #[arg(long, value_name = "PATH")]
+    history_dir: Option<PathBuf>,
+    /// Override the pricing override file: highest precedence, then
+    /// the config files, then `AGENTTRACE_PRICING_FILE` (rm-384).
+    #[arg(long, value_name = "PATH")]
+    pricing_file: Option<PathBuf>,
+    /// Weekly spend budget in USD for `--statusline-report` and
+    /// `--budget`: highest precedence, then config
+    /// `weekly_budget_usd` (rm-385).
+    #[arg(long, value_name = "USD")]
+    weekly_budget: Option<f64>,
+    /// Show the weekly budget window-burn view: per-day spend from
+    /// the statusline journal against the resolved weekly budget
+    /// (rm-385).
+    #[arg(long)]
+    budget: bool,
     #[arg(long)]
     version: bool,
     #[arg(long)]
@@ -223,6 +247,14 @@ fn run() -> anyhow::Result<()> {
     validate_range_applicability(&args)?;
 
     let language = report_language(&args.lang)?;
+    // rm-384: resolve the layered configuration and install the
+    // winning knobs before any consumer (history persistence,
+    // pricing override loading) initializes.
+    let resolved = config::resolve(&args)?;
+    agenttrace_core::set_runtime_config(agenttrace_core::RuntimeConfigOverrides {
+        history_dir: resolved.history_dir.clone(),
+        pricing_file: resolved.pricing_file.clone(),
+    });
 
     // rm-301: stdout purity under machine formats. The side-effect
     // announcements below are human progress chatter; with `-f json` the
@@ -276,6 +308,21 @@ fn run() -> anyhow::Result<()> {
 
     if args.doctor {
         let doctor_dir = args.dir.as_deref().map(PathBuf::from);
+        // rm-384: disclose the configuration layers and the winning
+        // source of every knob. JSON mode keeps stdout a single pure
+        // object; the disclosure goes to stderr as its own document.
+        if args.format == "json" {
+            eprintln!("{}", config::disclosure_json(&resolved));
+        } else {
+            let out = format!(
+                "{}{}",
+                config::disclosure_text(&resolved),
+                render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?
+            );
+            write_output(&args.output, &out)?;
+            write_stdout(&out)?;
+            return Ok(());
+        }
         let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -296,7 +343,16 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.statusline_report {
-        let out = agenttrace_core::render_statusline_report(&args.format)?;
+        let out = agenttrace_core::render_statusline_report(&args.format, resolved.weekly_budget)?;
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
+        return Ok(());
+    }
+
+    if args.budget {
+        // rm-385: the weekly window-burn view — journal-based, no
+        // session discovery, mirroring --statusline-report.
+        let out = agenttrace_core::render_budget_view(&args.format, resolved.weekly_budget)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -1003,6 +1059,14 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--limit"
             | "--sample"
             | "--inspect"
+            // rm-384: the config-surface flags all take a PATH/value;
+            // without them here their value is mistaken for the
+            // positional session path and every following flag is
+            // rejected as dropped (`--config x.toml --doctor` failed).
+            | "--config"
+            | "--history-dir"
+            | "--pricing-file"
+            | "--weekly-budget"
     )
 }
 
@@ -1165,21 +1229,107 @@ fn is_cline_task_dir(path: &std::path::Path) -> bool {
 
 fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     if let Some(path) = path {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // rm-250: stage through a unique temp sibling and rename into
-        // place, so a crash or Ctrl-C mid-write never leaves a
-        // truncated report at the destination (same pattern as the
-        // session-cache and history persistence writers).
-        let temp = unique_temp_sibling(path);
-        let staged = fs::write(&temp, content).and_then(|()| fs::rename(&temp, path));
-        if let Err(error) = staged {
-            let _ = fs::remove_file(&temp);
-            return Err(error).context("writing report output file");
-        }
-        eprintln!("Saved: {}", path.display());
+        // rm-250 residual (cycle 1): resolve the destination honestly
+        // before anything is written. The temp+rename dance used to
+        // silently replace a symlink with a regular file (the link's
+        // target kept its old bytes) and could not write special
+        // files at all.
+        let target = resolve_output_target(path)?;
+        write_output_resolved(path, &target, content)?;
     }
+    Ok(())
+}
+
+/// Follow symlinks to the final destination. A dangling link resolves
+/// to its missing target, which then gets created — the link is
+/// honored instead of replaced. Cycles fail loudly after 32 hops.
+fn resolve_output_target(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..32 {
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = fs::read_link(&target)?;
+                target = match target.parent() {
+                    Some(parent) => parent.join(link),
+                    None => link,
+                };
+            }
+            _ => return Ok(target),
+        }
+    }
+    bail!(
+        "resolving {}: symlink cycle detected (32 hops)",
+        path.display()
+    );
+}
+
+/// Write to the resolved destination. Regular files (and new paths)
+/// keep the rm-250 atomic stage-and-rename; character devices take a
+/// direct stream; fifos, sockets, and block devices are refused with
+/// a disclosed reason instead of silently becoming regular files.
+/// `-o` targets that alias our own stdout/stderr: streamed directly.
+/// `/dev/stdout` under a pipeline resolves through `/proc/self/fd/1`
+/// to an anonymous pipe inode — neither a regular file nor a char
+/// device — so the generic lanes would refuse it or try to stage a
+/// temp file under `/proc`. The aliases are intercepted up front and
+/// written through the descriptor instead (assess U3c: `-o
+/// /dev/stdout` must stream the report instead of failing).
+fn is_stdout_alias(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("/dev/stdout")
+            | Some("/dev/stderr")
+            | Some("/dev/fd/1")
+            | Some("/dev/fd/2")
+            | Some("/proc/self/fd/1")
+            | Some("/proc/self/fd/2")
+    )
+}
+
+fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyhow::Result<()> {
+    if is_stdout_alias(requested) {
+        let mut handle = fs::File::create(requested)
+            .with_context(|| format!("opening {}", requested.display()))?;
+        handle.write_all(content.as_bytes())?;
+        eprintln!("Saved: {} (streamed)", requested.display());
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = fs::symlink_metadata(target) {
+            let kind = meta.file_type();
+            if kind.is_fifo() || kind.is_socket() || kind.is_block_device() {
+                bail!(
+                    "refusing to write -o {}: it is a fifo/socket/block device; \
+                     writing would block or silently replace it — write to a \
+                     regular file instead",
+                    requested.display()
+                );
+            }
+            if kind.is_char_device() {
+                let mut handle = fs::File::create(target)
+                    .with_context(|| format!("opening {}", target.display()))?;
+                handle.write_all(content.as_bytes())?;
+                eprintln!("Saved: {}", target.display());
+                return Ok(());
+            }
+        }
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // rm-250: stage through a unique temp sibling and rename into
+    // place, so a crash or Ctrl-C mid-write never leaves a
+    // truncated report at the destination (same pattern as the
+    // session-cache and history persistence writers).
+    let temp = unique_temp_sibling(target);
+    let staged = fs::write(&temp, content).and_then(|()| fs::rename(&temp, target));
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&temp);
+        return Err(error).context("writing report output file");
+    }
+    eprintln!("Saved: {}", target.display());
     Ok(())
 }
 
@@ -1586,6 +1736,14 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
         args.list_models,
         args.test_match,
         args.statusline_report,
+        // rm-385 (integration review ad24bcb1): `--budget` is a report
+        // action like `--statusline-report`, but it was never added to
+        // this table, so `--budget --overview` (or `--budget --doctor`,
+        // `--budget --statusline-report`) silently rendered only the
+        // first branch's output and exited 0 with the other action
+        // dropped — exactly the action-hijack class rm-246 landed to
+        // close. Registered here so the pair is a loud usage error.
+        args.budget,
         args.version,
         args.search
             .as_deref()
@@ -1656,7 +1814,108 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
             bail!("{flag} must be a finite number >= 0 (got {value})");
         }
     }
+
+    // rm-389 (cycle 1): dispatch-time validation for numeric knobs
+    // that used to degrade silently regardless of the action being
+    // dispatched. Table-driven so every rule stays uniform and each
+    // error names its flag.
+    let rows: Vec<(&str, bool, String)> = vec![
+        (
+            "--limit",
+            args.limit >= 1,
+            format!("--limit must be at least 1 (got {})", args.limit),
+        ),
+        (
+            "--search-limit",
+            args.search_limit >= 1 || !(args.sessions || args.search.is_some()),
+            format!(
+                "--search-limit must be at least 1 with --sessions/--search (got {})",
+                args.search_limit
+            ),
+        ),
+        (
+            "--weekly-budget",
+            args.weekly_budget
+                .is_none_or(|value| value.is_finite() && value > 0.0),
+            format!(
+                "--weekly-budget must be a positive finite USD amount (got {})",
+                args.weekly_budget.unwrap_or(f64::NAN)
+            ),
+        ),
+    ];
+    for (_, valid, message) in rows {
+        if !valid {
+            bail!("{message}");
+        }
+    }
     Ok(())
+}
+
+/// Test-visible Args base: every knob at its neutral default, with
+/// the non-zero CLI defaults real invocations carry (json format,
+/// limit 20, `recent`/`desc` ordering, `en`/`all`). Shared by the
+/// main.rs tests and the config.rs precedence matrix so both build
+/// Args the same way.
+#[cfg(test)]
+pub(crate) fn test_args(dir: Option<String>) -> Args {
+    Args {
+        path: None,
+        format: "json".to_string(),
+        config: None,
+        history_dir: None,
+        pricing_file: None,
+        weekly_budget: None,
+        budget: false,
+        dir,
+        compare: true,
+        audit: false,
+        recommend: false,
+        mcp_governance: false,
+        context_trends: false,
+        delivery_evidence: false,
+        overview: false,
+        sessions: false,
+        diagnostics: false,
+        inspect: None,
+        model: "default".to_string(),
+        output: None,
+        latest: false,
+        waste: false,
+        list_models: false,
+        statusline_report: false,
+        fetch: false,
+        update_pricing: false,
+        test_match: false,
+        version: false,
+        demo: false,
+        doctor: false,
+        search: None,
+        search_limit: 20,
+        fail_under_health: 0,
+        fail_on_critical: false,
+        max_tool_fail_rate: None,
+        baseline: None,
+        baseline_max_duration_delta_pct: 0.0,
+        baseline_max_cost_delta_pct: 0.0,
+        baseline_max_token_delta_pct: 0.0,
+        no_baseline_gate: false,
+        lang: "en".to_string(),
+        range: "all".to_string(),
+        project: String::new(),
+        source: String::new(),
+        model_filter: String::new(),
+        query: String::new(),
+        health: String::new(),
+        cost: String::new(),
+        anomaly: String::new(),
+        sort: "recent".to_string(),
+        order: "desc".to_string(),
+        limit: 20,
+        sample: None,
+        clear_cache: false,
+        preserve_history: false,
+        include_history: false,
+    }
 }
 
 #[cfg(test)]
@@ -2038,6 +2297,45 @@ mod tests {
     }
 
     #[test]
+    fn budget_is_a_report_action_and_conflicts_loudly() {
+        // rm-385 / integration review ad24bcb1: `--budget` dispatches as
+        // its own report branch, so it must be a member of the
+        // action-exclusivity table. Before it was registered,
+        // `--budget --overview` (and `--budget --doctor`,
+        // `--budget --statusline-report`) rendered only the branch that
+        // ran first and exited 0 with the other action silently
+        // dropped — the rm-246 action-hijack class.
+        let mut args = test_args(None);
+        args.compare = false;
+        args.budget = true;
+        assert!(validate_primary_action(&args).is_ok(), "--budget alone");
+
+        for flag in [
+            "--overview",
+            "--doctor",
+            "--statusline-report",
+            "--sessions",
+            "--waste",
+        ] {
+            let mut args = test_args(None);
+            args.compare = false;
+            args.budget = true;
+            match flag {
+                "--overview" => args.overview = true,
+                "--doctor" => args.doctor = true,
+                "--statusline-report" => args.statusline_report = true,
+                "--sessions" => args.sessions = true,
+                "--waste" => args.waste = true,
+                _ => unreachable!("unhandled arm: {flag}"),
+            }
+            let error = validate_primary_action(&args)
+                .expect_err("--budget must conflict with every other report action")
+                .to_string();
+            assert_eq!(error, "choose exactly one report action", "{flag}");
+        }
+    }
+
+    #[test]
     fn single_session_report_yields_to_explicit_actions() {
         // rm-246 (assess N1): a positional session path (or --latest)
         // used to render the single-session report even when
@@ -2140,6 +2438,160 @@ mod tests {
     }
 
     #[test]
+    fn write_output_honors_symlinks_instead_of_replacing_them() {
+        // rm-250 residual (cycle 1): -o through a symlink must update
+        // the link's target and keep the link a link — the assess PoC
+        // showed the link itself silently replaced by a regular file
+        // while the target kept its original bytes. A dangling link
+        // resolves to its missing target, which is created.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-write-link-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let real = dir.join("real");
+        fs::write(&real, "original\n").unwrap();
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_output(&Some(link.clone()), "new bytes\n").expect("write via link");
+        assert_eq!(fs::read_to_string(&real).unwrap(), "new bytes\n");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link must stay a link"
+        );
+
+        let dangling = dir.join("dangling.md");
+        std::os::unix::fs::symlink(dir.join("missing.md"), &dangling).unwrap();
+        write_output(&Some(dangling.clone()), "created\n").expect("via dangling link");
+        assert_eq!(
+            fs::read_to_string(dir.join("missing.md")).unwrap(),
+            "created\n"
+        );
+        assert!(fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let a = dir.join("cycle-a");
+        let b = dir.join("cycle-b");
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        let error = write_output(&Some(a), "x\n").unwrap_err().to_string();
+        assert!(error.contains("symlink cycle"), "{error}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_output_refuses_special_files_instead_of_materializing_them() {
+        // rm-250 residual (cycle 1): a fifo destination is refused with
+        // a disclosed reason (the assess PoC showed "Saved:" rc0 while
+        // the fifo silently became a regular file); character devices
+        // like /dev/null take a direct stream.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-write-fifo-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let fifo = dir.join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo")
+            .success());
+        let error = write_output(&Some(fifo.clone()), "x\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to write"), "{error}");
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+            "fifo must be untouched"
+        );
+        write_output(&Some(PathBuf::from("/dev/null")), "x\n").expect("char device streams");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_output_streams_stdout_aliases_even_under_a_pipe() {
+        // Assess U3c + live PoC A4: `-o /dev/stdout` under a pipeline
+        // resolves through /proc/self/fd/1 to an anonymous pipe inode,
+        // which is neither a regular file nor a char device. The alias
+        // set intercepts it before resolution and streams through the
+        // descriptor, so piping `-o /dev/stdout` into jq keeps working.
+        assert!(is_stdout_alias(Path::new("/dev/stdout")));
+        assert!(is_stdout_alias(Path::new("/proc/self/fd/1")));
+        assert!(is_stdout_alias(Path::new("/dev/fd/2")));
+        assert!(!is_stdout_alias(Path::new("/tmp/out.md")));
+        assert!(!is_stdout_alias(Path::new("/dev/null")));
+    }
+
+    #[test]
+    fn go_flag_compatible_args_know_config_surface_flags_take_values() {
+        // rm-384 regression: the Go-style shim's value-taking flag list
+        // predates the config surface, so `--config x.toml --doctor`
+        // mistook the config path for the positional session path and
+        // rejected every following flag as dropped. All four new flags
+        // must consume their value before the positional scan continues.
+        for flag in ["--config", "--history-dir", "--pricing-file"] {
+            let args = go_flag_compatible_args([
+                OsString::from("agenttrace"),
+                OsString::from(flag),
+                OsString::from("conf.toml"),
+                OsString::from("--doctor"),
+                OsString::from("--demo"),
+            ])
+            .expect("value-taking flags do not end the positional scan");
+            assert_eq!(args.len(), 5, "{flag} keeps the full argv");
+        }
+        let args = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--weekly-budget"),
+            OsString::from("25"),
+            OsString::from("--budget"),
+        ])
+        .expect("--weekly-budget takes a value");
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn validate_gate_thresholds_rejects_silent_degradation_values() {
+        // rm-389 (cycle 1): --limit 0 and --search-limit 0 under
+        // --sessions used to be accepted silently at dispatch;
+        // --weekly-budget validates like every other numeric knob.
+        let mut args = compare_args(None);
+        args.limit = 0;
+        let error = validate_gate_thresholds(&args).unwrap_err().to_string();
+        assert!(error.contains("--limit must be at least 1"), "{error}");
+
+        let mut args = compare_args(None);
+        args.sessions = true;
+        args.search_limit = 0;
+        let error = validate_gate_thresholds(&args).unwrap_err().to_string();
+        assert!(
+            error.contains("--search-limit must be at least 1 with --sessions"),
+            "{error}"
+        );
+
+        let mut args = compare_args(None);
+        args.weekly_budget = Some(f64::NAN);
+        let error = validate_gate_thresholds(&args).unwrap_err().to_string();
+        assert!(
+            error.contains("--weekly-budget must be a positive finite USD"),
+            "{error}"
+        );
+
+        let mut args = compare_args(None);
+        args.search_limit = 0;
+        validate_gate_thresholds(&args).expect("search-limit without search is inert");
+        let mut args = compare_args(None);
+        args.weekly_budget = Some(12.5);
+        validate_gate_thresholds(&args).expect("positive budget accepted");
+    }
+
+    #[test]
     fn compare_uses_shared_filters_and_limit() {
         let root =
             std::env::temp_dir().join(format!("agenttrace-compare-cap-{}", std::process::id()));
@@ -2207,59 +2659,7 @@ mod tests {
     }
 
     fn compare_args(dir: Option<String>) -> Args {
-        Args {
-            path: None,
-            format: "json".to_string(),
-            dir,
-            compare: true,
-            audit: false,
-            recommend: false,
-            mcp_governance: false,
-            context_trends: false,
-            delivery_evidence: false,
-            overview: false,
-            sessions: false,
-            diagnostics: false,
-            inspect: None,
-            model: "default".to_string(),
-            output: None,
-            latest: false,
-            waste: false,
-            list_models: false,
-            statusline_report: false,
-            fetch: false,
-            update_pricing: false,
-            test_match: false,
-            version: false,
-            demo: false,
-            doctor: false,
-            search: None,
-            search_limit: 20,
-            fail_under_health: 0,
-            fail_on_critical: false,
-            max_tool_fail_rate: None,
-            baseline: None,
-            baseline_max_duration_delta_pct: 0.0,
-            baseline_max_cost_delta_pct: 0.0,
-            baseline_max_token_delta_pct: 0.0,
-            no_baseline_gate: false,
-            lang: "en".to_string(),
-            range: "all".to_string(),
-            project: String::new(),
-            source: String::new(),
-            model_filter: String::new(),
-            query: String::new(),
-            health: String::new(),
-            cost: String::new(),
-            anomaly: String::new(),
-            sort: "recent".to_string(),
-            order: "desc".to_string(),
-            limit: 20,
-            sample: None,
-            clear_cache: false,
-            preserve_history: false,
-            include_history: false,
-        }
+        crate::test_args(dir)
     }
 
     #[test]

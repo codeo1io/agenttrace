@@ -493,7 +493,7 @@ pub fn filter_sessions(
         .collect()
 }
 pub fn session_matches_time_range(session: &Session, range: TimeRange, now: DateTime<Utc>) -> bool {
-    range.since(now).map_or(true, |since| {
+    range.since(now).is_none_or(|since| {
         // Unknown start times stay visible (N7 unknown-time bucket);
         // only sessions with a known start before the cutoff drop out.
         parse_ts(&session.metrics.session_start)

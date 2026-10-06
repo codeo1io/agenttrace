@@ -9,6 +9,7 @@ mod otel;
 mod parser;
 mod pricing;
 mod reports;
+mod runtime_config;
 mod search;
 mod session_cache;
 mod sqlite_sessions;
@@ -64,6 +65,9 @@ pub use reports::{
     report_overview_markdown_with_context, report_overview_text, report_overview_text_with_context,
     report_text, report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage,
 };
+pub use runtime_config::{
+    get as runtime_config_overrides, set as set_runtime_config, RuntimeConfigOverrides,
+};
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
     cached_session, clear_session_cache, load_cached_sessions, load_cached_sessions_from_cache,
@@ -71,9 +75,10 @@ pub use session_cache::{
 };
 pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
 pub use statusline::{
-    load_statusline_insights, render_statusline_report, run_statusline_host, sanitize_line_segment,
-    statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
-    StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
+    load_statusline_insights, render_budget_view, render_statusline_report, run_statusline_host,
+    sanitize_line_segment, statusline_budget_series, statusline_capture_path, statusline_insights,
+    statusline_journal_stats, CapturedStatusline, StatuslineBudgetSeries, StatuslineInsights,
+    StatuslineJournalStats, StatuslineRateLimitState,
 };
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language,

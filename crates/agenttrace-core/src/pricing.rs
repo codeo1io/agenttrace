@@ -769,7 +769,13 @@ struct PricingOverrides {
 type PricingOverrideMaps = (BTreeMap<String, Price>, BTreeMap<String, String>);
 
 fn load_pricing_overrides() -> Option<PricingOverrideMaps> {
-    let path = std::env::var_os("AGENTTRACE_PRICING_FILE").map(PathBuf::from)?;
+    // rm-384: a resolved config file (CLI > --config > project > user)
+    // outranks the env knob; the env knob remains the fallback for
+    // library consumers and the config-free statusline host.
+    let path = crate::runtime_config::get()
+        .pricing_file
+        .clone()
+        .or_else(|| std::env::var_os("AGENTTRACE_PRICING_FILE").map(PathBuf::from))?;
     match std::fs::read(&path) {
         Err(err) => {
             record_pricing_override_failure(&path, format!("cannot read: {err}"));

@@ -130,6 +130,22 @@ jobs:
       - name: Rust tests
         run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
 
+      - name: MSRV floor check
+        # rm-386: prove the Cargo.toml `rust-version` floor is real —
+        # the declared floor must itself compile the workspace. Runs on
+        # the nightly schedule and manual dispatch only: a second
+        # toolchain means a cold target dir, and the PR/push lanes stay
+        # fast. The floor is read from Cargo.toml so this lane and the
+        # manifest cannot drift apart; older toolchains are rejected
+        # loudly by cargo's own rust-version guard.
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          MSRV="$(sed -nE 's/^rust-version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
+          [ -n "$MSRV" ] || { echo "no rust-version found in Cargo.toml" >&2; exit 1; }
+          echo "declared MSRV: $MSRV"
+          rustup toolchain install "$MSRV" --profile minimal
+          cargo "+$MSRV" check --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
+
       - name: Build CLI
         run: cargo build --release --locked -p agenttrace
 

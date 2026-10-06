@@ -566,16 +566,34 @@ pub fn statusline_journal_stats(path: &Path) -> StatuslineJournalStats {
 }
 
 /// `--statusline-report`: journal stats plus the aggregated insights.
-pub fn render_statusline_report(format: &str) -> anyhow::Result<String> {
+/// `weekly_budget` (rm-385) is the resolved weekly USD budget; `None`
+/// leaves the report exactly as it was before the knob existed.
+pub fn render_statusline_report(
+    format: &str,
+    weekly_budget: Option<f64>,
+) -> anyhow::Result<String> {
     let path = statusline_capture_path();
     let stats = statusline_journal_stats(&path);
     let captures = read_statusline_captures(&path);
     let insights = statusline_insights(&captures);
+    let series = statusline_budget_series(&captures, 7);
     if format == "json" {
-        let value = serde_json::json!({ "journal": stats, "insights": insights });
+        let mut value = serde_json::json!({ "journal": stats, "insights": insights });
+        if let Some(budget) = weekly_budget {
+            value["budget"] = serde_json::json!({
+                "weekly_budget_usd": budget,
+                "spend_7d_usd": series.total,
+                "remaining_usd": budget - series.total,
+            });
+        }
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
     }
-    Ok(render_statusline_report_text(&stats, &insights))
+    Ok(render_statusline_report_text(
+        &stats,
+        &insights,
+        weekly_budget,
+        &series,
+    ))
 }
 
 fn format_epoch(epoch: i64) -> String {
@@ -593,6 +611,8 @@ fn format_percent(value: Option<f64>) -> String {
 fn render_statusline_report_text(
     stats: &StatuslineJournalStats,
     insights: &StatuslineInsights,
+    weekly_budget: Option<f64>,
+    series: &StatuslineBudgetSeries,
 ) -> String {
     let mut out = String::new();
     out.push_str("AGENTTRACE statusline capture\n");
@@ -622,6 +642,20 @@ fn render_statusline_report_text(
             format_epoch(crossing.resets_at),
             format_percent(crossing.used_percentage_before),
             format_percent(crossing.used_percentage_after),
+        ));
+    }
+    // rm-385: the weekly budget line rides the already-parsed capture
+    // journal; budget unset keeps the report byte-compatible.
+    if let Some(budget) = weekly_budget {
+        let remaining = budget - series.total;
+        let state = if remaining < 0.0 {
+            format!("OVER by ${:.2}", -remaining)
+        } else {
+            format!("${remaining:.2} remaining")
+        };
+        out.push_str(&format!(
+            "Budget: 7d spend ${:.2} of ${budget:.2} — {state}\n",
+            series.total
         ));
     }
     if !insights.session_caches.is_empty() {
@@ -667,9 +701,313 @@ fn render_statusline_report_text(
     out
 }
 
+// --- rm-385: weekly budget telemetry (cycle 1) -------------------------
+
+/// The `cost.total_cost_usd` sample a capture carries, if any. The
+/// payload gates this field at v2.1.251+, so older captures simply
+/// contribute nothing rather than failing the aggregation.
+fn capture_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
+    capture.payload.get("cost")?.get("total_cost_usd")?.as_f64()
+}
+
+fn utc_day(epoch: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(epoch, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// Per-day USD spend derived from the ALREADY-parsed capture journal
+/// (rm-385). Captures carry each session's *cumulative* cost, so a
+/// day's spend is the rise of that cumulative value across the day's
+/// samples; a value that drops (session epoch reset) contributes only
+/// itself. Days are UTC buckets over the trailing window, ascending.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatuslineBudgetSeries {
+    /// UTC day (`YYYY-MM-DD`) -> spend in USD, ascending.
+    pub daily: Vec<(String, f64)>,
+    /// Sum of `daily`.
+    pub total: f64,
+}
+
+pub fn statusline_budget_series(
+    captures: &[CapturedStatusline],
+    days: usize,
+) -> StatuslineBudgetSeries {
+    use std::collections::BTreeMap;
+
+    // session -> day -> max cumulative cost seen that day.
+    let mut per_session: BTreeMap<&str, BTreeMap<String, f64>> = BTreeMap::new();
+    for capture in captures {
+        if let Some(cost) = capture_cost_usd(capture) {
+            let day = utc_day(capture.captured_at);
+            if day.is_empty() {
+                continue;
+            }
+            // Captures without a session id cannot be attributed to a
+            // cost series; skipping them keeps the sum conservative.
+            let Some(session) = capture.session_id() else {
+                continue;
+            };
+            let entry = per_session
+                .entry(session)
+                .or_default()
+                .entry(day)
+                .or_insert(f64::NEG_INFINITY);
+            if cost > *entry {
+                *entry = cost;
+            }
+        }
+    }
+    let mut daily: BTreeMap<String, f64> = BTreeMap::new();
+    for samples in per_session.values() {
+        let mut previous = 0.0;
+        for (day, cumulative) in samples {
+            let rise = (cumulative - previous).max(0.0);
+            *daily.entry(day.clone()).or_insert(0.0) += rise;
+            previous = *cumulative;
+        }
+    }
+    // Keep only the trailing `days` window.
+    let mut window: Vec<(String, f64)> = daily.into_iter().collect();
+    if window.len() > days {
+        window = window.split_off(window.len() - days);
+    }
+    // Review 5b9a9470 F4: an empty window's f64 reduction is lowered
+    // by LLVM to the additive identity -0.0 in optimized builds, which
+    // rendered as "$-0.00" at both budget display sites (the fresh-
+    // install default carries no cost samples). Adding +0.0 normalizes
+    // the sign bit and changes no other value (-0.0 + 0.0 == +0.0).
+    let total = window.iter().map(|(_, spend)| *spend).sum::<f64>() + 0.0;
+    StatuslineBudgetSeries {
+        daily: window,
+        total,
+    }
+}
+
+/// rm-385: the `--budget` window-burn view. Renders the trailing
+/// seven days of spend from the capture journal against the resolved
+/// weekly budget. An unset budget is not an error — the view then
+/// shows the spend and how to set the knob. `-f json` renders the
+/// same data as one JSON object (review 5b9a9470 F5: the machine
+/// format must never silently emit prose), mirroring the
+/// `--statusline-report` budget keys.
+pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::Result<String> {
+    let path = statusline_capture_path();
+    let stats = statusline_journal_stats(&path);
+    let captures = read_statusline_captures(&path);
+    let series = statusline_budget_series(&captures, 7);
+    if format == "json" {
+        let mut value = serde_json::json!({
+            "journal": stats,
+            "daily": series
+                .daily
+                .iter()
+                .map(|(day, spend)| serde_json::json!({
+                    "date": day,
+                    "spend_usd": spend,
+                }))
+                .collect::<Vec<_>>(),
+            "spend_7d_usd": series.total,
+        });
+        if let Some(budget) = weekly_budget {
+            value["weekly_budget_usd"] = serde_json::json!(budget);
+            value["remaining_usd"] = serde_json::json!(budget - series.total);
+        }
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
+    }
+    if !stats.exists || stats.lines == 0 {
+        return Ok(format!(
+            "No statusline captures yet at {} — the journal is populated by the \
+             `agenttrace statusline` host command.\n",
+            path.display()
+        ));
+    }
+    let captures = read_statusline_captures(&path);
+    let series = statusline_budget_series(&captures, 7);
+    let mut out = String::from("Weekly budget — last 7 days (statusline journal)\n");
+    for (day, spend) in &series.daily {
+        out.push_str(&format!("  {day}  ${spend:.2}\n"));
+    }
+    if series.daily.is_empty() {
+        out.push_str("  (no cost samples in the window)\n");
+    }
+    out.push_str(&format!("  7d total ${:.2}\n", series.total));
+    match weekly_budget {
+        Some(budget) => {
+            let remaining = budget - series.total;
+            if remaining < 0.0 {
+                out.push_str(&format!(
+                    "  budget ${budget:.2} — OVER by ${:.2}\n",
+                    -remaining
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  budget ${budget:.2} — ${remaining:.2} remaining ({:.0}%)\n",
+                    (remaining / budget * 100.0).clamp(0.0, 100.0)
+                ));
+            }
+        }
+        None => out.push_str(
+            "  no weekly budget configured — set `weekly_budget_usd` in \
+             ~/.config/agenttrace/config.toml (or pass --weekly-budget)\n",
+        ),
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn budget_capture(session: &str, captured_at: i64, cost: f64) -> CapturedStatusline {
+        let payload: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let mut payload = payload;
+        payload["session_id"] = Value::String(session.to_string());
+        payload["cost"] = serde_json::json!({ "total_cost_usd": cost });
+        CapturedStatusline {
+            captured_at,
+            payload,
+        }
+    }
+
+    #[test]
+    fn budget_series_empty_window_total_is_positive_zero() {
+        // Review 5b9a9470 F4: LLVM lowers an empty f64 reduction to the
+        // additive identity -0.0 in optimized builds, which rendered as
+        // "$-0.00" for every fresh install (no cost samples). The sum
+        // site normalizes with `+ 0.0`; this pins the sign bit so no
+        // future change reintroduces negative zero.
+        let series = statusline_budget_series(&[], 7);
+        assert_eq!(series.total.to_bits(), 0.0f64.to_bits(), "{series:?}");
+        assert!(series.daily.is_empty());
+    }
+
+    #[test]
+    fn budget_view_json_is_one_object_with_budget_keys() {
+        // Review 5b9a9470 F5: `--budget` used to ignore `-f json` and
+        // print prose. The JSON arm must emit exactly one parseable
+        // object mirroring the --statusline-report budget keys, with
+        // the budget fields present only when the knob is set. The
+        // test stays hermetic: no env mutation, and every spend
+        // assertion holds for any host journal (daily rises are
+        // clamped at 0, so a negative sign is impossible — negative
+        // zero included).
+        for (budget, has_budget) in [(None, false), (Some(12.5), true)] {
+            let rendered = render_budget_view("json", budget).expect("render budget view");
+            let value: Value = serde_json::from_str(rendered.trim()).expect("budget JSON parses");
+            let object = value.as_object().expect("top level is an object");
+            for key in ["journal", "daily", "spend_7d_usd"] {
+                assert!(object.contains_key(key), "missing {key}: {rendered}");
+            }
+            assert_eq!(
+                object.contains_key("weekly_budget_usd"),
+                has_budget,
+                "weekly_budget_usd presence: {rendered}"
+            );
+            assert_eq!(
+                object.contains_key("remaining_usd"),
+                has_budget,
+                "remaining_usd presence: {rendered}"
+            );
+            let spend = object["spend_7d_usd"].as_f64().expect("spend is a number");
+            assert!(spend >= 0.0 && !spend.is_sign_negative(), "{rendered}");
+            let daily = object["daily"].as_array().expect("daily is an array");
+            for entry in daily {
+                assert!(
+                    entry["date"].is_string() && entry["spend_usd"].is_number(),
+                    "{entry}"
+                );
+            }
+            if let Some(budget) = budget {
+                assert_eq!(object["weekly_budget_usd"].as_f64(), Some(budget));
+            }
+        }
+    }
+
+    #[test]
+    fn budget_series_rises_per_day_and_windows_to_seven_days() {
+        // Day 1: session A burns 0 -> 2.00; day 2: A continues to 3.50
+        // while B starts fresh at 1.00 (epoch reset contributes only
+        // itself). Days 3..10: A restarts its counter and burns 0.25
+        // per day (cumulative 0.25, 0.50, ...) — a reset that never
+        // rises again burns nothing.
+        let day = |n: i64| n * 86_400;
+        let mut captures = vec![
+            budget_capture("A", day(1) + 100, 2.00),
+            budget_capture("A", day(2) + 100, 3.50),
+            budget_capture("B", day(2) + 200, 1.00),
+        ];
+        for n in 3..=10 {
+            captures.push(budget_capture("A", day(n), 0.25 * (n - 2) as f64));
+        }
+        let series = statusline_budget_series(&captures, 7);
+        // Window keeps the trailing 7 days: day 3 (rise 0 after the
+        // reset) drops off, days 4..=10 burn 0.25 each.
+        assert_eq!(series.daily.len(), 7, "{:?}", series.daily);
+        assert!((series.total - 7.0 * 0.25).abs() < 1e-9, "{:?}", series);
+        // The full-journal variant still sums the early burn.
+        let full = statusline_budget_series(&captures, 30);
+        assert!(
+            (full.total - (2.00 + 1.50 + 1.00 + 7.0 * 0.25)).abs() < 1e-9,
+            "{full:?}"
+        );
+    }
+
+    #[test]
+    fn budget_series_ignores_captures_without_cost_fields() {
+        let payload: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let capture = CapturedStatusline {
+            captured_at: 1_000_000_000,
+            payload,
+        };
+        // The shared fixture carries no `cost` object; verify by
+        // stripping it defensively anyway.
+        let mut stripped = capture;
+        stripped.payload.as_object_mut().map(|o| o.remove("cost"));
+        let series = statusline_budget_series(&[stripped], 7);
+        assert_eq!(series.daily.len(), 0);
+        assert_eq!(series.total, 0.0);
+    }
+
+    #[test]
+    fn budget_view_renders_spend_budget_and_unconfigured_state() {
+        let captures = vec![
+            budget_capture("A", 1_000_000_000, 2.00),
+            budget_capture("A", 1_000_000_000 + 3_600, 3.00),
+        ];
+        let series = statusline_budget_series(&captures, 7);
+        let budget = Some(10.0);
+        let text = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 2,
+                bytes: 100,
+                retained_max_bytes: 1024,
+            },
+            &statusline_insights(&captures),
+            budget,
+            &series,
+        );
+        assert!(text.contains("Budget: 7d spend $3.00 of $10.00"), "{text}");
+        assert!(text.contains("$7.00 remaining"), "{text}");
+        let unbudgeted = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 2,
+                bytes: 100,
+                retained_max_bytes: 1024,
+            },
+            &statusline_insights(&captures),
+            None,
+            &series,
+        );
+        assert!(!unbudgeted.contains("Budget:"), "{unbudgeted}");
+    }
 
     /// Fixture built field-for-field from the documented statusline input
     /// schema (https://code.claude.com/docs/en/statusline, v2.1.251+
@@ -955,7 +1293,7 @@ mod tests {
             }
         });
         append_statusline_capture(&payload).expect("append hostile capture");
-        let text = render_statusline_report("text").expect("text report renders");
+        let text = render_statusline_report("text", None).expect("text report renders");
         // cat -v equivalence: no raw control bytes may reach the terminal
         // beyond the report's own line breaks.
         assert!(
@@ -977,7 +1315,7 @@ mod tests {
         );
         // The JSON path keeps the payload verbatim (serde escapes it) —
         // sanitization is a print-site concern, not a data concern.
-        let json = render_statusline_report("json").expect("json report renders");
+        let json = render_statusline_report("json", None).expect("json report renders");
         let value: Value = serde_json::from_str(&json).expect("json report parses");
         assert_eq!(
             value["insights"]["session_caches"][0]["session_id"], "probe2-RED\u{001b}[31mX",
