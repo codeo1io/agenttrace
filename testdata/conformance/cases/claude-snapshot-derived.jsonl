@@ -1,0 +1,2 @@
+{"type": "user", "timestamp": "2026-10-07T09:20:00Z", "cwd": "/work/proj", "sessionId": "drift", "message": {"role": "user", "content": "pricing sanity"}}
+{"type": "assistant", "timestamp": "2026-10-07T09:20:10Z", "sessionId": "drift", "message": {"id": "d1", "role": "assistant", "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 3000, "output_tokens": 300}}}
