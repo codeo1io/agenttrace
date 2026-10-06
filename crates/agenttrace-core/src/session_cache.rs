@@ -5,7 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 25;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 26;
+// Bumped 25 -> 26 (integration of run 32192d92, rm-485): the copilot
+// session-wide credit accounting (totalNanoAiu on shutdown plus the
+// freshest usage_checkpoint snapshot) raises reported cost for
+// UNCHANGED files, so a warm v25 cache keeps serving the pre-fix
+// cost 0.0 / credit null with matching fingerprints — no re-parse,
+// no self-heal (proven live on a surgically degraded cache by the
+// batch's review 08e99143, F1). The batch landed against schema 22
+// and bumped it to 23 there (review fix 955c3cea, pinned by
+// stale_schema_version_cache_never_serves_entries); integration
+// re-bases the bump onto the already-advanced ceiling (23 was
+// rm-408, 24 was rm-436/437/438, 25 was rm-450) per the rm-230
+// convention: parser-semantics changes bump the schema so cached
+// sessions regenerate under corrected accounting. Entries
+// regenerate once on next scan.
 // Bumped 24 -> 25 (integration of run 66a7d797, rm-450): the
 // workbuddy input-basis disclosure adds metrics.line_skips counters
 // that warm v24 snapshots don't carry, so cached sessions would
@@ -262,6 +276,11 @@ struct GoMetrics {
     duration_sec: f64,
     #[serde(default, rename = "CostEstimated")]
     cost_estimated: f64,
+    /// rm-485: session-wide cost-only credit total (USD) for adapters whose
+    /// billing truth is a credit counter (Copilot totalNanoAiu). Defaulted
+    // so pre-existing cache rows deserialize unchanged.
+    #[serde(default, rename = "CreditUsd")]
+    credit_usd: f64,
     #[serde(default, rename = "StoredTotalsDelta")]
     stored_totals_delta: i64,
     /// Parse lines lost inside the session source, by reason (pass-7
@@ -1355,6 +1374,7 @@ impl GoMetrics {
             session_end: metrics.session_end.clone(),
             duration_sec: metrics.duration_sec,
             cost_estimated: metrics.cost_estimated,
+            credit_usd: metrics.credit_usd,
             stored_totals_delta: metrics.stored_totals_delta,
             line_skips: metrics.line_skips.clone(),
             zero_usage_events: metrics.zero_usage_events,
@@ -1395,6 +1415,7 @@ impl GoMetrics {
             session_end: self.session_end,
             duration_sec: self.duration_sec,
             cost_estimated: self.cost_estimated,
+            credit_usd: self.credit_usd,
             stored_totals_delta: self.stored_totals_delta,
             line_skips: self.line_skips.clone(),
             zero_usage_events: self.zero_usage_events,
@@ -2407,6 +2428,80 @@ mod tests {
             cache.raw_entries.len(),
             1,
             "an unstamped legacy journal is accepted, not mass-invalidated"
+        );
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_schema_version_cache_never_serves_entries() {
+        // F1 of the cycle-1 independent review (08e99143, fixed at
+        // 955c3cea): rm-485 changes reported cost for UNCHANGED copilot
+        // files, so a warm cache written by the pre-fix build kept
+        // serving cost 0.0 / credit null forever — the fingerprints
+        // still match, so nothing re-parses and the cache never
+        // self-heals (proven live on a surgically degraded v22 cache).
+        // The rm-230 convention: parser-semantics changes bump
+        // SESSION_CACHE_SCHEMA_VERSION, and a stale doc must drop its
+        // entries at load, never serve them — however well-formed.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-stale-schema-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp cache root");
+        let journal = root.join("journal.jsonl");
+        fs::write(
+            &journal,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"sessionId\":\"s1\",\"timestamp\":\"2026-05-07T02:00:00Z\"}\n",
+        )
+        .expect("write journal");
+        let session = crate::parse_file(&journal).expect("parse journal");
+
+        // Shared env lock (see lib.rs `test_env`): sibling-module tests
+        // (pricing, statusline) mutate the same variables.
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let cache_doc = root.join("sessions.json");
+        let mut cache = load_session_cache();
+        store_session(&journal, &session, &mut cache).expect("store session");
+        save_session_cache(&mut cache).expect("save cache");
+        // Sanity: the current schema version serves the stored entry.
+        let fresh = load_session_cache();
+        assert_eq!(
+            fresh.entry_count(),
+            1,
+            "a current-version cache must serve the stored entry"
+        );
+        // Surgical version downgrade = a warm cache from the previous
+        // build: entries untouched, fingerprints still valid. (Downgrade
+        // through serde_json only — jq corrupts >2^53 fingerprint ints,
+        // as the review's first attempt proved.)
+        let mut doc: Value =
+            serde_json::from_str(&fs::read_to_string(&cache_doc).expect("read cache doc"))
+                .expect("cache json");
+        doc["schema_version"] = serde_json::json!(SESSION_CACHE_SCHEMA_VERSION - 1);
+        fs::write(
+            &cache_doc,
+            serde_json::to_string(&doc).expect("serialize downgraded cache"),
+        )
+        .expect("write downgraded cache");
+        let stale = load_session_cache();
+        assert_eq!(
+            stale.entry_count(),
+            0,
+            "a stale-schema cache must drop every entry, never serve it"
+        );
+        assert!(
+            stale.dirty,
+            "the one-time invalidation must mark the cache dirty so it regenerates"
         );
 
         match prior_cache {

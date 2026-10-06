@@ -148,6 +148,14 @@ pub struct Event {
     pub usage: BTreeMap<String, i64>,
     #[serde(default, rename = "ModelUsed", deserialize_with = "deserialize_string")]
     pub model_used: String,
+    /// rm-485: cost-only credit attribution in USD. Carried by meta events
+    /// whose adapter truth is a session-wide credit counter (Copilot's
+    /// `totalNanoAiu`, 1 AIU = 1 AI credit = $0.01) rather than tokens the
+    /// pricing table can price. Never summed across events: the session
+    /// keeps the maximum, so repeated snapshots (checkpoints, shutdown after
+    /// checkpoints) never double-count.
+    #[serde(default, rename = "CreditUsd")]
+    pub credit_usd: f64,
     #[serde(
         default,
         rename = "SourceTool",
@@ -374,6 +382,11 @@ pub struct Metrics {
     pub session_end: String,
     pub duration_sec: f64,
     pub cost_estimated: f64,
+    /// rm-485: session-wide cost-only credit total (USD), folded from meta
+    /// events with max semantics. Zero for every non-credit adapter, so the
+    /// field stays out of their serialized output.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub credit_usd: f64,
     /// How far message-derived token aggregation drifted from the
     /// authoritative totals stored on the session row (SQLite sources).
     /// Zero unless stored totals were applied.
@@ -809,6 +822,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // ride the existing DataHealth aggregation and confidence degradation.
     let mut line_skips: BTreeMap<String, usize> = BTreeMap::new();
 
+    // rm-490: capture a family fallback before the loop consumes `events` —
+    // meta-only sessions (codex usage journals, copilot metric records)
+    // otherwise end with an empty source_tool.
+    let meta_fallback_source_tool = events
+        .iter()
+        .find(|event| !event.source_tool.is_empty())
+        .map(|event| event.source_tool.clone());
+
     for event in events {
         if metrics.source_tool.is_empty()
             && !event.source_tool.is_empty()
@@ -895,6 +916,11 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
                     upstream_priced_cache_r = upstream_priced_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
+                }
+                // rm-485: fold cost-only credit attribution with max
+                // semantics — repeated snapshots never double-count.
+                if event.credit_usd > metrics.credit_usd {
+                    metrics.credit_usd = event.credit_usd;
                 }
             }
             "user" => {
@@ -1001,6 +1027,13 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     if metrics.tool_calls_ok > max_ok {
         metrics.tool_calls_ok = max_ok;
     }
+    // rm-490: apply the family fallback after the loop — only when no
+    // non-meta event ever named a tool (see capture above).
+    if metrics.source_tool.is_empty() {
+        if let Some(fallback) = meta_fallback_source_tool {
+            metrics.source_tool = fallback;
+        }
+    }
     // rm-436: tokens whose cost the source journal recorded (pi
     // `type:"usage"` entries carrying `usage.cost.total`) were already
     // added to the class totals above for visibility; exclude them from
@@ -1041,7 +1074,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         || (!usage_models.is_empty()
             && session_model_is_real
             && !usage_models.iter().any(|usage_model| usage_model == model));
-    metrics.cost_estimated = if usage_blocks_multi_model {
+    let token_priced = if usage_blocks_multi_model {
         // Recorded costs were accumulated into upstream_cost_usd above;
         // start from them and add per-block catalog pricing for the rest.
         let mut per_block_cost = metrics.upstream_cost_usd;
@@ -1093,10 +1126,26 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     } else {
         round4(catalog_cost + metrics.upstream_cost_usd)
     };
+    // rm-485: a session-wide credit counter is billing truth — never
+    // report below it, never stack it on top of the token-priced
+    // estimate. (Integration of run 32192d92: `token_priced` is the
+    // rm-436/rm-438-refined token estimate above — upstream-recorded
+    // costs excluded from the catalog formula and per-block pricing
+    // for multi-model sessions — so the credit floor composes with,
+    // rather than replaces, the landed pricing rules.)
+    metrics.cost_estimated = if metrics.credit_usd > 0.0 {
+        round4(token_priced.max(metrics.credit_usd))
+    } else {
+        round4(token_priced)
+    };
     // rm-046: a class pinned at i64::MAX means accumulation saturated —
     // the total is a clamp, not an exact sum, and the provenance must
     // say so instead of claiming precise arithmetic.
-    metrics.provenance.cost = if [
+    metrics.provenance.cost = if metrics.credit_usd > 0.0 && metrics.credit_usd >= token_priced {
+        // rm-485: the credit counter decided the total (or matched it) —
+        // say so instead of implying token arithmetic produced it.
+        "calculated_from_copilot_credits"
+    } else if [
         metrics.tokens_input,
         metrics.tokens_output,
         metrics.tokens_reasoning,
@@ -1628,6 +1677,10 @@ pub fn format_cost(value: f64) -> String {
     } else {
         format!("${value:.4}")
     }
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
 }
 
 pub fn round4(value: f64) -> f64 {

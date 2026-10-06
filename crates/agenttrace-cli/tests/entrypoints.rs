@@ -78,6 +78,65 @@ fn help_exits_zero() {
 }
 
 #[test]
+fn compare_honors_the_fail_under_health_gate() {
+    // rm-486: the --compare branch's own comment claims the same coverage
+    // contract as the governance branch, but it returned Ok(()) without
+    // evaluating the --fail-* gates — a gated `--compare` exited rc0 on a
+    // corpus the same flags condemn on every sibling report, so a CI gate
+    // built on --compare passed silently.
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-compare-gate-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    // One unhealthy session (failed tool call) keeps health below 100.
+    std::fs::write(
+        work.join("unhealthy.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"run the thing"},"sessionId":"s1","timestamp":"2026-05-07T02:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"bash","input":{"command":"ls"}}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:05Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"boom","is_error":true}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:06Z"}
+"#,
+    )
+    .expect("write unhealthy session");
+
+    // rm-301 style sandbox (see `discover_via_env_overrides_agent_default`
+    // at the bottom of this file): the spawned CLI loads and saves the
+    // session cache, so without pinning HOME/XDG_CACHE_HOME/
+    // AGENTTRACE_SESSION_CACHE_DIR this test would read and REWRITE the
+    // operator's real ~/.cache/agenttrace/sessions.json (cycle-1 review
+    // 08e99143, F2 — caught by mtime).
+    let cache = work.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let gated = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "-d",
+            work.to_str().expect("temp dir is valid UTF-8"),
+            "--compare",
+            "--fail-under-health",
+            "100",
+        ])
+        .output()
+        .expect("run gated compare");
+    assert_eq!(
+        gated.status.code(),
+        Some(2),
+        "--compare must exit 2 when the gate fails, got {:?}",
+        gated.status
+    );
+    let stderr = String::from_utf8_lossy(&gated.stderr);
+    assert!(
+        stderr.contains("Gate failed"),
+        "expected gate failure evidence on stderr, got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
 fn baseline_regression_gates_the_exit_code_and_opt_out_flags_work() {
     // Pass-7 P7-3: `--baseline-max-*-delta-pct` used to leave the breach
     // booleans buried in the JSON while the process exited 0 — a gate
