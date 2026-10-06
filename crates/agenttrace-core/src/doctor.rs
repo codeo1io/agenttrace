@@ -673,8 +673,14 @@ fn user_cache_dir() -> PathBuf {
             return home.join("Library").join("Caches");
         }
     }
+    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
+    // $XDG_CACHE_HOME values; a relative one is treated as unset and
+    // falls through to the HOME-based default instead of scattering a
+    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
+    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
+    // scratch cwd).
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() {
+        if !cache.as_os_str().is_empty() && cache.is_absolute() {
             return cache;
         }
     }

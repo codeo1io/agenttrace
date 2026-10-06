@@ -1451,8 +1451,14 @@ fn user_cache_dir() -> PathBuf {
             return home.join("Library").join("Caches");
         }
     }
+    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
+    // $XDG_CACHE_HOME values; a relative one is treated as unset and
+    // falls through to the HOME-based default instead of scattering a
+    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
+    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
+    // scratch cwd).
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() {
+        if !cache.as_os_str().is_empty() && cache.is_absolute() {
             return cache;
         }
     }
@@ -2644,6 +2650,75 @@ mod tests {
                 "PRIVACY.md must disclose the legacy {pattern}* purge"
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn relative_xdg_cache_home_is_ignored_per_spec() {
+        // rm-248: a relative $XDG_CACHE_HOME is undefined under the XDG
+        // Base Directory spec, so every artifact-root constructor must
+        // treat it as unset and fall back to HOME/.cache instead of
+        // scattering a per-cwd cache (observed live:
+        // `XDG_CACHE_HOME=rel-cache agenttrace --overview` wrote
+        // ./rel-cache/agenttrace from a scratch cwd). Pinned through
+        // the public constructors of every module that reads the
+        // variable — session_cache, pricing, statusline; doctor's
+        // user_cache_dir() copy is byte-identical and exercised by the
+        // --doctor binary probe recorded on the row.
+        let _env = crate::test_env::lock_env();
+        let prior_home = std::env::var_os("HOME");
+        let prior_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prior_cache_root = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        let home = std::env::temp_dir().join(format!(
+            "agenttrace-relative-xdg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp HOME");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CACHE_HOME", "rel-cache");
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        let expected_root = home.join(".cache").join("agenttrace");
+        for path in [
+            session_cache_path(),
+            crate::pricing::pricing_cache_path(),
+            crate::statusline::statusline_capture_path(),
+        ] {
+            assert!(
+                path.starts_with(&expected_root),
+                "{} must resolve under HOME/.cache when XDG_CACHE_HOME is relative, got {}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("?"),
+                path.display()
+            );
+        }
+        // A relative value must behave EXACTLY like an unset one —
+        // not like an empty one, not like a rejection.
+        std::env::remove_var("XDG_CACHE_HOME");
+        let unset = session_cache_path();
+        std::env::set_var("XDG_CACHE_HOME", "rel-cache");
+        assert_eq!(
+            session_cache_path(),
+            unset,
+            "a relative XDG_CACHE_HOME must behave exactly like unset"
+        );
+
+        match prior_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_xdg {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prior_cache_root {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
