@@ -1774,14 +1774,14 @@ fn context_trends_text(report: &ContextTrend, language: Language) -> String {
     }
     for item in report.projects.iter().take(20) {
         lines.push(format!(
-            "- {}  sessions={} context={:.1}% cache={:.1}% repeat-reads={} read/write={:.2} output-cost={}",
+            "- {}  sessions={} context={:.1}% cache={:.1}% repeat-reads={} read/write={:.2} output $/M={}",
             item.project,
             item.sessions,
             item.avg_context_utilization_pct,
             item.cache_effectiveness_pct,
             item.repeated_file_reads,
             item.read_to_write_ratio,
-            format_compact_cost(item.cost_per_output_token)
+            format_compact_cost(item.output_cost_per_million_tokens)
         ));
     }
     lines.join("\n")

@@ -1454,8 +1454,17 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .or_default();
         task_type_entry.sessions += 1;
         task_type_entry.cost += session.metrics.cost_estimated;
-        task_type_entry.tokens_input += session.metrics.tokens_input.max(0);
-        task_type_entry.tokens_output += session.metrics.tokens_output.max(0);
+        // rm-529: token totals saturate at i64::MAX instead of panicking
+        // (debug) or wrapping (release) on hostile or corrupt journals whose
+        // usage rows clamp to the i64 ceiling — the same cap-once semantics
+        // the parser's `add_usage` has applied since rm-046. Cost stays f64,
+        // which cannot overflow-panic.
+        task_type_entry.tokens_input = task_type_entry
+            .tokens_input
+            .saturating_add(session.metrics.tokens_input.max(0));
+        task_type_entry.tokens_output = task_type_entry
+            .tokens_output
+            .saturating_add(session.metrics.tokens_output.max(0));
 
         let project_entry = overview
             .by_project
