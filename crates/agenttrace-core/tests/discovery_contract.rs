@@ -979,15 +979,16 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v26 (integration of run 32192d92, rm-485 copilot session-wide
-        // credit accounting, re-based off the campaign's 22 -> 23 bump;
-        // 25 was the rm-450 workbuddy input-basis disclosure, 24 the
+        // v27 (integration of run b1ff12f8, rm-542 Codex custom-tools
+        // parse coverage, re-based off the campaign's 22 -> 23 bump;
+        // 26 was the rm-485 copilot session-wide credit accounting,
+        // 25 the rm-450 workbuddy input-basis disclosure, 24 the
         // rm-436/437/438 pi journal accounting, 23 rm-408, 22 was run
         // 2c2db6f5 rm-400/401): parser-semantics fixes bump the schema
         // so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(26)
+            Some(27)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1152,14 +1153,14 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v26 — see the rm-485, rm-450, rm-436/437/438,
-        // rm-408 and rm-400/401 bump notes in session_cache.rs; the
-        // copilot session-wide credit accounting is what carried
-        // 25 -> 26 at this integration, re-based off the campaign's
-        // 22 -> 23 bump).
+        // version (v27 — see the rm-542, rm-485, rm-450,
+        // rm-436/437/438, rm-408 and rm-400/401 bump notes in
+        // session_cache.rs; the Codex custom-tools parse coverage is
+        // what carried 26 -> 27 at this integration, re-based off the
+        // campaign's 22 -> 23 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(26)
+            Some(27)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))

@@ -5,7 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 26;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+// Bumped 26 -> 27 (integration of run b1ff12f8, rm-542, minted
+// campaign-locally as rm-449): the Codex custom-tools response items are
+// now parsed — custom_tool_call / custom_tool_call_output pairs count as
+// tool calls and results (with an agent-reported failure status surfacing
+// as an error), standalone reasoning items count as reasoning blocks, and
+// world_state lines are disclosed as an ignorable counter — so the newest
+// real rollouts stop reporting tool_calls_total=0 while carrying 7-20 tool
+// pairs. Reported totals change for unchanged files, which warm v26
+// entries still carry pre-fix. The batch landed against schema 22 and
+// bumped it to 23 there; integration re-bases the bump onto the
+// already-advanced ceiling (23 was rm-408, 24 was rm-436/437/438, 25 was
+// rm-450, 26 was rm-485) per the rm-230 convention: parser-semantics
+// changes bump the schema so cached sessions regenerate under corrected
+// accounting. Entries regenerate once on next scan.
 // Bumped 25 -> 26 (integration of run 32192d92, rm-485): the copilot
 // session-wide credit accounting (totalNanoAiu on shutdown plus the
 // freshest usage_checkpoint snapshot) raises reported cost for

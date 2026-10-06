@@ -76,7 +76,8 @@ pub use statusline::{
     StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
 };
 pub use waste::{
-    compute_waste_report, render_waste_report, render_waste_report_with_language, WasteReport,
+    compute_waste_report, render_waste_report, render_waste_report_with_language,
+    waste_report_json, WasteReport,
 };
 
 pub const VERSION: &str = match option_env!("AGENTTRACE_RELEASE_VERSION") {
@@ -845,7 +846,11 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
 
         // Usage values arrive from untrusted session logs; clamp negatives
         // (corrupt data) and accumulate with saturation so adversarial or
-        // corrupt token counts can never wrap into negative totals.
+        // corrupt token counts can never wrap into negative totals. The
+        // same clamp-plus-saturate contract governs every downstream
+        // consumer of these totals (by_model/by_task_type rollups
+        // included, rm-541) — a new sum of untrusted counts must use
+        // saturating_add, never `+=`.
         let usage_tokens = |key: &str| -> i64 { event.usage.get(key).copied().unwrap_or(0).max(0) };
 
         // rm-436/rm-437: aggregate parse-time disclosure counters onto
@@ -1535,8 +1540,20 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .or_default();
         task_type_entry.sessions += 1;
         task_type_entry.cost += session.metrics.cost_estimated;
-        task_type_entry.tokens_input += session.metrics.tokens_input.max(0);
-        task_type_entry.tokens_output += session.metrics.tokens_output.max(0);
+        // rm-541: token sums saturate, never `+=`. These per-session totals
+        // arrive from untrusted logs (a hostile journal pins i64::MAX), so
+        // a bare `+=` aborted debug builds with `attempt to add with
+        // overflow` and wrapped negative in release — where the renderer's
+        // `.max(0)` mask printed a 0-token bucket beside a summary claiming
+        // 9,223,372,036,854,775,807 total tokens. Same treatment as every
+        // other token total (the governance.rs add_context_session comment
+        // is the precedent).
+        task_type_entry.tokens_input = task_type_entry
+            .tokens_input
+            .saturating_add(session.metrics.tokens_input.max(0));
+        task_type_entry.tokens_output = task_type_entry
+            .tokens_output
+            .saturating_add(session.metrics.tokens_output.max(0));
 
         let project_entry = overview
             .by_project

@@ -1631,9 +1631,10 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 26 (integration of run 32192d92, rm-485 copilot
-                // session-wide credit accounting — re-based off the
-                // campaign's 22 -> 23 bump; 25 was the rm-450 workbuddy
+                // Schema 27 (integration of run b1ff12f8, rm-542 Codex
+                // custom-tools parse coverage — re-based off the
+                // campaign's 22 -> 23 bump; 26 was the rm-485 copilot
+                // session-wide credit accounting, 25 the rm-450 workbuddy
                 // input-basis disclosure, 24 the rm-436/437/438 pi
                 // journal accounting, 23 the rm-408 zero-usage bump, 22
                 // the rm-400/rm-401 bump): a warm entry is reused only
@@ -1643,7 +1644,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // level (`pricing_catalog_id`), and an unstamped journal
                 // is accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":26,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":27,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

@@ -45,6 +45,18 @@ the published version against the running build. If the registry probe
 fails (no `curl`, offline, bad response) the report degrades to
 `unavailable (...)` instead of failing.
 
+Every `git` subprocess this command spawns runs under a stated
+deadline, mirroring the governance `git log` probe's bound (rm-543):
+local probes (rev-parse, merge-base, rev-list, diff, tag, log) are
+capped at ten seconds — the same local class as governance's
+`GIT_PROBE_TIMEOUT` — and the opt-in `git fetch` takes thirty seconds,
+the network class the pricing-catalog download uses. A subprocess that
+overruns its deadline is killed and the command fails with a terminal
+error naming the git operation and the deadline; it never renders a
+report from a partial repository, and a slow `git` can never masquerade
+as "not inside a git repository" — only a probe that actually ran and
+failed counts as a missing prerequisite.
+
 Like the rest of the CLI, flags follow Go-style placement: they must
 precede the positional command, so `agenttrace -f json upstream` and
 `agenttrace --fetch upstream` parse, while anything after `upstream` is

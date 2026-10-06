@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 26 and the SQLite snapshot is schema 7; the
+The session cache is schema 27 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -78,10 +78,13 @@ present-but-zero usage blocks began counting as disclosed measured zeros
 (rm-408), to 24 when pi-journal disclosure counters, upstream
 recorded-cost passthrough and per-block multi-model pricing joined the
 persisted metrics (rm-436/437/438), to 25 when the workbuddy
-input-basis disclosure counters joined Metrics.line_skips (rm-450), and
-to 26 when Copilot sessions began counting session-wide credit totals
+input-basis disclosure counters joined Metrics.line_skips (rm-450), to
+26 when Copilot sessions began counting session-wide credit totals
 (`totalNanoAiu` shutdown reads and `usage_checkpoint` snapshots, rm-485),
-so cached sessions regenerate under
+and to 27 when Codex custom-tools response items began counting as tool
+calls, results, and reasoning (custom_tool_call/custom_tool_call_output
+pairing and standalone reasoning items, rm-542), so cached sessions
+regenerate under
 the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
@@ -142,6 +145,31 @@ seconds per repository root, and a probe that overruns the cap is
 treated as unavailable — that root degrades to the tool-authority
 heuristic and the report says so. A repository that answers slowly
 slows the report by at most that cap.
+
+## Waste report
+
+```bash
+agenttrace --waste -f json
+```
+
+The waste report scores the newest matching session for cache
+efficiency, tool-call bloat, retry-loop spend, and stuck patterns. In
+JSON it carries the same verdicts the text banner does, as data (schema
+`agenttrace.waste.v1`): `waste_score` (0–100), `waste_level`,
+`total_wasted_cost`, `loop_waste_percent`, `session_cost`, `cache`
+(`rating`, `hit_rate_percent`, `cache_read_tokens`,
+`total_input_tokens`, `wasted_cost`, `suggestion`), `tool_bloat`
+(`tools_per_turn`, `bloat_score`, `bloat_level`, `top_bloat[]`),
+`stuck_patterns[]`, `summary`, and `top_actions[]`.
+
+Per-tool `allocated_cost` figures share the text report's caveat: they
+are a share of the session-level estimate, not measured per-tool spend.
+
+The format matrix is consistent across report actions: `-f json` is
+honored everywhere the format guard admits it (the waste report
+included), while `-f markdown` and `-f html` are the overview and
+governance surfaces — `--waste -f markdown` is rejected with the guard's
+error naming those actions instead of silently rendering text.
 
 ## Overview appendix
 

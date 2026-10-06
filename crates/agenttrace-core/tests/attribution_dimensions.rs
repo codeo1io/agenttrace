@@ -66,6 +66,100 @@ fn overview_json_exposes_by_provider_dimension() {
 }
 
 #[test]
+fn hostile_task_type_usage_saturates_instead_of_panicking_or_wrapping() {
+    // rm-541 (run b1ff12f8, minted campaign-locally as rm-448, cycle 2): the task-type accumulator used a
+    // bare `+=` (lib.rs task_type_entry.tokens_input/tokens_output), so
+    // two hostile sessions each pinning i64::MAX output inside ONE bucket
+    // aborted every aggregate surface in a debug build
+    // (`attempt to add with overflow` on --overview/--audit/--context-trends/
+    // --delivery-evidence/--mcp-governance/--recommend) and wrapped negative
+    // in release, where reports.rs renders the bucket through `.max(0)` —
+    // a 0-token planning bucket next to a summary claiming
+    // total_tokens = 9223372036854775807. Both task-type sums must saturate
+    // like every other token total in the codebase (governance.rs's
+    // add_context_session comment is the precedent this fix cites).
+    let mut sessions = demo_sessions().expect("demo sessions parse");
+    assert!(
+        sessions.len() >= 2,
+        "demo corpus must supply at least two sessions for one bucket"
+    );
+    for session in sessions.iter_mut() {
+        // Zero tool authority => every session classifies `planning`, the
+        // same one-bucket setup the in-memory task-type test above uses.
+        session.metrics.tool_authority.clear();
+        session.metrics.tool_usage.clear();
+        session.metrics.file_usage.clear();
+        session.metrics.highest_authority = String::new();
+        session.metrics.tool_calls_ok = 0;
+        session.metrics.tool_calls_fail = 0;
+        session.anomalies.clear();
+        session.metrics.tokens_input = 1_000;
+        session.metrics.tokens_output = i64::MAX;
+    }
+    let planning: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| infer_task_type(session) == "planning")
+        .collect();
+    assert_eq!(
+        planning.len(),
+        sessions.len(),
+        "hostile corpus must land in ONE task-type bucket for the overflow"
+    );
+
+    let overview = compute_overview(&sessions);
+    let group = overview
+        .by_task_type
+        .get("planning")
+        .expect("planning bucket");
+    assert_eq!(
+        group.sessions,
+        sessions.len(),
+        "every hostile session counts in the bucket"
+    );
+    assert_eq!(
+        group.tokens_input,
+        1_000 * sessions.len() as i64,
+        "small inputs sum exactly even beside a saturated output"
+    );
+    assert_eq!(
+        group.tokens_output,
+        i64::MAX,
+        "saturated bucket, not a debug abort and not the release wraparound \
+         that reports.rs's .max(0) mask rendered as 0"
+    );
+
+    // Cross-check against the by-model baseline with the same saturating
+    // arithmetic: the bucket total equals the by-model total exactly, so
+    // the two dimensions can never disagree about how much was written.
+    let mut by_model_output: i64 = 0;
+    for session in &sessions {
+        by_model_output = by_model_output.saturating_add(session.metrics.tokens_output);
+    }
+    assert_eq!(group.tokens_output, by_model_output);
+
+    // The rendered JSON surface must show the saturated maximum, never the
+    // wrapped-then-masked 0 the release build used to print.
+    let report: Value = serde_json::from_str(&report_overview_json(&overview, &sessions))
+        .expect("valid overview json");
+    let rendered = report["by_task_type"]
+        .as_array()
+        .expect("by_task_type array")
+        .iter()
+        .find(|item| item["task_type"].as_str() == Some("planning"))
+        .expect("planning row");
+    assert_eq!(
+        rendered["tokens"]["output"].as_i64(),
+        Some(i64::MAX),
+        "rendered bucket output saturates at i64::MAX, not 0"
+    );
+    assert_eq!(
+        report["summary"]["total_tokens"].as_i64(),
+        Some(i64::MAX),
+        "summary total stays saturated-consistent with the bucket"
+    );
+}
+
+#[test]
 fn overview_json_exposes_by_task_type_dimension() {
     let report = demo_report();
     let task_types = report["by_task_type"]
