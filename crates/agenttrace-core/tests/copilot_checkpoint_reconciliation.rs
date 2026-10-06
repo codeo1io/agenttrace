@@ -112,3 +112,51 @@ fn no_session_start_parses_as_generic_documented_fallback() {
     assert_eq!(m.tokens_input, 0);
     assert_eq!(m.tokens_output, 0);
 }
+
+#[test]
+fn agent_host_turn_markers_are_named_not_dropped() {
+    // rm-721 / codeburn #1651: VS Code runs Copilot Chat's agent through
+    // the Copilot CLI engine (workspace.yaml client_name:
+    // vscode-agent-host); CLI 1.0.8x writes the same shape. Those journals
+    // carry assistant.turn_start/turn_end (ids only — an un-counted class
+    // under the rm-485 counting rules) and assistant.message entries with
+    // NO outputTokens (each message is one model request; tokens arrive
+    // only in the shutdown rollup). The audit contract: every request
+    // class counts exactly once, un-counted classes are NAMED (the
+    // rm-584 disclosure rule), and the rollup's per-model
+    // modelMetrics[model].totalNanoAiu — the agent-host shape, no
+    // top-level totalNanoAiu — yields exact Copilot credits.
+    let session = parse_file(&fixture("agent-host-events.jsonl")).unwrap();
+    let m = &session.metrics;
+    assert_eq!(m.source_tool, "copilot_cli");
+    assert_eq!(m.user_messages, 1, "user turn counted exactly once");
+    assert_eq!(
+        m.assistant_turns, 2,
+        "assistant.message + tool.execution_start each counted exactly once"
+    );
+    assert_eq!(m.tool_calls_total, 1, "tool-call turn counted exactly once");
+    assert_eq!(m.tool_results, 1);
+    assert_eq!(
+        m.tokens_input, 120,
+        "shutdown rollup is the only token record (agent-host basis)"
+    );
+    assert_eq!(m.tokens_output, 45);
+    assert_eq!(m.model_used, "gpt-5-mini");
+    assert!(
+        (m.credit_usd - 0.0025).abs() < 1e-9,
+        "per-model modelMetrics totalNanoAiu (250e6 nano AIU) must price \
+         credits at 1 AIU = $0.01, got {}",
+        m.credit_usd
+    );
+    assert_eq!(
+        m.disclosure_counters
+            .get("copilot_uncounted_entry_type:assistant.turn_start"),
+        Some(&1),
+        "the un-counted turn-marker class must be named, not dropped"
+    );
+    assert_eq!(
+        m.disclosure_counters
+            .get("copilot_uncounted_entry_type:assistant.turn_end"),
+        Some(&1)
+    );
+}
