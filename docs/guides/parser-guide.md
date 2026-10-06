@@ -64,6 +64,10 @@ For local-first tools like Aider, the default history may live in the current re
 
 For SQLite-backed tools like Cursor, prefer a documented JSON export path unless direct database support is worth the dependency and platform cost.
 
+## Numeric Bounding (cap-once semantics)
+
+Token counts are untrusted input: a corrupt or hostile journal can carry `1e300`, and the parser clamps every such value into `i64` with a saturating cast (`1e300` → `i64::MAX`) before it ever reaches a struct. Every layer that *aggregates* those counts must saturate too — a plain `i64 +=` on two clamped values panics the debug binary (`attempt to add with overflow`) and silently wraps in release. The parser's `add_usage` and the report layer's overview accumulations (e.g. `compute_overview`'s per-task-type totals, rm-541) therefore accumulate with `saturating_add`: a row saturates at `i64::MAX` **once** and stays there no matter how many more clamped sessions arrive, so downstream rates and shares always divide by finite non-negative totals. Costs are `f64` dollars, which cannot overflow-panic. When you add a new aggregation site, use `saturating_add` for token counts and add a fixture with two `i64::MAX` sessions to the report-layer contract tests (`tests/report_numeric_truthfulness.rs`).
+
 ## Privacy Notes
 
 Do not commit real agent logs unless they are fully synthetic or carefully redacted. Session logs often include prompts, source code, file paths, tool arguments, and secrets.

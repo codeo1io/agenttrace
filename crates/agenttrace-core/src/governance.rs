@@ -172,7 +172,7 @@ pub struct ProjectContextTrend {
     pub cache_effectiveness_pct: f64,
     pub repeated_file_reads: usize,
     pub read_to_write_ratio: f64,
-    pub cost_per_output_token: f64,
+    pub output_cost_per_million_tokens: f64,
 }
 
 #[derive(Default)]
@@ -641,11 +641,7 @@ pub fn context_trends(sessions: &[Session]) -> ContextTrend {
                 .map(|count| count.saturating_sub(1))
                 .sum(),
             read_to_write_ratio: ratio(value.reads, value.writes),
-            cost_per_output_token: if value.output == 0 {
-                0.0
-            } else {
-                round4(value.cost / value.output as f64)
-            },
+            output_cost_per_million_tokens: per_million_output_cost(&value),
         })
         .collect::<Vec<_>>();
     projects.sort_by(|left, right| {
@@ -1036,11 +1032,19 @@ fn context_totals(value: &ContextAggregate) -> ContextTrendTotals {
             value.input.saturating_add(value.cache_read),
         ),
         read_to_write_ratio: ratio(value.reads, value.writes),
-        output_cost_per_million_tokens: if value.output == 0 {
-            0.0
-        } else {
-            round4(value.cost / value.output as f64 * 1e6)
-        },
+        output_cost_per_million_tokens: per_million_output_cost(value),
+    }
+}
+
+/// Cost of one million output tokens in USD — the same derivation for the
+/// per-project rows and the totals row so the two can never drift apart
+/// (rm-532: the old project field divided dollars by single tokens and read
+/// 0.0 everywhere while the totals twin carried the real rate).
+fn per_million_output_cost(value: &ContextAggregate) -> f64 {
+    if value.output == 0 {
+        0.0
+    } else {
+        round4(value.cost / value.output as f64 * 1e6)
     }
 }
 fn is_read_tool(tool: &str) -> bool {

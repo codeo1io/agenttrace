@@ -162,11 +162,7 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some((events, parse_counters)) = parse_workbuddy_jsonl(&objs) {
             let mut session = session_from_events(name, path, events)?;
             for (key, count) in parse_counters {
-                *session
-                    .metrics
-                    .disclosure_counters
-                    .entry(key)
-                    .or_insert(0) += count as usize;
+                *session.metrics.disclosure_counters.entry(key).or_insert(0) += count as usize;
             }
             return Ok(session);
         }

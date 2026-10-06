@@ -1558,6 +1558,11 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         // 9,223,372,036,854,775,807 total tokens. Same treatment as every
         // other token total (the governance.rs add_context_session comment
         // is the precedent).
+        // Independently re-derived by run 933058 (campaign-local
+        // rm-529, retired at integration as this row's title-twin;
+        // its distinct deliverable, the
+        // tests/report_numeric_truthfulness.rs suite, pins the
+        // committed adversarial corpus).
         task_type_entry.tokens_input = task_type_entry
             .tokens_input
             .saturating_add(session.metrics.tokens_input.max(0));
