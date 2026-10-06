@@ -2599,10 +2599,20 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             day.discovered, all.discovered,
             "discovered must be range-independent"
         );
-        let health_all =
-            data_health_scoped(&all.sessions, all.discovered, all.skipped, all.cache_hits);
-        let health_day =
-            data_health_scoped(&day.sessions, day.discovered, day.skipped, day.cache_hits);
+        let health_all = data_health_scoped(
+            &all.sessions,
+            all.discovered,
+            all.skipped,
+            all.cache_hits,
+            Vec::new(),
+        );
+        let health_day = data_health_scoped(
+            &day.sessions,
+            day.discovered,
+            day.skipped,
+            day.cache_hits,
+            Vec::new(),
+        );
         assert_eq!(health_all.parsed, 2);
         assert_eq!(
             health_all.out_of_scope, 0,
@@ -2684,6 +2694,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
+            Vec::new(),
         );
         assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
         assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
@@ -2692,6 +2703,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
+            Vec::new(),
         );
         assert_eq!(clean.non_finite_costs, 0);
     });

@@ -587,12 +587,38 @@ fn run() -> anyhow::Result<()> {
         // parse failures stay separate from sessions excluded by the
         // range/filters, so "Parse coverage N/M" is true for every
         // range (pass-8 F8-2).
+        // rm-722: sqlite-backed stores whose read failed (transient
+        // SQLITE_BUSY/locked, unreadable database) are disclosed here —
+        // their sessions are excluded, the aggregate is honest, and the
+        // health report carries the failure detail.
+        let sqlite_store_failures = load_report
+            .as_ref()
+            .map(|report| {
+                report
+                    .sqlite_store_failures
+                    .iter()
+                    .map(|failure| {
+                        format!("{} {}: {}", failure.store, failure.database, failure.error)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !sqlite_store_failures.is_empty() {
+            eprintln!(
+                "Warning: {} SQLite-backed store read failed — those sessions are EXCLUDED from this report:",
+                sqlite_store_failures.len()
+            );
+            for failure in &sqlite_store_failures {
+                eprintln!("  {failure}");
+            }
+        }
         let health = match load_report.as_ref() {
             Some(report) => data_health_scoped(
                 &sessions,
                 report.discovered,
                 report.skipped,
                 report.cache_hits,
+                sqlite_store_failures.clone(),
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
