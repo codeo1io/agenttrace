@@ -95,7 +95,7 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -197,6 +197,12 @@ struct SqliteSnapshot {
     /// the snapshot so the sessions re-price.
     #[serde(default)]
     pricing_catalog_id: Option<String>,
+    /// rm-548: opencode fork copies excluded from `sessions` when the
+    /// snapshot was written. Carried so warm snapshots keep disclosing
+    /// the exclusion instead of going silent. The schema bump to 8
+    /// retires snapshots written before the exclusion existed.
+    #[serde(default)]
+    fork_excluded: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +210,17 @@ struct DirCacheEntry {
     mod_time: i64,
     files: Vec<String>,
     dirs: Vec<String>,
+    /// rm-548 (independent-review fix): memoized opencode fork-marker
+    /// probes for this listing's files — file key -> (fingerprint at
+    /// probe time, parentID). Absent (listings written before the field
+    /// existed) simply re-probes once and stores; a fingerprint
+    /// mismatch (the session doc was rewritten, e.g. it gained a
+    /// `parentID`) re-probes too, so the memo can never mask a
+    /// newly-forked session. Kept per-directory so it retires with the
+    /// listing, and skipped entirely when empty so untouched journals
+    /// serialize byte-identically.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    fork_parents: BTreeMap<String, (FileFingerprint, Option<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -432,10 +449,22 @@ fn remove_cache_artifacts(paths: &[PathBuf]) -> anyhow::Result<()> {
 }
 
 pub(crate) fn load_sqlite_snapshot(database: &Path, name: &str) -> Option<Vec<Session>> {
+    load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name)).map(|(sessions, _)| sessions)
+}
+
+/// rm-548: opencode snapshots also carry their fork-exclusion count so
+/// the disclosure survives a warm cache.
+pub(crate) fn load_sqlite_snapshot_with_meta(
+    database: &Path,
+    name: &str,
+) -> Option<(Vec<Session>, usize)> {
     load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name))
 }
 
-fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Vec<Session>> {
+fn load_sqlite_snapshot_from(
+    database: &Path,
+    snapshot_path: &Path,
+) -> Option<(Vec<Session>, usize)> {
     let raw = fs::read(snapshot_path).ok()?;
     let snapshot = serde_json::from_slice::<SqliteSnapshot>(&raw).ok()?;
     if snapshot.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION
@@ -449,13 +478,15 @@ fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Ve
     {
         return None;
     }
-    Some(
+    let fork_excluded = snapshot.fork_excluded;
+    Some((
         snapshot
             .sessions
             .into_iter()
             .map(|session| session.into_session(&database.to_string_lossy()))
             .collect(),
-    )
+        fork_excluded,
+    ))
 }
 
 pub(crate) fn store_sqlite_snapshot(
@@ -463,13 +494,30 @@ pub(crate) fn store_sqlite_snapshot(
     name: &str,
     sessions: &[Session],
 ) -> anyhow::Result<()> {
-    store_sqlite_snapshot_at(database, &sqlite_snapshot_path(name), sessions)
+    store_sqlite_snapshot_with_meta(database, name, sessions, 0)
+}
+
+/// rm-548: opencode snapshots record their fork-exclusion count so the
+/// disclosure survives warm caches.
+pub(crate) fn store_sqlite_snapshot_with_meta(
+    database: &Path,
+    name: &str,
+    sessions: &[Session],
+    fork_excluded: usize,
+) -> anyhow::Result<()> {
+    store_sqlite_snapshot_at(
+        database,
+        &sqlite_snapshot_path(name),
+        sessions,
+        fork_excluded,
+    )
 }
 
 fn store_sqlite_snapshot_at(
     database: &Path,
     path: &Path,
     sessions: &[Session],
+    fork_excluded: usize,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -481,6 +529,7 @@ fn store_sqlite_snapshot_at(
         shm: file_fingerprint(&sqlite_shm_path(database)),
         sessions: sessions.iter().map(GoSession::from_session).collect(),
         pricing_catalog_id: Some(crate::pricing::catalog_identity().to_string()),
+        fork_excluded,
     };
     let tmp = unique_temp_path(path);
     write_private(&tmp, &serde_json::to_vec(&snapshot)?)?;
@@ -813,10 +862,64 @@ pub(crate) fn store_dir_listing(
             mod_time: file_mod_time_nanos(&metadata),
             files: files.iter().map(|path| cache_key(path)).collect(),
             dirs: dirs.iter().map(|path| cache_key(path)).collect(),
+            fork_parents: BTreeMap::new(),
         },
     );
     cache.dirty = true;
     Ok(())
+}
+
+/// rm-548 (independent-review fix): memoized opencode fork-marker
+/// probe for one storage session info file, served from the parent
+/// directory's cached listing. `Some(parent)` = the memo says the doc
+/// is (not) a fork; `None` = no usable memo (probe never run, no
+/// listing for the parent directory, or the file's fingerprint moved
+/// — a rewritten doc re-probes, so the memo can never mask a
+/// newly-forked session). Callers probe the file and persist with
+/// [`store_fork_parent_probe`].
+pub(crate) fn cached_fork_parent(path: &Path, cache: &SessionCache) -> Option<Option<String>> {
+    let entry = cache.dirs.get(&cache_key(path.parent()?))?;
+    let (fingerprint, parent) = entry.fork_parents.get(&cache_key(path))?;
+    let metadata = fs::metadata(path).ok()?;
+    if fingerprint.mod_time == file_mod_time_nanos(&metadata)
+        && fingerprint.size == metadata.len() as i64
+    {
+        Some(parent.clone())
+    } else {
+        None
+    }
+}
+
+/// rm-548 (independent-review fix): persist one fork-marker probe
+/// result onto the parent directory's cached listing (see
+/// [`cached_fork_parent`]). When the parent directory has no cached
+/// listing the result is simply not persisted — the probe answer is
+/// still correct for this run.
+pub(crate) fn store_fork_parent_probe(
+    path: &Path,
+    parent: Option<String>,
+    cache: &mut SessionCache,
+) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    let Some(entry) = cache.dirs.get_mut(&cache_key(dir)) else {
+        return;
+    };
+    entry.fork_parents.insert(
+        cache_key(path),
+        (
+            FileFingerprint {
+                mod_time: file_mod_time_nanos(&metadata),
+                size: metadata.len() as i64,
+            },
+            parent,
+        ),
+    );
+    cache.dirty = true;
 }
 
 pub(crate) fn cached_file_mod_time_if_fresh(
@@ -1547,7 +1650,7 @@ mod tests {
                     let database = database.clone();
                     let snapshot = snapshot.clone();
                     let session = session.clone();
-                    move || store_sqlite_snapshot_at(&database, &snapshot, &[session]).map(|_| i)
+                    move || store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).map(|_| i)
                 })
             })
             .collect();
@@ -1560,6 +1663,7 @@ mod tests {
         assert_eq!(
             load_sqlite_snapshot_from(&database, &snapshot)
                 .expect("snapshot must survive the race")
+                .0
                 .len(),
             1
         );
@@ -1597,10 +1701,11 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
 
-        store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
         assert_eq!(
             load_sqlite_snapshot_from(&database, &snapshot)
                 .expect("cache hit")
+                .0
                 .len(),
             1
         );
@@ -1621,6 +1726,7 @@ mod tests {
                 tool_warnings: Vec::new(),
                 diagnostics: Diagnostics::default(),
             }],
+            0,
         )
         .expect("store snapshot with wal");
         fs::write(sqlite_shm_path(&database), b"shm").expect("write shm");
@@ -1629,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_eight_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1659,14 +1765,17 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         // Version seven (cycle-1 rm-198): hermes tool outcome semantics
         // changed (ok/fail now derive from the messages table instead of
         // fabricating ok == tool_call_count), so v6 snapshots carry stale
-        // tool outcome splits and must regenerate.
-        assert_eq!(doc["schema_version"], 7);
+        // tool outcome splits and must regenerate. Version eight
+        // (rm-548): snapshots now carry their opencode fork-exclusion
+        // count, so v7 snapshots would disclose a silently-missing
+        // count and must regenerate too.
+        assert_eq!(doc["schema_version"], 8);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1679,11 +1788,12 @@ mod tests {
         );
         let loaded =
             load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
+        let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(6);
+        old["schema_version"] = serde_json::Value::from(7);
         fs::write(
             &snapshot,
             serde_json::to_vec(&old).expect("schema six json"),
@@ -1757,6 +1867,7 @@ mod tests {
             mod_time: 0,
             files: Vec::new(),
             dirs: Vec::new(),
+            fork_parents: BTreeMap::new(),
         };
         cache
             .dirs
@@ -2137,6 +2248,7 @@ mod tests {
                     mod_time: 500_000 + i,
                     files: vec!["f".repeat(120); 6],
                     dirs: Vec::new(),
+                    fork_parents: BTreeMap::new(),
                 },
             );
         }
@@ -2225,6 +2337,7 @@ mod tests {
                 mod_time: 500_000,
                 files: vec!["f".repeat(120); 6],
                 dirs: Vec::new(),
+                fork_parents: BTreeMap::new(),
             },
         );
         let projected = serialized_doc_size(&cache);
@@ -2245,6 +2358,66 @@ mod tests {
     }
 
     #[test]
+    fn fork_parent_probe_memoizes_and_reprobes_on_rewrite() {
+        // rm-548 (independent-review fix): the fork-marker probe memo
+        // lives on the parent directory's cached listing, keyed by the
+        // file's fingerprint. A fresh memo misses (probe + store), a
+        // matching fingerprint serves it, a rewrite — even a same-mtime
+        // one caught by the size change — re-probes, and a vanished
+        // file never serves a stale answer, so the memo cannot mask a
+        // newly-forked session.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-fork-memo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let info_dir = root.join("storage/session/info");
+        fs::create_dir_all(&info_dir).expect("create info dir");
+        let info = info_dir.join("s1.json");
+        fs::write(&info, "{\"parentID\":\"parent-1\"}").expect("write info doc");
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            ..SessionCache::default()
+        };
+        store_dir_listing(&info_dir, &[], &[], &mut cache).expect("store listing");
+        assert_eq!(
+            cached_fork_parent(&info, &cache),
+            None,
+            "a fresh memo must miss so the caller probes the file"
+        );
+        store_fork_parent_probe(&info, Some("parent-1".to_string()), &mut cache);
+        assert!(cache.dirty, "storing a probe marks the cache dirty");
+        assert_eq!(
+            cached_fork_parent(&info, &cache),
+            Some(Some("parent-1".to_string())),
+            "a stored memo with a matching fingerprint serves without reading the file"
+        );
+        // A shorter rewrite changes the fingerprint: the memo must
+        // miss again even though a memo entry exists.
+        fs::write(&info, "{\"parentID\":\"\"}").expect("rewrite info doc");
+        assert_eq!(
+            cached_fork_parent(&info, &cache),
+            None,
+            "a rewritten doc must re-probe, never serve the old answer"
+        );
+        store_fork_parent_probe(&info, None, &mut cache);
+        assert_eq!(
+            cached_fork_parent(&info, &cache),
+            Some(None),
+            "a non-fork memo is a real answer, not a miss"
+        );
+        fs::remove_file(&info).expect("remove info doc");
+        assert_eq!(
+            cached_fork_parent(&info, &cache),
+            None,
+            "a vanished file has no usable fingerprint, so no memo serves"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn dirs_map_gains_count_and_byte_bounds_of_its_own() {
         // rm-298: `dirs` had no bound at all — only entries did — so a
         // broad directory tree grew the snapshot without limit. The
@@ -2258,6 +2431,7 @@ mod tests {
                     mod_time: 400_000 + i * 1_000,
                     files: vec![format!("file-{i}-{}.jsonl", "f".repeat(60)); 4],
                     dirs: Vec::new(),
+                    fork_parents: BTreeMap::new(),
                 },
             );
         }
@@ -2687,7 +2861,7 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
         let mode = fs::metadata(&snapshot)
             .expect("snapshot exists")
             .permissions()
