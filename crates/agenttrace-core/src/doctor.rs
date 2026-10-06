@@ -37,6 +37,13 @@ pub struct DoctorReport {
     /// The hard bounds `save_session_cache` enforces before serializing
     /// (entries and serialized bytes; pass-9 CU-22).
     pub cache_limits: String,
+    /// rm-292 disclosure parity (review fix R3, run 2d92ee95): the
+    /// journal's `schema_invalidations` ledger summarized for humans —
+    /// how many invalidations the surviving journal records and the
+    /// newest record verbatim (schema bumps and pricing-catalog
+    /// changes alike). `None` when the journal has never recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_invalidation_note: Option<String>,
     pub sessions: usize,
     pub session_files: usize,
     pub directories: Vec<DoctorDirReport>,
@@ -84,6 +91,7 @@ struct SessionCacheReport {
     path: PathBuf,
     entries: BTreeMap<String, CacheEntryHeader>,
     dirs: usize,
+    invalidation_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -151,6 +159,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             crate::session_cache::MAX_SESSION_CACHE_ENTRIES,
             crate::session_cache::MAX_SESSION_CACHE_BYTES
         ),
+        cache_invalidation_note: cache.invalidation_note.clone(),
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
         project_decode,
@@ -558,6 +567,9 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first)\n",
         report.cache_size_bytes, report.cache_limits
     ));
+    if let Some(note) = &report.cache_invalidation_note {
+        out.push_str(&format!("  cache disclosure: {note}\n"));
+    }
     let statusline_state = if report.statusline.exists {
         format!(
             "{} captures, {} distinct sessions, {} bytes",
@@ -651,10 +663,28 @@ fn load_session_cache_report() -> SessionCacheReport {
                 .count()
         })
         .unwrap_or(0);
+    // rm-292 disclosure parity (review fix R3, run 2d92ee95): surface
+    // the persisted invalidation ledger — schema bumps AND pricing
+    // catalog changes — so a re-parse cascade is visible from
+    // `--doctor` (text and JSON) instead of only by opening the
+    // journal by hand.
+    let invalidation_note = doc
+        .get("schema_invalidations")
+        .and_then(Value::as_array)
+        .filter(|records| !records.is_empty())
+        .map(|records| {
+            format!(
+                "{} invalidation record(s) recorded; newest: {}",
+                records.len(),
+                serde_json::to_string(&records[records.len() - 1])
+                    .unwrap_or_else(|_| "<unserializable record>".to_string())
+            )
+        });
     SessionCacheReport {
         path,
         entries,
         dirs,
+        invalidation_note,
     }
 }
 
