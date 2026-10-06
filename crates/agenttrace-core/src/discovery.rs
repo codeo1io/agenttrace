@@ -425,7 +425,15 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
-    walk_session_files(dir, 0, max_depth, &mut items, &mut visited);
+    let mut file_targets = SessionFileTargets::new();
+    walk_session_files(
+        dir,
+        0,
+        max_depth,
+        &mut items,
+        &mut visited,
+        &mut file_targets,
+    );
     items.sort_by_key(|item| Reverse(item.1));
     items.into_iter().map(|item| item.0).collect()
 }
@@ -472,7 +480,16 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
-    walk_session_files_cached(dir, 0, max_depth, cache, &mut items, &mut visited);
+    let mut file_targets = SessionFileTargets::new();
+    walk_session_files_cached(
+        dir,
+        0,
+        max_depth,
+        cache,
+        &mut items,
+        &mut visited,
+        &mut file_targets,
+    );
     sort_paths_by_cache(items, cache)
 }
 
@@ -503,6 +520,67 @@ impl SymlinkTargets {
     }
 }
 
+/// Same-file admission for the walk's file arm (rm-597): one transcript
+/// reachable through two paths — a symlink alias (`link.jsonl` pointing
+/// at `real.jsonl`) or a hardlink alias (two names, one inode) — used to
+/// be collected and parsed twice, double-counting every aggregate it
+/// feeds (assess f376d372 F1: one $0.0011 transcript reported "Total
+/// Sessions: 2" / $0.0022 across overview/sessions/search/doctor).
+/// Identity is walk-scoped and enforced where per-directory file lists
+/// merge into the walk output, because whether two names alias one file
+/// can depend on directories the whole walk visits. Stored directory
+/// listings therefore stay raw and warm cache replays dedup identically
+/// to cold walks — no listing-version bump.
+///
+/// On Unix the resolved file's `(device, inode)` pair covers both alias
+/// kinds. Off Unix, std exposes no portable file index, so the canonical
+/// path covers symlink aliases and hardlink aliasing is documented as
+/// uncovered there.
+#[derive(Eq, PartialEq, Hash)]
+enum SameFileIdentity {
+    #[cfg(unix)]
+    DevIno(u64, u64),
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
+}
+
+struct SessionFileTargets(HashSet<SameFileIdentity>);
+
+impl SessionFileTargets {
+    fn new() -> Self {
+        SessionFileTargets(HashSet::new())
+    }
+
+    /// Returns true when the file's identity has not been collected
+    /// yet, recording it. Unresolvable or non-regular paths are
+    /// admitted; downstream admission checks (parse, cache
+    /// fingerprint) still gate them.
+    fn admit(&mut self, path: &Path) -> bool {
+        match same_file_identity(path) {
+            Some(identity) => self.0.insert(identity),
+            None => true,
+        }
+    }
+}
+
+fn same_file_identity(path: &Path) -> Option<SameFileIdentity> {
+    // Follows symlinks: a symlink alias must resolve to its target's
+    // identity, not the link's own.
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(SameFileIdentity::DevIno(metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(SameFileIdentity::Canonical(fs::canonicalize(path).ok()?))
+    }
+}
+
 /// `entry.file_type()` reports the link itself, not its target, so a
 /// symlinked session directory (officially supported by Codex 0.153+,
 /// `openai/codex` `#42135`, and common in dotfile-managed homes) used to
@@ -527,6 +605,7 @@ fn walk_session_files_cached(
     cache: &mut SessionCache,
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
+    file_targets: &mut SessionFileTargets,
 ) {
     if depth > max_depth {
         return;
@@ -542,10 +621,25 @@ fn walk_session_files_cached(
         return;
     }
     if let Some(listing) = cached_dir_listing(dir, cache) {
-        items.extend(listing.files);
+        // rm-597: replayed listings are raw (pre-dedup), so the same
+        // same-file admission applies on warm replay as on a cold walk.
+        items.extend(
+            listing
+                .files
+                .into_iter()
+                .filter(|path| file_targets.admit(path)),
+        );
         for child in listing.dirs {
             if visited.admit(&child) {
-                walk_session_files_cached(&child, depth + 1, max_depth, cache, items, visited);
+                walk_session_files_cached(
+                    &child,
+                    depth + 1,
+                    max_depth,
+                    cache,
+                    items,
+                    visited,
+                    file_targets,
+                );
             }
         }
         return;
@@ -596,11 +690,22 @@ fn walk_session_files_cached(
     }
     files.sort();
     dirs.sort();
+    // rm-597: the stored listing is deliberately raw (undecidable at
+    // per-directory scope); dedup happens as the list merges into the
+    // walk output, keeping cached and uncached walks identical.
     let _ = store_dir_listing(dir, &files, &dirs, cache);
 
-    items.extend(files);
+    items.extend(files.into_iter().filter(|path| file_targets.admit(path)));
     for child in dirs {
-        walk_session_files_cached(&child, depth + 1, max_depth, cache, items, visited);
+        walk_session_files_cached(
+            &child,
+            depth + 1,
+            max_depth,
+            cache,
+            items,
+            visited,
+            file_targets,
+        );
     }
 }
 
@@ -610,6 +715,7 @@ fn walk_session_files(
     max_depth: usize,
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
+    file_targets: &mut SessionFileTargets,
 ) {
     if depth > max_depth {
         return;
@@ -617,6 +723,12 @@ fn walk_session_files(
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    // rm-597 review fix: collect candidates first and admit them in
+    // sorted order, mirroring the cached walk (files.sort() before the
+    // merge filter) so the alias survivor is the same path on a cold
+    // uncached walk and a cached replay instead of whichever alias
+    // readdir happened to yield first.
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
@@ -636,7 +748,7 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited);
+            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
             continue;
         }
         let name = entry.file_name();
@@ -653,8 +765,17 @@ fn walk_session_files(
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
             continue;
         }
-        items.push((path, entry_mod_time(&entry)));
+        // rm-597: same-file admission — a symlink or hardlink alias of an
+        // already-collected transcript is not a second session; admitted
+        // in sorted order below (see the comment above the loop).
+        files.push((path, entry_mod_time(&entry)));
     }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    items.extend(
+        files
+            .into_iter()
+            .filter(|(path, _)| file_targets.admit(path)),
+    );
 }
 
 fn sort_paths_by_mod_time(paths: Vec<PathBuf>) -> Vec<PathBuf> {

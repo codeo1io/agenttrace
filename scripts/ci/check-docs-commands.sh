@@ -79,3 +79,50 @@ fi
 # after the first positional are ignored.
 grep -q 'before the session path\|before the first positional' README.md \
   || fail "README must document that flags go before the positional session path"
+
+# rm-598 (cycle 4): skills/*/SKILL.md ships operator-facing agenttrace
+# invocations (e.g. --fail-under-health, --max-tool-fail-rate) that CI
+# gates and operator runbooks depend on. A flag renamed or removed from
+# the binary leaves every operator following the skill with a broken
+# command. The docs gate must verify them like any other documented
+# command: every flag used in a skills doc's agenttrace invocation must
+# exist in --help output of the binary this gate ran against.
+skills_help="$($bin --help 2>&1)"
+[[ -n "$skills_help" ]] || fail "agenttrace --help produced no output"
+skills_docs=()
+shopt -s nullglob
+for doc in skills/*/SKILL.md; do
+  skills_docs+=("$doc")
+done
+shopt -u nullglob
+[[ ${#skills_docs[@]} -gt 0 ]] \
+  || fail "no skills/*/SKILL.md found: the operator-docs sweep has nothing to verify"
+for doc in "${skills_docs[@]}"; do
+  # Only lines that invoke the binary directly (fenced command lines,
+  # indented or not) — prose and wrapper lines are out of contract.
+  while IFS= read -r line; do
+    # Word-split the invocation exactly like a shell would: each token
+    # is either a long flag (possibly --flag=value), a short flag, or
+    # not a flag. Boundary-grepping the raw line cannot work — adjacent
+    # flags would contend for the space between them.
+    # shellcheck disable=SC2206
+    tokens=($line)
+    for tok in "${tokens[@]}"; do
+      flag="${tok%%=*}"
+      case "$flag" in
+        --[a-zA-Z0-9]*|-[a-zA-Z]) ;;
+        *) continue ;;
+      esac
+      # Quote ERE metacharacters so a malformed token that slips past
+      # the case glob (e.g. --foo(x) cannot turn the pattern invalid.
+      flag_ere=$(printf '%s' "$flag" | sed -e 's/[][\\.*^$(){}?+|]/\\&/g')
+      # here-string, not a pipe: grep -q exits on first match and would
+      # close the read end while printf still writes the ~6KB help text,
+      # and pipefail would turn that SIGPIPE(141) into a spurious
+      # 'flag missing' failure on a correct tree.
+      if ! grep -qE -- "(^|[[:space:]])${flag_ere}([[:space:]=,]|$)" <<<"$skills_help"; then
+        fail "$doc invokes agenttrace with flag $flag, which is missing from --help"
+      fi
+    done
+  done < <(grep -E '^[[:space:]]*agenttrace ' "$doc" || true)
+done
