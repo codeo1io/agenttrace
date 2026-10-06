@@ -5,7 +5,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (rm-710, assess SL1/SL2 of run 6d574820, "truthful
+// usage accounting across parse -> cache -> report"): the batch
+// corrects derived token totals for UNCHANGED source files — codex
+// occurrence-aware usage (rm-711: post-compaction re-based token_count
+// windows count their fresh `last` snapshots instead of colliding
+// with values already counted pre-compaction; the dedup ledger is
+// compaction-envelope-scoped and hard-capped) and qwen per-turn
+// accumulation (rm-711: every turn's `result` usage counts; the
+// session-wide first-wins latch kept only the first result) — so a
+// warm v32 cache keeps serving the pre-fix undercounts with matching
+// fingerprints and never re-parses. The bump ALSO invalidates the
+// warm disclosure amnesia assessed as NN2: pre-rm-526 v32-era entries
+// were written before `line_skips` existed on the entry shape, so a
+// warm hit replays hidden skips at confidence "high" — one bump
+// covers both defect classes at once (rm-230 convention: parser-
+// semantics changes bump the schema so cached sessions regenerate
+// under corrected accounting). Entries regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):
