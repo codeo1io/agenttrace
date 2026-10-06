@@ -232,6 +232,65 @@ const ZERO_TOKEN_RECORDED_COST: &str = concat!(
     r#"{"type": "usage", "id": "31", "parentId": "21", "timestamp": "2026-10-04T10:00:05.000Z", "kind": "cache_warm", "provider": "anthropic", "model": "claude-sonnet-4-5", "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0.015, "cacheWrite": 0, "total": 0.015}}}"#,
 );
 
+/// rm-253 (cycle 2): a pi v3 MESSAGE whose usage block carries the
+/// upstream-recorded cost object — the wire shape the shipped
+/// pi-pi-v3 contract fixture mirrors from a real 1.0.2 journal, and
+/// the assess PoC replayed at $0.0165 catalog-billed against the
+/// journal's own $0.0075 (2.2x, `calculated_from_tokens` provenance,
+/// no disclosure). The message arm dropped the cost whole — the
+/// defect rm-436 fixed for standalone usage entries, one arm over.
+const MESSAGE_RECORDED_COST: &str = concat!(
+    r#"{"type": "session", "version": 3, "id": "s-1", "timestamp": "2026-10-04T10:00:00.000Z", "cwd": "/tmp/x"}"#,
+    "\n",
+    r#"{"type": "message", "id": "11", "parentId": null, "timestamp": "2026-10-04T10:00:01.000Z", "message": {"role": "user", "content": "hi", "timestamp": 1733234401000}}"#,
+    "\n",
+    r#"{"type": "message", "id": "21", "parentId": "11", "timestamp": "2026-10-04T10:00:02.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 1733234401000, "usage": {"input": 100, "output": 50, "cacheRead": 0, "cacheWrite": 0, "cost": {"input": 0.0015, "output": 0.006, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0075}}, "model": "claude-sonnet-4-5"}}"#,
+);
+
+/// rm-253 either-signal shape for the message arm (the standalone
+/// arm's review-F-C mirror): a message block whose token classes are
+/// all zero but whose recorded cost is PRESENT must not drop the $ —
+/// and neither must its non-zero sibling lose its tokens to the
+/// catalog re-price.
+const MESSAGE_ZERO_TOKEN_RECORDED_COST: &str = concat!(
+    r#"{"type": "session", "version": 3, "id": "s-1", "timestamp": "2026-10-04T10:00:00.000Z", "cwd": "/tmp/x"}"#,
+    "\n",
+    r#"{"type": "message", "id": "11", "parentId": null, "timestamp": "2026-10-04T10:00:01.000Z", "message": {"role": "user", "content": "hi", "timestamp": 1733234401000}}"#,
+    "\n",
+    r#"{"type": "message", "id": "21", "parentId": "11", "timestamp": "2026-10-04T10:00:02.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 1733234401000, "usage": {"input": 100, "output": 50}, "model": "claude-sonnet-4-5"}}"#,
+    "\n",
+    r#"{"type": "message", "id": "22", "parentId": "21", "timestamp": "2026-10-04T10:00:03.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "warm"}], "timestamp": 1733234401000, "usage": {"input": 0, "output": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0.05, "cacheWrite": 0, "total": 0.05}}, "model": "claude-sonnet-4-5"}}"#,
+);
+
+/// rm-408 residual (pi arm): PRESENT-but-zero usage blocks on BOTH
+/// pi arms — a message block and a standalone `type:"usage"` entry,
+/// each reporting recognized classes at zero — must surface as
+/// measured zeros (event emitted, zero_usage_events disclosed)
+/// instead of silently vanishing. The claude-family alias table has
+/// inserted zeros unconditionally since rm-408; the pi extractor's
+/// `> 0` gates made pi the one family where "present-zero never
+/// reads as clean" was false.
+const PI_PRESENT_ZERO_USAGE: &str = concat!(
+    r#"{"type": "session", "version": 3, "id": "s-1", "timestamp": "2026-10-04T10:00:00.000Z", "cwd": "/tmp/x"}"#,
+    "\n",
+    r#"{"type": "message", "id": "11", "parentId": null, "timestamp": "2026-10-04T10:00:01.000Z", "message": {"role": "user", "content": "hi", "timestamp": 1733234401000}}"#,
+    "\n",
+    r#"{"type": "message", "id": "21", "parentId": "11", "timestamp": "2026-10-04T10:00:02.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 1733234401000, "usage": {"input": 0, "output": 0}, "model": "claude-sonnet-4-5"}}"#,
+    "\n",
+    r#"{"type": "usage", "id": "31", "parentId": "21", "timestamp": "2026-10-04T10:00:05.000Z", "kind": "normal", "provider": "anthropic", "model": "claude-sonnet-4-5", "usage": {"input": 0, "output": 0}}"#,
+);
+
+/// The contrast half for the zero rider: same journal with the usage
+/// keys ABSENT — nothing was reported, so nothing is counted and
+/// nothing is flagged (the text-estimate path stays untouched).
+const PI_ABSENT_USAGE: &str = concat!(
+    r#"{"type": "session", "version": 3, "id": "s-1", "timestamp": "2026-10-04T10:00:00.000Z", "cwd": "/tmp/x"}"#,
+    "\n",
+    r#"{"type": "message", "id": "11", "parentId": null, "timestamp": "2026-10-04T10:00:01.000Z", "message": {"role": "user", "content": "hi", "timestamp": 1733234401000}}"#,
+    "\n",
+    r#"{"type": "message", "id": "21", "parentId": "11", "timestamp": "2026-10-04T10:00:02.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 1733234401000}, "model": "claude-sonnet-4-5"}}"#,
+);
+
 /// Scratch dir per call (atomic sequence, not `line!()`, which is
 /// macro-site invariant): the doctor test scans its whole dir, so a
 /// shared dir would fold other tests' fixtures into its aggregate.
@@ -804,5 +863,122 @@ fn zero_token_usage_entry_still_passes_recorded_cost() {
         Some(&1),
         "the entry is still disclosed: {:?}",
         metrics.disclosure_counters
+    );
+}
+
+#[test]
+fn message_usage_blocks_pass_their_recorded_cost_through() {
+    // rm-253 (cycle 2): the message arm honors `message.usage.cost`
+    // exactly as the standalone arm has since rm-436 — recorded cost
+    // passes through at face value, the block's tokens are excluded
+    // from the catalog formula, and the provenance discloses the
+    // recorded component. The assess PoC priced this journal's own
+    // $0.0075 at $0.0165 (2.2x) pre-fix.
+    let session = parsed("message-recorded.jsonl", MESSAGE_RECORDED_COST);
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, 100, "message tokens counted");
+    assert_eq!(metrics.tokens_output, 50);
+    assert!(
+        (metrics.upstream_cost_usd - 0.0075).abs() < 1e-12,
+        "journal-recorded message cost passes through: got {}",
+        metrics.upstream_cost_usd
+    );
+    assert!(
+        (metrics.cost_estimated - 0.0075).abs() < 1e-9,
+        "recorded cost wins — the block is not catalog-priced on top: got {}",
+        metrics.cost_estimated
+    );
+    assert!(
+        metrics
+            .provenance
+            .pricing_source
+            .ends_with(" + recorded cost"),
+        "pricing source discloses the recorded component: {}",
+        metrics.provenance.pricing_source
+    );
+    assert_eq!(
+        metrics.provenance.cost, "calculated_from_tokens_with_recorded_cost",
+        "single-model recorded-cost provenance: {}",
+        metrics.provenance.cost
+    );
+    assert_eq!(metrics.provenance.tokens, "reported_by_agent");
+    assert_eq!(metrics.assistant_turns, 1);
+    assert_eq!(metrics.user_messages, 1);
+}
+
+#[test]
+fn message_zero_token_block_still_passes_recorded_cost() {
+    // rm-253 either-signal gate on the message arm (the standalone
+    // arm's review-F-C mirror): a PRESENT cost is never silently
+    // zeroed for lacking token classes — entry 22 reports $0.05 with
+    // zero classes, and entry 21's unrecorded tokens keep their
+    // catalog price.
+    let session = parsed(
+        "message-zero-token-recorded.jsonl",
+        MESSAGE_ZERO_TOKEN_RECORDED_COST,
+    );
+    let metrics = &session.metrics;
+    assert_eq!(
+        metrics.tokens_input, 100,
+        "only the unrecorded block's tokens count"
+    );
+    assert_eq!(metrics.tokens_output, 50);
+    assert!(
+        (metrics.upstream_cost_usd - 0.05).abs() < 1e-12,
+        "zero-token message cost passes through: got {}",
+        metrics.upstream_cost_usd
+    );
+    let price = lookup_price("claude-sonnet-4-5");
+    let expected = round4(100.0 / 1e6 * price.input + 50.0 / 1e6 * price.output + 0.05);
+    assert!(
+        (metrics.cost_estimated - expected).abs() < 1e-9,
+        "catalog prices the unrecorded block, recorded rides along: got {} want {}",
+        metrics.cost_estimated,
+        expected
+    );
+    assert_eq!(
+        metrics.provenance.cost,
+        "calculated_from_tokens_with_recorded_cost"
+    );
+}
+
+#[test]
+fn present_zero_pi_usage_counts_as_measured_zeros_on_both_arms() {
+    // rm-408 residual (pi arm): a PRESENT block reporting recognized
+    // classes at zero yields its classes (zeros included), so the
+    // event emits and lands in the landed zero-usage disclosure
+    // instead of silently reading as clean — on BOTH pi arms (the
+    // message block and the standalone usage entry).
+    let session = parsed("pi-present-zero.jsonl", PI_PRESENT_ZERO_USAGE);
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, 0, "nothing to count");
+    assert_eq!(metrics.tokens_output, 0);
+    assert_eq!(metrics.zero_usage_events, 2, "message arm + standalone arm");
+    assert_eq!(
+        metrics.provenance.tokens, "reported_by_agent+zero_usage_reported:2",
+        "the rm-054 taxonomy suffix composes for pi: {}",
+        metrics.provenance.tokens
+    );
+    assert_eq!(metrics.assistant_turns, 1);
+
+    // The landed disclosure surfaces pick the counter up with no
+    // further changes (doctor verify-only leg).
+    let dir = scratch_dir();
+    journal(&dir, "pi-present-zero.jsonl", PI_PRESENT_ZERO_USAGE);
+    let report = build_doctor_report(Some(&dir), false);
+    assert_eq!(report.zero_usage.sessions, 1);
+    assert_eq!(report.zero_usage.events, 2);
+    let text = render_doctor_report(Some(&dir), false, "text").expect("doctor text");
+    assert!(
+        text.contains("all-zero usage block"),
+        "doctor census names the zero blocks:\n{text}"
+    );
+
+    // Contrast: with the usage keys ABSENT there is nothing reported —
+    // no event, no flag, no disclosure.
+    let absent = parsed("pi-absent-usage.jsonl", PI_ABSENT_USAGE);
+    assert_eq!(
+        absent.metrics.zero_usage_events, 0,
+        "absent usage never flags"
     );
 }

@@ -152,17 +152,40 @@ fn pi_v3_journal_message_usage_and_model_contract() {
         session.metrics.model_used, "multiple",
         "{PI_V3}: contract drift — a switched session must disclose the model mix, not name the pre-switch model"
     );
-    let sonnet = agenttrace_core::lookup_price("claude-sonnet-4-20250514");
-    let expected_block_cost = 500.0 / 1e6 * sonnet.input
-        + 1000.0 / 1e6 * sonnet.output
-        + 25000.0 / 1e6 * sonnet.cr
-        + 5000.0 / 1e6 * sonnet.cw;
+    // rm-253 (cycle 2): the message arm honors the block's
+    // upstream-recorded cost — the fixture's own usage block records
+    // cost.total = $0.0075, and recorded cost WINS over the catalog
+    // exactly as the standalone usage arm has since rm-436: the
+    // block's tokens are excluded from the catalog formula, the
+    // recorded value passes through at face value, and the pricing
+    // source discloses the recorded component. The former pin
+    // (catalog-priced sonnet rates over 500/1000/25k/5k) asserted the
+    // defect this flip retires — flipped by intent, not drift.
     assert!(
-        (session.metrics.cost_estimated - agenttrace_core::round4(expected_block_cost)).abs()
-            < 1e-9,
-        "{PI_V3}: message-level key 'model' no longer drives pricing attribution: got {} want {}",
-        session.metrics.cost_estimated,
-        expected_block_cost
+        (session.metrics.upstream_cost_usd - 0.0075).abs() < 1e-12,
+        "{PI_V3}: message-level recorded cost must pass through, got {}",
+        session.metrics.upstream_cost_usd
+    );
+    let sonnet = agenttrace_core::lookup_price("claude-sonnet-4-20250514");
+    let catalog_only = agenttrace_core::round4(
+        500.0 / 1e6 * sonnet.input
+            + 1000.0 / 1e6 * sonnet.output
+            + 25000.0 / 1e6 * sonnet.cr
+            + 5000.0 / 1e6 * sonnet.cw,
+    );
+    assert!(
+        (session.metrics.cost_estimated - 0.0075).abs() < 1e-9,
+        "{PI_V3}: recorded cost must win over catalog pricing (catalog-only would be {catalog_only}): got {}",
+        session.metrics.cost_estimated
+    );
+    assert_eq!(
+        session.metrics.provenance.pricing_source,
+        "multiple models (priced per usage block) + recorded cost",
+        "{PI_V3}: the recorded component must be disclosed on the pricing source"
+    );
+    assert_eq!(
+        session.metrics.provenance.cost, "calculated_per_message_tokens",
+        "{PI_V3}: mixed-model recorded-cost provenance"
     );
     assert!(
         session.metrics.cost_estimated > 0.0,
@@ -205,6 +228,51 @@ fn pi_v3_journal_message_usage_and_model_contract() {
     assert_eq!(
         switched_session.metrics.assistant_turns, 2,
         "{PI_V3}: the model-less post-switch assistant message must still count as a turn"
+    );
+}
+
+#[test]
+fn both_pi_arms_honor_the_same_recorded_cost_shape() {
+    // rm-253 (cycle 2): the message arm and the standalone
+    // `type:"usage"` arm (rm-436) read the same wire cost object
+    // through the same helper, so one corpus carrying BOTH shapes
+    // must land both recorded costs additively — with neither arm
+    // re-pricing its tokens through the catalog. A standalone
+    // cache-warm entry with its own $0.0075 rides the fixture's
+    // message-level $0.0075.
+    let standalone = concat!(
+        "{\"id\": \"00000000-0000-4000-8000-000000000008\", ",
+        "\"parentId\": \"00000000-0000-4000-8000-000000000006\", ",
+        "\"timestamp\": \"2026-10-04T07:16:48.250Z\", \"type\": \"usage\", ",
+        "\"kind\": \"cache_warm\", \"provider\": \"anthropic\", ",
+        "\"model\": \"claude-sonnet-4-20250514\", ",
+        "\"usage\": {\"input\": 0, \"output\": 0, \"cacheRead\": 1000, \"cacheWrite\": 0, ",
+        "\"cost\": {\"input\": 0, \"output\": 0, \"cacheRead\": 0.0075, \"cacheWrite\": 0, \"total\": 0.0075}}}",
+    );
+    let corpus = format!("{}\n{standalone}", fixture(PI_V3));
+    let session = parse_raw_session("pi-v3-both-arms", PI_V3, &corpus)
+        .unwrap_or_else(|error| panic!("{PI_V3}: two-arm corpus no longer parses: {error}"));
+    assert_eq!(
+        session.metrics.tokens_cache_r, 26000,
+        "25,000 message + 1,000 standalone cache-read tokens, both counted"
+    );
+    assert!(
+        (session.metrics.upstream_cost_usd - 0.015).abs() < 1e-12,
+        "both arms' recorded costs pass through: got {}",
+        session.metrics.upstream_cost_usd
+    );
+    assert!(
+        (session.metrics.cost_estimated - 0.015).abs() < 1e-9,
+        "neither arm's tokens are catalog-priced when the journal records the cost: got {}",
+        session.metrics.cost_estimated
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("pi_usage_entry:cache_warm"),
+        Some(&1),
+        "the standalone entry stays disclosed alongside the message arm"
     );
 }
 

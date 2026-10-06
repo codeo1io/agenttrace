@@ -1692,10 +1692,12 @@ fn pi_source_for_path(path: &str) -> String {
     }
 }
 
-/// pi `type:"usage"` entries carry a recorded cost block
-/// (`usage.cost.total`, USD). Returned only when finite and
-/// non-negative; anything else is treated as absent (rm-436): a
-/// missing or corrupt cost must not silently zero real spend.
+/// pi usage blocks carry a recorded cost object (`usage.cost.total`,
+/// USD) on EITHER arm that can hold one: standalone `type:"usage"`
+/// entries (rm-436) and message-level `message.usage` blocks
+/// (rm-253). Returned only when finite and non-negative; anything
+/// else is treated as absent (rm-436): a missing or corrupt cost must
+/// not silently zero real spend.
 fn oh_my_pi_recorded_cost_usd(usage: Option<&Value>) -> Option<f64> {
     let total = usage?
         .as_object()?
@@ -1738,12 +1740,25 @@ fn oh_my_pi_message_events(
     }
 
     let mut events = Vec::new();
-    if let Some(usage) = oh_my_pi_usage(message.get("usage")) {
+    // rm-253 (cycle 2): the message arm honors the SAME upstream-
+    // recorded cost the standalone usage arm reads (rm-436): a pi
+    // message usage block can carry `cost.total` (USD) and the wire-
+    // observed fixture shape does — pre-fix, a journal recording
+    // $0.0075 was catalog-billed at the session model's rate
+    // ($0.0165, 2.2x on the assess PoC) with
+    // `calculated_from_tokens` provenance and no disclosure. Emit on
+    // EITHER signal (mirroring the standalone arm's review-F-C
+    // repair) and mark the cost so analyze() prices the block at
+    // face value instead of the catalog rate.
+    let usage = oh_my_pi_usage(message.get("usage"));
+    let recorded_cost_usd = oh_my_pi_recorded_cost_usd(message.get("usage"));
+    if usage.is_some() || recorded_cost_usd.is_some() {
         events.push(Event {
             role: "meta".to_string(),
             timestamp: ts.clone(),
-            usage,
+            usage: usage.unwrap_or_default(),
             model_used: model.clone(),
+            recorded_cost_usd,
             source_tool: source_tool.to_string(),
             ..Event::default()
         });
@@ -1883,19 +1898,38 @@ fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let output = sum_numbers(obj, &["output", "output_tokens"]);
     let cache_read = sum_numbers(obj, &["cacheRead", "cache_read_input_tokens"]);
     let cache_write = sum_numbers(obj, &["cacheWrite", "cache_creation_input_tokens"]);
-    if input > 0 {
+    // rm-408 residual (pi arm): insert every RECOGNIZED class, zeros
+    // included — the claude-family contract (usage_from_value_with
+    // _keys) inserts a class whenever a wire key yields a number. The
+    // former `> 0` gates made pi the one family where a present
+    // {input: 0, output: 0} block produced no event and no
+    // zero_usage_events disclosure, silently reading as clean.
+    let recognized = |keys: &[&str]| {
+        keys.iter()
+            .any(|key| obj.get(*key).and_then(number_as_i64).is_some())
+    };
+    if recognized(&["input", "input_tokens"]) {
         usage.insert("input_tokens".to_string(), input);
     }
-    if output > 0 {
+    if recognized(&["output", "output_tokens"]) {
         usage.insert("output_tokens".to_string(), output);
     }
-    if cache_read > 0 {
+    if recognized(&["cacheRead", "cache_read_input_tokens"]) {
         usage.insert("cache_read_input_tokens".to_string(), cache_read);
     }
-    if cache_write > 0 {
+    if recognized(&["cacheWrite", "cache_creation_input_tokens"]) {
         usage.insert("cache_creation_input_tokens".to_string(), cache_write);
     }
-    non_empty_usage(usage)
+    // A PRESENT block whose recognized classes are all zero surfaces
+    // as measured zeros — the event emits and lib's zero_usage_events
+    // disclosure counts it (the rm-408 contract). A block with no
+    // recognized numeric class at all stays absent: nothing was
+    // reported to honor.
+    if usage.is_empty() {
+        None
+    } else {
+        Some(usage)
+    }
 }
 
 fn oh_my_pi_timestamp(raw: Option<&Value>, fallback: &str) -> String {
@@ -5850,6 +5884,39 @@ mod tests {
         let map = oh_my_pi_usage(Some(&usage)).expect("usage map");
         assert_eq!(map.get("input_tokens"), Some(&100));
         assert_eq!(map.get("output_tokens"), Some(&50));
+    }
+
+    #[test]
+    fn pi_usage_inserts_recognized_zero_classes() {
+        // rm-408 residual (pi arm): a PRESENT block reporting
+        // recognized classes at zero yields those classes (zeros
+        // included) — the claude-family contract
+        // (usage_from_value_with_keys) — so the event emits and the
+        // zero-usage disclosure can count it.
+        let usage = serde_json::json!({
+            "input": 0,
+            "output": 0,
+        });
+        let map = oh_my_pi_usage(Some(&usage)).expect("present block yields a map");
+        assert_eq!(map.get("input_tokens"), Some(&0));
+        assert_eq!(map.get("output_tokens"), Some(&0));
+        assert!(
+            !map.contains_key("cache_read_input_tokens"),
+            "unreported classes stay absent: {map:?}"
+        );
+    }
+
+    #[test]
+    fn pi_usage_without_recognized_classes_stays_absent() {
+        // The contrast half: nothing recognized was reported — no
+        // map, no event, no zero flag (absent usage keeps the
+        // text-estimate path, and a cost-only block reports no token
+        // class; its cost signal is read separately by the emit
+        // gate).
+        assert!(oh_my_pi_usage(None).is_none());
+        assert!(oh_my_pi_usage(Some(&serde_json::json!({}))).is_none());
+        assert!(oh_my_pi_usage(Some(&serde_json::json!({"weird": 5}))).is_none());
+        assert!(oh_my_pi_usage(Some(&serde_json::json!({"cost": {"total": 0.05}}))).is_none());
     }
 
     #[test]

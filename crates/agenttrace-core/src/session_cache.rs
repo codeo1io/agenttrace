@@ -5,7 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 25;
+// Bumped 24 -> 25 (run e486dc1a cycle 2, rm-253 + rm-408 pi residual):
+// the pi MESSAGE arm now passes `message.usage.cost.total` through as
+// recorded cost (recorded wins over catalog pricing; the block's
+// tokens leave the catalog formula), and present-but-zero pi usage
+// blocks emit their events (recognized classes inserted with zeros,
+// the claude-family rm-408 contract). v24 entries carry the pre-fix
+// pi totals — catalog-priced message costs and silently-clean zero
+// blocks — that nothing regenerates until each source file changes
+// again. Per the rm-230 convention the bump invalidates them once:
+// entries regenerate on the next scan.
 // Bumped 23 -> 24 (integration of run 6403d975, rm-436/437/438): the
 // pi journal accounting batch (disclosure counters, upstream
 // recorded-cost passthrough, per-block multi-model pricing) changed
