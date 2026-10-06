@@ -57,22 +57,118 @@ struct SqliteSessionAgg {
     first_user_text: String,
 }
 
+/// Per-file honesty report for the SQLite-backed ingestion lanes
+/// (rm-596): a discovered database that exists but cannot be read, and
+/// session rows that fail to decode, are disclosed here instead of
+/// silently counting as absent/empty.
+#[derive(Debug, Default, Clone)]
+pub struct SqliteIngestReport {
+    /// Discovered database files that could not be opened or queried
+    /// (corrupt bytes, unusable schema, permissions) — distinct from an
+    /// absent file, which legitimately yields no sessions.
+    pub unreadable: Vec<SqliteUnreadableDb>,
+    /// Per-file counts of session rows dropped because the row failed
+    /// to decode (NULL ids, wrong-typed columns outside the lenient
+    /// readers). A dropped row is a lost session, not an empty corpus.
+    pub dropped_rows: Vec<SqliteDroppedRows>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteUnreadableDb {
+    pub path: PathBuf,
+    pub source: &'static str,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SqliteDroppedRows {
+    pub path: PathBuf,
+    pub source: &'static str,
+    pub dropped: usize,
+    pub sample: String,
+}
+
+impl SqliteIngestReport {
+    fn absorb(&mut self, path: &Path, source: &'static str, failures: SqliteFileFailures) {
+        if let Some(reason) = failures.unreadable {
+            self.unreadable.push(SqliteUnreadableDb {
+                path: path.to_path_buf(),
+                source,
+                reason,
+            });
+        }
+        if failures.dropped > 0 {
+            self.dropped_rows.push(SqliteDroppedRows {
+                path: path.to_path_buf(),
+                source,
+                dropped: failures.dropped,
+                sample: failures
+                    .dropped_sample
+                    .unwrap_or_else(|| "undecodable session row".to_string()),
+            });
+        }
+    }
+}
+
+/// Failures of one database file during a load pass.
+#[derive(Debug, Default, Clone)]
+struct SqliteFileFailures {
+    unreadable: Option<String>,
+    dropped: usize,
+    dropped_sample: Option<String>,
+}
+
+impl SqliteFileFailures {
+    fn record_dropped(&mut self, error: &rusqlite::Error) {
+        self.dropped += 1;
+        if self.dropped_sample.is_none() {
+            self.dropped_sample = Some(error.to_string());
+        }
+    }
+
+    fn merge(&mut self, other: SqliteFileFailures) {
+        if self.unreadable.is_none() {
+            self.unreadable = other.unreadable;
+        }
+        self.dropped += other.dropped;
+        if self.dropped_sample.is_none() {
+            self.dropped_sample = other.dropped_sample;
+        }
+    }
+
+    fn is_clean(&self) -> bool {
+        self.unreadable.is_none() && self.dropped == 0
+    }
+}
+
 pub fn load_sqlite_backed_sessions() -> Vec<Session> {
     load_sqlite_backed_sessions_since(None)
 }
 
 pub(crate) fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) -> Vec<Session> {
+    load_sqlite_backed_sessions_reported(since).0
+}
+
+/// rm-596: the SQLite-backed sessions alongside their per-file failure
+/// report. Callers that only need sessions keep the Vec-returning
+/// wrappers; doctor and the CLI report paths consume the report so a
+/// discovered-but-unreadable database and dropped session rows are
+/// disclosed instead of rendering as an empty corpus.
+pub fn load_sqlite_backed_sessions_reported(
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, SqliteIngestReport) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
+        return (Vec::new(), SqliteIngestReport::default());
     };
     let mut sessions = Vec::new();
+    let mut report = SqliteIngestReport::default();
     for path in hermes_state_db_paths(&home) {
-        sessions.extend(load_hermes_sqlite_sessions(&path, since));
+        sessions.extend(load_hermes_sqlite_sessions(&path, since, &mut report));
     }
     for path in opencode_db_paths(&home) {
-        sessions.extend(load_opencode_sqlite_sessions(&path, since));
+        sessions.extend(load_opencode_sqlite_sessions(&path, since, &mut report));
     }
-    sessions
+    (sessions, report)
 }
 
 pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
@@ -154,21 +250,48 @@ fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
     )
 }
 
-fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn load_hermes_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    report: &mut SqliteIngestReport,
+) -> Vec<Session> {
     if !sqlite_file_exists(path) {
         return Vec::new();
     }
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "hermes") {
-        return filter_since(sessions, since);
+        // rm-596: an empty snapshot is not trusted as final — a corrupt
+        // database cached an empty result under pre-fix binaries and
+        // the unreadable disclosure would stay hidden behind it
+        // forever. Re-query instead (cheap on a genuinely empty DB) so
+        // failures are re-detected every run.
+        if !sessions.is_empty() {
+            return filter_since(sessions, since);
+        }
     }
-    let sessions = query_hermes_sqlite_sessions(path, None);
-    let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
+    let (sessions, failures) = query_hermes_sqlite_sessions(path, None);
+    let clean = failures.is_clean();
+    report.absorb(path, "hermes", failures);
+    // A failed pass must not poison the snapshot cache with an empty
+    // result: the failure would replay as "absent" on every later run.
+    if clean {
+        let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
+    }
     filter_since(sessions, since)
 }
 
-fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
-    let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
+fn query_hermes_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, SqliteFileFailures) {
+    let mut failures = SqliteFileFailures::default();
+    let db = match open_sqlite_read_only(path) {
+        Ok(db) => db,
+        // rm-596: found-but-unopenable is a distinct failure from
+        // absent (permissions, lock policy) — disclose, don't null.
+        Err(error) => {
+            failures.unreadable = Some(error.to_string());
+            return (Vec::new(), failures);
+        }
     };
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
     let tool_outcomes = hermes_tool_outcome_counts(&db);
@@ -182,11 +305,20 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, {cwd} from sessions \
          where (?1 is null or started_at >= ?1 or started_at is null or started_at <= 0)"
     );
-    let Ok(mut stmt) = db.prepare(&sql) else {
-        return Vec::new();
+    let mut stmt = match db.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            // A valid-but-foreign database with no `sessions` table is
+            // legitimately session-less; anything else (corrupt bytes,
+            // "file is not a database") is found-but-unreadable.
+            if !error.to_string().contains("no such table") {
+                failures.unreadable = Some(error.to_string());
+            }
+            return (Vec::new(), failures);
+        }
     };
     let since_unix = since.map(|value| value.timestamp() as f64);
-    let Ok(rows) = stmt.query_map([since_unix], |row| {
+    let rows = match stmt.query_map([since_unix], |row| {
         Ok(SqliteSessionAgg {
             id: row.get::<_, String>(0)?,
             model: string_or(row.get::<_, Option<String>>(1)?, "default"),
@@ -203,66 +335,109 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             path: path.to_string_lossy().to_string(),
             ..SqliteSessionAgg::default()
         })
-    }) else {
-        return Vec::new();
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.unreadable = Some(error.to_string());
+            return (Vec::new(), failures);
+        }
     };
 
-    rows.filter_map(Result::ok)
-        .map(|mut agg| {
-            if !agg.model.is_empty() {
-                agg.models.insert(agg.model.clone());
+    // rm-596: a row that fails to decode is counted and sampled, never
+    // dropped by filter_map — a NULL id used to erase the whole session
+    // silently (P13: 1 of 2 sessions "reported").
+    let mut sessions = Vec::new();
+    for row in rows {
+        match row {
+            Ok(mut agg) => {
+                enrich_hermes_agg(&mut agg, &roles, &tool_outcomes);
+                sessions.push(session_from_sqlite_agg(agg));
             }
-            if let Some(counts) = roles.get(&agg.id) {
-                agg.user_messages = counts.user;
-                agg.assistant_turns = counts.assistant;
-            }
-            if let Some(outcomes) = tool_outcomes.get(&agg.id) {
-                // rm-198: the hermes session row records only the number
-                // of tool calls, never their outcome. The outcome split
-                // comes from the messages table instead (observed result
-                // rows, minus the ones hermes renders as tool errors),
-                // matching the parser convention that ok+fail counts
-                // observed results while tool_calls_total counts calls.
-                agg.tool_results = outcomes.results;
-                agg.tool_calls_fail = outcomes.failures;
-                agg.tool_calls_ok = outcomes.results.saturating_sub(outcomes.failures);
-                agg.tool_calls_total = agg.tool_calls_total.max(outcomes.results);
-            } else if let Some(counts) = roles.get(&agg.id) {
-                // No content column (or no tool rows): an outcome split
-                // cannot be derived, so report the observed result count
-                // without fabricating a success split.
-                agg.tool_results = counts.tool;
-            }
-            session_from_sqlite_agg(agg)
-        })
-        .collect()
+            Err(error) => failures.record_dropped(&error),
+        }
+    }
+    (sessions, failures)
 }
 
-fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn enrich_hermes_agg(
+    agg: &mut SqliteSessionAgg,
+    roles: &HashMap<String, RoleCounts>,
+    tool_outcomes: &HashMap<String, HermesToolOutcomes>,
+) {
+    if !agg.model.is_empty() {
+        agg.models.insert(agg.model.clone());
+    }
+    if let Some(counts) = roles.get(&agg.id) {
+        agg.user_messages = counts.user;
+        agg.assistant_turns = counts.assistant;
+    }
+    if let Some(outcomes) = tool_outcomes.get(&agg.id) {
+        // rm-198: the hermes session row records only the number
+        // of tool calls, never their outcome. The outcome split
+        // comes from the messages table instead (observed result
+        // rows, minus the ones hermes renders as tool errors),
+        // matching the parser convention that ok+fail counts
+        // observed results while tool_calls_total counts calls.
+        agg.tool_results = outcomes.results;
+        agg.tool_calls_fail = outcomes.failures;
+        agg.tool_calls_ok = outcomes.results.saturating_sub(outcomes.failures);
+        agg.tool_calls_total = agg.tool_calls_total.max(outcomes.results);
+    } else if let Some(counts) = roles.get(&agg.id) {
+        // No content column (or no tool rows): an outcome split
+        // cannot be derived, so report the observed result count
+        // without fabricating a success split.
+        agg.tool_results = counts.tool;
+    }
+}
+
+fn load_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    report: &mut SqliteIngestReport,
+) -> Vec<Session> {
     if !sqlite_file_exists(path) {
         return Vec::new();
     }
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
-        return filter_since(sessions, since);
+        // rm-596: see load_hermes_sqlite_sessions — an empty snapshot
+        // is re-verified, not trusted (pre-fix corrupt databases cached
+        // one; the P14 probe left exactly such a file behind).
+        if !sessions.is_empty() {
+            return filter_since(sessions, since);
+        }
     }
-    let sessions = query_opencode_sqlite_sessions(path, None);
-    let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
+    let (sessions, failures) = query_opencode_sqlite_sessions(path, None);
+    let clean = failures.is_clean();
+    report.absorb(path, "opencode", failures);
+    if clean {
+        let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
+    }
     filter_since(sessions, since)
 }
 
-fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
-    let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
+fn query_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, SqliteFileFailures) {
+    let mut failures = SqliteFileFailures::default();
+    let db = match open_sqlite_read_only(path) {
+        Ok(db) => db,
+        Err(error) => {
+            failures.unreadable = Some(error.to_string());
+            return (Vec::new(), failures);
+        }
     };
-    let mut aggs = opencode_sqlite_session_rows(&db, path, since);
+    let (mut aggs, row_failures) = opencode_sqlite_session_rows(&db, path, since);
+    failures.merge(row_failures);
     if aggs.is_empty() {
-        return Vec::new();
+        return (Vec::new(), failures);
     }
     add_opencode_sqlite_messages(&db, &mut aggs);
     add_opencode_sqlite_parts(&db, &mut aggs);
     capture_opencode_user_text(&db, &mut aggs);
 
-    aggs.into_values()
+    let sessions = aggs
+        .into_values()
         .map(|mut agg| {
             if agg.model.is_empty() {
                 agg.model = "default".to_string();
@@ -273,7 +448,8 @@ fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> 
             apply_opencode_stored_totals(&mut agg);
             session_from_sqlite_agg(agg)
         })
-        .collect()
+        .collect();
+    (sessions, failures)
 }
 
 /// Prefer the authoritative totals recorded on the session row over
@@ -354,7 +530,8 @@ fn opencode_sqlite_session_rows(
     db: &Connection,
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> HashMap<String, SqliteSessionAgg> {
+) -> (HashMap<String, SqliteSessionAgg>, SqliteFileFailures) {
+    let mut failures = SqliteFileFailures::default();
     let directory = if sqlite_has_column(db, "session", "directory") {
         "directory"
     } else {
@@ -401,11 +578,21 @@ fn opencode_sqlite_session_rows(
         "select id, title, time_created, time_updated, {directory}, {stored_select} from session \
          where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
-    let Ok(mut stmt) = db.prepare(&sql) else {
-        return HashMap::new();
+    let mut stmt = match db.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(error) => {
+            // Same class split as the hermes lane: a database with no
+            // `session` table is session-less, anything else is
+            // found-but-unreadable (random bytes → "file is not a
+            // database", P12/P14).
+            if !error.to_string().contains("no such table") {
+                failures.unreadable = Some(error.to_string());
+            }
+            return (HashMap::new(), failures);
+        }
     };
     let since_millis = since.map(|value| value.timestamp_millis());
-    let Ok(rows) = stmt.query_map([since_millis], |row| {
+    let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
         Ok((
             id.clone(),
@@ -430,10 +617,26 @@ fn opencode_sqlite_session_rows(
                 ..SqliteSessionAgg::default()
             },
         ))
-    }) else {
-        return HashMap::new();
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.unreadable = Some(error.to_string());
+            return (HashMap::new(), failures);
+        }
     };
-    rows.filter_map(Result::ok).collect()
+    // rm-596: decode failures are counted and sampled, not
+    // filter_map-dropped — the NULL-id ghost row erased a whole
+    // session silently (P11: 4 of 5 sessions "reported").
+    let mut aggs = HashMap::new();
+    for row in rows {
+        match row {
+            Ok((id, agg)) => {
+                aggs.insert(id, agg);
+            }
+            Err(error) => failures.record_dropped(&error),
+        }
+    }
+    (aggs, failures)
 }
 
 fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
@@ -476,9 +679,17 @@ fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, Sqli
 /// so the join recovers the prompt behind placeholder titles like
 /// `New session - <timestamp>`.
 fn capture_opencode_user_text(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
+    // rm-596 perf rider: this used to `order by p.time_created`,
+    // sorting the ENTIRE part table on every load to find each
+    // session's earliest user text. One unordered pass keeping the
+    // per-session (time_created, rowid) minimum selects the same part
+    // without the database-side sort. Ordering matches SQLite's ASC
+    // semantics exactly: NULL time_created first, then value, ties by
+    // rowid; time_created reads through the lenient i64 converter so
+    // wrong-typed values degrade to None instead of dropping the row.
     let Ok(mut stmt) = db.prepare(
-        "select p.session_id, p.data, m.data from part p \
-         join message m on p.message_id = m.id order by p.time_created",
+        "select p.session_id, p.data, m.data, p.time_created, p.rowid from part p \
+         join message m on p.message_id = m.id",
     ) else {
         return;
     };
@@ -487,17 +698,14 @@ fn capture_opencode_user_text(db: &Connection, aggs: &mut HashMap<String, Sqlite
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            sqlite_value_as_i64(row.get(3)?),
+            row.get::<_, i64>(4)?,
         ))
     }) else {
         return;
     };
-    for (session_id, part_raw, message_raw) in rows.filter_map(Result::ok) {
-        let Some(agg) = aggs.get_mut(&session_id) else {
-            continue;
-        };
-        if !agg.first_user_text.is_empty() {
-            continue;
-        }
+    let mut earliest: HashMap<String, (Option<i64>, i64, String)> = HashMap::new();
+    for (session_id, part_raw, message_raw, time_created, rowid) in rows.filter_map(Result::ok) {
         let Ok(serde_json::Value::Object(message)) = serde_json::from_str::<Value>(&message_raw)
         else {
             continue;
@@ -512,8 +720,22 @@ fn capture_opencode_user_text(db: &Connection, aggs: &mut HashMap<String, Sqlite
             continue;
         }
         let text = string(part.get("text"));
-        if !text.trim().is_empty() {
-            agg.first_user_text = text.to_string();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let better = match earliest.get(&session_id) {
+            None => true,
+            Some((best_time, best_rowid, _)) => (time_created, rowid) < (*best_time, *best_rowid),
+        };
+        if better {
+            earliest.insert(session_id, (time_created, rowid, text.to_string()));
+        }
+    }
+    for (session_id, (_, _, text)) in earliest {
+        if let Some(agg) = aggs.get_mut(&session_id) {
+            if agg.first_user_text.is_empty() {
+                agg.first_user_text = text;
+            }
         }
     }
 }
@@ -994,9 +1216,13 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let (sessions, failures) = query_hermes_sqlite_sessions(&path, None);
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 2, "both fixture sessions must load");
+        assert!(
+            failures.is_clean(),
+            "healthy fixture must report zero failures: {failures:?}"
+        );
 
         let s1 = sessions
             .iter()
@@ -1036,7 +1262,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let (sessions, _failures) = query_hermes_sqlite_sessions(&path, None);
         std::fs::remove_dir_all(&root).ok();
 
         // s1: ok 1 / fail 1 -> 50% across the corpus (s2 contributes no
@@ -1055,6 +1281,247 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("tool failure rate")),
             "--max-tool-fail-rate must trip on hermes-sourced failures: {failures:?}"
+        );
+    }
+
+    /// Minimal opencode `opencode.db` with parts deliberately out of
+    /// chronological insertion order and a NULL time_created — the
+    /// rm-596 perf-rider corpus (the load must select the same
+    /// earliest user text without the removed `order by`).
+    fn opencode_user_text_fixture(dir: &Path, with_null_time: bool) -> PathBuf {
+        let path = dir.join("opencode.db");
+        let db = Connection::open(&path).expect("open fixture db");
+        db.execute_batch(
+            r#"
+            create table session (
+                id text primary key,
+                title text,
+                time_created integer,
+                time_updated integer
+            );
+            create table message (
+                id text primary key,
+                session_id text,
+                data text
+            );
+            create table part (
+                id text primary key,
+                message_id text,
+                session_id text,
+                data text,
+                time_created integer
+            );
+            insert into session (id, title, time_created, time_updated) values
+                ('s1', '', 1762000000000, 1762000000001);
+            insert into message (id, session_id, data) values
+                ('m1', 's1', '{"role":"user"}'),
+                ('m2', 's1', '{"role":"user"}'),
+                ('m3', 's1', '{"role":"user"}'),
+                ('m4', 's1', '{"role":"user"}');
+            "#,
+        )
+        .expect("seed session/message");
+        let parts: &[(&str, &str, &str)] = if with_null_time {
+            // NULL time sorts FIRST under SQLite ASC semantics, so the
+            // untimestamped part wins the earliest-user-text slot.
+            &[
+                ("p1", "third by time", "300000000"),
+                ("p2", "first by time", "100000000"),
+                ("p3", "no timestamp", "NULL"),
+                ("p4", "tie, later rowid", "100000000"),
+            ]
+        } else {
+            &[
+                ("p1", "third by time", "300000000"),
+                ("p2", "first by time", "100000000"),
+                ("p4", "tie, later rowid", "100000000"),
+            ]
+        };
+        let mut parts_sql = String::new();
+        for (part, text, time_created) in parts {
+            let data = format!("{{\"type\":\"text\",\"text\":\"{text}\"}}");
+            parts_sql.push_str(&format!(
+                "insert into part (id, message_id, session_id, data, time_created) \
+                 values ('{part}', 'm1', 's1', '{data}', {time_created});\n"
+            ));
+        }
+        db.execute_batch(&parts_sql).expect("seed parts");
+        path
+    }
+
+    #[test]
+    fn opencode_user_text_selection_survives_without_the_order_by() {
+        // rm-596 perf rider: the earliest-user-text pass used to sort
+        // the whole part table via `order by p.time_created`. The
+        // unordered pass keeps the (time_created, rowid) minimum, so
+        // the selected text must be identical: NULL time first, then
+        // ascending value, ties by rowid.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm596-usertext-{}-a",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = opencode_user_text_fixture(&root, true);
+        let (sessions, failures) = query_opencode_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(failures.is_clean(), "corpus must load clean: {failures:?}");
+        assert_eq!(sessions.len(), 1, "one session in the fixture");
+        // NULL time_created sorts before every timestamp under SQLite
+        // ASC semantics — the untimestamped part wins.
+        assert_eq!(
+            sessions[0].name, "no timestamp",
+            "empty title means message-derived naming from the earliest part"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm596-usertext-{}-b",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = opencode_user_text_fixture(&root, false);
+        let (sessions, failures) = query_opencode_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(failures.is_clean(), "corpus must load clean: {failures:?}");
+        // Same minimum time (100000000) on two parts: the lower rowid
+        // ("first by time", inserted before "tie, later rowid") wins,
+        // exactly as the ordered scan resolved ties before.
+        assert_eq!(
+            sessions[0].name, "first by time",
+            "ties resolve by rowid, matching the previous ordered scan"
+        );
+    }
+
+    #[test]
+    fn failed_loads_neither_store_nor_trust_an_empty_snapshot() {
+        // rm-596 poison class: a load that dropped rows used to cache
+        // its PARTIAL result and an unreadable database used to cache
+        // an EMPTY one — after which every later run hit the snapshot
+        // and the failure never re-appeared. Two pins: (a) a failed
+        // load stores nothing; (b) even a pre-existing empty snapshot
+        // (written by a pre-fix binary) is distrusted and re-verified.
+        // The cache location is env-derived, so the test isolates it
+        // (and restores on exit).
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                for (key, value) in self.0.iter() {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = EnvRestore(
+            [
+                (
+                    "AGENTTRACE_SESSION_CACHE_DIR",
+                    std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR"),
+                ),
+                ("XDG_CACHE_HOME", std::env::var_os("XDG_CACHE_HOME")),
+                ("HOME", std::env::var_os("HOME")),
+            ]
+            .to_vec(),
+        );
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm596-poison-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let path = opencode_hostile_fixture(&root);
+
+        // (a) hostile load through the snapshot-caching entry point:
+        // 4 decodable rows, 1 dropped row counted, no snapshot stored.
+        let mut report = SqliteIngestReport::default();
+        let sessions = load_opencode_sqlite_sessions(&path, None, &mut report);
+        assert_eq!(sessions.len(), 4, "the four decodable rows load");
+        assert_eq!(
+            report.dropped_rows.len(),
+            1,
+            "the NULL-id ghost row is counted"
+        );
+        assert_eq!(report.dropped_rows[0].dropped, 1);
+        let snapshot =
+            crate::session_cache::session_cache_path().with_file_name("opencode-sqlite.json");
+        assert!(
+            !snapshot.exists(),
+            "a failed load must not store a snapshot at {}",
+            snapshot.display()
+        );
+
+        // (b) a pre-fix empty snapshot for the same database is
+        // ignored instead of trusted: the row drop is re-detected.
+        crate::session_cache::store_sqlite_snapshot(&path, "opencode", &[])
+            .expect("hand-poison an empty snapshot");
+        assert!(snapshot.exists(), "poisoned snapshot is in place");
+        let mut report = SqliteIngestReport::default();
+        let sessions = load_opencode_sqlite_sessions(&path, None, &mut report);
+        assert_eq!(sessions.len(), 4, "decodable rows still load");
+        assert_eq!(
+            report.dropped_rows.len(),
+            1,
+            "empty snapshot must be distrusted so failures re-surface"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The P11 hostile corpus, re-crafted at runtime: five session rows
+    /// of which the NULL-id ghost must drop counted, not silently.
+    fn opencode_hostile_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("opencode.db");
+        let db = Connection::open(&path).expect("open hostile db");
+        db.execute_batch(
+            r#"
+            create table session (
+                id text primary key,
+                title text,
+                time_created integer,
+                time_updated integer,
+                tokens_input integer,
+                tokens_output integer
+            );
+            insert into session (id, title, time_created, time_updated, tokens_input, tokens_output) values
+                ('s-good', 'Good session', 1762000000000, 1762000000001, 100, 200),
+                (NULL, 'Ghost session', 1762001000000, 1762001000001, 7, 8),
+                ('s-texty', 'Type-abuse session', 'not-a-number', 1762002000001, 1, 2),
+                ('s-neg', 'Negative tokens', 1762003000000, 1762003000001, -100, -5),
+                ('s-huge', 'Huge tokens', 1762005000000, 1762005000001, 9223372036854775807, 9223372036854775807);
+            "#,
+        )
+        .expect("seed hostile rows");
+        path
+    }
+
+    #[test]
+    fn hostile_opencode_rows_are_reported_or_counted_never_silently_dropped() {
+        // The acceptance golden: every hostile session row either
+        // loads or is counted in the failure report — none vanishes.
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm596-golden-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = opencode_hostile_fixture(&root);
+        let (sessions, failures) = query_opencode_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(sessions.len(), 4, "the four decodable rows load");
+        assert_eq!(failures.dropped, 1, "the NULL-id ghost is counted");
+        assert!(
+            failures
+                .dropped_sample
+                .as_deref()
+                .is_some_and(|sample| !sample.is_empty()),
+            "the count carries a sample: {:?}",
+            failures.dropped_sample
+        );
+        assert_eq!(sessions.len() + failures.dropped, 5, "row conservation");
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.metrics.tokens_input >= 0
+                    && session.metrics.tokens_output >= 0),
+            "lenient readers keep negative token values clamped at 0"
         );
     }
 }

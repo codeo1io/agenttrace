@@ -1,6 +1,7 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
+    load_sqlite_backed_sessions_reported, parse_file, skip_sqlite_backed_file_dir, Session,
+    SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -112,10 +113,14 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     } else {
         find_session_files(dir)
     };
-    let sqlite_sessions = if dir.is_none() && !demo {
-        load_sqlite_backed_sessions()
+    // rm-596: the SQLite-backed load returns its per-file failure
+    // report alongside the sessions so doctor counters stop printing
+    // parsed=0 failed=0 over discovered-but-unreadable databases
+    // (P12/P14) and dropped session rows surface as failures.
+    let (sqlite_sessions, sqlite_ingest) = if dir.is_none() && !demo {
+        load_sqlite_backed_sessions_reported(None)
     } else {
-        Vec::new()
+        (Vec::new(), SqliteIngestReport::default())
     };
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
@@ -132,6 +137,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         dir,
         &files,
         &sqlite_sessions,
+        &sqlite_ingest,
         &mut project_decode,
         &mut zero_usage,
         &mut disclosures,
@@ -307,6 +313,7 @@ fn doctor_directories(
     dir: Option<&Path>,
     files: &[PathBuf],
     sqlite_sessions: &[Session],
+    sqlite_ingest: &SqliteIngestReport,
     project_decode: &mut DoctorProjectDecodeReport,
     zero_usage: &mut DoctorZeroUsageReport,
     disclosures: &mut BTreeMap<String, usize>,
@@ -354,7 +361,7 @@ fn doctor_directories(
             disclosures,
         ));
     }
-    dirs.extend(doctor_sqlite_directories(sqlite_sessions));
+    dirs.extend(doctor_sqlite_directories(sqlite_sessions, sqlite_ingest));
     // SQLite-backed sessions never flow through doctor_dir_report; fold
     // their disclosure counters in directly so every scanned session
     // discloses identically regardless of backing store.
@@ -432,7 +439,10 @@ fn symlink_target_of(path: &Path) -> Option<String> {
         .map(|target| target.to_string_lossy().to_string())
 }
 
-fn doctor_sqlite_directories(sessions: &[Session]) -> Vec<DoctorDirReport> {
+fn doctor_sqlite_directories(
+    sessions: &[Session],
+    ingest: &SqliteIngestReport,
+) -> Vec<DoctorDirReport> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
     };
@@ -459,21 +469,41 @@ fn doctor_sqlite_directories(sessions: &[Session]) -> Vec<DoctorDirReport> {
     ];
     let mut dirs = Vec::new();
     for (tool, name, path) in candidates {
-        let files = count_by_tool.get(tool).copied().unwrap_or(0);
+        let parsed = count_by_tool.get(tool).copied().unwrap_or(0);
         let exists = path.is_file();
-        if !exists && files == 0 {
+        if !exists && parsed == 0 {
             continue;
+        }
+        // rm-596: the counters now come from the ingest report, so a
+        // discovered-but-unreadable database reports found/failed=1
+        // with a sample instead of parsed=0 failed=0, and dropped
+        // session rows (NULL ids, wrong-typed columns) count as
+        // failures. Non-primary databases (profile state.dbs,
+        // opencode*.db siblings) stay rm-607's disclosure lane.
+        let unreadable = ingest.unreadable.iter().find(|db| db.path == path);
+        let dropped = ingest.dropped_rows.iter().find(|db| db.path == path);
+        let failed =
+            usize::from(unreadable.is_some()) + dropped.map(|entry| entry.dropped).unwrap_or(0);
+        let mut failure_samples = Vec::new();
+        if let Some(db) = unreadable {
+            failure_samples.push(format!("unreadable: {}", db.reason));
+        }
+        if let Some(entry) = dropped {
+            failure_samples.push(format!(
+                "{} session row(s) failed to decode (e.g. {})",
+                entry.dropped, entry.sample
+            ));
         }
         dirs.push(DoctorDirReport {
             name: name.to_string(),
             path: path.to_string_lossy().to_string(),
             exists,
-            files,
-            parsed: files,
-            failed: 0,
+            files: parsed + failed,
+            parsed,
+            failed,
             cache_hits: 0,
             symlink_target: symlink_target_of(&path),
-            failure_samples: Vec::new(),
+            failure_samples,
         });
     }
     dirs

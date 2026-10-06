@@ -2065,3 +2065,71 @@ fn provenance_label_translates_the_taxonomy_base_behind_disclosure_suffixes() {
         i18n::provenance_label("mystery", Language::En)
     );
 }
+
+#[test]
+fn report_context_underline_matches_display_width_not_byte_length() {
+    // rm-611: the raw-report/diagnostics underline used
+    // `"-".repeat(title.len())` — UTF-8 byte length — so every CJK
+    // title drew ~3x more dashes than the glyphs it sat under
+    // (the zh detail view renders "原始报告" = 12 bytes / 8 columns).
+    // The underline must equal UnicodeWidthStr::width(title).
+    use unicode_width::UnicodeWidthStr;
+
+    let cjk = "原始报告";
+    assert_eq!(cjk.len(), 12, "fixture: 4 CJK chars are 12 UTF-8 bytes");
+    assert_eq!(cjk.width(), 8, "fixture: 4 CJK chars are 8 columns");
+
+    let out = super::presentation::report_with_context(
+        "summary".to_string(),
+        cjk,
+        "report body".to_string(),
+    );
+    let lines: Vec<&str> = out.split('\n').collect();
+    let underline = lines[3];
+    assert_eq!(
+        underline.chars().count(),
+        cjk.width(),
+        "underline column count must equal the title's display width"
+    );
+    assert!(
+        underline.chars().all(|c| c == '-'),
+        "underline stays a dash run: {underline}"
+    );
+    assert_eq!(lines[2], cjk, "title line unchanged");
+
+    // Mixed CJK + emoji: emoji are width-2 (but 3 bytes here —
+    // U+2728) and their bytes must not inflate the rule either.
+    let mixed = "原始报告 ✨";
+    assert_eq!(mixed.len(), 16);
+    assert_eq!(mixed.width(), 11);
+    let out = super::presentation::report_with_context(
+        "summary".to_string(),
+        mixed,
+        "report body".to_string(),
+    );
+    let underline = out.split('\n').nth(3).expect("underline line");
+    assert_eq!(
+        underline.chars().count(),
+        mixed.width(),
+        "mixed title underline must equal display width ({}), got {}",
+        mixed.width(),
+        underline.chars().count()
+    );
+
+    // ASCII byte-identical before/after: width == len, and the whole
+    // rendering matches the historical byte-length formula exactly.
+    let ascii = "Raw report";
+    let out = super::presentation::report_with_context(
+        "summary".to_string(),
+        ascii,
+        "report body".to_string(),
+    );
+    assert_eq!(
+        out,
+        format!(
+            "summary\n\n{ascii}\n{}\nreport body",
+            "-".repeat(ascii.len())
+        ),
+        "pure-ASCII titles render byte-identical to the byte-length era"
+    );
+}
