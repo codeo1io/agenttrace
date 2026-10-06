@@ -1434,6 +1434,15 @@ impl GoMetrics {
             line_skips: self.line_skips.clone(),
             zero_usage_events: self.zero_usage_events,
             upstream_cost_usd: self.upstream_cost_usd,
+            // rm-578: the upstream-priced token split is in-memory
+            // only (lib.rs `analyze`), so a cache round-trip cannot
+            // restore it — zero here means "split unavailable", and
+            // governance's drift note treats recorded dollars with
+            // no split as a basis it must not report as rate drift.
+            upstream_priced_input: 0,
+            upstream_priced_output: 0,
+            upstream_priced_cache_w: 0,
+            upstream_priced_cache_r: 0,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
         }

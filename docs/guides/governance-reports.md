@@ -50,6 +50,19 @@ Pricing status is intentionally explicit:
 - `fallback_estimate`: no exact catalog match exists, so AgentTrace used its fallback rate.
 - `unpriced_or_unknown`: the model name is absent or too generic to price confidently.
 
+When a session carries a stored estimate, the audit's `pricing_note` compares the
+current-rate total against it on the stored estimate's own basis: tokens whose cost
+the journal itself recorded (recorded-cost passthrough, e.g. pi `type:"usage"`
+entries) are excluded from the catalog re-price and counted at their recorded
+dollars, so the drift note (`current rates recalculate a different total than the
+stored estimate`) fires only when the catalog-priced share genuinely re-prices
+differently — never merely because recorded dollars differ from catalog dollars.
+A recorded-cost session served from the session cache does not carry its
+recorded-token split, so its basis cannot be reproduced: the current-rate column
+is withheld (no `estimated_cost_usd`) and the note says so rather than
+reporting drift or double-counting the recorded tokens into a fresh catalog
+total.
+
 To map internal model names or override per-million-token rates locally, set `AGENTTRACE_PRICING_FILE`:
 
 ```json

@@ -83,6 +83,52 @@ pub struct SessionCostAudit {
     pub pricing_note: String,
 }
 
+/// rm-578: the drift arm of the pricing note. The current-rate total
+/// is compared against the stored estimate on the stored estimate's
+/// own basis — lib.rs prices it as "catalog rates on the tokens the
+/// journal did not record a cost for, plus the recorded dollars at
+/// face value" — so a difference really does mean the catalog rates
+/// moved. The comparison the audit used to make re-priced every
+/// token at catalog rates and read every single-model recorded-cost
+/// session as drift, because recorded dollars and catalog dollars
+/// legitimately differ (the false-drift defect this row fixes).
+///
+/// No suffix when the totals agree on that basis, when there is no
+/// single-rate re-price (aggregates), or when the session carries
+/// recorded dollars whose token split is unavailable: the split
+/// lives in memory only (`Metrics::upstream_priced_*`), a
+/// session-cache round-trip drops it, and a basis the audit cannot
+/// reproduce must stay silent instead of being reported as drift —
+/// the same-basis re-price is withheld entirely rather than
+/// double-count the recorded tokens into a fresh catalog total.
+fn append_drift_note(
+    pricing_note: &str,
+    current_total: Option<f64>,
+    stored: f64,
+    recorded_usd: f64,
+    split_reproducible: bool,
+) -> String {
+    let Some(current_total) = current_total else {
+        if recorded_usd > 0.0 && !split_reproducible {
+            return format!(
+                "{pricing_note}; no same-basis re-price available — \
+                 the session cache does not retain the recorded-cost token split"
+            );
+        }
+        return pricing_note.to_string();
+    };
+    if recorded_usd > 0.0 && !split_reproducible {
+        return pricing_note.to_string();
+    }
+    if (current_total - stored).abs() > 0.0001 {
+        format!(
+            "{pricing_note}; current rates recalculate a different total than the stored estimate"
+        )
+    } else {
+        pricing_note.to_string()
+    }
+}
+
 fn current_cost_estimate(
     model: &str,
     tokens: &TokenBreakdown,
@@ -221,6 +267,17 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         sessions: usize,
         tokens: TokenBreakdown,
         cost: f64,
+        recorded: f64,
+        upstream_priced_input: i64,
+        upstream_priced_output: i64,
+        upstream_priced_cache_w: i64,
+        upstream_priced_cache_r: i64,
+        /// rm-578: some session in the row carries recorded dollars
+        /// without their token split (a cache round-trip drops the
+        /// in-memory counters) — the row's basis cannot be reproduced,
+        /// so the drift note stays off and the current-rate column is
+        /// withheld for the whole row.
+        split_lost: bool,
         specific: usize,
         fallback: usize,
         unknown: usize,
@@ -254,6 +311,27 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
         row.cost += session.metrics.cost_estimated;
+        // rm-578: the recorded-cost basis rides next to the stored
+        // total so the drift comparison can tell basis differences
+        // from real rate drift (see `append_drift_note`).
+        row.recorded += session.metrics.upstream_cost_usd;
+        row.upstream_priced_input = row
+            .upstream_priced_input
+            .saturating_add(session.metrics.upstream_priced_input);
+        row.upstream_priced_output = row
+            .upstream_priced_output
+            .saturating_add(session.metrics.upstream_priced_output);
+        row.upstream_priced_cache_w = row
+            .upstream_priced_cache_w
+            .saturating_add(session.metrics.upstream_priced_cache_w);
+        row.upstream_priced_cache_r = row
+            .upstream_priced_cache_r
+            .saturating_add(session.metrics.upstream_priced_cache_r);
+        row.split_lost |= session.metrics.upstream_cost_usd > 0.0
+            && session.metrics.upstream_priced_input == 0
+            && session.metrics.upstream_priced_output == 0
+            && session.metrics.upstream_priced_cache_w == 0
+            && session.metrics.upstream_priced_cache_r == 0;
         if matches!(model.as_str(), "default" | "unknown" | "multiple") {
             row.unknown += 1;
             coverage.unpriced_or_unknown_sessions += 1;
@@ -292,11 +370,49 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
     let mut by_provider_model = rows
         .into_iter()
         .map(|((provider, model), row)| {
-            let current = current_cost_estimate(&model, &row.tokens);
-            let pricing_source = current
-                .as_ref()
-                .map(|(source, _, _)| source.clone())
-                .unwrap_or_else(|| "unavailable: multiple models".to_string());
+            // rm-578: re-price on the stored estimate's basis — the
+            // catalog rates apply only to the tokens the journal did
+            // not already price (upstream-priced tokens are compared
+            // at their recorded dollars, added back into the totals
+            // below), mirroring the lib.rs cost formula.
+            let catalog_tokens = TokenBreakdown {
+                input: row.tokens.input.saturating_sub(row.upstream_priced_input),
+                output: row.tokens.output.saturating_sub(row.upstream_priced_output),
+                cache_write: row
+                    .tokens
+                    .cache_write
+                    .saturating_sub(row.upstream_priced_cache_w),
+                cache_read: row
+                    .tokens
+                    .cache_read
+                    .saturating_sub(row.upstream_priced_cache_r),
+                total: row.tokens.total.saturating_sub(
+                    row.upstream_priced_input
+                        .saturating_add(row.upstream_priced_output)
+                        .saturating_add(row.upstream_priced_cache_w)
+                        .saturating_add(row.upstream_priced_cache_r),
+                ),
+                reasoning: row.tokens.reasoning,
+            };
+            let current = if row.split_lost {
+                // rm-578: a recorded-cost basis whose token split was
+                // lost to a cache round-trip cannot be re-priced
+                // without double-counting the recorded dollars —
+                // withhold the current-rate column for the row.
+                None
+            } else {
+                current_cost_estimate(&model, &catalog_tokens)
+            };
+            let pricing_source = if row.split_lost {
+                // rm-578: withheld for the same reason as the estimate
+                // — the split the re-price needs is gone.
+                "unavailable: recorded-cost split not retained by the session cache".to_string()
+            } else {
+                current
+                    .as_ref()
+                    .map(|(source, _, _)| source.clone())
+                    .unwrap_or_else(|| "unavailable: multiple models".to_string())
+            };
             let (pricing_status, pricing_note) = if model == "multiple" {
                 (
                     "aggregate_estimate",
@@ -315,19 +431,21 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                     "exact normalized model match in pricing catalog",
                 )
             };
-            let pricing_note = if current
-                .as_ref()
-                .is_some_and(|(_, _, components)| (components.total - row.cost).abs() > 0.0001)
-            {
-                format!(
-                    "{pricing_note}; current rates recalculate a different total than the stored estimate"
-                )
-            } else {
-                pricing_note.to_string()
-            };
+            let pricing_note = append_drift_note(
+                pricing_note,
+                current
+                    .as_ref()
+                    .map(|(_, _, components)| round4(components.total + row.recorded)),
+                row.cost,
+                row.recorded,
+                !row.split_lost,
+            );
             let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
                 .map(|(_, rates, components)| {
-                    let total = components.total;
+                    // The current-rate total carries the recorded
+                    // dollars at face value so it shares the stored
+                    // estimate's basis (rm-578).
+                    let total = round4(components.total + row.recorded);
                     (Some(rates), Some(components), Some(total))
                 })
                 .unwrap_or((None, None, None));
@@ -398,7 +516,47 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         cache_read: session.metrics.tokens_cache_r,
         total: total_tokens(session),
     };
-    let current = current_cost_estimate(&model, &tokens);
+    // rm-578: re-price on the stored estimate's basis — see
+    // `append_drift_note`. The catalog re-price applies only to the
+    // tokens the journal did not record a cost for; recorded dollars
+    // ride the current total at face value.
+    let recorded_usd = session.metrics.upstream_cost_usd;
+    let split_reproducible = recorded_usd <= 0.0
+        || session.metrics.upstream_priced_input > 0
+        || session.metrics.upstream_priced_output > 0
+        || session.metrics.upstream_priced_cache_w > 0
+        || session.metrics.upstream_priced_cache_r > 0;
+    let catalog_tokens = TokenBreakdown {
+        input: tokens
+            .input
+            .saturating_sub(session.metrics.upstream_priced_input),
+        output: tokens
+            .output
+            .saturating_sub(session.metrics.upstream_priced_output),
+        cache_write: tokens
+            .cache_write
+            .saturating_sub(session.metrics.upstream_priced_cache_w),
+        cache_read: tokens
+            .cache_read
+            .saturating_sub(session.metrics.upstream_priced_cache_r),
+        total: tokens.total.saturating_sub(
+            session
+                .metrics
+                .upstream_priced_input
+                .saturating_add(session.metrics.upstream_priced_output)
+                .saturating_add(session.metrics.upstream_priced_cache_w)
+                .saturating_add(session.metrics.upstream_priced_cache_r),
+        ),
+        reasoning: tokens.reasoning,
+    };
+    let current = if split_reproducible {
+        current_cost_estimate(&model, &catalog_tokens)
+    } else {
+        // rm-578: same withholding at session level — re-pricing a
+        // split-lost recorded-cost basis would price the recorded
+        // tokens twice (catalog + face value).
+        None
+    };
     let (pricing_status, pricing_note) = if model == "multiple" {
         (
             "aggregate_estimate",
@@ -420,22 +578,26 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
             "no exact catalog match; built-in fallback rate used",
         )
     };
-    let pricing_note = if current.as_ref().is_some_and(|(_, _, components)| {
-        (components.total - session.metrics.cost_estimated).abs() > 0.0001
-    }) {
-        format!(
-            "{pricing_note}; current rates recalculate a different total than the stored estimate"
-        )
+    let pricing_note = append_drift_note(
+        pricing_note,
+        current
+            .as_ref()
+            .map(|(_, _, components)| round4(components.total + recorded_usd)),
+        session.metrics.cost_estimated,
+        recorded_usd,
+        split_reproducible,
+    );
+    let pricing_source = if !split_reproducible {
+        "unavailable: recorded-cost split not retained by the session cache".to_string()
     } else {
-        pricing_note.to_string()
+        current
+            .as_ref()
+            .map(|(source, _, _)| source.clone())
+            .unwrap_or_else(|| "unavailable: multiple models".to_string())
     };
-    let pricing_source = current
-        .as_ref()
-        .map(|(source, _, _)| source.clone())
-        .unwrap_or_else(|| "unavailable: multiple models".to_string());
     let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
         .map(|(_, rates, components)| {
-            let total = components.total;
+            let total = round4(components.total + recorded_usd);
             (Some(rates), Some(components), Some(total))
         })
         .unwrap_or((None, None, None));
@@ -1078,6 +1240,69 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         }
+    }
+
+    #[test]
+    fn audit_reprices_recorded_cost_sessions_on_their_own_basis() {
+        // rm-578: the assess PoC shape (pi v3 usage entry carrying
+        // usage.cost.total 0.0075 on 31.5k sonnet-4 tokens): the
+        // stored total rests on a recorded-cost basis, so the
+        // current-rate column must compare on that basis — catalog
+        // rates on the unrecorded tokens (none here) plus the
+        // recorded dollars — instead of re-pricing every token and
+        // reporting legitimate basis differences as rate drift.
+        let mut session = session("recorded");
+        session.metrics.model_used = "claude-sonnet-4-20250514".to_string();
+        session.metrics.tokens_input = 500;
+        session.metrics.tokens_output = 1_000;
+        session.metrics.tokens_cache_w = 5_000;
+        session.metrics.tokens_cache_r = 25_000;
+        session.metrics.upstream_cost_usd = 0.0075;
+        session.metrics.upstream_priced_input = 500;
+        session.metrics.upstream_priced_output = 1_000;
+        session.metrics.upstream_priced_cache_w = 5_000;
+        session.metrics.upstream_priced_cache_r = 25_000;
+        session.metrics.cost_estimated = 0.0075;
+        let audit = session_cost_audit(&session);
+        assert!(!audit.pricing_note.contains("current rates recalculate"));
+        assert!((audit.estimated_cost_usd.expect("same-basis re-price") - 0.0075).abs() < 1e-6);
+        let report = cost_audit(&[session]);
+        let row = &report.by_provider_model[0];
+        assert!(!row.pricing_note.contains("current rates recalculate"));
+        assert!((row.estimated_cost_usd.expect("row re-price") - 0.0075).abs() < 1e-6);
+    }
+
+    #[test]
+    fn audit_still_reports_genuine_catalog_rate_drift() {
+        // No recorded dollars: a stored total priced under different
+        // rates must still re-price to a different total and say so
+        // (the note's honest meaning survives rm-578).
+        let mut session = session("drift");
+        session.metrics.model_used = "claude-sonnet-4-20250514".to_string();
+        session.metrics.tokens_input = 1_000_000;
+        session.metrics.cost_estimated = 4.5; // catalog says 3.0
+        let audit = session_cost_audit(&session);
+        assert!(audit.pricing_note.contains("current rates recalculate"));
+    }
+
+    #[test]
+    fn audit_stays_silent_when_the_recorded_split_was_lost() {
+        // Cache round-trip shape: the recorded dollars survive
+        // (`upstream_cost_usd` round-trips through `GoMetrics`) but
+        // the in-memory token split does not, so the basis cannot be
+        // reproduced and must not be reported as drift.
+        let mut session = session("cached");
+        session.metrics.model_used = "claude-sonnet-4-20250514".to_string();
+        session.metrics.tokens_input = 500;
+        session.metrics.tokens_output = 1_000;
+        session.metrics.tokens_cache_w = 5_000;
+        session.metrics.tokens_cache_r = 25_000;
+        session.metrics.upstream_cost_usd = 0.0075;
+        session.metrics.cost_estimated = 0.0075;
+        let audit = session_cost_audit(&session);
+        assert!(!audit.pricing_note.contains("current rates recalculate"));
+        assert!(audit.pricing_note.contains("no same-basis re-price"));
+        assert_eq!(audit.estimated_cost_usd, None);
     }
 
     #[test]

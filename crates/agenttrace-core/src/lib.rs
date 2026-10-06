@@ -414,6 +414,23 @@ pub struct Metrics {
     /// rate.
     #[serde(skip_serializing_if = "zero_usd")]
     pub upstream_cost_usd: f64,
+    /// rm-578: the token side of `upstream_cost_usd` — per-class
+    /// counts of the tokens whose cost the journal itself recorded,
+    /// kept so a consumer can re-price on the stored estimate's own
+    /// basis (catalog rates on the rest, recorded dollars at face
+    /// value) the way the cost formula below does. In memory only:
+    /// the session cache does not round-trip them, so a cache-loaded
+    /// recorded-cost session reads all-zero here and must be treated
+    /// as a basis that cannot be reproduced, never as evidence of
+    /// zero upstream-priced tokens.
+    #[serde(skip)]
+    pub upstream_priced_input: i64,
+    #[serde(skip)]
+    pub upstream_priced_output: i64,
+    #[serde(skip)]
+    pub upstream_priced_cache_w: i64,
+    #[serde(skip)]
+    pub upstream_priced_cache_r: i64,
     /// Parse-time disclosure counters (pi-family journals,
     /// rm-436/rm-437): `pi_usage_entry:<kind>` per usage-entry kind,
     /// `pi_branches` when a v2/v3 tree journal has more than one
@@ -815,10 +832,6 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // which models produced usage blocks, and which token classes
     // already carry an upstream-recorded cost.
     let mut usage_models: BTreeSet<String> = BTreeSet::new();
-    let mut upstream_priced_input = 0i64;
-    let mut upstream_priced_output = 0i64;
-    let mut upstream_priced_cache_w = 0i64;
-    let mut upstream_priced_cache_r = 0i64;
     // rm-450 disclosure counters, in the pass-7 line_skips family so they
     // ride the existing DataHealth aggregation and confidence degradation.
     let mut line_skips: BTreeMap<String, usize> = BTreeMap::new();
@@ -913,13 +926,17 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .filter(|cost| cost.is_finite() && *cost >= 0.0)
                 {
                     metrics.upstream_cost_usd += cost;
-                    upstream_priced_input =
-                        upstream_priced_input.saturating_add(usage_tokens("input_tokens"));
-                    upstream_priced_output =
-                        upstream_priced_output.saturating_add(usage_tokens("output_tokens"));
-                    upstream_priced_cache_w = upstream_priced_cache_w
+                    metrics.upstream_priced_input = metrics
+                        .upstream_priced_input
+                        .saturating_add(usage_tokens("input_tokens"));
+                    metrics.upstream_priced_output = metrics
+                        .upstream_priced_output
+                        .saturating_add(usage_tokens("output_tokens"));
+                    metrics.upstream_priced_cache_w = metrics
+                        .upstream_priced_cache_w
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
-                    upstream_priced_cache_r = upstream_priced_cache_r
+                    metrics.upstream_priced_cache_r = metrics
+                        .upstream_priced_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
                 }
                 // rm-485: fold cost-only credit attribution with max
@@ -1046,17 +1063,24 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // recorded value, instead of being estimated at the session
     // model's rate on top of the recorded cost.
     let catalog_cost = round4(
-        metrics.tokens_input.saturating_sub(upstream_priced_input) as f64 / 1e6 * price.input
-            + metrics.tokens_output.saturating_sub(upstream_priced_output) as f64 / 1e6
+        metrics
+            .tokens_input
+            .saturating_sub(metrics.upstream_priced_input) as f64
+            / 1e6
+            * price.input
+            + metrics
+                .tokens_output
+                .saturating_sub(metrics.upstream_priced_output) as f64
+                / 1e6
                 * price.output
             + metrics
                 .tokens_cache_w
-                .saturating_sub(upstream_priced_cache_w) as f64
+                .saturating_sub(metrics.upstream_priced_cache_w) as f64
                 / 1e6
                 * price.cw
             + metrics
                 .tokens_cache_r
-                .saturating_sub(upstream_priced_cache_r) as f64
+                .saturating_sub(metrics.upstream_priced_cache_r) as f64
                 / 1e6
                 * price.cr,
     );

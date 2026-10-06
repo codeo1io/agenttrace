@@ -15,6 +15,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# rm-007 (cycle 3, run e94bb1ee — "trust & truthfulness"): unmaintained
+# advisories now FAIL this lane instead of passing silently. The
+# unsound advisory class (e.g. lru RUSTSEC-2026-0253, informational)
+# has no deny knob in cargo-deny's v2 config (probed live: `unsound =
+# "deny"` is rejected as an unexpected value), so those cannot be
+# gated here — the operating rule is to bump past the patched version
+# on sight (lru 0.18.1 → 0.18.5 in this same change) rather than
+# pretend a gate exists.
+unmaintained = "all"
 ignore = []
 
 [licenses]
