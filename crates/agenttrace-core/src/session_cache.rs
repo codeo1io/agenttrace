@@ -5,7 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 30;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 31;
+// Bumped 30 -> 31 (integration of run 254b2417, rm-551 'Copilot usage
+// reconciliation is per-model, not per-snapshot'): a checkpoint or
+// shutdown now REPLACES the per-model entries it names and PRESERVES
+// every other model's last-known values, so a rotation across
+// checkpoints and a partial shutdown stop dropping whole models'
+// cumulative tokens (the assess PoCs; ccusage #1824's subtract_usage
+// reconciliation keeps the same per-entry discipline for credits) —
+// reported totals rise for UNCHANGED multi-model files, which a warm
+// v30 cache keeps serving with matching fingerprints: no re-parse,
+// no self-heal (the rm-230 convention: parser-semantics changes that
+// alter reported totals for unchanged files bump the schema so cached
+// sessions regenerate under corrected accounting). The batch landed
+// against its base 6b03087 at schema 26 and bumped it to 27 there;
+// integration re-bases the bump onto the already-advanced ceiling
+// (27 was rm-542, 28 was rm-529, 29 was rm-600, 30 was rm-538) per
+// the same convention. Entries regenerate once on next scan.
 // Bumped 29 -> 30 (integration of run cb38b958, rm-538 'Disclosure-
 // channel truthfulness: split assumption-disclosure from parse-
 // loss'): the workbuddy input-basis disclosures

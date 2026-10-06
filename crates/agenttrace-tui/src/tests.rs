@@ -1631,7 +1631,11 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 30 (integration of run cb38b958, rm-538: the workbuddy
+                // Schema 31 (integration of run 254b2417, rm-551 copilot
+                // per-model reconciliation — warm v30 entries carried
+                // snapshot-level totals; re-based off the campaign's
+                // 26 -> 27 bump); schema 30 (integration of run
+                // cb38b958, rm-538: the workbuddy
                 // input-basis disclosures moved from metrics.line_skips to
                 // metrics.disclosure_counters — same counters, different
                 // channel — re-based off the campaign's 26 -> 27 bump; 29
@@ -1653,7 +1657,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":30,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":31,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

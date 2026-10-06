@@ -1014,7 +1014,11 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v30 (integration of run cb38b958, rm-538: the workbuddy
+        // v31 (integration of run 254b2417, rm-551 copilot per-model
+        // reconciliation — warm v30 entries carried snapshot-level
+        // totals that dropped whole models on rotation/partial shutdown;
+        // re-based off the campaign's 26 -> 27 bump); v30
+        // (integration of run cb38b958, rm-538: the workbuddy
         // input-basis disclosures moved from metrics.line_skips to
         // metrics.disclosure_counters — same counters, different
         // channel — re-based off the campaign's 26 -> 27 bump); v29
@@ -1196,11 +1200,11 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v30 — see the rm-538, rm-600, rm-529, rm-542, rm-485,
-        // rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes in
-        // session_cache.rs; the disclosure-channel move is what carried
-        // 29 -> 30 at this integration, re-based off the campaign's own
-        // 26 -> 27 bump).
+        // version (v31 — see the rm-551, rm-538, rm-600, rm-529, rm-542,
+        // rm-485, rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes
+        // in session_cache.rs; the per-model copilot reconciliation is what
+        // carried 30 -> 31 at this integration, re-based off the campaign's
+        // own 26 -> 27 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(SESSION_CACHE_SCHEMA_VERSION)
