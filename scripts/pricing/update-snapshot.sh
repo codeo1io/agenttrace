@@ -3,6 +3,11 @@
 # offline pricing catalog. Requires network. Run manually, then commit the
 # result and update PRICING_SNAPSHOT_DATE in crates/agenttrace-core/src/pricing.rs
 # to match the printed date.
+# Optional argument: path to a pre-fetched copy of the live catalog. The
+# pricing-drift workflow passes its single job-wide fetch here (review fix F4)
+# so regeneration and gate verification compare against exactly the catalog
+# the job fetched — no mid-job TOCTOU when LiteLLM main moves between steps.
+# Without the argument, behavior is unchanged: fetch, then build.
 set -euo pipefail
 
 url="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
@@ -11,9 +16,16 @@ date="$(date -u +%F)"
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
-curl -fsSL "$url" -o "$tmp"
+src="${1:-}"
+if [ -z "$src" ]; then
+  curl -fsSL "$url" -o "$tmp"
+  src="$tmp"
+elif [ ! -f "$src" ]; then
+  echo "update-snapshot: input not found: $src" >&2
+  exit 2
+fi
 
-python3 - "$tmp" "$out" "$date" <<'EOF'
+python3 - "$src" "$out" "$date" <<'EOF'
 import json
 import sys
 
