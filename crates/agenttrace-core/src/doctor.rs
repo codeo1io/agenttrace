@@ -4,6 +4,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -136,6 +137,9 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         &mut zero_usage,
         &mut disclosures,
     );
+    // rm-512: the walk records per-project tallies; render them into the
+    // deduplicated sample lines before the report leaves this function.
+    project_decode.finalize_samples();
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -159,10 +163,10 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         directories,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
-            "LiteLLM snapshot {} (bundled, {} models, {} days old)",
+            "LiteLLM snapshot {} (bundled, {} models, {})",
             crate::pricing::bundled_snapshot_date(),
             crate::pricing::bundled_snapshot_model_count(),
-            crate::pricing::bundled_snapshot_age_days().unwrap_or(-1)
+            snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
         ) + &doctor_deprecation_suffix(),
         recommendations: Vec::new(),
     };
@@ -197,10 +201,96 @@ pub struct DoctorProjectDecodeReport {
     pub resolved: usize,
     pub ambiguous: usize,
     pub unresolved: usize,
-    /// Up to six sanitized examples (ambiguous and unresolved interleaved,
-    /// in scan order).
+    /// One representative sample per distinct project, in first-seen
+    /// order, at most six (rm-512): repeated projects collapse into a
+    /// single line carrying their session count instead of crowding the
+    /// budget, so distinct projects fill the sample slots.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<String>,
+    /// Per-project sample tallies accumulated during the scan — path →
+    /// (session count, sanitized shadowed-alternatives list) for
+    /// ambiguous projects, encoded dir → session count for unresolved
+    /// ones. Rendered into [`Self::samples`] by
+    /// [`Self::finalize_samples`] before the report is serialized; kept
+    /// out of the JSON surface.
+    #[serde(skip)]
+    ambiguous_tally: BTreeMap<String, (usize, String)>,
+    #[serde(skip)]
+    unresolved_tally: BTreeMap<String, usize>,
+    /// First-seen order of distinct sample projects (`true` = ambiguous).
+    #[serde(skip)]
+    sample_order: Vec<(bool, String)>,
+}
+
+impl DoctorProjectDecodeReport {
+    fn record_ambiguous(&mut self, path: &str, shadowed: String) {
+        match self.ambiguous_tally.entry(path.to_string()) {
+            Entry::Occupied(mut entry) => entry.get_mut().0 += 1,
+            Entry::Vacant(vacant) => {
+                vacant.insert((1, shadowed));
+                self.sample_order.push((true, path.to_string()));
+            }
+        }
+    }
+
+    fn record_unresolved(&mut self, encoded: &str) {
+        match self.unresolved_tally.entry(encoded.to_string()) {
+            Entry::Occupied(mut entry) => *entry.get_mut() += 1,
+            Entry::Vacant(vacant) => {
+                vacant.insert(1);
+                self.sample_order.push((false, encoded.to_string()));
+            }
+        }
+    }
+
+    /// Render the per-project tallies into `samples` (rm-512): one
+    /// representative line per distinct project — ambiguous and
+    /// unresolved interleaved in first-seen order — with the project's
+    /// session count appended when it repeated, and distinct projects
+    /// preferred inside the six-slot budget.
+    pub fn finalize_samples(&mut self) {
+        let mut samples = Vec::new();
+        for (ambiguous, project) in &self.sample_order {
+            if samples.len() >= 6 {
+                break;
+            }
+            let (line, count) = if *ambiguous {
+                let Some((count, shadowed)) = self.ambiguous_tally.get(project) else {
+                    continue;
+                };
+                (
+                    format!(
+                        "ambiguous: {} attributed via the longest-verified-path rule; \
+                         verified alternatives shadowed: {}",
+                        crate::statusline::sanitize_line_segment(project),
+                        shadowed
+                    ),
+                    *count,
+                )
+            } else {
+                let Some(count) = self.unresolved_tally.get(project) else {
+                    continue;
+                };
+                (
+                    format!(
+                        "unresolved: projects/{} has no verified decode; \
+                         session attributed to `unknown`",
+                        crate::statusline::sanitize_line_segment(project)
+                    ),
+                    *count,
+                )
+            };
+            let mut line = line;
+            if count > 1 {
+                line.push_str(&format!(" ({count} sessions)"));
+            }
+            samples.push(line);
+        }
+        self.samples = samples;
+        self.ambiguous_tally.clear();
+        self.unresolved_tally.clear();
+        self.sample_order.clear();
+    }
 }
 
 /// rm-408 disclosure aggregated over the scanned corpus: sessions whose
@@ -223,28 +313,29 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
         ProjectDecodeStatus::Resolved { .. } => out.resolved += 1,
         ProjectDecodeStatus::Ambiguous { path, shadowed } => {
             out.ambiguous += 1;
-            if out.samples.len() < 6 {
-                let shadowed = shadowed
-                    .iter()
-                    .map(|alt| crate::statusline::sanitize_line_segment(alt))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                out.samples.push(format!(
-                    "ambiguous: {} attributed via the longest-verified-path rule; verified alternatives shadowed: {}",
-                    crate::statusline::sanitize_line_segment(&path),
-                    shadowed
-                ));
-            }
+            let shadowed = shadowed
+                .iter()
+                .map(|alt| crate::statusline::sanitize_line_segment(alt))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.record_ambiguous(&path, shadowed);
         }
         ProjectDecodeStatus::Unresolved { encoded } => {
             out.unresolved += 1;
-            if out.samples.len() < 6 {
-                out.samples.push(format!(
-                    "unresolved: projects/{} has no verified decode; session attributed to `unknown`",
-                    crate::statusline::sanitize_line_segment(&encoded)
-                ));
-            }
+            out.record_unresolved(&encoded);
         }
+    }
+}
+
+/// Snapshot age with singular/plural grammar (rm-512): the bundled
+/// snapshot is date-stamped, so "1 day old" — not "1 days old" — is the
+/// literal fresh-release reading. The `-1` sentinel (unknown age)
+/// keeps its pre-existing rendering.
+fn snapshot_age_phrase(age_days: i64) -> String {
+    if age_days == 1 {
+        "1 day old".to_string()
+    } else {
+        format!("{age_days} days old")
     }
 }
 
@@ -730,4 +821,185 @@ fn file_mod_time_nanos(metadata: &std::fs::Metadata) -> Option<i64> {
 
 fn is_under(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_at(cwd: &str, path: &str) -> Session {
+        Session {
+            name: "session.jsonl".to_string(),
+            path: path.to_string(),
+            cwd: cwd.to_string(),
+            metrics: crate::Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        }
+    }
+
+    /// A session whose encoded project dir cannot decode (rm-512
+    /// fixtures): the path sits under a nonexistent root, so the walk
+    /// finds no verified decode and the session is `Unresolved`.
+    fn unresolved_session(encoded_dir: &str) -> Session {
+        session_at("", &format!("/nowhere/projects/-{encoded_dir}/s.jsonl"))
+    }
+
+    #[test]
+    fn unresolved_samples_dedup_by_project_with_counts() {
+        // rm-512: two distinct projects × three sessions each used to
+        // fill the six-slot budget with repeats; they now render one
+        // line per project, each carrying its session count.
+        let mut report = DoctorProjectDecodeReport::default();
+        for _ in 0..3 {
+            collect_project_decode(&mut report, &unresolved_session("alpha-one"));
+            collect_project_decode(&mut report, &unresolved_session("beta-two"));
+        }
+        report.finalize_samples();
+
+        assert_eq!(report.unresolved, 6);
+        assert_eq!(
+            report.samples.len(),
+            2,
+            "one line per distinct project: {:?}",
+            report.samples
+        );
+        assert!(report.samples[0].contains("projects/alpha-one"));
+        assert!(
+            report.samples[0].ends_with("(3 sessions)"),
+            "{}",
+            report.samples[0]
+        );
+        assert!(report.samples[1].contains("projects/beta-two"));
+        assert!(
+            report.samples[1].ends_with("(3 sessions)"),
+            "{}",
+            report.samples[1]
+        );
+    }
+
+    #[test]
+    fn ambiguous_samples_dedup_by_project_path() {
+        // rm-512 ambiguous arm: a transcript under an encoded dir that
+        // decodes to both a literal and a shadowed alternative — three
+        // sessions collapse to one line with the session count.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-doctor-ambiguous-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let base = root.join("misattr");
+        let true_repo = base.join("my-repo");
+        std::fs::create_dir_all(&true_repo).expect("create true repo dir");
+        let decoy = base.join("my").join("repo");
+        std::fs::create_dir_all(&decoy).expect("plant decoy repo dir");
+        let encoded = true_repo.to_string_lossy().replace('/', "-");
+        let transcript = root
+            .join("projects")
+            .join(&encoded)
+            .join("session.jsonl")
+            .to_string_lossy()
+            .to_string();
+
+        let mut report = DoctorProjectDecodeReport::default();
+        for _ in 0..3 {
+            collect_project_decode(&mut report, &session_at("", &transcript));
+        }
+        report.finalize_samples();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert_eq!(report.ambiguous, 3);
+        assert_eq!(
+            report.samples.len(),
+            1,
+            "three sessions of one project render one line: {:?}",
+            report.samples
+        );
+        assert!(
+            report.samples[0].contains("ambiguous: "),
+            "{}",
+            report.samples[0]
+        );
+        assert!(
+            report.samples[0].ends_with("(3 sessions)"),
+            "{}",
+            report.samples[0]
+        );
+    }
+
+    #[test]
+    fn sample_budget_prefers_distinct_projects() {
+        // rm-512 budget: seven distinct projects keep the sample cap at
+        // six without repeats swallowing the slots, and single-session
+        // projects carry no count suffix.
+        let mut report = DoctorProjectDecodeReport::default();
+        for i in 0..7 {
+            collect_project_decode(&mut report, &unresolved_session(&format!("proj-{i}")));
+        }
+        report.finalize_samples();
+
+        assert_eq!(report.unresolved, 7);
+        assert_eq!(
+            report.samples.len(),
+            6,
+            "the budget caps at six samples: {:?}",
+            report.samples
+        );
+        for (i, sample) in report.samples.iter().enumerate() {
+            assert!(
+                sample.contains(&format!("proj-{i}")),
+                "first-seen order: {sample}"
+            );
+            assert!(
+                !sample.contains("(1 sessions)"),
+                "single sessions stay suffix-free: {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_decode_report_json_surface_unchanged() {
+        // rm-512 must not alter the serde shape: the tally state stays
+        // out of the JSON surface and `samples` keeps its
+        // skip-when-empty behavior.
+        let mut report = DoctorProjectDecodeReport::default();
+        for _ in 0..2 {
+            collect_project_decode(&mut report, &unresolved_session("serde-proj"));
+        }
+        let before = serde_json::to_value(&report).expect("serialize before finalize");
+        assert!(
+            before.get("samples").is_none(),
+            "empty samples stay skipped: {before}"
+        );
+        assert!(
+            !before.to_string().contains("tally"),
+            "tally state never serializes: {before}"
+        );
+
+        report.finalize_samples();
+        let after = serde_json::to_value(&report).expect("serialize after finalize");
+        assert_eq!(
+            after.get("unresolved"),
+            Some(&serde_json::json!(2)),
+            "counters unchanged: {after}"
+        );
+        let samples = after
+            .get("samples")
+            .expect("samples render after finalize")
+            .as_array()
+            .expect("samples stay an array");
+        assert_eq!(samples.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_age_phrase_uses_singular_for_one_day() {
+        // rm-512 grammar: the bundled snapshot reads "1 day old" on
+        // release day; the unknown-age sentinel keeps its rendering.
+        assert_eq!(snapshot_age_phrase(1), "1 day old");
+        assert_eq!(snapshot_age_phrase(0), "0 days old");
+        assert_eq!(snapshot_age_phrase(47), "47 days old");
+        assert_eq!(snapshot_age_phrase(-1), "-1 days old");
+    }
 }
