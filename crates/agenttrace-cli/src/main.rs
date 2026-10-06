@@ -183,7 +183,10 @@ fn run() -> anyhow::Result<()> {
     // (roadmap candidate 53, cycle 7), not a report action: it must run
     // before action validation and never fail the host — the status
     // line would otherwise hang or error on every prompt.
-    if args.path.as_deref() == Some("statusline") {
+    // rm-573: an explicit --statusline-report wins over keyword host dispatch —
+    // otherwise `agenttrace --statusline-report statusline` runs the host and
+    // appends a bogus capture to the real journal before the report renders.
+    if args.path.as_deref() == Some("statusline") && !args.statusline_report {
         return agenttrace_core::run_statusline_host();
     }
     // `agenttrace upstream` is a repository status host command (rm-024,
@@ -191,7 +194,8 @@ fn run() -> anyhow::Result<()> {
     // host command it dispatches before action validation; unlike it,
     // this is an explicit user action that may fail loudly. It is fully
     // offline unless --fetch explicitly opts into the network.
-    if args.path.as_deref() == Some("upstream") {
+    // rm-573: --statusline-report also wins over the upstream keyword lane.
+    if args.path.as_deref() == Some("upstream") && !args.statusline_report {
         let report = upstream::status_report(&args.format, args.fetch)?;
         write_stdout(&report)?;
         return Ok(());
@@ -1059,7 +1063,12 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                 path.display()
             );
         }
-        bail!("session path does not exist: {}", path.display());
+        // rm-212 + review fix (2026-10-06): report the true stat class
+        // instead of claiming the path is missing, and admit symlinks that
+        // resolve to a readable file or directory (the discovery collectors
+        // follow symlinks too) while naming a special-file target by its
+        // real class instead of mislabeling every symlink "dangling".
+        admit_session_path(&path)?;
     }
     let dir = args.dir.as_deref().map(PathBuf::from);
     // Cycle-4 B2: a typo'd `-d` path used to produce the same
@@ -1596,6 +1605,97 @@ fn governance_inspect_flag(args: &Args) -> &'static str {
     }
 }
 
+/// rm-212: describe a non-regular, non-directory filesystem object for the
+/// truthful admission error.
+///
+/// Admit a positional session path, or fail with the path's true class.
+/// Review fix (2026-10-07, round 2 MF1): the unix-only class detector must be
+/// paired with a cfg(not(unix)) stub below, or non-unix builds fail at the
+/// unconditional call site in load_sessions_report.
+#[cfg(unix)]
+fn admit_session_path(path: &std::path::Path) -> anyhow::Result<()> {
+    if path.as_os_str() == "-" {
+        bail!("invalid session path '-': read from stdin is not supported");
+    }
+    if path.is_file() || path.is_dir() {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(path) {
+            Ok(target) if target.is_file() || target.is_dir() => Ok(()),
+            Ok(target) => bail!(
+                "session path is not a regular file or directory: {} (symbolic link to {})",
+                path.display(),
+                special_file_kind(&target)
+            ),
+            Err(_) => bail!("session path is a dangling symlink: {}", path.display()),
+        },
+        Ok(meta) => bail!(
+            "session path is not a regular file or directory: {} ({})",
+            path.display(),
+            special_file_kind(&meta)
+        ),
+        Err(_) => bail!("session path does not exist: {}", path.display()),
+    }
+}
+
+/// rm-212 non-unix arm (review fix 2026-10-07, round 2 MF1): stat-class
+/// detection is unix-only (FileTypeExt), so this stub keeps the same
+/// admission contract with the generic class name — a non-regular path
+/// still fails truthfully instead of "does not exist".
+#[cfg(not(unix))]
+fn admit_session_path(path: &std::path::Path) -> anyhow::Result<()> {
+    if path.as_os_str() == "-" {
+        bail!("invalid session path '-': read from stdin is not supported");
+    }
+    if path.is_file() || path.is_dir() {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(path) {
+            Ok(target) if target.is_file() || target.is_dir() => Ok(()),
+            Ok(target) => bail!(
+                "session path is not a regular file or directory: {} (symbolic link to {})",
+                path.display(),
+                special_file_kind(&target)
+            ),
+            Err(_) => bail!("session path is a dangling symlink: {}", path.display()),
+        },
+        Ok(meta) => bail!(
+            "session path is not a regular file or directory: {} ({})",
+            path.display(),
+            special_file_kind(&meta)
+        ),
+        Err(_) => bail!("session path does not exist: {}", path.display()),
+    }
+}
+
+// Review fix (2026-10-07, round 2 MF1): this variant imports
+// std::os::unix::fs::FileTypeExt, so it needs its own #[cfg(unix)] — an
+// un-gated definition is an E0433 break on non-unix targets even with the
+// stubs above in place.
+#[cfg(unix)]
+fn special_file_kind(meta: &std::fs::Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = meta.file_type();
+    if file_type.is_char_device() {
+        "character device"
+    } else if file_type.is_fifo() {
+        "fifo"
+    } else if file_type.is_socket() {
+        "socket"
+    } else if file_type.is_block_device() {
+        "block device"
+    } else {
+        "special file"
+    }
+}
+
+#[cfg(not(unix))]
+fn special_file_kind(_meta: &std::fs::Metadata) -> &'static str {
+    "special file"
+}
+
 fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     if !(0..=100).contains(&args.fail_under_health) {
         bail!("--fail-under-health must be between 0 and 100");
@@ -1606,8 +1706,14 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     {
         bail!("--max-tool-fail-rate must be a finite number between 0 and 100");
     }
-    if args.search.is_some() && args.search_limit == 0 {
+    // rm-389: a zero limit is invalid regardless of which action runs —
+    // --limit 0 used to render empty output rc0, and a bare --search-limit 0
+    // skipped the guard when --search was not set.
+    if args.search_limit == 0 {
         bail!("--search-limit must be at least 1");
+    }
+    if args.limit == 0 {
+        bail!("--limit must be at least 1");
     }
     // rm-346 arm-b: the --baseline-max-*-delta-pct thresholds used to reach
     // the comparison unvalidated — NaN made the bound vacuous (rc0, zero
@@ -2314,5 +2420,85 @@ mod tests {
         args.overview = true;
         args.range = "7d".to_string();
         assert!(validate_range_applicability(&args).is_ok());
+    }
+
+    #[test]
+    fn gate_thresholds_reject_zero_limits_regardless_of_action() {
+        // rm-389: --limit 0 used to render empty output rc0 and a bare
+        // --search-limit 0 skipped the guard when --search was not set.
+        let mut args = compare_args(None);
+        args.overview = true;
+        args.compare = false;
+        args.limit = 0;
+        let err = validate_gate_thresholds(&args).expect_err("--limit 0 must fail");
+        assert!(err.to_string().contains("--limit"), "got: {err}");
+
+        args.limit = 20;
+        args.search_limit = 0;
+        let err = validate_gate_thresholds(&args).expect_err("bare --search-limit 0 must fail");
+        assert!(err.to_string().contains("--search-limit"), "got: {err}");
+    }
+
+    #[test]
+    fn gate_thresholds_still_accept_valid_limits() {
+        let mut args = compare_args(None);
+        args.overview = true;
+        args.compare = false;
+        validate_gate_thresholds(&args).expect("valid limits pass");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn special_file_kind_classifies_character_devices() {
+        let meta = std::fs::symlink_metadata("/dev/null").expect("/dev/null metadata");
+        assert_eq!(special_file_kind(&meta), "character device");
+    }
+
+    #[test]
+    fn statusline_report_flag_wins_over_keyword_host_dispatch() {
+        // rm-573: the dispatch-order guards must stay in main().
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains(r#"== Some("statusline") && !args.statusline_report"#),
+            "rm-573: statusline keyword guard missing"
+        );
+        assert!(
+            source.contains(r#"== Some("upstream") && !args.statusline_report"#),
+            "rm-573: upstream keyword guard missing"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn admission_names_symlink_targets_by_their_true_class() {
+        // Review fix (rm-212, 2026-10-06): a symlink to /dev/null used to read
+        // as "dangling symlink"; a symlink to a readable session file must be
+        // admitted (discovery follows symlinks too).
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-symlink-admission-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let link = dir.join("null-link");
+        std::os::unix::fs::symlink("/dev/null", &link).expect("symlink to /dev/null");
+        let err = admit_session_path(&link).expect_err("symlink to a device must fail");
+        assert!(
+            err.to_string()
+                .contains("symbolic link to character device"),
+            "got: {err}"
+        );
+
+        let dangling = dir.join("dangling");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &dangling).expect("dangling symlink");
+        let err = admit_session_path(&dangling).expect_err("dangling must fail");
+        assert!(err.to_string().contains("dangling symlink"), "got: {err}");
+
+        let real = dir.join("real.jsonl");
+        std::fs::write(&real, "{}").expect("real session file");
+        let good = dir.join("good-link");
+        std::os::unix::fs::symlink(&real, &good).expect("symlink to a real file");
+        admit_session_path(&good).expect("symlink to a regular file is admitted");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
