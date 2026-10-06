@@ -38,11 +38,43 @@ fn assistant_line(usage: &str, model: &str) -> String {
     )
 }
 
+/// rm-540: an assistant line whose model is given in ALREADY-ESCAPED
+/// wire form — hostile payloads carry control bytes and quotes that
+/// must ride the wire as `\uXXXX`/`\"` escapes to keep the fixture
+/// line valid JSONL while the parsed cell keeps the specials. Each
+/// line needs its own message id: the parser dedupes assistant
+/// messages by id, so a shared `msg_1` collapses to one usage event
+/// (and one by_model row) per session.
+fn assistant_line_model_json(id: &str, model_json: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","timestamp":"2026-10-04T01:00:05Z","message":{{"id":"{id}","model":"{model_json}","role":"assistant","content":[{{"type":"text","text":"on it"}}],"usage":{ALL_ZERO}}}}}"#
+    )
+}
+
 const ALL_ZERO: &str = r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#;
 const CLAUDE_MODEL: &str = "claude-sonnet-4-5-20250929";
 
+/// Spawns the CLI for one test. The HOME/XDG sandbox is per test
+/// thread (the rm-301 entrypoints.rs convention): run_csv used to
+/// inherit the operator's real HOME, so every spawned CLI
+/// read-modify-wrote the shared ~/.cache/agenttrace/sessions.json —
+/// parallel test threads raced on that file (observed twice as
+/// csv_export e2e failures during this batch's verification while
+/// concurrent agenttrace processes wrote the same cache), and every
+/// test run polluted the operator's real cache with fixture entries
+/// and schema churn.
 fn run_csv(dir: &Path, args: &[&str]) -> String {
+    let sandbox = std::env::temp_dir().join(format!(
+        "at-csv-sandbox-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = sandbox.join("cache");
+    fs::create_dir_all(&cache).expect("create sandbox cache dir");
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &sandbox)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
         .args(args)
         .arg("-d")
         .arg(dir)
@@ -127,6 +159,104 @@ fn overview_csv_emits_summary_and_attribution_tables() {
 }
 
 #[test]
+fn overview_csv_sanitizes_hostile_group_keys() {
+    // rm-540 (assess PoC F1): transcript-controlled ModelUsed strings
+    // reached the by_model group keys RAW — live OSC-52 clipboard-write
+    // bytes, a tab-prefixed =HYPERLINK, and a CRLF row-forgery payload
+    // all rode into `--overview -f csv` (od -c transcripts in assess
+    // 871cae94). csv_row now sanitizes every cell at the render
+    // boundary and guard_formula judges the first non-whitespace
+    // character.
+    let dir = std::env::temp_dir().join("at-csv-hostile-groups");
+    fs::create_dir_all(&dir).expect("mkdir fixture dir");
+    // One session FILE per hostile model: by_model attributes the
+    // session's primary model, so a single session with three models
+    // collapses to one row (the assess corpus used one file per
+    // payload for the same reason).
+    let models: [(&str, &str); 3] = [
+        // wire form: esc<ESC>]52;c;pwn<BEL>
+        ("a", r"esc\u001b]52;c;pwn\u0007"),
+        // wire form: <TAB>=HYPERLINK("http://evil.example";"click me")
+        ("b", r#"\t=HYPERLINK(\"http://evil.example\";\"click me\")"#),
+        // wire form: fake-table<CRLF>name, sessions, cost<CRLF>
+        // EVIL-ROW, 99999, 88888.0<CRLF>real-model
+        (
+            "c",
+            r"fake-table\r\nname, sessions, cost\r\nEVIL-ROW, 99999, 88888.0\r\nreal-model",
+        ),
+    ];
+    for (tag, model_json) in models {
+        fs::write(
+            dir.join(format!("session-{tag}.jsonl")),
+            user_line("check the billing please")
+                + "\n"
+                + &assistant_line_model_json("msg_1", model_json)
+                + "\n",
+        )
+        .expect("write fixture");
+    }
+    let out = run_csv(&dir, &["--overview", "-f", "csv"]);
+    // F1a: no raw control bytes anywhere except the CRLF row
+    // terminators — OSC bytes are neutralized to U+FFFD.
+    assert!(
+        !out.chars()
+            .any(|c| c.is_control() && c != '\r' && c != '\n'),
+        "no raw control bytes may ride the csv: {out:?}"
+    );
+    assert!(
+        !out.contains('\u{1b}') && !out.contains('\u{7}') && !out.contains('\t'),
+        "ESC/BEL/tab must be sanitized: {out:?}"
+    );
+    assert!(
+        out.contains("esc\u{FFFD}]52;c;pwn\u{FFFD}"),
+        "OSC-52 payload becomes U+FFFD in the by_model key: {out:?}"
+    );
+    // F1b: the tab prefix is a control byte and becomes U+FFFD, so
+    // the cell no longer leads with a formula character at all (any
+    // leading quote is the RFC 4180 quote for embedded double-quotes,
+    // not the formula guard).
+    assert!(
+        out.contains("\u{FFFD}=HYPERLINK"),
+        "tab-prefixed HYPERLINK loses its formula start: {out:?}"
+    );
+    assert!(
+        !out.contains("'\u{FFFD}"),
+        "no stale guard on FFFD: {out:?}"
+    );
+    // F1c containment: the CRLF forgery payload stays ONE cell — no
+    // EVIL-ROW row of its own and no raw CRLF inside the cell.
+    assert!(
+        !out.lines().any(|l| l.starts_with("EVIL-ROW")),
+        "no forged rows from the CRLF payload: {out:?}"
+    );
+    assert!(
+        out.contains("fake-table\u{FFFD}\u{FFFD}name, sessions, cost"),
+        "CRLF payload is neutralized and stays one cell: {out:?}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn sessions_csv_guards_whitespace_prefixed_formulas() {
+    // rm-540 (assess PoC F2): ` =SUM(9+9)` passed the old
+    // first-char-only formula guard in the model column; the guard now
+    // judges the first non-whitespace character.
+    let dir = fixture_dir(
+        "lead-space",
+        &[
+            user_line("check the billing please"),
+            assistant_line(ALL_ZERO, " =SUM(9+9)"),
+        ],
+    );
+    let out = run_csv(&dir, &["--sessions", "-f", "csv"]);
+    assert!(
+        out.contains("' =SUM(9+9)"),
+        "leading-space formula gets the guard quote: {out}"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn csv_output_is_byte_deterministic_across_runs() {
     let dir = fixture_dir(
         "determinism",
@@ -172,7 +302,19 @@ fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
             "markdown and html formats require --overview",
         ),
     ] {
+        // Same per-thread HOME/XDG sandbox as run_csv: no test in this
+        // file may touch operator state, even on bail paths.
+        let sandbox = std::env::temp_dir().join(format!(
+            "at-csv-sandbox-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let cache = sandbox.join("cache");
+        fs::create_dir_all(&cache).expect("create sandbox cache dir");
         let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &sandbox)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
             .args(args)
             .arg("-d")
             .arg(&dir)
