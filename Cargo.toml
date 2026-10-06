@@ -15,7 +15,9 @@ edition = "2021"
 # floor tells builders "1.80 works" when it cannot even compile the
 # deps. Upstream raised theirs to 1.85 (#303); this fork's real floor is
 # higher. `cargo +1.80.1 check` must fail loudly at this guard.
-rust-version = "1.88"
+# rm-166: `std::fs::File::lock` (the cross-process statusline journal
+# serialization) stabilized in 1.89 — the floor follows the code.
+rust-version = "1.89"
 license = "MIT"
 description = "Local-first TUI and reports for AI coding-agent session history, cost, tokens, time, and slow-run diagnosis."
 repository = "https://github.com/luoyuctl/agenttrace"

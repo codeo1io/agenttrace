@@ -61,11 +61,18 @@ if [ -n "$gate_start" ]; then
   # Strip YAML comments first: prose explaining the report-only policy may
   # legitimately mention `|| true` — only actual run lines count.
   gate_code="$(printf '%s\n' "$gate_block" | sed 's/[[:space:]]*#.*//')"
-  if printf '%s\n' "$gate_code" | grep -q '|| true'; then
+  # rm-166 full-suite flake fix: these lookups must not run through a
+  # pipe. `printf | grep -q` races its own success — grep exits on the
+  # first match and closes the pipe while printf may still hold buffered
+  # bytes; under `set -o pipefail` printf's SIGPIPE (141) then fails the
+  # pipeline and the `! ...` guard reports a threshold that is present
+  # (observed ~1/10 under heavy machine load). Here-strings have no pipe
+  # to race.
+  if grep -q '|| true' <<<"$gate_code"; then
     echo "FAIL: the health-gate step suppresses its own exit code (|| true)" >&2
     fail=1
   fi
-  if ! printf '%s\n' "$gate_code" | grep -qE 'fail-under-health'; then
+  if ! grep -qE 'fail-under-health' <<<"$gate_code"; then
     echo "FAIL: the health-gate step no longer enforces a health threshold" >&2
     fail=1
   fi

@@ -11,7 +11,7 @@ use agenttrace_core::{
     recommendations, resolve_project, session_capability, session_cost_audit,
     session_matches_time_range, total_tokens, ContextTrend, CostAudit, DataHealth,
     DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
-    Recommendation, ReportLanguage, Session, SessionCache, TimeRange,
+    ProjectIdentity, Recommendation, ReportLanguage, Session, SessionCache, TimeRange,
 };
 #[cfg(test)]
 use agenttrace_core::{
@@ -260,6 +260,17 @@ enum ExplorerOverlay {
 
 struct App {
     sessions: Vec<Session>,
+    /// rm-038: session→project identity memo. resolve_project() walks the
+    /// filesystem (git_root ancestor probes, encoded-directory decoding)
+    /// and the TUI asks for the same session's identity in several
+    /// per-render loops (visible_sessions predicate, project totals,
+    /// per-row previews) — O(sessions) walks per frame on mixed trees.
+    /// The memo answers those from one resolution per session, populated
+    /// when sessions load (App::new / reload) and rebuilt wholesale when
+    /// the session list is replaced. A lookup for a session missing from
+    /// the memo falls back to one live resolution, so correctness never
+    /// depends on the memo being warm.
+    project_identities: std::collections::HashMap<String, ProjectIdentity>,
     overview: Overview,
     source_label: String,
     reload_dir: Option<String>,
@@ -382,8 +393,13 @@ impl App {
     fn new(sessions: Vec<Session>, source_label: &str, reload_dir: Option<String>) -> Self {
         let sessions = canonical_sessions(&sessions);
         let overview = compute_overview(&sessions);
+        let project_identities = sessions
+            .iter()
+            .map(|session| (session.path.clone(), resolve_project(session)))
+            .collect();
         let mut app = Self {
             sessions,
+            project_identities,
             overview,
             source_label: source_label.to_string(),
             reload_dir,
@@ -1074,6 +1090,10 @@ impl App {
         self.sessions = report.sessions;
         self.sessions
             .sort_by(|left, right| compare_sessions(left, right, SortKey::Recent, true));
+        // rm-038: the session list was replaced wholesale — identities are
+        // re-resolved once here rather than falling back to live walks in
+        // every render loop that follows.
+        self.rebuild_project_identities();
         let selected_index = selected.as_ref().and_then(|selected| {
             self.sessions
                 .iter()
@@ -1431,6 +1451,27 @@ impl App {
         };
     }
 
+    /// rm-038: memoized project identity for one session (populated at
+    /// load; falls back to a single live resolution for sessions that
+    /// never went through it, e.g. ones appended outside App::new).
+    fn project_identity(&self, session: &Session) -> ProjectIdentity {
+        self.project_identities
+            .get(&session.path)
+            .cloned()
+            .unwrap_or_else(|| resolve_project(session))
+    }
+
+    /// rm-038: rebuild the identity memo from the current session list —
+    /// one resolution per session, called when sessions are replaced
+    /// (reload) so render loops keep hitting the memo, not the filesystem.
+    fn rebuild_project_identities(&mut self) {
+        self.project_identities = self
+            .sessions
+            .iter()
+            .map(|session| (session.path.clone(), resolve_project(session)))
+            .collect();
+    }
+
     fn session_visible(
         &self,
         session: &Session,
@@ -1441,9 +1482,12 @@ impl App {
             && matches_health_filter(session, &self.health_filter)
             && matches_source_filter(session, &self.source_filter)
             && matches_text_filter(&session.metrics.model_used, &self.model_filter)
-            && matches_text_filter(&project_name(session), &self.project_filter)
+            && matches_text_filter(
+                &self.project_identity(session).display_name,
+                &self.project_filter,
+            )
             && (self.project_id_filter.is_empty()
-                || resolve_project(session).id == self.project_id_filter)
+                || self.project_identity(session).id == self.project_id_filter)
             && session_matches_time_range(session, self.range_filter, now)
             && matches_cost_filter(session, self.cost_filter)
             && self.failure_filter.is_none_or(|(op, value)| {

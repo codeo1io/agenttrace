@@ -1093,10 +1093,24 @@ fn flag_takes_value(arg: &OsString) -> bool {
 }
 
 fn latest_session(sessions: &[Session]) -> Option<&Session> {
-    sessions.iter().max_by(|a, b| newer_session_order(a, b))
+    // rm-688: the mtime fallback stats the file on every comparison, so a
+    // --latest selection over n mixed-presence sessions stat'ed each
+    // fallback file up to 2·(n−1) times for one answer. One memo per
+    // selection pass — every file is stat'ed at most once, and missing
+    // files still resolve to the epoch fallback (their "stat" is cached
+    // like any other).
+    let mut mod_times: std::collections::HashMap<&Path, SystemTime> =
+        std::collections::HashMap::with_capacity(sessions.len());
+    sessions
+        .iter()
+        .max_by(|a, b| newer_session_order(a, b, &mut mod_times))
 }
 
-fn newer_session_order(a: &Session, b: &Session) -> std::cmp::Ordering {
+fn newer_session_order<'a>(
+    a: &'a Session,
+    b: &'a Session,
+    mod_times: &mut std::collections::HashMap<&'a Path, SystemTime>,
+) -> std::cmp::Ordering {
     let a_has_session_time = !a.metrics.session_start.is_empty();
     let b_has_session_time = !b.metrics.session_start.is_empty();
     a_has_session_time
@@ -1105,16 +1119,30 @@ fn newer_session_order(a: &Session, b: &Session) -> std::cmp::Ordering {
             if a_has_session_time && b_has_session_time {
                 a.metrics.session_start.cmp(&b.metrics.session_start)
             } else {
-                session_mod_time(a).cmp(&session_mod_time(b))
+                // Sequential binds: the map is borrowed mutably per stat,
+                // and both stats share the one memo.
+                let a_mod_time = session_mod_time(a, mod_times);
+                let b_mod_time = session_mod_time(b, mod_times);
+                a_mod_time.cmp(&b_mod_time)
             }
         })
         .then_with(|| a.path.cmp(&b.path))
 }
 
-fn session_mod_time(session: &Session) -> SystemTime {
-    fs::metadata(&session.path)
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
+fn session_mod_time<'a>(
+    session: &'a Session,
+    mod_times: &mut std::collections::HashMap<&'a Path, SystemTime>,
+) -> SystemTime {
+    // One stat per distinct path per selection pass (rm-688); the raw
+    // stat stays here so the memo and the epoch fallback are one code
+    // path, not two that can drift.
+    *mod_times
+        .entry(Path::new(&session.path))
+        .or_insert_with(|| {
+            fs::metadata(&session.path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        })
 }
 
 fn report_language(value: &str) -> anyhow::Result<ReportLanguage> {
@@ -2121,6 +2149,123 @@ mod tests {
             latest_session(&[alpha, omega]).map(|session| session.name.as_str()),
             Some("omega")
         );
+    }
+
+    // rm-688: one stat per distinct fallback path per selection pass.
+    // The pre-memo comparator stat'ed both operands on every comparison —
+    // 2·C(n,2) stats over a full ordering — so a --latest selection over a
+    // large mixed-presence history was a stat storm. The pin: drive the
+    // comparator pairwise across every session pair with one shared memo
+    // and require the memo to hold exactly one entry per fallback path,
+    // each equal to a fresh stat.
+    #[test]
+    fn latest_session_selection_stats_each_fallback_file_once() {
+        let mut files = Vec::new();
+        for index in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            files.push(temp_session_file(
+                &format!("agenttrace-stat-pin-{index}"),
+                "stat-pin",
+            ));
+        }
+        // Mixed presence: two sessions carry session_start (no stat needed),
+        // five fall back to mtime, one of which points at a missing file
+        // (the epoch fallback is memoized like any other stat).
+        let sessions = vec![
+            session("stamped-a", &files[0], "2026-01-01T00:00:00Z"),
+            session("stamped-b", &files[1], "2026-01-02T00:00:00Z"),
+            session("file-2", &files[2], ""),
+            session("file-3", &files[3], ""),
+            session("file-4", &files[4], ""),
+            session("file-5", &files[5], ""),
+            session("shared-path", &files[2], ""),
+            session_with_missing_file("missing", "/tmp/agenttrace-stat-pin-absent.jsonl"),
+        ];
+        let mut mod_times: std::collections::HashMap<&Path, SystemTime> =
+            std::collections::HashMap::new();
+        for a in &sessions {
+            for b in &sessions {
+                let _ = newer_session_order(a, b, &mut mod_times);
+            }
+        }
+        // 4 distinct real fallback paths + 1 missing path, one entry each
+        // — stamped paths never enter the memo, and the shared path is
+        // stat'ed once, not once per pair that touches it.
+        assert_eq!(mod_times.len(), 5, "one memo entry per fallback path");
+        for (path, memoized) in &mod_times {
+            let fresh = fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            assert_eq!(memoized, &fresh, "memo holds a live stat for {path:?}");
+        }
+        for file in files {
+            let _ = fs::remove_file(file);
+        }
+    }
+
+    // rm-688 parity: the memo changes how often files are stat'ed, never
+    // which session wins. Mixed-presence selection must match an unmemoized
+    // recomputation, including when a file disappears mid-pass (the memo
+    // then keeps that session's earlier position instead of re-stating).
+    #[test]
+    fn latest_session_mixed_presence_selection_matches_unmemoized() {
+        let mut files = Vec::new();
+        for index in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            files.push(temp_session_file(
+                &format!("agenttrace-parity-{index}"),
+                "parity",
+            ));
+        }
+        let sessions = vec![
+            session("file-0", &files[0], ""),
+            session("file-1", &files[1], ""),
+            session("stamped", &files[2], "2026-01-01T00:00:00Z"),
+            session("file-3", &files[3], ""),
+            session_with_missing_file("gone", "/tmp/agenttrace-parity-absent.jsonl"),
+        ];
+        let expected: Vec<String> = {
+            // Unmemoized oracle: sort by the same precedence with a fresh
+            // stat per comparison (the pre-rm-688 behavior).
+            let mut ordered = sessions.clone();
+            ordered.sort_by(|a, b| {
+                let a_stamp = !a.metrics.session_start.is_empty();
+                let b_stamp = !b.metrics.session_start.is_empty();
+                a_stamp
+                    .cmp(&b_stamp)
+                    .then_with(|| {
+                        if a_stamp && b_stamp {
+                            a.metrics.session_start.cmp(&b.metrics.session_start)
+                        } else {
+                            let a_time = fs::metadata(&a.path)
+                                .and_then(|metadata| metadata.modified())
+                                .unwrap_or(SystemTime::UNIX_EPOCH);
+                            let b_time = fs::metadata(&b.path)
+                                .and_then(|metadata| metadata.modified())
+                                .unwrap_or(SystemTime::UNIX_EPOCH);
+                            a_time.cmp(&b_time)
+                        }
+                    })
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            ordered.iter().rev().map(|s| s.name.clone()).collect()
+        };
+        // max_by returns the greatest by the same ordering the oracle sorts
+        // ascending — assert the winner, and the full precedence (stamped
+        // above all mtime sessions) via repeated selection.
+        assert_eq!(
+            latest_session(&sessions).map(|session| session.name.clone()),
+            expected.first().cloned(),
+            "memoized selection disagrees with the unmemoized oracle"
+        );
+        assert_eq!(
+            latest_session(&sessions).map(|session| session.name.clone()),
+            Some("stamped".to_string()),
+            "stamped sessions outrank every mtime fallback"
+        );
+        for file in files {
+            let _ = fs::remove_file(file);
+        }
     }
 
     #[test]
