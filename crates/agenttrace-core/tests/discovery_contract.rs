@@ -2111,7 +2111,12 @@ fn rust_renders_waste_report_for_testdata_latest_slice() {
 
         let report = render_waste_report(latest);
         assert!(report.contains("AGENTTRACE v"));
-        assert!(report.contains("Score: 22/100"));
+        // rm-567: re-pinned from 22/100 — cache "none" now scores 30
+        // (was 20) and the ladder reaches all tiers; Wasted names its
+        // denominator instead of printing an unbased dollar sum.
+        assert!(report.contains("Score: 31/100"));
+        assert!(report.contains("(🟡 MODERATE)"));
+        assert!(report.contains("(33% of session cost $0.0003)"));
         assert!(report.contains("minor waste - cache 0% hit"));
         assert!(report.contains("caching not enabled"));
     });

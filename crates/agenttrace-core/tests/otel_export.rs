@@ -148,3 +148,48 @@ fn otel_export_has_no_network_transport() {
         assert!(!src.contains(banned), "otel.rs must not reference {banned}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// rm-568: gen_ai.system from the session's source family, not path
+// substrings.
+// ---------------------------------------------------------------------------
+
+fn write_under(dirname: &str, file: &str, body: &str) -> PathBuf {
+    let dir = fixture_dir().join(dirname);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(file);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn rm568_gen_ai_system_follows_source_tool_not_path() {
+    // The same Claude journal parsed from a directory whose name
+    // contains a foreign marker: the session's source family (recorded
+    // from the journal itself) must win over path inference. Before
+    // rm-568 this session exported gen_ai.system=cursor because the
+    // path marker scan matched the directory name first.
+    let path = write_under("cursor-backup", "claude-twin.jsonl", CLAUDE_BODY);
+    let session = parse_file(&path).unwrap();
+    assert_eq!(session.metrics.source_tool, "claude_code");
+    let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&[session])).unwrap();
+    let span = &doc["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    assert_eq!(
+        attr(span, "agenttrace.session.source_tool")["stringValue"],
+        "claude_code"
+    );
+    assert_eq!(attr(span, "gen_ai.system")["stringValue"], "claude-code");
+}
+
+#[test]
+fn rm568_arbitrary_dir_does_not_demote_to_other() {
+    // A --dir-loaded claude session (arbitrary directory name with no
+    // known marker) must not export gen_ai.system=other: the family
+    // comes from the journal; path inference is only the fallback for
+    // sessions that carry none.
+    let path = write_under("archival-dump-2026", "session.jsonl", CLAUDE_BODY);
+    let session = parse_file(&path).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&[session])).unwrap();
+    let span = &doc["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    assert_eq!(attr(span, "gen_ai.system")["stringValue"], "claude-code");
+}

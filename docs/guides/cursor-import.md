@@ -33,3 +33,31 @@ agenttrace --overview -d .
 - `composer.composerData`: composer/session metadata
 
 The export intentionally avoids Cursor auth tokens and unrelated UI state. If Cursor changes the internal schema, export the relevant key values as JSON and keep the original key names above.
+
+## Cost estimates for cursor sessions (rm-566)
+
+Cursor journals carry **no token accounting** — no usage events, no
+provider-reported input/output tokens. Every dollar agenttrace
+attributes to a cursor session is therefore priced from cursor-local
+heuristics (model pricing applied to locally-derived turn/token
+proxies), not measured provider usage.
+
+All overview surfaces mark such rows: `By agent` rows show `(est.)` in
+text/markdown, the JSON `by_agent` entries and `recent_sessions` rows
+carry `"estimated": true`, and the HTML table annotates the cost cell.
+The marker means "these dollars are an estimate with no token basis",
+not "the estimate is rough by a few percent".
+
+The gap is not small. A codeburn investigation of real usage (#1637,
+Oct 2026) measured one month of Cursor API-usage-based billing at
+**$703.77** where the local cursor data implied **$15.67** — a 45x
+divergence, consistent with Cursor's local records under-counting what
+the provider actually billed (fast-path/agent-mode requests largely do
+not appear in local token fields). Treat cursor cost rows as a lower
+bound; do not use them for chargeback, budget enforcement, or
+upstream/downstream comparisons against token-accounted sources
+(claude_code, codex_cli, gemini_cli, …).
+
+Importing Cursor's web-exported usage CSV (which carries billed
+dollars per request) to reconcile the two is tracked as a separate,
+optional follow-up; the `(est.)` marker does not depend on it.

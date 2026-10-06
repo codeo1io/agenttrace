@@ -3105,7 +3105,7 @@ fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             model = next_model;
         }
         let ts = copilot_timestamp(span.get("startTimeUnixNano"));
-        let usage = copilot_usage(span);
+        let (usage, dialect_torn) = copilot_usage(span);
         match name {
             "chat.completion" => {
                 let content = copilot_span_content(span);
@@ -3120,13 +3120,22 @@ fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     });
                 }
                 if usage_has_values(&usage) {
-                    events.push(Event {
+                    let mut meta = Event {
                         role: "meta".to_string(),
                         usage,
                         model_used: model.clone(),
                         source_tool: "copilot_cli".to_string(),
                         ..Event::default()
-                    });
+                    };
+                    if dialect_torn {
+                        // rm-564: the span reports usage but its cache
+                        // attribute spelling matches no known dialect —
+                        // disclose instead of silently reporting zero
+                        // cache (aggregates onto metrics counters).
+                        meta.disclosure_counters
+                            .insert("copilot_usage_dialect:cache_torn".to_string(), 1);
+                    }
+                    events.push(meta);
                 }
             }
             "tool.call" => events.push(Event {
@@ -4790,25 +4799,78 @@ fn tool_result_content(block: &Map<String, Value>) -> String {
     jsonish(block.get("content").or_else(|| block.get("response")))
 }
 
-fn copilot_usage(span: &Map<String, Value>) -> BTreeMap<String, i64> {
-    let mut usage = BTreeMap::new();
-    for (target, key) in [
-        ("input_tokens", "gen_ai.usage.input_tokens"),
-        ("output_tokens", "gen_ai.usage.output_tokens"),
-        (
-            "cache_creation_input_tokens",
+/// rm-564 (upstream #312): each usage field answers to every attribute
+/// spelling seen in the wild — the flat names Copilot shipped first and
+/// the dot-dialect the GenAI semantic conventions moved to
+/// (`gen_ai.usage.cache_read.input_tokens`), flat-first so a span
+/// carrying both keeps the historical value.
+fn copilot_usage_keys(target: &str) -> &'static [&'static str] {
+    match target {
+        "input_tokens" => &["gen_ai.usage.input_tokens"],
+        "output_tokens" => &["gen_ai.usage.output_tokens"],
+        "cache_creation_input_tokens" => &[
             "gen_ai.usage.cache_creation_input_tokens",
-        ),
-        (
-            "cache_read_input_tokens",
+            "gen_ai.usage.cache_creation.input_tokens",
+        ],
+        "cache_read_input_tokens" => &[
             "gen_ai.usage.cache_read_input_tokens",
-        ),
-    ] {
-        if let Some(value) = copilot_i64_attr(span, key).filter(|value| *value > 0) {
-            usage.insert(target.to_string(), value);
+            "gen_ai.usage.cache_read.input_tokens",
+        ],
+        _ => &[],
+    }
+}
+
+const COPILOT_USAGE_TARGETS: &[&str] = &[
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+];
+
+/// Returns the span's usage fields and whether the span is "torn": it
+/// reports input/output usage but its `gen_ai.usage.cache*` attributes
+/// match no known dialect, so the cache fields would silently read as
+/// zero (rm-564). Torn spans are disclosed via the disclosure-counter
+/// rail (`copilot_usage_dialect:cache_torn`), never silently zeroed.
+fn copilot_usage(span: &Map<String, Value>) -> (BTreeMap<String, i64>, bool) {
+    let mut usage = BTreeMap::new();
+    for target in COPILOT_USAGE_TARGETS {
+        for key in copilot_usage_keys(target) {
+            if let Some(value) = copilot_i64_attr(span, key).filter(|value| *value > 0) {
+                usage.insert(target.to_string(), value);
+                break;
+            }
         }
     }
-    usage
+    let cache_seen = usage.contains_key("cache_creation_input_tokens")
+        || usage.contains_key("cache_read_input_tokens");
+    let usage_bearing = usage.contains_key("input_tokens") || usage.contains_key("output_tokens");
+    let unknown_cache_key = copilot_attr_keys(span).into_iter().any(|key| {
+        key.starts_with("gen_ai.usage.cache")
+            && !COPILOT_USAGE_TARGETS
+                .iter()
+                .flat_map(|target| copilot_usage_keys(target).iter())
+                .any(|known| *known == key)
+    });
+    let torn = usage_bearing && !cache_seen && unknown_cache_key;
+    (usage, torn)
+}
+
+/// Attribute key names present on the span in either attribute form
+/// (rm-564) — the map of values Copilot exports today and the OTLP array
+/// of `{key, value}` pairs the exporter accepts.
+fn copilot_attr_keys(span: &Map<String, Value>) -> Vec<String> {
+    match span.get("attributes") {
+        Some(Value::Object(attrs)) => attrs.keys().cloned().collect(),
+        Some(Value::Array(attrs)) => attrs
+            .iter()
+            .filter_map(|attr| {
+                let attr = attr.as_object()?;
+                string(attr.get("key")).map(str::to_string)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn copilot_span_content(span: &Map<String, Value>) -> String {
@@ -6295,5 +6357,136 @@ mod tests {
                 .get("codex_compaction_usage_record"),
             Some(&1)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // rm-564: Copilot usage cache-attr dialects (upstream #312).
+    // ------------------------------------------------------------------
+
+    fn copilot_span_with(attrs: serde_json::Value) -> JsonObject {
+        let mut span = serde_json::json!({
+            "name": "chat.completion",
+            "traceId": "00000000000000000000000000000001",
+            "spanId": "0000000000000001",
+            "startTimeUnixNano": 1_759_600_000_000_000_000u64,
+            "gen_ai.request.model": "gpt-5.2",
+        });
+        span["attributes"] = attrs;
+        span.as_object().unwrap().clone()
+    }
+
+    fn copilot_usage_events(attrs: serde_json::Value) -> Vec<Event> {
+        let spans = vec![copilot_span_with(attrs)];
+        parse_copilot_jsonl(&spans)
+            .expect("copilot parse")
+            .into_iter()
+            .filter(|event| event.role == "meta")
+            .collect()
+    }
+
+    #[test]
+    fn rm564_flat_and_dot_dialect_cache_attrs_parse_identically() {
+        // Golden dialect-twin pair: the two spellings Copilot ships
+        // (flat first, then the dot-dialect the GenAI semconv moved
+        // to, upstream #312) must yield identical usage — not zeros.
+        let flat = copilot_usage_events(serde_json::json!({
+            "gen_ai.usage.input_tokens": 100,
+            "gen_ai.usage.output_tokens": 50,
+            "gen_ai.usage.cache_creation_input_tokens": 10,
+            "gen_ai.usage.cache_read_input_tokens": 80,
+        }));
+        let dotted = copilot_usage_events(serde_json::json!({
+            "gen_ai.usage.input_tokens": 100,
+            "gen_ai.usage.output_tokens": 50,
+            "gen_ai.usage.cache_creation.input_tokens": 10,
+            "gen_ai.usage.cache_read.input_tokens": 80,
+        }));
+        assert_eq!(flat.len(), 1);
+        assert_eq!(dotted.len(), 1);
+        assert_eq!(flat[0].usage, dotted[0].usage);
+        assert_eq!(flat[0].usage.get("input_tokens"), Some(&100));
+        assert_eq!(flat[0].usage.get("output_tokens"), Some(&50));
+        assert_eq!(flat[0].usage.get("cache_creation_input_tokens"), Some(&10));
+        assert_eq!(flat[0].usage.get("cache_read_input_tokens"), Some(&80));
+        // Neither twin is torn.
+        assert!(!flat[0]
+            .disclosure_counters
+            .contains_key("copilot_usage_dialect:cache_torn"));
+        assert!(!dotted[0]
+            .disclosure_counters
+            .contains_key("copilot_usage_dialect:cache_torn"));
+    }
+
+    #[test]
+    fn rm564_flat_spelling_wins_when_both_present() {
+        // Both spellings on one span: keep the historical (flat) value.
+        let events = copilot_usage_events(serde_json::json!({
+            "gen_ai.usage.input_tokens": 100,
+            "gen_ai.usage.output_tokens": 50,
+            "gen_ai.usage.cache_read_input_tokens": 80,
+            "gen_ai.usage.cache_read.input_tokens": 999,
+        }));
+        assert_eq!(
+            events[0].usage.get("cache_read_input_tokens"),
+            Some(&80),
+            "flat spelling must take precedence over the dot-dialect"
+        );
+    }
+
+    #[test]
+    fn rm564_torn_cache_dialect_is_disclosed_not_silently_zeroed() {
+        // A usage-bearing span whose cache attribute matches no known
+        // spelling: report the usage AND disclose the torn dialect so
+        // cache-efficiency lanes know their zeros are artifacts of an
+        // unknown spelling, not measured truth.
+        let events = copilot_usage_events(serde_json::json!({
+            "gen_ai.usage.input_tokens": 100,
+            "gen_ai.usage.output_tokens": 50,
+            "gen_ai.usage.cache_read_input_tokens_v2": 80,
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].usage.get("input_tokens"), Some(&100));
+        assert_eq!(events[0].usage.get("cache_read_input_tokens"), None);
+        assert_eq!(
+            events[0]
+                .disclosure_counters
+                .get("copilot_usage_dialect:cache_torn"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn rm564_non_usage_span_with_unknown_cache_attr_is_not_torn() {
+        // Tornness requires usage to be present at all: a span without
+        // input/output usage has nothing to degrade.
+        let (usage, torn) = copilot_usage(
+            serde_json::json!({
+                "gen_ai.usage.cache_read_input_tokens_v2": 80,
+            })
+            .as_object()
+            .unwrap(),
+        );
+        assert!(usage.is_empty());
+        assert!(!torn);
+    }
+
+    #[test]
+    fn rm564_zero_cache_attrs_are_not_torn() {
+        // A span that spells its cache fields with KNOWN names and
+        // reports zeros is not torn — the zeros are measured truth (or
+        // deliberate), and the dialect is understood. Known-spelling
+        // zeros are dropped from the map (base semantics, >0 filter),
+        // and no disclosure fires.
+        let events = copilot_usage_events(serde_json::json!({
+            "gen_ai.usage.input_tokens": 100,
+            "gen_ai.usage.output_tokens": 50,
+            "gen_ai.usage.cache_read_input_tokens": 0,
+            "gen_ai.usage.cache_creation.input_tokens": 0,
+        }));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].usage.get("input_tokens"), Some(&100));
+        assert!(!events[0]
+            .disclosure_counters
+            .contains_key("copilot_usage_dialect:cache_torn"));
     }
 }

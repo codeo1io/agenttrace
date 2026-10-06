@@ -526,6 +526,16 @@ pub fn report_overview_json_with_health(
                 "anomalies": session.anomalies.len(),
                 "highest_tool_authority": highest_authority_for_metrics(&session.metrics),
                 "possible_cost_driver": possible_cost_driver_note_strict(session),
+                // rm-566: recent rows carry the estimate marker
+                // individually; strip_nulls drops it for every other
+                // source so clean corpora stay byte-identical.
+                "estimated": if crate::session_cost_is_cursor_local(
+                    &session.metrics.source_tool
+                ) {
+                    json!(true)
+                } else {
+                    Value::Null
+                },
             })
         })
         .map(strip_nulls)
@@ -956,11 +966,16 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
 
     out.push_str("  ── By Agent ──\n");
     for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
+        // rm-566: cursor groups price their dollars from cursor-local
+        // data — say so on the row instead of implying parity with
+        // token-accounted sources.
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         out.push_str(&format!(
-            "    {:<30} {:>4} Sessions  {:>8}\n",
+            "    {:<30} {:>4} Sessions  {:>8}{}\n",
             tool_display_name(&agent),
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
     out.push('\n');
@@ -1134,11 +1149,14 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     out.push_str("## By agent\n\n");
     out.push_str("| Agent | Sessions | Cost |\n|---|---:|---:|\n");
     for (agent, group) in sorted_agent_groups(&overview.by_agent) {
+        // rm-566: estimate marker for cursor-priced rows.
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         out.push_str(&format!(
-            "| {} | {} | {} |\n",
+            "| {} | {} | {}{} |\n",
             markdown_cell(&tool_display_name(&agent)),
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
 
@@ -1370,11 +1388,18 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
 
     w("<section><h2>By agent</h2><table><thead><tr><th>Agent</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (agent, group) in agents {
+        // rm-566: estimate marker for cursor-priced rows.
+        let estimate_marker = if group.estimated_cost {
+            " <span class=\"muted\" title=\"cost estimated from cursor-local data (no token accounting)\">(est.)</span>"
+        } else {
+            ""
+        };
         w(format!(
-            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}{}</td></tr>",
             html_escape(&tool_display_name(&agent)),
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
     w("</tbody></table></section>".to_string());
@@ -1844,11 +1869,20 @@ fn group_items(groups: &BTreeMap<String, GroupOverview>, agent_display: bool) ->
     let mut items: Vec<_> = groups
         .iter()
         .map(|(name, group)| {
-            json!({
+            let mut item = json!({
                 "name": if agent_display { tool_display_name(name) } else { name.clone() },
                 "sessions": group.sessions,
                 "cost": round4(group.cost),
-            })
+            });
+            if group.estimated_cost {
+                // rm-566: every dollar in this row is priced from
+                // cursor-local data; skip-if-false keeps non-cursor
+                // corpora byte-identical.
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("estimated".to_string(), json!(true));
+                }
+            }
+            item
         })
         .collect();
     if agent_display {
@@ -3151,5 +3185,101 @@ mod tests {
         assert!(cell.contains("workbuddy_input_basis:zeroed_suspected_mismatch=1"));
         assert!(cell.contains("upstream luoyuctl/agenttrace#310"));
         assert!(cell.contains("cache-inclusive"));
+    }
+
+    // ---- rm-566: cursor estimate markers on every overview surface ----
+
+    fn rm566_session(source_tool: &str) -> Session {
+        Session {
+            name: format!("{source_tool}-session"),
+            path: "/tmp/x.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                source_tool: source_tool.to_string(),
+                model_used: "m".to_string(),
+                cost_estimated: 1.5,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        }
+    }
+
+    fn rm566_sessions() -> Vec<Session> {
+        vec![rm566_session("cursor"), rm566_session("claude_code")]
+    }
+
+    #[test]
+    fn rm566_text_overview_marks_cursor_cost_row_as_estimate() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let text = report_overview_text(&overview, &sessions);
+        let cursor_line = text
+            .lines()
+            .find(|line| line.contains("Cursor") && line.contains("(est.)"))
+            .expect("cursor row must carry the estimate marker");
+        assert!(cursor_line.contains("1.5"));
+        assert!(text
+            .lines()
+            .any(|line| line.contains("Claude Code") && !line.contains("(est.)")));
+    }
+
+    #[test]
+    fn rm566_markdown_overview_marks_cursor_cost_cell() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let md = report_overview_markdown(&overview, &sessions);
+        let row = md
+            .lines()
+            .find(|line| line.starts_with("| Cursor |"))
+            .expect("cursor row present");
+        assert!(row.contains("(est.)"), "row: {row}");
+        let claude_row = md
+            .lines()
+            .find(|line| line.starts_with("| Claude Code |"))
+            .expect("claude row present");
+        assert!(!claude_row.contains("(est.)"), "row: {claude_row}");
+    }
+
+    #[test]
+    fn rm566_json_overview_carries_estimated_flag_on_cursor_rows_only() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let json_text = report_overview_json(&overview, &sessions);
+        let doc: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        let agents = doc["by_agent"].as_array().unwrap();
+        let cursor = agents
+            .iter()
+            .find(|item| item["name"] == "Cursor")
+            .expect("cursor group");
+        let claude = agents
+            .iter()
+            .find(|item| item["name"] == "Claude Code")
+            .expect("claude group");
+        assert_eq!(cursor["estimated"], serde_json::json!(true));
+        assert!(claude.get("estimated").is_none());
+        let recent = doc["recent_sessions"].as_array().unwrap();
+        let cursor_recent = recent
+            .iter()
+            .find(|item| item["source_tool"] == "cursor")
+            .expect("cursor recent row");
+        assert_eq!(cursor_recent["estimated"], serde_json::json!(true));
+        let claude_recent = recent
+            .iter()
+            .find(|item| item["source_tool"] == "claude_code")
+            .expect("claude recent row");
+        assert!(claude_recent.get("estimated").is_none());
+    }
+
+    #[test]
+    fn rm566_html_overview_marks_cursor_cost_cell() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let html = report_overview_html(&overview, &[]);
+        assert!(html.contains("Cursor"));
+        assert!(html.contains("(est.)"));
+        assert!(html.contains("cost estimated from cursor-local data"));
     }
 }

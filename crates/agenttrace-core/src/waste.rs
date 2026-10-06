@@ -43,6 +43,15 @@ pub struct WasteReport {
     waste_score: i32,
     waste_level: &'static str,
     total_wasted: f64,
+    /// rm-567: the uncapped component sum before the session-cost clamp.
+    wasted_raw: f64,
+    /// rm-567: true when the raw sum exceeded the session cost and the
+    /// rendered figure was clamped to it — always disclosed in the
+    /// report, never silently truncated.
+    wasted_capped: bool,
+    /// rm-567: Wasted as a percent of the session's estimated cost
+    /// (0.0 when the session cost is unknown).
+    wasted_percent: f64,
     loop_percent: f64,
     /// Session-level estimated cost that the per-tool figures are
     /// allocated from. Per-tool "cost" is an allocated share, never
@@ -84,21 +93,43 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
     );
     let loop_cost = session.diagnostics.loop_cost.total_loop_cost;
     let loop_percent = loop_waste_percent(loop_cost, session.metrics.cost_estimated);
-    let mut total_wasted = cache.wasted_cost + loop_cost;
-    if bloat.bloat_score > 50 {
-        total_wasted += session.metrics.cost_estimated * 0.05;
-    }
 
+    // rm-567: Wasted dollars are priced on two disjoint bases and never
+    // claim more than the session's own cost. The cache component is the
+    // avoidable premium on un-cached input tokens (what a working cache
+    // would have saved — see analyze_cache_efficiency); the loop
+    // component is the measured duplicate-call cost from diagnostics,
+    // already capped at the session cost at its source. Tool bloat no
+    // longer adds invented dollars; it only scores.
+    let session_cost = session.metrics.cost_estimated.max(0.0);
+    let wasted_raw = cache.wasted_cost + loop_cost;
+    let wasted_capped = session_cost > 0.0 && wasted_raw > session_cost;
+    let total_wasted = if wasted_capped {
+        session_cost
+    } else {
+        wasted_raw
+    };
+    let wasted_percent = if session_cost > 0.0 {
+        total_wasted / session_cost * 100.0
+    } else {
+        0.0
+    };
+
+    // rm-567: the score is a documented sum of capped components —
+    // cache <= 40, loops <= 25, stuck <= 20, bloat <= 15 — so the scale
+    // reaches 100 and every tier band (including red, >= 70) is
+    // constructible instead of dead. docs/guides/waste-guide.md pins
+    // the weights.
     let mut score = match cache.rating {
-        "none" => 20.0,
-        "poor" => 15.0,
-        "good" => 5.0,
+        "none" => 30.0,
+        "poor" => 24.0,
+        "good" => 12.0,
         _ => 0.0,
     };
-    score += bloat.bloat_score as f64 * 0.25;
-    score += loop_percent * 0.6;
-    if score > 30.0 {
-        score = 30.0;
+    score += bloat.bloat_score as f64 * (15.0 / 90.0);
+    score += loop_percent.min(50.0) * 0.5;
+    if score > 80.0 {
+        score = 80.0;
     }
     let mut stuck_score = stuck.len() as f64 * 7.0;
     for item in &stuck {
@@ -173,8 +204,11 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         waste_score,
         waste_level,
         total_wasted,
+        wasted_raw,
+        wasted_capped,
+        wasted_percent,
         loop_percent,
-        session_cost: session.metrics.cost_estimated.max(0.0),
+        session_cost,
         summary,
         top_actions,
     }
@@ -199,7 +233,14 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
         .saturating_sub(metrics.tokens_cache_r)
         .max(0);
     let price = pricing::lookup_price(&metrics.model_used);
-    let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
+    // rm-567: the avoidable premium — what a working cache would have
+    // saved on the un-cached input tokens (input minus cache-read
+    // rates) — not the full un-cached input spend, which double-counts
+    // the tokens the session legitimately had to send once. Models
+    // without cache-read pricing (cr == 0) degrade to the full input
+    // rate.
+    let cache_premium_rate = (price.input - price.cr).max(0.0);
+    let wasted_cost = round4(wasted_tokens as f64 / 1e6 * cache_premium_rate);
     let (rating, suggestion) = if hit_rate >= 80.0 {
         (
             "excellent",
@@ -308,11 +349,33 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         level_emoji(report.waste_level),
         waste_level_label(report.waste_level, language)
     ));
-    out.push_str(&format!(
-        "  {}: {}\n",
-        t(language, "Wasted", "浪费成本"),
-        format_cost(report.total_wasted)
-    ));
+    if report.wasted_capped {
+        out.push_str(&format!(
+            "  {}: {} ({} {} - {} {})\n",
+            t(language, "Wasted", "浪费成本"),
+            format_cost(report.total_wasted),
+            t(language, "capped from", "自"),
+            format_cost(report.wasted_raw),
+            t(language, "exceeds session cost", "超过会话成本"),
+            format_cost(report.session_cost)
+        ));
+    } else if report.session_cost > 0.0 {
+        out.push_str(&format!(
+            "  {}: {} ({:.0}% {} {})\n",
+            t(language, "Wasted", "浪费成本"),
+            format_cost(report.total_wasted),
+            report.wasted_percent,
+            t(language, "of session cost", "占会话成本"),
+            format_cost(report.session_cost)
+        ));
+    } else {
+        out.push_str(&format!(
+            "  {}: {} ({})\n",
+            t(language, "Wasted", "浪费成本"),
+            format_cost(report.total_wasted),
+            t(language, "session cost unavailable", "会话成本不可用")
+        ));
+    }
     out.push_str(&format!("  {}\n", waste_summary(report, language)));
     out.push('\n');
     out.push_str(t(language, "  -- Cache --\n", "  -- 缓存 --\n"));
@@ -329,7 +392,11 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
     if report.cache.wasted_cost > 0.0 {
         out.push_str(&format!(
             "  {}: {}\n",
-            t(language, "Cache waste", "缓存浪费"),
+            t(
+                language,
+                "Cache waste (avoidable premium)",
+                "缓存浪费（可避免差价）"
+            ),
             format_cost(report.cache.wasted_cost)
         ));
     }
@@ -649,5 +716,154 @@ mod tests {
         let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
         assert!(rendered.contains("allocated share of session cost"));
         assert!(rendered.contains("75% of session"));
+    }
+
+    fn rm567_session(metrics: Metrics, loop_cost: f64) -> Session {
+        Session {
+            name: "s".to_string(),
+            path: "/tmp/s".to_string(),
+            cwd: String::new(),
+            metrics,
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics {
+                loop_cost: crate::LoopCost {
+                    total_loop_cost: loop_cost,
+                    ..crate::LoopCost::default()
+                },
+                ..crate::Diagnostics::default()
+            },
+        }
+    }
+
+    #[test]
+    fn rm567_red_tier_is_reachable() {
+        // rm-567 golden: before the score re-scale the arithmetic
+        // ceiling was 56 (30 cache + 20 stuck + 6), so the "red" band
+        // (>= 70) and "severe waste" summary were dead code. This
+        // fixture — cacheless priced session + 50% loop waste + severe
+        // bloat + stuck pattern — must reach red.
+        let session = rm567_session(
+            Metrics {
+                model_used: "claude-opus-4.7".to_string(),
+                tokens_input: 1_000_000,
+                tokens_cache_r: 0,
+                cost_estimated: 2.0,
+                assistant_turns: 2,
+                tool_calls_total: 12,
+                tool_usage: std::collections::BTreeMap::from([
+                    ("read".to_string(), 6),
+                    ("write".to_string(), 6),
+                ]),
+                gaps_sec: vec![130.0, 140.0, 150.0],
+                ..Metrics::default()
+            },
+            1.0,
+        );
+        let report = compute_waste_report(&session);
+        assert!(
+            report.waste_score >= 70,
+            "red tier must be reachable, got {}",
+            report.waste_score
+        );
+        assert_eq!(report.waste_level, "red");
+        let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
+        assert!(rendered.contains("severe waste"));
+    }
+
+    #[test]
+    fn rm567_wasted_never_exceeds_session_cost_and_clamp_is_disclosed() {
+        // rm-567 golden: 1M un-cached input tokens on claude-opus-4.7
+        // price at the avoidable premium (input 5.0 - cache_read 0.5 =
+        // 4.5/M => $4.5) plus $1.0 loop cost = $5.5 raw, on a $2.0
+        // session. The report must clamp to the session cost AND say so
+        // — the pre-rm-567 report printed $5.50 of "waste" (197% of
+        // spend) on a session labeled minor waste.
+        let session = rm567_session(
+            Metrics {
+                model_used: "claude-opus-4.7".to_string(),
+                tokens_input: 1_000_000,
+                tokens_cache_r: 0,
+                cost_estimated: 2.0,
+                ..Metrics::default()
+            },
+            1.0,
+        );
+        let report = compute_waste_report(&session);
+        assert!((report.wasted_raw - 5.5).abs() < 1e-6);
+        assert!(report.wasted_capped);
+        assert!((report.total_wasted - 2.0).abs() < 1e-9);
+        assert!((report.wasted_percent - 100.0).abs() < 1e-9);
+        assert!(report.total_wasted <= report.session_cost);
+        let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
+        assert!(rendered.contains("capped from"));
+        assert!(rendered.contains("exceeds session cost"));
+    }
+
+    #[test]
+    fn rm567_wasted_names_its_denominator() {
+        // rm-567: the healthy arm of the Wasted line carries the percent
+        // and the session cost it is measured against.
+        let session = rm567_session(
+            Metrics {
+                model_used: "claude-opus-4.7".to_string(),
+                tokens_input: 1_000_000,
+                tokens_cache_r: 900_000,
+                cost_estimated: 5.0,
+                ..Metrics::default()
+            },
+            0.0,
+        );
+        // premium = 100k un-cached tokens * (5.0 - 0.5)/1e6 = $0.45 = 9%
+        let report = compute_waste_report(&session);
+        assert!(!report.wasted_capped);
+        assert!((report.cache.wasted_cost - 0.45).abs() < 1e-6);
+        assert!((report.wasted_percent - 9.0).abs() < 1e-9);
+        assert_eq!(report.waste_level, "green");
+        let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
+        assert!(rendered.contains("of session cost"));
+        assert!(rendered.contains("Cache waste (avoidable premium)"));
+    }
+
+    #[test]
+    fn rm567_unpriced_session_discloses_missing_denominator() {
+        let session = rm567_session(
+            Metrics {
+                model_used: "unknown-model".to_string(),
+                cost_estimated: 0.0,
+                ..Metrics::default()
+            },
+            1.0,
+        );
+        let report = compute_waste_report(&session);
+        assert!(!report.wasted_capped);
+        assert!((report.total_wasted - 1.0).abs() < 1e-9);
+        let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
+        assert!(rendered.contains("session cost unavailable"));
+    }
+
+    #[test]
+    fn rm567_bloat_no_longer_adds_dollars() {
+        // rm-567 golden: tool bloat only scores — the invented flat 5%
+        // of session cost is gone. Severe bloat (90), zero cache waste,
+        // zero loop cost => Wasted $0.0000 exactly.
+        let session = rm567_session(
+            Metrics {
+                cost_estimated: 10.0,
+                assistant_turns: 2,
+                tool_calls_total: 12,
+                tool_usage: std::collections::BTreeMap::from([
+                    ("read".to_string(), 6),
+                    ("write".to_string(), 6),
+                ]),
+                ..Metrics::default()
+            },
+            0.0,
+        );
+        let report = compute_waste_report(&session);
+        assert_eq!(report.bloat.bloat_score, 90);
+        assert!((report.total_wasted - 0.0).abs() < 1e-9);
+        assert!((report.wasted_raw - 0.0).abs() < 1e-9);
     }
 }

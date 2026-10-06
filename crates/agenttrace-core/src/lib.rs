@@ -494,6 +494,11 @@ pub struct TaskTypeOverview {
 pub struct GroupOverview {
     pub sessions: usize,
     pub cost: f64,
+    /// rm-566: true when any session in this group prices its cost from
+    /// cursor-local data rather than provider-reported usage (cursor
+    /// journals carry no token accounting). Every overview surface
+    /// renders such rows as estimates.
+    pub estimated_cost: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1440,6 +1445,15 @@ fn looks_like_structured_args(args: &str) -> bool {
     args.starts_with('{') || args.starts_with('[')
 }
 
+/// rm-566: cursor journals carry no token accounting, so every dollar
+/// attributed to a cursor session is priced from cursor-local
+/// heuristics rather than provider-reported usage (the recorded
+/// divergence is in docs/guides/cursor-import.md). Rows carrying such
+/// dollars are marked as estimates on every overview surface.
+pub fn session_cost_is_cursor_local(source_tool: &str) -> bool {
+    source_tool == "cursor" || source_tool.starts_with("cursor")
+}
+
 pub fn compute_overview(sessions: &[Session]) -> Overview {
     compute_overview_iter(sessions.iter())
 }
@@ -1460,6 +1474,11 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         let agent_entry = overview.by_agent.entry(agent).or_default();
         agent_entry.sessions += 1;
         agent_entry.cost += session.metrics.cost_estimated;
+        // rm-566: mark the group, not the session — the estimate flag
+        // travels with every aggregate that carries these dollars.
+        if session_cost_is_cursor_local(&session.metrics.source_tool) {
+            agent_entry.estimated_cost = true;
+        }
 
         let model = if session.metrics.model_used.is_empty() {
             "unknown".to_string()
@@ -2997,5 +3016,52 @@ mod tests {
             .line_skips
             .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
         assert_eq!(session.metrics.tokens_input, 500);
+    }
+
+    // ---- rm-566: cursor cost estimate marking ----
+
+    fn session_with_tool(source_tool: &str, cost: f64) -> Session {
+        let mut session = test_session();
+        session.metrics.source_tool = source_tool.to_string();
+        session.metrics.cost_estimated = cost;
+        session
+    }
+
+    #[test]
+    fn rm566_cursor_group_marked_estimated_others_clean() {
+        // Only the group carrying cursor-local dollars is marked; the
+        // flag must not leak to sibling groups in the same overview.
+        let sessions = [
+            session_with_tool("cursor", 5.0),
+            session_with_tool("claude_code", 10.0),
+        ];
+        let overview = compute_overview(&sessions);
+        assert!(overview.by_agent["cursor"].estimated_cost);
+        assert!(!overview.by_agent["claude_code"].estimated_cost);
+    }
+
+    #[test]
+    fn rm566_cursor_alias_prefixes_marked() {
+        // Any cursor-family source tool marks the group; nothing else.
+        for tool in ["cursor", "cursor-agent"] {
+            assert!(session_cost_is_cursor_local(tool), "{tool}");
+        }
+        for tool in ["claude_code", "codex_cli", "copilot_cli", ""] {
+            assert!(!session_cost_is_cursor_local(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn rm566_cursor_group_keeps_sessions_and_cost() {
+        // Marking is additive: the group's arithmetic is unchanged.
+        let sessions = [
+            session_with_tool("cursor", 2.0),
+            session_with_tool("cursor", 3.0),
+        ];
+        let overview = compute_overview(&sessions);
+        let group = &overview.by_agent["cursor"];
+        assert_eq!(group.sessions, 2);
+        assert!((group.cost - 5.0).abs() < 1e-9);
+        assert!(group.estimated_cost);
     }
 }

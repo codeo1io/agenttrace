@@ -122,10 +122,47 @@ fn attr_f64(key: &str, value: f64) -> KeyValue {
     }
 }
 
-/// Best-effort `gen_ai.system` inference from the session log's path.
-/// The loaded [`Session`] model does not carry the source family at this
-/// revision, so we fall back to path markers for the common agent CLIs
-/// and `"other"` when nothing matches.
+/// `gen_ai.system` for a session, derived from the authoritative source
+/// family the loader recorded on the journal (`metrics.source_tool`) —
+/// every parser sets it from the session's own content — with path-marker
+/// inference only as the fallback for sessions that carry no family
+/// (empty or `generic`). rm-568: deriving from the path alone mislabeled
+/// `--dir`-loaded sessions (a Claude session at any arbitrary path
+/// exported `gen_ai.system: other`) and let a foreign directory name
+/// re-label a session (a Claude journal under `.../cursor-backup/`
+/// exported `cursor`). A known-but-unmapped harness (pi family, hermes,
+/// workbuddy, openclaw, …) has no semconv system value and reports
+/// `"other"` from the authoritative record instead of a path guess.
+pub fn gen_ai_system_for(source_tool: &str, path: &str) -> &'static str {
+    const TOOL_TO_SYSTEM: &[(&str, &str)] = &[
+        ("claude_code", "claude-code"),
+        ("claude_code_jsonl", "claude-code"),
+        ("codex_cli", "codex"),
+        ("codex_rollout", "codex"),
+        ("gemini_cli", "gemini-cli"),
+        ("qwen_code", "qwen-code"),
+        ("kimi_cli", "kimi"),
+        ("opencode", "opencode"),
+        ("opencode_db", "opencode"),
+        ("cursor", "cursor"),
+        ("cline", "cline"),
+        ("aider", "aider"),
+        ("copilot_cli", "copilot"),
+    ];
+    let tool = source_tool.trim();
+    if !tool.is_empty() && tool != "generic" {
+        return TOOL_TO_SYSTEM
+            .iter()
+            .find(|(key, _)| *key == tool)
+            .map(|(_, system)| *system)
+            .unwrap_or("other");
+    }
+    infer_gen_ai_system(path)
+}
+
+/// Path-marker inference for the fallback arm of
+/// [`gen_ai_system_for`]: markers for the common agent CLIs and `"other"`
+/// when nothing matches.
 fn infer_gen_ai_system(path: &str) -> &'static str {
     const MARKERS: &[(&str, &str)] = &[
         ("claude", "claude-code"),
@@ -206,7 +243,10 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
         start_time_unix_nano: start,
         end_time_unix_nano: end,
         attributes: vec![
-            attr_str("gen_ai.system", infer_gen_ai_system(&session.path)),
+            attr_str(
+                "gen_ai.system",
+                gen_ai_system_for(&session.metrics.source_tool, &session.path),
+            ),
             attr_str("gen_ai.request.model", metrics.model_used.clone()),
             attr_int("gen_ai.usage.input_tokens", metrics.tokens_input),
             attr_int("gen_ai.usage.output_tokens", metrics.tokens_output),
@@ -276,6 +316,55 @@ pub fn report_otel_export(sessions: &[Session]) -> String {
 /// system by [`infer_gen_ai_system`] — exposed for tests.
 pub fn gen_ai_system_for_path(path: &Path) -> &'static str {
     infer_gen_ai_system(&path.to_string_lossy())
+}
+
+#[cfg(test)]
+mod gen_ai_system_tests {
+    use super::*;
+
+    #[test]
+    fn source_family_wins_over_path_markers() {
+        // rm-568: the recorded family is authoritative — a foreign marker
+        // in the path must not re-label the session, and an arbitrary
+        // `--dir` path must not erase it.
+        assert_eq!(
+            gen_ai_system_for("claude_code", "/any/dir/x.jsonl"),
+            "claude-code"
+        );
+        assert_eq!(
+            gen_ai_system_for("claude_code", "/logs/cursor-backup/x.jsonl"),
+            "claude-code"
+        );
+        assert_eq!(
+            gen_ai_system_for("cursor", "/home/u/.claude/x.jsonl"),
+            "cursor"
+        );
+        assert_eq!(
+            gen_ai_system_for("copilot_cli", "/tmp/span-export.jsonl"),
+            "copilot"
+        );
+    }
+
+    #[test]
+    fn known_but_unmapped_families_report_other_not_a_path_guess() {
+        assert_eq!(gen_ai_system_for("pi", "/home/u/.claude/s.jsonl"), "other");
+        assert_eq!(
+            gen_ai_system_for("hermes_json", "/logs/codex/s.jsonl"),
+            "other"
+        );
+    }
+
+    #[test]
+    fn family_less_sessions_fall_back_to_path_markers() {
+        // Legacy exports with no recorded family keep the historical
+        // path-marker inference.
+        assert_eq!(
+            gen_ai_system_for("", "/home/u/.claude/x.jsonl"),
+            "claude-code"
+        );
+        assert_eq!(gen_ai_system_for("generic", "/logs/codex/x.jsonl"), "codex");
+        assert_eq!(gen_ai_system_for("generic", "/tmp/nothing.jsonl"), "other");
+    }
 }
 
 #[cfg(test)]

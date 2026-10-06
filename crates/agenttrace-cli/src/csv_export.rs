@@ -246,6 +246,7 @@ mod tests {
             agenttrace_core::GroupOverview {
                 sessions: 2,
                 cost: 2.0,
+                estimated_cost: false,
             },
         );
         let out = overview_csv(&overview);
