@@ -107,9 +107,11 @@ struct Args {
     /// `weekly_budget_usd` (rm-385).
     #[arg(long, value_name = "USD")]
     weekly_budget: Option<f64>,
-    /// Show the weekly budget window-burn view: per-day spend from
-    /// the statusline journal against the resolved weekly budget
-    /// (rm-385).
+    /// Show the weekly budget window-burn view: per-day spend over
+    /// the last 7 calendar days (UTC-bounded window — captures older
+    /// than the cutoff count zero, even when they are the newest
+    /// samples) from the statusline journal, against the resolved
+    /// weekly budget (rm-385, rm-628).
     #[arg(long)]
     budget: bool,
     #[arg(long)]
