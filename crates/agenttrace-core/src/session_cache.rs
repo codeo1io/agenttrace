@@ -12,14 +12,20 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
 // reasoning_output_tokens into output, Copilot session.shutdown keeps one
 // cumulative snapshot per model with cache subtracted from input, the OTEL
 // arm gates usage on per-request chat spans and accepts both cache-attribute
-// spellings, WorkBuddy counts every (messageId, usage) pair, Qwen switches
-// to first-number semantics with cached reads subtracted from input, and
-// opencode folds its reasoning counter into output. Gemini-format support
-// is gone entirely. Warm v22 entries carry the pre-port totals this batch
-// exists to correct (rm-230 convention), so they regenerate once. Upstream
-// renumbered 23 (their #311) and 24 (their #312) in one release; the fork
-// takes both in a single step and reserves 23 unused so the numbers stay
-// aligned with upstream from here on.
+// spellings, WorkBuddy counts every usage record once deduplicated by
+// messageId (upstream #311), Qwen switches to first-number semantics with
+// cached reads subtracted from input, and opencode folds its reasoning
+// counter into output. Gemini-format support is gone entirely. Warm v22
+// entries carry the pre-port totals this batch exists to correct (rm-230
+// convention), so they regenerate once — pinned by the test below.
+// Numbering is fork-local, not upstream-mirrored: upstream's own counter
+// moved 24 -> 25 (their #311) and 25 -> 26 (their #312, "cache schema
+// v26" in the v0.10.1 release notes), while the fork jumps 22 -> 24 and
+// leaves 23 reserved unused — 23 is already content-claimed by a sibling
+// change landing in this repository's integration order, so taking it
+// here would collide at merge time. Version numbers only gate
+// invalidation inside one lineage, so the divergence from upstream's
+// counter is deliberate and harmless.
 // Bumped 21 -> 22 (integration of run 2c2db6f5, rm-400/rm-401): the
 // kimi_cli usage-alias fix and the Codex compaction pairing fix change
 // reported totals for unchanged files, so warm v21 entries carry the
@@ -49,6 +55,12 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 24;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
+// Deliberate fork-local divergence (rm-517): upstream's SQLITE_SNAPSHOT
+// schema stayed 6 through v0.10.1; the fork is at 7 because rm-198's
+// ok/fail-from-messages-table semantics are fork-only. The constants gate
+// different snapshot shapes and are not expected to match, and this batch
+// changes no DB-derived metrics, so 7 stays. The session-journal bump
+// above (22 -> 24) is what forces re-parse of the corrected totals.
 const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
@@ -2362,6 +2374,66 @@ mod tests {
             cache.raw_entries.len(),
             1,
             "an unstamped legacy journal is accepted, not mass-invalidated"
+        );
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v22_journals_from_before_the_token_accounting_port_regenerate_once() {
+        // rm-517: journals written before the upstream #312/v0.10.1
+        // token-accounting port carry the pre-port totals (unfolded CC
+        // streams, summed codex running totals, keep-one workbuddy usage,
+        // doubled copilot shutdowns). The 22 -> 24 bump must discard them
+        // on first load and mark the journal dirty so the corrected
+        // entries re-parse and re-persist — not serve the stale numbers.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-v22-journal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("sessions.json");
+        // The entry path must exist on disk or load-time pruning would
+        // remove it for an unrelated reason.
+        let session_file = root.join("session.jsonl");
+        fs::write(&session_file, b"{}\n").expect("write session file");
+        let doc = serde_json::json!({
+            "schema_version": 22,
+            "entries": {
+                session_file.to_string_lossy().to_string(): {
+                    "mod_time": 1,
+                    "size": 1,
+                }
+            },
+            "dirs": {},
+        });
+        fs::write(
+            &journal,
+            serde_json::to_string(&doc).expect("serialize journal"),
+        )
+        .expect("write journal");
+
+        // Shared env lock (see lib.rs `test_env`): the loader reads env
+        // for its cache dir.
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.raw_entries.len(),
+            0,
+            "a v22 journal must be discarded, not served"
+        );
+        assert!(
+            cache.dirty,
+            "the discard must mark the journal dirty so corrected entries persist"
         );
 
         match prior_cache {

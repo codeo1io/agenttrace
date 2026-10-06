@@ -110,7 +110,8 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
-# The ref is the installer's pinned default (v0.9.0, rm-051) or whatever
+# The ref is the installer's pinned default (a literal vX.Y.Z, held to the
+# newest tag by check-install-drift.sh — rm-051/rm-516) or whatever
 # AGENTTRACE_SOURCE_REF names, so the fallback never has to resolve
 # api.github.com in an offline run.
 shims="$tmp/shims"
@@ -149,8 +150,11 @@ grep -q "pinned ref" "$out" ||
 	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
-grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
-	fail "test D: install receipt must record the default pinned ref (rm-051)"
+default_ref=$(sed -n 's/^REF="${AGENTTRACE_SOURCE_REF:-\(v[0-9][^"]*\)}"$/\1/p' install.sh)
+[ -n "$default_ref" ] ||
+	fail "test D: install.sh REF default is not a literal pinned tag (rm-051/rm-516)"
+grep -q "^ref=$default_ref$" "$tmp/d-receipt" ||
+	fail "test D: install receipt must record the default pinned ref $default_ref (rm-051; the pin itself is held to the newest tag by check-install-drift.sh, rm-516)"
 
 # — test E: the fallback clones a PINNED ref, never a moving default
 #   branch (rm-051) — this fake git refuses an unpinned clone and
@@ -194,9 +198,9 @@ if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
 	cat "$out" >&2
 	fail "test E: pinned source build must succeed"
 fi
-grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
-	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
-grep -q "pinned ref v0.9.0" "$out" ||
+grep -q "^clone --branch $default_ref$" "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch $default_ref (the pinned default ref)"
+grep -q "pinned ref $default_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"

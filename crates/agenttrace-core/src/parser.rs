@@ -798,8 +798,12 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     }
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
-    // `messageId` identifies a turn; one usage event per turn, but every record
-    // counts (the CLI reports final usage per message, not a running total; #311).
+    // `messageId` identifies a turn: one usage event per turn, counted once
+    // (upstream #311: the CLI writes the turn's usage both in the initial
+    // record and again in its completion/shutdown record with different
+    // running numbers — keying on (messageId, usage-shape) counted the turn
+    // twice, the 9,588-vs-6,102 overcount; key on messageId alone). Records
+    // without an id count as-is, matching upstream.
     let mut seen_usage = BTreeSet::new();
     for entry in objs.iter() {
         if let Some(next) = entry
@@ -822,7 +826,7 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 .and_then(|provider_data| provider_data.get("messageId"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if seen_usage.insert((message_id.to_string(), format!("{usage:?}"))) {
+            if message_id.is_empty() || seen_usage.insert(message_id.to_string()) {
                 let timestamp = timestamp.clone();
                 events.insert(
                     0,

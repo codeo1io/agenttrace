@@ -32,6 +32,16 @@
 
 One `agenttrace` binary provides both interfaces: run it without a report action to open the TUI, or pass flags such as `--sessions` and `--overview` for CLI output.
 
+> **Token totals changed with the v0.10.1 accounting alignment.** Per-agent token
+> accounting follows upstream's v0.10.1 reference semantics, so totals move compared
+> with earlier builds: **Claude Code** and **Codex** totals are generally *lower*
+> (streaming repeats fold per message id, repeated running totals count once, and
+> reasoning tokens are a breakdown of output rather than an addition), **WorkBuddy**
+> totals are *higher* (every per-request usage record counts once, deduplicated by
+> message id), and **Copilot** totals stop double-counting resume snapshots and
+> `invoke_agent` wrapper-span repeats. The first run after upgrading rebuilds the
+> session cache once under the corrected totals.
+
 ## Why agenttrace?
 
 AI coding agents now behave like small build systems: they call tools, retry, stall, and spend tokens while you only see the final answer.
@@ -100,6 +110,12 @@ tag or a full commit id; a commit-id pin is fetched directly and verified
 against the pin), and records what it built in an install receipt
 (`repo`, `ref`, and the exact `commit`) so the fallback install stays
 auditable after the fact.
+
+Both installers pin instead of drifting, and both take the pin from the
+environment: `AGENTTRACE_SOURCE_REF` (POSIX) and `AGENTTRACE_VERSION`
+(Windows) install exactly that tag or commit instead of the installer's
+current default, so CI and air-gapped hosts never re-resolve "latest" at
+install time.
 
 ## Quickstart
 

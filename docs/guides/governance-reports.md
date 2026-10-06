@@ -74,8 +74,7 @@ versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, to 22 when per-format usage accounting was corrected —
 kimi_cli wire aliases and Codex compaction usage records — and to 24 with
-the upstream #312/v0.10.1 token-accounting alignment, which renumbered
-past upstream's intermediate 23 in a single step so cached sessions
+the upstream #312/v0.10.1 token-accounting alignment so cached sessions
 regenerate under the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify

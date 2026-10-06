@@ -172,8 +172,8 @@ fn token_accounting_qwen_aliases_are_first_number_and_cache_is_subtracted() {
 
 #[test]
 fn token_accounting_workbuddy_counts_every_distinct_turn_usage() {
-    // Upstream #311 golden: every record's usage counts once per (messageId,
-    // usage) — the function_call and the assistant message are separate turns
+    // Upstream #311 golden: every turn's usage counts once per messageId —
+    // the function_call and the assistant message are separate turns
     // (100-60 + 120-80 = 80 input, 20+30 output, 60+80 cached reads).
     let path = write_session(
         "agenttrace-ta-workbuddy",
@@ -190,6 +190,31 @@ fn token_accounting_workbuddy_counts_every_distinct_turn_usage() {
     assert_eq!(parsed.metrics.tokens_input, 80);
     assert_eq!(parsed.metrics.tokens_output, 50);
     assert_eq!(parsed.metrics.tokens_cache_r, 140);
+}
+
+#[test]
+fn token_accounting_workbuddy_turn_usage_counts_once_across_rewrites() {
+    // Upstream #311 golden (the 6,102-vs-9,588 class): the same turn
+    // (messageId) writes its usage twice — the initial record and the
+    // completion/shutdown record — with different running numbers. Keying
+    // on (messageId, usage-shape) counted both rewrites; the turn counts
+    // once, first record wins. Input is net of cached reads
+    // (1_000-940 = 60).
+    let path = write_session(
+        "agenttrace-ta-workbuddy-rewrite",
+        "workbuddy.jsonl",
+        concat!(
+            r#"{"type":"function_call","sessionId":"s1","cwd":"/repo","callId":"call_1","name":"read","arguments":"{}","timestamp":1764750001000,"providerData":{"messageId":"m1","model":"workbuddy-x"},"message":{"usage":{"inputTokens":1000,"outputTokens":100,"cacheReadTokens":940}}}"#,
+            "\n",
+            r#"{"type":"message","sessionId":"s1","cwd":"/repo","role":"assistant","timestamp":1764750002000,"providerData":{"messageId":"m1","model":"workbuddy-x"},"content":[{"type":"text","text":"done"}],"message":{"usage":{"inputTokens":1500,"outputTokens":160,"cacheReadTokens":940}}}"#,
+            "\n",
+        ),
+    );
+    let parsed = parse_file(&path).expect("parse");
+    assert_eq!(parsed.metrics.source_tool, "workbuddy");
+    assert_eq!(parsed.metrics.tokens_input, 60);
+    assert_eq!(parsed.metrics.tokens_output, 100);
+    assert_eq!(parsed.metrics.tokens_cache_r, 940);
 }
 
 #[test]

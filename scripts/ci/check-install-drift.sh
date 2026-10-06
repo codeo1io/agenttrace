@@ -47,8 +47,20 @@ done
 grep -q 'RuntimeInformation' install.ps1 || err "install.ps1: primary architecture probe missing"
 
 # --- version pinning hooks on both platforms ---
-grep -q 'AGENTTRACE_VERSION' install.ps1 || err "install.ps1: AGENTTRACE_VERSION pinning hook missing"
+grep -q '\$env:AGENTTRACE_VERSION' install.ps1 ||
+    err "install.ps1: AGENTTRACE_VERSION pinning hook missing (a comment alone is not a hook)"
 grep -q 'AGENTTRACE_SOURCE_REF' install.sh || err "install.sh: AGENTTRACE_SOURCE_REF pinning hook missing"
+
+# --- install.sh download integrity (parity with check-install-runtime,
+#     which exercises behavior; this catches silent deletion only) ---
+grep -q 'CHECKSUM_URL' install.sh ||
+    err "install.sh: checksum sidecar verification missing (.sha256 parity with release.yml)"
+grep -q 'sha256sum' install.sh ||
+    err "install.sh: sha256 verification of the downloaded asset missing"
+grep -q 'cannot verify the download, not installing' install.sh ||
+    err "install.sh: missing-sha256-tool refusal missing"
+grep -q 'refusing to build an unverified master tip' install.sh ||
+    err "install.sh: unresolvable-pin refusal (never build a floating master tip) missing"
 
 if [ "$fail" -ne 0 ]; then
     exit 1
