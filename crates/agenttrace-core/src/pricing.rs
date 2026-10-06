@@ -395,7 +395,27 @@ fn pricing_source_for_catalog(
             })
             .unwrap_or_else(|| "user override".to_string())
     } else if normalized != resolved {
-        format!("{} via user override alias", catalog_source(catalog))
+        // rm-511: an alias override supplies identity, not a rate — the
+        // session still prices at catalog rates, so a vendor-retired
+        // target carries the plain-catalog arm's retirement disclosure,
+        // "(rate unverified)" included (unlike the direct arm above,
+        // whose rate the user set themselves).
+        let deprecated = catalog
+            .reference_date
+            .zip(catalog.entries.get(&key))
+            .filter(|(reference, price)| past_deprecated(price, *reference))
+            .map(|(_, price)| {
+                format!(
+                    "; model deprecated {} (rate unverified)",
+                    price.deprecation_date.as_deref().unwrap_or("unknown date")
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "{} via user override alias{}",
+            catalog_source(catalog),
+            deprecated
+        )
     } else if let Some(reference) = catalog.reference_date {
         // Deprecation disclosure (rm-419): a session priced on a model
         // the vendor has already retired (per this catalog's vintage)
@@ -1958,6 +1978,136 @@ mod tests {
         assert!(
             pricing_source_for_catalog("alias-model", &catalog, &overrides)
                 .contains("via user override alias")
+        );
+    }
+
+    #[test]
+    fn pricing_source_alias_arm_discloses_deprecation_like_the_plain_arm() {
+        // rm-511 golden: all three arms of pricing_source_for_catalog
+        // carry the retirement disclosure when the catalog model is past
+        // its vendor deprecation date (per the catalog's own vintage).
+        // The alias arm prices at catalog rates — the override file
+        // supplies identity only — so its clause is the plain arm's,
+        // "(rate unverified)" included; the direct arm (rm-419) keeps
+        // its qualifier-free clause because that rate is the user's own.
+        let retired = || Price {
+            deprecation_date: Some("2025-01-01".to_string()),
+            ..Price::default()
+        };
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([("retired-model".to_string(), retired())]),
+            aliases: BTreeMap::from([("my-alias".to_string(), "retired-model".to_string())]),
+            source: "cache".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: Some(2026_1004),
+        };
+        // Plain catalog arm.
+        assert_eq!(
+            pricing_source_for_catalog("retired-model", &catalog, &BTreeSet::new()),
+            "LiteLLM (cached catalog); 1 of 1 priced models past vendor deprecation; \
+             model deprecated 2025-01-01 (rate unverified)"
+        );
+        // Direct user-rate arm keeps the rm-419 clause.
+        let overrides = BTreeSet::from(["retired-model".to_string()]);
+        assert_eq!(
+            pricing_source_for_catalog("retired-model", &catalog, &overrides),
+            "user override; model deprecated 2025-01-01"
+        );
+        // Alias arm (the rm-511 fix): same clause as the plain arm.
+        assert_eq!(
+            pricing_source_for_catalog("my-alias", &catalog, &BTreeSet::new()),
+            "LiteLLM (cached catalog); 1 of 1 priced models past vendor deprecation \
+             via user override alias; model deprecated 2025-01-01 (rate unverified)"
+        );
+        // A non-deprecated alias target stays qualifier-free, and a
+        // catalog without a vintage can declare nothing deprecated.
+        let fresh = PricingCatalog {
+            entries: BTreeMap::from([("fresh-model".to_string(), Price::default())]),
+            aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
+            source: "cache".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: Some(2026_1004),
+        };
+        assert_eq!(
+            pricing_source_for_catalog("my-alias", &fresh, &BTreeSet::new()),
+            "LiteLLM (cached catalog) via user override alias"
+        );
+        let undated = PricingCatalog {
+            entries: BTreeMap::from([("fresh-model".to_string(), Price::default())]),
+            aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
+            source: "cache".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        assert_eq!(
+            pricing_source_for_catalog("my-alias", &undated, &BTreeSet::new()),
+            "LiteLLM (cached catalog) via user override alias"
+        );
+    }
+
+    #[test]
+    fn override_alias_file_discloses_retired_target_end_to_end() {
+        // rm-511 fixture: an AGENTTRACE_PRICING_FILE that maps an alias
+        // onto a vendor-retired catalog model must surface the
+        // retirement disclosure end-to-end — load_pricing_overrides ->
+        // aliases extended into the catalog -> pricing_source_for_catalog.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-alias-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let override_file = root.join("pricing.json");
+        std::fs::write(
+            &override_file,
+            serde_json::json!({
+                "aliases": {"my-alias": "wide-retired"}
+            })
+            .to_string(),
+        )
+        .expect("write override file");
+
+        let mut catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "wide-retired".to_string(),
+                    Price {
+                        input: 3.0,
+                        output: 15.0,
+                        max_input_tokens: Some(1_000_000),
+                        deprecation_date: Some("2025-01-01".to_string()),
+                        ..Price::default()
+                    },
+                ),
+                ("current-model".to_string(), Price::default()),
+            ]),
+            aliases: BTreeMap::new(),
+            source: "cache".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: Some(2026_1004),
+        };
+
+        let _env = crate::test_env::lock_env();
+        let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
+        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        let override_models = apply_pricing_overrides(&mut catalog);
+        match prior_file {
+            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
+            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            override_models.is_empty(),
+            "an aliases-only file overrides no rates directly"
+        );
+        assert_eq!(
+            pricing_source_for_catalog("my-alias", &catalog, &override_models),
+            "LiteLLM (cached catalog); 1 of 2 priced models past vendor deprecation \
+             via user override alias; model deprecated 2025-01-01 (rate unverified)",
+            "an alias onto a retired model keeps the retirement disclosure \
+             (pricing_source_reported the catalog source with no clause before rm-511)"
         );
     }
 
