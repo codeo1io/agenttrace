@@ -791,6 +791,135 @@ fn rust_counts_copilot_usage_checkpoint_on_open_sessions() {
 }
 
 #[test]
+fn rust_copilot_partial_shutdown_keeps_checkpoint_only_models() {
+    // rm-584 (run fb1addd5): a resumed Copilot session can shut down
+    // with a PARTIAL modelMetrics map — only the post-resume model
+    // reported — while an earlier usage_checkpoint carried the whole
+    // picture (ccusage #1823, still open ecosystem-wide; our rm-485
+    // landed the same-shape fix for the credit counter). The old
+    // freshest-snapshot-wins supersession erased the checkpoint-only
+    // model wholesale: no tokens, no by_provider_model row, no
+    // disclosure (assess PoC pocA: claude-x's 280 tokens vanished).
+    // Per-model usage now folds with MAX semantics across every
+    // checkpoint plus the shutdown, mirroring the credit fold.
+    let root = temp_root("agenttrace-rust-copilot-partial-shutdown");
+    fs::create_dir_all(&root).expect("create copilot temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"user.message","timestamp":"2026-05-07T10:00:01Z","data":{"content":"resume please"}}
+{"type":"session.usage_checkpoint","timestamp":"2026-05-07T10:05:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":100,"outputTokens":20}},"claude-x":{"usage":{"inputTokens":180,"outputTokens":10}}},"totalNanoAiu":200000000000}}
+{"type":"session.shutdown","timestamp":"2026-05-07T10:06:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":100,"outputTokens":20}}},"totalNanoAiu":200000000000}}
+"#,
+    )
+    .expect("write copilot partial-shutdown session");
+
+    let parsed = parse_file(&path).expect("parse copilot partial-shutdown session");
+    assert_eq!(parsed.metrics.source_tool, "copilot_cli");
+    // The checkpoint-only model survives the partial shutdown:
+    // 100 (gpt-5.4) + 180 (claude-x).
+    assert_eq!(parsed.metrics.tokens_input, 280);
+    assert_eq!(parsed.metrics.tokens_output, 30);
+    // The credit fold is unchanged: max(2.0, 2.0) = 2.0.
+    assert!((parsed.metrics.credit_usd - 2.0).abs() < 1e-9);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_copilot_partial_checkpoint_cannot_erase_a_richer_earlier_one() {
+    // rm-584: the same loss without a shutdown — a fresher PARTIAL
+    // checkpoint used to replace the richer earlier snapshot wholesale
+    // (assess PoC pocA2). The fold keeps claude-x's 180 input tokens
+    // and takes gpt-5.4's per-key max (120 — not the 220 a sum would
+    // report), so overlap still never double-counts.
+    let root = temp_root("agenttrace-rust-copilot-partial-checkpoint");
+    fs::create_dir_all(&root).expect("create copilot temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"user.message","timestamp":"2026-05-07T10:00:01Z","data":{"content":"still working"}}
+{"type":"session.usage_checkpoint","timestamp":"2026-05-07T10:05:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":100,"outputTokens":20}},"claude-x":{"usage":{"inputTokens":180,"outputTokens":10}}},"totalNanoAiu":300000000000}}
+{"type":"session.usage_checkpoint","timestamp":"2026-05-07T10:10:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":120,"outputTokens":25}}},"totalNanoAiu":300000000000}}
+"#,
+    )
+    .expect("write copilot partial-checkpoint session");
+
+    let parsed = parse_file(&path).expect("parse copilot partial-checkpoint session");
+    assert_eq!(parsed.metrics.source_tool, "copilot_cli");
+    // claude-x kept: 120 (gpt-5.4 max) + 180 (claude-x).
+    assert_eq!(parsed.metrics.tokens_input, 300);
+    assert_eq!(parsed.metrics.tokens_output, 35);
+    assert!((parsed.metrics.credit_usd - 3.0).abs() < 1e-9);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_copilot_repeated_identical_checkpoints_never_double_count() {
+    // rm-485 landed MAX for the credit counter; rm-584 extends the
+    // same guarantee to the per-model fold: re-emitted identical
+    // checkpoints (overlap is the norm, ccusage #1824) keep the same
+    // totals instead of doubling them.
+    let root = temp_root("agenttrace-rust-copilot-repeat-checkpoint");
+    fs::create_dir_all(&root).expect("create copilot temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"session.usage_checkpoint","timestamp":"2026-05-07T10:05:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":100,"outputTokens":20}}},"totalNanoAiu":100000000000}}
+{"type":"session.usage_checkpoint","timestamp":"2026-05-07T10:10:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":100,"outputTokens":20}}},"totalNanoAiu":100000000000}}
+"#,
+    )
+    .expect("write copilot repeat-checkpoint session");
+
+    let parsed = parse_file(&path).expect("parse copilot repeat-checkpoint session");
+    assert_eq!(parsed.metrics.tokens_input, 100, "MAX fold, not a sum");
+    assert_eq!(parsed.metrics.tokens_output, 20);
+    assert!((parsed.metrics.credit_usd - 1.0).abs() < 1e-9);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_copilot_empty_shutdown_keeps_checkpoint_tokens_and_credit_floor() {
+    // rm-584 + rm-485 composed (assess PoC pocA3): a shutdown with
+    // EMPTY modelMetrics used to suppress the checkpoint's per-model
+    // usage even though the session-wide credit counter carried the
+    // truth — tokens reported $0.0012 where the credit floor alone
+    // was ~$1.2 on the live specimen. Both arms hold at once now:
+    // tokens from the folded checkpoints, cost floored at the credit
+    // maximum (310 tokens cannot out-price $7 at any catalog rate).
+    let root = temp_root("agenttrace-rust-copilot-empty-shutdown-floor");
+    fs::create_dir_all(&root).expect("create copilot temp dir");
+    let path = root.join("events.jsonl");
+    fs::write(
+        &path,
+        r#"{"type":"session.start","timestamp":"2026-05-07T10:00:00Z","data":{"context":{"cwd":"/tmp/copilot"}}}
+{"type":"user.message","timestamp":"2026-05-07T10:00:01Z","data":{"content":"resume please"}}
+{"type":"session.usage_checkpoint","timestamp":"2026-05-07T10:05:00Z","data":{"modelMetrics":{"gpt-5.4":{"usage":{"inputTokens":100,"outputTokens":20}},"claude-x":{"usage":{"inputTokens":180,"outputTokens":10}}},"totalNanoAiu":500000000000}}
+{"type":"session.shutdown","timestamp":"2026-05-07T10:06:00Z","data":{"modelMetrics":{},"totalNanoAiu":700000000000}}
+"#,
+    )
+    .expect("write copilot empty-shutdown session");
+
+    let parsed = parse_file(&path).expect("parse copilot empty-shutdown session");
+    assert_eq!(parsed.metrics.source_tool, "copilot_cli");
+    assert_eq!(parsed.metrics.tokens_input, 280);
+    assert_eq!(parsed.metrics.tokens_output, 30);
+    assert!((parsed.metrics.credit_usd - 7.0).abs() < 1e-9);
+    assert!((parsed.metrics.cost_estimated - 7.0).abs() < 1e-6);
+    assert_eq!(
+        parsed.metrics.provenance.cost,
+        "calculated_from_copilot_credits"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_attributes_meta_only_sessions_to_their_family() {
     // rm-490: a session whose every event is meta (a codex journal of pure
     // token_usage_record lines) used to end with source_tool "" and render
@@ -979,7 +1108,9 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v27 (integration of run b1ff12f8, rm-542 Codex custom-tools
+        // v28 (run fb1addd5 rm-584/rm-585 — the Copilot per-model
+        // MAX fold and the Codex custom-tool failure re-pair; v27 was
+        // integration of run b1ff12f8, rm-542 Codex custom-tools
         // parse coverage, re-based off the campaign's 22 -> 23 bump;
         // 26 was the rm-485 copilot session-wide credit accounting,
         // 25 the rm-450 workbuddy input-basis disclosure, 24 the
@@ -988,7 +1119,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1153,14 +1284,16 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v27 — see the rm-542, rm-485, rm-450,
-        // rm-436/437/438, rm-408 and rm-400/401 bump notes in
-        // session_cache.rs; the Codex custom-tools parse coverage is
-        // what carried 26 -> 27 at this integration, re-based off the
-        // campaign's 22 -> 23 bump).
+        // version (v28 — see the rm-584/rm-585, rm-542, rm-485,
+        // rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes in
+        // session_cache.rs; the Copilot per-model MAX fold and the
+        // Codex failure re-pair carried 27 -> 28, on top of the
+        // Codex custom-tools parse coverage that carried 26 -> 27 at
+        // the b1ff12f8 integration, re-based off the campaign's
+        // 22 -> 23 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
