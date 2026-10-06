@@ -353,6 +353,88 @@ fn upstream_remote_env_override_is_honored() {
 }
 
 #[test]
+fn hostile_upstream_bytes_render_zero_control_bytes() {
+    // rm-594, end-to-end replay of the assess PoC fixture
+    // /tmp/at-assess-59bc/osc: a fork tracking a hostile upstream
+    // whose commit subjects carry a BEL-terminated OSC-52 clipboard
+    // write and a CSI SGR hijack, with a hostile OSC-8 URL as the
+    // remote's address. Before the fix the offline text view emitted
+    // the raw sequences (od-verified: ESC ] 5 2 ; at offset 0600,
+    // ESC [ 3 1 m at 0662) while `-f json` escaped them — the text arm
+    // now neutralizes control bytes, the JSON arm keeps exact bytes.
+    let fixture = Fixture::new("hostile");
+    let osc52 = "pwn\u{1b}]52;c;aGVsbG8=\u{7}OSC52clip";
+    let csi = "\u{1b}[31mREDTEXT\u{1b}[0m CSI-sgr hijack";
+    fixture.upstream_commit("h1.txt", osc52);
+    fixture.upstream_commit("h2.txt", csi);
+    // Fetch first (the URL must stay resolvable while fetching), then
+    // repoint the remote at a hostile address — the offline view only
+    // reads it back through `git remote get-url`.
+    fixture.fetch();
+    let hostile_url = "\u{1b}]8;;https://evil.example\u{1b}\\remote\u{1b}]8;;\u{7}";
+    git(
+        &fixture.fork,
+        &["remote", "set-url", "upstream", hostile_url],
+    );
+
+    let output = run_cli(&fixture.fork, &["upstream"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.chars().all(|c| !c.is_control() || c == '\n'),
+        "text view must carry no control bytes besides newlines: {text:?}"
+    );
+    assert!(!text.contains(osc52) && !text.contains(csi));
+    assert!(text.contains('\u{FFFD}'), "control bytes become U+FFFD");
+    assert!(text.contains("REDTEXT") && text.contains("OSC52clip"));
+
+    // The JSON arm is unchanged: control bytes round-trip verbatim
+    // behind serde's lossless \u001b escaping, so scripting consumers
+    // keep the exact upstream strings.
+    let json_output = run_cli(&fixture.fork, &["-f", "json", "upstream"]);
+    assert!(json_output.status.success(), "{}", stderr(&json_output));
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout(&json_output)).expect("stdout parses as JSON");
+    assert_eq!(value["remote_url"], hostile_url);
+    let subjects: Vec<&str> = value["unported_commits"]
+        .as_array()
+        .expect("unported list")
+        .iter()
+        .map(|commit| commit["subject"].as_str().expect("subject"))
+        .collect();
+    assert!(
+        subjects.contains(&osc52),
+        "json keeps the raw OSC-52 subject"
+    );
+    assert!(subjects.contains(&csi), "json keeps the raw CSI subject");
+}
+
+#[test]
+fn benign_repo_text_output_is_byte_stable() {
+    // rm-594 byte-stability contract, end to end: on a benign repo
+    // the render boundary is the identity — every subject, the remote
+    // URL, and the whole report render the exact bytes the docs
+    // sample output promises, with no replacement character anywhere.
+    let fixture = Fixture::new("benignstable");
+    let benign_subject = "upstream: parser fix (#287) — [tab-safe] {json} <xml>";
+    fixture.fork_commit("fork.txt", "fork: local work");
+    fixture.upstream_commit("crates/agenttrace-core/src/parser.rs", benign_subject);
+    fixture.fetch();
+
+    let output = run_cli(&fixture.fork, &["upstream"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(!text.contains('\u{FFFD}'), "benign repo renders no U+FFFD");
+    assert!(
+        text.chars().all(|c| !c.is_control() || c == '\n'),
+        "benign repo carries no control bytes to begin with"
+    );
+    assert!(text.contains(&format!("({})", fixture.bare.to_string_lossy())));
+    assert!(text.contains("base: shared history"));
+    assert!(text.contains(benign_subject));
+}
+
+#[test]
 fn fetch_flag_without_the_upstream_command_is_rejected() {
     // --fetch only means something for `agenttrace upstream`; a stray
     // --fetch must fail loudly instead of silently reporting stale
