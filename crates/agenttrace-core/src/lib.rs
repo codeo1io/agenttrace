@@ -2975,8 +2975,20 @@ mod tests {
                 .get("workbuddy_input_basis:zeroed_suspected_mismatch"),
             Some(&1)
         );
+        // rm-542 (upstream #316): cache_read is now clamped to the
+        // source-recorded input, so a record claiming 1500 cached
+        // against 1000 input reports cache_r 1000 (was 1500) with the
+        // clamp disclosed by the parser-side counter below.
         assert_eq!(session.metrics.tokens_input, 0);
-        assert_eq!(session.metrics.tokens_cache_r, 1500);
+        assert_eq!(session.metrics.tokens_cache_r, 1000);
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("workbuddy_input_basis:cache_clamped"),
+            Some(&1),
+            "rm-542: the 1500>1000 clamp must be disclosed"
+        );
 
         let inclusive = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),

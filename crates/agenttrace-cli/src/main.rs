@@ -33,7 +33,7 @@ struct Args {
         short = 'f',
         long = "format",
         default_value = "text",
-        value_parser = ["text", "json", "csv", "markdown", "md", "html"]
+        value_parser = ["text", "json", "csv", "markdown", "md", "html", "otel"]
     )]
     format: String,
     /// Session directory to scan instead of auto-discovered agent homes
@@ -217,6 +217,13 @@ fn run() -> anyhow::Result<()> {
     if args.format == "csv" && !(args.overview || args.sessions) {
         bail!("csv format requires --overview or --sessions");
     }
+    // rm-541: `-f otel` renders the OTLP-JSON export of the whole
+    // session corpus, so it rides the --overview lane (which loads
+    // every session). On any other lane it would silently render text
+    // — the same incoherence the guards above exist to prevent.
+    if args.format == "otel" && !args.overview {
+        bail!("otel format requires --overview");
+    }
     validate_range_applicability(&args)?;
 
     let language = report_language(&args.lang)?;
@@ -226,12 +233,12 @@ fn run() -> anyhow::Result<()> {
     // stdout stream must stay a single parseable JSON document end to
     // end (a downstream `jq` breaks on any leading line), so they route
     // to stderr. The human path keeps them on stdout exactly as before.
-    let announce: fn(&str) -> anyhow::Result<()> = if matches!(args.format.as_str(), "json" | "csv")
-    {
-        write_stderr
-    } else {
-        write_stdout
-    };
+    let announce: fn(&str) -> anyhow::Result<()> =
+        if matches!(args.format.as_str(), "json" | "csv" | "otel") {
+            write_stderr
+        } else {
+            write_stdout
+        };
 
     if args.clear_cache {
         agenttrace_core::clear_session_cache()?;
@@ -560,6 +567,11 @@ fn run() -> anyhow::Result<()> {
         let range = parse_range(&args)?;
         let mut out = match args.format.as_str() {
             "csv" => csv_export::overview_csv(&overview),
+            // rm-541: the OTLP-JSON export lane — the CLI half of the
+            // rm-493 renderer. Every session becomes one span with a
+            // valid (non-zero) span id; see agenttrace_core::otel for
+            // the recorded input-token basis and snapshot date.
+            "otel" => agenttrace_core::report_otel_export(&sessions),
             "json" => report_overview_json_with_context(
                 &overview,
                 &sessions,
@@ -681,7 +693,17 @@ fn write_stderr(value: &str) -> anyhow::Result<()> {
 }
 
 fn write_stdout(value: &str) -> anyhow::Result<()> {
-    match io::stdout().write_all(value.as_bytes()) {
+    // rm-541 rider: text stdout lanes end with a trailing newline
+    // exactly like their `-o` file twins (whose callers append "\n").
+    // Idempotent — values that already end in a newline are written
+    // verbatim, so machine documents gain at most the one standard
+    // trailing newline.
+    let out = if value.ends_with('\n') {
+        std::borrow::Cow::Borrowed(value)
+    } else {
+        std::borrow::Cow::Owned(format!("{value}\n"))
+    };
+    match io::stdout().write_all(out.as_bytes()) {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result.map_err(Into::into),
     }

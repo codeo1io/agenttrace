@@ -294,3 +294,84 @@ fn parsing_is_deterministic_and_adversarial_key_mixes_stay_safe() {
         }
     }
 }
+
+#[test]
+fn workbuddy_usage_sums_across_records_upstream_311() {
+    // rm-542 / upstream #311: workbuddy journals carry one usage block
+    // per assistant record and the session total is their SUM. The
+    // previous keep-last arm reported only the FINAL record's tokens —
+    // the research live PoC (wb1): 100/10 + 200/20 + 300/30 reported
+    // 330 instead of 660.
+    // Detector guard: the workbuddy probe requires at least one
+    // function_call/function_call_result/reasoning record, so the
+    // corpus carries one non-usage record alongside the usage rows.
+    let raw = [
+        r#"{"type":"function_call","name":"bash","arguments":"{}","callId":"c1","sessionId":"wb-sum","cwd":"/tmp"}"#,
+        r#"{"type":"message","role":"user","content":[{"type":"text","text":"a"}],"sessionId":"wb-sum","cwd":"/tmp","message":{"role":"user","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+        r#"{"type":"message","role":"user","content":[{"type":"text","text":"b"}],"sessionId":"wb-sum","cwd":"/tmp","message":{"role":"user","usage":{"input_tokens":200,"output_tokens":20}}}"#,
+        r#"{"type":"message","role":"user","content":[{"type":"text","text":"c"}],"sessionId":"wb-sum","cwd":"/tmp","message":{"role":"user","usage":{"input_tokens":300,"output_tokens":30}}}"#,
+    ]
+    .join("\n");
+    let session = parse_raw_session("wb", "wb-sum.jsonl", &raw).expect("parses");
+    assert_eq!(session.metrics.source_tool, "workbuddy");
+    assert_eq!(
+        session.metrics.tokens_input, 600,
+        "sum, not keep-last (was 300)"
+    );
+    assert_eq!(session.metrics.tokens_output, 60);
+
+    // The sum is order-invariant: reversed records give the same total.
+    let reversed: Vec<&str> = raw.split('\n').collect();
+    let mut reversed = reversed.clone();
+    reversed.reverse();
+    let session = parse_raw_session("wb", "wb-sum.jsonl", &reversed.join("\n")).expect("parses");
+    assert_eq!(session.metrics.tokens_input, 600);
+    assert_eq!(session.metrics.tokens_output, 60);
+}
+
+#[test]
+fn workbuddy_clamps_cached_above_input_upstream_316() {
+    // rm-542 / upstream #316 live PoC (wb7): a record reports 150
+    // cached tokens against 100 input. The previous subtraction kept
+    // the full cache count, so input+cache (0 + 150 = 150) EXCEEDED
+    // the source-recorded input. Both sides clamp, and the clamp rides
+    // the rm-450 disclosure family so the report never hides it.
+    let raw = [
+        r#"{"type":"function_call","name":"bash","arguments":"{}","callId":"c1","sessionId":"wb-clamp","cwd":"/tmp"}"#,
+        r#"{"type":"message","role":"user","content":[{"type":"text","text":"go"}],"sessionId":"wb-clamp","cwd":"/tmp","message":{"role":"user","usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":150}}}"#,
+    ]
+    .join("\n");
+    let session = parse_raw_session("wb", "wb-clamp.jsonl", &raw).expect("parses");
+    assert_eq!(session.metrics.tokens_input, 0);
+    assert_eq!(
+        session.metrics.tokens_cache_r, 100,
+        "cached clamps to the recorded input"
+    );
+    assert_eq!(session.metrics.tokens_output, 10);
+    assert_eq!(
+        session
+            .metrics
+            .line_skips
+            .get("workbuddy_input_basis:cache_clamped"),
+        Some(&1),
+        "clamp disclosed, not silent"
+    );
+}
+
+#[test]
+fn workbuddy_reasoning_records_contribute_usage_upstream_311_rider() {
+    // rm-542 rider: the "reasoning" arm previously never read the
+    // usage block, silently dropping those tokens from the session
+    // total (research PoC wb3).
+    let raw = [
+        r#"{"type":"reasoning","content":[{"type":"text","text":"thinking"}],"sessionId":"wb-reason","cwd":"/tmp","message":{"role":"assistant","usage":{"input_tokens":5,"output_tokens":7}}}"#,
+        r#"{"type":"message","role":"user","content":[{"type":"text","text":"hi"}],"sessionId":"wb-reason","cwd":"/tmp","message":{"role":"user","usage":{"input_tokens":50,"output_tokens":3}}}"#,
+    ]
+    .join("\n");
+    let session = parse_raw_session("wb", "wb-reason.jsonl", &raw).expect("parses");
+    assert_eq!(
+        session.metrics.tokens_input, 55,
+        "reasoning record usage counted"
+    );
+    assert_eq!(session.metrics.tokens_output, 10);
+}

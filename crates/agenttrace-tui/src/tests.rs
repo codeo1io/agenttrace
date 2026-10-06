@@ -1631,13 +1631,14 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 25 (rm-450 workbuddy input-basis disclosure;
-                // 24 was the rm-436/437/438 pi journal accounting, 23 the
-                // rm-408 zero-usage bump, 22 the rm-400/rm-401 bump): a
+                // Schema 26 (rm-542 workbuddy usage sum + cache clamp,
+                // upstream #311/#316; 25 was the rm-450 workbuddy
+                // input-basis disclosure, 24 the rm-436/437/438 pi journal
+                // accounting, 23 the rm-408 zero-usage bump): a
                 // warm entry is reused only when it carries the current
                 // schema version, so this fixture tracks
                 // SESSION_CACHE_SCHEMA_VERSION.
-                r#"{{"schema_version":25,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":26,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

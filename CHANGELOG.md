@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- OTel exports are spec-valid (rm-541): span ids are hash-derived, unique and never the
+  all-zero ordinal-0 form the OTLP receiver rejects; non-finite costs are omitted with an
+  explicit agenttrace.session.cost_usd_omitted=non-finite disclosure instead of rendering
+  "doubleValue": null; control bytes are stripped from string values; and every span
+  carries granular gen_ai.usage.cache_read/cache_write.input_tokens (always),
+  gen_ai.usage.reasoning.output_tokens (when present), the basis disclosure
+  agenttrace.export.input_token_basis=delta_excludes_cache, and a pinned semconv
+  snapshot date.
+- Workbuddy accounting is truthful (rm-542): multi-record journals SUM usage per record
+  instead of keep-last (3x100-token journals counted 330 of 660), cache_read is clamped to
+  cached.min(input) so cache>input journals no longer total past their source, reasoning
+  and function_call rows contribute their usage, and copilot modelMetrics reuses the same
+  clamp; clamped sessions gain a workbuddy_input_basis:cache_clamped line-skip disclosure.
 - Context utilization divides by the model's real vendor window (rm-231): the denominator was guessed from model-name substrings (`claude` → 200k, unknown models silently 131k), so 1M-context models — the current Claude default class — reported utilization roughly 5x too high and tripped critical-pressure findings on healthy sessions. The pricing snapshot builder now carries LiteLLM's `max_input_tokens` (the source file is literally named `model_prices_and_context_window.json`; the field used to be the one thing the trim dropped), diagnostics resolves the window per session model from the active catalog, and models the catalog cannot resolve take the documented fallback ladder with the estimate disclosed as `window_source: "fallback"` instead of silently asserted. The bundled snapshot was refreshed from 2026-09-13 (2,755 models) to 2026-10-04 (3,099). The refresh retired upstream's first-party `claude-sonnet-4` row, which would have silently reattributed the demo corpus's Claude session to an openrouter gateway row (identical rates, wrong vendor lane), so the demo session now names `claude-sonnet-4-5` — the current first-party row, byte-identical rates, every demo cost unchanged.
 - Cached per-session costs re-price when the pricing catalog changes (rm-196): the session cache's freshness fingerprint was only file mtime+size, so a snapshot bump on upgrade or a `--update-pricing` refresh left every cached per-session cost priced at the old catalog's rates. The cache journal and SQLite snapshot now stamp a 64-bit content-identity digest of the active catalog (stable across `cache`/`cache(stale)` relabeling); a stamped id that disagrees with the live catalog drops the entries exactly once so they re-price, an unstamped legacy journal is accepted as-is and stamped at the next save (upgrading alone never forces a rescan), and identical catalogs keep every hit.
 - Markdown reports no longer pass transcript-derived HTML through verbatim (rm-403): `markdown_cell` escaped only `|` and newline, so a model or session string carrying `<img onerror=…>` / `<script>…` landed raw in `-f markdown` output, and every markdown renderer that allows inline HTML executed it (the same threat class as Claude Code 2.1.289's published-artifact `<script>` freezes). Plain cells now entity-escape `&`, `<`, `>` before the pipe/newline table escapes — mirroring the HTML arm's `html_escape` — with the policy documented at the function; the five raw Scope-row string fields (range, session-window timestamps, parse coverage, confidence) route through the same escape, while `markdown_inline_code` deliberately keeps code-span semantics (renderers escape code spans themselves, and pre-escaping would corrupt display). Pinned by a hostile-corpus regression suite (`tests/markdown_escape_contract.rs`: payloads arrive entity-escaped verbatim, `&`/`|`/newline stay display-faithful); the assess PoC corpus re-renders with zero raw `<img`/`<script>` tags. Boundary: the governance `--audit -f markdown` JSON fence is inert under CommonMark fence semantics (a mid-line triple backtick cannot close it) and is documented as a boundary rather than fixed.
@@ -34,6 +47,9 @@
 
 ### Added
 
+- `-f otel` output format (rm-541 CLI half): OpenTelemetry GenAI OTLP-JSON export on the
+  `--overview` lane (`--overview` required; `-o` supported); stdout text/json/csv output
+  now ends with exactly one trailing newline, at parity with `-o` files.
 - `--doctor` and the pricing-source report line disclose vendor-deprecated models (rm-419): the snapshot ingestion now carries LiteLLM's `deprecation_date` when the source has one (463 of 3,099 entries in the 2026-10-04 refresh), the pricing provenance line discloses how many priced models are past their vendor deprecation date, and a session priced on a model the vendor has already retired says `model deprecated YYYY-MM-DD (rate unverified)` at its rate provenance instead of silently billing at catalog rates. The judgment anchors to the catalog's own vintage (the bundled snapshot's pinned date, or a cached catalog's fetch date) — never the wall clock — so report bytes stay stable for a given catalog.
 - pi-family journal format-contract suite (cycle 3, rm-423): the pi upstream (`@earendil-works/pi-coding-agent`) is a private repository that shipped 1.0.0→1.0.2 within four days, so journal-format drift has no release-notes early warning — a silent key change would degrade discovery, labeling, and usage attribution without failing a test. Golden fixtures (one derived-redacted from a real 1.0.2 v3 journal observed live, one per sniff arm: title-preamble/versionless header, `parentSession` header) pin the header key set, a known-journal-version gate (`1|2|3`) that names the `version` key on drift, both usage alias families (`input/cacheRead/cacheWrite/totalTokens` and `input_tokens/cache_creation_input_tokens/...`), message-level model attribution, and the `model_change` wire key (`modelId`) end to end. Known-divergence pins (the dead `model` handler, documented; system-entry routing — `branch_summary`/`compaction` surfacing as assistant turns — pinned by a fixture assertion added at review) are recorded in the suite so those fixes must update the contract deliberately, not by drift.
 - Statusline capture (research pass 9 candidate 53): `agenttrace statusline` is a host command for Claude Code's `statusLine` hook that renders the one-line status and tees the raw payload to a bounded local journal (`~/.cache/agenttrace/statusline.jsonl`, 10 MiB cap, newest-whole-lines compaction via temp-file rename, `AGENTTRACE_SESSION_CACHE_DIR` honored, torn lines skipped on read). It never fails the host — valid payload, malformed JSON, and empty stdin all exit 0 with exactly one stdout line, diagnostics to stderr only, stdin bounded at 1 MiB. `--statusline-report` (text and JSON) turns the journal into subscription limit-pressure windows (`5h`/`7d` usage, `resets_at` crossings evidenced by observations on both sides), deduplicated per-session prompt-cache analytics (`hit_ratio`, misses, `miss_causes` such as `tools_changed`), and peaks; `--doctor` reports the journal's health and the TUI Efficiency panel gains a "Subscription limits" block. Captures are deduplicated by exact payload with the count disclosed. Fixtures are schema-faithful to the documented payload contract, not recordings of a real host.
@@ -45,6 +61,8 @@
 
 ### Changed
 
+- Session cache schema 25->26 (rm-542): the workbuddy accounting change forces one reparse
+  of each session on first run after upgrade.
 - The health-gate example workflow is supply-chain pinned and lets the gate gate (rm-405): `examples/github-actions/agenttrace-health-gate.yml` pinned `actions/checkout` and `actions/upload-artifact` to mutable major tags and installed the binary with `curl | sh` straight off the moving `master` ref with no checksum. Both actions are now SHA-pinned to their `v7.0.0` tags with version comments, the install step downloads the pinned `v0.9.0` release asset and verifies it against that release's published `checksums.txt` (platform detection mirrors `install.sh`; both `sha256sum` and `shasum` handled), and the gate step is documented as the job-verdict owner — the report-only steps stay `if: always()` explainers whose exit codes cannot mask a red gate. A new `scripts/ci/check-example-workflows.sh` gate (wired into CI after the release-surface-drift check) enforces the contract deny-by-default: every `uses:` must end in a full 40-hex commit SHA, a pinned release with checksum must be present, no moving-ref `curl | sh`, no `|| true` on the gate step, and `--fail-under-health` must appear — verified rc0 on the example and red on each mutation. The runner-execution arm (a sub-health corpus failing the example job on a real runner) stays open on the follow-up checklist; the static arms are verified. The report-only session-breakdown leg now runs `--sessions -f csv` instead of `--sessions -f markdown` — markdown requires `--overview`, so the taught command always bailed at the format guard and the step never produced output; the CSV statement export is inside `-f csv`'s composable set and machine-readable (integration review decfa879).
 - CI: the never-true `AGENTTRACE_TUI_REAL_DIR` gate (pass-11 A11-8) on the PTY TUI smoke step now reads the repository variable of the same name and forwards it, making the opt-in reachable; dependency review skips fork PRs with an explanatory note instead of failing on the missing base snapshot (repo-owned runs unchanged).
 - CI: `scripts/ci/check-docs-commands.sh` is hermetic (rm-369): the gate binary now resolves from the repository's own release build (`target/release/agenttrace`) instead of a days-old `/tmp/agenttrace` left over from a previous session, failing loudly when neither that nor `AGENTTRACE_BIN` exists, and the markdown/HTML stdout captures land under the same `AGENTTRACE_CI_OUT` directory instead of stray fixed `/tmp/agenttrace-docs-*.stdout` paths — the `AGENTTRACE_BIN`/`AGENTTRACE_CI_OUT` override contracts are unchanged.
@@ -308,3 +326,21 @@ one place
   report semantics, release surfaces, and Pages artifacts. (#118)
 - Documented the launch-kit validation gates and release consistency checklist
   for public demo and install surfaces. (#115, #121)
+
+<!--
+  no-changelog-section markers (scripts/ci/check-plugin-version.sh, per-tag
+  arm rm-303): releases shipped before that arm existed, whose tags are
+  merged into every branch but whose changes never got a dedicated section
+  at release time. Reasons below are taken from each tag's own commit
+  (git log -1 <tag>). Recorded 2026-10-05, run 4a688257 full_tests
+  b163e538: the gate began failing only after a wholesale tag fetch made
+  these refs visible to `git tag --merged HEAD`; nothing about the releases
+  themselves changed.
+-->
+<!-- no-changelog-section: v0.7.2: release only decoupled the Pages checks from the release version (3f6252a); CI wiring, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.3: release only fixed npm tarball publishing (739a6c3); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.4: release only configured npm auth before publishing (2462045); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.5: re-tag of v0.7.4's npm-auth fix on the same commit (2462045); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.6: release only published the npm launcher under the zack78 scope (e20a224); packaging plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.7.7: release only fixed release-channel script permissions (cd33203); CI plumbing, no user-facing behavior to section -->
+<!-- no-changelog-section: v0.8.0: upstream merge "Improve pricing provenance and TUI session exploration (#280)" (b964a74) shipped without a dedicated section; its user-visible changes are covered by the v0.8.1 and v0.9.0 sections that follow it -->

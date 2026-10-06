@@ -13,6 +13,19 @@
 //! `Session` only). Exposing one means a parser.rs surface change that is
 //! outside this batch's stewardship boundaries — tracked as a follow-up
 //! rider on rm-493.
+//!
+//! Input-token basis (recorded decision, rm-541): the emitted
+//! `gen_ai.usage.input_tokens` carries agenttrace's DELTA basis — the
+//! uncached portion, with `gen_ai.usage.cache_read.input_tokens` and
+//! `gen_ai.usage.cache_write.input_tokens` as separate subset counters —
+//! not the cache-inclusive total the GenAI token-metrics notes prefer.
+//! The aggregate prices `tokens_input` and `tokens_cache_r` as disjoint
+//! buckets, and reconstructing an inclusive total (input + cache_read +
+//! cache_write) would double-count on lanes whose sources are already
+//! inclusive (OpenAI-compatible `prompt_tokens` includes `cached_tokens`).
+//! The deviation is disclosed on every span as
+//! `agenttrace.export.input_token_basis` so consumers never have to
+//! guess which basis the numbers are on.
 
 use crate::Session;
 use chrono::{DateTime, Utc};
@@ -26,6 +39,11 @@ use std::path::Path;
 /// so a future semconv drift forces a conscious refresh of the attribute
 /// names rather than silent staleness.
 pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-05";
+
+/// Recorded input-token basis of the emitted `gen_ai.usage.*` counters —
+/// see the module docs for the rationale. Emitted on every span so
+/// consumers never have to guess which basis the numbers are on.
+const INPUT_TOKEN_BASIS: &str = "delta_excludes_cache";
 
 const SPAN_KIND_INTERNAL: u32 = 1;
 const SPAN_STATUS_OK: u32 = 1;
@@ -101,10 +119,30 @@ enum AnyValue {
     DoubleValue(f64),
 }
 
+/// C0/C1/DEL control bytes in a stringValue become U+FFFD before the
+/// value is emitted: JSON can carry them, but OTLP consumers (collectors
+/// and their UIs) treat control bytes in attribute values as hostile
+/// payload. Stated equivalence with the fleet's rm-539 sanitization
+/// lane (same U+FFFD substitution for C0/C1/DEL); when that lane lands
+/// this folds into its shared helper.
+fn sanitize_otel_string(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            let code = c as u32;
+            if code < 0x20 || code == 0x7f || (0x80..=0x9f).contains(&code) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn attr_str(key: &str, value: impl Into<String>) -> KeyValue {
     KeyValue {
         key: key.to_string(),
-        value: AnyValue::StringValue(value.into()),
+        value: AnyValue::StringValue(sanitize_otel_string(&value.into())),
     }
 }
 
@@ -115,11 +153,16 @@ fn attr_int(key: &str, value: i64) -> KeyValue {
     }
 }
 
-fn attr_f64(key: &str, value: f64) -> KeyValue {
-    KeyValue {
+/// Finite `doubleValue` attribute. Non-finite values (NaN/±inf) cannot
+/// ride an AnyValue: serde renders them as `null`, and an AnyValue whose
+/// only value field is null is spec-invalid — conforming OTLP receivers
+/// reject the whole request. The caller omits the attribute and
+/// discloses the omission instead.
+fn attr_f64_finite(key: &str, value: f64) -> Option<KeyValue> {
+    value.is_finite().then(|| KeyValue {
         key: key.to_string(),
         value: AnyValue::DoubleValue(value),
-    }
+    })
 }
 
 /// Best-effort `gen_ai.system` inference from the session log's path.
@@ -140,6 +183,9 @@ fn infer_gen_ai_system(path: &str) -> &'static str {
         ("goose", "goose"),
         ("crush", "crush"),
         ("copilot", "copilot"),
+        // rm-541: workbuddy sessions are a first-class source tool —
+        // without the marker they exported as "other".
+        ("workbuddy", "workbuddy"),
     ];
     let path = path.to_lowercase();
     for (marker, system) in MARKERS {
@@ -189,54 +235,106 @@ fn trace_id_for(session: &Session) -> String {
     format!("{h:016x}{h:016x}")
 }
 
-/// Deterministic 16-hex-char span id derived from a seed.
-fn span_id_for(seed: u64) -> String {
-    format!("{seed:016x}")
+/// Deterministic 16-hex-char span id derived from the session identity
+/// and export ordinal. The raw ordinal must never be used directly: the
+/// OTel trace-data format requires a span id to contain at least one
+/// non-zero byte, and ordinal 0 renders `0000000000000000` — an id that
+/// conforming OTLP receivers (the OTel Collector among them) reject,
+/// dropping the ENTIRE export request. Keying the hash on the session
+/// identity also keeps ids distinct across sessions that share an
+/// ordinal position.
+fn span_id_for(session: &Session, ordinal: u64) -> String {
+    let mut hasher = DefaultHasher::new();
+    "agenttrace-span".hash(&mut hasher);
+    session.path.hash(&mut hasher);
+    session.name.hash(&mut hasher);
+    ordinal.hash(&mut hasher);
+    let seed = hasher.finish();
+    if seed == 0 {
+        // The all-zero id is the only invalid value; fold
+        // deterministically to stay spec-valid.
+        "0000000000000001".to_string()
+    } else {
+        format!("{seed:016x}")
+    }
 }
 
 fn session_span(session: &Session, ordinal: u64) -> Span {
     let metrics = &session.metrics;
     let (start, end) = session_bounds(session);
+    let mut attributes = vec![
+        attr_str("gen_ai.system", infer_gen_ai_system(&session.path)),
+        attr_str("gen_ai.request.model", metrics.model_used.clone()),
+        // Delta basis — see the module docs and the basis disclosure
+        // attribute below.
+        attr_int("gen_ai.usage.input_tokens", metrics.tokens_input),
+        attr_int("gen_ai.usage.output_tokens", metrics.tokens_output),
+        // GenAI semconv snapshot 2026-10-05: cache_read/cache_write are
+        // input-subset counters and reasoning is an output-subset
+        // counter. The cache buckets always emit (honest zeros);
+        // reasoning emits only when the session recorded any — a zero
+        // cannot distinguish "none" from "source does not report".
+        attr_int(
+            "gen_ai.usage.cache_read.input_tokens",
+            metrics.tokens_cache_r,
+        ),
+        attr_int(
+            "gen_ai.usage.cache_write.input_tokens",
+            metrics.tokens_cache_w,
+        ),
+        attr_int(
+            "agenttrace.session.cache_read_tokens",
+            metrics.tokens_cache_r,
+        ),
+        attr_int(
+            "agenttrace.session.cache_write_tokens",
+            metrics.tokens_cache_w,
+        ),
+        attr_int(
+            "agenttrace.session.tool_calls",
+            metrics.tool_calls_total as i64,
+        ),
+        attr_str(
+            "agenttrace.session.pricing_source",
+            crate::pricing::pricing_source_for(&metrics.model_used),
+        ),
+        attr_str(
+            "agenttrace.session.source_tool",
+            metrics.source_tool.clone(),
+        ),
+        attr_str("agenttrace.session.file", session.path.clone()),
+        attr_str(
+            "agenttrace.export.semconv_snapshot_date",
+            SEMCONV_SNAPSHOT_DATE,
+        ),
+        attr_str("agenttrace.export.input_token_basis", INPUT_TOKEN_BASIS),
+    ];
+    if metrics.tokens_reasoning != 0 {
+        attributes.push(attr_int(
+            "gen_ai.usage.reasoning.output_tokens",
+            metrics.tokens_reasoning,
+        ));
+    }
+    // A non-finite cost (NaN/±inf from a hostile or future pricing
+    // source) cannot ride a doubleValue (serde renders it as `null`,
+    // which is a spec-invalid AnyValue) — omit the attribute and
+    // disclose the omission as a string attribute.
+    match attr_f64_finite("agenttrace.session.cost_usd", metrics.cost_estimated) {
+        Some(attribute) => attributes.push(attribute),
+        None => attributes.push(attr_str(
+            "agenttrace.session.cost_usd_omitted",
+            "non-finite",
+        )),
+    }
     Span {
         trace_id: trace_id_for(session),
-        span_id: span_id_for(ordinal),
+        span_id: span_id_for(session, ordinal),
         parent_span_id: None,
         name: format!("session {}", session.name),
         kind: SPAN_KIND_INTERNAL,
         start_time_unix_nano: start,
         end_time_unix_nano: end,
-        attributes: vec![
-            attr_str("gen_ai.system", infer_gen_ai_system(&session.path)),
-            attr_str("gen_ai.request.model", metrics.model_used.clone()),
-            attr_int("gen_ai.usage.input_tokens", metrics.tokens_input),
-            attr_int("gen_ai.usage.output_tokens", metrics.tokens_output),
-            attr_int(
-                "agenttrace.session.cache_read_tokens",
-                metrics.tokens_cache_r,
-            ),
-            attr_int(
-                "agenttrace.session.cache_write_tokens",
-                metrics.tokens_cache_w,
-            ),
-            attr_int(
-                "agenttrace.session.tool_calls",
-                metrics.tool_calls_total as i64,
-            ),
-            attr_f64("agenttrace.session.cost_usd", metrics.cost_estimated),
-            attr_str(
-                "agenttrace.session.pricing_source",
-                crate::pricing::pricing_source_for(&metrics.model_used),
-            ),
-            attr_str(
-                "agenttrace.session.source_tool",
-                metrics.source_tool.clone(),
-            ),
-            attr_str("agenttrace.session.file", session.path.clone()),
-            attr_str(
-                "agenttrace.export.semconv_snapshot_date",
-                SEMCONV_SNAPSHOT_DATE,
-            ),
-        ],
+        attributes,
         status: Status {
             code: SPAN_STATUS_OK,
         },
@@ -292,5 +390,30 @@ mod tests {
         let nanos = rfc3339_to_unix_nanos("2026-10-05T10:00:00Z");
         assert_eq!(nanos, Some(1_791_194_400_000_000_000));
         assert_eq!(rfc3339_to_unix_nanos(""), None);
+    }
+
+    #[test]
+    fn non_finite_doubles_are_omitted_not_null() {
+        // A null AnyValue is spec-invalid: NaN/±inf must never reach the
+        // wire as doubleValue (serde would render `null`).
+        assert!(attr_f64_finite("k", f64::NAN).is_none());
+        assert!(attr_f64_finite("k", f64::INFINITY).is_none());
+        assert!(attr_f64_finite("k", f64::NEG_INFINITY).is_none());
+        let finite = attr_f64_finite("k", 1.5).expect("finite renders");
+        match finite.value {
+            AnyValue::DoubleValue(v) => assert_eq!(v, 1.5),
+            _ => panic!("expected doubleValue"),
+        }
+    }
+
+    #[test]
+    fn control_bytes_are_replaced_in_string_values() {
+        // 'm\x07' from the assess live probe must not ride a stringValue.
+        let rendered =
+            serde_json::to_string(&attr_str("k", "m\u{7}x\u{9b}y\u{7f}")).expect("renders");
+        assert!(!rendered.contains("\\u0007"));
+        assert!(!rendered.contains("\\u009b"));
+        assert!(!rendered.contains("\\u007f"));
+        assert!(rendered.contains('\u{FFFD}'));
     }
 }

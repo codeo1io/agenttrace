@@ -5,11 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 25;
-// Bumped 24 -> 25 (integration of run 66a7d797, rm-450): the
-// workbuddy input-basis disclosure adds metrics.line_skips counters
-// that warm v24 snapshots don't carry, so cached sessions would
-// silently omit the very disclosure this batch exists to surface
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 26;
+// Bumped 25 -> 26 (rm-542): workbuddy usage arithmetic now SUMS across
+// records (upstream #311) and clamps the cached count to the
+// source-recorded input (upstream #316), so cached sessions would
+// silently keep reporting the old keep-last, unclamped totals — the
+// rm-230 convention: a parser-semantics change that alters reported
+// totals for unchanged files must invalidate warm caches. Copilot
+// sessions ride the same shared clamp and re-price identically.
 // (rm-230 convention: parser-semantics changes bump the schema so
 // cached sessions regenerate under corrected accounting). The batch
 // landed against schema 22 and bumped it to 23 there; integration
