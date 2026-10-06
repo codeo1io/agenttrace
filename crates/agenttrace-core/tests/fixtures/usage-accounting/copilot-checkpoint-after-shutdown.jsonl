@@ -1,0 +1,4 @@
+{"type":"session.start","timestamp":"2026-01-04T00:00:00Z","data":{"context":{"cwd":"/tmp/ck"}}}
+{"type":"user.message","timestamp":"2026-01-04T00:00:01Z","data":{"content":"hi"}}
+{"type":"session.shutdown","timestamp":"2026-01-04T00:00:20Z","data":{"totalNanoAiu":1000000000}}
+{"type":"session.usage_checkpoint","timestamp":"2026-01-04T00:00:30Z","data":{"modelMetrics":{"gpt-5":{"usage":{"inputTokens":10,"outputTokens":1}}},"totalNanoAiu":1000000000}}

@@ -5,7 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 31;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+// Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
+// truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
+// rm-556 keeping their numerals and rm-555 folding into landed rm-551):
+// the batch corrects derived token totals and durations for UNCHANGED
+// source files — claude streaming per-message-id folding, qwen
+// alias/cache-inclusive basis, codex reasoning double-add and
+// post-compaction forward counting, copilot per-model later-record-wins
+// tracking and the shutdown timestamp tail — so a warm v31 cache keeps
+// serving the pre-fix totals with matching fingerprints and never
+// re-parses (rm-230 convention: parser-semantics changes bump the
+// schema so cached sessions regenerate under corrected accounting).
+// The batch landed against its base 67dfdb5 at schema 26 and bumped it
+// to 27 there; integration re-bases the bump onto the already-advanced
+// ceiling (27 was rm-542, 28 was rm-529, 29 was rm-600, 30 was rm-538,
+// 31 was landed rm-551) per the same convention. Entries regenerate
+// once on next scan.
 // Bumped 30 -> 31 (integration of run 254b2417, rm-551 'Copilot usage
 // reconciliation is per-model, not per-snapshot'): a checkpoint or
 // shutdown now REPLACES the per-model entries it names and PRESERVES

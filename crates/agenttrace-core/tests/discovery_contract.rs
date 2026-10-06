@@ -1014,10 +1014,18 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v31 (integration of run 254b2417, rm-551 copilot per-model
-        // reconciliation — warm v30 entries carried snapshot-level
-        // totals that dropped whole models on rotation/partial shutdown;
-        // re-based off the campaign's 26 -> 27 bump); v30
+        // v32 (integration of run 7f9c6d24, usage-accounting
+        // truthfulness — rm-601/rm-602/rm-603/rm-554/rm-556, with the
+        // campaign's title-twin rm-555 folded into the landed rm-551 —
+        // claude streaming per-message-id
+        // fold, qwen alias/cache-inclusive basis, codex reasoning and
+        // post-compaction counting, copilot later-record-wins and the
+        // shutdown timestamp tail; re-based off the campaign's
+        // 26 -> 27 bump); v31 (integration of run 254b2417, rm-551
+        // copilot per-model reconciliation — warm v30 entries carried
+        // snapshot-level totals that dropped whole models on
+        // rotation/partial shutdown; re-based off the campaign's
+        // 26 -> 27 bump); v30
         // (integration of run cb38b958, rm-538: the workbuddy
         // input-basis disclosures moved from metrics.line_skips to
         // metrics.disclosure_counters — same counters, different
@@ -1200,10 +1208,11 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v31 — see the rm-551, rm-538, rm-600, rm-529, rm-542,
+        // version (v32 — see the usage-accounting-truthfulness,
+        // rm-551, rm-538, rm-600, rm-529, rm-542,
         // rm-485, rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes
-        // in session_cache.rs; the per-model copilot reconciliation is what
-        // carried 30 -> 31 at this integration, re-based off the campaign's
+        // in session_cache.rs; the run-7f9c6d24 truthfulness batch is what
+        // carried 31 -> 32 at this integration, re-based off the campaign's
         // own 26 -> 27 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
@@ -1541,7 +1550,12 @@ fn rust_codex_rollout_token_counts_use_turn_context_model() {
     assert_eq!(metrics.source_tool, "codex_cli");
     assert_eq!(metrics.tokens_input, 800);
     assert_eq!(metrics.tokens_cache_r, 900);
-    assert_eq!(metrics.tokens_output, 190);
+    // Dated pin change 2026-10-06 (rm-553, rebound rm-603 at integration,
+    // upstream #312): reasoning is a BREAKDOWN of output_tokens, so each
+    // window's output is its raw output_tokens (100 + 60) with reasoning
+    // on its own line (20 + 10) instead of folded in (190).
+    assert_eq!(metrics.tokens_output, 160);
+    assert_eq!(metrics.tokens_reasoning, 30);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
 
@@ -2012,7 +2026,13 @@ fn rust_parses_qwen_code_stream_jsonl() {
     assert_eq!(metrics.assistant_turns, 1);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
-    assert_eq!(metrics.tokens_input, 120);
+    // rm-552 (2026-10-06, rebound rm-602 at integration): the qwen
+    // input aliases are cache-INCLUSIVE — the 120 input_tokens
+    // already contains the 10
+    // cached read tokens, so net input is 110 beside the separate cache
+    // line (the old 120 pin stacked the cached span on top of an input
+    // count that already contained it).
+    assert_eq!(metrics.tokens_input, 110);
     assert_eq!(metrics.tokens_output, 45);
     assert_eq!(metrics.tokens_cache_r, 10);
     assert_eq!(metrics.tokens_cache_w, 5);
