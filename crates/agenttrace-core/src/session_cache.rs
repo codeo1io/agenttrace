@@ -5,7 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 34;
+// Bumped 33 -> 34 (integration of run 73fe8e1e, rm-710 'truthful usage
+// accounting across parse -> cache -> report', assess SL1/SL2/NN2 of
+// run 6d574820): the batch corrects derived token totals for UNCHANGED
+// source files — codex occurrence-aware usage (rm-711: post-compaction
+// re-based token_count windows count their fresh `last` snapshots
+// instead of colliding with values already counted pre-compaction; the
+// dedup ledger is compaction-envelope-scoped and hard-capped) and qwen
+// per-turn accumulation (rm-711: every turn's `result` usage counts;
+// the session-wide first-wins latch kept only the first result) — so a
+// warm v33 cache keeps serving the pre-fix undercounts with matching
+// fingerprints and never re-parses. The bump ALSO invalidates the warm
+// disclosure amnesia assessed as NN2: pre-rm-526 v32-era entries were
+// written before `line_skips` existed on the entry shape, so a warm
+// hit replays hidden skips at confidence "high" — one bump covers both
+// defect classes at once (rm-230 convention: parser-semantics changes
+// bump the schema so cached sessions regenerate under corrected
+// accounting). The batch landed against its base 1c5edd1 at schema 32
+// and bumped it to 33 there; integration re-bases the bump onto the
+// already-advanced ceiling (33 was the run-91833f02 rm-616 generic-
+// lane model/usage truth batch) per the same convention. Entries
+// regenerate once on next scan.
 // Bumped 32 -> 33 (integration of run 91833f02, rm-616 'Generic-lane
 // model/usage truth', review fix 0be11bb1 after review f6b98bc3 F1):
 // the Event.model_used snake_case alias plus the generic-lane counted

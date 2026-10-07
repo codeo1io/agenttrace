@@ -1482,11 +1482,29 @@ fn delivery_confidence(value: &str, language: Language) -> String {
     if language == Language::En {
         return value.to_string();
     }
-    if value.starts_with("medium:") {
-        "中等：时间匹配只能作为线索，不能证明作者、合入主分支或业务价值。".to_string()
-    } else {
-        "较低：时间匹配只能作为线索，不能证明作者、合入主分支或业务价值。".to_string()
+    // rm-714 (integration of run 73fe8e1e): rows carry the BARE
+    // confidence word — the disclaimer moved to the document-level
+    // `confidence_note`. Key on the word (tolerant of the legacy
+    // `medium: time-window heuristic; …` composite, so a stale caller
+    // degrades to the same answer instead of mislabelling): matching
+    // the old `medium:` prefix would silently render every medium row
+    // as 较低.
+    match value.split(':').next().unwrap_or(value).trim() {
+        "medium" => "中等".to_string(),
+        "low" => "较低".to_string(),
+        other => other.to_string(),
     }
+}
+
+/// rm-714: the confidence disclaimer is a document-level field, stated
+/// once per report instead of being re-serialized into every row. The
+/// TUI text lane must still surface it — once — or the hoist would be
+/// an information loss in this lane rather than a size win.
+pub(super) fn delivery_confidence_note(report: &DeliveryEvidence, language: Language) -> String {
+    if language == Language::En {
+        return report.confidence_note.clone();
+    }
+    "可信度是一个时间窗口启发式；Git 提交只是相关，不能证明已合入主分支或产生业务价值。".to_string()
 }
 
 fn governance_loading_or(
@@ -1789,7 +1807,7 @@ fn context_trends_text(report: &ContextTrend, language: Language) -> String {
     lines.join("\n")
 }
 
-fn delivery_evidence_text(report: &DeliveryEvidence, language: Language) -> String {
+pub(super) fn delivery_evidence_text(report: &DeliveryEvidence, language: Language) -> String {
     let summary = &report.summary;
     let mut lines = vec![
         text(language, "Delivery evidence", "交付证据").to_string(),
@@ -1798,6 +1816,12 @@ fn delivery_evidence_text(report: &DeliveryEvidence, language: Language) -> Stri
             "{}: {}",
             text(language, "How to read this", "怎么看"),
             delivery_methodology(language)
+        ),
+        // rm-714: one disclaimer per document (hoisted out of the rows).
+        format!(
+            "{}: {}",
+            text(language, "How sure", "可信度"),
+            delivery_confidence_note(report, language)
         ),
         format!(
             "{}={} {}={} {}={} {}={} {}={}",

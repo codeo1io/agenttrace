@@ -2500,7 +2500,6 @@ where
                             source_tool: "qwen_code".to_string(),
                             ..Event::default()
                         });
-                        has_usage = true;
                     }
                 }
                 if !has_assistant {
@@ -2517,6 +2516,19 @@ where
                         has_assistant = true;
                     }
                 }
+                // rm-711 (assess SL2): a `result` record CLOSES the turn
+                // it reports — release the usage latch so the next
+                // turn's `result` usage counts. The old session-wide
+                // first-wins latch kept only the first result across the
+                // whole session (a 3×(10/5) journal reported 15 of a
+                // truthful 45). Assistant-message usage still wins WITHIN
+                // a turn: the assistant arm re-sets the latch after this
+                // boundary, so an assistant-usage-plus-result pair keeps
+                // counting once (pinned by
+                // rust_parses_qwen_code_stream_jsonl). User records
+                // deliberately do NOT touch the latch — tool-result user
+                // records arrive mid-turn.
+                has_usage = false;
             }
             _ => {}
         }
@@ -3216,6 +3228,12 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 }
             }
             "compacted" => {
+                // rm-711 (assess SL1): the compaction marker re-bases the
+                // cumulative token_count totals — open a fresh accounting
+                // envelope before any pairing so the post-compaction windows
+                // count their `last` snapshots instead of colliding with
+                // values already counted pre-compaction.
+                codex_totals.begin_envelope();
                 // rm-401: a compaction boundary. The turn that produced
                 // the summary is invisible to every later cumulative snapshot,
                 // so its usage arrives as a token_usage_record paired to
@@ -3459,9 +3477,25 @@ fn codex_token_count_usage(
         last
     } else {
         let prev = totals.prev.replace(total.clone());
+        if prev.as_ref() == Some(&total) {
+            // rm-554: the same running total re-emitted consecutively
+            // (rate-limit-only update) carries no fresh usage — count
+            // nothing. Stated as an explicit comparison against `prev`
+            // so the guard survives the ledger rollovers rm-711 added
+            // below (envelope boundary + size cap).
+            return None;
+        }
+        if totals.seen.len() >= MAX_CODEX_SEEN_TOTALS {
+            // rm-711 (assess SL3): bounded-recent distincts — roll the
+            // ledger over instead of growing one set entry per call.
+            totals.seen.clear();
+        }
         if !totals.seen.insert(total.clone()) {
-            // rm-554: the same running total re-emitted (rate-limit-only
-            // update) carries no fresh usage — count nothing.
+            // rm-554/rm-711: this exact total was already counted in the
+            // current compaction envelope — a rewind-and-climb-back, not
+            // a fresh window. `compacted` markers clear the ledger
+            // (CodexTotals::begin_envelope) because the re-based counters
+            // re-emit old values while carrying fresh usage.
             return None;
         }
         if usage_has_values(&last) {
@@ -3513,10 +3547,38 @@ fn codex_token_count_usage(
 /// inside the old envelope even though those context re-sends are billed
 /// usage (the counters are cumulative and NOT monotonic: compaction resets
 /// them, and the same total re-emits on rate-limit-only updates).
+///
+/// rm-711 (assess SL1/SL3): the `seen` ledger is scoped to one compaction
+/// envelope (`begin_envelope` clears it at every `compacted` marker) and
+/// hard-capped, so the value-dedup never grows without bound while the
+/// post-compaction re-based counters still count their fresh `last`
+/// snapshots.
 #[derive(Default)]
 struct CodexTotals {
     prev: Option<TokenUsage>,
     seen: BTreeSet<TokenUsage>,
+}
+
+/// rm-711 (assess SL3): hard cap on the distinct-totals ledger. A journal
+/// with more distinct totals than this rolls the ledger over (treated as
+/// an implicit envelope boundary) instead of pinning one set entry per
+/// call in memory. The rate-limit guard is unaffected: its signature is
+/// the consecutive duplicate checked against `prev`, not set membership.
+/// 1024 distinct totals without a compaction marker is ~1024 calls;
+/// rewinds deeper than that lose value-dedup only.
+const MAX_CODEX_SEEN_TOTALS: usize = 1024;
+
+impl CodexTotals {
+    /// rm-711 (assess SL1): a `compacted` marker re-bases Codex's
+    /// cumulative token counters — the compacted context is re-sent and
+    /// billed, so values already counted in the previous envelope
+    /// legitimately reappear carrying a fresh `last` snapshot. Open a new
+    /// envelope: drop the value-dedup ledger and the delta baseline so
+    /// the re-based windows count again.
+    fn begin_envelope(&mut self) {
+        self.seen.clear();
+        self.prev = None;
+    }
 }
 
 fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
@@ -7495,6 +7557,14 @@ mod tests {
         // from the rewound 1000 baseline now counts its full growth (2000)
         // instead of the old mark-relative climb (500), so the pinned
         // total moved 8000 → 9500.
+        // Dated pin change 2026-10-07 (rm-711, assess SL1): the explicit
+        // `compacted` marker announces the counter re-base, so the ledger
+        // opens a fresh envelope there (CodexTotals::begin_envelope) and
+        // the post-compaction baseline counts once as the re-sent
+        // context (1000) instead of being fabrication-clamped to zero
+        // against the stale 2500 mark — the pinned total moved 9500 →
+        // 10500. The marker is what makes the rewind distinguishable
+        // from an unmarked brief rewind, which stays clamped.
         let lines = [
             serde_json::json!({"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.3-codex"}}),
             serde_json::json!({"timestamp":"2026-10-01T09:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2500}}}}),
@@ -7510,12 +7580,13 @@ mod tests {
             .join("\n");
         let session = parse_raw_session("codex", "rollout-compaction-hwm.jsonl", &raw)
             .expect("codex rollout parses");
-        // 2500 (first snapshot) + 5000 (the record, standalone) + 2000
-        // (growth from the rewound 1000 baseline to 3000 — billed
-        // post-compaction re-sends, rm-554). If the record had touched
-        // the totals state the final snapshot's window would count 0
-        // (delta from a 5000 baseline).
-        assert_eq!(session.metrics.tokens_input, 9_500);
+        // 2500 (first snapshot) + 5000 (the record, standalone) + 1000
+        // (post-compaction re-based baseline — the re-sent context,
+        // billed once, rm-711) + 2000 (growth from the re-based 1000
+        // baseline to 3000 — billed post-compaction re-sends, rm-554).
+        // If the record had touched the totals state the final
+        // snapshot's window would count 0 (delta from a 5000 baseline).
+        assert_eq!(session.metrics.tokens_input, 10_500);
         assert_eq!(
             session
                 .metrics

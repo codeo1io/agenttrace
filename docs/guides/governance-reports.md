@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 33 and the SQLite snapshot is schema 8; the
+The session cache is schema 34 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -115,7 +115,15 @@ identity and usage instead of degrading to text estimation (rm-616, the
 Event.model_used snake_case alias plus the counted generic-lane usage
 fold; landed at its base as 27 → 28, re-based at integration onto the
 advanced ceiling) — so cached sessions regenerate under the corrected
-model identity and totals; the SQLite snapshot to 7
+model identity and totals, and to 34 when occurrence-aware usage landed
+— Codex post-compaction token_count windows count their fresh `last`
+snapshots instead of colliding with values already counted
+pre-compaction, Qwen accumulates every turn's result usage, and
+pre-rm-526 v32-era entries replayed hidden torn-tail skips at confidence
+"high" (the occurrence batch, rm-710/rm-711, one bump covering both
+defect classes; landed at its base 1c5edd1 as 32 → 33, re-based at
+integration onto the advanced ceiling) — so cached sessions regenerate
+under the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, and to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548). Older versions are discarded and

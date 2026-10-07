@@ -1631,6 +1631,17 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 34 (integration of run 73fe8e1e, rm-710
+                // occurrence-aware usage — codex post-compaction
+                // token_count windows count their fresh `last`
+                // snapshots (envelope-scoped, hard-capped dedup
+                // ledger) and qwen accumulates every turn's `result`
+                // usage, so a warm v33 entry would keep serving the
+                // pre-fix undercounts, and pre-rm-526 v32-era entries
+                // their hidden line_skips at confidence "high";
+                // landed at its base as the campaign's 32 -> 33 bump,
+                // re-based here onto the advanced ceiling, 33 being
+                // the landed rm-616 generic-lane rung below);
                 // Schema 33 (integration of run 91833f02, rm-616
                 // generic-lane model/usage truth: the Event.model_used
                 // snake_case alias plus the counted generic-lane usage
@@ -1673,7 +1684,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":33,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":34,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
@@ -2249,4 +2260,60 @@ fn project_identity_memo_rebuilds_when_sessions_are_replaced() {
     assert_eq!(fallback.root, live.root);
     assert_eq!(fallback.resolution, live.resolution);
     let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delivery_evidence_confidence_localizes_bare_words_and_states_note_once() {
+    // rm-714 (integration of run 73fe8e1e) hoisted the per-row
+    // confidence disclaimer to the document-level `confidence_note`, so
+    // `SessionDeliveryEvidence.confidence` is now the BARE word. Two
+    // consumers had to follow the new shape: `delivery_confidence` must
+    // key on the word — the old `starts_with("medium:")` check silently
+    // rendered every medium row as 较低 — and the text lane must state
+    // the disclaimer exactly once per document, or the hoist becomes an
+    // information loss in this lane rather than a size win.
+    use agenttrace_core::{DeliveryEvidence, DeliverySummary, SessionDeliveryEvidence};
+
+    let row = |session: &str, level: &str, confidence: &str| SessionDeliveryEvidence {
+        session: session.to_string(),
+        project: "proj".to_string(),
+        level: level.to_string(),
+        evidence: Vec::new(),
+        confidence: confidence.to_string(),
+    };
+    let report = DeliveryEvidence {
+        methodology: "Lightweight heuristic".to_string(),
+        confidence_note: "Confidence is a time-window heuristic; Git commits are correlated, not attributable proof of main-merge or business value".to_string(),
+        summary: DeliverySummary::default(),
+        sessions: vec![
+            row("s1", "strong", "medium"),
+            row("s2", "non_code", "low"),
+        ],
+    };
+
+    let en = super::presentation::delivery_evidence_text(&report, Language::En);
+    assert_eq!(en.matches("not attributable").count(), 1);
+    assert!(
+        en.contains("How sure: medium"),
+        "rows keep the bare confidence word: {en}"
+    );
+
+    let zh = super::presentation::delivery_evidence_text(&report, Language::Zh);
+    assert!(
+        zh.contains("中等"),
+        "a bare `medium` row must render as 中等, not 较低: {zh}"
+    );
+    assert!(
+        zh.contains("较低"),
+        "a bare `low` row renders as 较低: {zh}"
+    );
+    assert_eq!(
+        zh.matches("不能证明已合入主分支或产生业务价值").count(),
+        1,
+        "the localized disclaimer is stated once at document level"
+    );
+    assert!(
+        !zh.contains("medium:"),
+        "legacy composite shape must not leak"
+    );
 }
