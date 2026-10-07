@@ -5,7 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (run 3ec6cec0 review fix 8a3231c6 over implement
+// b127341f, rm-720 'Agent-lane usage truthfulness' + rm-721 copilot
+// agent-host audit): the batch corrects cost/usage for UNCHANGED
+// agent-lane files — antigravity journals fold per-generation usage
+// blocks they previously dropped (tokens 0 / $0 by construction), and
+// copilot agent-host rollups read the per-model totalNanoAiu meters
+// (now SUMMED across models, review 3e3a2198 F4) they previously
+// ignored — so a warm v32 cache keeps serving the pre-batch $0/token
+// totals with matching fingerprints and never re-parses (rm-230
+// convention; the stewardship's original 'no schema bump' decision is
+// corrected by review finding F1: the cached GoMetrics shape covers
+// credit_usd, so only a schema bump regenerates the disclosed numbers).
+// rm-710's in-flight lane targets the same 32 -> 33 seam on another
+// lineage; integration reconciles by title per the one-invalidation
+// rule. Entries regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):

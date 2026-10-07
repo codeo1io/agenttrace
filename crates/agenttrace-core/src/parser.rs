@@ -296,7 +296,20 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         usage: BTreeMap<String, i64>,
     }
     let mut per_model: BTreeMap<String, CopilotModelSnapshot> = BTreeMap::new();
+    // rm-721 / codeburn #1651: VS Code agent-host journals (workspace.yaml
+    // client_name: vscode-agent-host; Copilot CLI 1.0.8x writes the same
+    // shape) interleave entry types the counting rules do not fold —
+    // assistant.turn_start/turn_end carry only ids, IDE-side entries vary.
+    // Name every un-counted entry type instead of letting it vanish (the
+    // disclosure rule rm-584 landed for the codex lane).
+    let mut uncounted: BTreeMap<String, i64> = BTreeMap::new();
     let mut max_credit_nano: f64 = 0.0;
+    // Review 3e3a2198 F4: per-model credit meters (modelMetrics[m].
+    // totalNanoAiu). Each entry is one model's OWN bill (codeburn #1651
+    // reads them as per-leg deltas), so the values SUM at emit — a global
+    // max across them under-reports a 2-model rollup; only a model's own
+    // re-emitted snapshots need the running-bill max discipline.
+    let mut per_model_credit_nano: BTreeMap<String, f64> = BTreeMap::new();
     // rm-555 (folded into rm-551): shutdown modelMetrics are per-model
     // cumulative snapshots and every resume writes another shutdown
     // record, so only the LATER record per model may count — the per_model
@@ -385,6 +398,21 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     .and_then(Value::as_object)
                 {
                     for (model, metric) in metrics {
+                        // rm-721 / codeburn #1651: the agent-host rollup
+                        // carries the per-model running Copilot-credit bill
+                        // inside modelMetrics (the CLI-shape top-level
+                        // totalNanoAiu is absent there), so credits must read
+                        // both shapes — max-fold, matching the rm-485
+                        // family's repeated-snapshot semantics.
+                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64) {
+                            if nano.is_finite() {
+                                let slot =
+                                    per_model_credit_nano.entry(model.clone()).or_insert(0.0);
+                                if nano > *slot {
+                                    *slot = nano;
+                                }
+                            }
+                        }
                         if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
                             // Copilot modelMetrics follow the GenAI
                             // semconv basis (input_tokens INCLUDES
@@ -440,6 +468,19 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     .and_then(Value::as_object)
                 {
                     for (model, metric) in metrics {
+                        // rm-721: same dual-shape credit read as the
+                        // shutdown arm — checkpoints carry modelMetrics
+                        // with totalNanoAiu on live agent-host sessions
+                        // (top-level nanoAiu but no tokens, #1651).
+                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64) {
+                            if nano.is_finite() {
+                                let slot =
+                                    per_model_credit_nano.entry(model.clone()).or_insert(0.0);
+                                if nano > *slot {
+                                    *slot = nano;
+                                }
+                            }
+                        }
                         if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
                             // rm-485 checkpoints carry the same
                             // modelMetrics shapes as shutdown — apply
@@ -481,8 +522,32 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // rm-721: name the un-counted class (turn markers, IDE
+                // entries) instead of dropping it silently.
+                if !typ.is_empty() {
+                    *uncounted.entry(typ.to_string()).or_insert(0) += 1;
+                }
+            }
         }
+    }
+    // rm-721: one carrier names every un-counted entry type. A bare
+    // meta marker carries no usage and an empty timestamp, so nothing
+    // else in the metrics can move (the rm-556 fallback pattern).
+    if !uncounted.is_empty() {
+        let counters = uncounted
+            .into_iter()
+            .map(|(typ, count)| (format!("copilot_uncounted_entry_type:{typ}"), count))
+            .collect();
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                disclosure_counters: counters,
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            },
+        );
     }
     // rm-551: one meta event per observed model, stamped with the
     // timestamp that last named it — lib.rs sums across models, prices
@@ -517,14 +582,22 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // shutdown records — a metrics-less shutdown at T+20s over messages
     // ending at T+1s used to leave the duration at 1.0s.
     let credit_timestamp = later_rfc3339(&latest_checkpoint_timestamp, &latest_shutdown_timestamp);
-    if max_credit_nano > 0.0 {
+    // Review 3e3a2198 F4: per-model meters SUM (each is one model's bill);
+    // the top-level totalNanoAiu (CLI 1.0.8x shutdown/checkpoint records)
+    // stays max-folded as the session-wide counter. Both describe the
+    // same bill, so the greater of the two is exact on either shape and
+    // never double-counts; a global max across per-model meters silently
+    // under-reports a 2-model rollup with no disclosure.
+    let per_model_credit_sum: f64 = per_model_credit_nano.values().sum();
+    let credit_nano = max_credit_nano.max(per_model_credit_sum);
+    if credit_nano > 0.0 {
         events.insert(
             0,
             Event {
                 role: "meta".to_string(),
                 timestamp: credit_timestamp,
                 model_used: "unknown".to_string(),
-                credit_usd: max_credit_nano * 0.01 / 1_000_000_000.0,
+                credit_usd: credit_nano * 0.01 / 1_000_000_000.0,
                 source_tool: "copilot_cli".to_string(),
                 ..Event::default()
             },
@@ -682,6 +755,115 @@ fn parse_kimi_wire_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, BTreeMap<St
     non_empty(events).map(|events| (events, usage_alias_counts))
 }
 
+// rm-720 / codeburn #1655: antigravity generations carry usage via the
+// language-server RPC's JSON names (`inputTokens`, `outputTokens`,
+// `cacheReadInputTokens`, `cacheCreationInputTokens`,
+// `reasoningTokens` — exa.codeium_common_pb.ModelUsageStats fields
+// 2/3/4/5/9). No export surface pins one nesting key, so every
+// candidate below is probed per generation and the first block that
+// yields a number wins; the fold sums the per-generation blocks
+// (gen_metadata rows are one completion turn each) and names its basis
+// in a disclosure counter. Field 2 is UNCACHED input and field 5 the
+// cache read, so the folded map keeps agenttrace's delta basis with no
+// GenAI clamp (unlike the copilot lane's rm-600).
+//
+// Review 3e3a2198 F7 removed `modelUsage` from this list: the qwen lane's
+// nested per-model map (see `qwen_model_usage`) would be silently
+// swallowed by the flat-key reader below — a dead probe masquerading as
+// coverage. The only observed antigravity carrier is `usageStats`
+// (codeburn #1655); if a specimen journal ever pins a nested
+// `modelUsage` shape, fold it with the qwen per-model mechanism instead
+// of re-adding the key here.
+const ANTIGRAVITY_USAGE_KEYS: [&str; 3] = ["usageStats", "usage", "usageMetadata"];
+
+// The standalone app names models by config id (Field 19,
+// `gemini-pro-default`) or the `model_enum` metadata key (Field 20);
+// the display name (Field 21) is absent there. The id passes through
+// verbatim: a priced id resolves standalone, and an unpriced one
+// surfaces through cost_audit's pricing-coverage channel
+// (exact/fallback/unknown) instead of silently costing $0.
+const ANTIGRAVITY_MODEL_KEYS: [&str; 4] = ["modelConfigId", "model_enum", "modelVersion", "model"];
+
+fn antigravity_usage_block(obj: &Map<String, Value>) -> Option<BTreeMap<String, i64>> {
+    ANTIGRAVITY_USAGE_KEYS
+        .iter()
+        .find_map(|key| obj.get(*key).and_then(usage_from_value))
+}
+
+fn antigravity_model_id(obj: &Map<String, Value>) -> Option<String> {
+    ANTIGRAVITY_MODEL_KEYS
+        .iter()
+        .find_map(|key| string(obj.get(*key)).map(str::to_string))
+        .filter(|model| !model.is_empty())
+}
+
+/// rm-720 fold state: sums per-generation usage blocks and emits ONE
+/// meta event carrying the session totals, the last-seen model id and
+/// the basis counters (lib.rs's meta arm folds usage maps additively,
+/// so a single totals event is exactly right for summed blocks).
+struct AntigravityUsageFold {
+    usage: BTreeMap<String, i64>,
+    model: String,
+    models_seen: usize,
+    generations: usize,
+    latest_timestamp: String,
+}
+
+impl AntigravityUsageFold {
+    fn new() -> Self {
+        AntigravityUsageFold {
+            usage: BTreeMap::new(),
+            model: String::new(),
+            models_seen: 0,
+            generations: 0,
+            latest_timestamp: String::new(),
+        }
+    }
+
+    fn fold(&mut self, usage: &BTreeMap<String, i64>, model: Option<String>, timestamp: &str) {
+        self.generations += 1;
+        for (key, value) in usage {
+            *self.usage.entry(key.clone()).or_insert(0) += *value;
+        }
+        if let Some(model) = model {
+            self.models_seen += 1;
+            self.model = model;
+        }
+        self.latest_timestamp = later_rfc3339(&self.latest_timestamp, timestamp);
+    }
+
+    fn meta_event(&self) -> Option<Event> {
+        if self.generations == 0 {
+            return None;
+        }
+        // Units (review 3e3a2198 F8): `planner_response_summed` counts
+        // GENERATIONS — one folded completion turn each, so a multi-turn
+        // session reports N, not 1; `multi_model_last_wins` counts model-id
+        // SIGHTINGS across those generations (and the model id itself is
+        // last-wins). Neither counter is a session count.
+        let mut counters = BTreeMap::new();
+        counters.insert(
+            "antigravity_usage_basis:planner_response_summed".to_string(),
+            self.generations as i64,
+        );
+        if self.models_seen > 1 {
+            counters.insert(
+                "antigravity_model:multi_model_last_wins".to_string(),
+                self.models_seen as i64,
+            );
+        }
+        Some(Event {
+            role: "meta".to_string(),
+            timestamp: self.latest_timestamp.clone(),
+            usage: self.usage.clone(),
+            model_used: self.model.clone(),
+            disclosure_counters: counters,
+            source_tool: "antigravity_cli".to_string(),
+            ..Event::default()
+        })
+    }
+}
+
 /// Parses a decrypted Antigravity trajectory sidecar
 /// (`<uuid>.trajectory.json` under
 /// `~/.gemini/antigravity-cli/conversations/`). The on-disk conversation
@@ -689,7 +871,10 @@ fn parse_kimi_wire_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, BTreeMap<St
 /// `user_version=1`, 7 tables) whose blobs are protobuf payloads; the JSON
 /// sidecar is the documented reader surface (schema cross-checked against
 /// mjacobs/agy-reader `internal/daemon/types.go`, verified against agy
-/// 1.1.23 on 2026-09-01). Steps carry no token usage — events only.
+/// 1.1.23 on 2026-09-01). Planner steps carry per-generation usage
+/// blocks under the language-server RPC's JSON names (rm-720, codeburn
+/// #1655's `exa.codeium_common_pb.ModelUsageStats` field map) — folded
+/// by [`AntigravityUsageFold`] below, never silently dropped.
 fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
     let value: Value = serde_json::from_str(raw.trim_start()).ok()?;
     let obj = value.as_object()?;
@@ -708,6 +893,7 @@ fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
                 .is_some()
     };
     steps.iter().find(is_trajectory_step)?;
+    let mut usage_fold = AntigravityUsageFold::new();
     let mut events = Vec::new();
     for step in steps {
         let typ = step.get("type").and_then(Value::as_str).unwrap_or("");
@@ -774,6 +960,11 @@ fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
                 assistant.reasoning = thinking;
                 assistant.tool_calls = tool_calls;
                 events.push(assistant);
+                if let Some(planner) = step.pointer("/plannerResponse").and_then(Value::as_object) {
+                    if let Some(usage) = antigravity_usage_block(planner) {
+                        usage_fold.fold(&usage, antigravity_model_id(planner), &timestamp);
+                    }
+                }
             }
             "CORTEX_STEP_TYPE_RUN_COMMAND" => {
                 let command = step
@@ -825,6 +1016,11 @@ fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
             _ => {}
         }
     }
+    // rm-720: one meta event carries the folded usage totals and the
+    // model id, so pricing resolves or discloses — never silently $0.
+    if let Some(meta) = usage_fold.meta_event() {
+        events.insert(0, meta);
+    }
     non_empty(events)
 }
 
@@ -838,6 +1034,7 @@ fn parse_antigravity_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     }) {
         return None;
     }
+    let mut usage_fold = AntigravityUsageFold::new();
     let mut events = Vec::new();
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
@@ -865,6 +1062,9 @@ fn parse_antigravity_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         })
                     })
                     .collect();
+                if let Some(usage) = antigravity_usage_block(entry) {
+                    usage_fold.fold(&usage, antigravity_model_id(entry), &timestamp);
+                }
                 events.push(Event {
                     role: "assistant".to_string(),
                     content: string(entry.get("content")).unwrap_or("").to_string(),
@@ -885,6 +1085,11 @@ fn parse_antigravity_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 ..Event::default()
             }),
         }
+    }
+    // rm-720: same fold as the trajectory sidecar — one meta event
+    // carries the summed generation totals and the model id.
+    if let Some(meta) = usage_fold.meta_event() {
+        events.insert(0, meta);
     }
     non_empty(events)
 }
@@ -5257,6 +5462,10 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
             &[
                 "cache_read_input_tokens",
                 "cacheReadInputTokens",
+                // Gemini API JSON shape; the antigravity standalone app
+                // reports its cache reads through it (rm-720, codeburn
+                // #1655's ModelUsageStats field map).
+                "cachedContentTokenCount",
                 "cache_read",
                 "cacheReadTokens",
                 "input_cache_read", // kimi_cli
@@ -5289,6 +5498,10 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
         "thinkingTokenCount",
         "thinking_tokens",
         "reasoning_tokens",
+        // antigravity RPC name, ModelUsageStats field 9 (rm-720,
+        // codeburn #1655: thinking_output_tokens bills at the output
+        // rate like every other reasoning alias)
+        "reasoningTokens",
     ]
     .iter()
     .find_map(|key| obj.get(*key))
@@ -6354,6 +6567,96 @@ mod tests {
             "generic steps arrays must fall through to the unsupported-format error"
         );
         assert!(parse_antigravity_trajectory(&generic).is_none());
+    }
+
+    #[test]
+    fn antigravity_trajectory_folds_usage_blocks_and_model_id() {
+        // rm-720 / codeburn #1655: planner generations carry
+        // ModelUsageStats under the RPC JSON names; the fold sums them
+        // into one meta event (field 2 uncached input, field 5 cache read —
+        // delta basis, no clamp) and passes the standalone app's
+        // config-id model through verbatim (pricing resolves or discloses
+        // — never silently $0).
+        let raw = serde_json::json!({
+            "trajectoryId": "11111111-2222-3333-4444-555555555555",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:05Z"},
+                    "plannerResponse": {
+                        "response": "First generation.",
+                        "usageStats": {
+                            "inputTokens": 100,
+                            "outputTokens": 50,
+                            "cacheReadInputTokens": 200
+                        },
+                        "modelConfigId": "gemini-pro-default"
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": {"createdAt": "2026-09-01T10:00:09Z"},
+                    "plannerResponse": {
+                        "response": "Second generation.",
+                        "usageMetadata": {
+                            "inputTokens": 30,
+                            "outputTokens": 20,
+                            "cachedContentTokenCount": 7,
+                            "reasoningTokens": 10
+                        },
+                        "modelConfigId": "gemini-pro-default"
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session = parse_raw_session("traj", "traj.trajectory.json", &raw)
+            .expect("usage-bearing trajectory parses");
+        assert_eq!(session.metrics.tokens_input, 130, "summed generations");
+        assert_eq!(
+            session.metrics.tokens_output, 80,
+            "reasoning bills at the output rate (50 + 20 + 10)"
+        );
+        assert_eq!(session.metrics.tokens_reasoning, 10);
+        assert_eq!(
+            session.metrics.tokens_cache_r, 207,
+            "cacheReadInputTokens and cachedContentTokenCount are one basis"
+        );
+        assert_eq!(
+            session.metrics.model_used, "gemini-pro-default",
+            "config id passes through verbatim"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_usage_basis:planner_response_summed"),
+            Some(&2),
+            "the fold names its basis"
+        );
+    }
+
+    #[test]
+    fn antigravity_jsonl_folds_usage_blocks() {
+        // rm-720: the jsonl lane folds PLANNER_RESPONSE usage blocks the
+        // same way; `model_enum` (Field 20) is the standalone id shape
+        // when the config id is absent.
+        let raw = [
+            r#"{"type":"USER_INPUT","step_index":0,"created_at":"2026-09-01T10:00:00Z","content":"Ship it"}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":1,"created_at":"2026-09-01T10:00:05Z","content":"Done","usage":{"inputTokens":40,"outputTokens":10,"cacheReadInputTokens":7},"model_enum":"MODEL_PLACEHOLDER_M16"}"#,
+        ]
+        .join("\n");
+        let session = parse_raw_session("ag", "x.jsonl", &raw).expect("jsonl parses");
+        assert_eq!(session.metrics.tokens_input, 40);
+        assert_eq!(session.metrics.tokens_output, 10);
+        assert_eq!(session.metrics.tokens_cache_r, 7);
+        assert_eq!(session.metrics.model_used, "MODEL_PLACEHOLDER_M16");
+        assert_eq!(
+            session.metrics.source_tool, "antigravity_cli",
+            "the lane still claims the file"
+        );
     }
 
     #[test]

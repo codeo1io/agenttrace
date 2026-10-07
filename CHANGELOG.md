@@ -4,6 +4,29 @@
 
 ### Fixed
 
+- Antigravity sessions report real usage and price the standalone model (rm-720, run
+  3ec6cec08fb9 cycle 2): both antigravity lanes (trajectory + jsonl) now fold per-message
+  usage blocks (input/output tokens, cache reads) and resolve the model id, priced via
+  lookup or surfaced as unknown_models — never a silent $0 (codeburn #1655's usageStats
+  field map adopted as the accounting reference). Cumulative quota events were considered
+  and declined by recorded decision: a summed cumulative meter double-counts against the
+  per-generation fold.
+- Copilot agent-host turns are audited, not swallowed (rm-721, run 3ec6cec08fb9 cycle 2):
+  the agent-host journal's un-counted request classes — turn markers, IDE-command hooks
+  (userPromptSubmitted hook.start/hook.end, permission.requested/completed) and the
+  sub-issue lifecycle marker (subagent.deselected) — are each NAMED exactly once via
+  copilot_uncounted_entry_type disclosure counters instead of dropped, and the rollup's
+  per-model totalNanoAiu meters sum at emit, so a two-model session (250e6+100e6 nano =
+  $0.0035 on the fixture) no longer reports only the largest model's bill (codeburn
+  #1651's class-enumeration shape adopted; its unified-platform journal shape deferred to
+  research pass 14).
+- Session-cache schema bumped 32 → 33 (run 3ec6cec08fb9 cycle 2): warm v32 caches kept
+  serving pre-batch token estimates and $0 credits for unchanged files, masking both
+  agent-lane rollups above; v32 caches now retire once on first scan and regenerate under
+  the corrected accounting (rm-230 convention), pinned by the stale-schema-32 test. The
+  same-unit set moved together: the TUI planted warm-cache fixture literal and the
+  governance-guide schema sentence.
+
 - Assumption disclosures stop masquerading as parse loss (rm-538): the workbuddy input-basis counters (`workbuddy_input_basis:cache_subtracted` — a priced journal that already subtracted cache from input — and `workbuddy_input_basis:zeroed_suspected_mismatch`) rode `Metrics.line_skips`, so an otherwise-exact parse rendered `Dropped lines: workbuddy_input_basis:cache_subtracted=1` beside `confidence: high` arithmetic and — worse — `data_health.confidence: low` in `-f json`: an assumption the accounting kept visible (tokens intentionally left as-is, per the disclosed provenance) mislabeled the corpus as lossy and tripped `--fail-under-health` gates. rm-450 minted that channel deliberately ("aggregate and degrade confidence the same way"); this deliberately reverses the channel choice while keeping the disclosure itself: the counters now live in `Metrics.disclosure_counters` beside the pi-family journal facts, render under the renamed `Disclosed facts:` row (with the existing basis provenance parenthetical) in every arm — text, markdown, HTML, doctor — are aggregated into `data_health.disclosures`, and no longer touch `confidence` (the assess PoC: `confidence: low` + a Dropped-lines row with `exact=1 fallback=0 unknown=0` → `confidence: high`, zero Dropped-lines row, `Disclosed facts: workbuddy_input_basis:cache_subtracted=1`), while real parse loss keeps both the row and the degradation. The session-cache schema was bumped so the channel move is visible on warm corpora — landed as 29 → 30 at integration, re-basing the campaign’s own 26 → 27 bump onto the ceiling since advanced by the Codex custom-tools (27, rm-542), #316 clamp (28, rm-529) and workbuddy-sum/Copilot-adoption (29, rm-600) landings, one invalidation either way (the rm-230 convention); the two Go-compat cache-contract pins now read `SESSION_CACHE_SCHEMA_VERSION` (newly exported from the crate root) instead of a hardcoded `26`, and the markdown render pins moved to the `report_overview_markdown_with_context` arm where the Scope-and-confidence section actually renders. Pinned red-first by `tests/disclosure_channel.rs`: the corpus3 basis shape keeps `line_skips` empty, carries the counter in `disclosure_counters`, stays `confidence: high`, and never mentions the basis key under Dropped lines.
 
 - OTel exports are spec-valid (rm-599, run 99d1c79c cycle 3, minted campaign-locally as rm-541 and rebound at integration): span ids are hash-derived, unique and never the
