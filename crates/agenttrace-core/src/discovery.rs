@@ -531,7 +531,10 @@ pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
 /// when the file's fingerprint still matches the probe-time one, so a
 /// rewritten doc — one that gained a `parentID`, i.e. the exact state
 /// change rm-548 exists to disclose — always re-probes.
-fn opencode_session_fork_parent_cached(path: &Path, cache: &mut SessionCache) -> Option<String> {
+pub(crate) fn opencode_session_fork_parent_cached(
+    path: &Path,
+    cache: &mut SessionCache,
+) -> Option<String> {
     let is_info_doc = path
         .components()
         .rev()

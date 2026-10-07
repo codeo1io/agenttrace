@@ -1,6 +1,6 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions_since, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
+    load_sqlite_backed_sessions_since, parse_file, Session, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -307,30 +307,26 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     if dir.is_some() {
         return (find_session_files(dir), 0);
     }
-    let mut out = Vec::new();
-    for candidate in crate::discover_session_dirs() {
-        if skip_sqlite_backed_file_dir(&candidate) {
-            continue;
-        }
-        out.extend(crate::collect_session_files(&candidate));
-    }
     // rm-548 (independent-review fix): the doctor's auto-discovery
-    // inventory aggregates the same way the CLI loader does — an
+    // inventory aggregates through the SAME loader primitive the CLI
+    // uses (`find_session_files_cached`), not a private walk — an
     // opencode fork copy re-emits its parent's history, so counting
-    // both inflates `sessions`/`session_files` — and the exclusion
-    // rides the disclosure channel instead of dying silently here.
-    // An explicit `--dir` keeps every file (the exclusion is
+    // both inflates `sessions`/`session_files`, and a private walk
+    // silently diverges from the loader (different dedup, different
+    // fork filter). Sharing the primitive means the doctor also
+    // rides the session-cache memo (fingerprint-keyed fork-probe
+    // results; a rewritten doc always re-probes) instead of
+    // re-reading every storage session info doc, and the exclusion
+    // rides the disclosure channel instead of dying silently. An
+    // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
-    let mut opencode_fork_excluded = 0usize;
-    out.retain(|path| {
-        if crate::discovery::opencode_session_fork_parent(path).is_some() {
-            opencode_fork_excluded += 1;
-            false
-        } else {
-            true
-        }
-    });
-    (out, opencode_fork_excluded)
+    let mut cache = crate::session_cache::load_session_cache();
+    let (files, opencode_fork_excluded) =
+        crate::discovery::find_session_files_cached(None, &mut cache, true);
+    // A cache write failure must never fail the doctor (the cache is
+    // an optimization; the inventory answer is already correct).
+    let _ = crate::session_cache::save_session_cache(&mut cache);
+    (files, opencode_fork_excluded)
 }
 
 fn doctor_directories(

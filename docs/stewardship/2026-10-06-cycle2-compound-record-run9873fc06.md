@@ -62,8 +62,12 @@ files + ROADMAP delta + governance-guide schema pin, uncommitted (commit gate ow
 - **rm-239 fold**: rm-625's choke point delivers rm-239's shared-helper acceptance —
   fold rm-239 into rm-625 by title at integration; rider sites (compare session names,
   waste tool names, governance plain values) are covered by the boundary.
-- **rm-543/rm-544** remain reserved for run 4ffc4fbb's recorded band (pi compaction/
-  branch_summary parser arms — active sibling lane, intentionally not touched).
+- **rm-543/rm-544 are NOT reservable** (corrected at the independent-review fix,
+  review F7): origin landed its own rm-543 (git-timeout) and rm-544 (waste-json)
+  from run b1ff12f8's integration — wall rows :1786/:1793, status implemented —
+  so run 4ffc4fbb's pi compaction/branch_summary band cannot hold those ids and
+  must renumber by title at integration per fleet precedent. The earlier
+  "reserved for 4ffc4fbb" wording invited a duplicate claim and is retracted.
 - **rm-547 saturation**: the #316 cache-clamp lane stays triple-claimed fleet-wide
   (rm-529/542/547) and unlanded on fork origin (`subtract_cached_input` grep = 0) —
   do not add a fourth claim; reconcile by landing order.
