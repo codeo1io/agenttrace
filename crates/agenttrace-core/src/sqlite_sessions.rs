@@ -147,11 +147,21 @@ fn sqlite_file_exists(path: &Path) -> bool {
     path.is_file()
 }
 
+/// rm-626: without a busy timeout, a database locked by its writer fails
+/// the read immediately (SQLITE_BUSY), and that transient failure used
+/// to be persisted as an empty snapshot that masked the database on
+/// every later run. Waiting briefly lets the normal writer-release race
+/// resolve; reads that still time out fail the query — which the caller
+/// no longer caches — instead of caching "no data".
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    )?;
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    Ok(connection)
 }
 
 fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
@@ -161,14 +171,27 @@ fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "hermes") {
         return filter_since(sessions, since);
     }
-    let sessions = query_hermes_sqlite_sessions(path, None);
+    // rm-626: a failed read (None) must not reach the store — caching
+    // the failure's empty vec persisted "zero sessions" with a live
+    // fingerprint and masked the database on every later run (the
+    // chmod-000 -> chmod-644 poison: mtime/size never changed, so the
+    // empty snapshot kept matching). A healthy empty database stays
+    // cacheable: its own ledger entry cannot clobber a sibling.
+    let Some(sessions) = query_hermes_sqlite_sessions(path, None) else {
+        return Vec::new();
+    };
     let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
     filter_since(sessions, since)
 }
 
-fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+/// Reads hermes sessions from a `state.db`. `None` means the database
+/// could not be read (open, prepare, or row-source failure) — the
+/// caller must not persist a snapshot for a failed read (rm-626).
+/// `Some(vec![])` is a healthy database with zero matching sessions and
+/// caches normally.
+fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Option<Vec<Session>> {
     let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
+        return None;
     };
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
     let tool_outcomes = hermes_tool_outcome_counts(&db);
@@ -183,7 +206,7 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
          where (?1 is null or started_at >= ?1 or started_at is null or started_at <= 0)"
     );
     let Ok(mut stmt) = db.prepare(&sql) else {
-        return Vec::new();
+        return None;
     };
     let since_unix = since.map(|value| value.timestamp() as f64);
     let Ok(rows) = stmt.query_map([since_unix], |row| {
@@ -204,38 +227,40 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             ..SqliteSessionAgg::default()
         })
     }) else {
-        return Vec::new();
+        return None;
     };
 
-    rows.filter_map(Result::ok)
-        .map(|mut agg| {
-            if !agg.model.is_empty() {
-                agg.models.insert(agg.model.clone());
-            }
-            if let Some(counts) = roles.get(&agg.id) {
-                agg.user_messages = counts.user;
-                agg.assistant_turns = counts.assistant;
-            }
-            if let Some(outcomes) = tool_outcomes.get(&agg.id) {
-                // rm-198: the hermes session row records only the number
-                // of tool calls, never their outcome. The outcome split
-                // comes from the messages table instead (observed result
-                // rows, minus the ones hermes renders as tool errors),
-                // matching the parser convention that ok+fail counts
-                // observed results while tool_calls_total counts calls.
-                agg.tool_results = outcomes.results;
-                agg.tool_calls_fail = outcomes.failures;
-                agg.tool_calls_ok = outcomes.results.saturating_sub(outcomes.failures);
-                agg.tool_calls_total = agg.tool_calls_total.max(outcomes.results);
-            } else if let Some(counts) = roles.get(&agg.id) {
-                // No content column (or no tool rows): an outcome split
-                // cannot be derived, so report the observed result count
-                // without fabricating a success split.
-                agg.tool_results = counts.tool;
-            }
-            session_from_sqlite_agg(agg)
-        })
-        .collect()
+    Some(
+        rows.filter_map(Result::ok)
+            .map(|mut agg| {
+                if !agg.model.is_empty() {
+                    agg.models.insert(agg.model.clone());
+                }
+                if let Some(counts) = roles.get(&agg.id) {
+                    agg.user_messages = counts.user;
+                    agg.assistant_turns = counts.assistant;
+                }
+                if let Some(outcomes) = tool_outcomes.get(&agg.id) {
+                    // rm-198: the hermes session row records only the number
+                    // of tool calls, never their outcome. The outcome split
+                    // comes from the messages table instead (observed result
+                    // rows, minus the ones hermes renders as tool errors),
+                    // matching the parser convention that ok+fail counts
+                    // observed results while tool_calls_total counts calls.
+                    agg.tool_results = outcomes.results;
+                    agg.tool_calls_fail = outcomes.failures;
+                    agg.tool_calls_ok = outcomes.results.saturating_sub(outcomes.failures);
+                    agg.tool_calls_total = agg.tool_calls_total.max(outcomes.results);
+                } else if let Some(counts) = roles.get(&agg.id) {
+                    // No content column (or no tool rows): an outcome split
+                    // cannot be derived, so report the observed result count
+                    // without fabricating a success split.
+                    agg.tool_results = counts.tool;
+                }
+                session_from_sqlite_agg(agg)
+            })
+            .collect(),
+    )
 }
 
 fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
@@ -245,35 +270,54 @@ fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> V
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
         return filter_since(sessions, since);
     }
-    let sessions = query_opencode_sqlite_sessions(path, None);
+    // rm-626 twin: a failed read must not reach the store (see the
+    // hermes arm for the poison this prevents).
+    let Some(sessions) = query_opencode_sqlite_sessions(path, None) else {
+        return Vec::new();
+    };
     let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
     filter_since(sessions, since)
 }
 
-fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+/// Reads opencode sessions from a `storage.db`, with the rm-626 failure
+/// contract of `query_hermes_sqlite_sessions`: `None` = read failure
+/// (never cached), `Some(vec![])` = healthy empty database.
+fn query_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Option<Vec<Session>> {
     let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
+        return None;
     };
+    // rm-626: distinguish "cannot read this database at all" (garbage
+    // file, lock timeout — never cached) from "healthy database with
+    // zero sessions" (cacheable). The row helpers below are lenient by
+    // design and would read a garbage file as an empty database.
+    if db.prepare("SELECT count(*) FROM sqlite_master").is_err() {
+        return None;
+    }
     let mut aggs = opencode_sqlite_session_rows(&db, path, since);
     if aggs.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     add_opencode_sqlite_messages(&db, &mut aggs);
     add_opencode_sqlite_parts(&db, &mut aggs);
     capture_opencode_user_text(&db, &mut aggs);
 
-    aggs.into_values()
-        .map(|mut agg| {
-            if agg.model.is_empty() {
-                agg.model = "default".to_string();
-            }
-            if agg.events == 0 {
-                agg.events = agg.user_messages + agg.assistant_turns + agg.tool_calls_total;
-            }
-            apply_opencode_stored_totals(&mut agg);
-            session_from_sqlite_agg(agg)
-        })
-        .collect()
+    Some(
+        aggs.into_values()
+            .map(|mut agg| {
+                if agg.model.is_empty() {
+                    agg.model = "default".to_string();
+                }
+                if agg.events == 0 {
+                    agg.events = agg.user_messages + agg.assistant_turns + agg.tool_calls_total;
+                }
+                apply_opencode_stored_totals(&mut agg);
+                session_from_sqlite_agg(agg)
+            })
+            .collect(),
+    )
 }
 
 /// Prefer the authoritative totals recorded on the session row over
@@ -994,7 +1038,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions =
+            query_hermes_sqlite_sessions(&path, None).expect("fixture database must read cleanly");
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 2, "both fixture sessions must load");
 
@@ -1024,6 +1069,97 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn failed_hermes_read_never_persists_or_serves_an_empty_snapshot() {
+        // rm-626 red-first (the home1 poison recipe): a database that
+        // cannot be read must not persist a snapshot. Pre-fix, the
+        // failed query returned Vec::new() and load stored it as the
+        // database's snapshot with a live fingerprint — and because the
+        // chmod 000 -> 644 recovery keeps mtime/size, that empty
+        // snapshot kept matching the fingerprint and masked the
+        // database on every later run until the cache was wiped.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm626-poison-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let database = root.join("state.db");
+        let hermes_snapshot = root.join("hermes-sqlite.json");
+        let opencode_database = root.join("storage.db");
+        let opencode_snapshot = root.join("opencode-sqlite.json");
+
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // Leg 1 — a garbage database file: a deterministic query
+        // failure everywhere (including containers where chmod cannot
+        // stop a root reader). Nothing may be stored for the failure,
+        // on either the hermes or the opencode lane.
+        std::fs::write(&database, b"not a sqlite database at all").expect("write garbage db");
+        assert!(load_hermes_sqlite_sessions(&database, None).is_empty());
+        assert!(
+            !hermes_snapshot.exists(),
+            "a failed hermes read must not persist any snapshot"
+        );
+        std::fs::write(&opencode_database, b"not a sqlite database either")
+            .expect("write garbage opencode db");
+        assert!(load_opencode_sqlite_sessions(&opencode_database, None).is_empty());
+        assert!(
+            !opencode_snapshot.exists(),
+            "a failed opencode read must not persist any snapshot"
+        );
+
+        // Leg 2 — the original poison sequence: chmod 000 -> chmod 644
+        // leaves mtime/size untouched, so a stored empty snapshot would
+        // keep matching the fingerprint forever. Skipped when the
+        // runner reads through 000-mode files (root).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fixture_dir = root.join("fixture");
+            std::fs::create_dir_all(&fixture_dir).expect("fixture tempdir");
+            let fixture = hermes_state_db_fixture(&fixture_dir);
+            std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+            let blocked = std::fs::read(&fixture).is_err();
+            std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod 644");
+            if blocked {
+                std::fs::rename(&fixture, &database).expect("move fixture into place");
+                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o000))
+                    .expect("chmod 000");
+                assert!(load_hermes_sqlite_sessions(&database, None).is_empty());
+                assert!(
+                    !hermes_snapshot.exists(),
+                    "the chmod-000 failure must not persist either"
+                );
+                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644))
+                    .expect("chmod 644");
+                let recovered = load_hermes_sqlite_sessions(&database, None);
+                assert_eq!(
+                    recovered.len(),
+                    2,
+                    "the healthy database must parse again without wiping the cache"
+                );
+                assert!(
+                    hermes_snapshot.exists(),
+                    "the successful re-read must populate the snapshot"
+                );
+            } else {
+                eprintln!("skipping chmod legs: runner reads through 000-mode files");
+            }
+        }
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn hermes_tool_failures_trip_the_overview_gate() {
         // rm-198 end-to-end leg: fixture metrics -> tool_fail_rate ->
         // evaluate_overview_gate (--max-tool-fail-rate). Pre-fix the rate
@@ -1036,7 +1172,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions =
+            query_hermes_sqlite_sessions(&path, None).expect("fixture database must read cleanly");
         std::fs::remove_dir_all(&root).ok();
 
         // s1: ok 1 / fail 1 -> 50% across the corpus (s2 contributes no

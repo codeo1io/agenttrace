@@ -4,6 +4,33 @@
 
 ### Fixed
 
+- SQLite snapshot cache: failed database reads no longer persist an empty
+  snapshot, and each database path now owns its own ledger entry
+  (rm-626 + rm-627). A database that could not be read (locked by its
+  writer, unreadable, or not a SQLite database at all) used to return an
+  empty session list that the loader stored as the database's snapshot —
+  and because the chmod-000-to-644 style recovery leaves mtime/size
+  untouched, that empty snapshot kept matching the file fingerprint and
+  masked the healthy database on every later run until the cache was
+  wiped. Reads now carry a 250 ms busy timeout, and a failed read is
+  never stored (`None` at the query seam); a healthy database with zero
+  sessions stays cacheable. Independently, the snapshot slot was keyed
+  by source name alone, so a plural-database home (the default plus
+  per-profile `state.db` files) clobbered its own cache on every store —
+  the last database to write owned the slot and every sibling re-parsed
+  forever (a 10-database PoC home parsed 6,223 sessions with
+  `cache_hits: 0` cold and warm). The snapshot file is now a
+  per-database ledger keyed by database path, entries whose database
+  disappeared are pruned at store time, and `SQLITE_SNAPSHOT_SCHEMA_VERSION`
+  moves 7 → 8: pre-ledger flat snapshots are rejected once and rebuilt
+  in place, with the governance guide realigned (`scripts/ci/check-docs-commands.sh`
+  verifies the guide against the live constant). Pinned red-first:
+  the poison sequence (garbage database file → no snapshot stored;
+  chmod 000 → chmod 644 → the database parses again without wiping the
+  cache) and the plural-database warm-hit test both failed against the
+  pre-fix code (the single-slot clobber even served database b's session
+  for database a's lookup).
+
 - Codex custom-tools sessions stop reporting zero tool activity and zero reasoning (rm-542, run b1ff12f8 cycle 2, minted campaign-locally as rm-449 and rebound at integration): the newest real Codex rollouts (2026-09-26 census: 7–20 pairs per session, zero classic `function_call`s) carry all their tool work as `response_item/custom_tool_call` + `custom_tool_call_output` and their reasoning as standalone `response_item/reasoning` items, plus a new top-level `world_state` — every one of which the parser silently dropped, so those sessions reported `tool_calls_total = 0`, `tool_results = 0`, and `reasoning_blocks = 0` while real work happened. Custom tool calls now count like function calls (the JS-source `input` feeds args and tool usage; a call whose `status` is not `completed` marks its paired output as a tool failure, agent-reported), standalone reasoning items feed `reasoning_blocks`/`reasoning_chars` from their `summary_text` blocks, `world_state` is explicitly ignored and disclosed as a `codex_world_state` parse counter, and future wire growth is visible instead of silent: unknown `response_item` payload types and unknown top-level types land in parse diagnostics as `codex_unmatched_response_item:<type>` / `codex_unmatched_type:<type>` counters (the rm-401 disclosure precedent). A real-shape rollout is vendored sanitized (structure preserved, content scrubbed, metrics-neutral — provenance, census, and sha256 in `tests/fixtures/codex-custom-tools/README.md`) as the golden corpus for the census-pinned contract test. The session cache schema was bumped so previously cached Codex sessions regenerate under the corrected accounting — landed as 26 → 27 at integration, re-basing the campaign’s own 22 → 23 bump onto the ceiling already advanced by the zero-usage (23), pi-accounting (24), workbuddy (25) and copilot-credit (26) landings, one invalidation either way (the rm-230 convention: a parser-semantics change that alters reported totals for unchanged files must invalidate warm caches, or the fix stays invisible behind stale entries) — and the governance guide’s schema sentence, which `scripts/ci/check-docs-commands.sh` verifies against the live constant, was realigned at integration together with the test fixtures that pin the version.
 - The by-task-type overview accumulator saturates instead of panicking or wrapping (rm-541, run b1ff12f8 cycle 2, minted campaign-locally as rm-448 and rebound at integration): the task-type rollup summed token totals with a bare `+=`, so two hostile sessions each pinning `i64::MAX` into one bucket aborted every aggregate surface (`--overview`, `--audit`, `--context-trends`, `--delivery-evidence`, `--mcp-governance`, `--recommend`, TUI) with `attempt to add with overflow` in debug builds, and wrapped negative in release where the renderer's `.max(0)` mask printed a 0-token bucket beside a summary claiming `total_tokens = 9223372036854775807`. Both sums now use `saturating_add` like every other token total, pinned red-first by a two-sessions-in-one-bucket regression test asserting the saturated bucket, the exact small-input sum, and the rendered JSON surface.
 - `--waste -f json` renders JSON instead of a text banner (rm-544, run b1ff12f8 cycle 2, minted campaign-locally as rm-451 and rebound at integration): the format guard admits `-f json` for every action, but the waste arm rendered its text report regardless of format — exit 0 with prose where scripts expected data. The waste report now has a JSON serializer (schema `agenttrace.waste.v1`) carrying the same verdicts the text banner does, and the format matrix is pinned end to end: text and json both render machine-consistently, markdown stays rejected with the guard's error naming the overview/governance actions that own it. Per-tool `allocated_cost` keeps the text report's caveat (a share of the session estimate, not measured per-tool spend).
