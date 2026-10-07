@@ -1956,3 +1956,204 @@ fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     let _ = fs::remove_file(&fifo);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn error_stderr_carries_the_anyhow_cause_chain() {
+    // rm-610: the top-level handler printed `Error: {err}`, and
+    // anyhow's Display shows only the outermost context layer — so
+    // `--overview -o /dev/full` (ENOSPC) and `-o <existing-dir>`
+    // (EISDIR) exited with byte-identical stderr through the SAME
+    // "writing report output file" context site and the io error kind
+    // was discarded. The handler must surface the full cause chain;
+    // exit codes stay pinned at 1.
+    let dir = std::env::temp_dir().join(format!("at-rm610-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create -o directory target");
+    let enospc = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o", "/dev/full"])
+        .output()
+        .expect("run agenttrace against /dev/full");
+    let eisdir = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o", dir.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace against a directory -o target");
+    let _ = std::fs::remove_dir(&dir);
+
+    let enospc_err = String::from_utf8_lossy(&enospc.stderr);
+    let eisdir_err = String::from_utf8_lossy(&eisdir.stderr);
+    for (label, code, stderr) in [
+        ("enospc", enospc.status.code(), &enospc_err),
+        ("eisdir", eisdir.status.code(), &eisdir_err),
+    ] {
+        assert_eq!(code, Some(1), "{label}: exit code unchanged: {stderr}");
+        assert!(
+            stderr.contains("Error: writing report output file"),
+            "{label}: context site still leads the chain: {stderr}"
+        );
+    }
+    assert!(
+        enospc_err.contains("No space left on device")
+            || enospc_err.contains("Permission denied")
+            || enospc_err.contains("ENOSPC"),
+        "the underlying write cause must surface through the context site \
+         (on hosts where the atomic writer's temp sibling cannot be created \
+         next to /dev/full, the honest cause is EACCES): {enospc_err}"
+    );
+    assert!(
+        eisdir_err.contains("Is a directory"),
+        "EISDIR cause must be visible through the context site: {eisdir_err}"
+    );
+    assert_ne!(
+        enospc_err, eisdir_err,
+        "a full disk and path misuse must be distinguishable in stderr"
+    );
+}
+
+// rm-610, second leg: the cause-chain join must not change how
+// single-layer (uncontextualized) errors render — the missing -d
+// message keeps its plain form with no dangling separator glue.
+// (The /dev/full and -o <directory> legs live in
+// error_stderr_carries_the_anyhow_cause_chain above, written by the
+// provider-dead prior attempt of this run and adopted after
+// verification.)
+#[test]
+fn error_output_includes_the_underlying_cause_chain() {
+    let missing = std::env::temp_dir().join(format!("at-rm610-missing-{}", std::process::id()));
+    let plain = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--sessions", "-d", missing.to_str().expect("utf8")])
+        .output()
+        .expect("run agenttrace with missing -d");
+    let stderr_plain = String::from_utf8_lossy(&plain.stderr);
+    assert_eq!(plain.status.code(), Some(2), "bad request class");
+    assert!(
+        stderr_plain.contains("does not exist") && !stderr_plain.contains("writing report"),
+        "unlayered errors keep their plain rendering: {stderr_plain}"
+    );
+    assert!(
+        !stderr_plain.trim_end().ends_with(":"),
+        "no dangling chain separator on a single-layer error: {stderr_plain}"
+    );
+}
+
+#[test]
+fn unreadable_agent_db_is_disclosed_not_claimed_absent() {
+    // rm-753 (run ff0068ca, minted campaign-locally as rm-596,
+    // rebound at integration 2026-10-07; assess P12/P14): a discovered
+    // opencode
+    // database of random bytes used to render as "No session files
+    // found" with --doctor printing `parsed=0 failed=0` and
+    // recommending --demo. The failure must now be disclosed on every
+    // report path, and must survive the cache (no poisoned empty
+    // snapshot from the failed load).
+    let home = std::env::temp_dir().join(format!("at-rm753-home-rnd-{}", std::process::id()));
+    let db = home.join(".local/share/opencode/opencode.db");
+    std::fs::create_dir_all(db.parent().expect("parent")).expect("create db dir");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../agenttrace-core/tests/fixtures/random-bytes/opencode.db");
+    std::fs::copy(&fixture, &db).expect("plant hostile db");
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .arg("--overview")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"))
+            .output()
+            .expect("run agenttrace over the hostile home")
+    };
+    for run_index in 1..=2 {
+        let out = run();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "run {run_index}: no sessions anywhere stays rc1"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("No session files found"),
+            "run {run_index}: the empty-corpus message stays: {stderr}"
+        );
+        assert!(
+            stderr.contains("found and could not be read"),
+            "run {run_index}: the unreadable database is disclosed: {stderr}"
+        );
+        assert!(
+            stderr.contains("opencode.db"),
+            "run {run_index}: the disclosure names the file: {stderr}"
+        );
+    }
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--doctor")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"))
+        .output()
+        .expect("run agenttrace --doctor over the hostile home");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        rendered.contains("OpenCode (DB)"),
+        "the database row appears in doctor output: {rendered}"
+    );
+    assert!(
+        rendered.contains("failed=1"),
+        "unreadable counts as a failure in the doctor counters: {rendered}"
+    );
+    assert!(
+        rendered.contains("unreadable:"),
+        "the doctor explains the failure: {rendered}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn dropped_sqlite_rows_are_disclosed_on_report_paths() {
+    // rm-753 (run ff0068ca, minted campaign-locally as rm-596,
+    // rebound at integration 2026-10-07; assess P11): five hostile
+    // session rows of
+    // which the NULL-id ghost used to vanish silently — the report
+    // claimed "4 sessions" with no hint that a fifth was lost.
+    let home = std::env::temp_dir().join(format!("at-rm753-home-oc-{}", std::process::id()));
+    let db = home.join(".local/share/opencode/opencode.db");
+    std::fs::create_dir_all(db.parent().expect("parent")).expect("create db dir");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../agenttrace-core/tests/fixtures/opencode-hostile/opencode.db");
+    std::fs::copy(&fixture, &db).expect("plant hostile db");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--overview")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"))
+        .output()
+        .expect("run agenttrace over the hostile opencode db");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the four decodable sessions are a usable corpus"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.trim().is_empty(),
+        "the report still renders the four sessions"
+    );
+    assert!(
+        stderr.contains("1 session row(s) dropped as undecodable"),
+        "the dropped row is disclosed: {stderr}"
+    );
+    assert!(
+        stderr.contains("opencode.db"),
+        "the disclosure names the file: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

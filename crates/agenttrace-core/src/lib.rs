@@ -75,7 +75,10 @@ pub use session_cache::{
     load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,
     SESSION_CACHE_SCHEMA_VERSION,
 };
-pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
+pub use sqlite_sessions::{
+    load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported, skip_sqlite_backed_file_dir,
+    SqliteDroppedRows, SqliteIngestReport, SqliteUnreadableDb,
+};
 pub use statusline::{
     load_statusline_insights, render_budget_view, render_statusline_report, run_statusline_host,
     sanitize_line_segment, statusline_budget_series, statusline_capture_path, statusline_insights,

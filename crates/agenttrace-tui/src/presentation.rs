@@ -2229,11 +2229,17 @@ pub(super) fn diagnostics_text(app: &App) -> String {
 }
 
 pub(super) fn report_with_context(summary: String, raw_title: &str, report: String) -> String {
+    // rm-611: the underline must span the title's terminal display
+    // width, not its UTF-8 byte length — a CJK/emoji title rendered
+    // ~3x longer dashes than the glyphs above it ("原始报告" is 12
+    // bytes but 8 columns). ASCII titles are unaffected: byte length
+    // and display width coincide.
+    use unicode_width::UnicodeWidthStr;
     format!(
         "{}\n\n{}\n{}\n{}",
         summary,
         raw_title,
-        "-".repeat(raw_title.len()),
+        "-".repeat(raw_title.width()),
         report
     )
 }

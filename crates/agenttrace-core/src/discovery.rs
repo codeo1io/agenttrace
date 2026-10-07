@@ -36,6 +36,10 @@ pub struct LoadReport {
     pub parsed: usize,
     pub skipped: usize,
     pub cache_hits: usize,
+    /// rm-753: SQLite-backed ingestion failures (unreadable agent
+    /// databases, dropped session rows) so the CLI can disclose
+    /// partial data instead of rendering it as the whole corpus.
+    pub sqlite: crate::sqlite_sessions::SqliteIngestReport,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -361,10 +365,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     if cache.is_dirty() {
         let _ = save_session_cache(cache);
     }
+    let mut sqlite_ingest = crate::sqlite_sessions::SqliteIngestReport::default();
     if dir.is_none() {
-        sessions.extend(crate::sqlite_sessions::load_sqlite_backed_sessions_since(
-            options.since,
-        ));
+        let (sqlite_sessions, ingest) =
+            crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
+        sessions.extend(sqlite_sessions);
+        sqlite_ingest = ingest;
     }
     if options.preserve_history {
         let _ = preserve_derived_history(&sessions);
@@ -404,6 +410,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sessions,
         discovered,
         cache_hits,
+        sqlite: sqlite_ingest,
     }
 }
 

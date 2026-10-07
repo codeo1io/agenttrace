@@ -268,7 +268,19 @@ struct Args {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("Error: {err}");
+        // rm-610: anyhow's Display prints only the outermost context
+        // layer, so `--overview -o /dev/full` (ENOSPC) and `-o <dir>`
+        // (EISDIR) used to exit with byte-identical stderr — the io
+        // error kind underneath the context line was discarded at this
+        // handler. Join the full cause chain onto one line instead;
+        // single-layer errors (and therefore every exit code) render
+        // exactly as before.
+        let chain = err
+            .chain()
+            .map(|cause| cause.to_string())
+            .collect::<Vec<_>>()
+            .join(": ");
+        eprintln!("Error: {chain}");
         std::process::exit(1);
     }
 }
@@ -1316,18 +1328,66 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         },
     );
     let sessions = report.sessions.clone();
+    // rm-753: SQLite-backed ingestion failures are disclosed, never
+    // silently swallowed — a discovered-but-unreadable agent database
+    // or a dropped session row prints one stderr note so report runs
+    // cannot mistake partial data for the whole corpus. stdout (and
+    // -f json) stays clean; exit codes are unchanged.
+    disclose_sqlite_ingest(&report.sqlite);
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
                 Some(dir) => bail!(
                     "No session files found in {dir} (directory exists but holds no session files)"
                 ),
-                None => bail!("No session files found in any auto-discovered agent home"),
+                None => {
+                    // rm-753: a discovered-but-unreadable agent database
+                    // must not be reported as "nothing found" — the
+                    // corpus is unreadable, not absent (P12/P14 used to
+                    // exit with the plain message here).
+                    if !report.sqlite.unreadable.is_empty() {
+                        let listed = report
+                            .sqlite
+                            .unreadable
+                            .iter()
+                            .map(|db| format!("{} ({})", db.path.display(), db.reason))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        bail!(
+                            "No session files found in any auto-discovered agent home, \
+                             but {} agent database(s) were found and could not be read: {}",
+                            report.sqlite.unreadable.len(),
+                            listed
+                        );
+                    }
+                    bail!("No session files found in any auto-discovered agent home");
+                }
             }
         }
         bail!("No sessions match the requested filters");
     }
     Ok((sessions, Some(report)))
+}
+
+/// rm-753: one stderr line per SQLite-backed ingestion failure — a
+/// discovered-but-unreadable database, or a session row dropped as
+/// undecodable. Report output on stdout is unaffected.
+fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
+    for db in &ingest.unreadable {
+        eprintln!(
+            "agenttrace: warning: agent database found but unreadable: {} ({})",
+            db.path.display(),
+            db.reason
+        );
+    }
+    for db in &ingest.dropped_rows {
+        eprintln!(
+            "agenttrace: warning: {} session row(s) dropped as undecodable in {}: {}",
+            db.dropped,
+            db.path.display(),
+            db.sample
+        );
+    }
 }
 
 fn parse_range(args: &Args) -> anyhow::Result<TimeRange> {
@@ -1478,7 +1538,15 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
             if kind.is_char_device() {
                 let mut handle = fs::File::create(target)
                     .with_context(|| format!("opening {}", target.display()))?;
-                handle.write_all(content.as_bytes())?;
+                // rm-610 (rebased at integration onto this rm-489
+                // write-through lane): a failed streamed write must
+                // surface its cause through the SAME context site as
+                // the atomic regular-file lane, so `-o /dev/full`
+                // renders "writing report output file: No space left
+                // on device" instead of the bare io error.
+                handle
+                    .write_all(content.as_bytes())
+                    .context("writing report output file")?;
                 eprintln!("Saved: {}", target.display());
                 return Ok(());
             }
