@@ -716,12 +716,14 @@ fn write_pricing_cache_at(path: &Path, raw: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Stage through a unique temp sibling, then rename into place so a
-    // crash mid-write can no longer leave a torn catalog behind
-    // (pass-7 P7-5); sweep_orphaned_temps reclaims the temp.
-    let tmp = crate::session_cache::unique_temp_path(path);
-    std::fs::write(&tmp, raw)?;
-    std::fs::rename(&tmp, path)?;
+    // rm-693: stage through a fresh O_EXCL temp sibling (owner-only)
+    // and rename into place so a crash mid-write can no longer leave a
+    // torn catalog behind (pass-7 P7-5) and a symlink planted at the
+    // predictable `{name}.tmp.{pid}.{seq}` name is bumped past, never
+    // truncated through (the shared staging helper also lands the
+    // catalog 0600, closing the plain-fs::write 0644 gap);
+    // sweep_orphaned_temps still reclaims the temps.
+    crate::session_cache::write_private_exclusive(path, raw.as_bytes())?;
     let meta = PricingCacheMeta {
         url: PRICING_URL.to_string(),
         fetched_at_unix: SystemTime::now()
@@ -731,9 +733,7 @@ fn write_pricing_cache_at(path: &Path, raw: &str) -> anyhow::Result<()> {
         bytes: raw.len(),
     };
     let meta_path = path.with_extension("meta.json");
-    let meta_tmp = crate::session_cache::unique_temp_path(&meta_path);
-    std::fs::write(&meta_tmp, serde_json::to_vec_pretty(&meta)?)?;
-    std::fs::rename(&meta_tmp, &meta_path)?;
+    crate::session_cache::write_private_exclusive(&meta_path, &serde_json::to_vec_pretty(&meta)?)?;
     Ok(())
 }
 
@@ -1735,6 +1735,55 @@ mod tests {
         assert_eq!(meta.url, PRICING_URL);
         assert_eq!(meta.bytes, "{\"stub\":true}".len());
         assert!(meta.fetched_at_unix > 0, "fetch time is stamped");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pricing_cache_write_is_owner_only_and_refuses_preplanted_temps() {
+        // rm-693: the catalog cache used to land through a plain
+        // `fs::write` on a predictable temp sibling — a symlink planted
+        // at that name was followed (the victim behind it clobbered)
+        // AND the catalog plus its sidecar landed 0644. The stage must
+        // be O_EXCL with a sequence bump, and both files owner-only.
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-excl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("pricing.json");
+        let victim = root.join("victim.txt");
+        std::fs::write(&victim, "secret bytes").expect("write victim");
+        let planted = crate::session_cache::unique_temp_path(&path);
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink at the next temp");
+        write_pricing_cache_at(&path, "{\"stub\":true}").expect("write past the planted link");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"secret bytes",
+            "the victim behind the planted link must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"stub\":true}",
+            "the catalog itself must land at the destination"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "catalog cache must be owner-only (got {mode:o})"
+        );
+        let meta_path = path.with_extension("meta.json");
+        let meta_mode = std::fs::metadata(&meta_path)
+            .expect("provenance sidecar exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            meta_mode, 0o600,
+            "provenance sidecar must be owner-only (got {meta_mode:o})"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

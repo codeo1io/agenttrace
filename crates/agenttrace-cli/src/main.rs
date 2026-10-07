@@ -1269,14 +1269,19 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     // rename, and a rewrite over an older artifact resurrected
     // group/other read. Non-Unix keeps the plain write, mirroring the
     // rm-208 helper's fallback.
+    //
+    // rm-693: creation is EXCLUSIVE (O_EXCL) — callers stage through a
+    // fresh `unique_temp_sibling`, so a pre-existing path at the
+    // staging name (a planted symlink) is refused with `AlreadyExists`
+    // instead of opened and truncated through; pair with
+    // `write_private_exclusive` for the sequence-bump retry and rename.
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)?;
         file.write_all(content.as_bytes())
@@ -1285,6 +1290,55 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     {
         fs::write(path, content)
     }
+}
+
+/// How many consecutive temp names `write_private_exclusive` tries
+/// before refusing (rm-693) — mirrors the agenttrace-core staging
+/// helper's bound. A genuine collision (a stale same-name temp)
+/// clears on the first bump; a symlink-poisoned directory fails
+/// honestly after this many tries instead of ever truncating through
+/// an occupied path.
+const EXCLUSIVE_STAGING_ATTEMPTS: u32 = 16;
+
+/// rm-693: stage `content` into a fresh owner-only temp sibling of
+/// `path` (O_EXCL) and rename it into place. An `AlreadyExists` at the
+/// predictable `{name}.tmp.{pid}.{seq}` name — a planted symlink, or a
+/// stale temp — bumps the sequence instead of truncating through the
+/// existing path; a fully poisoned window is refused loudly. The
+/// rename still hands the destination a fresh inode atomically, so a
+/// crash mid-write can never tear it. Mirrors
+/// `agenttrace_core::session_cache::write_private_exclusive` (kept
+/// local because the core helper is `pub(crate)`).
+fn write_private_exclusive(path: &Path, content: &str) -> std::io::Result<()> {
+    for _ in 0..EXCLUSIVE_STAGING_ATTEMPTS {
+        let temp = unique_temp_sibling(path);
+        match write_private(&temp, content) {
+            Ok(()) => match fs::rename(&temp, path) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // rm-250's no-residue invariant: a failed rename
+                    // (e.g. the destination is a directory) must not
+                    // leave the staged temp behind.
+                    let _ = fs::remove_file(&temp);
+                    return Err(err);
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                let _ = fs::remove_file(&temp);
+                return Err(err);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to stage {}: {} consecutive temp names were already occupied \
+             (planted symlinks or stale temps); nothing was written or truncated",
+            path.display(),
+            EXCLUSIVE_STAGING_ATTEMPTS
+        ),
+    ))
 }
 
 fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
@@ -1379,7 +1433,12 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
         }
     }
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        // rm-704: name the phase and the -o target — a raw
+        // "Permission denied (os error 13)" for an uncreatable parent
+        // gave the user nothing to act on while every adjacent -o
+        // failure (opening, writing) already carried its context.
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory for -o {}", requested.display()))?;
     }
     // rm-250: stage through a unique temp sibling and rename into
     // place, so a crash or Ctrl-C mid-write never leaves a
@@ -1390,12 +1449,12 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
     // 0600 before the rename — the rename hands the destination a
     // fresh inode every time, which is what re-tightens a rewrite over
     // an artifact aged to 0664 (PRIVACY.md's report-artifact sentence).
-    let temp = unique_temp_sibling(target);
-    let staged = write_private(&temp, content).and_then(|()| fs::rename(&temp, target));
-    if let Err(error) = staged {
-        let _ = fs::remove_file(&temp);
-        return Err(error).context("writing report output file");
-    }
+    // rm-693: the stage is O_EXCL with a sequence bump — a symlink
+    // planted at the predictable temp name is skipped past (or, in a
+    // fully poisoned window, refused loudly), never truncated through,
+    // and the victim behind it is never touched.
+    write_private_exclusive(target, content)
+        .map_err(|error| anyhow::anyhow!("writing report output file: {error}"))?;
     eprintln!("Saved: {}", target.display());
     Ok(())
 }
@@ -2669,6 +2728,80 @@ mod tests {
         let error = write_output(&Some(a), "x\n").unwrap_err().to_string();
         assert!(error.contains("symlink cycle"), "{error}");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_output_refuses_preplanted_symlinks_at_the_staged_temp() {
+        // rm-693: the -o lane staged through create+truncate on a
+        // predictable `{name}.tmp.{pid}.{seq}` sibling — a symlink
+        // planted at that name was FOLLOWED (the victim clobbered
+        // through the link) and the rename left the destination AS the
+        // link. Staging must be O_EXCL with a sequence bump: one
+        // planted name is skipped past, a fully poisoned window fails
+        // loudly, and the victim survives both.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-write-excl-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "secret bytes\n").expect("write victim");
+
+        // One planted link at the next temp name: the write bumps the
+        // sequence and succeeds, leaving the victim intact.
+        let target = dir.join("report.json");
+        let planted = unique_temp_sibling(&target);
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
+        write_output(&Some(target.clone()), "body\n").expect("write past one planted link");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "body\n");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "secret bytes\n",
+            "victim behind the planted link must be untouched"
+        );
+        assert!(
+            fs::symlink_metadata(&target).unwrap().file_type().is_file(),
+            "the destination must be a regular file, never the link"
+        );
+
+        // Fully poisoned window: every candidate temp name is a link —
+        // the write must fail loudly instead of following any of them.
+        let poisoned = dir.join("poisoned.json");
+        let seq_of = |name: &Path| {
+            name.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.rsplit('.').next())
+                .and_then(|name| name.parse::<u64>().ok())
+                .expect("temp name carries a numeric sequence")
+        };
+        let mut last_seq = 0u64;
+        for _ in 0..64 {
+            let name = unique_temp_sibling(&poisoned);
+            last_seq = seq_of(&name);
+            std::os::unix::fs::symlink(&victim, &name).expect("plant probe symlink");
+        }
+        for seq in (last_seq + 1)..=(last_seq + 64) {
+            let name = dir.join(format!("poisoned.json.tmp.{}.{}", std::process::id(), seq));
+            std::os::unix::fs::symlink(&victim, &name).expect("plant forward symlink");
+        }
+        let error = write_output(&Some(poisoned.clone()), "body\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("writing report output file"),
+            "the -o write context must lead: {error}"
+        );
+        assert!(
+            error.contains("refusing to stage"),
+            "the refusal must say so: {error}"
+        );
+        assert!(!poisoned.exists(), "no destination may materialize");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "secret bytes\n",
+            "victim behind every planted link must be untouched"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

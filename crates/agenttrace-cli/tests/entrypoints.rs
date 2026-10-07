@@ -236,6 +236,49 @@ fn baseline_regression_gates_the_exit_code_and_opt_out_flags_work() {
     let _ = std::fs::remove_dir_all(work);
 }
 
+#[test]
+fn output_parent_creation_failure_names_the_dash_o_target() {
+    // rm-704: `-o` under an uncreatable parent directory used to die
+    // with a contextless raw io::Error ("Permission denied (os error
+    // 13)" / "Not a directory") while adjacent -o failures carry the
+    // phase and the path; the parent-creation phase must name the -o
+    // target too.
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-o-parent-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    // A FILE where a directory would be needed: create_dir_all fails
+    // deterministically for any user (no root-only / probe).
+    let blocker = work.join("blocker");
+    std::fs::write(&blocker, "not a directory").expect("write blocker file");
+    let target = blocker.join("rep.json");
+    let target_arg = target.to_str().expect("target path is valid UTF-8");
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-f", "json", "-o", target_arg])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !output.status.success(),
+        "an uncreatable -o parent must fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("creating parent directory"),
+        "phase missing from error: {stderr}"
+    );
+    assert!(
+        stderr.contains(target_arg),
+        "-o target missing from error: {stderr}"
+    );
+    assert!(
+        stderr.contains("-o"),
+        "flag attribution missing from error: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(work);
+}
+
 fn run_json(args: &[&str]) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .args(args)

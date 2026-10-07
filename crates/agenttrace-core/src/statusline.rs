@@ -324,22 +324,23 @@ fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<
         kept.push(line);
     }
     kept.reverse();
-    // rm-202: the temp is a per-writer `unique_temp_path` sibling, not
+    // rm-202: the temp is a per-writer sibling, not
     // a fixed `<name>.jsonl.compact` — concurrent compacts can no longer
     // interleave into (and race the rename of) one shared temp, and a
     // crash before the rename leaves a `.tmp.` orphan that the
     // cache-load sweep already removes instead of a name no sweep
     // knows. The rewrite is bounded (half the 10 MiB retention bound),
     // so building it in memory first is safe, and the owner-only write
-    // (rm-208) keeps the renamed journal private as well.
-    let temp = crate::session_cache::unique_temp_path(path);
+    // (rm-208) keeps the renamed journal private as well. rm-693: the
+    // stage is the shared O_EXCL staging helper — a symlink planted at
+    // the predictable temp name is bumped past, never truncated
+    // through (same exclusivity as every other atomic writer).
     let mut rewritten = String::with_capacity(kept_bytes.min(usize::MAX as u64) as usize);
     for line in kept {
         rewritten.push_str(line);
         rewritten.push('\n');
     }
-    crate::session_cache::write_private(&temp, rewritten.as_bytes())?;
-    fs::rename(&temp, path)?;
+    crate::session_cache::write_private_exclusive(path, rewritten.as_bytes())?;
     Ok(())
 }
 
