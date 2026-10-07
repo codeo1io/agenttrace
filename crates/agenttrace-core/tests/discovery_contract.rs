@@ -638,6 +638,62 @@ fn rust_parses_workbuddy_messages_tools_usage_and_millis() {
 }
 
 #[test]
+fn rust_workbuddy_re_flushed_message_ids_count_once() {
+    // rm-647: a WorkBuddy journal re-emits a session record on
+    // re-open/flush — a fresh content slot, but the SAME
+    // providerData.messageId (the provider response identity) — and
+    // the rewrite re-carries its usage block, so the rm-600 all-record
+    // sum lane added every rewritten copy again (the prioritize wb1/wb7
+    // shape: 30 tokens reported where the journal shows 10). Records
+    // now dedup on messageId before the sum: the first occurrence
+    // counts, a re-flush contributes nothing, and a record with NO
+    // messageId keeps per-record accounting so a provider that never
+    // stamps the identity never loses usage.
+    let root = temp_root("agenttrace-rust-workbuddy-reflush");
+    fs::create_dir_all(&root).expect("create workbuddy temp dir");
+    let session_path = root.join("session.jsonl");
+    fs::write(
+        &session_path,
+        [
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}],"timestamp":1783777800000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"agent":"cli"}}"#,
+            // first occurrence of response m-1: 100 input / 50 output
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}],"timestamp":1783777801000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":100,"output_tokens":50}},"providerData":{"messageId":"m-1","model":"glm-5.2","agent":"cli"}}"#,
+            // re-flush of the SAME response: identical usage, later
+            // timestamp — must contribute nothing
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}],"timestamp":1783777801500,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":100,"output_tokens":50}},"providerData":{"messageId":"m-1","model":"glm-5.2","agent":"cli"}}"#,
+            // a distinct response m-2: 40 input / 20 output
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}],"timestamp":1783777802000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":40,"output_tokens":20}},"providerData":{"messageId":"m-2","model":"glm-5.2","agent":"cli"}}"#,
+            // usage on a record with NO messageId (function_call_result,
+            // the rm-647 all-record arm): per-record fallback counts
+            r#"{"type":"function_call_result","name":"Read","callId":"c1","status":"completed","output":{"type":"text","text":"ok"},"timestamp":1783777803000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":7,"output_tokens":3}},"providerData":{"agent":"cli"}}"#,
+        ]
+        .join("\n"),
+    )
+    .expect("write workbuddy re-flush session");
+    let parsed = parse_file(&session_path).expect("parse workbuddy re-flush session");
+    assert_eq!(parsed.metrics.source_tool, "workbuddy");
+    // distinct responses only: 100 + 40 + 7 = 147 input, 50 + 20 + 3 =
+    // 73 output. Pre-rm-647 the re-flush re-added m-1 (247 / 123 —
+    // the assess/prioritize inflation shape).
+    assert_eq!(parsed.metrics.tokens_input, 147);
+    assert_eq!(parsed.metrics.tokens_output, 73);
+    // both halves disclosed through the parse-counter channel
+    assert_eq!(
+        parsed.metrics.line_skips.get("workbuddy_message_dedup"),
+        Some(&1)
+    );
+    assert_eq!(
+        parsed
+            .metrics
+            .line_skips
+            .get("workbuddy_usage_no_message_id"),
+        Some(&1)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_parses_antigravity_cli_transcript() {
     let root = temp_root("agenttrace-rust-antigravity");
     fs::create_dir_all(&root).expect("create antigravity temp dir");
@@ -951,6 +1007,125 @@ fn rust_single_codex_session_meta_json_object_falls_back_to_generic() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// rm-402: a Codex child rollout (compact/subagent fork) replays the
+/// parent's conversation at its head — token_count snapshots included
+/// — so parsing each file from zero counted the parent's spend again
+/// in every child. Two-file golden, pinned RED-first: the corpus load
+/// at the top is the fix (the child inherits the parent's fork-point
+/// high-water mark and counts only its own work: 1,400 + 300 = 1,700
+/// true), and the single-file `parse_file` at the bottom pins the
+/// from-zero parse the fix must beat (child alone reports 1,700;
+/// summed naively with the parent that is the pre-fix corpus total of
+/// 3,100, the +82% inflation the roadmap PoC recorded).
+#[test]
+fn rust_codex_child_rollout_inherits_parent_baseline_and_counts_own_work_once() {
+    fn rollout_line(session_id: &str, parent_id: Option<&str>, fork_ts: &str) -> String {
+        let mut payload = serde_json::json!({ "id": session_id });
+        if let Some(id) = parent_id {
+            payload["forked_from_id"] = serde_json::json!(id);
+        }
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": fork_ts,
+                "type": "session_meta",
+                "payload": payload,
+            })
+        )
+    }
+    fn token_count_line(ts: &str, input: i64, cached: i64, output: i64) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": cached,
+                            "output_tokens": output,
+                        },
+                    },
+                },
+            })
+        )
+    }
+
+    let root = temp_root("agenttrace-rm402-codex-replay");
+    let home = root.join("home");
+    let corpus = home.join("rollouts");
+    fs::create_dir_all(&corpus).expect("create corpus dir");
+    // Parent: cumulative snapshots end at 1,000 in / 400 out = 1,400.
+    fs::write(
+        corpus.join("parent.jsonl"),
+        format!(
+            "{}{}{}",
+            rollout_line("sess-parent", None, "2026-10-01T10:00:00.000Z"),
+            token_count_line("2026-10-01T10:01:00.000Z", 1000, 0, 300),
+            token_count_line("2026-10-01T10:02:00.000Z", 1000, 0, 400),
+        ),
+    )
+    .expect("write parent rollout");
+    // Child: forked at 10:03 (after both parent snapshots), replays the
+    // parent's final cumulative snapshot (1,000/400), then adds 200 in
+    // / 100 out of its own.
+    fs::write(
+        corpus.join("child.jsonl"),
+        format!(
+            "{}{}{}",
+            rollout_line(
+                "sess-child",
+                Some("sess-parent"),
+                "2026-10-01T10:03:00.000Z"
+            ),
+            token_count_line("2026-10-01T10:04:00.000Z", 1000, 0, 400),
+            token_count_line("2026-10-01T10:05:00.000Z", 1200, 0, 500),
+        ),
+    )
+    .expect("write child rollout");
+
+    with_home_and_cache(&home, &root.join("cache"), || {
+        let sessions = load_sessions_from_dir(Some(&corpus));
+        assert_eq!(sessions.len(), 2, "parent and child both load");
+        let child = sessions
+            .iter()
+            .find(|s| s.path.ends_with("child.jsonl"))
+            .expect("child session");
+        let parent = sessions
+            .iter()
+            .find(|s| s.path.ends_with("parent.jsonl"))
+            .expect("parent session");
+        assert_eq!(parent.metrics.source_tool, "codex_cli");
+        assert_eq!(parent.metrics.tokens_input, 1000);
+        assert_eq!(parent.metrics.tokens_output, 400);
+        // The child counts ONLY its own work; the inherited baseline is
+        // disclosed through the parse-counter channel (rm-401 family).
+        assert_eq!(child.metrics.source_tool, "codex_cli");
+        assert_eq!(child.metrics.tokens_input, 200);
+        assert_eq!(child.metrics.tokens_output, 100);
+        assert_eq!(
+            child
+                .metrics
+                .line_skips
+                .get("codex_replay_baseline_inherited"),
+            Some(&1)
+        );
+        // Corpus truth: 1,400 (parent) + 300 (child's own work) = 1,700.
+        assert_eq!(sessions.iter().map(total_tokens).sum::<i64>(), 1700);
+    });
+
+    // RED side, pinned on purpose: parsing the child WITHOUT the corpus
+    // has no parent to inherit, so it counts the replayed prefix from
+    // zero (1,700 alone).
+    let child_alone = parse_file(&corpus.join("child.jsonl")).expect("parse child alone");
+    assert_eq!(child_alone.metrics.tokens_input, 1200);
+    assert_eq!(child_alone.metrics.tokens_output, 500);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn rust_generic_jsonl_accepts_legacy_type_events_without_role() {
     let root = temp_root("agenttrace-rust-legacy-generic-jsonl");
@@ -1014,6 +1189,10 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // v29 (integration of run 99d1c79c, rm-600 workbuddy usage
+        // v30 (rm-647 workbuddy re-flush dedup + rm-402 codex replay
+        // baseline inheritance + rm-487 subagent linkage) changed
+        // stored totals and added Metrics.ParentSession/Subagent*;
+        // 29 was the rm-600 workbuddy usage
         // sum + cache clamp + Copilot adoption, upstream
         // #311/#316, re-based off the campaign's 25 -> 26 bump; 28 was
         // the rm-529 #316 clamp port, 27 was the rm-542 Codex
@@ -1026,7 +1205,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(29)
+            Some(30)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1198,7 +1377,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         // integration, re-based off the campaign's own 25 -> 26 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(29)
+            Some(30)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -3262,6 +3441,196 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
             doc.pointer("/dir_listing_version").and_then(Value::as_i64),
             Some(2),
             "the journal must be rewritten at the current walk version"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_subagent_rollup_links_without_folding() {
+    // rm-487 (upstream #305 fork parity): subagent transcripts under a
+    // `subagents/` directory link to their parent session post-load.
+    // The rollup rides Metrics.subagent_* on the parent and NEVER folds
+    // into the parent's own usage — fleet totals count each transcript
+    // exactly once. This golden pins three layouts at once:
+    //   sibling   `<dir>/p1.jsonl` + `<dir>/subagents/agent-p1-sub1.jsonl`
+    //             in a MULTI-session `<dir>` (the stem-anchored rule;
+    //             an unconstrained in-owner match would see p1 AND q1
+    //             as candidates and decline both links)
+    //   nested    `<dir>/p2.jsonl` + `<dir>/p2/subagents/agent-p2-x.jsonl`
+    //             where the parent matches TWO rules at once (the owner
+    //             dir is named for the parent AND the agent file embeds
+    //             the parent id) — agreement, not ambiguity
+    //   orphan    `agent-ghost-sub.jsonl` with no parent transcript —
+    //             stays unlinked rather than inventing an edge.
+    let root = temp_root("agenttrace-rm487-subagent-rollup");
+    let projects = root.join("projects");
+    let repo = projects.join("repo");
+    let repo2 = projects.join("repo2");
+    let subagents = repo.join("subagents");
+    fs::create_dir_all(&subagents).expect("create subagents dir");
+    fs::create_dir_all(repo2.join("p2").join("subagents")).expect("create nested subagents dir");
+    fs::write(repo.join("p1.jsonl"), SAMPLE_JSONL).expect("write p1");
+    fs::write(repo.join("q1.jsonl"), SAMPLE_JSONL).expect("write q1");
+    fs::write(subagents.join("agent-p1-sub1.jsonl"), SAMPLE_JSONL).expect("write p1 subagent");
+    fs::write(subagents.join("agent-q1-sub.jsonl"), SAMPLE_JSONL).expect("write q1 subagent");
+    fs::write(subagents.join("agent-ghost-sub.jsonl"), SAMPLE_JSONL)
+        .expect("write orphan subagent");
+    fs::write(repo2.join("p2.jsonl"), SAMPLE_JSONL).expect("write p2");
+    fs::write(
+        repo2.join("p2").join("subagents").join("agent-p2-x.jsonl"),
+        SAMPLE_JSONL,
+    )
+    .expect("write p2 subagent");
+
+    with_home_and_cache(&root.join("home"), &root.join("cache"), || {
+        let sessions = load_sessions_from_dir(Some(&projects));
+        assert_eq!(
+            sessions.len(),
+            7,
+            "every transcript loads as its own session: {sessions:?}"
+        );
+        let stem_of = |s: &agenttrace_core::Session| {
+            std::path::Path::new(&s.path)
+                .file_stem()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()
+        };
+        let by_stem = |stem: &str| {
+            sessions
+                .iter()
+                .find(|s| stem_of(s) == stem)
+                .unwrap_or_else(|| panic!("session {stem}: {:?}", sessions))
+        };
+        let p1 = by_stem("p1");
+        let q1 = by_stem("q1");
+        let p2 = by_stem("p2");
+        let sub1 = by_stem("agent-p1-sub1");
+        let qsub = by_stem("agent-q1-sub");
+        let ghost = by_stem("agent-ghost-sub");
+        let p2sub = by_stem("agent-p2-x");
+
+        // Linkage: children name their parent (id + path).
+        let parent = sub1.metrics.parent_session.as_ref().expect("p1 link");
+        assert_eq!(parent.id, "p1");
+        assert!(parent.path.ends_with("p1.jsonl"));
+        assert_eq!(
+            qsub.metrics.parent_session.as_ref().map(|p| p.id.as_str()),
+            Some("q1")
+        );
+        assert_eq!(
+            p2sub.metrics.parent_session.as_ref().map(|p| p.id.as_str()),
+            Some("p2"),
+            "a parent matching two rules at once is ONE candidate, not ambiguity"
+        );
+        assert!(
+            ghost.metrics.parent_session.is_none(),
+            "an orphan subagent stays unlinked instead of inventing an edge"
+        );
+
+        // Rollup: the parent attributes the child's spend without
+        // folding it into its own numbers.
+        assert_eq!(p1.metrics.subagent_sessions, 1);
+        assert_eq!(p1.metrics.subagent_tokens, total_tokens(sub1));
+        assert_eq!(p1.metrics.subagent_cost, sub1.metrics.cost_estimated);
+        assert_eq!(p2.metrics.subagent_sessions, 1);
+        assert_eq!(q1.metrics.subagent_sessions, 1);
+        assert_eq!(ghost.metrics.subagent_sessions, 0);
+
+        // Never-folds: the parent's own accounting is untouched by the
+        // rollup, and fleet totals count each transcript exactly once
+        // (7 transcripts x 1,500 tokens — no +1,500 anywhere).
+        assert_eq!(p1.metrics.tokens_input, 1000);
+        assert_eq!(p1.metrics.tokens_output, 500);
+        assert_eq!(total_tokens(p1), 1500);
+        assert_eq!(
+            sessions.iter().map(total_tokens).sum::<i64>(),
+            7 * 1500,
+            "fleet truth: parent + children each counted once"
+        );
+
+        // Warm-cache round trip: the linkage fields ride the session
+        // cache (schema 30 regenerates schema-29 entries) and are
+        // recomputed — reset, then relink — on every load, so a second
+        // load through the cache reports the identical rollup.
+        let warm = load_sessions_with_options(Some(&projects), &LoadOptions::default());
+        assert!(warm.cache_hits > 0, "the second load rides the warm cache");
+        let warm_p1 = warm
+            .sessions
+            .iter()
+            .find(|s| stem_of(s) == "p1")
+            .expect("warm p1");
+        let warm_sub1 = warm
+            .sessions
+            .iter()
+            .find(|s| stem_of(s) == "agent-p1-sub1")
+            .expect("warm sub1");
+        assert_eq!(warm_p1.metrics.subagent_sessions, 1);
+        assert_eq!(warm_p1.metrics.subagent_tokens, total_tokens(warm_sub1));
+        assert_eq!(
+            warm_sub1
+                .metrics
+                .parent_session
+                .as_ref()
+                .map(|p| p.id.as_str()),
+            Some("p1")
+        );
+        assert_eq!(
+            warm.sessions.iter().map(total_tokens).sum::<i64>(),
+            7 * 1500
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn subagent_forked_copies_roll_up_without_double_counting() {
+    // rm-487 acceptance: a parent + child + forked-copy corpus (the
+    // fork is a byte-identical second subagent transcript) rolls BOTH
+    // children up while fleet totals still count each file exactly
+    // once — the rollup is a view, never an aggregate lane that could
+    // double-bill a forked subagent.
+    let root = temp_root("agenttrace-rm487-forked-copies");
+    let repo = root.join("repo");
+    let subagents = repo.join("subagents");
+    fs::create_dir_all(&subagents).expect("create subagents dir");
+    fs::write(repo.join("p1.jsonl"), SAMPLE_JSONL).expect("write p1");
+    fs::write(subagents.join("agent-p1-sub1.jsonl"), SAMPLE_JSONL).expect("write sub1");
+    fs::write(subagents.join("agent-p1-sub2.jsonl"), SAMPLE_JSONL).expect("write forked copy");
+
+    with_home_and_cache(&root.join("home"), &root.join("cache"), || {
+        let sessions = load_sessions_from_dir(Some(&repo));
+        assert_eq!(sessions.len(), 3);
+        let p1 = sessions
+            .iter()
+            .find(|s| {
+                std::path::Path::new(&s.path)
+                    .file_stem()
+                    .map(|f| f == "p1")
+                    .unwrap_or(false)
+            })
+            .expect("p1");
+        assert_eq!(p1.metrics.subagent_sessions, 2);
+        assert_eq!(p1.metrics.subagent_tokens, 2 * 1500);
+        let children: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.metrics.parent_session.is_some())
+            .collect();
+        assert_eq!(children.len(), 2);
+        for child in &children {
+            assert_eq!(child.metrics.parent_session.as_ref().unwrap().id, "p1");
+        }
+        assert!(
+            (p1.metrics.subagent_cost - 2.0 * children[0].metrics.cost_estimated).abs()
+                < f64::EPSILON,
+            "the rollup bills both forks once each"
+        );
+        assert_eq!(
+            sessions.iter().map(total_tokens).sum::<i64>(),
+            3 * 1500,
+            "no double count: the fork adds exactly one more transcript"
         );
     });
 

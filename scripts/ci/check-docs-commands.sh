@@ -29,6 +29,10 @@ mkdir -p "$out_dir/docs"
 "$bin" --demo --latest -f json >"$out_dir/docs/latest.json"
 "$bin" --demo --latest --lang zh -f json >"$out_dir/docs/latest-zh.json"
 "$bin" --demo --overview -f json >"$out_dir/docs/overview.json"
+# rm-207-ext: the otel OTLP export is a documented format now — keep a
+# real invocation in the gate so a ValueEnum/serializer regression fails
+# here, not in an operator's collector.
+"$bin" --demo --overview -f otel >"$out_dir/docs/overview.otel.json"
 "$bin" --demo --search billing >"$out_dir/docs/search.txt"
 "$bin" --demo --search internal/ws -f json >"$out_dir/docs/search.json"
 "$bin" --demo --overview -f markdown -o "$out_dir/docs/overview.md" >"$out_dir/docs/overview-md.stdout"
@@ -125,4 +129,88 @@ for doc in "${skills_docs[@]}"; do
       fi
     done
   done < <(grep -E '^[[:space:]]*agenttrace ' "$doc" || true)
+done
+
+# rm-207-ext rider (cycle 2): two sweeps the skills sweep cannot see.
+#
+# Both read ONLY fenced code blocks (```-delimited): prose can
+# legitimately start a line with the word `agenttrace` ("agenttrace
+# supports multiple session formats...") without invoking anything, so
+# a raw line-leading grep would flag sentence verbs as missing
+# subcommands.
+fenced_agenttrace_lines() {
+  awk '
+    /^```/ { fenced = !fenced; next }
+    fenced && /^[[:space:]]*(\$[[:space:]]+)?agenttrace / { print }
+  ' "$1"
+}
+
+# (1) FORMAT VALUES: every documented `-f X` / `--format X` in the
+# operator docs must be a possible value of --format in the binary this
+# gate ran against. A format renamed or dropped from the ValueEnum
+# (e.g. the `otel` OTLP export) leaves every documented invocation
+# erroring at parse time — earlier than any flag check can catch it.
+# The possible-values list is read from --help next to the -f/--format
+# entry, not hardcoded here, so the gate tracks the binary by
+# construction.
+format_values="$(
+  awk '
+    /-f, --format <FORMAT>/ { in_format = 1; next }
+    in_format && /possible values:/ {
+      line = $0
+      sub(/.*possible values: /, "", line)
+      sub(/\].*/, "", line)
+      gsub(/[[:space:]]/, "", line)
+      print line
+      exit
+    }
+    in_format && NF == 0 { exit }
+  ' <<<"$skills_help"
+)"
+[[ -n "$format_values" ]] || fail "could not read --format possible values from --help"
+for doc in README.md docs/guides/*.md skills/*/SKILL.md; do
+  [[ -f "$doc" ]] || continue
+  while IFS= read -r used; do
+    [[ -n "$used" ]] || continue
+    case ",$format_values," in
+      *",$used,"*) ;;
+      *) fail "$doc uses format '$used', which is not a --format possible value ($format_values)" ;;
+    esac
+  done < <(
+    fenced_agenttrace_lines "$doc" \
+      | grep -oE -- '(^|[^a-zA-Z0-9-])(-f|--format)[[:space:]]*[=]?[[:space:]]*[a-z]+' \
+      | grep -oE '[a-z]+$' | sort -u || true
+  )
+done
+
+# (2) HIDDEN HOST COMMANDS: `statusline` and `upstream` are dispatched
+# as positionals BEFORE action validation (main.rs
+# `args.path.as_deref() == Some(...)`), so they never appear in --help
+# and the flag sweep cannot vouch for them. Every bare subcommand word
+# the operator docs invoke on a command line must therefore be
+# recognized by the dispatcher. The exclusion class
+# `[^a-zA-Z0-9./-]` skips path-shaped positionals (`sessions.jsonl`,
+# `path/to/session.jsonl`): a dot or slash after the word means the
+# docs mean a file, not a host command.
+dispatcher="$repo_root/crates/agenttrace-cli/src/main.rs"
+[[ -f "$dispatcher" ]] || fail "dispatcher source not found: $dispatcher"
+recognized="$(
+  grep -oE 'args\.path\.as_deref\(\) == Some\("[a-z][a-z0-9-]+"\)' "$dispatcher" \
+    | grep -oE '"[a-z][a-z0-9-]+"' | tr -d '"' | tr '\n' ',' | sed 's/,$//'
+)"
+[[ -n "$recognized" ]] || fail "no host commands found in $dispatcher"
+for doc in README.md docs/guides/*.md skills/*/SKILL.md; do
+  [[ -f "$doc" ]] || continue
+  while IFS= read -r word; do
+    [[ -n "$word" ]] || continue
+    case ",$recognized," in
+      *",$word,"*) ;;
+      *) fail "$doc invokes 'agenttrace $word' as a bare subcommand, but the dispatcher recognizes only: $recognized" ;;
+    esac
+  done < <(
+    fenced_agenttrace_lines "$doc" \
+      | grep -E '^[[:space:]]*(\$[[:space:]]+)?agenttrace [a-z][a-z0-9-]*[^a-zA-Z0-9./-]' \
+      | grep -oE '^[[:space:]]*(\$[[:space:]]+)?agenttrace [a-z][a-z0-9-]*' \
+      | awk '{print $NF}' | sort -u || true
+  )
 done

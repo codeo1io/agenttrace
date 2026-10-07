@@ -48,6 +48,12 @@ pub struct SessionCsvRow {
     /// rm-408: all-zero usage blocks the transcript reported, counted
     /// as measured and disclosed.
     pub zero_usage_events: usize,
+    /// rm-487: subagent transcripts linked to this session post-load
+    /// (the rollup view — kept separate from the session's own cost
+    /// and tokens so fleet sums stay once-per-transcript).
+    pub subagents: usize,
+    /// rm-487: estimated cost of those subagent transcripts.
+    pub subagent_cost: f64,
 }
 
 pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
@@ -64,6 +70,8 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             "fail",
             "anomalies",
             "zero_usage_events",
+            "subagents",
+            "subagent_cost",
         ],
     );
     for row in rows {
@@ -78,6 +86,8 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
+            &row.subagents.to_string(),
+            &format!("{:.4}", row.subagent_cost),
         ]));
     }
     out
@@ -290,16 +300,18 @@ mod tests {
             fail: 0,
             anomalies: 0,
             zero_usage_events: 2,
+            subagents: 3,
+            subagent_cost: 0.5,
         }]);
         let lines: Vec<&str> = out.split("\r\n").collect();
         assert_eq!(lines[0], "# sessions");
         assert_eq!(
             lines[1],
-            "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events"
+            "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost"
         );
         assert_eq!(
             lines[2],
-            "\"fix the \"\"bug\"\", today\",98,green,claude_code,claude-sonnet-4-5,1.2500,900,0,0,2"
+            "\"fix the \"\"bug\"\", today\",98,green,claude_code,claude-sonnet-4-5,1.2500,900,0,0,2,3,0.5000"
         );
         assert!(out.ends_with("\r\n"));
     }

@@ -13,7 +13,24 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 /// values have already been summed.
 type ParseCounters = Vec<(String, i64)>;
 
+use crate::codex_replay::CodexReplayBaseline;
+
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
+    parse_path(path, None)
+}
+
+/// rm-402: `parse_file` with a cross-file replay baseline. Discovery
+/// computes one baseline per Codex child rollout (see `codex_replay`)
+/// so the parent's conversation — replayed at the head of the child —
+/// is not counted twice. `None` parses exactly as before.
+pub(crate) fn parse_file_with_replay(
+    path: &Path,
+    baseline: Option<&CodexReplayBaseline>,
+) -> anyhow::Result<Session> {
+    parse_path(path, baseline)
+}
+
+fn parse_path(path: &Path, baseline: Option<&CodexReplayBaseline>) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
     }
@@ -28,14 +45,19 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
-    parse_session_bytes(raw, &path_text, &name)
+    parse_session_bytes(raw, &path_text, &name, baseline)
 }
 
 /// Decode + parse one session stream (rm-503): the shared tail of
 /// `parse_file` past the byte read. Encoding guards keep the exact
 /// wording the file path produced, with `label` standing in for the
 /// path so stdin failures read `session file <stdin> is …`.
-fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<Session> {
+fn parse_session_bytes(
+    raw: Vec<u8>,
+    label: &str,
+    name: &str,
+    baseline: Option<&CodexReplayBaseline>,
+) -> anyhow::Result<Session> {
     // Windows tooling (notably PowerShell 5.1's `>` redirection) writes
     // UTF-16 with a BOM by default; name the encoding instead of failing
     // with a generic read error (pass-7 P7-2).
@@ -57,7 +79,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
     }
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
-    parse_raw_session(name, label, &raw)
+    parse_raw_session_with_replay(name, label, &raw, baseline)
 }
 
 /// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):
@@ -66,7 +88,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
 /// touched for it — and stdin sessions are ephemeral, so callers keep
 /// them out of the session cache.
 pub fn parse_stdin_bytes(raw: Vec<u8>) -> anyhow::Result<Session> {
-    parse_session_bytes(raw, "<stdin>", "stdin")
+    parse_session_bytes(raw, "<stdin>", "stdin", None)
 }
 
 fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
@@ -105,6 +127,18 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
 }
 
 pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Session> {
+    parse_raw_session_with_replay(name, path, raw, None)
+}
+
+/// rm-402 tail of `parse_raw_session`: same parse, seeded with a
+/// cross-file replay baseline when the stream is a Codex child
+/// rollout that replayed its parent's conversation.
+fn parse_raw_session_with_replay(
+    name: &str,
+    path: &str,
+    raw: &str,
+    baseline: Option<&CodexReplayBaseline>,
+) -> anyhow::Result<Session> {
     // Strip one UTF-8 BOM at offset 0 and nowhere else (pass-7 P7-2):
     // every parse path funnels through this entry, so a single strip
     // covers every format, and a U+FEFF embedded later in the content
@@ -136,7 +170,7 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if parsed_value.is_none() {
-        if let Some((events, parse_counters)) = parse_codex_rollout_jsonl(raw) {
+        if let Some((events, parse_counters)) = parse_codex_rollout_jsonl(raw, baseline) {
             let mut session = session_from_events(name, path, events)?;
             // rm-047 made the fast-path skips visible in parse diagnostics;
             // rm-401 widened the channel to every codex parse decision
@@ -948,6 +982,17 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
     let mut usage_sum: TokenUsage = BTreeMap::new();
     let mut has_usage = false;
     let mut clamped_records: i64 = 0;
+    // rm-647 (upstream #311's dedup key onto the landed sum lane):
+    // WorkBuddy re-flush rewrites a record — a new content slot, but
+    // the SAME providerData.messageId, the provider response
+    // identity — and the rewrite re-carries its usage block, so a
+    // re-flushed ledger double-counted every rewritten record on the
+    // sum lane. The first occurrence counts; repeats drop with a
+    // disclosure counter. Records with NO messageId (the wb1/wb7
+    // green-pin shape) keep per-record accounting, also disclosed.
+    let mut seen_message_ids: BTreeSet<String> = BTreeSet::new();
+    let mut deduped_records: i64 = 0;
+    let mut unkeyed_usage_records: i64 = 0;
     for entry in objs.iter() {
         if let Some(next) = entry
             .get("providerData")
@@ -963,6 +1008,42 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
             .map(timestamp_millis)
             .unwrap_or_default();
         let cwd = string(entry.get("cwd")).unwrap_or("").to_string();
+        // rm-647 acceptance (3): usage is read from EVERY record type,
+        // not just message/reasoning/function_call — upstream reads
+        // it wherever the provider attaches it (a usage block on a
+        // function_call_result row was previously dropped).
+        if let Some((next, clamped)) = workbuddy_usage(entry) {
+            let message_id = entry
+                .get("providerData")
+                .and_then(Value::as_object)
+                .and_then(|data| string(data.get("messageId")))
+                .filter(|value| !value.is_empty());
+            let counted = match message_id {
+                Some(id) if seen_message_ids.contains(id) => {
+                    // Same provider response re-flushed: count once.
+                    deduped_records += 1;
+                    false
+                }
+                Some(id) => {
+                    seen_message_ids.insert(id.to_string());
+                    true
+                }
+                None => {
+                    // No response identity: per-record fallback (the
+                    // pre-rm-647 behavior), disclosed so a provider
+                    // that never stamps messageId is visible.
+                    unkeyed_usage_records += 1;
+                    true
+                }
+            };
+            if counted {
+                has_usage = true;
+                if clamped {
+                    clamped_records += 1;
+                }
+                add_usage_into(&mut usage_sum, next);
+            }
+        }
         match string(entry.get("type")).unwrap_or("") {
             "message" => {
                 let role = string(entry.get("role")).unwrap_or("");
@@ -978,25 +1059,8 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
                         ..Event::default()
                     });
                 }
-                if let Some((next, clamped)) = workbuddy_usage(entry) {
-                    has_usage = true;
-                    if clamped {
-                        clamped_records += 1;
-                    }
-                    add_usage_into(&mut usage_sum, next);
-                }
             }
             "reasoning" => {
-                // Upstream #311 rider: reasoning records can carry a
-                // usage block too — read it into the sum instead of
-                // silently dropping the record's tokens.
-                if let Some((next, clamped)) = workbuddy_usage(entry) {
-                    has_usage = true;
-                    if clamped {
-                        clamped_records += 1;
-                    }
-                    add_usage_into(&mut usage_sum, next);
-                }
                 let reasoning = workbuddy_content(
                     entry
                         .get("content")
@@ -1016,13 +1080,6 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
                 }
             }
             "function_call" => {
-                if let Some((next, clamped)) = workbuddy_usage(entry) {
-                    has_usage = true;
-                    if clamped {
-                        clamped_records += 1;
-                    }
-                    add_usage_into(&mut usage_sum, next);
-                }
                 events.push(Event {
                     role: "assistant".to_string(),
                     timestamp,
@@ -1065,6 +1122,15 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
             parse_counters.push((
                 "workbuddy_input_basis:cache_clamped".to_string(),
                 clamped_records,
+            ));
+        }
+        if deduped_records > 0 {
+            parse_counters.push(("workbuddy_message_dedup".to_string(), deduped_records));
+        }
+        if unkeyed_usage_records > 0 {
+            parse_counters.push((
+                "workbuddy_usage_no_message_id".to_string(),
+                unkeyed_usage_records,
             ));
         }
         events.insert(
@@ -2700,15 +2766,35 @@ fn collect_codex_usage_record(record: &Value, into: &mut Vec<CodexUsageRecord>, 
     });
 }
 
-fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, usize>)> {
+fn parse_codex_rollout_jsonl(
+    raw: &str,
+    replay_baseline: Option<&CodexReplayBaseline>,
+) -> Option<(Vec<Event>, BTreeMap<String, usize>)> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_codex = false;
+    // rm-402 (ccusage CodexReplayPlan port): a child rollout replays
+    // the parent's conversation at its head — token_count snapshots
+    // included — so parsing the child from zero counted the parent's
+    // spend again. Seed the high-water mark with the parent's
+    // fork-point cumulative usage: every replayed snapshot computes a
+    // zero delta and drops out, and only genuinely new child work is
+    // counted. A child whose named parent is not part of the corpus
+    // still counts from zero (nothing is invented) and the gap is
+    // disclosed through the parse-counter channel instead.
+    let mut counters: BTreeMap<String, usize> = BTreeMap::new();
     let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
+    if let Some(baseline) = replay_baseline {
+        if baseline.parent_found {
+            prev_token_total = Some(baseline.usage.clone());
+            counters.insert("codex_replay_baseline_inherited".to_string(), 1);
+        } else {
+            counters.insert("codex_replay_parent_missing".to_string(), 1);
+        }
+    }
     // rm-047: the head-probe fast path used to discard lines invisibly;
     // count every skip so parse diagnostics can surface it. rm-401
     // widened the map to the compaction-usage decisions too.
-    let mut counters: BTreeMap<String, usize> = BTreeMap::new();
     // rm-401: token_usage_record events describe one response's
     // usage; only records paired to a compaction marker count (normal turns
     // are already inside the cumulative snapshots). Records can arrive
@@ -3123,7 +3209,7 @@ fn codex_line_is_ignorable(line: &str) -> bool {
 /// before it is `{` or `,`). Valid JSON cannot place the raw needle
 /// inside a string value — its quotes would have to be escaped — so this
 /// anchors the skip decision against lenient-parsed or corrupt lines.
-fn json_key_present(line: &str, needle: &str) -> bool {
+pub(crate) fn json_key_present(line: &str, needle: &str) -> bool {
     let bytes = line.as_bytes();
     let mut from = 0;
     while let Some(at) = line[from..].find(needle) {
@@ -3184,7 +3270,7 @@ fn codex_token_count_usage(
     Some((usage, next_total))
 }
 
-fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
+pub(crate) fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
     let Some(obj) = raw.and_then(Value::as_object) else {
         return BTreeMap::new();
     };
@@ -6319,6 +6405,78 @@ mod tests {
             BTreeMap::from([("input_tokens".to_string(), i64::MAX)]),
         );
         assert_eq!(total.get("input_tokens"), Some(&i64::MAX));
+    }
+
+    #[test]
+    fn workbuddy_dedups_re_flushed_usage_records_by_message_id() {
+        // rm-647 (upstream #311's dedup key ported onto the landed sum
+        // lane): WorkBuddy re-flush rewrites a record — a new content
+        // slot, but the SAME providerData.messageId, the provider
+        // response identity — and the rewrite re-carries its usage
+        // block, so the sum lane counted one response twice. The first
+        // occurrence counts; repeats drop with a disclosure counter.
+        let raw = [
+            r#"{"type":"reasoning","content":[],"rawContent":[],"timestamp":1783777799000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"model":"glm-5.2"}}"#,
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"v1"}],"timestamp":1783777800000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":100,"output_tokens":50}},"providerData":{"model":"glm-5.2","messageId":"resp-1"}}"#,
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"v1 (re-rendered)"}],"timestamp":1783777800500,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":100,"output_tokens":50}},"providerData":{"model":"glm-5.2","messageId":"resp-1"}}"#,
+        ]
+        .join("\n");
+        let session = parse_raw_session("cp", "wb.jsonl", &raw).expect("workbuddy parses");
+        assert_eq!(session.metrics.source_tool, "workbuddy");
+        assert_eq!(session.metrics.tokens_input, 100);
+        assert_eq!(session.metrics.tokens_output, 50);
+        assert_eq!(
+            session.metrics.line_skips.get("workbuddy_message_dedup"),
+            Some(&1),
+            "the dropped rewrite is disclosed in diagnostics"
+        );
+    }
+
+    #[test]
+    fn workbuddy_reads_usage_from_every_record_type() {
+        // rm-647 acceptance (3): the old lane read usage only in the
+        // message/reasoning/function_call arms, so a usage block on a
+        // function_call_result row (upstream reads it wherever the
+        // provider attaches it) was silently dropped.
+        let raw = [
+            r#"{"type":"reasoning","content":[],"rawContent":[],"timestamp":1783777800000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"model":"glm-5.2"}}"#,
+            r#"{"type":"function_call","name":"Read","callId":"c1","arguments":"{}","timestamp":1783777801000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"model":"glm-5.2","messageId":"resp-1"}}"#,
+            r#"{"type":"function_call_result","name":"Read","callId":"c1","status":"completed","output":"ok","timestamp":1783777802000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":40,"output_tokens":10}},"providerData":{"model":"glm-5.2","messageId":"resp-2"}}"#,
+        ]
+        .join("\n");
+        let session = parse_raw_session("cp", "wb.jsonl", &raw).expect("workbuddy parses");
+        assert_eq!(session.metrics.tokens_input, 40);
+        assert_eq!(session.metrics.tokens_output, 10);
+        assert_eq!(
+            session.metrics.line_skips.get("workbuddy_message_dedup"),
+            None
+        );
+    }
+
+    #[test]
+    fn workbuddy_usage_without_message_id_falls_back_per_record() {
+        // rm-647 acceptance (2): records missing messageId keep the
+        // per-record accounting (the wb1/wb7 green-pin corpora are
+        // exactly this shape) and disclose the fallback so a journal
+        // whose provider never stamps response identity is visible.
+        let raw = [
+            r#"{"type":"reasoning","content":[],"rawContent":[],"timestamp":1783777799000,"sessionId":"s1","cwd":"/tmp/project","providerData":{"model":"glm-5.2"}}"#,
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}],"timestamp":1783777800000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":100,"output_tokens":50}}}"#,
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}],"timestamp":1783777801000,"sessionId":"s1","cwd":"/tmp/project","message":{"usage":{"input_tokens":200,"output_tokens":60}}}"#,
+        ]
+        .join("\n");
+        let session = parse_raw_session("cp", "wb.jsonl", &raw).expect("workbuddy parses");
+        // wb1 pin: the fallback lane sums exactly as before (300/110).
+        assert_eq!(session.metrics.tokens_input, 300);
+        assert_eq!(session.metrics.tokens_output, 110);
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("workbuddy_usage_no_message_id"),
+            Some(&2),
+            "each unkeyed contributing record discloses the fallback"
+        );
     }
 
     #[test]

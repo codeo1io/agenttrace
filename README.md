@@ -130,6 +130,18 @@ with the file, line number, and key — a typo never silently does
 nothing. The same flags exist on the command line (`--history-dir`,
 `--pricing-file`, `--weekly-budget`) and win over every file.
 
+### Report formats (`-f`)
+
+`-f/--format` takes `text` (default), `json`, `csv`, `markdown` (alias
+`md`), `html`, and `otel`. The structured formats are compositional, not
+free-form: `markdown`/`md`/`html` render the overview or a governance
+report action, `csv` renders `--overview` or `--sessions` (see below),
+and `otel` renders `--overview` alone as an OTLP JSON document
+(`resourceSpans` with one span per session — ship it to any OTLP/HTTP
+receiver for trace-store retention; the export is offline and makes no
+network calls). Asking for a structured format outside its composable
+set bails loudly instead of silently rendering the text report.
+
 ### CSV statement export (rm-409)
 
 `-f csv` emits RFC 4180 (CRLF rows, `""`-doubled quotes) with one table per
@@ -141,9 +153,17 @@ across runs, announcements on stderr so stdout stays pure):
 ```bash
 agenttrace --sessions -f csv
 agenttrace --overview -f csv
+agenttrace --overview -f otel
 ```
 
-Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events`.
+Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost`.
+The trailing pair carries the subagent rollup (rm-487): transcripts
+parked under a `subagents/` directory link to their parent session at
+load time, and the parent attributes them — `3` subagents, their token
+sum, their cost sum — without ever folding them into its own
+`cost`/`tokens` cells, so fleet totals still count each transcript
+exactly once. A linked child names its parent in `--sessions -f json`
+(`parent_session`).
 `zero_usage_events` carries the rm-408 disclosure: transcripts that
 REPORT `{input_tokens: 0, output_tokens: 0, …}` are counted as measured
 zeros and flagged `zero_usage_reported` in provenance instead of reading
@@ -268,6 +288,24 @@ exits 0 with a one-line fallback. Review what was captured with
 [docs/guides/statusline-capture.md](docs/guides/statusline-capture.md) for the
 schema and retention details.
 
+### Upstream status (`agenttrace upstream`)
+
+This fork tracks `luoyuctl/agenttrace` as the `upstream` git remote.
+
+```bash
+agenttrace upstream
+agenttrace --fetch upstream
+```
+
+The report prints the drift — remote/local tips, ahead/behind counts,
+diverged files, new releases, and the unported-commit list — from local
+remote-tracking refs alone (fully offline). Prefix it with `--fetch` to
+run `git fetch upstream` and probe the npm registry first; that is the
+only network it ever performs and it says so on stderr. It is a host
+command dispatched before report flags, like `agenttrace statusline`.
+Full walkthrough:
+[docs/guides/upstream-status.md](docs/guides/upstream-status.md).
+
 ## What you get
 
 | Need | agenttrace gives you |
@@ -289,6 +327,7 @@ schema and retention details.
 - Documentation index: [docs/README.md](docs/README.md)
 - CI setup: [docs/guides/ci-integration.md](docs/guides/ci-integration.md)
 - Governance reports: [docs/guides/governance-reports.md](docs/guides/governance-reports.md)
+- Upstream status: [docs/guides/upstream-status.md](docs/guides/upstream-status.md)
 - Cursor import: [docs/guides/cursor-import.md](docs/guides/cursor-import.md)
 - Parser guide: [docs/guides/parser-guide.md](docs/guides/parser-guide.md)
 - Maintainer distribution guide: [docs/maintainers/distribution.md](docs/maintainers/distribution.md)

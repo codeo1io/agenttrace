@@ -98,12 +98,14 @@ fn sessions_csv_carries_the_disclosure_column_and_crlf_rows() {
     assert_eq!(lines[0], "# sessions", "table marker first");
     assert_eq!(
         lines[1],
-        "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events"
+        "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost"
     );
-    // rm-408: the reported-zero block is disclosed in the statement.
+    // rm-408: the reported-zero block is disclosed in the statement;
+    // rm-487: the subagent rollup columns ride beside it (0 / 0.0000
+    // on a corpus without subagent transcripts).
     assert!(
-        lines[2].ends_with(",1"),
-        "zero_usage_events=1 on the data row, got: {}",
+        lines[2].ends_with(",1,0,0.0000"),
+        "zero_usage_events=1 plus empty subagent rollup on the data row, got: {}",
         lines[2]
     );
     assert!(out.ends_with("\r\n"));

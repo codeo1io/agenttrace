@@ -8,9 +8,9 @@ use agenttrace_core::{
     delivery_evidence_with_git, format_cost, format_tokens, inspect_first, inspect_reason,
     load_cached_sessions_from_cache, load_session_cache, load_sessions_with_progress,
     load_sessions_with_progress_from_cache_mode, mcp_governance, needs_attention, project_name,
-    recommendations, resolve_project, session_capability, session_cost_audit,
-    session_matches_time_range, total_tokens, ContextTrend, CostAudit, DataHealth,
-    DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
+    recommendations, resolve_project, sanitize_line_segment, session_capability,
+    session_cost_audit, session_matches_time_range, total_tokens, ContextTrend, CostAudit,
+    DataHealth, DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
     Recommendation, ReportLanguage, Session, SessionCache, TimeRange,
 };
 #[cfg(test)]

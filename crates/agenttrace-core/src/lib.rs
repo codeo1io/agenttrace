@@ -1,3 +1,4 @@
+mod codex_replay;
 mod demo;
 mod diagnostics;
 mod discovery;
@@ -351,6 +352,16 @@ pub struct MetricProvenance {
     pub naming: String,
 }
 
+/// rm-487: parent linkage for a subagent transcript. `id` is the
+/// parent's session identity (its file stem today), `path` the
+/// transcript it was linked against at load time. Carried on the
+/// child so the subagent→parent edge is queryable from any output.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParentSessionRef {
+    pub id: String,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Metrics {
     pub events_total: usize,
@@ -393,6 +404,23 @@ pub struct Metrics {
     /// field stays out of their serialized output.
     #[serde(skip_serializing_if = "is_zero_f64")]
     pub credit_usd: f64,
+    /// rm-487 (upstream #305 fork parity): set post-load when this
+    /// transcript is a subagent thread linked to its parent. Not
+    /// parsed from content — discovery computes it from the
+    /// `subagents/` layout, and `load_sessions_from_dir` recomputes it
+    /// on every load so warm-cache entries self-heal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<ParentSessionRef>,
+    /// rm-487: subagent rollup ON THE PARENT. Kept strictly separate
+    /// from the parent's own usage: fleet totals count each transcript
+    /// exactly once, and the rollup is the attribution view of the same
+    /// transcripts (never added into `tokens_*`/`cost_estimated`).
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub subagent_sessions: usize,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub subagent_tokens: i64,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub subagent_cost: f64,
     /// How far message-derived token aggregation drifted from the
     /// authoritative totals stored on the session row (SQLite sources).
     /// Zero unless stored totals were applied.
@@ -1703,6 +1731,14 @@ pub fn format_cost(value: f64) -> String {
 
 fn is_zero_f64(value: &f64) -> bool {
     *value == 0.0
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 pub fn round4(value: f64) -> f64 {

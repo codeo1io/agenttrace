@@ -1,11 +1,19 @@
-use crate::{Anomaly, Diagnostics, Metrics, Session, ToolWarning};
+use crate::{Anomaly, Diagnostics, Metrics, ParentSessionRef, Session, ToolWarning};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 29;
+// v30 (rm-647 workbuddy messageId re-flush dedup + rm-402 codex
+// parent-prefix baseline inheritance + rm-487 subagent linkage):
+// workbuddy totals change when a re-flush stops double-counting,
+// codex child rollouts change when the replayed parent prefix stops
+// counting, and the new Metrics.ParentSession/Subagent* fields must
+// not be served by entries written before they existed. 29 was the
+// rm-600 workbuddy usage sum + cache clamp + Copilot adoption
+// (upstream #311/#316).
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 30;
 // Bumped 28 -> 29 (integration of run 99d1c79c, rm-600 'Port the
 // workbuddy usage arithmetic set (upstream #311 sum, #316 clamp,
 // reasoning-row usage)', minted campaign-locally as rm-542): workbuddy
@@ -328,6 +336,18 @@ struct GoMetrics {
     // so pre-existing cache rows deserialize unchanged.
     #[serde(default, rename = "CreditUsd")]
     credit_usd: f64,
+    #[serde(
+        default,
+        rename = "ParentSession",
+        skip_serializing_if = "Option::is_none"
+    )]
+    parent_session: Option<GoParentSessionRef>,
+    #[serde(default, rename = "SubagentSessions")]
+    subagent_sessions: usize,
+    #[serde(default, rename = "SubagentTokens")]
+    subagent_tokens: i64,
+    #[serde(default, rename = "SubagentCost")]
+    subagent_cost: f64,
     #[serde(default, rename = "StoredTotalsDelta")]
     stored_totals_delta: i64,
     /// Parse lines lost inside the session source, by reason (pass-7
@@ -1428,6 +1448,18 @@ impl GoMetrics {
             upstream_cost_usd: metrics.upstream_cost_usd,
             disclosure_counters: metrics.disclosure_counters.clone(),
             provenance: metrics.provenance.clone(),
+            // rm-487: linkage round-trips through the cache so a warm
+            // load reads the same rollups a cold one computed;
+            // `link_subagent_sessions` still recomputes (and resets)
+            // post-load, so a stale or foreign cache entry cannot pin
+            // a wrong edge.
+            parent_session: metrics
+                .parent_session
+                .clone()
+                .map(GoParentSessionRef::from_link),
+            subagent_sessions: metrics.subagent_sessions,
+            subagent_tokens: metrics.subagent_tokens,
+            subagent_cost: metrics.subagent_cost,
         }
     }
 
@@ -1469,6 +1501,34 @@ impl GoMetrics {
             upstream_cost_usd: self.upstream_cost_usd,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
+            parent_session: self.parent_session.map(GoParentSessionRef::into_link),
+            subagent_sessions: self.subagent_sessions,
+            subagent_tokens: self.subagent_tokens,
+            subagent_cost: self.subagent_cost,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GoParentSessionRef {
+    #[serde(default, rename = "Id")]
+    id: String,
+    #[serde(default, rename = "Path")]
+    path: String,
+}
+
+impl GoParentSessionRef {
+    fn from_link(link: ParentSessionRef) -> Self {
+        Self {
+            id: link.id,
+            path: link.path,
+        }
+    }
+
+    fn into_link(self) -> ParentSessionRef {
+        ParentSessionRef {
+            id: self.id,
+            path: self.path,
         }
     }
 }

@@ -1587,20 +1587,32 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
                 fail: session.metrics.tool_calls_fail,
                 anomalies: session.anomalies.len(),
                 zero_usage_events: session.metrics.zero_usage_events,
+                // rm-487: subagent rollup columns ride the statement
+                // export beside the session's own numbers — the
+                // attribution view, never folded into cost/tokens.
+                subagents: session.metrics.subagent_sessions,
+                subagent_cost: session.metrics.subagent_cost,
             })
             .collect::<Vec<_>>();
         return csv_export::sessions_csv(&rows);
     }
-    let mut lines =
-        vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
+    // rm-487: SUBAGENTS/SUBAGENT_COST close the row (upstream #305's
+    // TSV pattern); zero-usage stays CSV-only per the rm-408 landing.
+    let mut lines = vec![
+        "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES\tSUBAGENTS\tSUBAGENT_COST"
+            .to_string(),
+    ];
     lines.extend(sessions.into_iter().map(|session| {
         // rm-383: name, source tool, and model are
         // transcript-derived; sanitize them for terminal display and TSV
         // row integrity (assess PoC: a crafted session name carried a raw
         // OSC-52 clipboard-write byte-for-byte into the --sessions TSV).
         // JSON output escapes control bytes losslessly and stays untouched.
+        // rm-487: the subagent rollup columns are the parent's
+        // attribution view of OTHER transcripts — kept separate from
+        // the parent's own cost/tokens so fleet sums stay once-per-file.
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
             sanitize_line_segment(&session.name),
             session.health,
             session_capability(session),
@@ -1609,7 +1621,9 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,
-            session.anomalies.len()
+            session.anomalies.len(),
+            session.metrics.subagent_sessions,
+            session.metrics.subagent_cost
         )
     }));
     lines.join("\n")

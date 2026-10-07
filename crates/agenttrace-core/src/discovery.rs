@@ -3,12 +3,12 @@ use crate::session_cache::{
     load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
 };
 use crate::{
-    merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
-    Session,
+    merge_preserved_history, preserve_derived_history, skip_sqlite_backed_file_dir, total_tokens,
+    ParentSessionRef, Session,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -285,6 +285,15 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let mut sessions = Vec::new();
     let files = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
+    // rm-402: cross-file replay baselines for Codex child rollouts
+    // (compact/subagent forks replay the parent's conversation —
+    // snapshots included — at the head of a NEW file). One probe of
+    // each file's first line; only a `session_meta` line that names a
+    // parent enters the plan, so corpora without fork markers parse
+    // byte-identically to before. Children named against a parent
+    // outside the corpus count from zero and disclose the gap through
+    // the `codex_replay_parent_missing` parse counter instead.
+    let replay_baselines = crate::codex_replay::replay_baselines(&files);
     let mut cache_hits = 0;
     let mut skipped = 0;
     // Slots hold (parsed session, came from cache); progress is still emitted in file order.
@@ -314,12 +323,18 @@ pub fn load_sessions_with_progress_from_cache_mode(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
-            let (files, misses, next_miss) = (&files, &misses, &next_miss);
+            let (files, misses, next_miss, replay_baselines) =
+                (&files, &misses, &next_miss, &replay_baselines);
             scope.spawn(move || {
                 while let Some(&index) =
                     misses.get(next_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    if tx.send((index, parse_file(&files[index]).ok())).is_err() {
+                    let session = crate::parser::parse_file_with_replay(
+                        &files[index],
+                        replay_baselines.get(&files[index]),
+                    )
+                    .ok();
+                    if tx.send((index, session)).is_err() {
                         break;
                     }
                 }
@@ -392,12 +407,149 @@ pub fn load_sessions_with_progress_from_cache_mode(
                 .then_with(|| b.name.cmp(&a.name))
         });
     }
+    // rm-487 runs after the filters so the rollup reflects the same view
+    // the caller asked for (a `--since` window that drops a subagent
+    // transcript must not bill it to the parent either).
+    link_subagent_sessions(&mut sessions);
     LoadReport {
         parsed: sessions.len(),
         skipped: discovered.saturating_sub(live_parsed),
         sessions,
         discovered,
         cache_hits,
+    }
+}
+
+/// rm-487 (upstream #305 fork parity): link subagent transcripts to
+/// their parent session after load. Subagent threads park under a
+/// `subagents/` directory — `<session>/subagents/agent-*.jsonl` or a
+/// sibling `<dir>/subagents/agent-<parent>-<suffix>.jsonl` — and
+/// without this pass they read as independent top-level sessions,
+/// hiding that their spend belongs to the orchestrating transcript.
+///
+/// Parent resolution from a child under `<owner>/subagents/<name>`:
+/// a sibling `<dir>/<owner>.jsonl` (the directory is named for the
+/// parent), a sibling matching the parent id embedded in the agent
+/// file name (`agent-<parent>[-suffix]`), or a transcript directly
+/// inside `<owner>/` whose stem names the parent (either the embedded
+/// id or the owner name — the sibling layout `<dir>/subagents/
+/// agent-<parent>-sub.jsonl` resolves here, precisely, even when
+/// `<dir>` holds many unrelated sessions). The three rules union into
+/// a SET of candidate parents: a transcript matching several rules is
+/// still one candidate, and exactly one distinct candidate must exist
+/// — an ambiguous or missing parent leaves the child unlinked rather
+/// than inventing an edge. Chained links (a subagent spawning its own
+/// subagent) are fine: the middle session then carries both
+/// `parent_session` and its own rollup.
+///
+/// The rollup rides `Metrics.subagent_*` on the parent and NEVER
+/// folds into the parent's own usage — fleet totals count each
+/// transcript exactly once. The never-folds rule is pinned by
+/// `rust_subagent_rollup_links_without_folding`.
+fn link_subagent_sessions(sessions: &mut [Session]) {
+    // Idempotent across warm-cache loads: reset, then relink from
+    // paths (a stale or foreign cache entry cannot pin an edge).
+    for session in sessions.iter_mut() {
+        session.metrics.parent_session = None;
+        session.metrics.subagent_sessions = 0;
+        session.metrics.subagent_tokens = 0;
+        session.metrics.subagent_cost = 0.0;
+    }
+    let owned: Vec<(usize, PathBuf)> = sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| {
+            let components: Vec<_> = Path::new(&session.path).components().collect();
+            let subagents_at = components
+                .iter()
+                .position(|component| component.as_os_str() == "subagents")?;
+            // Only transcripts directly inside the subagents directory;
+            // deeper nesting has no documented layout to resolve.
+            if components.len() != subagents_at + 2 {
+                return None;
+            }
+            Some((
+                index,
+                components[..subagents_at].iter().collect::<PathBuf>(),
+            ))
+        })
+        .collect();
+    for (index, owner_dir) in owned {
+        let path = Path::new(&sessions[index].path).to_path_buf();
+        let file_stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let owner_name = owner_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let embedded_parent = file_stem.strip_prefix("agent-").and_then(|rest| {
+            let parent = rest.split(['-', '_']).next().unwrap_or(rest);
+            (!parent.is_empty()).then_some(parent.to_string())
+        });
+        // Set semantics: one transcript can satisfy several rules at
+        // once (the nested layout names the session dir for the parent
+        // AND embeds the parent id in the agent file name) and must
+        // still count as ONE candidate, or the uniqueness gate would
+        // misread agreement as ambiguity and silently decline the
+        // link.
+        let mut candidates: BTreeSet<usize> = BTreeSet::new();
+        for (other, session) in sessions.iter().enumerate() {
+            if other == index {
+                continue;
+            }
+            let other_path = Path::new(&session.path);
+            let other_stem = other_path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let sibling_of_owner = other_path.parent() == owner_dir.parent();
+            if sibling_of_owner && !owner_name.is_empty() && other_stem == owner_name {
+                candidates.insert(other);
+            }
+            if sibling_of_owner
+                && embedded_parent
+                    .as_deref()
+                    .is_some_and(|parent| other_stem == parent)
+            {
+                candidates.insert(other);
+            }
+            // A transcript directly inside the owner directory links
+            // only when its stem names the parent (embedded id or the
+            // owner name); an unconstrained match would let every
+            // session in a shared `<dir>` kidnap the rollup.
+            if other_path.parent() == Some(owner_dir.as_path())
+                && (!other_stem.is_empty()
+                    && (Some(other_stem.as_str()) == embedded_parent.as_deref()
+                        || other_stem == owner_name))
+            {
+                candidates.insert(other);
+            }
+        }
+        let Some(&parent) = candidates.iter().next().filter(|_| candidates.len() == 1) else {
+            continue;
+        };
+        let parent_path = sessions[parent].path.clone();
+        let parent_id = Path::new(&parent_path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| sessions[parent].name.clone());
+        let (tokens, cost) = {
+            let child = &sessions[index];
+            (
+                total_tokens(child),
+                child.metrics.cost_estimated + child.metrics.credit_usd,
+            )
+        };
+        sessions[index].metrics.parent_session = Some(ParentSessionRef {
+            id: parent_id,
+            path: parent_path,
+        });
+        let parent_metrics = &mut sessions[parent].metrics;
+        parent_metrics.subagent_sessions += 1;
+        parent_metrics.subagent_tokens = parent_metrics.subagent_tokens.saturating_add(tokens);
+        parent_metrics.subagent_cost += cost;
     }
 }
 

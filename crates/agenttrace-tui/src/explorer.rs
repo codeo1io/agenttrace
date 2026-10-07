@@ -1585,6 +1585,41 @@ fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, ar
                 Style::default()
             },
         ),
+        // rm-487 (upstream #305 fork parity): the subagent rollup is
+        // the parent's attribution view of OTHER transcripts — shown
+        // beside the parent's own spend, never folded into it — and a
+        // linked child names the session it belongs to.
+        if session.metrics.subagent_sessions > 0 {
+            sidebar_field(
+                app.t("Subagents", "子代理"),
+                format!(
+                    "{} ({})",
+                    session.metrics.subagent_sessions,
+                    format_tokens(session.metrics.subagent_tokens)
+                ),
+                Style::default().fg(Color::Cyan),
+            )
+        } else {
+            Line::raw("")
+        },
+        if session.metrics.subagent_sessions > 0 {
+            sidebar_field(
+                app.t("Subagent spend", "子代理花费"),
+                format_compact_cost(session.metrics.subagent_cost),
+                Style::default().fg(Color::Cyan),
+            )
+        } else {
+            Line::raw("")
+        },
+        if let Some(parent) = session.metrics.parent_session.as_ref() {
+            sidebar_field(
+                app.t("Parent session", "父会话"),
+                sanitize_line_segment(&parent.id),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Line::raw("")
+        },
         Line::raw(""),
         Line::styled(
             app.t("Data quality", "数据质量"),

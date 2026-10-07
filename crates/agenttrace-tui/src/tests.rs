@@ -1632,6 +1632,9 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
             &cache_path,
             format!(
 
+                // Schema 30 (cycle 2 batch rm-647/rm-402/rm-487: workbuddy
+                // re-flush dedup + all-record usage, codex replay
+                // baseline inheritance, subagent linkage fields).
                 // Schema 29 (integration of run 99d1c79c, rm-600 workbuddy usage
                 // sum + cache clamp + Copilot adoption, upstream #311/#316
                 // — re-based off the campaign's 25 -> 26 bump; 28 was the
@@ -1650,7 +1653,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":29,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":30,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

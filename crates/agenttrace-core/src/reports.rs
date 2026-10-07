@@ -522,6 +522,23 @@ pub fn report_overview_json_with_health(
                 "tools": session.metrics.tool_calls_ok + session.metrics.tool_calls_fail,
                 "tokens": total_tokens(session),
                 "cost": round4(session.metrics.cost_estimated),
+                // rm-487: the subagent rollup surfaces beside the
+                // session's own numbers (attribution view — never
+                // folded into tokens/cost above), and a linked child
+                // names its parent. strip_nulls drops both on plain
+                // sessions so the column contract only grows where
+                // the linkage exists.
+                "subagents": (session.metrics.subagent_sessions > 0)
+                    .then_some(session.metrics.subagent_sessions),
+                "subagent_tokens": (session.metrics.subagent_sessions > 0)
+                    .then_some(session.metrics.subagent_tokens),
+                "subagent_cost": (session.metrics.subagent_sessions > 0)
+                    .then(|| round4(session.metrics.subagent_cost)),
+                "parent_session": session
+                    .metrics
+                    .parent_session
+                    .as_ref()
+                    .map(|parent| parent.id.clone()),
                 "health": session.health,
                 "anomalies": session.anomalies.len(),
                 "highest_tool_authority": highest_authority_for_metrics(&session.metrics),
