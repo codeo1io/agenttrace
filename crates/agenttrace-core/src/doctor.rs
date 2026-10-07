@@ -271,9 +271,26 @@ pub struct DoctorProjectDecodeReport {
     ambiguous_tally: BTreeMap<String, (usize, String)>,
     #[serde(skip)]
     unresolved_tally: BTreeMap<String, usize>,
-    /// First-seen order of distinct sample projects (`true` = ambiguous).
+    /// rm-240 resolved-decode notes composed into the same rm-512 tally
+    /// at integration 2026-10-07 (conflict case d9ddc6a9): identity key
+    /// (`prefix#hash` for truncated names, the bare name for opaque
+    /// ones) → (session count, pre-rendered sample line).
     #[serde(skip)]
-    sample_order: Vec<(bool, String)>,
+    resolved_tally: BTreeMap<String, (usize, String)>,
+    /// First-seen order of distinct sample projects, tagged with the
+    /// tally each entry renders from.
+    #[serde(skip)]
+    sample_order: Vec<(SampleChannel, String)>,
+}
+
+/// Which tally a `sample_order` entry renders from: the landed rm-512
+/// pair plus the rm-240 resolved-decode notes composed in at
+/// integration 2026-10-07 (conflict case d9ddc6a9).
+#[derive(Clone, Copy, Debug)]
+enum SampleChannel {
+    Ambiguous,
+    Unresolved,
+    Resolved,
 }
 
 impl DoctorProjectDecodeReport {
@@ -282,7 +299,8 @@ impl DoctorProjectDecodeReport {
             Entry::Occupied(mut entry) => entry.get_mut().0 += 1,
             Entry::Vacant(vacant) => {
                 vacant.insert((1, shadowed));
-                self.sample_order.push((true, path.to_string()));
+                self.sample_order
+                    .push((SampleChannel::Ambiguous, path.to_string()));
             }
         }
     }
@@ -292,7 +310,25 @@ impl DoctorProjectDecodeReport {
             Entry::Occupied(mut entry) => *entry.get_mut() += 1,
             Entry::Vacant(vacant) => {
                 vacant.insert(1);
-                self.sample_order.push((false, encoded.to_string()));
+                self.sample_order
+                    .push((SampleChannel::Unresolved, encoded.to_string()));
+            }
+        }
+    }
+
+    /// rm-240 resolved-decode note (truncated / opaque name): counted as
+    /// resolved, with one deduplicated sample line per distinct identity
+    /// carrying the session count — composed into the rm-512 tally
+    /// semantics at integration 2026-10-07 (conflict case d9ddc6a9) so
+    /// repeated names cannot crowd the six-slot budget and nothing lands
+    /// on the JSON surface before `finalize_samples`.
+    fn record_resolved(&mut self, key: &str, line: String) {
+        match self.resolved_tally.entry(key.to_string()) {
+            Entry::Occupied(mut entry) => entry.get_mut().0 += 1,
+            Entry::Vacant(vacant) => {
+                vacant.insert((1, line));
+                self.sample_order
+                    .push((SampleChannel::Resolved, key.to_string()));
             }
         }
     }
@@ -304,35 +340,47 @@ impl DoctorProjectDecodeReport {
     /// preferred inside the six-slot budget.
     pub fn finalize_samples(&mut self) {
         let mut samples = Vec::new();
-        for (ambiguous, project) in &self.sample_order {
+        for (channel, project) in &self.sample_order {
             if samples.len() >= 6 {
                 break;
             }
-            let (line, count) = if *ambiguous {
-                let Some((count, shadowed)) = self.ambiguous_tally.get(project) else {
-                    continue;
-                };
-                (
-                    format!(
-                        "ambiguous: {} attributed via the longest-verified-path rule; \
-                         verified alternatives shadowed: {}",
-                        crate::statusline::sanitize_line_segment(project),
-                        shadowed
-                    ),
-                    *count,
-                )
-            } else {
-                let Some(count) = self.unresolved_tally.get(project) else {
-                    continue;
-                };
-                (
-                    format!(
-                        "unresolved: projects/{} has no verified decode; \
-                         session attributed to `unknown`",
-                        crate::statusline::sanitize_line_segment(project)
-                    ),
-                    *count,
-                )
+            let (line, count) = match channel {
+                SampleChannel::Ambiguous => {
+                    let Some((count, shadowed)) = self.ambiguous_tally.get(project) else {
+                        continue;
+                    };
+                    (
+                        format!(
+                            "ambiguous: {} attributed via the longest-verified-path rule; \
+                             verified alternatives shadowed: {}",
+                            crate::statusline::sanitize_line_segment(project),
+                            shadowed
+                        ),
+                        *count,
+                    )
+                }
+                SampleChannel::Unresolved => {
+                    let Some(count) = self.unresolved_tally.get(project) else {
+                        continue;
+                    };
+                    (
+                        format!(
+                            "unresolved: projects/{} has no verified decode; \
+                             session attributed to `unknown`",
+                            crate::statusline::sanitize_line_segment(project)
+                        ),
+                        *count,
+                    )
+                }
+                // rm-240: the line is pre-rendered at mint (prefix, hash
+                // and name are already baked in); only the session count
+                // is appended here.
+                SampleChannel::Resolved => {
+                    let Some((count, line)) = self.resolved_tally.get(project) else {
+                        continue;
+                    };
+                    (line.clone(), *count)
+                }
             };
             let mut line = line;
             if count > 1 {
@@ -343,6 +391,7 @@ impl DoctorProjectDecodeReport {
         self.samples = samples;
         self.ambiguous_tally.clear();
         self.unresolved_tally.clear();
+        self.resolved_tally.clear();
         self.sample_order.clear();
     }
 }
@@ -377,6 +426,35 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
         ProjectDecodeStatus::Unresolved { encoded } => {
             out.unresolved += 1;
             out.record_unresolved(&encoded);
+        }
+        // rm-240 arms: both yield a stable identity, so they count as
+        // resolved — with a sample line stating exactly what happened.
+        // Composed into the rm-512 tally at integration 2026-10-07
+        // (conflict case d9ddc6a9): the note flows through
+        // `record_resolved` (dedup by identity, session-count suffix,
+        // six-slot budget at finalize) instead of pushing `samples`
+        // directly, keeping the tally off the JSON surface until
+        // `finalize_samples` runs.
+        ProjectDecodeStatus::Truncated { prefix, hash } => {
+            out.resolved += 1;
+            out.record_resolved(
+                &format!("{prefix}#{hash}"),
+                format!(
+                    "truncated: >200-char encoded name decoded to its verified prefix {}#{}; the hash tail is opaque but stable",
+                    crate::statusline::sanitize_line_segment(&prefix),
+                    crate::statusline::sanitize_line_segment(&hash)
+                ),
+            );
+        }
+        ProjectDecodeStatus::Opaque { name } => {
+            out.resolved += 1;
+            out.record_resolved(
+                &name,
+                format!(
+                    "opaque: projects/{} kept as its own stable identity (CLAUDE_CODE_PROJECT_DIR_NAME-style names encode no path)",
+                    crate::statusline::sanitize_line_segment(&name)
+                ),
+            );
         }
     }
 }
@@ -936,7 +1014,11 @@ mod tests {
 
     /// A session whose encoded project dir cannot decode (rm-512
     /// fixtures): the path sits under a nonexistent root, so the walk
-    /// finds no verified decode and the session is `Unresolved`.
+    /// finds no verified decode. Re-anchored at integration 2026-10-07
+    /// (conflict case d9ddc6a9): rm-240 landed after rm-512 and resolves
+    /// such names as OPAQUE identities instead of `Unresolved`, so these
+    /// fixtures now exercise the resolved-decode note tally — the
+    /// rm-512 dedup/budget/surface semantics under test are unchanged.
     fn unresolved_session(encoded_dir: &str) -> Session {
         session_at("", &format!("/nowhere/projects/-{encoded_dir}/s.jsonl"))
     }
@@ -953,7 +1035,11 @@ mod tests {
         }
         report.finalize_samples();
 
-        assert_eq!(report.unresolved, 6);
+        assert_eq!(report.unresolved, 0);
+        // Integration 2026-10-07 (d9ddc6a9): the fixtures count as
+        // resolved opaque identities now; the dedup contract under test
+        // is otherwise byte-identical.
+        assert_eq!(report.resolved, 6);
         assert_eq!(
             report.samples.len(),
             2,
@@ -1034,7 +1120,10 @@ mod tests {
         }
         report.finalize_samples();
 
-        assert_eq!(report.unresolved, 7);
+        assert_eq!(report.unresolved, 0);
+        // Integration 2026-10-07 (d9ddc6a9): opaque identities, not
+        // unresolved dirs — the budget contract under test is unchanged.
+        assert_eq!(report.resolved, 7);
         assert_eq!(
             report.samples.len(),
             6,
@@ -1076,6 +1165,13 @@ mod tests {
         let after = serde_json::to_value(&report).expect("serialize after finalize");
         assert_eq!(
             after.get("unresolved"),
+            Some(&serde_json::json!(0)),
+            "counters unchanged: {after}"
+        );
+        // Integration 2026-10-07 (d9ddc6a9): rm-240 reclassifies the
+        // fixture as a resolved opaque identity.
+        assert_eq!(
+            after.get("resolved"),
             Some(&serde_json::json!(2)),
             "counters unchanged: {after}"
         );
@@ -1085,6 +1181,91 @@ mod tests {
             .as_array()
             .expect("samples stay an array");
         assert_eq!(samples.len(), 1);
+        assert!(
+            samples[0]
+                .as_str()
+                .unwrap()
+                .starts_with("opaque: projects/serde-proj"),
+            "two sessions dedup to one rm-240 resolved note (integration \
+             2026-10-07, d9ddc6a9): {samples:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_decode_notes_dedup_by_identity_with_counts() {
+        // Integration 2026-10-07 (conflict case d9ddc6a9): the rm-240
+        // truncated and opaque arms count as resolved with one
+        // deduplicated sample line per identity — composed into the
+        // rm-512 tally (session-count suffix, first-seen order, nothing
+        // on the JSON surface before finalize). Two hashes sharing a
+        // 200-char head stay two lines; a repeated opaque name stays
+        // one line with its count.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-doctor-resolved-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let mut deep = root.clone();
+        for idx in 0..30 {
+            deep = deep.join(format!("seg{idx:02}-component"));
+        }
+        std::fs::create_dir_all(&deep).expect("create deep project dir");
+        let encoded = deep.to_string_lossy().replace('/', "-");
+        assert!(
+            encoded.chars().count() > 220,
+            "fixture must exceed the truncation limit"
+        );
+        let head: String = encoded.chars().take(200).collect();
+        let truncated = |hash: &str| {
+            let dir = root.join("projects").join(format!("{head}-{hash}"));
+            std::fs::create_dir_all(&dir).expect("create truncated dir");
+            let path = dir.join("s.jsonl").to_string_lossy().to_string();
+            session_at("", &path)
+        };
+        let opaque_dir = root.join("projects").join("MyOpaque-Name_77");
+        std::fs::create_dir_all(&opaque_dir).expect("create opaque dir");
+        let opaque_path = opaque_dir.join("s.jsonl").to_string_lossy().to_string();
+        let opaque_session = session_at("", &opaque_path);
+
+        let mut report = DoctorProjectDecodeReport::default();
+        for _ in 0..2 {
+            collect_project_decode(&mut report, &truncated("aaaa1111"));
+            collect_project_decode(&mut report, &truncated("bbbb2222"));
+            collect_project_decode(&mut report, &opaque_session);
+        }
+        let before = serde_json::to_value(&report).expect("serialize before finalize");
+        assert!(
+            before.get("samples").is_none(),
+            "tally state stays off the JSON surface: {before}"
+        );
+        report.finalize_samples();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert_eq!(report.resolved, 6);
+        assert_eq!(
+            report.samples.len(),
+            3,
+            "one line per distinct identity: {:?}",
+            report.samples
+        );
+        assert!(report.samples[0].starts_with("truncated: "));
+        assert!(
+            report.samples[0].contains("#aaaa1111"),
+            "{}",
+            report.samples[0]
+        );
+        assert!(report.samples[1].contains("#bbbb2222"));
+        assert!(
+            report.samples[0].ends_with("(2 sessions)"),
+            "{}",
+            report.samples[0]
+        );
+        assert!(report.samples[2].starts_with("opaque: projects/MyOpaque-Name_77"));
+        assert!(
+            report.samples[2].ends_with("(2 sessions)"),
+            "{}",
+            report.samples[2]
+        );
     }
 
     #[test]

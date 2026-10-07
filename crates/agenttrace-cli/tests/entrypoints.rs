@@ -137,6 +137,117 @@ fn compare_honors_the_fail_under_health_gate() {
 }
 
 #[test]
+fn waste_json_honors_the_report_gates_but_the_text_view_stays_carved_out() {
+    // rm-486 premise-refresh rider: rm-544 made `--waste -f json` a
+    // versioned machine contract (`agenttrace.waste.v1`) documented for
+    // CI, so the row's old "--waste ungated BY DESIGN" carve-out —
+    // recorded when waste rendered a human text view — had to be
+    // re-adjudicated for the machine form. The json arm evaluates the
+    // same shared gate contract as `--compare` (write-then-gate: the
+    // artifact is still emitted before the failing exit) across the
+    // filtered session view the report is drawn from; the waste metrics
+    // themselves are not gate inputs and carry no gate flags; the human
+    // text view stays ungated by design.
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-waste-gate-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    // One unhealthy session (failed tool call) keeps health below 100.
+    std::fs::write(
+        work.join("unhealthy.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"run the thing"},"sessionId":"s1","timestamp":"2026-05-07T02:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"bash","input":{"command":"ls"}}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:05Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"boom","is_error":true}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:06Z"}
+"#,
+    )
+    .expect("write unhealthy session");
+
+    // rm-301 style sandbox (see `compare_honors_the_fail_under_health_gate"):
+    // the spawned CLI loads and saves the session cache, so without pinning
+    // HOME/XDG_CACHE_HOME/AGENTTRACE_SESSION_CACHE_DIR this test would read
+    // and REWRITE the operator's real session cache.
+    let cache = work.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let gated = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "-d",
+            work.to_str().expect("temp dir is valid UTF-8"),
+            "--waste",
+            "-f",
+            "json",
+            "--fail-under-health",
+            "100",
+        ])
+        .output()
+        .expect("run gated waste json");
+    assert_eq!(
+        gated.status.code(),
+        Some(2),
+        "--waste -f json must exit 2 when the gate fails, got {:?}",
+        gated.status
+    );
+    let stderr = String::from_utf8_lossy(&gated.stderr);
+    assert!(
+        stderr.contains("Gate failed"),
+        "expected gate failure evidence on stderr, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&gated.stdout);
+    assert!(
+        stdout.contains("agenttrace.waste.v1"),
+        "write-then-gate: the machine artifact must still be emitted before the failing exit, got: {stdout}"
+    );
+
+    // The ungated invocation is unchanged.
+    let ungated = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "-d",
+            work.to_str().expect("temp dir is valid UTF-8"),
+            "--waste",
+            "-f",
+            "json",
+        ])
+        .output()
+        .expect("run ungated waste json");
+    assert_eq!(
+        ungated.status.code(),
+        Some(0),
+        "without gate flags --waste -f json must still exit 0, got {:?}",
+        ungated.status
+    );
+
+    // The human text view stays carved out by design.
+    let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "-d",
+            work.to_str().expect("temp dir is valid UTF-8"),
+            "--waste",
+            "--fail-under-health",
+            "100",
+        ])
+        .output()
+        .expect("run gated waste text view");
+    assert_eq!(
+        text.status.code(),
+        Some(0),
+        "the human waste view is ungated by design, got {:?}",
+        text.status
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
 fn baseline_regression_gates_the_exit_code_and_opt_out_flags_work() {
     // Pass-7 P7-3: `--baseline-max-*-delta-pct` used to leave the breach
     // booleans buried in the JSON while the process exited 0 — a gate
