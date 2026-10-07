@@ -12,6 +12,19 @@ fn panel(title: impl Into<String>) -> Block<'static> {
         )
 }
 
+/// rm-015: the test renderer computes the overview on demand from the
+/// filtered set instead of reading a precomputed `App::overview` field —
+/// production stopped carrying that field when the per-keystroke
+/// recompute (a write with no production reader) was removed. This is a
+/// test-side adapter; production renders from `App::derived`.
+fn overview(app: &App) -> agenttrace_core::Overview {
+    agenttrace_core::compute_overview_iter(
+        app.filtered
+            .iter()
+            .filter_map(|index| app.sessions.get(*index)),
+    )
+}
+
 pub(super) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     if area.width < 48 || area.height < 14 {
@@ -188,23 +201,23 @@ pub(super) fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::raw("  "),
             Span::styled(
-                format!("{}={}", app.t("ok", "良好"), app.overview.healthy),
+                format!("{}={}", app.t("ok", "良好"), overview(app).healthy),
                 Style::default().fg(Color::Green),
             ),
             Span::raw(" "),
             Span::styled(
-                format!("{}={}", app.t("warn", "警告"), app.overview.warning),
+                format!("{}={}", app.t("warn", "警告"), overview(app).warning),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" "),
             Span::styled(
-                format!("{}={}", app.t("crit", "严重"), app.overview.critical),
+                format!("{}={}", app.t("crit", "严重"), overview(app).critical),
                 Style::default().fg(Color::Red),
             ),
             Span::raw(format!(
                 "  {}={}  {}={}  {}",
                 app.t("cost", "成本"),
-                format_compact_cost(app.overview.total_cost),
+                format_compact_cost(overview(app).total_cost),
                 app.t("tokens", "Token"),
                 format_tokens(app.derived.total_tokens),
                 load_summary_line(app)
@@ -343,17 +356,17 @@ pub(super) fn render_scoreboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(format!(
                 "  {} {}  {} {}  {} {}",
                 app.t("sessions", "会话"),
-                format_count(app.overview.total_sessions as i64),
+                format_count(overview(app).total_sessions as i64),
                 app.t("critical", "严重"),
-                format_count(app.overview.critical as i64),
+                format_count(overview(app).critical as i64),
                 app.t("warning", "警告"),
-                format_count(app.overview.warning as i64)
+                format_count(overview(app).warning as i64)
             )),
         ]),
         Line::from(format!(
             "{} {}  {} {}  {} {}  p95 {}",
             app.t("cost", "成本"),
-            format_compact_cost(app.overview.total_cost),
+            format_compact_cost(overview(app).total_cost),
             app.t("tokens", "Token"),
             format_tokens(app.derived.total_tokens),
             app.t("elapsed", "耗时"),
@@ -387,10 +400,10 @@ pub(super) fn render_scoreboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 pub(super) fn render_health_distribution(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let total = app.overview.total_sessions;
+    let total = overview(app).total_sessions;
     let bar_width = area.width.saturating_sub(4).clamp(12, 48) as usize;
-    let healthy = bar_share(app.overview.healthy, total, bar_width);
-    let warning = bar_share(app.overview.warning, total, bar_width);
+    let healthy = bar_share(overview(app).healthy, total, bar_width);
+    let warning = bar_share(overview(app).warning, total, bar_width);
     let critical = bar_width.saturating_sub(healthy + warning);
     let pct = |count: usize| count.saturating_mul(100).checked_div(total).unwrap_or(0);
     let lines = vec![
@@ -402,17 +415,17 @@ pub(super) fn render_health_distribution(frame: &mut Frame<'_>, app: &App, area:
         Line::from(format!(
             "{} {} ({}%)  {} {} ({}%)",
             app.t("healthy", "良好"),
-            format_count(app.overview.healthy as i64),
-            pct(app.overview.healthy),
+            format_count(overview(app).healthy as i64),
+            pct(overview(app).healthy),
             app.t("warning", "警告"),
-            format_count(app.overview.warning as i64),
-            pct(app.overview.warning)
+            format_count(overview(app).warning as i64),
+            pct(overview(app).warning)
         )),
         Line::from(format!(
             "{} {} ({}%)  {} {:.1}",
             app.t("critical", "严重"),
-            format_count(app.overview.critical as i64),
-            pct(app.overview.critical),
+            format_count(overview(app).critical as i64),
+            pct(overview(app).critical),
             app.t("average", "平均"),
             app.derived.average_health
         )),
@@ -769,15 +782,6 @@ pub(super) fn render_list_status(
     frame.render_widget(
         Paragraph::new(text)
             .block(panel(app.t("List Status", "列表状态")))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-pub(super) fn render_loading_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    frame.render_widget(
-        Paragraph::new(loading_status_lines(app))
-            .block(panel(app.t("Loading Status", "加载状态")))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -1514,7 +1518,7 @@ pub(super) fn scope_confidence_line(app: &App) -> String {
         "{}: {}={} {}={}/{} {}={} {}={} {}={}",
         app.t("Scope", "范围"),
         app.t("sessions", "会话"),
-        app.overview.total_sessions,
+        overview(app).total_sessions,
         app.t("parse", "解析"),
         health.parsed,
         health.discovered,
@@ -2623,23 +2627,6 @@ pub(super) fn diagnostic_actions(session: &Session, language: Language) -> Vec<S
     actions
 }
 
-pub(super) fn localized_level(value: &str, language: Language) -> String {
-    if language == Language::En {
-        return value.to_string();
-    }
-    match value {
-        "critical" => "严重",
-        "warning" => "警告",
-        "high" => "高",
-        "medium" => "中",
-        "good" => "良好",
-        "low" => "低",
-        "info" => "提示",
-        _ => value,
-    }
-    .to_string()
-}
-
 pub(super) fn localized_anomaly(kind: &str, language: Language) -> String {
     if language == Language::En {
         return kind.replace('_', " ");
@@ -3183,158 +3170,6 @@ pub(super) fn help_text(view: View, language: Language) -> String {
         .join("\n")
 }
 
-pub(super) fn cache_state_label() -> String {
-    match agenttrace_core::session_cache_path().metadata() {
-        Ok(metadata) if metadata.len() > 0 => "cache warm".to_string(),
-        Ok(_) => "cache empty".to_string(),
-        Err(_) => "cache empty".to_string(),
-    }
-}
-
-pub(super) fn source_counts(sessions: &[Session]) -> Vec<(String, usize)> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for session in sessions {
-        *counts.entry(driver_source(session)).or_default() += 1;
-    }
-    let mut items = counts.into_iter().collect::<Vec<_>>();
-    items.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    items
-}
-
-pub(super) fn loading_status_lines(app: &App) -> Vec<Line<'static>> {
-    let state = &app.load_state;
-    let health = &app.derived.health;
-    let mode = if state.force {
-        app.t("force reload", "强制重载")
-    } else {
-        app.t("normal load", "正常加载")
-    };
-    let processed = state.processed.min(state.discovered);
-    let progress_width = 32;
-    let filled = processed
-        .saturating_mul(progress_width)
-        .checked_div(state.discovered)
-        .unwrap_or(0);
-    let percent = processed
-        .saturating_mul(100)
-        .checked_div(state.discovered)
-        .unwrap_or(0);
-    let source_text = if state.sources.is_empty() {
-        format!("{}={}", app.t("sources", "来源"), app.t("none", "无"))
-    } else {
-        format!(
-            "{}={}",
-            app.t("sources", "来源"),
-            state
-                .sources
-                .iter()
-                .take(4)
-                .map(|(source, count)| format!("{}:{count}", short(source, 18)))
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-    };
-    vec![
-        Line::from(format!(
-            "{} - {} {} {}",
-            load_phase_label(state.phase, app.language),
-            mode,
-            app.t("from", "来自"),
-            short(&display_source_label(&state.source), 36)
-        )),
-        Line::from(format!(
-            "{} {}/{} {}, {} {}, {}",
-            app.t("loaded", "已加载"),
-            format_count(processed as i64),
-            format_count(state.discovered as i64),
-            app.t("files processed", "个文件已处理"),
-            format_count(state.cache_hits as i64),
-            app.t("cache hits", "缓存命中"),
-            cache_state_for_language(&state.cache_state, app.language)
-        )),
-        Line::from(vec![
-            Span::raw("["),
-            Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
-            Span::styled(
-                "░".repeat(progress_width - filled),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw(format!("] {percent}%")),
-        ]),
-        Line::from(source_text),
-        Line::from(format!(
-            "{}={}  {}={}  {}={}  {}={}  {}={}",
-            app.t("sessions parsed", "已解析会话"),
-            format_count(state.parsed as i64),
-            app.t("confidence", "可信度"),
-            localized_level(&health.confidence, app.language),
-            app.t("skipped", "跳过"),
-            format_count(state.skipped as i64),
-            app.t("pricing fallback", "价格回退"),
-            format_count(health.fallback_pricing as i64),
-            app.t("latest", "最新"),
-            if health.latest_session_at.is_empty() {
-                app.t("unknown", "未知").to_string()
-            } else {
-                short(&health.latest_session_at, 20)
-            }
-        )),
-    ]
-}
-
-pub(super) fn load_summary_line(app: &App) -> String {
-    let state = &app.load_state;
-    match state.phase {
-        LoadPhase::Idle => app.t("idle", "空闲").to_string(),
-        LoadPhase::Discovering => format!(
-            "{} {} {}",
-            app.t("discovering", "发现中"),
-            format_count(state.discovered as i64),
-            app.t("files", "个文件")
-        ),
-        LoadPhase::Parsing => format!(
-            "{} {} {}, {} {}",
-            app.t("loading", "加载中"),
-            format_count(state.discovered as i64),
-            app.t("files", "个文件"),
-            format_count(state.cache_hits as i64),
-            app.t("cache hits", "缓存命中")
-        ),
-        LoadPhase::Ready => {
-            let source = state
-                .sources
-                .first()
-                .map(|(source, count)| {
-                    format!(
-                        "{}:{}",
-                        display_source_label(source),
-                        format_count(*count as i64)
-                    )
-                })
-                .unwrap_or_else(|| app.t("none", "无").to_string());
-            format!(
-                "{} {} {}, {} {}, {source}",
-                app.t("loaded", "已加载"),
-                format_count(state.parsed as i64),
-                app.t("sessions", "个会话"),
-                format_count(state.cache_hits as i64),
-                app.t("cache hits", "缓存命中")
-            )
-        }
-        LoadPhase::Failed => app.t("load failed", "加载失败").to_string(),
-    }
-}
-
-pub(super) fn load_phase_label(phase: LoadPhase, language: Language) -> &'static str {
-    match phase {
-        LoadPhase::Idle => text(language, "Idle", "空闲"),
-        LoadPhase::Discovering => text(language, "Discovering", "发现中"),
-        LoadPhase::Parsing => text(language, "Loading", "加载中"),
-        LoadPhase::Ready => text(language, "Ready", "就绪"),
-        LoadPhase::Failed => text(language, "Failed", "失败"),
-    }
-}
-
 pub(super) fn top_group(
     groups: &std::collections::BTreeMap<String, agenttrace_core::GroupOverview>,
 ) -> Option<(&String, &agenttrace_core::GroupOverview)> {
@@ -3349,7 +3184,7 @@ pub(super) fn top_group(
 }
 
 pub(super) fn top_model_line(app: &App) -> String {
-    if let Some((model, group)) = top_group(&app.overview.by_model) {
+    if let Some((model, group)) = top_group(&overview(app).by_model) {
         format!(
             "{} {}  {} {}  {} {}",
             app.t("top model", "最高频模型"),
@@ -3368,16 +3203,6 @@ pub(super) fn top_model_line(app: &App) -> String {
     }
 }
 
-pub(super) fn health_color(health: i32) -> Color {
-    if health >= 80 {
-        Color::Gray
-    } else if health >= 50 {
-        Color::Yellow
-    } else {
-        Color::LightRed
-    }
-}
-
 pub(super) fn session_row_style(session: &Session) -> Style {
     if session.health < 50 {
         Style::default().fg(Color::LightRed)
@@ -3389,9 +3214,9 @@ pub(super) fn session_row_style(session: &Session) -> Style {
 }
 
 pub(super) fn priority_color(app: &App) -> Color {
-    if app.overview.critical > 0 {
+    if overview(app).critical > 0 {
         Color::LightRed
-    } else if app.overview.warning > 0 {
+    } else if overview(app).warning > 0 {
         Color::Yellow
     } else {
         Color::LightGreen
@@ -3444,71 +3269,6 @@ pub(super) fn session_table_title(app: &App, active_filters: &str) -> String {
 
 pub(super) fn recent_limit(height: u16) -> usize {
     height.saturating_sub(2).max(1) as usize
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(super) struct DriverItem {
-    pub(super) label: String,
-    pub(super) sessions: usize,
-    pub(super) failures: usize,
-    pub(super) tokens: i64,
-    pub(super) cost: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct InspectFirstItem {
-    pub(super) label: &'static str,
-    pub(super) index: usize,
-}
-
-pub(super) fn top_driver<T: Borrow<Session>>(
-    sessions: &[T],
-    label: fn(&Session) -> String,
-) -> Option<DriverItem> {
-    let mut groups: BTreeMap<String, DriverItem> = BTreeMap::new();
-    for session in sessions {
-        let session = session.borrow();
-        let label = label(session);
-        let entry = groups.entry(label.clone()).or_insert_with(|| DriverItem {
-            label,
-            ..DriverItem::default()
-        });
-        entry.sessions += 1;
-        entry.failures += session.metrics.tool_calls_fail;
-        entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-        entry.cost += session.metrics.cost_estimated;
-    }
-    groups.into_values().max_by(compare_driver_items)
-}
-
-pub(super) fn top_anomaly_driver<T: Borrow<Session>>(sessions: &[T]) -> Option<DriverItem> {
-    let mut groups: BTreeMap<String, DriverItem> = BTreeMap::new();
-    for session in sessions {
-        let session = session.borrow();
-        let mut seen = BTreeMap::new();
-        for anomaly in &session.anomalies {
-            seen.insert(anomaly.kind.clone(), ());
-        }
-        for label in seen.keys() {
-            let entry = groups.entry(label.clone()).or_insert_with(|| DriverItem {
-                label: label.clone(),
-                ..DriverItem::default()
-            });
-            entry.sessions += 1;
-            entry.failures += session.metrics.tool_calls_fail;
-            entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-            entry.cost += session.metrics.cost_estimated;
-        }
-    }
-    groups.into_values().max_by(compare_driver_items)
-}
-
-pub(super) fn compare_driver_items(left: &DriverItem, right: &DriverItem) -> Ordering {
-    left.sessions
-        .cmp(&right.sessions)
-        .then_with(|| left.failures.cmp(&right.failures))
-        .then_with(|| cmp_f64(left.cost, right.cost))
-        .then_with(|| right.label.cmp(&left.label))
 }
 
 pub(super) fn inspect_first_lines(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -3566,45 +3326,6 @@ pub(super) fn inspect_first_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-pub(super) fn inspect_first_items<T: Borrow<Session>>(sessions: &[T]) -> Vec<InspectFirstItem> {
-    let sessions = sessions
-        .iter()
-        .map(Borrow::borrow)
-        .cloned()
-        .collect::<Vec<_>>();
-    inspect_first(&sessions)
-        .into_iter()
-        .map(|item| InspectFirstItem {
-            label: item.reason,
-            index: item.index,
-        })
-        .collect()
-}
-
-pub(super) fn inspect_first_items_for_app(app: &App) -> Vec<InspectFirstItem> {
-    let indices = app.filtered.clone();
-    let sessions = indices
-        .iter()
-        .map(|index| &app.sessions[*index])
-        .collect::<Vec<_>>();
-    inspect_first_items(&sessions)
-        .into_iter()
-        .filter_map(|item| {
-            indices.get(item.index).map(|index| InspectFirstItem {
-                index: *index,
-                ..item
-            })
-        })
-        .collect()
-}
-
-pub(super) fn inspect_target_view(label: &str) -> View {
-    match label {
-        "cost" => View::Detail,
-        _ => View::Diagnostics,
-    }
-}
-
 pub(super) fn inspect_open_label(label: &str, language: Language) -> &'static str {
     match inspect_target_view(label) {
         View::Detail => text(language, "Detail", "详情"),
@@ -3619,65 +3340,6 @@ pub(super) fn inspect_label_color(label: &str) -> Color {
         "anomaly" | "latency" => Color::Yellow,
         "cost" => Color::LightMagenta,
         _ => Color::Gray,
-    }
-}
-
-pub(super) fn driver_source(session: &Session) -> String {
-    if session.metrics.source_tool.is_empty() {
-        "unknown".to_string()
-    } else {
-        display_source_label(&session.metrics.source_tool)
-    }
-}
-
-pub(super) fn display_session_source(session: &Session) -> String {
-    driver_source(session)
-}
-
-pub(super) fn display_source_label(source: &str) -> String {
-    let source = source.trim();
-    if source.is_empty() || source == "auto-discovery" {
-        return "auto discovery".to_string();
-    }
-    if source == "pi" || source.ends_with("/.pi/agent/sessions") {
-        return "Pi sessions".to_string();
-    }
-    if source == "oh_my_pi" || source.ends_with("/.omp/agent/sessions") {
-        return "Oh My Pi sessions".to_string();
-    }
-    if source == "pi_senpi" {
-        return "Pi (senpi) sessions".to_string();
-    }
-    if source == "pi_omo" {
-        return "Pi (omo) sessions".to_string();
-    }
-    if source == "claude_code" || source.ends_with("/.claude/projects") {
-        return "Claude Code".to_string();
-    }
-    if source == "codex_cli" || source.contains("/.codex/") {
-        return "Codex".to_string();
-    }
-    if source == "hermes_db" || source.ends_with("/.hermes/state.db") {
-        return "Hermes DB".to_string();
-    }
-    if source == "opencode_db" || source.ends_with("/opencode.db") {
-        return "OpenCode DB".to_string();
-    }
-    if source.contains('/') {
-        return source
-            .rsplit('/')
-            .find(|part| !part.is_empty())
-            .unwrap_or(source)
-            .to_string();
-    }
-    source.to_string()
-}
-
-pub(super) fn driver_model(session: &Session) -> String {
-    if session.metrics.model_used.is_empty() {
-        "unknown".to_string()
-    } else {
-        session.metrics.model_used.clone()
     }
 }
 
@@ -3739,43 +3401,9 @@ pub(super) fn driver_chart_line(
     ])
 }
 
-pub(super) fn format_compact_cost(cost: f64) -> String {
-    format_cost(cost)
-}
-
 fn format_optional_cost(cost: Option<f64>, language: Language) -> String {
     cost.map(format_compact_cost)
         .unwrap_or_else(|| text(language, "not available", "不可用").to_string())
-}
-
-pub(super) fn total_tokens_all<T: Borrow<Session>>(sessions: &[T]) -> i64 {
-    // Saturating: cross-session totals must stay bounded when individual
-    // sessions saturate (mirrors shared.rs and reports.rs overview_summary).
-    sessions
-        .iter()
-        .map(|session| total_tokens(session.borrow()))
-        .fold(0i64, i64::saturating_add)
-}
-
-pub(super) fn total_duration<T: Borrow<Session>>(sessions: &[T]) -> f64 {
-    sessions
-        .iter()
-        .map(|session| session.borrow().metrics.duration_sec)
-        .sum()
-}
-
-pub(super) fn p95_gap<T: Borrow<Session>>(sessions: &[T]) -> f64 {
-    let mut gaps: Vec<f64> = sessions
-        .iter()
-        .flat_map(|session| session.borrow().metrics.gaps_sec.iter().copied())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .collect();
-    if gaps.is_empty() {
-        return 0.0;
-    }
-    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let index = ((gaps.len() as f64) * 0.95) as usize;
-    gaps[index.min(gaps.len() - 1)]
 }
 
 pub(super) fn session_p95_gap(session: &Session) -> f64 {
@@ -3891,7 +3519,7 @@ pub(super) fn next_action(app: &App) -> String {
             return selected_next_action(session, app.language);
         }
     }
-    if app.overview.critical > 0 {
+    if overview(app).critical > 0 {
         return app.t("open critical sessions", "打开严重会话").to_string();
     }
     if app
@@ -3910,27 +3538,4 @@ pub(super) fn next_action(app: &App) -> String {
     }
     app.t("watch cost and latency", "关注成本和延迟")
         .to_string()
-}
-
-pub(super) fn format_count(value: i64) -> String {
-    format_tokens(value)
-}
-
-pub(super) fn format_duration(seconds: f64) -> String {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return "0s".to_string();
-    }
-    if seconds < 60.0 {
-        return format!("{seconds:.0}s");
-    }
-    if seconds < 3600.0 {
-        return format!("{:.1}m", seconds / 60.0);
-    }
-    if seconds < 86_400.0 {
-        return format!("{:.1}h", seconds / 3600.0);
-    }
-    if seconds >= 365.0 * 86_400.0 {
-        return format!("{:.1}y", seconds / (365.0 * 86_400.0));
-    }
-    format!("{:.1}d", seconds / 86_400.0)
 }

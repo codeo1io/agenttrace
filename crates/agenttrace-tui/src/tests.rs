@@ -1373,7 +1373,10 @@ fn renders_overview_and_list_with_test_backend() {
     assert!(overview.contains("AGENTTRACE"));
     assert!(overview.contains("idle"));
     assert!(overview.contains("Scoreboard"));
-    assert!(overview.contains("Loading Status"));
+    // rm-014: the suite now binds production's loading panel — its title
+    // is "Loading" and its first disclosure line says "Idle" (adopted
+    // semantics: Idle no longer masquerades as "Ready").
+    assert!(overview.contains("Idle"));
     assert!(overview.contains("normal load"));
     assert!(overview.contains("0 cache hits"));
     assert!(overview.contains("tokens"));
@@ -1408,7 +1411,8 @@ fn renders_overview_and_list_with_test_backend() {
     assert!(list.contains("2/2 visible"));
     assert!(list.contains("filters: none"));
     assert!(list.contains("Enter detail"));
-    assert!(list.contains("Loading Status"));
+    // rm-014: the loading panel's presence is pinned by its "Idle"
+    // disclosure line below (unified panel title is "Loading").
     assert!(list.contains("Idle"));
     assert!(list.contains("Source"));
     assert!(list.contains("Claude Code"));
@@ -1685,7 +1689,9 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
             .map(|line| format!("{line:?}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(loading.contains("Discovering"));
+        // rm-014 adopted semantics: production's "Finding sessions"
+        // phase label (the test-renderer copy said "Discovering").
+        assert!(loading.contains("Finding sessions"));
         assert!(loading.contains("normal load"));
         assert!(loading.contains("loaded 0/0 files processed"));
         assert!(loading.contains("0 cache hits"));
@@ -1770,7 +1776,9 @@ fn startup_uses_cache_immediately_but_waits_without_cache() {
         .draw(|frame| render(frame, &mut empty))
         .expect("render empty");
     let rendered = format!("{:?}", terminal.backend().buffer());
-    assert!(rendered.contains("Loading Status"));
+    // rm-014: unified loading panel — "Reading sessions" is its
+    // phase-specific disclosure line.
+    assert!(rendered.contains("Reading sessions"));
     assert!(!rendered.contains("Scoreboard"));
 }
 
@@ -2150,5 +2158,175 @@ fn report_context_underline_matches_display_width_not_byte_length() {
             "-".repeat(ascii.len())
         ),
         "pure-ASCII titles render byte-identical to the byte-length era"
+    );
+}
+
+#[test]
+fn presentation_defines_no_duplicate_helpers() {
+    // rm-014 guard: presentation.rs is the TEST renderer — it must not
+    // define any helper that also exists in shared.rs. A reintroduced
+    // copy would silently re-fork test semantics from production
+    // semantics; glob-import ambiguity (E0659) only fires for names the
+    // suite actually uses, so this source scan covers the whole helper
+    // surface, used or not.
+    let shared_src = include_str!("shared.rs");
+    let presentation_src = include_str!("presentation.rs");
+    let mut duplicates = Vec::new();
+    for line in shared_src.lines() {
+        for kind in ["pub(super) fn ", "pub(super) struct "] {
+            let Some(rest) = line.trim_start().strip_prefix(kind) else {
+                continue;
+            };
+            let Some(name) = rest
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            let needle = format!("{kind}{name}");
+            if presentation_src
+                .lines()
+                .any(|candidate| candidate.trim_start().starts_with(&needle))
+            {
+                duplicates.push(name.to_string());
+            }
+        }
+    }
+    assert!(
+        duplicates.is_empty(),
+        "presentation.rs re-introduced shared helpers: {duplicates:?}"
+    );
+}
+
+#[test]
+fn helpers_resolve_to_the_production_module() {
+    // rm-014 guard: every helper this suite can name through app's glob
+    // binding IS the production implementation in `shared` — pinned by
+    // function-pointer identity. A future cfg-gate split (e.g. restoring
+    // `#[cfg(not(test))] use shared::*`) would flip tests back onto
+    // test-only copies and break this pin.
+    fn assert_same_binding<T: PartialEq + std::fmt::Debug>(
+        name: &'static str,
+        glob: T,
+        canonical: T,
+    ) {
+        assert_eq!(
+            glob, canonical,
+            "tests must resolve {name} to the shared (production) implementation"
+        );
+    }
+    assert_same_binding(
+        "cache_state_label",
+        cache_state_label as fn() -> String,
+        shared::cache_state_label as fn() -> String,
+    );
+    assert_same_binding(
+        "source_counts",
+        source_counts as fn(&[Session]) -> Vec<(String, usize)>,
+        shared::source_counts as fn(&[Session]) -> Vec<(String, usize)>,
+    );
+    assert_same_binding(
+        "loading_status_lines",
+        loading_status_lines as fn(&App) -> Vec<Line<'static>>,
+        shared::loading_status_lines as fn(&App) -> Vec<Line<'static>>,
+    );
+    assert_same_binding(
+        "load_summary_line",
+        load_summary_line as fn(&App) -> String,
+        shared::load_summary_line as fn(&App) -> String,
+    );
+    assert_same_binding(
+        "load_phase_label",
+        load_phase_label as fn(LoadPhase, Language) -> &'static str,
+        shared::load_phase_label as fn(LoadPhase, Language) -> &'static str,
+    );
+    assert_same_binding(
+        "top_driver",
+        top_driver::<&'static Session>
+            as fn(&[&'static Session], fn(&Session) -> String) -> Option<DriverItem>,
+        shared::top_driver::<&'static Session>
+            as fn(&[&'static Session], fn(&Session) -> String) -> Option<DriverItem>,
+    );
+    assert_same_binding(
+        "top_anomaly_driver",
+        top_anomaly_driver::<&'static Session> as fn(&[&'static Session]) -> Option<DriverItem>,
+        shared::top_anomaly_driver::<&'static Session>
+            as fn(&[&'static Session]) -> Option<DriverItem>,
+    );
+    assert_same_binding(
+        "inspect_first_items_for_app",
+        inspect_first_items_for_app as fn(&App) -> Vec<InspectFirstItem>,
+        shared::inspect_first_items_for_app as fn(&App) -> Vec<InspectFirstItem>,
+    );
+    assert_same_binding(
+        "inspect_target_view",
+        inspect_target_view as fn(&str) -> View,
+        shared::inspect_target_view as fn(&str) -> View,
+    );
+    assert_same_binding(
+        "driver_source",
+        driver_source as fn(&Session) -> String,
+        shared::driver_source as fn(&Session) -> String,
+    );
+    assert_same_binding(
+        "display_session_source",
+        display_session_source as fn(&Session) -> String,
+        shared::display_session_source as fn(&Session) -> String,
+    );
+    assert_same_binding(
+        "display_source_label",
+        display_source_label as fn(&str) -> String,
+        shared::display_source_label as fn(&str) -> String,
+    );
+    assert_same_binding(
+        "driver_model",
+        driver_model as fn(&Session) -> String,
+        shared::driver_model as fn(&Session) -> String,
+    );
+    assert_same_binding(
+        "format_compact_cost",
+        format_compact_cost as fn(f64) -> String,
+        shared::format_compact_cost as fn(f64) -> String,
+    );
+    assert_same_binding(
+        "total_tokens_all",
+        total_tokens_all::<&'static Session> as fn(&[&'static Session]) -> i64,
+        shared::total_tokens_all::<&'static Session> as fn(&[&'static Session]) -> i64,
+    );
+    assert_same_binding(
+        "total_duration",
+        total_duration::<&'static Session> as fn(&[&'static Session]) -> f64,
+        shared::total_duration::<&'static Session> as fn(&[&'static Session]) -> f64,
+    );
+    assert_same_binding(
+        "p95_gap",
+        p95_gap::<&'static Session> as fn(&[&'static Session]) -> f64,
+        shared::p95_gap::<&'static Session> as fn(&[&'static Session]) -> f64,
+    );
+    assert_same_binding(
+        "health_color",
+        health_color as fn(i32) -> Color,
+        shared::health_color as fn(i32) -> Color,
+    );
+    assert_same_binding(
+        "format_count",
+        format_count as fn(i64) -> String,
+        shared::format_count as fn(i64) -> String,
+    );
+    assert_same_binding(
+        "format_duration",
+        format_duration as fn(f64) -> String,
+        shared::format_duration as fn(f64) -> String,
+    );
+    assert_same_binding(
+        "localized_level",
+        localized_level as fn(&str, Language) -> String,
+        shared::localized_level as fn(&str, Language) -> String,
+    );
+    assert_same_binding(
+        "render_loading_status",
+        render_loading_status as for<'f, 'a, 'b> fn(&'f mut Frame<'a>, &'b App, Rect),
+        shared::render_loading_status as for<'f, 'a, 'b> fn(&'f mut Frame<'a>, &'b App, Rect),
     );
 }
