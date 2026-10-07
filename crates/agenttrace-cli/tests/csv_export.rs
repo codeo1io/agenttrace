@@ -299,7 +299,11 @@ fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
         ),
         (
             &["--latest", "-f", "markdown"][..],
-            "markdown and html formats require --overview",
+            "markdown, html, and svg formats require --overview",
+        ),
+        (
+            &["--latest", "-f", "svg"][..],
+            "markdown, html, and svg formats require --overview",
         ),
     ] {
         // Same per-thread HOME/XDG sandbox as run_csv: no test in this

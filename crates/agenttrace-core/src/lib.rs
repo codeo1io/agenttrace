@@ -61,8 +61,9 @@ pub use reports::{
     report_json, report_json_with_language, report_overview_html,
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
-    report_overview_markdown_with_context, report_overview_text, report_overview_text_with_context,
-    report_text, report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage,
+    report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,
+    report_overview_text, report_overview_text_with_context, report_text,
+    report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage, SvgCardTheme,
 };
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{

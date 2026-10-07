@@ -720,6 +720,482 @@ pub fn report_overview_html_with_context(
     report_overview_html(overview, sessions).replacen("</main>", &(appendix + "</main>"), 1)
 }
 
+// rm-576: shareable usage card (deterministic SVG, no network).
+//
+// The card is a static SVG document rendered from the same aggregation
+// pass as every other `--overview` renderer. It is deliberately boring:
+// no external references, no fonts, no scripts, no clock of its own —
+// the same corpus + range + theme always produces the same bytes (pinned
+// by tests/svg_card_contract.rs). Every session-derived string goes
+// through `sanitize_line_segment` (raw control bytes would be illegal
+// XML 1.0) and then `html_escape` (the renderer family's entity
+// escaper), so a model/project name that looks like markup renders inert.
+
+/// Color scheme of the usage card. `Auto` ships the light palette as
+/// presentation attributes and embeds a `prefers-color-scheme: dark`
+/// override block, so one static file adapts wherever SVG media queries
+/// are honored — and degrades gracefully to light where they are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SvgCardTheme {
+    Light,
+    Dark,
+    Auto,
+}
+
+impl SvgCardTheme {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "light" => Some(SvgCardTheme::Light),
+            "dark" => Some(SvgCardTheme::Dark),
+            "auto" => Some(SvgCardTheme::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SvgCardTheme::Light => "light",
+            SvgCardTheme::Dark => "dark",
+            SvgCardTheme::Auto => "auto",
+        }
+    }
+}
+
+impl std::str::FromStr for SvgCardTheme {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+            .ok_or_else(|| format!("card theme must be auto, dark, or light (got {value:?})"))
+    }
+}
+
+struct CardPalette {
+    bg: &'static str,
+    panel: &'static str,
+    fg: &'static str,
+    muted: &'static str,
+    bar: &'static str,
+    bar_alt: &'static str,
+    spark: &'static str,
+    sep: &'static str,
+}
+
+const CARD_PALETTE_LIGHT: CardPalette = CardPalette {
+    bg: "#f8fafc",
+    panel: "#ffffff",
+    fg: "#0f172a",
+    muted: "#64748b",
+    bar: "#2563eb",
+    bar_alt: "#0ea5e9",
+    spark: "#2563eb",
+    sep: "#e2e8f0",
+};
+
+const CARD_PALETTE_DARK: CardPalette = CardPalette {
+    bg: "#0b1220",
+    panel: "#111a2e",
+    fg: "#e2e8f0",
+    muted: "#8aa0b8",
+    bar: "#38bdf8",
+    bar_alt: "#22d3ee",
+    spark: "#38bdf8",
+    sep: "#24344d",
+};
+
+/// Disclosure lines shared by the context and demo renderings.
+struct CardFooter {
+    range: String,
+    window: String,
+    pricing: String,
+    confidence: String,
+}
+
+fn svg_text(value: &str) -> String {
+    html_escape(&sanitize_line_segment(value))
+}
+
+fn card_cost(value: f64) -> String {
+    if !value.is_finite() || value <= 0.0 {
+        "$0.00".to_string()
+    } else if value >= 1000.0 {
+        format!("${value:.0}")
+    } else if value >= 1.0 {
+        format!("${value:.2}")
+    } else {
+        format!("${value:.4}")
+    }
+}
+
+fn card_count(value: u64) -> String {
+    // Plain integer with US grouping — no locale, no drift.
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let lead = digits.len() % 3;
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && i % 3 == lead {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn card_label(value: &str, max_chars: usize) -> String {
+    // Char-boundary-safe truncation so multi-byte model names cannot
+    // panic the renderer or exceed the drawn width.
+    if value.chars().count() <= max_chars {
+        svg_text(value)
+    } else {
+        let mut out: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('\u{2026}');
+        svg_text(&out)
+    }
+}
+
+/// Daily cost series over the trailing `days` days of the corpus's own
+/// clock (anchored at the latest event timestamp, never `Utc::now()`),
+/// so a fixed corpus always yields the same series.
+fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDate, f64)> {
+    let mut latest: Option<chrono::NaiveDate> = None;
+    let mut buckets: std::collections::BTreeMap<chrono::NaiveDate, f64> =
+        std::collections::BTreeMap::new();
+    for session in sessions {
+        let day = session
+            .metrics
+            .timestamps
+            .iter()
+            .map(|ts| ts.naive_utc().date())
+            .max();
+        let Some(day) = day else { continue };
+        latest = Some(match latest {
+            Some(current) if current >= day => current,
+            _ => day,
+        });
+        *buckets.entry(day).or_insert(0.0) += session.metrics.cost_estimated;
+    }
+    let mut series = Vec::with_capacity(days);
+    match latest {
+        Some(anchor) => {
+            for offset in (0..days).rev() {
+                let day = anchor - chrono::Duration::days(offset as i64);
+                series.push((day, buckets.get(&day).copied().unwrap_or(0.0)));
+            }
+        }
+        None => {
+            // Corpus with no timestamps at all: a flat, still-valid chart
+            // rather than a panic or a wall-clock leak.
+            for _ in 0..days {
+                series.push((
+                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date"),
+                    0.0,
+                ));
+            }
+        }
+    }
+    series
+}
+
+fn card_bars(
+    out: &mut String,
+    p: &CardPalette,
+    x: i32,
+    y: i32,
+    title: &str,
+    groups: &[(String, GroupOverview)],
+    cls: &dyn Fn(&str) -> String,
+) {
+    out.push_str(&format!(
+        "<text{} x=\"{x}\" y=\"{y}\" fill=\"{}\" font-size=\"13\" font-family=\"ui-monospace, Menlo, monospace\" letter-spacing=\"0.5\">{}</text>\n",
+        cls("card-fg"),
+        p.fg,
+        svg_text(title)
+    ));
+    let rows = groups.iter().take(5).collect::<Vec<_>>();
+    let max = rows.iter().map(|(_, g)| g.cost).fold(0.0_f64, f64::max);
+    for (i, (name, group)) in rows.iter().enumerate() {
+        let row_y = y + 18 + (i as i32) * 26;
+        out.push_str(&format!(
+            "<text{} x=\"{x}\" y=\"{}\" fill=\"{}\" font-size=\"11\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+            cls("card-muted"),
+            row_y + 11,
+            p.muted,
+            card_label(name, 22)
+        ));
+        let ratio = if max > 0.0 { group.cost / max } else { 0.0 };
+        let bar_w = (ratio * 150.0).round();
+        out.push_str(&format!(
+            "<rect{} x=\"{}\" y=\"{row_y}\" width=\"{bar_w:.0}\" height=\"13\" rx=\"3\" fill=\"{}\"/>\n",
+            cls(if i % 2 == 0 { "card-bar" } else { "card-bar-alt" }),
+            x + 160,
+            if i % 2 == 0 { p.bar } else { p.bar_alt }
+        ));
+        out.push_str(&format!(
+            "<text{} x=\"{}\" y=\"{}\" fill=\"{}\" font-size=\"11\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+            cls("card-fg"),
+            x + 160 + 156,
+            row_y + 11,
+            p.fg,
+            card_cost(group.cost)
+        ));
+    }
+}
+
+fn render_usage_card(
+    overview: &Overview,
+    canonical: &[Session],
+    theme: SvgCardTheme,
+    footer: &CardFooter,
+) -> String {
+    let p = match theme {
+        SvgCardTheme::Dark => &CARD_PALETTE_DARK,
+        SvgCardTheme::Light | SvgCardTheme::Auto => &CARD_PALETTE_LIGHT,
+    };
+    // Auto theme: presentation attributes below stay light and these
+    // classes restyle the card where the viewer prefers dark. A sanitizer
+    // that strips <style> leaves a correct light card behind.
+    let cls: Box<dyn Fn(&str) -> String> = if theme == SvgCardTheme::Auto {
+        Box::new(|c: &str| format!(" class=\"{c}\""))
+    } else {
+        Box::new(|_: &str| String::new())
+    };
+
+    let total_tokens = canonical
+        .iter()
+        .map(|s| (s.metrics.tokens_input as i128).max(0) + (s.metrics.tokens_output as i128).max(0))
+        .fold(0_i128, i128::saturating_add);
+    let total_tokens = total_tokens.clamp(0, u64::MAX as i128) as u64;
+    let tool_calls = canonical
+        .iter()
+        .map(|s| s.metrics.tool_calls_total)
+        .fold(0_usize, usize::saturating_add);
+    let tool_calls = tool_calls as u64;
+
+    let mut out = String::with_capacity(12 * 1024);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"920\" height=\"560\" viewBox=\"0 0 920 560\" role=\"img\" aria-label=\"agenttrace usage card\">\n");
+    if theme == SvgCardTheme::Auto {
+        out.push_str(
+            "<style>\n@media (prefers-color-scheme: dark) {\n.card-bg { fill: #0b1220; }\n.card-panel { fill: #111a2e; }\n.card-fg { fill: #e2e8f0; }\n.card-muted { fill: #8aa0b8; }\n.card-bar { fill: #38bdf8; }\n.card-bar-alt { fill: #22d3ee; }\n.card-spark { stroke: #38bdf8; }\n.card-sep { fill: #24344d; }\n}\n</style>\n",
+        );
+    }
+    out.push_str(&format!(
+        "<rect class=\"card-bg\" x=\"0\" y=\"0\" width=\"920\" height=\"560\" rx=\"12\" fill=\"{}\"/>\n",
+        p.bg
+    ));
+    out.push_str(&format!(
+        "<rect class=\"card-panel\" x=\"16\" y=\"16\" width=\"888\" height=\"528\" rx=\"10\" fill=\"{}\" fill-opacity=\"0.6\"/>\n",
+        p.panel
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"40\" y=\"48\" fill=\"{}\" font-size=\"22\" font-weight=\"bold\" font-family=\"ui-monospace, Menlo, monospace\">agenttrace \u{b7} usage card</text>\n",
+        cls("card-fg"),
+        p.fg
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"880\" y=\"48\" text-anchor=\"end\" fill=\"{}\" font-size=\"12\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+        cls("card-muted"),
+        p.muted,
+        svg_text(&footer.range)
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"40\" y=\"70\" fill=\"{}\" font-size=\"12\" font-family=\"ui-monospace, Menlo, monospace\">{} sessions \u{b7} {} tool calls \u{b7} {} tokens (input+output)</text>\n",
+        cls("card-muted"),
+        p.muted,
+        card_count(canonical.len() as u64),
+        card_count(tool_calls),
+        card_count(total_tokens)
+    ));
+    out.push_str(&format!(
+        "<rect{} x=\"40\" y=\"86\" width=\"840\" height=\"1\" fill=\"{}\"/>\n",
+        cls("card-sep"),
+        p.sep
+    ));
+
+    // Stat row: total cost is the headline number.
+    out.push_str(&format!(
+        "<text{} x=\"40\" y=\"118\" fill=\"{}\" font-size=\"11\" letter-spacing=\"1\" font-family=\"ui-monospace, Menlo, monospace\">TOTAL COST</text>\n",
+        cls("card-muted"),
+        p.muted
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"40\" y=\"148\" fill=\"{}\" font-size=\"26\" font-weight=\"bold\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+        cls("card-fg"),
+        p.fg,
+        card_cost(overview.total_cost)
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"300\" y=\"118\" fill=\"{}\" font-size=\"11\" letter-spacing=\"1\" font-family=\"ui-monospace, Menlo, monospace\">SESSIONS</text>\n",
+        cls("card-muted"),
+        p.muted
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"300\" y=\"148\" fill=\"{}\" font-size=\"26\" font-weight=\"bold\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+        cls("card-fg"),
+        p.fg,
+        card_count(canonical.len() as u64)
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"520\" y=\"118\" fill=\"{}\" font-size=\"11\" letter-spacing=\"1\" font-family=\"ui-monospace, Menlo, monospace\">TOOL CALLS</text>\n",
+        cls("card-muted"),
+        p.muted
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"520\" y=\"148\" fill=\"{}\" font-size=\"26\" font-weight=\"bold\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+        cls("card-fg"),
+        p.fg,
+        card_count(tool_calls)
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"720\" y=\"118\" fill=\"{}\" font-size=\"11\" letter-spacing=\"1\" font-family=\"ui-monospace, Menlo, monospace\">TOKENS IN+OUT</text>\n",
+        cls("card-muted"),
+        p.muted
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"720\" y=\"148\" fill=\"{}\" font-size=\"26\" font-weight=\"bold\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+        cls("card-fg"),
+        p.fg,
+        card_count(total_tokens)
+    ));
+
+    // Bars: models left, projects right (top 5 by cost each).
+    card_bars(
+        &mut out,
+        p,
+        40,
+        180,
+        "Top models (cost)",
+        &sorted_model_groups(&overview.by_model),
+        &cls,
+    );
+    card_bars(
+        &mut out,
+        p,
+        480,
+        180,
+        "Top projects (cost)",
+        &sorted_model_groups(&overview.by_project),
+        &cls,
+    );
+
+    // Sparkline: daily spend over the corpus's trailing 14 days.
+    out.push_str(&format!(
+        "<text{} x=\"40\" y=\"356\" fill=\"{}\" font-size=\"13\" font-family=\"ui-monospace, Menlo, monospace\">Daily spend \u{b7} last 14 days</text>\n",
+        cls("card-fg"),
+        p.fg
+    ));
+    let series = card_daily_series(canonical, 14);
+    let peak = series.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+    let base_y = 448.0_f64;
+    let chart_h = 56.0_f64;
+    let step = 840.0 / (series.len().saturating_sub(1).max(1)) as f64;
+    let mut points = Vec::with_capacity(series.len());
+    for (i, (_, value)) in series.iter().enumerate() {
+        let x = 40.0 + (i as f64) * step;
+        let y = base_y
+            - if peak > 0.0 {
+                (value / peak) * chart_h
+            } else {
+                0.0
+            };
+        points.push(format!("{x:.1},{y:.1}"));
+    }
+    if let (Some(first), Some(last)) = (series.first(), series.last()) {
+        out.push_str(&format!(
+            "<text{} x=\"40\" y=\"466\" fill=\"{}\" font-size=\"10\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+            cls("card-muted"),
+            p.muted,
+            first.0.format("%Y-%m-%d")
+        ));
+        out.push_str(&format!(
+            "<text{} x=\"880\" y=\"466\" text-anchor=\"end\" fill=\"{}\" font-size=\"10\" font-family=\"ui-monospace, Menlo, monospace\">{}</text>\n",
+            cls("card-muted"),
+            p.muted,
+            last.0.format("%Y-%m-%d")
+        ));
+    }
+    out.push_str(&format!(
+        "<line{} x1=\"40\" y1=\"{base_y:.1}\" x2=\"880\" y2=\"{base_y:.1}\" stroke=\"{}\" stroke-width=\"1\"/>\n",
+        cls("card-sep"),
+        p.sep
+    ));
+    out.push_str(&format!(
+        "<polyline{} points=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>\n",
+        cls("card-spark"),
+        points.join(" "),
+        p.spark
+    ));
+
+    // Honesty footer (the same disclosure fields the other renderers
+    // carry: window, pricing source, data confidence).
+    out.push_str(&format!(
+        "<rect{} x=\"40\" y=\"488\" width=\"840\" height=\"1\" fill=\"{}\"/>\n",
+        cls("card-sep"),
+        p.sep
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"40\" y=\"512\" fill=\"{}\" font-size=\"11\" font-family=\"ui-monospace, Menlo, monospace\">window {} \u{b7} pricing {} \u{b7} data confidence {}</text>\n",
+        cls("card-muted"),
+        p.muted,
+        svg_text(&footer.window),
+        svg_text(&footer.pricing),
+        svg_text(&footer.confidence)
+    ));
+    out.push_str(&format!(
+        "<text{} x=\"40\" y=\"532\" fill=\"{}\" font-size=\"10\" font-family=\"ui-monospace, Menlo, monospace\">generated by agenttrace \u{b7} static file \u{b7} offline \u{b7} byte-deterministic for a fixed corpus+range+theme</text>\n",
+        cls("card-muted"),
+        p.muted
+    ));
+    out.push_str("</svg>");
+    out
+}
+
+/// The shareable usage card over the full corpus (library entry point).
+pub fn report_overview_svg(
+    overview: &Overview,
+    sessions: &[Session],
+    theme: SvgCardTheme,
+) -> String {
+    let canonical = canonical_sessions(sessions);
+    let scope = report_scope(sessions, crate::TimeRange::All, false);
+    let audit = cost_audit(sessions);
+    let footer = CardFooter {
+        range: scope.range,
+        window: format!(
+            "{} \u{2192} {}",
+            scope.earliest_session_at, scope.latest_session_at
+        ),
+        pricing: audit.pricing_source,
+        confidence: "not assessed".to_string(),
+    };
+    render_usage_card(overview, &canonical, theme, &footer)
+}
+
+/// The usage card with the same context footer the HTML renderer carries
+/// (selected range, window, pricing source, data-health confidence).
+pub fn report_overview_svg_with_context(
+    overview: &Overview,
+    sessions: &[Session],
+    data_health: &crate::DataHealth,
+    range: crate::TimeRange,
+    includes_preserved_history: bool,
+    theme: SvgCardTheme,
+) -> String {
+    let canonical = canonical_sessions(sessions);
+    let scope = report_scope(sessions, range, includes_preserved_history);
+    let audit = cost_audit(sessions);
+    let footer = CardFooter {
+        range: scope.range,
+        window: format!(
+            "{} \u{2192} {}",
+            scope.earliest_session_at, scope.latest_session_at
+        ),
+        pricing: audit.pricing_source,
+        confidence: data_health.confidence.clone(),
+    };
+    render_usage_card(overview, &canonical, theme, &footer)
+}
+
 fn render_recommendations_text(out: &mut String, items: &[crate::Recommendation]) {
     if items.is_empty() {
         return;

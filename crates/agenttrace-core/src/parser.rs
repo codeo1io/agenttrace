@@ -6,6 +6,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 type TokenUsage = BTreeMap<String, i64>;
+// rm-485 checkpoint/shutdown metrics shape: per-model usage at one instant.
+type ModelUsageSnapshot = Vec<(String, TokenUsage)>;
 type JsonObject = Map<String, Value>;
 type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 
@@ -237,7 +239,7 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // shutdown metrics were emitted at all.
     let mut max_credit_nano: f64 = 0.0;
     let mut shutdown_metrics_emitted = false;
-    let mut checkpoint_snapshot: Option<(String, Vec<(String, BTreeMap<String, i64>)>)> = None;
+    let mut checkpoint_snapshot: Option<(String, ModelUsageSnapshot)> = None;
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();

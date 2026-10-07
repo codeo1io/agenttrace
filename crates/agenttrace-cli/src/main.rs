@@ -7,10 +7,11 @@ use agenttrace_core::{
     render_doctor_report, render_model_pricing_list, render_test_match,
     render_waste_report_with_language, report_compare_json, report_json_with_language,
     report_overview_html_with_context, report_overview_json_with_context,
-    report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
-    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
-    session_capability, tool_fail_rate, total_tokens, update_pricing, BaselineThresholds,
-    LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
+    report_overview_markdown_with_context, report_overview_svg_with_context,
+    report_overview_text_with_context, report_search_json, report_search_text,
+    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
+    tool_fail_rate, total_tokens, update_pricing, BaselineThresholds, LoadOptions, LoadReport,
+    ReportLanguage, Session, SvgCardTheme, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -36,9 +37,14 @@ struct Args {
         short = 'f',
         long = "format",
         default_value = "text",
-        value_parser = ["text", "json", "csv", "markdown", "md", "html"]
+        value_parser = ["text", "json", "csv", "markdown", "md", "html", "svg"]
     )]
     format: String,
+    /// rm-576: color scheme of the SVG usage card (`-f svg`). `auto`
+    /// ships the light palette plus a `prefers-color-scheme` override so
+    /// the static file adapts to the viewer; bytes stay deterministic.
+    #[arg(long = "card-theme", default_value = "auto")]
+    card_theme: SvgCardTheme,
     /// Session directory to scan instead of auto-discovered agent homes
     #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
@@ -201,7 +207,7 @@ fn run() -> anyhow::Result<()> {
     if args.sample == Some(0) {
         bail!("--sample must be at least 1");
     }
-    if matches!(args.format.as_str(), "markdown" | "md" | "html")
+    if matches!(args.format.as_str(), "markdown" | "md" | "html" | "svg")
         && !(args.overview
             || args.audit
             || args.recommend
@@ -209,7 +215,7 @@ fn run() -> anyhow::Result<()> {
             || args.context_trends
             || args.delivery_evidence)
     {
-        bail!("markdown and html formats require --overview or a governance report action");
+        bail!("markdown, html, and svg formats require --overview or a governance report action");
     }
     // rm-409 (review fix): csv's composable set is exactly --overview and
     // --sessions (the README column contract); every other report shape
@@ -555,6 +561,14 @@ fn run() -> anyhow::Result<()> {
                 range,
                 args.include_history,
             ),
+            "svg" => report_overview_svg_with_context(
+                &overview,
+                &sessions,
+                &health,
+                range,
+                args.include_history,
+                args.card_theme,
+            ),
             _ => report_overview_text_with_context(
                 &overview,
                 &sessions,
@@ -677,16 +691,16 @@ fn enforce_report_gates(args: &Args, sessions: &[Session]) {
     let inspect = if args.demo {
         format!(
             "agenttrace --demo {} -f json",
-            governance_inspect_flag(&args)
+            governance_inspect_flag(args)
         )
     } else if let Some(dir) = args.dir.as_deref() {
         format!(
             "agenttrace -d {:?} {} -f json",
             dir,
-            governance_inspect_flag(&args)
+            governance_inspect_flag(args)
         )
     } else {
-        format!("agenttrace {} -f json", governance_inspect_flag(&args))
+        format!("agenttrace {} -f json", governance_inspect_flag(args))
     };
     eprintln!("- inspect: `{inspect}`");
     std::process::exit(2);
@@ -969,6 +983,7 @@ fn flag_takes_value(arg: &OsString) -> bool {
     matches!(
         text.as_ref(),
         "-f" | "--format"
+            | "--card-theme"
             | "-d"
             | "--dir"
             | "-m"
@@ -2202,6 +2217,7 @@ mod tests {
         Args {
             path: None,
             format: "json".to_string(),
+            card_theme: SvgCardTheme::Auto,
             dir,
             compare: true,
             audit: false,

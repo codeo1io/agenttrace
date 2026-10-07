@@ -33,6 +33,10 @@ mkdir -p "$out_dir/docs"
 "$bin" --demo --search internal/ws -f json >"$out_dir/docs/search.json"
 "$bin" --demo --overview -f markdown -o "$out_dir/docs/overview.md" >"$out_dir/docs/overview-md.stdout"
 "$bin" --demo --overview -f html -o "$out_dir/docs/overview.html" >"$out_dir/docs/overview-html.stdout"
+# rm-576: keep the documented usage-card command exercised.
+"$bin" --demo --overview -f svg --card-theme auto -o "$out_dir/docs/overview.svg" >"$out_dir/docs/overview-svg.stdout"
+grep -q '^<?xml version' "$out_dir/docs/overview.svg" \
+  || fail "documented svg card command must produce SVG markup"
 for path in "$out_dir"/docs/*.json; do
   node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$path" \
     || fail "invalid JSON from documented command: $path"
