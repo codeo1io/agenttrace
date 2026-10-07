@@ -2424,13 +2424,29 @@ fn qwen_tool_result_events(raw: Option<&Value>, ts: &str, model: &str) -> Vec<Ev
 }
 
 fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
+    // rm-616 (upstream #312 port): Qwen Code builds this map from
+    // Gemini-style metadata — the input side is `promptTokenCount`,
+    // which ALREADY contains `cachedContentTokenCount` (surfaced by
+    // Qwen Code as `cache_read_input_tokens`), so the cached share is
+    // netted out of input, and only the FIRST matching alias is read:
+    // the wire mirrors the same counter under several aliases
+    // (`input_tokens`/`prompt_tokens`/`input`/`promptTokenCount`), and
+    // summing the aliases counted each token once per alias (the
+    // mirrored-snapshot PoC double-counted input: 200 reported for a
+    // 100-token turn). The codex path already nets cached input out of
+    // `input_tokens` the same way.
     let obj = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
-    let input = sum_numbers(
+    let cache_read = first_number(
+        obj,
+        &["cache_read_input_tokens", "cacheRead", "cached_tokens"],
+    );
+    let input = first_number(
         obj,
         &["input_tokens", "prompt_tokens", "input", "promptTokenCount"],
-    );
-    let output = sum_numbers(
+    )
+    .saturating_sub(cache_read);
+    let output = first_number(
         obj,
         &[
             "output_tokens",
@@ -2454,11 +2470,7 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
         ],
     );
     let output = output.saturating_add(reasoning);
-    let cache_read = sum_numbers(
-        obj,
-        &["cache_read_input_tokens", "cacheRead", "cached_tokens"],
-    );
-    let cache_write = sum_numbers(obj, &["cache_creation_input_tokens", "cacheWrite"]);
+    let cache_write = first_number(obj, &["cache_creation_input_tokens", "cacheWrite"]);
     if input > 0 {
         usage.insert("input_tokens".to_string(), input);
     }
@@ -2578,7 +2590,7 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_codex = false;
-    let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
+    let mut codex_totals = CodexTotals::default();
     // rm-047: the head-probe fast path used to discard lines invisibly;
     // count every skip so parse diagnostics can surface it. rm-401
     // widened the map to the compaction-usage decisions too.
@@ -2658,10 +2670,9 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     continue;
                 };
                 if string(payload.get("type")) == Some("token_count") {
-                    if let Some((usage, next_total)) =
-                        codex_token_count_usage(payload.get("info"), prev_token_total.as_ref())
+                    if let Some(usage) =
+                        codex_token_count_usage(payload.get("info"), &mut codex_totals)
                     {
-                        prev_token_total = next_total;
                         events.push(Event {
                             role: "meta".to_string(),
                             timestamp: ts,
@@ -2904,9 +2915,9 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     // #1821 dedups the copy). Unpaired records describe turns whose usage is
     // already inside the cumulative snapshots, so they count for nothing but
     // stay visible in diagnostics — the class this defect evaded. Counted
-    // usage never touches prev_token_total: the compaction turn is outside
-    // every cumulative snapshot, so feeding it to the high-water baseline
-    // would eat the next snapshot's climb.
+    // usage never touches the cumulative baseline: the compaction turn is
+    // outside every cumulative snapshot, so feeding it to the totals
+    // baseline would eat the next snapshot's climb.
     let mut counted: BTreeSet<&str> = BTreeSet::new();
     for record in &usage_records {
         if record.response_id.is_empty() || !compaction_response_ids.contains(&record.response_id) {
@@ -2939,18 +2950,11 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             .copied()
             .unwrap_or(0);
         let input = (record.usage.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-        let output = record
-            .usage
-            .get("output_tokens")
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(
-                record
-                    .usage
-                    .get("reasoning_output_tokens")
-                    .copied()
-                    .unwrap_or(0),
-            );
+        // rm-617 (upstream #312): reasoning_output_tokens is a breakdown
+        // of output_tokens, not an addition to it — Codex's output_tokens
+        // already contains the reasoning share, so the old saturating_add
+        // here counted those tokens twice on every compaction turn.
+        let output = record.usage.get("output_tokens").copied().unwrap_or(0);
         let usage = BTreeMap::from([
             ("input_tokens".to_string(), input),
             ("output_tokens".to_string(), output),
@@ -3011,22 +3015,45 @@ fn json_key_present(line: &str, needle: &str) -> bool {
     false
 }
 
+/// Codex cumulative-snapshot accounting state (upstream #312, which
+/// supersedes the #286 high-water port this fork carried as rm-162).
+///
+/// `total_token_usage` is cumulative for the session and `last_token_usage`
+/// is the freshest turn. Real compaction RESETS the cumulative counter: the
+/// post-reset climb is fresh usage, and a high-water mark that survives the
+/// reset eats it; a forked rollout inherits the parent's cumulative, so a
+/// from-None delta re-counts the parent's whole history. Count
+/// `last_token_usage` once per DISTINCT cumulative value (duplicate totals
+/// are re-sends of the same accounting snapshot), with a positive-delta
+/// fallback against the immediately-previous cumulative when the turn view
+/// is absent (legacy wire). Upstream's corpus study matched reference
+/// totals on 1166 of 1166 files under this accounting vs 27 under the
+/// high-water math.
+#[derive(Default)]
+struct CodexTotals {
+    prev: Option<TokenUsage>,
+    seen: BTreeSet<TokenUsage>,
+}
+
 fn codex_token_count_usage(
     raw_info: Option<&Value>,
-    prev_total: Option<&TokenUsage>,
-) -> Option<(TokenUsage, Option<TokenUsage>)> {
+    totals: &mut CodexTotals,
+) -> Option<TokenUsage> {
     let info = raw_info?.as_object()?;
     let total = token_usage_map(info.get("total_token_usage"));
-    let (counts, next_total) = if !total.is_empty() {
-        // rm-162 / upstream #286: keep the high-water mark as `prev` so a
-        // post-compaction rewind followed by a rebound is not counted twice.
-        let delta = token_usage_delta(&total, prev_total);
-        (delta, Some(token_usage_high_water(&total, prev_total)))
+    let last = token_usage_map(info.get("last_token_usage"));
+    let counts = if total.is_empty() {
+        last
     } else {
-        (
-            token_usage_map(info.get("last_token_usage")),
-            prev_total.cloned(),
-        )
+        let prev = totals.prev.replace(total.clone());
+        if !totals.seen.insert(total.clone()) {
+            return None;
+        }
+        if usage_has_values(&last) {
+            last
+        } else {
+            token_usage_delta(&total, prev.as_ref())
+        }
     };
     if counts.is_empty() || !usage_has_values(&counts) {
         return None;
@@ -3041,21 +3068,18 @@ fn codex_token_count_usage(
         .copied()
         .unwrap_or(0);
     let input = (counts.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-    // Saturating (rm-162): two legal in-range counters can sum past i64::MAX
-    // on adversarial journals; plain `+` panicked in debug and wrapped negative
-    // in release. Sibling sums at sum_numbers already saturate for the same reason.
-    let output = counts
-        .get("output_tokens")
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(counts.get("reasoning_output_tokens").copied().unwrap_or(0));
+    // rm-617 (upstream #312): reasoning_output_tokens is a breakdown of
+    // output_tokens, not an addition to it — Codex's output_tokens already
+    // contains the reasoning share (corpus study: +64% output over-count
+    // from the old add), so no saturating fold is performed here anymore.
+    let output = counts.get("output_tokens").copied().unwrap_or(0);
 
     let mut usage = BTreeMap::new();
     usage.insert("input_tokens".to_string(), input);
     usage.insert("output_tokens".to_string(), output);
     usage.insert("cache_creation_input_tokens".to_string(), cache_write);
     usage.insert("cache_read_input_tokens".to_string(), cache_read);
-    Some((usage, next_total))
+    Some(usage)
 }
 
 fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
@@ -3078,18 +3102,6 @@ fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
             .map(|value| ((*key).to_string(), value))
     })
     .collect()
-}
-
-// Codex can briefly rewind total_token_usage (e.g. after compaction) and then
-// climb back; tracking the high-water mark keeps the rebound from being counted
-// twice. Ported from upstream #286 (rm-035, renumbered rm-162 at integration).
-fn token_usage_high_water(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
-    let mut merged = prev.cloned().unwrap_or_default();
-    for (key, value) in cur {
-        let slot = merged.entry(key.clone()).or_insert(0);
-        *slot = (*slot).max(*value);
-    }
-    merged
 }
 
 fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
@@ -3116,7 +3128,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_claude = false;
-    let mut seen_usage_snapshots = BTreeSet::new();
+    let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
@@ -3154,24 +3166,56 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     }
                 }
                 if let Some(usage_value) = message.get("usage") {
+                    // rm-616 (upstream #312 port): streaming writes one
+                    // row per content block, each repeating the message's
+                    // usage with a growing output count. Deduping on a
+                    // key that embeds the full usage JSON lets every
+                    // growing snapshot through, so input/cache re-count
+                    // per row (upstream measured ~1.9x input over-count
+                    // on 155 real Claude Code files). Fold the rows into
+                    // ONE meta event per message id, keeping the MAX
+                    // value per field: the streamed final row carries the
+                    // true totals and max-per-field is robust to rows
+                    // arriving out of order. Id-less rows cannot be
+                    // folded and stay per-row (pre-#312 behavior).
                     let message_id = string(message.get("id")).unwrap_or("");
-                    let usage_key = if message_id.is_empty() {
-                        String::new()
-                    } else {
-                        serde_json::to_string(usage_value)
-                            .map(|usage| format!("{message_id}:{usage}"))
-                            .unwrap_or_default()
-                    };
-                    if usage_key.is_empty() || seen_usage_snapshots.insert(usage_key) {
-                        if let Some(usage) = usage_from_value(usage_value) {
-                            events.push(Event {
-                                role: "meta".to_string(),
-                                timestamp: ts.clone(),
-                                usage,
-                                model_used: model.clone(),
-                                source_tool: "claude_code".to_string(),
-                                ..Event::default()
-                            });
+                    // review-fix (independent_review 3a0e F1, fork-side of
+                    // rm-616): a slot is registered ONLY for a meta event
+                    // that was just pushed, storing that event's real
+                    // index. The previous shape registered
+                    // `usage_by_message[id] = events.len()` before the
+                    // conditional `usage_from_value` push, so a first row
+                    // with present-but-unparseable usage pointed the slot
+                    // at whatever landed next: the row's own assistant
+                    // event (later usage rows folded into a non-meta event
+                    // and the analyzer's meta-only usage fold silently
+                    // dropped them) or one past the end of a still-empty
+                    // event list (a later usage row for the id panicked
+                    // with `index out of bounds`). Upstream #312 registers
+                    // the index immediately after its meta push; this
+                    // matches it.
+                    if let Some(usage) = usage_from_value(usage_value) {
+                        match usage_by_message.get(message_id).copied() {
+                            Some(index) => {
+                                for (key, value) in usage {
+                                    let slot = events[index].usage.entry(key).or_insert(0);
+                                    *slot = (*slot).max(value);
+                                }
+                            }
+                            None => {
+                                events.push(Event {
+                                    role: "meta".to_string(),
+                                    timestamp: ts.clone(),
+                                    usage,
+                                    model_used: model.clone(),
+                                    source_tool: "claude_code".to_string(),
+                                    ..Event::default()
+                                });
+                                if !message_id.is_empty() {
+                                    usage_by_message
+                                        .insert(message_id.to_string(), events.len() - 1);
+                                }
+                            }
                         }
                     }
                 }
@@ -3391,21 +3435,16 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
     }
     let model = string(doc.get("model")).unwrap_or("unknown").to_string();
     let mut events = Vec::new();
-    if let Some(usage) = doc.get("usage").and_then(usage_from_value) {
-        events.push(Event {
-            role: "meta".to_string(),
-            usage,
-            model_used: model.clone(),
-            source_tool: "kimi_cli".to_string(),
-            ..Event::default()
-        });
-    }
-    if let Some(usage) = doc
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("usage"))
-        .and_then(usage_from_value)
-    {
+    // rm-616 (upstream #312 port): exports that carry BOTH a top-level
+    // `usage` and `metadata.usage` mirror the same counters — counting
+    // both doubled the session. Read ONE of the two, preferring the
+    // top-level object (the shape the docs bless).
+    if let Some(usage) = doc.get("usage").and_then(usage_from_value).or_else(|| {
+        doc.get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("usage"))
+            .and_then(usage_from_value)
+    }) {
         events.push(Event {
             role: "meta".to_string(),
             usage,
@@ -3674,6 +3713,17 @@ fn cursor_composer_message_events(composer: &Map<String, Value>, fallback_ts: &s
     events
 }
 
+// rm-617 divergence note (upstream #312 port): upstream agenttrace
+// DELETED its gemini parser in the same series that fixed token
+// accounting; this fork deliberately KEEPS it ("keep-and-own") because
+// the fork's discovery walks .gemini/tmp and the antigravity "brain"
+// layout (discovery.rs) that upstream no longer handles — 30 parser
+// references and the repo-root testdata/gemini-{checkpoint,current-chat,
+// thoughts-checkpoint}.json fixtures stay maintained here. The #312
+// accounting rules apply everywhere else; gemini usage keeps its own
+// gemini_usage alias table (input from promptTokenCount-class aliases,
+// thoughts folded into output) which already follows the same
+// first-matching/net-of-cache decomposition this batch pins elsewhere.
 fn parse_gemini_value(value: &Value) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -4204,6 +4254,13 @@ fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -
     };
     add_usage_value(usage, "input_tokens", tokens.get("input"));
     add_usage_value(usage, "output_tokens", tokens.get("output"));
+    // rm-616 (upstream #312 port): the AI-SDK usage object reports the
+    // reasoning share as a separate `reasoning` field billed at the
+    // output rate. The SQLite path already folds it into output
+    // (sqlite_sessions.rs: output + reasoning); the JSONL path dropped
+    // it, so the same session reported LOWER output totals depending
+    // on which store agenttrace read.
+    add_usage_value(usage, "output_tokens", tokens.get("reasoning"));
     if let Some(cache) = tokens.get("cache").and_then(Value::as_object) {
         add_usage_value(usage, "cache_read_input_tokens", cache.get("read"));
         add_usage_value(usage, "cache_creation_input_tokens", cache.get("write"));
@@ -5304,20 +5361,27 @@ mod tests {
             // while output keeps climbing: this event still emits and is
             // exactly where the raw-total previous went wrong.
             token_count(2, total(600, 250, 350, 60)),
-            // Rebound over the old high-water mark.
+            // Rebound past the rewound cumulative.
             token_count(3, total(1100, 480, 500, 90)),
         ]
         .join("\n");
         let session =
             parse_raw_session("codex", "rollout.jsonl", &raw).expect("codex rollout parses");
-        // True per-event deltas: (1000, 400, 250) + (0, 0, 160) + (100, 80,
-        // 180). Input is net of cache reads, so the single-counted total is
-        // exactly the final cumulative input minus cached (1100 - 480):
-        // 620 input / 480 cache read / 590 output. The pre-fix raw-total
-        // accounting yields 870 input / 630 cache read here.
-        assert_eq!(session.metrics.tokens_input, 620);
-        assert_eq!(session.metrics.tokens_cache_r, 480);
-        assert_eq!(session.metrics.tokens_output, 590);
+        // rm-617 / upstream #312 adjudication: this fixture has no
+        // last_token_usage, so each event falls to the delta fallback
+        // against the immediately-previous cumulative. The rewind to
+        // (600, 250) emits only its output climb, and the rebound's full
+        // climb counts — after a REAL compaction reset those are fresh
+        // tokens, so the old high-water mark that survived the reset was
+        // eating them (620 input was an undercount of the true path
+        // sum; the upstream corpus study matched reference totals on
+        // 1166 of 1166 files under this accounting vs 27 before).
+        // Per-event net input: 600 + 0 + (500 - 230) = 870; cache reads
+        // 400 + 0 + 230 = 630; output 200 + 150 + 150 = 500 with
+        // reasoning no longer added on top.
+        assert_eq!(session.metrics.tokens_input, 870);
+        assert_eq!(session.metrics.tokens_cache_r, 630);
+        assert_eq!(session.metrics.tokens_output, 500);
         assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
     }
 
@@ -5462,9 +5526,14 @@ mod tests {
         // reasoning lives outside messages).
         assert_eq!(session.metrics.reasoning_blocks, 5);
         // Reported usage pins (token_count snapshots are preserved by
-        // the sanitizer): 23,312 in / 9,790 out / 192,128 cache read.
+        // the sanitizer): 23,312 in / 5,531 out / 192,128 cache read.
+        // rm-617 (upstream #312): the 4,259 reasoning share stays inside
+        // output_tokens instead of being added on top (old pin: 9,790);
+        // input/cache are unchanged — every snapshot in this file carries
+        // last_token_usage and the totals rise monotonically, so the
+        // per-turn view equals the old per-field delta.
         assert_eq!(session.metrics.tokens_input, 23_312);
-        assert_eq!(session.metrics.tokens_output, 9_790);
+        assert_eq!(session.metrics.tokens_output, 5_531);
         assert_eq!(session.metrics.tokens_cache_r, 192_128);
         // Disclosure pins: world_state is explicitly ignored AND counted
         // (1 in the census), and nothing in this real-shape fixture is
@@ -5591,44 +5660,103 @@ mod tests {
     }
 
     #[test]
-    fn codex_usage_sums_saturate_instead_of_overflowing() {
-        // rm-162: output_tokens + reasoning_output_tokens can each carry a
-        // legal in-range i64 whose sum overflows on adversarial journals;
-        // plain `+` panicked in debug and wrapped negative in release.
-        // Saturating addition clamps at i64::MAX, matching sum_numbers.
+    fn codex_usage_tokens_pass_through_without_arithmetic_overflow() {
+        // rm-617 (upstream #312): the parser no longer sums anything onto
+        // output_tokens — reasoning_output_tokens is a breakdown of it, so
+        // the old saturating fold (rm-162) is gone along with the addition
+        // it hardened. i64::MAX-scale magnitudes now pass through untouched,
+        // with no panic (debug) or wrap (release) possible on the output
+        // side; the input side keeps its saturating cache subtraction.
+        let mut totals = CodexTotals::default();
         let info = serde_json::json!({
-            "last_token_usage": {
+            "total_token_usage": {
                 "input_tokens": 10,
                 "output_tokens": i64::MAX,
                 "reasoning_output_tokens": i64::MAX
             }
         });
-        let (usage, _) = codex_token_count_usage(Some(&info), None).expect("usage event");
+        let usage = codex_token_count_usage(Some(&info), &mut totals).expect("usage event");
         assert_eq!(usage["input_tokens"], 10);
         assert_eq!(usage["output_tokens"], i64::MAX);
     }
 
     #[test]
-    fn codex_usage_rewind_uses_high_water_mark() {
-        // rm-162 / upstream #286: Codex can briefly rewind
-        // total_token_usage after compaction and then climb back. Without
-        // the high-water mark every token up to the old mark is counted
-        // twice on the rebound; with it, only the climb past it counts.
+    fn codex_reasoning_is_a_breakdown_of_output_not_an_addition() {
+        // rm-617 (upstream #312): Codex's output_tokens already contains
+        // the reasoning share. The old saturating_add counted those tokens
+        // twice — {input 10, output 100, reasoning 40} reported 150 for a
+        // 110-token turn (assess PoC at this base).
+        let mut totals = CodexTotals::default();
+        let info = serde_json::json!({
+            "total_token_usage": {
+                "input_tokens": 10,
+                "output_tokens": 100,
+                "reasoning_output_tokens": 40
+            },
+            "last_token_usage": {
+                "input_tokens": 10,
+                "output_tokens": 100,
+                "reasoning_output_tokens": 40
+            }
+        });
+        let usage = codex_token_count_usage(Some(&info), &mut totals).expect("usage event");
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 100);
+    }
+
+    #[test]
+    fn codex_totals_dedupe_distinct_snapshots_with_delta_fallback() {
+        // rm-617 / upstream #312, superseding the rm-162 high-water port:
+        // count last_token_usage once per DISTINCT cumulative value, with a
+        // positive-delta fallback against the immediately-previous
+        // cumulative when the turn view is absent. The rewound snapshot
+        // (1000, distinct) fabricates no usage; the rebound counts its full
+        // climb past the rewound baseline — post-reset tokens are fresh
+        // usage (see the rewind fixture above for the adjudication).
         let step = |total_input: i64| {
             serde_json::json!({
                 "total_token_usage": {"input_tokens": total_input}
             })
         };
-        let (first, prev) = codex_token_count_usage(Some(&step(2500)), None).expect("first event");
+        let mut totals = CodexTotals::default();
+        let first = codex_token_count_usage(Some(&step(2500)), &mut totals).expect("first event");
         assert_eq!(first["input_tokens"], 2500);
-        // Rewind to 1000 fabricates no usage (empty delta -> no event),
-        // and preserves the 2500 high-water mark as `prev`.
-        let rewound = codex_token_count_usage(Some(&step(1000)), prev.as_ref());
+        // Rewind to 1000 is a distinct cumulative: negative delta -> no
+        // event, but it becomes the baseline the next snapshot diffs
+        // against (not the old 2500 high-water mark).
+        let rewound = codex_token_count_usage(Some(&step(1000)), &mut totals);
         assert!(rewound.is_none());
-        // Rebound to 3000 counts only the 500-token climb past the mark.
-        let (rebound, _) =
-            codex_token_count_usage(Some(&step(3000)), prev.as_ref()).expect("rebound event");
-        assert_eq!(rebound["input_tokens"], 500);
+        // Rebound to 3000 counts the full climb over the rewound baseline.
+        let rebound =
+            codex_token_count_usage(Some(&step(3000)), &mut totals).expect("rebound event");
+        assert_eq!(rebound["input_tokens"], 2000);
+        // A re-send of an already-seen cumulative is not usage at all.
+        let duplicate = codex_token_count_usage(Some(&step(3000)), &mut totals);
+        assert!(duplicate.is_none());
+    }
+
+    #[test]
+    fn opencode_reasoning_tokens_are_billed_as_output() {
+        // rm-616 (upstream #312): the AI-SDK usage object reports the
+        // reasoning share as a separate `reasoning` field, billed at the
+        // output rate. The SQLite path already folds it into output
+        // (sqlite_sessions.rs adds tokens.reasoning to output); the JSONL
+        // path dropped it, so identical sessions reported different
+        // output totals depending on which store agenttrace read.
+        let mut usage = BTreeMap::new();
+        assert!(add_opencode_tokens(
+            &mut usage,
+            Some(&serde_json::json!({
+                "input": 10,
+                "output": 20,
+                "reasoning": 5,
+                "cache": {"read": 3, "write": 2}
+            }))
+        ));
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 25);
+        assert_eq!(usage["cache_read_input_tokens"], 3);
+        assert_eq!(usage["cache_creation_input_tokens"], 2);
     }
 
     #[test]
@@ -5678,6 +5806,140 @@ mod tests {
         let session =
             parse_raw_session("mid", "mid.jsonl", mid_content).expect("mid-content BOM parses");
         assert_eq!(session.metrics.user_messages, 1);
+    }
+
+    #[test]
+    fn claude_streamed_usage_rows_fold_into_one_event_per_message() {
+        // rm-616 (upstream #312): Claude Code streams one row per content
+        // block, each repeating the message's usage with a GROWING output
+        // count. The old dedup key embedded the full usage JSON, so every
+        // growing snapshot was distinct and input/cache re-counted per row
+        // (upstream's 155-file study measured ~1.9x input over-count). One
+        // meta event per message id now folds the rows with MAX-per-field:
+        // input counts once (50, not 100) and output takes the final row
+        // (25). Rows without a message id cannot be folded and stay
+        // per-row, matching the pre-port behavior for that shape.
+        let row = |output: i64| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-10-01T10:00:00Z",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4-5",
+                    "usage": {
+                        "input_tokens": 50,
+                        "cache_read_input_tokens": 5,
+                        "output_tokens": output
+                    },
+                    "content": [{"type": "text", "text": "chunk"}]
+                }
+            })
+            .to_string()
+        };
+        let raw = [row(10), row(25)].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_claude_code_jsonl(&objs).expect("claude streamed rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "both streamed rows fold into one usage event"
+        );
+        let usage = meta[0].usage.clone();
+        assert_eq!(usage["input_tokens"], 50);
+        assert_eq!(usage["cache_read_input_tokens"], 5);
+        assert_eq!(usage["output_tokens"], 25);
+    }
+
+    #[test]
+    fn claude_fold_never_indexes_one_past_the_last_event() {
+        // independent_review 3a0e F1 (review-fix): a first streamed row
+        // whose usage is present but unparseable ({}) and carries no
+        // content must NOT register a message-id slot pointing at
+        // events.len(); with such a slot a later valid usage row for the
+        // same id folded at that index and panicked `index out of bounds:
+        // the len is 0 but the index is 0` (probe corpus:
+        // /tmp/at-review-3a0e/claude-panic). The slot must only ever be
+        // registered for a meta event that was actually pushed.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-sonnet-4-5",
+                "usage": {},
+                "content": []
+            }
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:01Z",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 7}
+            }
+        })
+        .to_string();
+        let raw = [first, second].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_claude_code_jsonl(&objs).expect("claude streamed rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "the later valid usage row pushes one meta event"
+        );
+        let usage = meta[0].usage.clone();
+        assert_eq!(usage["input_tokens"], 10, "later valid usage counts once");
+        assert_eq!(usage["output_tokens"], 7);
+    }
+
+    #[test]
+    fn claude_usage_always_lands_on_a_meta_event() {
+        // independent_review 3a0e F1 (review-fix): registering the id slot
+        // before the conditional meta push pointed the slot at whatever
+        // event landed next. With a first content-bearing row whose usage
+        // was unparseable, that slot was the row's OWN assistant event, so
+        // later usage rows for the id folded usage into an assistant
+        // event — where the analyzer's meta-only usage fold silently
+        // dropped it (probe /tmp/at-review-3a0e/claude-misfold showed
+        // Input 0 vs true 75). Usage must land on a meta event even when
+        // the first row for the id carried content.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "msg_2",
+                "model": "claude-sonnet-4-5",
+                "usage": {},
+                "content": [{"type": "text", "text": "partial"}]
+            }
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:01Z",
+            "message": {
+                "id": "msg_2",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 40, "output_tokens": 35}
+            }
+        })
+        .to_string();
+        let raw = [first, second].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_claude_code_jsonl(&objs).expect("claude streamed rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "usage lands on a meta event even when the first row carried content"
+        );
+        let usage = meta[0].usage.clone();
+        assert_eq!(usage["input_tokens"], 40);
+        assert_eq!(usage["output_tokens"], 35);
     }
 
     #[test]
@@ -5997,6 +6259,27 @@ mod tests {
             "generic steps arrays must fall through to the unsupported-format error"
         );
         assert!(parse_antigravity_trajectory(&generic).is_none());
+    }
+
+    #[test]
+    fn qwen_mirrored_input_aliases_count_once_and_cache_nets_out() {
+        // rm-616 (upstream #312): Qwen Code mirrors the same input counter
+        // under input_tokens/prompt_tokens aliases — summing the aliases
+        // counted each token once per alias (assess PoC at this base:
+        // Input 200 reported for a 100-token turn), and the input side
+        // (promptTokenCount) already contains the cached share, so
+        // cache_read is netted out of input the way the codex path already
+        // nets cached_input_tokens.
+        let usage = qwen_usage(Some(&serde_json::json!({
+            "input_tokens": 100,
+            "prompt_tokens": 100,
+            "cache_read_input_tokens": 60,
+            "output_tokens": 50
+        })))
+        .expect("qwen usage");
+        assert_eq!(usage["input_tokens"], 40);
+        assert_eq!(usage["cache_read_input_tokens"], 60);
+        assert_eq!(usage["output_tokens"], 50);
     }
 
     #[test]
@@ -6346,6 +6629,62 @@ mod tests {
     // integration from the campaign-local id) -------------------------
 
     #[test]
+    fn kimi_session_usage_and_metadata_usage_count_once() {
+        // rm-616 (upstream #312): kimi exports mirror the session usage in
+        // BOTH `usage` and `metadata.usage`. Counting each source emitted
+        // two meta events and doubled every total; one source counts now —
+        // the top-level `usage`, falling back to `metadata.usage` for
+        // exports that only carry the nested copy. The value parser is
+        // pinned directly: in the full dispatcher the generic gemini
+        // value probe runs first and can claim a usage-bearing doc before
+        // parse_kimi_value is reached (pre-existing routing order,
+        // recorded in the batch findings), so this test pins the kimi
+        // accounting itself.
+        let value = serde_json::json!({
+            "model": "kimi-k2.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hi",
+                    "timestamp": "2026-10-01T10:00:00Z"
+                },
+                {
+                    "role": "assistant",
+                    "content": "hello",
+                    "timestamp": "2026-10-01T10:00:05Z"
+                }
+            ],
+            "usage": {"input_other": 100, "output": 40, "input_cache_read": 10},
+            "metadata": {"usage": {"input_other": 100, "output": 40, "input_cache_read": 10}}
+        });
+        let events = parse_kimi_value(&value).expect("kimi session value recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "usage and metadata.usage count once, not twice"
+        );
+        assert_eq!(meta[0].usage["input_tokens"], 100);
+        assert_eq!(meta[0].usage["output_tokens"], 40);
+        assert_eq!(meta[0].usage["cache_read_input_tokens"], 10);
+        // The fallback arm: a metadata-only export still counts once.
+        let metadata_only = serde_json::json!({
+            "model": "kimi-k2.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"usage": {"input_other": 7, "output": 3}}
+        });
+        let events = parse_kimi_value(&metadata_only).expect("metadata-only kimi parses");
+        let usage = events
+            .iter()
+            .find(|event| event.role == "meta")
+            .expect("fallback usage event")
+            .usage
+            .clone();
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
+    }
+
+    #[test]
     fn kimi_statusupdate_usage_uses_official_wire_aliases() {
         // Official MoonshotAI/kimi-code wire fixture (MIT, 130 lines,
         // 15 usage-bearing StatusUpdate records): the token_usage wire
@@ -6540,12 +6879,13 @@ mod tests {
             &codex_compaction_corpus("resp_comp_42"),
         )
         .expect("codex rollout parses");
-        // Snapshots: 400 net input + 600 cache + 550 out, then a
-        // 200-climb giving 0 net input + 200 cache + 160 out. Compaction
+        // Snapshots: 400 net input + 600 cache + 400 out, then a
+        // turn view of 0 net input + 200 cache + 120 out (rm-617:
+        // reasoning no longer added on top of output). Compaction
         // turn: 200 net input + 300 cache + 200 out.
         assert_eq!(session.metrics.tokens_input, 600);
         assert_eq!(session.metrics.tokens_cache_r, 1_100);
-        assert_eq!(session.metrics.tokens_output, 910);
+        assert_eq!(session.metrics.tokens_output, 720);
         assert_eq!(
             session
                 .metrics
@@ -6578,9 +6918,11 @@ mod tests {
         let session = parse_raw_session("codex", "rollout-compaction-replayed.jsonl", &raw)
             .expect("codex rollout parses");
         // 1000 from the snapshot + 700 net from the record, exactly once.
+        // rm-617: the record's reasoning share (120) stays inside its
+        // output_tokens instead of being added on top.
         assert_eq!(session.metrics.tokens_input, 1_700);
         assert_eq!(session.metrics.tokens_cache_r, 800);
-        assert_eq!(session.metrics.tokens_output, 620);
+        assert_eq!(session.metrics.tokens_output, 500);
         assert_eq!(
             session
                 .metrics
@@ -6611,14 +6953,18 @@ mod tests {
             &codex_compaction_corpus("resp_ordinary"),
         )
         .expect("codex rollout parses");
-        // Snapshot totals only (the 1,910 shape); the unpaired record
-        // adds nothing.
+        // Snapshot totals only (the 1,720 shape: 400 net input + 800
+        // cache read + 520 out, rm-617 netting reasoning out of output);
+        // the unpaired record adds nothing.
         assert_eq!(
             session.metrics.tokens_input
                 + session.metrics.tokens_cache_r
                 + session.metrics.tokens_output,
-            1_910
+            1_720
         );
+        assert_eq!(session.metrics.tokens_input, 400);
+        assert_eq!(session.metrics.tokens_cache_r, 800);
+        assert_eq!(session.metrics.tokens_output, 520);
         assert_eq!(
             session
                 .metrics
@@ -6633,12 +6979,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_compaction_record_does_not_advance_the_high_water_baseline() {
+    fn codex_compaction_record_does_not_advance_the_totals_baseline() {
         // The compaction turn's usage lives outside every later
         // cumulative snapshot, so it is added standalone — and it must
-        // never become the high-water baseline the snapshots diff
-        // against: a record larger than the running mark would otherwise
-        // eat the next snapshot's climb.
+        // never become the baseline the snapshots diff against: a record
+        // larger than the previous cumulative would otherwise eat the
+        // next snapshot's climb (rm-617: the baseline is now the
+        // immediately-previous cumulative, not a high-water mark).
         let lines = [
             serde_json::json!({"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.3-codex"}}),
             serde_json::json!({"timestamp":"2026-10-01T09:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2500}}}}),
@@ -6654,10 +7001,10 @@ mod tests {
             .join("\n");
         let session = parse_raw_session("codex", "rollout-compaction-hwm.jsonl", &raw)
             .expect("codex rollout parses");
-        // 2500 (first snapshot) + 5000 (the record, standalone) + 500
-        // (rebound past the 2500 mark). If the record had advanced the
-        // baseline the rebound would count 0.
-        assert_eq!(session.metrics.tokens_input, 8_000);
+        // 2500 (first snapshot) + 5000 (the record, standalone) + 2000
+        // (the rebound's full climb over the rewound 1000 baseline). If
+        // the record had advanced the baseline the rebound would count 0.
+        assert_eq!(session.metrics.tokens_input, 9_500);
         assert_eq!(
             session
                 .metrics

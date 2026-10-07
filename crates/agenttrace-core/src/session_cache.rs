@@ -5,7 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
+// Bumped 27 -> 28 (integration of run e5653f52, rm-616/rm-617, the
+// upstream-#312 usage-accounting port): token totals change for
+// UNCHANGED files across five parsers — claude_code folds streamed
+// usage rows into one event per message id (input/cache stop
+// re-counting per content-block row), qwen_code reads the first
+// matching input alias and nets cache reads out of input, opencode
+// folds tokens.reasoning into output on the JSONL path, kimi sessions
+// count `usage` OR `metadata.usage` instead of both, and codex_cli
+// counts last_token_usage once per distinct cumulative with a delta
+// fallback (superseding the rm-162 high-water port) while no longer
+// adding reasoning_output_tokens on top of output. Warm v27 entries
+// still carry pre-fix totals with matching fingerprints, so the
+// schema bump forces a one-time regeneration under corrected
+// accounting (rm-230 convention). The batch landed against schema 27.
 // Bumped 26 -> 27 (integration of run b1ff12f8, rm-542, minted
 // campaign-locally as rm-449): the Codex custom-tools response items are
 // now parsed — custom_tool_call / custom_tool_call_output pairs count as
