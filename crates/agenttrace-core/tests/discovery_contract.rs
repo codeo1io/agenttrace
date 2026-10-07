@@ -1014,6 +1014,12 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
+        // v33 (integration of run 91833f02, rm-616 generic-lane
+        // model/usage truth — the Event.model_used alias + the
+        // generic counted-lane fold change what unchanged generic
+        // files report: model, tokens, provenance and the new
+        // model_or_usage_dropped / usage_present_not_counted
+        // line_skips; re-based off the campaign's 27 -> 28 bump);
         // v32 (integration of run 7f9c6d24, usage-accounting
         // truthfulness — rm-601/rm-602/rm-603/rm-554/rm-556, with the
         // campaign's title-twin rm-555 folded into the landed rm-551 —
@@ -1208,12 +1214,12 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v32 — see the usage-accounting-truthfulness,
+        // version (v33 — see the rm-616, usage-accounting-truthfulness,
         // rm-551, rm-538, rm-600, rm-529, rm-542,
         // rm-485, rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes
-        // in session_cache.rs; the run-7f9c6d24 truthfulness batch is what
-        // carried 31 -> 32 at this integration, re-based off the campaign's
-        // own 26 -> 27 bump).
+        // in session_cache.rs; the generic-lane model/usage truth is
+        // what carried 32 -> 33 at this integration, re-based off the
+        // campaign's own 27 -> 28 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(SESSION_CACHE_SCHEMA_VERSION)

@@ -5,7 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (integration of run 91833f02, rm-616 'Generic-lane
+// model/usage truth', review fix 0be11bb1 after review f6b98bc3 F1):
+// the Event.model_used snake_case alias plus the generic-lane counted
+// fold change what UNCHANGED generic-shaped files report — model_used
+// (was "default" whenever the journal spelled the wire key
+// model_used), token totals, provenance (reported_by_agent instead of
+// estimated_from_text), and the new model_or_usage_dropped /
+// usage_present_not_counted line_skips — so a warm v32 cache keeps
+// serving the pre-fix values verbatim under matching size/mtime
+// fingerprints: no re-parse, no self-heal (proven live by the review's
+// pre-fix-binary cache-warming PoC). The batch landed against its base
+// 8991144 at schema 27 and bumped it to 28 there; integration re-bases
+// the bump onto the already-advanced ceiling (28 was rm-529, 29 was
+// rm-600, 30 was rm-538, 31 was landed rm-551, 32 was the run-7f9c6d24
+// usage-accounting truthfulness batch) per the same convention.
+// Entries regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):

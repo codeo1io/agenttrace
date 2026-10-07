@@ -158,7 +158,12 @@ pub struct Event {
         deserialize_with = "deserialize_usage_map"
     )]
     pub usage: BTreeMap<String, i64>,
-    #[serde(default, rename = "ModelUsed", deserialize_with = "deserialize_string")]
+    #[serde(
+        default,
+        rename = "ModelUsed",
+        alias = "model_used",
+        deserialize_with = "deserialize_string"
+    )]
     pub model_used: String,
     /// rm-485: cost-only credit attribution in USD. Carried by meta events
     /// whose adapter truth is a session-wide credit counter (Copilot's
@@ -405,10 +410,16 @@ pub struct Metrics {
     pub stored_totals_delta: i64,
     /// Parse lines lost inside this session's source file, by reason
     /// (pass-7 P7-1): `unparseable_line`, `event_schema`, `non_event`.
-    /// Pure parse loss only. Assumption disclosures — including the
-    /// rm-450 workbuddy basis counters (`workbuddy_input_basis:*`) —
-    /// live in `disclosure_counters` (rm-538) so they no longer
-    /// degrade confidence like a lost line would.
+    /// Parse loss and lost-accounting disclosures. Assumption
+    /// disclosures — including the rm-450 workbuddy basis counters
+    /// (`workbuddy_input_basis:*`) — live in `disclosure_counters`
+    /// (rm-538) so they no longer degrade confidence like a lost line
+    /// would. The rm-616 accounting-drop disclosures stay on this
+    /// channel because they mark lost accounting, not an assumption:
+    /// `model_or_usage_dropped` (a rejected line that itself carried
+    /// model identity or a usage block) and
+    /// `usage_present_not_counted` (a conversation line whose usage fell
+    /// outside its family's counted lane while the session estimated).
     /// Empty for clean parses.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub line_skips: BTreeMap<String, usize>,
@@ -689,6 +700,19 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         }
         let Some(value) = parser::parse_jsonl_value_lenient(line) else {
             count_skip("unparseable_line", &mut line_skips);
+            // rm-616: a rejected line that itself carries model identity
+            // or a usage block is not just a lost message — it is lost
+            // ACCOUNTING. Count it separately so the drop is disclosed,
+            // never silent. Unparseable lines get a conservative
+            // substring check (quoted key forms for usage to avoid
+            // `tool_usage`-shaped false positives).
+            if line.contains("model_used")
+                || line.contains("ModelUsed")
+                || line.contains("\"usage\"")
+                || line.contains("\"Usage\"")
+            {
+                count_skip("model_or_usage_dropped", &mut line_skips);
+            }
             continue;
         };
         if line_objects.len() < 20 {
@@ -708,12 +732,26 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         for disclosure in unrecognized_usage_keys(&value) {
             count_skip(&disclosure, &mut line_skips);
         }
+        // rm-616: computed before `value` is consumed by the strict
+        // Event parse — the same key census the drop markers use.
+        let carries_model_or_usage = value.as_object().is_some_and(|object| {
+            object.contains_key("model_used")
+                || object.contains_key("ModelUsed")
+                || object.contains_key("usage")
+                || object.contains_key("Usage")
+        });
         let Ok(mut event) = serde_json::from_value::<Event>(value) else {
             count_skip("event_schema", &mut line_skips);
+            if carries_model_or_usage {
+                count_skip("model_or_usage_dropped", &mut line_skips);
+            }
             continue;
         };
         if event.role.is_empty() && !has_event_type {
             count_skip("non_event", &mut line_skips);
+            if carries_model_or_usage {
+                count_skip("model_or_usage_dropped", &mut line_skips);
+            }
             continue;
         }
         if event.source_tool.is_empty() {
@@ -729,8 +767,12 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         event.source_tool = source_tool.to_string();
     }
     let mut session = session_from_events(name, path, events)?;
-    if !line_skips.is_empty() {
-        session.metrics.line_skips = line_skips;
+    // rm-616: merge, never overwrite — analyze() may have put its own
+    // disclosure counters (rm-450 workbuddy basis, rm-616
+    // usage_present_not_counted) into metrics.line_skips, and clobbering
+    // them here would silence exactly the disclosures that matter.
+    for (reason, count) in line_skips {
+        *session.metrics.line_skips.entry(reason).or_insert(0) += count;
     }
     Ok(session)
 }
@@ -947,7 +989,20 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let has_meta_usage = events.iter().any(|event| {
         matches!(event.role.as_str(), "session_meta" | "meta") && !event.usage.is_empty()
     });
-    metrics.provenance.tokens = if has_meta_usage {
+    // rm-616: generic-lane (serde passthrough) sessions carry usage on
+    // conversation lines, not synthetic meta events. Reported usage
+    // exists for them too, so text estimation must stand down. Scoped to
+    // the serde-origin classification (`source_tool == "generic"`, set
+    // by the parser.rs `Vec<Event>` arm and the per-line fallback):
+    // native families fold usage through meta events, and folding their
+    // conversation lines on top would double-count.
+    let has_reported_usage = has_meta_usage
+        || events.iter().any(|event| {
+            !matches!(event.role.as_str(), "session_meta" | "meta")
+                && event.source_tool == "generic"
+                && !event.usage.is_empty()
+        });
+    metrics.provenance.tokens = if has_reported_usage {
         "reported_by_agent"
     } else {
         "estimated_from_text"
@@ -1002,6 +1057,55 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // the journal, never conversation content.
         for (key, value) in &event.disclosure_counters {
             *metrics.disclosure_counters.entry(key.clone()).or_insert(0) += *value as usize;
+        }
+
+        // rm-616: fold reported usage from generic-lane conversation
+        // lines with the meta arm's clamp-plus-saturate contract — this
+        // is the counted lane for serde-origin sessions, whose journals
+        // put usage on the messages themselves. Events carrying model
+        // attribution join the per-model pricing state below so a
+        // switched session prices per block like any other family.
+        let generic_reported_usage = !matches!(event.role.as_str(), "session_meta" | "meta")
+            && event.source_tool == "generic"
+            && !event.usage.is_empty();
+        if generic_reported_usage {
+            metrics.tokens_input = metrics
+                .tokens_input
+                .saturating_add(usage_tokens("input_tokens"));
+            metrics.tokens_output = metrics
+                .tokens_output
+                .saturating_add(usage_tokens("output_tokens"));
+            metrics.tokens_reasoning = metrics
+                .tokens_reasoning
+                .saturating_add(usage_tokens("reasoning_tokens"));
+            metrics.tokens_cache_w = metrics
+                .tokens_cache_w
+                .saturating_add(usage_tokens("cache_creation_input_tokens"));
+            metrics.tokens_cache_r = metrics
+                .tokens_cache_r
+                .saturating_add(usage_tokens("cache_read_input_tokens"));
+            if !event.model_used.is_empty() && event.model_used != "unknown" {
+                usage_models.insert(event.model_used.clone());
+            }
+        }
+        // rm-616 disclosure: a conversation line that REPORTS usage but
+        // whose family's counted lane is elsewhere (native families
+        // fold usage through meta events; the generic lane folds above)
+        // must not be silently swallowed — disclose it on the pass-7
+        // line_skips channel instead. Review fix F3 (review f6b98bc3):
+        // the counter now also fires BESIDE meta usage — a session with
+        // meta totals plus stray conversation-line usage previously
+        // dropped the stray silently, narrower than the batch's own
+        // prevention rule. Still cannot fire for the meta arm (role
+        // gate) or the generic lane (folded above).
+        if !matches!(event.role.as_str(), "session_meta" | "meta")
+            && !generic_reported_usage
+            && !event.usage.is_empty()
+        {
+            *metrics
+                .line_skips
+                .entry("usage_present_not_counted".to_string())
+                .or_insert(0) += 1;
         }
 
         match event.role.as_str() {
@@ -1076,7 +1180,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             }
             "user" => {
                 metrics.user_messages += 1;
-                if !event.content.is_empty() && !has_meta_usage {
+                if !event.content.is_empty() && !has_reported_usage {
                     metrics.tokens_input = metrics.tokens_input.saturating_add(std::cmp::max(
                         1,
                         estimate_tokens_from_text(&event.content),
@@ -1095,13 +1199,13 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     if event.redacted {
                         metrics.reasoning_redact += 1;
                     }
-                    if !has_meta_usage {
+                    if !has_reported_usage {
                         metrics.tokens_output = metrics.tokens_output.saturating_add(
                             std::cmp::max(1, estimate_tokens_from_text(&event.reasoning)),
                         );
                     }
                 }
-                if !event.content.is_empty() && !has_meta_usage {
+                if !event.content.is_empty() && !has_reported_usage {
                     metrics.tokens_output = metrics.tokens_output.saturating_add(std::cmp::max(
                         1,
                         estimate_tokens_from_text(&event.content),
@@ -1229,9 +1333,16 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // Recorded costs were accumulated into upstream_cost_usd above;
         // start from them and add per-block catalog pricing for the rest.
         let mut per_block_cost = metrics.upstream_cost_usd;
+        // rm-616: generic-lane usage blocks join this loop — the rule is
+        // parser-agnostic ("any journal family whose usage-bearing events
+        // carry model attribution prices each block at its own model"),
+        // and serde-origin blocks carry usage on conversation lines.
         for event in events
             .iter()
-            .filter(|event| matches!(event.role.as_str(), "session_meta" | "meta"))
+            .filter(|event| {
+                matches!(event.role.as_str(), "session_meta" | "meta")
+                    || event.source_tool == "generic"
+            })
             .filter(|event| !event.usage.is_empty())
         {
             if event
