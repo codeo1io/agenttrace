@@ -1178,6 +1178,11 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         // resolve to a readable file or directory (the discovery collectors
         // follow symlinks too) while naming a special-file target by its
         // real class instead of mislabeling every symlink "dangling".
+        // rm-590 (run d65f72c7, landed at this merge) wanted the same
+        // three-way split here via an inline exists()-but-not-regular arm;
+        // this landed helper already provides it — and more (true stat
+        // class, symlink resolution, dangling detection) — so the inline
+        // arm is superseded and the distinct-words intent rides rm-212.
         admit_session_path(&path)?;
     }
     let dir = args.dir.as_deref().map(PathBuf::from);

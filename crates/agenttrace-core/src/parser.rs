@@ -2859,12 +2859,25 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 .or_insert(0) += 1;
             continue;
         }
-        let obj = match parse_jsonl_value_lenient(line.trim()).and_then(|value| match value {
-            Value::Object(obj) => Some(obj),
-            _ => None,
-        }) {
-            Some(obj) => obj,
-            None => continue,
+        // rm-584: a line that parses as JSON but is not an object (bare
+        // strings, numbers, arrays) used to vanish with no line_skips
+        // entry; a line that is not JSON at all vanished the same way.
+        // The disclosure contract requires every skipped line to name
+        // its shape.
+        let obj = match parse_jsonl_value_lenient(line.trim()) {
+            Some(Value::Object(map)) => map,
+            Some(value) => {
+                *counters
+                    .entry(format!("codex_non_object_line:{}", json_value_kind(&value)))
+                    .or_insert(0) += 1;
+                continue;
+            }
+            None => {
+                *counters
+                    .entry("codex_unparseable_line".to_string())
+                    .or_insert(0) += 1;
+                continue;
+            }
         };
         let typ = string(obj.get("type")).unwrap_or("");
         let ts = string(obj.get("timestamp")).unwrap_or("").to_string();
@@ -3139,14 +3152,21 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 saw_codex = true;
                 *counters.entry("codex_world_state".to_string()).or_insert(0) += 1;
             }
-            unknown_top_level if !unknown_top_level.is_empty() => {
+            "" => {
+                // rm-584: a missing or empty top-level type used to fall
+                // through silently — count it so a wire-format change that
+                // drops the field can never quietly empty a journal.
+                *counters
+                    .entry("codex_missing_type".to_string())
+                    .or_insert(0) += 1;
+            }
+            unknown_top_level => {
                 // rm-542: same disclosure duty as the response_item arm —
                 // an unrecognized top-level type is drift, not noise.
                 *counters
                     .entry(format!("codex_unmatched_type:{unknown_top_level}"))
                     .or_insert(0) += 1;
             }
-            _ => {}
         }
     }
     // Pair buffered usage records against compaction markers (rm-401).
@@ -3224,6 +3244,20 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
         non_empty(events).map(|events| (events, counters))
     } else {
         None
+    }
+}
+
+// Stable serde_json shape name for the rm-584 codex skip counters
+// (`codex_non_object_line:<kind>`), so a bare string/number/array line names
+// its shape instead of vanishing.
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -5764,6 +5798,55 @@ mod tests {
             session.metrics.line_skips.get("codex_ignorable_line"),
             Some(&2),
             "skipped codex chatter is visible in parse diagnostics"
+        );
+    }
+
+    #[test]
+    fn codex_line_skips_disclose_every_dropped_shape() {
+        // rm-584: a typeless payload line, a bare JSON string, a bare
+        // number, and an unparseable line used to vanish with
+        // line_skips: {} (PoC corpus /tmp/at-assess-92e8/codex-shapes.jsonl).
+        let meta = serde_json::json!({
+            "timestamp": "2026-10-05T20:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/probe"}
+        })
+        .to_string();
+        let typeless = serde_json::json!({
+            "timestamp": "2026-10-05T20:00:01Z",
+            "payload": {"type": "custom_tool_call", "call_id": "c1", "name": "exec"}
+        })
+        .to_string();
+        let raw = [
+            meta,
+            typeless,
+            serde_json::json!("a bare json string line").to_string(),
+            serde_json::json!(12345).to_string(),
+            "{ not json".to_string(),
+        ]
+        .join("\n");
+        let session =
+            parse_raw_session("codex", "codex-shapes.jsonl", &raw).expect("corpus parses");
+        let skips = &session.metrics.line_skips;
+        assert_eq!(
+            skips.get("codex_missing_type"),
+            Some(&1),
+            "a payload line with no top-level type must be disclosed: {skips:?}"
+        );
+        assert_eq!(
+            skips.get("codex_non_object_line:string"),
+            Some(&1),
+            "bare string lines must be disclosed: {skips:?}"
+        );
+        assert_eq!(
+            skips.get("codex_non_object_line:number"),
+            Some(&1),
+            "bare number lines must be disclosed: {skips:?}"
+        );
+        assert_eq!(
+            skips.get("codex_unparseable_line"),
+            Some(&1),
+            "non-JSON lines must be disclosed: {skips:?}"
         );
     }
 
