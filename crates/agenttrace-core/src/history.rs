@@ -59,14 +59,15 @@ pub fn preserve_derived_history(sessions: &[Session]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Stage through a unique temp sibling, then rename into place so a
-    // crash mid-write can no longer tear the only durable record of
-    // derived sessions (pass-7 P7-5).
-    let tmp = crate::session_cache::unique_temp_path(&path);
-    // rm-208: derived history names projects and carries session
-    // metrics; write it owner-only instead of the 0644 default.
-    crate::session_cache::write_private(&tmp, &serde_json::to_vec_pretty(&records)?)?;
-    std::fs::rename(&tmp, &path)?;
+    // rm-693: stage through a fresh O_EXCL temp sibling and rename
+    // into place so a crash mid-write can no longer tear the only
+    // durable record of derived sessions (pass-7 P7-5), and a symlink
+    // planted at the predictable temp name is bumped past, never
+    // truncated through (same exclusivity as every other atomic
+    // writer). rm-208: derived history names projects and carries
+    // session metrics; write it owner-only instead of the 0644
+    // default.
+    crate::session_cache::write_private_exclusive(&path, &serde_json::to_vec_pretty(&records)?)?;
     Ok(())
 }
 
@@ -113,7 +114,19 @@ fn records_from_bytes(path: &Path, raw: &[u8]) -> BTreeMap<String, DerivedSessio
     match serde_json::from_slice::<BTreeMap<String, DerivedSession>>(raw) {
         Ok(_) => decode_records(raw),
         Err(_) => {
-            let quarantine = path.with_extension("json.corrupt");
+            // rm-703: keep EVERY corrupt generation — the fixed
+            // `.corrupt` name let a second corruption clobber the
+            // first, destroying evidence exactly when forensics
+            // needed the older bytes. Successive corruptions stack as
+            // `<name>.json.corrupt`, `.corrupt.1`, `.corrupt.2`, ...;
+            // the bound only guards a pathological directory (the
+            // last slot is reused rather than looping forever).
+            let mut quarantine = path.with_extension("json.corrupt");
+            let mut generation = 0u32;
+            while quarantine.exists() && generation < 10_000 {
+                generation += 1;
+                quarantine = path.with_extension(format!("json.corrupt.{generation}"));
+            }
             let _ = std::fs::rename(path, &quarantine);
             eprintln!(
                 "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
@@ -310,6 +323,45 @@ mod tests {
         assert!(!path.exists(), "torn history must not be re-read in place");
         let preserved = std::fs::read(&quarantine).expect("quarantine preserves bytes");
         assert_eq!(preserved, b"{\"torn\": ");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successive_corruptions_keep_every_quarantine_generation() {
+        // rm-703: the quarantine used a fixed `history.json.corrupt`
+        // name under `rename`, so a SECOND corruption clobbered the
+        // first generation — evidence destroyed exactly when forensics
+        // needed the older bytes. Each corruption must keep its own
+        // quarantine file.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-twice-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("history.json");
+        std::fs::write(&path, b"{\"first\": ").expect("write first corrupt history");
+        records_from_bytes(&path, b"{\"first\": ");
+        std::fs::write(&path, b"{\"second\": ").expect("write second corrupt history");
+        records_from_bytes(&path, b"{\"second\": ");
+        let first = root.join("history.json.corrupt");
+        let second = root.join("history.json.corrupt.1");
+        assert!(first.exists(), "the first corruption must stay quarantined");
+        assert!(
+            second.exists(),
+            "the second corruption must get its own quarantine file"
+        );
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"{\"first\": ",
+            "the first generation's bytes must survive the second corruption"
+        );
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            b"{\"second\": ",
+            "the second generation's bytes must be preserved too"
+        );
+        assert!(!path.exists(), "the live file moved aside both times");
         let _ = std::fs::remove_dir_all(root);
     }
 

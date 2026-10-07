@@ -807,6 +807,22 @@ fn load_baseline_report(baseline_path: &str) -> anyhow::Result<Value> {
                  baseline with `agenttrace --overview -f json -o <baseline>`"
             );
         }
+        // rm-697: `is_number` admits negatives, and `delta_pct` divides
+        // by the baseline — total_cost = -100 sign-inverted a real
+        // +$100 regression into a PASSING negative delta (live PoC:
+        // delta_pct -100.036). Totals are magnitudes: admit only
+        // finite non-negative numbers, with the same flag/path/
+        // regenerate-hint shape as the rm-569 rejections above.
+        if let Some(number) = summary.get(key).and_then(Value::as_f64) {
+            if !number.is_finite() || number < 0.0 {
+                anyhow::bail!(
+                    "--baseline: {baseline_path} summary field \"{key}\" is negative or \
+                     not finite ({number}); a negative baseline total sign-inverts the delta \
+                     comparison into a pass — regenerate the baseline with \
+                     `agenttrace --overview -f json -o <baseline>`"
+                );
+            }
+        }
     }
     if baseline.get("version").and_then(Value::as_str).is_none() {
         anyhow::bail!(

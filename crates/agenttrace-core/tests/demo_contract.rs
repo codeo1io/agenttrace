@@ -373,6 +373,53 @@ fn baseline_empty_summary_object_is_rejected_not_zero_filled() {
 }
 
 #[test]
+fn baseline_negative_totals_are_rejected_not_sign_inverted() {
+    // rm-697: `Value::is_number` admitted negative summary totals, and
+    // `delta_pct` divides by the baseline — total_cost = -100 turned a
+    // real +$100 regression into a negative (passing) delta. Negative
+    // or non-finite totals must be rejected at admission with the same
+    // flag/path/regenerate-hint shape as the rm-569 rejections.
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let report = report_overview_json(&overview, &sessions);
+    let mut baseline: Value = serde_json::from_str(&report).expect("overview json is valid");
+    baseline["summary"]["total_cost"] = serde_json::json!(-100.0);
+    let path = std::env::temp_dir().join(format!(
+        "agenttrace-negative-baseline-{}.json",
+        std::process::id()
+    ));
+    fs::write(
+        &path,
+        serde_json::to_string(&baseline).expect("serialize negative baseline"),
+    )
+    .expect("write negative baseline");
+    let err = add_baseline_comparison(
+        &report,
+        path.to_str().unwrap(),
+        BaselineThresholds {
+            max_duration_delta_pct: 1.5,
+            max_cost_delta_pct: 2.5,
+            max_token_delta_pct: 3.5,
+        },
+    )
+    .expect_err("a negative summary total must be rejected, not compared against");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("negative") && message.contains("total_cost"),
+        "sign class and field missing: {message}"
+    );
+    assert!(
+        message.contains("--baseline") && message.contains(path.to_str().unwrap()),
+        "flag attribution missing: {message}"
+    );
+    assert!(
+        message.contains("regenerate"),
+        "regeneration hint missing: {message}"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn baseline_without_version_string_is_rejected() {
     // Review fix (rm-569, 2026-10-06): a baseline without a top-level "version"
     // used to skip the version cross-check silently.

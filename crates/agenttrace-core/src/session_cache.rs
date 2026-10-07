@@ -649,9 +649,7 @@ fn store_sqlite_snapshot_at(
         pricing_catalog_id: Some(crate::pricing::catalog_identity().to_string()),
         fork_excluded,
     };
-    let tmp = unique_temp_path(path);
-    write_private(&tmp, &serde_json::to_vec(&snapshot)?)?;
-    fs::rename(tmp, path)?;
+    write_private_exclusive(path, &serde_json::to_vec(&snapshot)?)?;
     Ok(())
 }
 
@@ -683,6 +681,12 @@ pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
 /// helper creates 0o600 on Unix — umask can only tighten it — and
 /// keeps the platform default elsewhere. Callers keep their own
 /// temp-then-rename atomicity.
+///
+/// rm-693: creation is EXCLUSIVE (O_EXCL) — every caller stages
+/// through a fresh [`unique_temp_path`] sibling, so a pre-existing
+/// path at the staging name (a planted symlink) is refused with
+/// `AlreadyExists` instead of opened and truncated through; pair with
+/// [`write_private_exclusive`] for the sequence-bump retry and rename.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -690,8 +694,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)?;
         file.write_all(bytes)
@@ -702,18 +705,91 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// How many consecutive temp names [`write_private_exclusive`] tries
+/// before giving up (rm-693). A genuine collision (a stale same-name
+/// temp) clears on the first bump; a symlink-poisoned directory fails
+/// honestly after this many tries instead of ever truncating through
+/// an occupied path.
+const EXCLUSIVE_STAGING_ATTEMPTS: u32 = 16;
+
+/// Stage `bytes` into a fresh owner-only temp sibling of `path` and
+/// rename it into place — the atomic-write shape the session cache,
+/// SQLite snapshots, derived history, statusline journal, and pricing
+/// catalog all share, now with rm-693's exclusivity: the temp is
+/// created O_EXCL, and an `AlreadyExists` at the predictable
+/// `{name}.tmp.{pid}.{seq}` name (a planted symlink, or a stale temp)
+/// bumps the sequence instead of truncating through the existing
+/// path. The rename still hands the destination a fresh inode
+/// atomically, so a crash mid-write can never tear it.
+pub(crate) fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    for _ in 0..EXCLUSIVE_STAGING_ATTEMPTS {
+        let temp = unique_temp_path(path);
+        match write_private(&temp, bytes) {
+            Ok(()) => match fs::rename(&temp, path) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    // rm-250's no-residue invariant: a failed rename
+                    // (e.g. the destination is a directory) must not
+                    // leave the staged temp behind.
+                    let _ = fs::remove_file(&temp);
+                    return Err(err);
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                let _ = fs::remove_file(&temp);
+                return Err(err);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to stage {}: {} consecutive temp names were already occupied \
+             (planted symlinks or stale temps); nothing was written or truncated",
+            path.display(),
+            EXCLUSIVE_STAGING_ATTEMPTS
+        ),
+    ))
+}
+
 /// Append-mode counterpart of [`write_private`] for the statusline
 /// journal (cycle-1 rm-208): creates the journal owner-only the first
 /// time it is written; an existing file's permissions are left alone.
+///
+/// rm-693: the journal is appended to at its final path (append
+/// semantics need one inode, so temp-then-rename is wrong here), which
+/// means first creation must be O_EXCL and an existing path is opened
+/// for append only after inspection — a planted symlink (or any
+/// non-regular file) at the journal path is refused loudly, never
+/// followed.
 pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .create(true)
+        match fs::OpenOptions::new()
             .append(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)
+        {
+            Ok(file) => Ok(file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = fs::symlink_metadata(path)?;
+                if !meta.file_type().is_file() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "refusing to append through {}: the journal path is a symlink \
+                             or special file, not a regular journal",
+                            path.display()
+                        ),
+                    ));
+                }
+                fs::OpenOptions::new().append(true).open(path)
+            }
+            Err(err) => Err(err),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -1458,9 +1534,7 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
             .collect();
         doc.insert("dirs".to_string(), Value::Object(dirs));
     }
-    let tmp = unique_temp_path(&cache.path);
-    write_private(&tmp, &serde_json::to_vec(&Value::Object(doc))?)?;
-    fs::rename(tmp, &cache.path)?;
+    write_private_exclusive(&cache.path, &serde_json::to_vec(&Value::Object(doc))?)?;
     Ok(())
 }
 
@@ -1960,6 +2034,203 @@ mod tests {
         assert!(!orphan.exists(), "orphan temp is gone");
         assert!(cache.exists(), "the cache itself is untouched");
         assert!(neighbor.exists(), "non-temp neighbors are untouched");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_refuses_a_preplanted_symlink_instead_of_following_it() {
+        // rm-693: every atomic writer stages through a predictable
+        // `<name>.tmp.<pid>.<seq>` sibling, and the staging open used
+        // create+truncate — a symlink planted at that name was FOLLOWED:
+        // the victim behind the link was clobbered and the rename left
+        // the destination AS the link (a persistent implant). The
+        // staging open must be O_EXCL: a pre-existing path is refused,
+        // never truncated through.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-stage-excl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let staged = root.join("sessions.json.tmp.planted");
+        let victim = root.join("victim.txt");
+        fs::write(&victim, "secret bytes").expect("write victim");
+        std::os::unix::fs::symlink(&victim, &staged).expect("plant symlink");
+        let error = write_private(&staged, b"attacker bytes").expect_err("symlink must be refused");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "staging must refuse with AlreadyExists, got {error:?}"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"secret bytes",
+            "the victim behind the planted link must be untouched"
+        );
+        assert!(
+            fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link itself is left in place"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exclusive_staging_bumps_the_sequence_past_a_planted_temp() {
+        // rm-693: one planted symlink at the next temp name must not
+        // fail the write — the writer bumps the sequence and stages at
+        // the following sibling — with the victim behind the link
+        // intact and the destination landing as a regular file.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-stage-bump-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let target = root.join("sessions.json");
+        let victim = root.join("victim.txt");
+        fs::write(&victim, "secret bytes").expect("write victim");
+        let planted = unique_temp_path(&target);
+        std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
+        write_private_exclusive(&target, b"cache bytes")
+            .expect("write must succeed via the next sequence number");
+        assert_eq!(fs::read(&target).unwrap(), b"cache bytes");
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"secret bytes",
+            "the victim behind the planted link must be untouched"
+        );
+        assert!(
+            fs::symlink_metadata(&target).unwrap().file_type().is_file(),
+            "the destination must be a regular file, never the link"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exclusive_staging_fails_honestly_when_every_temp_name_is_occupied() {
+        // rm-693: a directory whose every candidate temp name is a
+        // planted symlink must yield a loud refusal — never a write
+        // through a link, never a truncate, never a silent success.
+        // Probe-burn sequence numbers while planting links at the
+        // returned names, then hand-format the same-width window past
+        // the counter so the writer's retry range is covered wherever
+        // it starts.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-stage-poison-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let target = root.join("sessions.json");
+        let victim = root.join("victim.txt");
+        fs::write(&victim, "secret bytes").expect("write victim");
+        let base = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("target name is UTF-8")
+            .to_string();
+        let seq_of = |name: &std::path::Path| {
+            name.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.rsplit('.').next())
+                .and_then(|name| name.parse::<u64>().ok())
+                .expect("temp name carries a numeric sequence")
+        };
+        let mut last_seq = 0u64;
+        for _ in 0..64 {
+            let planted = unique_temp_path(&target);
+            last_seq = seq_of(&planted);
+            std::os::unix::fs::symlink(&victim, &planted).expect("plant probe symlink");
+        }
+        for seq in (last_seq + 1)..=(last_seq + 64) {
+            let planted = root.join(format!("{base}.tmp.{}.{}", std::process::id(), seq));
+            std::os::unix::fs::symlink(&victim, &planted).expect("plant forward symlink");
+        }
+        let error = write_private_exclusive(&target, b"cache bytes")
+            .expect_err("a fully poisoned temp window must fail the write");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing to stage"),
+            "the refusal must say so: {message}"
+        );
+        assert!(
+            message.contains(&target.display().to_string()),
+            "the refusal must name the destination: {message}"
+        );
+        assert!(!target.exists(), "no destination may materialize");
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"secret bytes",
+            "the victim behind every planted link must be untouched"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn statusline_journal_append_refuses_a_preplanted_symlink() {
+        // rm-693: the journal writer appends at its final path (append
+        // semantics need one inode), so first creation is O_EXCL and an
+        // existing path is appended through only after inspection: a
+        // planted symlink at the journal path is refused with the
+        // victim behind it intact, while a regular journal keeps
+        // appending in place.
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-journal-excl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let victim = root.join("victim.log");
+        fs::write(&victim, "secret line\n").expect("write victim");
+        std::os::unix::fs::symlink(&victim, &journal).expect("plant journal symlink");
+        let error = open_private_append(&journal).expect_err("symlinked journal must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing to append"),
+            "refusal must say so: {message}"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"secret line\n",
+            "the victim behind the planted link must be untouched"
+        );
+        assert!(
+            fs::symlink_metadata(&journal)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link itself is left in place"
+        );
+        // Remove the link; a real journal is created owner-only and
+        // keeps appending in place across calls.
+        fs::remove_file(&journal).expect("drop planted link");
+        let mut first = open_private_append(&journal).expect("fresh journal appends");
+        writeln!(first, "first").expect("append first line");
+        drop(first);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&journal).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "fresh journal must be owner-only (got {mode:o})"
+        );
+        let mut second = open_private_append(&journal).expect("existing regular journal appends");
+        writeln!(second, "second").expect("append second line");
+        drop(second);
+        assert_eq!(
+            fs::read_to_string(&journal).unwrap(),
+            "first\nsecond\n",
+            "appends must land in place, not replace the journal"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
