@@ -1852,3 +1852,107 @@ fn statusline_report_leaves_the_statusline_journal_untouched_e2e() {
     );
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+#[cfg(unix)]
+#[test]
+fn output_to_dev_null_writes_no_file_and_exits_zero() {
+    // rm-489: `-o /dev/null` used to fail with "writing report output
+    // file" because the rm-250 temp-sibling staging cannot rename onto a
+    // character device. A terminal sink is written through the open
+    // handle instead: exit 0, Saved: banner, and no temp litter.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o", "/dev/null"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "-o /dev/null must succeed: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Saved: /dev/null"),
+        "the Saved banner still names the sink: {stderr}"
+    );
+    // -o is a tee, not a redirect (documented contract): stdout still
+    // carries the report while the sink receives its own copy.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "-o tees: stdout keeps carrying the report: {:?}",
+        stdout
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_to_dev_stdout_lands_the_report_on_stdout() {
+    // rm-489: /dev/stdout is the same special-target class; the report
+    // must arrive on the captured stdout pipe itself.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o", "/dev/stdout"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "-o /dev/stdout must succeed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "the report rides the stdout device itself"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
+    // rm-489 (re-based at integration, conflict case
+    // 8801a55fef4945a94942a29831feb4): the assess PoC watched
+    // `-o <fifo>` silently REPLACE the named pipe with a regular file
+    // (temp-sibling + rename). The landed write_output contract —
+    // resolve_output_target + write_output_resolved from salvage run
+    // e43bb8f3, a superset of this run's char-device/fifo write-through
+    // arm — REFUSES fifo targets with a disclosed reason instead of
+    // writing through (a readerless fifo would block the writer
+    // forever, and a writer owning the node would replace it):
+    // non-zero exit, the refusal names the node type on stderr, and
+    // the pipe survives as a fifo — never materialized as a file.
+    use std::fs;
+    use std::os::unix::fs::FileTypeExt;
+
+    let dir = std::env::temp_dir().join(format!("agenttrace-fifo-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create scratch dir");
+    let fifo = dir.join("report.fifo");
+    let _ = fs::remove_file(&fifo);
+    let mkfifo = Command::new("mkfifo")
+        .arg(&fifo)
+        .output()
+        .expect("run mkfifo");
+    assert!(mkfifo.status.success(), "mkfifo failed: {mkfifo:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o"])
+        .arg(&fifo)
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !output.status.success(),
+        "-o <fifo> must be refused loudly, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to write"),
+        "the refusal must name itself: {stderr}"
+    );
+
+    let metadata = fs::metadata(&fifo).expect("fifo still exists");
+    assert!(
+        metadata.file_type().is_fifo(),
+        "the named pipe must never be replaced by a regular file"
+    );
+    let _ = fs::remove_file(&fifo);
+    let _ = fs::remove_dir_all(&dir);
+}

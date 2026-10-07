@@ -268,6 +268,72 @@ exits 0 with a one-line fallback. Review what was captured with
 [docs/guides/statusline-capture.md](docs/guides/statusline-capture.md) for the
 schema and retention details.
 
+## CLI flag reference
+
+Every option `agenttrace` accepts, with its default and purpose. This
+table mirrors `agenttrace --help`; the `check-docs-commands` CI gate
+fails when the README table drifts from the binary's actual flag count
+(rm-207).
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `-f, --format <FORMAT>` | `text` | Output format for the requested view: text (default), json, csv, markdown/md, html, or otel (the OTLP-JSON export of the whole corpus; requires --overview). Unsupported combinations fail loudly instead of falling back to text |
+| `-d, --dir <DIR>` |  | Session directory to scan instead of auto-discovered agent homes |
+| `--compare` |  | Compare the inspected session against the healthy-baseline summary (narrative framed for `--model`) |
+| `--audit` |  | Render the governance audit report across matching sessions (tool-authority drift and spend oversight; `--sample` bounds it) |
+| `--recommend` |  | Render cost and efficiency recommendations derived from the session corpus |
+| `--mcp-governance` |  | Audit MCP server governance across sessions: which servers were reachable, which tools they exposed, and allowlist drift |
+| `--context-trends` |  | Render context-utilization trends over the session corpus (window pressure, cache reuse, growth by turn) |
+| `--delivery-evidence` |  | Render the delivery-evidence report: verifiable outcome signals per session rather than effort metrics |
+| `--overview` |  | Render the corpus overview report: totals, health mix, and model/provider/project breakdowns |
+| `--sessions` |  | List sessions as rows (TSV text by default; `--format` json/csv for machine use). The TSV ends with the subagent rollup columns SUBAGENTS and SUBAGENT_COST — attributed spawned work, kept separate from the session's own COST/TOKENS cells |
+| `--diagnostics` |  | Render per-session diagnostics: findings, evidence, fix suggestions, and next actions |
+| `--inspect <INSPECT>` |  | Inspect a single session by its `--sessions` list index (1-based) instead of the whole corpus |
+| `-m <MODEL>` | `default` | Reference model for `--compare` framing (cost-rate attribution in the comparison narrative; not a session filter — see `--model-filter`) |
+| `-o <OUTPUT>` |  | Write the report to this path instead of stdout (the report is also kept on stdout — a tee, not a redirect). Regular paths stage atomically through a temp sibling (rm-250); terminal sinks like /dev/null and /dev/stdout write through directly, while fifo/socket/block-device targets are refused with a disclosed reason instead of being replaced (rm-489) |
+| `--latest` |  | Restrict the view to the single most recent session (works with `--waste` and report actions) |
+| `--waste` |  | Render the token-waste report: redundant context, loop cost, and unused tool output, with a per-reason breakdown |
+| `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes |
+| `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |
+| `--test-match` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification) |
+| `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
+| `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
+| `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
+| `--history-dir <PATH>` |  | Override the history directory: highest precedence, then the config files, then `AGENTTRACE_HISTORY_DIR` (rm-384) |
+| `--pricing-file <PATH>` |  | Override the pricing override file: highest precedence, then the config files, then `AGENTTRACE_PRICING_FILE` (rm-384) |
+| `--weekly-budget <USD>` |  | Weekly spend budget in USD for `--statusline-report` and `--budget`: highest precedence, then config `weekly_budget_usd` (rm-385) |
+| `--budget` |  | Show the weekly budget window-burn view: per-day spend from the statusline journal against the resolved weekly budget (rm-385) |
+| `--version` |  | Print the version banner and exit 0; wins over action validation |
+| `--demo` |  | Use the built-in demo corpus instead of discovered agent homes (stable epoch-anchored sessions) |
+| `--doctor` |  | Run environment self-checks (config paths, cache consistency, agent homes) and exit non-zero on failure |
+| `--search <SEARCH>` |  | Full-text search across discovered session transcripts for this query |
+| `--search-limit <SEARCH_LIMIT>` | `20` | Cap the number of `--search` hits reported (default 20) |
+| `--fail-under-health <FAIL_UNDER_HEALTH>` | `0` | CI gate: exit non-zero when corpus health drops below this score (0 disables the gate) |
+| `--fail-on-critical` |  | CI gate: exit non-zero when any critical-severity finding exists |
+| `--max-tool-fail-rate <MAX_TOOL_FAIL_RATE>` |  | CI gate: exit non-zero when the tool failure rate exceeds this fraction (0.0-1.0) |
+| `--baseline <BASELINE>` |  | Load a healthy-baseline summary JSON (path or id) to compare `--compare` runs against |
+| `--baseline-max-duration-delta-pct <BASELINE_MAX_DURATION_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session duration drift, in percent |
+| `--baseline-max-cost-delta-pct <BASELINE_MAX_COST_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session cost drift, in percent |
+| `--baseline-max-token-delta-pct <BASELINE_MAX_TOKEN_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session token drift, in percent |
+| `--no-baseline-gate` |  | Opt out of the baseline regression gate: keep the comparison in the report but do not fail the run (exit 2) on a threshold breach (pass-7 P7-3) |
+| `--lang <en|zh>` | `en` | Report language for text and TUI surfaces: en (default) or zh |
+| `--range <RANGE>` | `all` | Time range filter for session actions: today, 7d, 30d, or all (default all; ignored by corpus-wide reports) |
+| `--project <PROJECT>` | `""` | Filter sessions by project slug substring |
+| `--source <SOURCE>` | `""` | Filter sessions by source tool substring (e.g. claude-code, codex, pi) |
+| `--model-filter <MODEL_FILTER>` | `""` | Filter sessions by model name substring |
+| `--query <QUERY>` | `""` | Filter sessions by a free-text query over identity fields |
+| `--health <HEALTH>` | `""` | Filter sessions by health tier (healthy/warning/critical) or a numeric comparison |
+| `--cost <COST>` | `""` | Filter sessions by a cost comparison (e.g. `>1.5`) |
+| `--anomaly <ANOMALY>` | `""` | Filter sessions by anomaly kind |
+| `--sort <SORT>` | `recent` | Sort key for list views: recent (default), health, cost, turns, failures, source, or name |
+| `--order <ORDER>` | `desc` | Sort direction for list views: desc (default) or asc |
+| `--limit <LIMIT>` | `20` | Maximum number of rows a list view renders (default 20) |
+| `--sample <SAMPLE>` |  | Explicitly bound governance reports to the newest N sessions. Governance reports audit every matching session by default; sampling is always disclosed via audited_sessions/total_sessions (pass-8 F8-1) |
+| `--clear-cache` |  | Delete the session cache before running, forcing a full re-parse |
+| `--preserve-history` |  | Persist derived metrics to the history ledger so later `--include-history` runs can see them |
+| `--include-history` |  | Merge preserved-history sessions into the view (offline or retained-history analysis) |
+| `-h, --help` |  | Print help |
+
 ## What you get
 
 | Need | agenttrace gives you |

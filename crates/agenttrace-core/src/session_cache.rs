@@ -1256,6 +1256,19 @@ fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
 }
 
 pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
+    // A default-constructed cache is the in-memory sentinel (library
+    // embeds and tests pass `SessionCache::default()` so no host file
+    // is touched): with no backing file, a write-through save is a
+    // deliberate no-op. Without this guard the tmp sibling lands next
+    // to the empty path — i.e. the process cwd — and the rename onto
+    // "" can never succeed, littering sessions.json.tmp.<pid>.<n>
+    // behind every load (independent review, conflict case
+    // 0fc6c845; rm-545's corpus test hit it three times per run).
+    // Real caches always carry an absolute path from
+    // `load_session_cache`/`session_cache_path()` and are unaffected.
+    if cache.path.as_os_str().is_empty() {
+        return Ok(());
+    }
     // Hard bounds before serializing: beyond MAX_SESSION_CACHE_ENTRIES
     // the oldest-fingerprint entries are dropped (pass-8 F8-3); the
     // dirs map keeps its own count and byte budgets (rm-298); and the
@@ -1517,6 +1530,9 @@ impl GoMetrics {
             upstream_cost_usd: self.upstream_cost_usd,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
+            // rm-545: subagent rollups are re-derived after every load
+            // (discovery.rs), so the cached shape carries zeros here.
+            ..Metrics::default()
         }
     }
 }

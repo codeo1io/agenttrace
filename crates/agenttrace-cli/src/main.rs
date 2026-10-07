@@ -34,6 +34,10 @@ struct Args {
     /// stdin through the same parser; stdin sessions are ephemeral and
     /// never touch the session cache)
     path: Option<String>,
+    /// Output format for the requested view: text (default), json, csv,
+    /// markdown/md, html, or otel (the OTLP-JSON export of the whole
+    /// corpus; requires --overview). Unsupported combinations fail
+    /// loudly instead of falling back to text.
     #[arg(
         short = 'f',
         long = "format",
@@ -44,38 +48,78 @@ struct Args {
     /// Session directory to scan instead of auto-discovered agent homes
     #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
+    /// Compare the inspected session against the healthy-baseline
+    /// summary (narrative framed for `--model`).
     #[arg(long)]
     compare: bool,
+    /// Render the governance audit report across matching sessions
+    /// (tool-authority drift and spend oversight; `--sample` bounds it).
     #[arg(long)]
     audit: bool,
+    /// Render cost and efficiency recommendations derived from the
+    /// session corpus.
     #[arg(long = "recommend")]
     recommend: bool,
+    /// Audit MCP server governance across sessions: which servers were
+    /// reachable, which tools they exposed, and allowlist drift.
     #[arg(long = "mcp-governance")]
     mcp_governance: bool,
+    /// Render context-utilization trends over the session corpus
+    /// (window pressure, cache reuse, growth by turn).
     #[arg(long = "context-trends")]
     context_trends: bool,
+    /// Render the delivery-evidence report: verifiable outcome signals
+    /// per session rather than effort metrics.
     #[arg(long = "delivery-evidence")]
     delivery_evidence: bool,
+    /// Render the corpus overview report: totals, health mix, and
+    /// model/provider/project breakdowns.
     #[arg(long)]
     overview: bool,
+    /// List sessions as rows (TSV text by default; `--format` json/csv
+    /// for machine use). The TSV ends with the subagent rollup columns
+    /// SUBAGENTS and SUBAGENT_COST — attributed spawned work, kept
+    /// separate from the session's own COST/TOKENS cells.
     #[arg(long)]
     sessions: bool,
+    /// Render per-session diagnostics: findings, evidence, fix
+    /// suggestions, and next actions.
     #[arg(long)]
     diagnostics: bool,
+    /// Inspect a single session by its `--sessions` list index
+    /// (1-based) instead of the whole corpus.
     #[arg(long)]
     inspect: Option<usize>,
+    /// Reference model for `--compare` framing (cost-rate attribution
+    /// in the comparison narrative; not a session filter — see
+    /// `--model-filter`).
     #[arg(short = 'm', default_value = "default")]
     model: String,
+    /// Write the report to this path instead of stdout. Regular paths
+    /// stage atomically through a temp sibling (rm-250); terminal
+    /// sinks like /dev/null and /dev/stdout write through directly,
+    /// while fifo/socket/block-device targets are refused with a
+    /// disclosed reason instead of being replaced (rm-489).
     #[arg(short = 'o')]
     output: Option<PathBuf>,
+    /// Restrict the view to the single most recent session (works with
+    /// `--waste` and report actions).
     #[arg(long)]
     latest: bool,
+    /// Render the token-waste report: redundant context, loop cost,
+    /// and unused tool output, with a per-reason breakdown.
     #[arg(long)]
     waste: bool,
+    /// List the models the pricing catalog knows, with rate coverage;
+    /// `--test-match` shows the resolution probes.
     #[arg(long = "list-models")]
     list_models: bool,
+    /// Refresh the vendored pricing-catalog snapshots from their
+    /// upstream sources, then report the drift.
     #[arg(long = "update-pricing")]
     update_pricing: bool,
+    /// Print the catalog-resolution table for a probe set of model
+    /// identifiers (alias and rate-match verification).
     #[arg(long = "test-match")]
     test_match: bool,
     /// Report on the Claude Code statusline capture journal (candidate
@@ -112,28 +156,49 @@ struct Args {
     /// (rm-385).
     #[arg(long)]
     budget: bool,
+    /// Print the version banner and exit 0; wins over action
+    /// validation.
     #[arg(long)]
     version: bool,
+    /// Use the built-in demo corpus instead of discovered agent homes
+    /// (stable epoch-anchored sessions).
     #[arg(long)]
     demo: bool,
+    /// Run environment self-checks (config paths, cache consistency,
+    /// agent homes) and exit non-zero on failure.
     #[arg(long)]
     doctor: bool,
+    /// Full-text search across discovered session transcripts for
+    /// this query.
     #[arg(long)]
     search: Option<String>,
+    /// Cap the number of `--search` hits reported (default 20).
     #[arg(long = "search-limit", default_value_t = 20)]
     search_limit: usize,
+    /// CI gate: exit non-zero when corpus health drops below this
+    /// score (0 disables the gate).
     #[arg(long = "fail-under-health", default_value_t = 0)]
     fail_under_health: i32,
+    /// CI gate: exit non-zero when any critical-severity finding
+    /// exists.
     #[arg(long = "fail-on-critical")]
     fail_on_critical: bool,
+    /// CI gate: exit non-zero when the tool failure rate exceeds this
+    /// fraction (0.0-1.0).
     #[arg(long = "max-tool-fail-rate")]
     max_tool_fail_rate: Option<f64>,
+    /// Load a healthy-baseline summary JSON (path or id) to compare
+    /// `--compare` runs against.
     #[arg(long)]
     baseline: Option<String>,
+    /// Baseline gate: maximum allowed session duration drift, in
+    /// percent.
     #[arg(long = "baseline-max-duration-delta-pct", default_value_t = 0.0)]
     baseline_max_duration_delta_pct: f64,
+    /// Baseline gate: maximum allowed session cost drift, in percent.
     #[arg(long = "baseline-max-cost-delta-pct", default_value_t = 0.0)]
     baseline_max_cost_delta_pct: f64,
+    /// Baseline gate: maximum allowed session token drift, in percent.
     #[arg(long = "baseline-max-token-delta-pct", default_value_t = 0.0)]
     baseline_max_token_delta_pct: f64,
     /// Opt out of the baseline regression gate: keep the comparison in the
@@ -141,28 +206,44 @@ struct Args {
     /// (pass-7 P7-3).
     #[arg(long = "no-baseline-gate")]
     no_baseline_gate: bool,
+    /// Report language for text and TUI surfaces: en (default) or zh.
     #[arg(long = "lang", default_value = "en", value_name = "en|zh")]
     lang: String,
+    /// Time range filter for session actions: today, 7d, 30d, or all
+    /// (default all; ignored by corpus-wide reports).
     #[arg(long, default_value = "all")]
     range: String,
+    /// Filter sessions by project slug substring.
     #[arg(long, default_value = "")]
     project: String,
+    /// Filter sessions by source tool substring (e.g. claude-code,
+    /// codex, pi).
     #[arg(long, default_value = "")]
     source: String,
+    /// Filter sessions by model name substring.
     #[arg(long = "model-filter", default_value = "")]
     model_filter: String,
+    /// Filter sessions by a free-text query over identity fields.
     #[arg(long, default_value = "")]
     query: String,
+    /// Filter sessions by health tier (healthy/warning/critical) or a
+    /// numeric comparison.
     #[arg(long, default_value = "")]
     health: String,
+    /// Filter sessions by a cost comparison (e.g. `>1.5`).
     #[arg(long, default_value = "")]
     cost: String,
+    /// Filter sessions by anomaly kind.
     #[arg(long, default_value = "")]
     anomaly: String,
+    /// Sort key for list views: recent (default), health, cost, turns,
+    /// failures, source, or name.
     #[arg(long, default_value = "recent")]
     sort: String,
+    /// Sort direction for list views: desc (default) or asc.
     #[arg(long, default_value = "desc")]
     order: String,
+    /// Maximum number of rows a list view renders (default 20).
     #[arg(long, default_value_t = 20)]
     limit: usize,
     /// Explicitly bound governance reports to the newest N sessions.
@@ -171,10 +252,16 @@ struct Args {
     /// (pass-8 F8-1).
     #[arg(long)]
     sample: Option<usize>,
+    /// Delete the session cache before running, forcing a full
+    /// re-parse.
     #[arg(long = "clear-cache")]
     clear_cache: bool,
+    /// Persist derived metrics to the history ledger so later
+    /// `--include-history` runs can see them.
     #[arg(long = "preserve-history")]
     preserve_history: bool,
+    /// Merge preserved-history sessions into the view (offline or
+    /// retained-history analysis).
     #[arg(long = "include-history")]
     include_history: bool,
 }
@@ -1655,16 +1742,22 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             .collect::<Vec<_>>();
         return csv_export::sessions_csv(&rows);
     }
-    let mut lines =
-        vec!["SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES".to_string()];
+    let mut lines = vec![
+        "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES\tSUBAGENTS\tSUBAGENT_COST"
+            .to_string(),
+    ];
     lines.extend(sessions.into_iter().map(|session| {
         // rm-383: name, source tool, and model are
         // transcript-derived; sanitize them for terminal display and TSV
         // row integrity (assess PoC: a crafted session name carried a raw
         // OSC-52 clipboard-write byte-for-byte into the --sessions TSV).
         // JSON output escapes control bytes losslessly and stays untouched.
+        // rm-545: subagent rollups ride the TSV as their own columns so
+        // one session's spawned work stays visible without double
+        // counting — the columns are internally derived (not
+        // transcript-derived), so no sanitization is owed here.
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
             sanitize_line_segment(&session.name),
             session.health,
             session_capability(session),
@@ -1673,7 +1766,9 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,
-            session.anomalies.len()
+            session.anomalies.len(),
+            session.metrics.subagent_count,
+            session.metrics.subagent_cost
         )
     }));
     lines.join("\n")
@@ -2155,6 +2250,44 @@ mod tests {
         let second = render();
         assert_eq!(first, second);
         assert!(first.contains(agenttrace_core::DEMO_REPORT_EPOCH));
+    }
+
+    #[test]
+    fn session_list_tsv_carries_subagent_columns() {
+        // rm-487/rm-545 column contract: the --sessions TSV exposes
+        // SUBAGENTS and SUBAGENT_COST so spawned work stays visible in
+        // the default text view, and the rollup never bleeds into the
+        // session's own COST/TOKENS cells.
+        let mut session = Session {
+            name: "parent".to_string(),
+            path: "/tmp/parent.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                cost_estimated: 0.0105,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        session.metrics.subagent_count = 2;
+        session.metrics.subagent_cost = 0.0053;
+        let tsv = render_session_list(std::slice::from_ref(&session), "tsv", 20);
+        let header = tsv.lines().next().expect("header");
+        assert!(
+            header.contains("SUBAGENTS") && header.contains("SUBAGENT_COST"),
+            "TSV header must carry the subagent columns: {header}"
+        );
+        let row = tsv.lines().nth(1).expect("data row");
+        let cells: Vec<&str> = row.split('\t').collect();
+        // Column order is pinned: …FAIL, ANOMALIES, SUBAGENTS, SUBAGENT_COST.
+        assert_eq!(cells[cells.len() - 2], "2");
+        assert_eq!(cells[cells.len() - 1], "0.0053");
+        assert!(
+            cells.contains(&"0.0105"),
+            "own cost stays its own cell: {row}"
+        );
     }
 
     #[test]
