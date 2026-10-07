@@ -2,6 +2,34 @@ use crate::{
     format_cost, format_tokens, loop_waste_percent, pricing, round4, Metrics, ReportLanguage,
     Session, VERSION,
 };
+use serde_json::json;
+
+/// rm-567 (review fix 25d9da7b): the component breakdown behind
+/// [`WasteReport::waste_score`], recorded while the score is assembled
+/// so `--waste -f json` can report HOW the total was reached, not just
+/// the total. Field semantics are pinned in docs/guides/waste-guide.md.
+#[derive(Debug, Clone, Default)]
+pub struct WasteScoreComponents {
+    /// Rating base: `none` 30 / `poor` 24 / `good` 12 / `excellent` 0.
+    pub cache_base: f64,
+    /// +6 when cache entries were written but reads < 30% of input
+    /// (a paid-for cache that is not being hit).
+    pub paid_cache_penalty: f64,
+    /// `cache_base + paid_cache_penalty` (max 36).
+    pub cache_score: f64,
+    /// `bloat_score × 15/90` (max 15).
+    pub bloat_score: f64,
+    /// `min(loop_percent, 50) × 0.5` (max 25).
+    pub loop_score: f64,
+    /// Cache + bloat + loops before the guard clamp.
+    pub pre_stuck_sum: f64,
+    /// True when the pre-stuck guard (min 80) actually clamped. The
+    /// arithmetic ceiling of the sum is 70, so this is a guard, not a
+    /// reachable branch.
+    pub pre_stuck_clamped: bool,
+    /// Stuck patterns: 7 each + 5 per critical, max 20.
+    pub stuck_score: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct CacheEfficiency {
@@ -59,6 +87,9 @@ pub struct WasteReport {
     session_cost: f64,
     summary: String,
     top_actions: Vec<String>,
+    /// rm-567 (review fix 25d9da7b): how `waste_score` was assembled,
+    /// for `--waste -f json`.
+    components: WasteScoreComponents,
 }
 
 pub fn compute_waste_report(session: &Session) -> WasteReport {
@@ -116,21 +147,24 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
     };
 
     // rm-567: the score is a documented sum of capped components —
-    // cache <= 40, loops <= 25, stuck <= 20, bloat <= 15 — so the scale
-    // reaches 100 and every tier band (including red, >= 70) is
-    // constructible instead of dead. docs/guides/waste-guide.md pins
-    // the weights.
-    let mut score = match cache.rating {
+    // cache <= 36 (30 rating base + 6 paid-cache-not-hit), loops <= 25,
+    // stuck <= 20, bloat <= 15 — so the scale reaches 96 and every
+    // tier band (including red, >= 70) is constructible instead of
+    // dead. The pre-stuck guard clamps at 80; the sum's arithmetic
+    // ceiling (30 + 15 + 25 = 70) never reaches it, so the guard can
+    // never bind — it exists to make the cap explicit, not to be
+    // exercised. docs/guides/waste-guide.md pins the weights.
+    let cache_base = match cache.rating {
         "none" => 30.0,
         "poor" => 24.0,
         "good" => 12.0,
         _ => 0.0,
     };
-    score += bloat.bloat_score as f64 * (15.0 / 90.0);
-    score += loop_percent.min(50.0) * 0.5;
-    if score > 80.0 {
-        score = 80.0;
-    }
+    let bloat_part = bloat.bloat_score as f64 * (15.0 / 90.0);
+    let loop_part = loop_percent.min(50.0) * 0.5;
+    let pre_stuck_sum = cache_base + bloat_part + loop_part;
+    let pre_stuck_clamped = pre_stuck_sum > 80.0;
+    let mut score = pre_stuck_sum.min(80.0);
     let mut stuck_score = stuck.len() as f64 * 7.0;
     for item in &stuck {
         if item.severity == "critical" {
@@ -141,12 +175,15 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         stuck_score = 20.0;
     }
     score += stuck_score;
-    if session.metrics.tokens_cache_r > 0
+    let paid_cache_penalty = if session.metrics.tokens_cache_r > 0
         && session.metrics.tokens_input > 0
         && session.metrics.tokens_cache_r as f64 / (session.metrics.tokens_input as f64) < 0.3
     {
-        score += 6.0;
-    }
+        6.0
+    } else {
+        0.0
+    };
+    score += paid_cache_penalty;
     let waste_score = (score as i32).clamp(0, 100);
     let waste_level = match waste_score {
         70.. => "red",
@@ -211,6 +248,16 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         session_cost,
         summary,
         top_actions,
+        components: WasteScoreComponents {
+            cache_base,
+            paid_cache_penalty,
+            cache_score: cache_base + paid_cache_penalty,
+            bloat_score: bloat_part,
+            loop_score: loop_part,
+            pre_stuck_sum,
+            pre_stuck_clamped,
+            stuck_score,
+        },
     }
 }
 
@@ -220,6 +267,63 @@ pub fn render_waste_report(session: &Session) -> String {
 
 pub fn render_waste_report_with_language(session: &Session, language: ReportLanguage) -> String {
     waste_report_text(&compute_waste_report(session), language)
+}
+
+/// rm-567 (review fix 25d9da7b): the `--waste -f json` arm — the same
+/// report the text lane prints, as a machine-readable document. It
+/// exposes the component breakdown of the score, the disjoint-basis
+/// wasted dollars with the clamp disclosed, and the session-cost
+/// denominator every figure is argued against, so a consumer can
+/// re-derive the printed numbers instead of trusting them.
+pub fn waste_report_json(session: &Session) -> String {
+    let report = compute_waste_report(session);
+    let value = json!({
+        "score": report.waste_score,
+        "level": report.waste_level,
+        "components": {
+            "cache": {
+                "score": round4(report.components.cache_score),
+                "base": round4(report.components.cache_base),
+                "paid_cache_penalty": round4(report.components.paid_cache_penalty),
+                "rating": report.cache.rating,
+                "hit_rate_pct": round4(report.cache.hit_rate),
+                "wasted_usd": round4(report.cache.wasted_cost),
+                "cache_read_tokens": report.cache.cache_read_tokens,
+                "total_input_tokens": report.cache.total_input_tokens,
+            },
+            "loops": {
+                "score": round4(report.components.loop_score),
+                "loop_percent": round4(report.loop_percent),
+            },
+            "stuck": {
+                "score": round4(report.components.stuck_score),
+                "patterns": report.stuck.len(),
+            },
+            "bloat": {
+                "score": round4(report.components.bloat_score),
+                "level": report.bloat.bloat_level,
+                "tools_per_turn": round4(report.bloat.tools_per_turn),
+            },
+            "pre_stuck_sum": round4(report.components.pre_stuck_sum),
+            "pre_stuck_clamped": report.components.pre_stuck_clamped,
+        },
+        "wasted": {
+            "raw_usd": round4(report.wasted_raw),
+            "total_usd": round4(report.total_wasted),
+            "capped_to_session_cost": report.wasted_capped,
+            "percent_of_session_cost": round4(report.wasted_percent),
+        },
+        "basis": {
+            "session_cost_usd": round4(report.session_cost),
+            "wasted_dollars_from": [
+                "cache_premium_on_uncached_input",
+                "measured_loop_cost",
+            ],
+        },
+        "summary": report.summary,
+        "top_actions": report.top_actions,
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_default()
 }
 
 fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
@@ -865,5 +969,77 @@ mod tests {
         assert_eq!(report.bloat.bloat_score, 90);
         assert!((report.total_wasted - 0.0).abs() < 1e-9);
         assert!((report.wasted_raw - 0.0).abs() < 1e-9);
+    }
+
+    // Review fix 25d9da7b: the json arm must expose the component
+    // breakdown and the dollar basis, not just the totals.
+
+    #[test]
+    fn rm567_json_report_exposes_components_and_basis() {
+        // Red-tier fixture: cache rating none (30) + max loops (25) +
+        // max bloat (15) = 70 pre-stuck, plus the stuck component.
+        let session = rm567_session(
+            Metrics {
+                model_used: "claude-opus-4.7".to_string(),
+                tokens_input: 1_000_000,
+                tokens_cache_r: 0,
+                cost_estimated: 2.0,
+                assistant_turns: 2,
+                tool_calls_total: 12,
+                tool_usage: std::collections::BTreeMap::from([
+                    ("read".to_string(), 6),
+                    ("write".to_string(), 6),
+                ]),
+                gaps_sec: vec![130.0, 140.0, 150.0],
+                ..Metrics::default()
+            },
+            1.0,
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&waste_report_json(&session)).expect("valid json");
+        assert!(doc["score"].as_i64().unwrap() >= 70);
+        assert_eq!(doc["level"], "red");
+        let cache = &doc["components"]["cache"];
+        assert_eq!(cache["base"].as_f64().unwrap(), 30.0);
+        assert_eq!(cache["rating"], "none");
+        assert_eq!(doc["components"]["loops"]["score"].as_f64().unwrap(), 25.0);
+        assert_eq!(doc["components"]["bloat"]["score"].as_f64().unwrap(), 15.0);
+        assert_eq!(doc["components"]["pre_stuck_sum"].as_f64().unwrap(), 70.0);
+        assert_eq!(doc["components"]["pre_stuck_clamped"], false);
+        // The dollar basis: wasted is clamped to and argued against the
+        // session cost, which this fixture pins at $2.0.
+        assert_eq!(doc["basis"]["session_cost_usd"].as_f64().unwrap(), 2.0);
+        assert!(doc["wasted"]["total_usd"].as_f64().unwrap() <= 2.0);
+        assert!(
+            doc["wasted"]["raw_usd"].as_f64().unwrap()
+                >= doc["wasted"]["total_usd"].as_f64().unwrap()
+        );
+        assert!(doc["wasted"]["percent_of_session_cost"].as_f64().unwrap() <= 100.0);
+        assert!(doc["summary"].as_str().is_some());
+        assert!(doc["top_actions"].as_array().is_some());
+    }
+
+    #[test]
+    fn rm567_json_report_discloses_the_clamp() {
+        // The clamp fixture: $5.5 raw waste on a $2.0 session — the
+        // json arm must carry raw, the clamped total, the boolean,
+        // and the percentage against the session-cost denominator.
+        let session = rm567_session(
+            Metrics {
+                model_used: "claude-opus-4.7".to_string(),
+                tokens_input: 1_000_000,
+                tokens_cache_r: 0,
+                cost_estimated: 2.0,
+                ..Metrics::default()
+            },
+            1.0,
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&waste_report_json(&session)).expect("valid json");
+        let wasted = &doc["wasted"];
+        assert!((wasted["raw_usd"].as_f64().unwrap() - 5.5).abs() < 1e-6);
+        assert!((wasted["total_usd"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(wasted["capped_to_session_cost"], true);
+        assert_eq!(doc["basis"]["session_cost_usd"].as_f64().unwrap(), 2.0);
     }
 }

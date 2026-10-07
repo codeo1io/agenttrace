@@ -4,11 +4,11 @@
 `Wasted` dollar figure. This guide pins what both numbers mean so a
 report can be argued with, not just read (rm-567).
 
-## The score: four capped components, sum 100
+## The score: four capped components, sum 96 (not 100)
 
 | Component | Max | How it is computed |
 |---|---:|---|
-| Cache | 40 | rating base — `none` 30 / `poor` 24 / `good` 12 / `excellent` 0 — plus 6 when the session wrote cache entries but reads < 30% of input (a paid-for cache that is not being hit) |
+| Cache | 36 | rating base — `none` 30 / `poor` 24 / `good` 12 / `excellent` 0 — plus 6 when the session wrote cache entries but reads < 30% of input (a paid-for cache that is not being hit) |
 | Loops | 25 | loop-waste percent of session cost (from diagnostics), saturating at 50% → `min(percent, 50) × 0.5` |
 | Stuck | 20 | 7 per stuck pattern + 5 per critical pattern |
 | Tool bloat | 15 | `bloat_score × 15/90` (bloat_score: 90 severe >5 tools/turn, 65 high >3, 35 medium >1.5, 10 low) |
@@ -24,6 +24,24 @@ Tiers (score band → printed level, emoji, summary):
 Z/turn"; `red` >= 70 → SEVERE 🔴 "severe waste $X …". Before rm-567 the
 red band and its SEVERE summary were dead code — the arithmetic
 ceiling sat at 56, so no session could ever print them.
+
+Guard note (rm-567 review fix): the pre-stuck sum (cache rating base
++ loops + bloat) is clamped at 80 as a defensive guard, but its
+arithmetic ceiling is 70 — it can never bind. The paid-cache +6 is
+added after the stuck component; the table above lists it with the
+cache row (30 + 6 = 36) to keep each component's claim in one place.
+
+## Machine-readable report: `--waste -f json`
+
+The JSON arm prints the same numbers as the text lane plus the
+component breakdown: `components.cache / loops / stuck / bloat` carry
+each score with its inputs (rating, hit rate, loop %, pattern count,
+tools/turn), `components.pre_stuck_sum` and `pre_stuck_clamped`
+expose the guard, `wasted` carries `raw_usd` (uncapped), `total_usd`
+(capped), `capped_to_session_cost` (bool), and `percent_of_session_cost`,
+and `basis` names the session-cost denominator and which dollar bases
+the Wasted figure draws from (cache premium on un-cached input, plus
+measured loop cost — never both a component score and its dollars).
 
 ## Wasted dollars: two disjoint bases, clamped to the session cost
 

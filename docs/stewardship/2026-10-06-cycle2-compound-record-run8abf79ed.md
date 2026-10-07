@@ -17,14 +17,21 @@ phase boundary (11 M + 1 `??` docs/guides/waste-guide.md, +889/−51, of which R
 - **rm-568 (CU-2)** — `gen_ai_system_for(source_tool, path)`: gen_ai.system from the
   authoritative `metrics.source_tool` (13-entry family table), path markers only as
   the family-less fallback.
-- **rm-567 (CU-3)** — waste truthfulness: documented component caps (cache ≤40,
-  loops ≤25, stuck ≤20, bloat ≤15, pre-stuck clamp 80) make red ≥70 constructible
+- **rm-567 (CU-3)** — waste truthfulness: documented component caps (cache ≤36
+  = 30 rating base + 6 paid-cache penalty, loops ≤25, stuck ≤20, bloat ≤15;
+  pre-stuck clamp 80 never binds — ceiling 70; scale tops out at 96) make red
+  ≥70 constructible
   (was dead code, ceiling 56); Wasted $ on disjoint bases only, clamped to session
   cost with the clamp always disclosed; `docs/guides/waste-guide.md` pins scale,
   tiers, and semantics.
 - **rm-566 (CU-4)** — cursor cost honesty: `estimated:true` (-f json) + `(est.)`
-  (text/markdown) on every cursor-derived dollar; csv lane; cursor-import guide
-  documents the 45x-class divergence.
+  (text/markdown) on cursor-derived dollars; cursor-import guide documents the
+  45x-class divergence. Scope note (review 58221d71 F1): at implement time only
+  the by-agent row and the json group items were marked — the "csv lane"
+  phrase above then meant a test struct literal, not a shipped marker; review
+  fix 25d9da7b extended the marker to every dimension: model / provider /
+  task-type / project rows across text/markdown/html/json, the CSV `estimated`
+  column, and the TUI top-model line.
 
 Recorded validation (NOT re-run at compound): targeted 53fcf7a1 — impacted-crate
 battery 21× `test result: ok`, 466/0/0, `rm5` filter 19/0, fmt + clippy
@@ -39,16 +46,24 @@ Status flips candidate→implemented were made BY THIS COMPOUND on the four rows
 (the implement phase had not flipped them); flips to done stay reserved for the
 commit gate (rm-012 precedent).
 
-## OWED ARM found at compound (disclosed, not silently dropped)
+## OWED ARM found at compound (disclosed, not silently dropped) — DELIVERED by review fix 25d9da7b
 
-rm-567's acceptance bullet "--waste -f json exposes components + basis" is **not
-delivered**: `main.rs:474-478` routes `--waste` through
+rm-567's acceptance bullet "--waste -f json exposes components + basis" was **not
+delivered** at compound: `main.rs:474-478` routes `--waste` through
 `render_waste_report_with_language` (text) regardless of `-f`. `WasteReport`
-carries `wasted_raw`/`wasted_capped`/`wasted_percent`, but no json render arm was
-added. Verified by first-hand diff read at compound (no re-run). Carry as a
-review/commit-gate rider or next-cycle completion — for a batch named
-"reported-numbers truthfulness" the row must not claim a closed acceptance it
-did not close.
+carried `wasted_raw`/`wasted_capped`/`wasted_percent`, but no json render arm
+existed. Verified by first-hand diff read at compound (no re-run) and carried as
+the review rider — for a batch named "reported-numbers truthfulness" the row must
+not claim a closed acceptance it did not close.
+
+**Delivered in the review-fix phase (2026-10-06, attempt 25d9da7b):** `-f json`
+now routes to `waste_report_json` — component scores with their inputs
+(`cache.base`/`paid_cache_penalty`/rating/hit rate, `loops.score`/percent,
+`stuck.score`/pattern count, `bloat.score`/level/tools-per-turn), the pre-stuck
+guard (`pre_stuck_sum`, `pre_stuck_clamped`), disjoint-basis wasted dollars
+(`raw_usd`/`total_usd`/`capped_to_session_cost`/`percent_of_session_cost`), and
+the `basis` block naming the session-cost denominator and the two dollar bases.
+Documented in `docs/guides/waste-guide.md`.
 
 ## Prevention rules (reusable)
 

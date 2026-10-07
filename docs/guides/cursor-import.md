@@ -61,3 +61,10 @@ upstream/downstream comparisons against token-accounted sources
 Importing Cursor's web-exported usage CSV (which carries billed
 dollars per request) to reconcile the two is tracked as a separate,
 optional follow-up; the `(est.)` marker does not depend on it.
+
+Review fix 25d9da7b extends the marker to every overview dimension:
+model, provider, task-type, and project rows in text / markdown / html,
+the `estimated` column in the CSV `by_model` / `by_provider` /
+`by_task_type` tables (present only when a cursor-priced row is in
+that table), the TUI top-model line, and `"estimated": true` on those
+groups in `-f json`. Clean corpora stay byte-identical.

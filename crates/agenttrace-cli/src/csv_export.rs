@@ -85,6 +85,10 @@ pub fn overview_csv(overview: &Overview) -> String {
         &overview.critical.to_string(),
         &format!("{:.4}", overview.total_cost),
     ]));
+    // rm-566 (review fix 25d9da7b): overview tables mark cursor-priced
+    // dollars. The `estimated` column appears ONLY when at least one
+    // row in that table carries the flag, so non-cursor corpora stay
+    // byte-identical to the pre-marker contract.
     for (name, rows) in [
         ("by_model", &overview.by_model),
         ("by_provider", &overview.by_provider),
@@ -92,28 +96,57 @@ pub fn overview_csv(overview: &Overview) -> String {
         if rows.is_empty() {
             continue;
         }
-        out.push_str(&table(name, &["name", "sessions", "cost"]));
+        let any_estimated = rows.values().any(|entry| entry.estimated_cost);
+        let header: Vec<&str> = if any_estimated {
+            vec!["name", "sessions", "cost", "estimated"]
+        } else {
+            vec!["name", "sessions", "cost"]
+        };
+        out.push_str(&table(name, &header));
         for (group, entry) in rows {
-            out.push_str(&csv_row(&[
-                group,
-                &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
-            ]));
+            let mut cells = vec![
+                group.clone(),
+                entry.sessions.to_string(),
+                format!("{:.4}", entry.cost),
+            ];
+            if any_estimated {
+                cells.push(if entry.estimated_cost { "true" } else { "" }.to_string());
+            }
+            let cell_refs: Vec<&str> = cells.iter().map(|c| c.as_str()).collect();
+            out.push_str(&csv_row(&cell_refs));
         }
     }
     if !overview.by_task_type.is_empty() {
-        out.push_str(&table(
-            "by_task_type",
-            &["name", "sessions", "cost", "tokens_input", "tokens_output"],
-        ));
+        let any_estimated = overview
+            .by_task_type
+            .values()
+            .any(|entry| entry.estimated_cost);
+        let header: Vec<&str> = if any_estimated {
+            vec![
+                "name",
+                "sessions",
+                "cost",
+                "tokens_input",
+                "tokens_output",
+                "estimated",
+            ]
+        } else {
+            vec!["name", "sessions", "cost", "tokens_input", "tokens_output"]
+        };
+        out.push_str(&table("by_task_type", &header));
         for (task_type, entry) in &overview.by_task_type {
-            out.push_str(&csv_row(&[
-                task_type,
-                &entry.sessions.to_string(),
-                &format!("{:.4}", entry.cost),
-                &entry.tokens_input.to_string(),
-                &entry.tokens_output.to_string(),
-            ]));
+            let mut cells = vec![
+                task_type.clone(),
+                entry.sessions.to_string(),
+                format!("{:.4}", entry.cost),
+                entry.tokens_input.to_string(),
+                entry.tokens_output.to_string(),
+            ];
+            if any_estimated {
+                cells.push(if entry.estimated_cost { "true" } else { "" }.to_string());
+            }
+            let cell_refs: Vec<&str> = cells.iter().map(|c| c.as_str()).collect();
+            out.push_str(&csv_row(&cell_refs));
         }
     }
     out
@@ -257,5 +290,50 @@ mod tests {
         assert!(out.contains("# by_model"));
         assert!(out.contains("claude-sonnet-4-5,2,2.0000"));
         assert!(!out.contains("# by_provider")); // empty sections omitted
+    }
+
+    #[test]
+    fn overview_csv_adds_estimated_column_only_when_a_row_is_marked() {
+        // rm-566 review fix 25d9da7b: the estimated column is opt-in
+        // per table — clean corpora stay byte-identical to the
+        // pre-marker contract.
+        let mut clean = Overview {
+            total_sessions: 1,
+            total_cost: 1.0,
+            ..Overview::default()
+        };
+        clean.by_model.insert(
+            "m".to_string(),
+            agenttrace_core::GroupOverview {
+                sessions: 1,
+                cost: 1.0,
+                estimated_cost: false,
+            },
+        );
+        let out = overview_csv(&clean);
+        assert!(out.contains("# by_model"));
+        assert!(out.contains("name,sessions,cost"));
+        assert!(!out.contains("estimated"));
+
+        let mut marked = clean.clone();
+        marked
+            .by_model
+            .get_mut("m")
+            .expect("model row")
+            .estimated_cost = true;
+        marked.by_task_type.insert(
+            "coding".to_string(),
+            agenttrace_core::TaskTypeOverview {
+                sessions: 1,
+                cost: 1.0,
+                estimated_cost: true,
+                ..Default::default()
+            },
+        );
+        let out = overview_csv(&marked);
+        assert!(out.contains("name,sessions,cost,estimated"));
+        assert!(out.contains("m,1,1.0000,true"));
+        assert!(out.contains("name,sessions,cost,tokens_input,tokens_output,estimated"));
+        assert!(out.contains("coding,1,1.0000,0,0,true"));
     }
 }

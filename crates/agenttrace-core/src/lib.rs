@@ -76,7 +76,8 @@ pub use statusline::{
     StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
 };
 pub use waste::{
-    compute_waste_report, render_waste_report, render_waste_report_with_language, WasteReport,
+    compute_waste_report, render_waste_report, render_waste_report_with_language,
+    waste_report_json, WasteReport, WasteScoreComponents,
 };
 
 pub const VERSION: &str = match option_env!("AGENTTRACE_RELEASE_VERSION") {
@@ -488,6 +489,10 @@ pub struct TaskTypeOverview {
     pub cost: f64,
     pub tokens_input: i64,
     pub tokens_output: i64,
+    /// rm-566: true when any session in this group prices its cost
+    /// from cursor-local data rather than provider-reported usage.
+    /// Same contract as [`GroupOverview::estimated_cost`].
+    pub estimated_cost: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1471,12 +1476,18 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             overview.critical += 1;
         }
         let agent = session.metrics.source_tool.clone();
+        // rm-566: cursor journals carry no token accounting, so their
+        // dollars are estimates on EVERY aggregate that carries them —
+        // agent, model, provider, task type, and project rows alike
+        // (review fix 25d9da7b: the acceptance says "any report row",
+        // not only the by-agent view).
+        let cursor_local = session_cost_is_cursor_local(&session.metrics.source_tool);
         let agent_entry = overview.by_agent.entry(agent).or_default();
         agent_entry.sessions += 1;
         agent_entry.cost += session.metrics.cost_estimated;
         // rm-566: mark the group, not the session — the estimate flag
         // travels with every aggregate that carries these dollars.
-        if session_cost_is_cursor_local(&session.metrics.source_tool) {
+        if cursor_local {
             agent_entry.estimated_cost = true;
         }
 
@@ -1488,6 +1499,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         let model_entry = overview.by_model.entry(model).or_default();
         model_entry.sessions += 1;
         model_entry.cost += session.metrics.cost_estimated;
+        if cursor_local {
+            model_entry.estimated_cost = true;
+        }
 
         // rm-245: attribution dimensions. The provider comes from the
         // same catalog row that prices the model, so vendor claims and
@@ -1498,6 +1512,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         let provider_entry = overview.by_provider.entry(provider).or_default();
         provider_entry.sessions += 1;
         provider_entry.cost += session.metrics.cost_estimated;
+        if cursor_local {
+            provider_entry.estimated_cost = true;
+        }
 
         let task_type_entry = overview
             .by_task_type
@@ -1507,6 +1524,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         task_type_entry.cost += session.metrics.cost_estimated;
         task_type_entry.tokens_input += session.metrics.tokens_input.max(0);
         task_type_entry.tokens_output += session.metrics.tokens_output.max(0);
+        if cursor_local {
+            task_type_entry.estimated_cost = true;
+        }
 
         let project_entry = overview
             .by_project
@@ -1514,6 +1534,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .or_default();
         project_entry.sessions += 1;
         project_entry.cost += session.metrics.cost_estimated;
+        if cursor_local {
+            project_entry.estimated_cost = true;
+        }
 
         for anomaly in &session.anomalies {
             overview.anomalies_top.push(AnomalyTop {
@@ -3063,5 +3086,36 @@ mod tests {
         assert_eq!(group.sessions, 2);
         assert!((group.cost - 5.0).abs() < 1e-9);
         assert!(group.estimated_cost);
+    }
+
+    #[test]
+    fn rm566_cursor_marks_every_aggregate_dimension() {
+        // Review fix 25d9da7b: the acceptance is "any report row" —
+        // model, provider, task-type, and project groups carrying
+        // cursor-local dollars are flagged exactly like by-agent, and
+        // a clean corpus flags nothing anywhere.
+        let sessions = [
+            session_with_tool("cursor", 5.0),
+            session_with_tool("claude_code", 10.0),
+        ];
+        let overview = compute_overview(&sessions);
+        assert!(overview.by_model.values().any(|g| g.estimated_cost));
+        assert!(overview.by_provider.values().any(|g| g.estimated_cost));
+        assert!(overview.by_task_type.values().any(|g| g.estimated_cost));
+        assert!(overview.by_project.values().any(|g| g.estimated_cost));
+
+        let clean = compute_overview(&[session_with_tool("claude_code", 10.0)]);
+        for (name, map) in [
+            ("by_model", &clean.by_model),
+            ("by_provider", &clean.by_provider),
+            ("by_project", &clean.by_project),
+        ] {
+            for (key, group) in map {
+                assert!(!group.estimated_cost, "{name}[{key}] must be clean");
+            }
+        }
+        for (key, group) in &clean.by_task_type {
+            assert!(!group.estimated_cost, "by_task_type[{key}] must be clean");
+        }
     }
 }

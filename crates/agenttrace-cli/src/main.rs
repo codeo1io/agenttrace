@@ -9,8 +9,8 @@ use agenttrace_core::{
     report_overview_html_with_context, report_overview_json_with_context,
     report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
     report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
-    session_capability, tool_fail_rate, total_tokens, update_pricing, BaselineThresholds,
-    LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
+    session_capability, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
+    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -475,7 +475,12 @@ fn run() -> anyhow::Result<()> {
         let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
         let session =
             latest_session(&sessions).context("No sessions match the requested filters")?;
-        let out = render_waste_report_with_language(session, language);
+        // rm-567 (review fix 25d9da7b): the -f json arm the acceptance
+        // promised — components + basis, same numbers as the text lane.
+        let out = match args.format.as_str() {
+            "json" => waste_report_json(session),
+            _ => render_waste_report_with_language(session, language),
+        };
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         return Ok(());

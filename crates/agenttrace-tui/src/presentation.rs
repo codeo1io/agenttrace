@@ -3313,14 +3313,18 @@ pub(super) fn top_group(
 
 pub(super) fn top_model_line(app: &App) -> String {
     if let Some((model, group)) = top_group(&app.overview.by_model) {
+        // rm-566 (review fix 25d9da7b): a cursor-priced top model is
+        // marked here exactly like the by-agent view marks cursor rows.
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         format!(
-            "{} {}  {} {}  {} {}",
+            "{} {}  {} {}  {} {}{}",
             app.t("top model", "最高频模型"),
             short(model, 24),
             app.t("sessions", "会话"),
             format_count(group.sessions as i64),
             app.t("cost", "成本"),
-            format_compact_cost(group.cost)
+            format_compact_cost(group.cost),
+            estimate_marker
         )
     } else {
         format!(

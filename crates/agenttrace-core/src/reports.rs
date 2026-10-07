@@ -985,11 +985,15 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         .into_iter()
         .take(8)
     {
+        // rm-566: cursor-priced dollars are marked on every dimension,
+        // not only by-agent (review fix 25d9da7b).
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         out.push_str(&format!(
-            "    {:<25} {:>4} Sessions  {:>8}\n",
+            "    {:<25} {:>4} Sessions  {:>8}{}\n",
             model,
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
     out.push('\n');
@@ -1002,22 +1006,28 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         .into_iter()
         .take(8)
     {
+        // rm-566: same estimate marker as by-model (review fix 25d9da7b).
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         out.push_str(&format!(
-            "    {:<25} {:>4} Sessions  {:>8}\n",
+            "    {:<25} {:>4} Sessions  {:>8}{}\n",
             provider,
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
     out.push('\n');
 
     out.push_str("  ── By Task Type ──\n");
     for (task_type, group) in &overview.by_task_type {
+        // rm-566: same estimate marker as by-model (review fix 25d9da7b).
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         out.push_str(&format!(
-            "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
+            "    {:<15} {:>4} Sessions  {:>8}{}  in {:>9}  out {}\n",
             task_type,
             format_count(group.sessions),
             format_cost(group.cost),
+            estimate_marker,
             format_tokens(group.tokens_input),
             format_tokens(group.tokens_output)
         ));
@@ -1164,11 +1174,15 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     out.push_str("\n## By provider\n\n");
     out.push_str("| Provider | Sessions | Cost |\n|---|---:|---:|\n");
     for (provider, group) in sorted_model_groups(&overview.by_provider) {
+        // rm-566: estimate marker for cursor-priced rows (review fix
+        // 25d9da7b — same convention as the by-agent table).
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         out.push_str(&format!(
-            "| {} | {} | {} |\n",
+            "| {} | {} | {}{} |\n",
             markdown_cell(&provider),
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
 
@@ -1177,13 +1191,17 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         "| Task type | Sessions | Tokens in | Tokens out | Cost |\n|---|---:|---:|---:|---:|\n",
     );
     for (task_type, group) in &overview.by_task_type {
+        // rm-566: estimate marker for cursor-priced rows (review fix
+        // 25d9da7b).
+        let estimate_marker = if group.estimated_cost { " (est.)" } else { "" };
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {}{} |\n",
             markdown_cell(task_type),
             format_count(group.sessions),
             format_tokens(group.tokens_input),
             format_tokens(group.tokens_output),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
 
@@ -1406,11 +1424,19 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
 
     w("<section><h2>By model</h2><table><thead><tr><th>Model</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (model, group) in models.iter().take(12) {
+        // rm-566: estimate marker for cursor-priced rows (review fix
+        // 25d9da7b — same convention as the by-agent table).
+        let estimate_marker = if group.estimated_cost {
+            " <span class=\"muted\" title=\"cost estimated from cursor-local data (no token accounting)\">(est.)</span>"
+        } else {
+            ""
+        };
         w(format!(
-            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}{}</td></tr>",
             html_escape(model),
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
     w("</tbody></table></section>".to_string());
@@ -1418,24 +1444,40 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     // rm-245: vendor and task-type dimensions beside by-model.
     w("<section><h2>By provider</h2><table><thead><tr><th>Provider</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (provider, group) in providers.iter().take(12) {
+        // rm-566: estimate marker for cursor-priced rows (review fix
+        // 25d9da7b).
+        let estimate_marker = if group.estimated_cost {
+            " <span class=\"muted\" title=\"cost estimated from cursor-local data (no token accounting)\">(est.)</span>"
+        } else {
+            ""
+        };
         w(format!(
-            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}{}</td></tr>",
             html_escape(provider),
             format_count(group.sessions),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
     w("</tbody></table></section>".to_string());
 
     w("<section><h2>By task type</h2><table><thead><tr><th>Task type</th><th class=\"num\">Sessions</th><th class=\"num\">Tokens in</th><th class=\"num\">Tokens out</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (task_type, group) in &overview.by_task_type {
+        // rm-566: estimate marker for cursor-priced rows (review fix
+        // 25d9da7b).
+        let estimate_marker = if group.estimated_cost {
+            " <span class=\"muted\" title=\"cost estimated from cursor-local data (no token accounting)\">(est.)</span>"
+        } else {
+            ""
+        };
         w(format!(
-            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}{}</td></tr>",
             html_escape(task_type),
             format_count(group.sessions),
             format_tokens(group.tokens_input),
             format_tokens(group.tokens_output),
-            format_cost(group.cost)
+            format_cost(group.cost),
+            estimate_marker
         ));
     }
     w("</tbody></table></section>".to_string());
@@ -1921,7 +1963,7 @@ fn task_type_items(groups: &BTreeMap<String, TaskTypeOverview>, total_cost: f64)
     let mut items: Vec<_> = groups
         .iter()
         .map(|(task_type, group)| {
-            json!({
+            let mut item = json!({
                 "task_type": task_type,
                 "sessions": group.sessions,
                 "tokens": {
@@ -1934,7 +1976,16 @@ fn task_type_items(groups: &BTreeMap<String, TaskTypeOverview>, total_cost: f64)
                 } else {
                     0.0
                 },
-            })
+            });
+            if group.estimated_cost {
+                // rm-566: skip-if-false keeps non-cursor corpora
+                // byte-identical (review fix 25d9da7b — same
+                // convention as group_items).
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("estimated".to_string(), json!(true));
+                }
+            }
+            item
         })
         .collect();
     items.sort_by(|a, b| {
@@ -3281,5 +3332,74 @@ mod tests {
         assert!(html.contains("Cursor"));
         assert!(html.contains("(est.)"));
         assert!(html.contains("cost estimated from cursor-local data"));
+    }
+
+    // Review fix 25d9da7b: "any report row" — the model, provider, and
+    // task-type sections carry the marker too, in every format.
+
+    fn section_block<'a>(doc: &'a str, header: &str, end_marker: &str) -> &'a str {
+        let start = doc
+            .find(header)
+            .unwrap_or_else(|| panic!("missing {header}"));
+        let end = doc[start..]
+            .find(end_marker)
+            .map(|i| start + i + end_marker.len())
+            .unwrap_or(doc.len());
+        &doc[start..end]
+    }
+
+    #[test]
+    fn rm566_text_overview_marks_model_provider_and_task_rows() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let text = report_overview_text(&overview, &sessions);
+        // Both fixtures share model "m", so the single by-model row
+        // carries cursor dollars and must be marked — same for the
+        // provider and task-type rows the cursor session lands in.
+        for header in ["── By Model ──", "── By Provider ──", "── By Task Type ──"]
+        {
+            let block = section_block(&text, header, "\n\n");
+            assert!(block.contains("(est.)"), "{header} rows unmarked:\n{block}");
+        }
+    }
+
+    #[test]
+    fn rm566_markdown_overview_marks_provider_and_task_rows() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let md = report_overview_markdown(&overview, &sessions);
+        for header in ["## By provider", "## By task type"] {
+            // A markdown section ends at the next "## " heading, not at
+            // a blank line (one follows the heading immediately).
+            let block = section_block(&md, header, "\n## ");
+            assert!(block.contains("(est.)"), "{header} rows unmarked:\n{block}");
+        }
+    }
+
+    #[test]
+    fn rm566_html_overview_marks_model_provider_and_task_rows() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let html = report_overview_html(&overview, &[]);
+        for header in ["By model", "By provider", "By task type"] {
+            let block = section_block(&html, header, "</table>");
+            assert!(block.contains("(est.)"), "{header} rows unmarked");
+        }
+    }
+
+    #[test]
+    fn rm566_json_overview_marks_task_type_items() {
+        let sessions = rm566_sessions();
+        let overview = crate::compute_overview(&sessions);
+        let json_text = report_overview_json(&overview, &sessions);
+        let doc: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        let tasks = doc["by_task_type"].as_array().unwrap();
+        assert!(!tasks.is_empty());
+        // The cursor session's dollars flow into its task-type group,
+        // so that item is marked exactly like the by-agent group.
+        let marked = tasks
+            .iter()
+            .any(|item| item["estimated"] == serde_json::json!(true));
+        assert!(marked, "no by_task_type item carries estimated:true");
     }
 }
