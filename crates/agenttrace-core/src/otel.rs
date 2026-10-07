@@ -139,6 +139,24 @@ fn sanitize_otel_string(value: &str) -> String {
         .collect()
 }
 
+/// rm-768: span names ride into OTLP-JSON documents that exporters may
+/// surface raw (same exposure class as attribute values), so they get the
+/// identical control-byte discipline plus a bound — an unbounded name is
+/// an unbounded export record. 256 chars is far beyond any readable span
+/// name and matches common backend display budgets.
+const SPAN_NAME_MAX_CHARS: usize = 256;
+
+fn sanitize_span_name(value: &str) -> String {
+    let sanitized = sanitize_otel_string(value);
+    if sanitized.chars().count() <= SPAN_NAME_MAX_CHARS {
+        return sanitized;
+    }
+    match sanitized.char_indices().nth(SPAN_NAME_MAX_CHARS) {
+        Some((idx, _)) => sanitized[..idx].to_string(),
+        None => sanitized,
+    }
+}
+
 fn attr_str(key: &str, value: impl Into<String>) -> KeyValue {
     KeyValue {
         key: key.to_string(),
@@ -330,7 +348,7 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
         trace_id: trace_id_for(session),
         span_id: span_id_for(session, ordinal),
         parent_span_id: None,
-        name: format!("session {}", session.name),
+        name: sanitize_span_name(&format!("session {}", session.name)),
         kind: SPAN_KIND_INTERNAL,
         start_time_unix_nano: start,
         end_time_unix_nano: end,
@@ -415,5 +433,39 @@ mod tests {
         assert!(!rendered.contains("\\u009b"));
         assert!(!rendered.contains("\\u007f"));
         assert!(rendered.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn span_name_sanitizer_matches_attribute_discipline_and_binds_length() {
+        // rm-768: span names ride into OTLP-JSON documents that exporters
+        // may surface raw, so the "session {name}" span gets the same
+        // control-byte discipline as attribute values plus a 256-char cap.
+        let hostile = sanitize_span_name(&format!(
+            "pwn{}0;PWNED{} red {} text",
+            '\u{1b}', '\u{7}', '['
+        ));
+        assert!(
+            !hostile.contains('\u{1b}'),
+            "ESC must not survive: {hostile:?}"
+        );
+        assert!(
+            !hostile.contains('\u{7}'),
+            "BEL must not survive: {hostile:?}"
+        );
+        assert!(hostile.contains('\u{FFFD}'), "neutralized marker expected");
+        // Attribute discipline is stricter than the report-cell carve-outs:
+        // every C0/C1 byte (including `\n`/`\t`) neutralizes — span names
+        // inherit exactly that, so they can never smuggle layout bytes
+        // into OTLP-JSON either.
+        assert!(!sanitize_span_name("a\nb\tc").contains('\n'));
+        assert!(!sanitize_span_name("a\nb\tc").contains('\t'));
+        assert!(sanitize_span_name("plain name 42").contains("plain"));
+        let long = sanitize_span_name(&"x".repeat(400));
+        assert_eq!(
+            long.chars().count(),
+            SPAN_NAME_MAX_CHARS,
+            "span name must be bounded at {SPAN_NAME_MAX_CHARS} chars"
+        );
+        assert!(long.chars().all(|c| c == 'x'));
     }
 }

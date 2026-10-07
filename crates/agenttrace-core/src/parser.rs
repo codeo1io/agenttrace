@@ -5058,16 +5058,26 @@ pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
 /// exactly like the identical JSON Number. Integer strings parse
 /// directly; float-form ("100.5", "1e3"), padded, and beyond-i64::MAX
 /// strings coerce and clamp the same way the Number arm does instead of
-/// silently dropping. Non-numeric strings ("true", "lots") stay skipped
-/// — they carry no count to honor.
+/// silently dropping. Non-finite spellings ("inf", "NaN") are rejected
+/// (rm-342 residual, review 384979754): JSON Numbers are always finite,
+/// so those strings are not counts, and their f64 `as i64` saturation
+/// (i64::MAX / 0) would manufacture poison. Non-numeric strings ("true",
+/// "lots") stay skipped — they carry no count to honor.
 fn numeric_string_as_i64(text: &str) -> Option<i64> {
     let trimmed = text.trim();
     if let Ok(value) = trimmed.parse::<i64>() {
         return Some(value);
     }
     // `as` casts from f64 to i64 saturate, mirroring the Number arm for
-    // magnitudes beyond i64::MAX.
-    trimmed.parse::<f64>().ok().map(|value| value as i64)
+    // magnitudes beyond i64::MAX. Non-finite spellings ("inf", "NaN") are
+    // filtered first (rm-342 residual, review 384979754): JSON Numbers are
+    // always finite, so those strings are not counts, and their saturation
+    // (inf → i64::MAX, NaN → 0) would manufacture poison.
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(|value| value as i64)
 }
 
 fn boolish(value: Option<&Value>) -> bool {
@@ -6691,6 +6701,37 @@ mod tests {
         let obj = value.as_object().expect("object");
         assert_eq!(sum_numbers(obj, &["input", "input_tokens"]), i64::MAX);
         assert_eq!(sum_numbers(obj, &["output", "output_tokens"]), 0);
+    }
+
+    #[test]
+    fn numeric_string_as_i64_rejects_nonfinite_spellings() {
+        // rm-342 residual: "inf"/"NaN" are not counts; before the fix
+        // "inf" saturated to i64::MAX and "NaN" collapsed to 0.
+        assert_eq!(numeric_string_as_i64("inf"), None);
+        assert_eq!(numeric_string_as_i64("-inf"), None);
+        assert_eq!(numeric_string_as_i64("infinity"), None);
+        assert_eq!(numeric_string_as_i64("NaN"), None);
+        assert_eq!(numeric_string_as_i64(" nan "), None);
+        // Landed integer-string coercion (rm-342) is unchanged.
+        assert_eq!(numeric_string_as_i64("150"), Some(150));
+        assert_eq!(numeric_string_as_i64(" 42 "), Some(42));
+        // Finite float-form strings keep their documented truncation.
+        assert_eq!(numeric_string_as_i64("12.9"), Some(12));
+        // Plain garbage still skips.
+        assert_eq!(numeric_string_as_i64("lots"), None);
+    }
+
+    #[test]
+    fn sum_numbers_nonfinite_strings_contribute_zero() {
+        let value = serde_json::json!({
+            "input": "inf",
+            "output": "NaN",
+            "real": 7
+        });
+        let obj = value.as_object().expect("object");
+        assert_eq!(sum_numbers(obj, &["input"]), 0);
+        assert_eq!(sum_numbers(obj, &["output"]), 0);
+        assert_eq!(sum_numbers(obj, &["real"]), 7);
     }
 
     #[test]

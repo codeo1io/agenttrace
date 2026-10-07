@@ -435,6 +435,52 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
         // six-slot budget at finalize) instead of pushing `samples`
         // directly, keeping the tally off the JSON surface until
         // `finalize_samples` runs.
+        // rm-770 arms: the probe budget cut a scan — disclose the
+        // boundedness in the sample line instead of attributing silently.
+        // They ride the rm-240 `record_resolved` note channel purely for
+        // dedup + six-slot sample budgeting (counters stay honest:
+        // resolved only when a decode actually landed).
+        ProjectDecodeStatus::ResolvedScanTruncated { path, shadowed } => {
+            out.resolved += 1;
+            let shadowed = shadowed
+                .iter()
+                .map(|alt| crate::statusline::sanitize_line_segment(alt))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.record_resolved(
+                &path,
+                format!(
+                    "scan-truncated: decoded to {}, but the ambiguity scan hit the 1024-probe budget — shadowed alternatives may be missing{}",
+                    crate::statusline::sanitize_line_segment(&path),
+                    if shadowed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (found so far: {shadowed})")
+                    }
+                ),
+            );
+        }
+        ProjectDecodeStatus::ScanExhausted { name } => {
+            out.unresolved += 1;
+            out.record_resolved(
+                &name,
+                format!(
+                    "scan-exhausted: the 1024-probe budget cut the decode walk for projects/{} — attribution unknown, not proven undecodable",
+                    crate::statusline::sanitize_line_segment(&name)
+                ),
+            );
+        }
+        ProjectDecodeStatus::TruncatedScanCut { prefix, hash } => {
+            out.resolved += 1;
+            out.record_resolved(
+                &format!("{prefix}#{hash}"),
+                format!(
+                    "scan-cut: truncated name attributed to verified prefix {}#{} after the probe budget cut the walk — attribution is budget-bounded",
+                    crate::statusline::sanitize_line_segment(&prefix),
+                    crate::statusline::sanitize_line_segment(&hash)
+                ),
+            );
+        }
         ProjectDecodeStatus::Truncated { prefix, hash } => {
             out.resolved += 1;
             out.record_resolved(
@@ -806,7 +852,11 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     out.push_str("AGENTTRACE Doctor\n");
     out.push_str(&format!("Version: {}\n", report.version));
     out.push_str(&format!("Mode: {}\n", report.mode));
-    out.push_str(&format!("Session files: {}\n", report.sessions));
+    // rm-769: label the two JSON fields (`sessions` / `session_files`)
+    // exactly as they are named — the old single "Session files: N" line
+    // printed the `sessions` count under the `session_files` name.
+    out.push_str(&format!("Sessions: {}\n", report.sessions));
+    out.push_str(&format!("Session files: {}\n", report.session_files));
     out.push_str(&format!("Cache: {}\n", report.cache_path));
     out.push_str(&format!(
         "  {} parsed session cache entries, {} reusable for this scan, {} cached directory listings\n",
@@ -1343,5 +1393,28 @@ mod tests {
             Some(&3),
             "line_skips fold (rm-526 channel): {disclosures:?}"
         );
+    }
+    #[test]
+    fn doctor_text_labels_match_the_json_fields_they_summarize() {
+        // rm-769: --demo renders "Sessions: N" and "Session files: M" side
+        // by side; the JSON carries both counts as distinct fields. The
+        // text must keep both lines coherent with the JSON instead of
+        // folding two fields under one label.
+        let dir = std::env::temp_dir();
+        let mut report = build_doctor_report(Some(&dir), false);
+        report.sessions = 2;
+        report.session_files = 5;
+        let text = doctor_report_text(&report);
+        assert!(
+            text.contains("Sessions: 2"),
+            "sessions line must state the sessions count: {text:?}"
+        );
+        assert!(
+            text.contains("Session files: 5"),
+            "session-files line must state the session_files count: {text:?}"
+        );
+        let json = serde_json::to_string(&report).expect("report serializes");
+        assert!(json.contains("\"sessions\":2"));
+        assert!(json.contains("\"session_files\":5"));
     }
 }
