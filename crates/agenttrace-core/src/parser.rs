@@ -2129,7 +2129,27 @@ where
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut has_assistant = false;
-    let mut has_usage = false;
+    // rm-655: usage observations dedup by (timestamp, totals) across BOTH
+    // the assistant and the result arms — a verbatim re-emitted record is
+    // one logical observation (the claude-lane seen_usage_snapshots
+    // precedent), while distinct turns (distinct timestamps or distinct
+    // totals) each contribute.
+    // rm-655 review fix (independent_review e6b826a3 F1): a turn's usage
+    // can ride BOTH its assistant message and its closing result record —
+    // different timestamps and (typically) different map composition, so
+    // key-based dedup never catches the pair and every such turn
+    // double-counted (assistant 120/45 + restated result 120/45 reported
+    // 240/90). Track per-turn state instead: an assistant usage
+    // observation marks the turn as counted, the closing result record
+    // is skipped when the turn already carries usage (it restates the
+    // turn's accounting — claude-code wire semantics: result.usage equals
+    // the turn's usage, and the claude lane parses assistant records
+    // only, with no result arm at all), and the result record itself
+    // opens the next turn, so result-only turns (the original latch bug)
+    // still each count. Tool-loop user records inside a turn do NOT
+    // reset the state.
+    let mut seen_usage_keys = BTreeSet::new();
+    let mut turn_usage_counted = false;
 
     for obj in objs {
         let obj = std::borrow::Borrow::borrow(&obj);
@@ -2164,10 +2184,19 @@ where
                 };
                 for event in qwen_message_events(message, &ts, &mut model) {
                     if event.role == "meta" {
-                        if !event.usage.is_empty() {
-                            has_usage = true;
+                        if event.usage.is_empty()
+                            || seen_usage_keys
+                                .insert(qwen_usage_dedup_key(&event.timestamp, &event.usage))
+                        {
+                            // rm-655 review fix: only a real usage
+                            // observation marks the turn — the closing
+                            // result record then restates it and is
+                            // skipped instead of double-counting.
+                            if !event.usage.is_empty() {
+                                turn_usage_counted = true;
+                            }
+                            meta_events.push(event);
                         }
-                        meta_events.push(event);
                     } else {
                         if event.role == "assistant" {
                             has_assistant = true;
@@ -2177,22 +2206,40 @@ where
                 }
             }
             "result" => {
-                if !has_usage {
-                    let usage = qwen_usage(obj.get("usage"))
-                        .or_else(|| qwen_stats_usage(obj.get("stats")))
-                        .or_else(|| qwen_model_usage(obj.get("modelUsage")));
-                    if let Some(usage) = usage {
-                        meta_events.push(Event {
-                            role: "meta".to_string(),
-                            timestamp: ts.clone(),
-                            usage,
-                            model_used: model.clone(),
-                            source_tool: "qwen_code".to_string(),
-                            ..Event::default()
-                        });
-                        has_usage = true;
+                // rm-655: this arm used to latch on the first usage-bearing
+                // record (`if !has_usage`), so in a multi-turn session every
+                // result record after the first contributed zero tokens —
+                // three 10/5 turns reported 10/5 instead of 30/15. Each
+                // record now contributes, with identical (timestamp,
+                // totals) observations deduped once — EXCEPT the turn it
+                // closes: a result record restates its turn's accounting
+                // when the turn's assistant message(s) already carried
+                // usage (rm-655 review fix, independent_review e6b826a3
+                // F1 — counting both doubled every such turn), so it is
+                // skipped when the turn already counted. Turns whose only
+                // usage-bearing record is the result still count.
+                let usage = qwen_usage(obj.get("usage"))
+                    .or_else(|| qwen_stats_usage(obj.get("stats")))
+                    .or_else(|| qwen_model_usage(obj.get("modelUsage")));
+                if let Some(usage) = usage {
+                    if !turn_usage_counted {
+                        let usage_key = qwen_usage_dedup_key(&ts, &usage);
+                        if usage_key.is_empty() || seen_usage_keys.insert(usage_key) {
+                            meta_events.push(Event {
+                                role: "meta".to_string(),
+                                timestamp: ts.clone(),
+                                usage,
+                                model_used: model.clone(),
+                                source_tool: "qwen_code".to_string(),
+                                ..Event::default()
+                            });
+                        }
                     }
                 }
+                // The result record closes the turn: the next
+                // usage-bearing record — an assistant message of the next
+                // turn, or a result-only turn — opens fresh state.
+                turn_usage_counted = false;
                 if !has_assistant {
                     let content = string(obj.get("result")).unwrap_or("").trim().to_string();
                     if !content.is_empty() {
@@ -2421,6 +2468,21 @@ fn qwen_tool_result_events(raw: Option<&Value>, ts: &str, model: &str) -> Vec<Ev
         });
     }
     events
+}
+
+/// Dedup key for one qwen usage observation: the event timestamp plus the
+/// canonical (sorted-key) serialization of the token-class totals. Two
+/// records that agree on both are the same logical observation — a
+/// verbatim re-emission — and count once; anything that differs on
+/// either axis is a separate observation and counts (rm-655, mirroring
+/// the claude lane's seen_usage_snapshots). The same-turn
+/// assistant/result pair is NOT this key's job: the result record
+/// restates the turn's accounting and is skipped by the per-turn latch
+/// in parse_qwen_code_objects (rm-655 review fix).
+fn qwen_usage_dedup_key(ts: &str, usage: &BTreeMap<String, i64>) -> String {
+    serde_json::to_string(usage)
+        .map(|usage| format!("{ts}|{usage}"))
+        .unwrap_or_default()
 }
 
 fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
@@ -6235,6 +6297,184 @@ mod tests {
         let map = oh_my_pi_usage(Some(&usage)).expect("usage map");
         assert_eq!(map.get("input_tokens"), Some(&100));
         assert_eq!(map.get("output_tokens"), Some(&50));
+    }
+
+    fn qwen_result_line(ts: &str, input: i64, output: i64) -> String {
+        serde_json::json!({
+            "timestamp": ts,
+            "uuid": format!("result-{ts}"),
+            "type": "result",
+            "subtype": "success",
+            "result": "turn complete",
+            "usage": {"input_tokens": input, "output_tokens": output},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn qwen_multi_result_usage_counts_every_turn() {
+        // rm-655: the "result" arm latched on the first usage-bearing
+        // record (`if !has_usage`), so turns 2..N of a multi-turn qwen-code
+        // session contributed zero tokens. Each result record carries its
+        // own turn delta (per-record semantics, upstream #312), so three
+        // 10/5 records at distinct timestamps must report 30/15 — not the
+        // first record's 10/5.
+        let corpus = [
+            qwen_result_line("2026-10-07T10:00:00.000Z", 10, 5),
+            qwen_result_line("2026-10-07T10:00:01.000Z", 10, 5),
+            qwen_result_line("2026-10-07T10:00:02.000Z", 10, 5),
+        ]
+        .join("\n");
+        let session = parse_raw_session("qwen", "multi-result.jsonl", &corpus).unwrap();
+        assert_eq!(session.metrics.tokens_input, 30, "three turns x 10 input");
+        assert_eq!(session.metrics.tokens_output, 15, "three turns x 5 output");
+    }
+
+    #[test]
+    fn qwen_result_reemission_counts_once() {
+        // rm-655 re-emission control (the codex #312 distinct-total
+        // precedent): a result record re-written verbatim — same timestamp,
+        // same totals — is the same logical observation, not a new turn, so
+        // it counts once even inside a growing-total sequence.
+        let corpus = [
+            qwen_result_line("2026-10-07T10:00:00.000Z", 10, 5),
+            qwen_result_line("2026-10-07T10:00:01.000Z", 20, 15),
+            // verbatim re-emission of the 10:00:01 record
+            qwen_result_line("2026-10-07T10:00:01.000Z", 20, 15),
+        ]
+        .join("\n");
+        let session = parse_raw_session("qwen", "reemitted-result.jsonl", &corpus).unwrap();
+        assert_eq!(session.metrics.tokens_input, 30, "10 + 20 once each");
+        assert_eq!(session.metrics.tokens_output, 20, "5 + 15 once each");
+    }
+
+    #[test]
+    fn qwen_assistant_result_pair_counts_once() {
+        // rm-655 same-turn control, review-fixed shape (independent_review
+        // e6b826a3 F1): a turn's usage can ride both its assistant message
+        // and its closing result record, at DIFFERENT timestamps (the
+        // real-stream shape — timestamp equality is not something the
+        // wire format promises). The per-turn latch keeps the pair from
+        // double-counting while distinct turns still sum.
+        let corpus = [
+            serde_json::json!({
+                "timestamp": "2026-10-07T10:00:00.000Z",
+                "uuid": "assistant-1",
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "working on it",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            })
+            .to_string(),
+            qwen_result_line("2026-10-07T10:00:03.500Z", 10, 5),
+            qwen_result_line("2026-10-07T10:00:05.000Z", 7, 3),
+        ]
+        .join("\n");
+        let session = parse_raw_session("qwen", "assistant-result-pair.jsonl", &corpus).unwrap();
+        assert_eq!(session.metrics.tokens_input, 17, "10 once + 7");
+        assert_eq!(session.metrics.tokens_output, 8, "5 once + 3");
+    }
+
+    #[test]
+    fn qwen_result_restatement_skipped_when_assistant_carries_usage() {
+        // rm-655 review fix (independent_review e6b826a3 F1, live PoC
+        // poc2-doublecount): the assistant message carries 120/45 plus
+        // cache_read 10 / cache_creation 5, and the closing result record
+        // restates the same turn's 120/45 at a later timestamp with a
+        // leaner map — different timestamp AND different totals map, so
+        // key-based dedup can never catch the pair. Before the review fix
+        // this reported 240/90 (every such turn doubled); the per-turn
+        // latch skips the restating result record and reports the turn
+        // once, cache classes intact.
+        let corpus = [
+            serde_json::json!({
+                "timestamp": "2026-10-07T10:00:02.000Z",
+                "uuid": "assistant-1",
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "inspecting package files",
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 45,
+                        "cache_read_input_tokens": 10,
+                        "cache_creation_input_tokens": 5,
+                    },
+                },
+            })
+            .to_string(),
+            qwen_result_line("2026-10-07T10:00:03.500Z", 120, 45),
+        ]
+        .join("\n");
+        let session = parse_raw_session("qwen", "result-restatement.jsonl", &corpus).unwrap();
+        assert_eq!(session.metrics.tokens_input, 120, "the turn counts once");
+        assert_eq!(session.metrics.tokens_output, 45, "the turn counts once");
+        assert_eq!(
+            session.metrics.tokens_cache_r, 10,
+            "cache classes ride the assistant record"
+        );
+        assert_eq!(
+            session.metrics.tokens_cache_w, 5,
+            "cache classes ride the assistant record"
+        );
+    }
+
+    #[test]
+    fn qwen_multi_call_turn_sums_per_call_usage() {
+        // rm-655 review fix companion: a multi-call turn emits one usage
+        // observation per assistant call (per-record semantics, upstream
+        // #312) and its closing result record carries the turn's TOTAL —
+        // the sum of the per-call observations. The per-call assistant
+        // usages each count, the restating result record is skipped, and
+        // the tool-loop user record between the calls does not open a new
+        // turn: 10 + 20 input once, not 60.
+        let corpus = [
+            serde_json::json!({
+                "timestamp": "2026-10-07T10:00:00.000Z",
+                "uuid": "assistant-1",
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "tool-1", "name": "read_file", "input": {"path": "package.json"}}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-07T10:00:01.000Z",
+                "uuid": "user-1",
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "package metadata", "is_error": false}],
+                },
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-07T10:00:02.000Z",
+                "uuid": "assistant-2",
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "usage": {"input_tokens": 20, "output_tokens": 15},
+                },
+            })
+            .to_string(),
+            qwen_result_line("2026-10-07T10:00:03.000Z", 30, 20),
+        ]
+        .join("\n");
+        let session = parse_raw_session("qwen", "multi-call-turn.jsonl", &corpus).unwrap();
+        assert_eq!(
+            session.metrics.tokens_input, 30,
+            "10 + 20 per-call, restated 30 skipped"
+        );
+        assert_eq!(
+            session.metrics.tokens_output, 20,
+            "5 + 15 per-call, restated 20 skipped"
+        );
     }
 
     #[test]

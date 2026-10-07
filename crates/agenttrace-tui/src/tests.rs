@@ -1631,7 +1631,10 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 27 (integration of run b1ff12f8, rm-542 Codex
+                // Schema 28 (rm-655 qwen multi-result usage latch:
+                // every usage-bearing result record contributes, deduped
+                // by timestamp + totals; 27 was the integration of run
+                // b1ff12f8, rm-542 Codex
                 // custom-tools parse coverage — re-based off the
                 // campaign's 22 -> 23 bump; 26 was the rm-485 copilot
                 // session-wide credit accounting, 25 the rm-450 workbuddy
@@ -1644,7 +1647,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // level (`pricing_catalog_id`), and an unstamped journal
                 // is accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":27,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":28,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

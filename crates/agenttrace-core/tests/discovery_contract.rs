@@ -979,16 +979,19 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        // v27 (integration of run b1ff12f8, rm-542 Codex custom-tools
-        // parse coverage, re-based off the campaign's 22 -> 23 bump;
-        // 26 was the rm-485 copilot session-wide credit accounting,
+        // v28 (run c90a0f00, rm-655 qwen multi-result usage latch:
+        // every usage-bearing qwen-code result record now contributes,
+        // deduped by timestamp + totals, instead of only the first);
+        // 27 was integration of run b1ff12f8, rm-542 Codex custom-tools
+        // parse coverage, re-based off the campaign's 22 -> 23 bump,
+        // 26 the rm-485 copilot session-wide credit accounting,
         // 25 the rm-450 workbuddy input-basis disclosure, 24 the
-        // rm-436/437/438 pi journal accounting, 23 rm-408, 22 was run
+        // rm-436/437/438 pi journal accounting, 23 rm-408, 22 run
         // 2c2db6f5 rm-400/401): parser-semantics fixes bump the schema
         // so warm entries regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1153,14 +1156,15 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v27 — see the rm-542, rm-485, rm-450,
+        // version (v28 — see the rm-655, rm-542, rm-485, rm-450,
         // rm-436/437/438, rm-408 and rm-400/401 bump notes in
-        // session_cache.rs; the Codex custom-tools parse coverage is
-        // what carried 26 -> 27 at this integration, re-based off the
-        // campaign's 22 -> 23 bump).
+        // session_cache.rs; the qwen multi-result usage latch carried
+        // 27 -> 28, the Codex custom-tools parse coverage 26 -> 27 at
+        // this integration, re-based off the campaign's 22 -> 23
+        // bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(27)
+            Some(28)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1940,6 +1944,15 @@ fn rust_parses_qwen_code_stream_jsonl() {
     assert_eq!(metrics.assistant_turns, 1);
     assert_eq!(metrics.tool_calls_total, 1);
     assert_eq!(metrics.tool_calls_ok, 1);
+    // rm-655 review fix (independent_review e6b826a3 F1): this stream's
+    // assistant message and its closing result record are ONE turn — the
+    // result record's usage restates the turn's accounting (claude-code
+    // wire semantics; the claude lane parses assistant records only), so
+    // counting both would double the turn (240/90). The per-turn latch
+    // skips the closing result record when the turn's assistant message
+    // already carried usage, and the interleaved tool-loop user records
+    // do not open a new turn: input 120 once, output 45 once, with the
+    // cache totals riding the assistant record (10/5).
     assert_eq!(metrics.tokens_input, 120);
     assert_eq!(metrics.tokens_output, 45);
     assert_eq!(metrics.tokens_cache_r, 10);

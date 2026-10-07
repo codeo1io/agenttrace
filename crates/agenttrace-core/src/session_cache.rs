@@ -5,7 +5,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
+// Bumped 27 -> 28 (rm-655, run c90a0f00 repository-maintenance cycle 2):
+// the qwen_code "result" arm latched on the FIRST usage-bearing record
+// (`if !has_usage`), so a multi-turn qwen-code session reported only its
+// first turn's tokens — three 10/5 result records parsed as 10/5 instead
+// of 30/15. Every usage-bearing result record now contributes (deduped
+// by timestamp + totals across the assistant and result arms, the
+// claude-lane seen_usage_snapshots precedent), so reported totals change
+// for unchanged files, which warm v27 entries still carry pre-fix.
+// NUMERAL BASE (corrected by independent_review e6b826a3 F2 — the
+// original comment claimed the band's single coordinated slot, which
+// was wrong): this bump is BASE-RELATIVE to 8991144, not fleet-wide.
+// Sibling deltas DO carry their own 27 -> 28 riders (run-e5653f52
+// rm-616/rm-617, mtime 2026-10-06 17:27Z, predating this batch's
+// 23:45Z; run-91833f02 likewise), and origin/master has already
+// advanced to 32 (re-verified 2026-10-07 at 92149bd). The commit gate
+// re-censuses the ceiling and re-bases this numeral onto it per the
+// rm-230 convention — one invalidation per landing either way —
+// realigning the residual literal sites (discovery_contract pins, the
+// TUI warm-cache fixture, the governance schema sentence) in the same
+// delta. Entries regenerate once on next scan.
 // Bumped 26 -> 27 (integration of run b1ff12f8, rm-542, minted
 // campaign-locally as rm-449): the Codex custom-tools response items are
 // now parsed — custom_tool_call / custom_tool_call_output pairs count as

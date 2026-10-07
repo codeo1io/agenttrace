@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 27 and the SQLite snapshot is schema 7; the
+The session cache is schema 28 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -83,7 +83,14 @@ input-basis disclosure counters joined Metrics.line_skips (rm-450), to
 (`totalNanoAiu` shutdown reads and `usage_checkpoint` snapshots, rm-485),
 and to 27 when Codex custom-tools response items began counting as tool
 calls, results, and reasoning (custom_tool_call/custom_tool_call_output
-pairing and standalone reasoning items, rm-542), so cached sessions
+pairing and standalone reasoning items, rm-542), and to 28 when qwen
+multi-result sessions stopped dropping every usage-bearing result record
+after the first — each turn's usage rides either its assistant message
+or its closing result record: the closing result record is skipped when
+the turn's assistant message already carried usage (it restates the
+turn's accounting, claude-code wire semantics), verbatim re-emitted
+records count once by timestamp and totals, and per-call assistant
+usage sums (rm-655 review fix), so cached sessions
 regenerate under
 the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
