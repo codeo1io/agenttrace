@@ -5,15 +5,27 @@
 //!
 //! * the JSON-RPC handshake (initialize → notifications/initialized →
 //!   tools/list → tools/call) answers exactly one response per
-//!   request and stays silent for notifications;
+//!   request and stays silent for notifications, and `initialize`
+//!   negotiates the newest mutually supported protocol revision
+//!   instead of echoing the client's (rm-780);
 //! * both read-only tools render the same discovered corpus the CLI
 //!   reports on (`usage_overview` is the `--overview -f json`
-//!   document; `by_model_breakdown` is its `by_model` rollup);
+//!   document; `by_model_breakdown` is its `by_model` rollup), priced
+//!   through the same layered configuration the CLI resolves — a
+//!   `--config`/`--pricing-file` override moves both lanes equally
+//!   (rm-781), and `-d/--dir` before the keyword scopes the corpus;
+//! * flags before the `mcp` keyword are either honored (`-d`, the
+//!   config family) or refused at rc2 — never silently dropped
+//!   (rm-781);
 //! * malformed JSON, unknown methods, bad tool params, and batch
 //!   requests answer the JSON-RPC error arms (-32700/-32600/-32601/
-//!   -32602) instead of dying;
+//!   -32602) instead of dying, and so do hostile wire lines — a
+//!   non-UTF-8 line or one past the 1 MiB cap answers -32700 while
+//!   the server keeps serving (rm-782);
 //! * a discovered-but-empty corpus is a tool-level `isError` result —
-//!   the server exits 0 either way, because the host stays connected.
+//!   the server exits 0 either way, because the host stays connected,
+//!   and a corpus whose sessions fall outside the requested window
+//!   reports a filter miss, not a discovery miss (rm-781).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -51,27 +63,39 @@ fn seed_home(tag: &str, with_fixture: bool) -> (PathBuf, PathBuf) {
     (home, cache)
 }
 
-/// Run `agenttrace mcp` against the seeded home, feed it the whole
-/// request script, and return (exit status, parsed responses, stderr).
-/// The server is strictly line-sequential, so writing stdin to EOF and
-/// then reading stdout after exit is deterministic.
-fn mcp_session(home: &Path, cache: &Path, requests: &str) -> (Option<i32>, Vec<Value>, String) {
+/// Run the built CLI with `argv` (which includes the `mcp` keyword
+/// when a server is wanted), a hermetic environment, and stdin fed
+/// from `input` to EOF; return (exit code, stdout response objects,
+/// stderr). Environment hermeticity matters as much as HOME: the mcp
+/// lane resolves the layered configuration (rm-781), so a leaking
+/// `XDG_CONFIG_HOME`/`AGENTTRACE_PRICING_FILE` from the parent would
+/// steer a user layer into a test that never asked for one.
+fn mcp_session_raw(
+    home: &Path,
+    cache: &Path,
+    argv: &[&str],
+    input: &[u8],
+) -> (Option<i32>, Vec<Value>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
-        .arg("mcp")
+        .args(argv)
         .env("HOME", home)
         .env("AGENTTRACE_SESSION_CACHE_DIR", cache)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("AGENTTRACE_PRICING_FILE")
+        .env_remove("AGENTTRACE_HISTORY_DIR")
+        .current_dir(home.parent().expect("seeded root"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn agenttrace mcp");
+        .expect("spawn agenttrace");
     child
         .stdin
         .as_mut()
         .expect("stdin piped")
-        .write_all(requests.as_bytes())
+        .write_all(input)
         .expect("write request script");
-    let output = child.wait_with_output().expect("collect mcp output");
+    let output = child.wait_with_output().expect("collect output");
     let responses = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -80,6 +104,37 @@ fn mcp_session(home: &Path, cache: &Path, requests: &str) -> (Option<i32>, Vec<V
     (
         output.status.code(),
         responses,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Run `agenttrace mcp` against the seeded home, feed it the whole
+/// request script, and return (exit status, parsed responses, stderr).
+/// The server is strictly line-sequential, so writing stdin to EOF and
+/// then reading stdout after exit is deterministic.
+fn mcp_session(home: &Path, cache: &Path, requests: &str) -> (Option<i32>, Vec<Value>, String) {
+    mcp_session_raw(home, cache, &["mcp"], requests.as_bytes())
+}
+
+/// Run the CLI to completion without a request script (the lanes that
+/// exit before serving — flag refusal, `-d` admission): stdin is null
+/// so a process that unexpectedly tries to serve hits EOF and exits
+/// rc0, which the caller's rc2 assertion then catches.
+fn cli_run(home: &Path, cache: &Path, argv: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(argv)
+        .env("HOME", home)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", cache)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("AGENTTRACE_PRICING_FILE")
+        .env_remove("AGENTTRACE_HISTORY_DIR")
+        .current_dir(home.parent().expect("seeded root"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run agenttrace");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
 }
@@ -127,7 +182,7 @@ fn handshake_tools_and_report_rendering() {
     assert_eq!(
         Some("2025-06-18"),
         init["result"]["protocolVersion"].as_str(),
-        "initialize echoes the client protocol version"
+        "a supported client version is negotiated to itself (rm-780)"
     );
     assert_eq!("agenttrace", init["result"]["serverInfo"]["name"]);
     assert!(
@@ -145,9 +200,12 @@ fn handshake_tools_and_report_rendering() {
     assert_eq!(names, vec!["usage_overview", "by_model_breakdown"]);
     let range_enum = &tools[0]["inputSchema"]["properties"]["range"]["enum"];
     assert_eq!(
-        serde_json::json!(["today", "7d", "30d", "all"]),
+        serde_json::json!([
+            "today", "day", "1d", "7d", "week", "weekly", "30d", "month", "monthly", "all", ""
+        ]),
         *range_enum,
-        "the tool schema must offer exactly the CLI's range labels"
+        "the tool schema must publish exactly the labels TimeRange::parse \
+         enforces (rm-782)"
     );
 
     // usage_overview answers with the CLI's own overview document —
@@ -205,8 +263,9 @@ fn range_scopes_the_report_window() {
         responses[0]["result"]["content"][0]["text"]
             .as_str()
             .expect("error text")
-            .contains("No session files found"),
-        "the empty-corpse message must name the failure"
+            .contains("No sessions match the requested filters"),
+        "a discovered corpus with zero in-window sessions is a FILTER \
+         miss naming the discovery count, not a discovery miss (rm-781)"
     );
     // Absent arguments default to `all` — the second call reports.
     assert_eq!(false, responses[1]["result"]["isError"]);
@@ -270,8 +329,14 @@ fn refusal_arms_match_json_rpc_error_codes() {
         responses[3]["error"]["message"]
             .as_str()
             .expect("message")
-            .contains("today, 7d, 30d, all"),
-        "bad ranges must list the allowed labels"
+            .contains("weekly")
+            && responses[3]["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("monthly"),
+        "bad ranges must list the full alias set the parser enforces \
+         (rm-782): {}",
+        responses[3]["error"]["message"]
     );
     assert_eq!(Some(-32602), code_of(4));
     assert_eq!(Some(-32602), code_of(5));
@@ -305,4 +370,429 @@ fn empty_home_is_a_tool_error_not_a_crash() {
         .expect("error text")
         .contains("No session files found"));
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn protocol_version_is_negotiated_never_echoed() {
+    // rm-780: `initialize` answers the newest revision BOTH sides
+    // speak. A declared-in-set version is answered with itself; an
+    // unknown or absent one falls back to the server's newest with a
+    // one-line stderr disclosure (stdout stays protocol-only). The
+    // pre-fix server echoed `"1999-99-99"` back verbatim, claiming
+    // support for a version it does not speak (assess F5a PoC).
+    let (home, cache) = seed_home("negotiate", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"1999-99-99","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+    );
+    let (code, responses, stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(4, responses.len());
+    let answered = |index: usize| responses[index]["result"]["protocolVersion"].as_str();
+    assert_eq!(Some("2026-07-28"), answered(0), "newest supported answered");
+    assert_eq!(
+        Some("2026-07-28"),
+        answered(1),
+        "unknown versions fall back to the server's newest — never an echo"
+    );
+    assert_eq!(
+        Some("2026-07-28"),
+        answered(2),
+        "absent versions fall back to the server's newest"
+    );
+    assert_eq!(
+        Some("2025-11-25"),
+        answered(3),
+        "older mutual revision honored"
+    );
+    assert!(
+        stderr.contains("1999-99-99") && stderr.contains("does not speak"),
+        "the fallback discloses on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("<none>"),
+        "the absent-version arm names its shape: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn hostile_wire_lines_answer_32700_and_stay_up() {
+    // rm-782 (assess F2): one non-UTF-8 line used to kill the whole
+    // server with rc1 and no response (`lines()` surfaced InvalidData
+    // as a fatal error). The byte-level lane now answers -32700 and
+    // keeps serving — the next request is answered normally.
+    let (home, cache) = seed_home("nonutf8", false);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
+    payload.extend_from_slice(&[0xff, 0xfe, 0x00, b'b', b'a', b'd', b'\n']);
+    payload.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+    let (code, responses, _stderr) = mcp_session_raw(&home, &cache, &["mcp"], &payload);
+    assert_eq!(Some(0), code, "undecodable bytes are not a crash");
+    assert_eq!(3, responses.len(), "every line is answered in order");
+    assert!(responses[0]["result"].is_object());
+    assert_eq!(
+        Some(-32700),
+        responses[1]["error"]["code"].as_i64(),
+        "non-UTF-8 is wire garbage: parse error"
+    );
+    assert!(
+        responses[1]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("UTF-8"),
+        "the refusal names the failure class"
+    );
+    assert_eq!(
+        serde_json::json!(null),
+        responses[1]["id"],
+        "parse errors answer with id null"
+    );
+    assert!(
+        responses[2]["result"].is_object(),
+        "the server keeps serving after garbage"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn oversized_line_answers_32700_and_stays_up() {
+    // rm-782: a line past the 1 MiB cap is drained without storing and
+    // answered -32700; the next line is framed and served normally.
+    // (Memory-bounding arm of the byte-level reader.)
+    let (home, cache) = seed_home("oversized", false);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
+    payload.extend_from_slice(&vec![b'a'; (1 << 20) + 1]);
+    payload.push(b'\n');
+    payload.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+    let (code, responses, _stderr) = mcp_session_raw(&home, &cache, &["mcp"], &payload);
+    assert_eq!(Some(0), code);
+    assert_eq!(3, responses.len());
+    assert!(responses[0]["result"].is_object());
+    assert_eq!(
+        Some(-32700),
+        responses[1]["error"]["code"].as_i64(),
+        "an over-cap line is refused, not buffered"
+    );
+    assert!(
+        responses[1]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("1 MiB"),
+        "the refusal names the cap: {}",
+        responses[1]["error"]["message"]
+    );
+    assert!(
+        responses[2]["result"].is_object(),
+        "the stream stays framed after the drain"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn invalid_request_shapes_answer_spec_errors() {
+    // rm-782 (assess F5b/F6a): ids outside String|Number|Null answer
+    // -32600 with id null instead of being echoed back; non-object
+    // `params` and non-object `arguments` answer -32602 instead of
+    // silently behaving like an absent value (which used to render a
+    // full default report for a structurally bad call).
+    let (home, cache) = seed_home("shapes", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":[1,2],"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"ping","params":7}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"usage_overview","arguments":5}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(4, responses.len());
+    assert_eq!(
+        Some(-32600),
+        responses[0]["error"]["code"].as_i64(),
+        "array ids violate JSON-RPC 2.0"
+    );
+    assert_eq!(
+        serde_json::json!(null),
+        responses[0]["id"],
+        "an undecodable id is answered with id null, never echoed"
+    );
+    assert_eq!(
+        Some(-32602),
+        responses[1]["error"]["code"].as_i64(),
+        "non-object params are invalid params"
+    );
+    assert!(
+        responses[1]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("params"),
+        "the message names the field"
+    );
+    assert_eq!(
+        Some(-32602),
+        responses[2]["error"]["code"].as_i64(),
+        "non-object arguments are invalid params, not a default report"
+    );
+    assert!(
+        responses[2]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("arguments"),
+        "the message names the field"
+    );
+    assert!(
+        responses[3]["result"].is_object(),
+        "the server keeps serving after every refusal"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn range_alias_schema_matches_the_enforced_parser() {
+    // rm-782 (assess F6b): the published enum used to under-declare the
+    // parser (`day`, `1d`, `week`, `weekly`, `month`, `monthly`, `""`
+    // accepted but unpublished), so schema-validating hosts refused
+    // calls the server itself would have answered. The schema now
+    // publishes the enforced set, and every alias round-trips.
+    let (home, cache) = seed_home("aliases", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"day"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"weekly"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":""}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(4, responses.len());
+    let enums: Vec<Value> = responses[0]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["inputSchema"]["properties"]["range"]["enum"].clone())
+        .collect();
+    for published in enums {
+        assert_eq!(
+            serde_json::json!([
+                "today", "day", "1d", "7d", "week", "weekly", "30d", "month", "monthly", "all", ""
+            ]),
+            published,
+            "every tool publishes the full enforced set"
+        );
+    }
+    for response in &responses[1..] {
+        assert!(
+            response.get("error").is_none(),
+            "every published alias is accepted by the parser: {response}"
+        );
+    }
+    // The empty string is the `all` default spelled out: it reports.
+    assert_eq!(false, responses[3]["result"]["isError"]);
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn inapplicable_flags_before_the_keyword_are_refused() {
+    // rm-781 (assess F3): flags placed BEFORE the `mcp` keyword used
+    // to be accepted by clap and then silently ignored — the server
+    // started as if nothing was asked. The lane now refuses every
+    // flag that cannot apply, at rc2, naming the refused flag, the
+    // honored set, and the help route.
+    let (home, cache) = seed_home("flagrefusal", false);
+    let (code, _stdout, stderr) = cli_run(&home, &cache, &["--overview", "mcp"]);
+    assert_eq!(
+        Some(2),
+        code,
+        "a report action cannot apply to a stdio server: rc2, not silence"
+    );
+    assert!(
+        stderr.contains("--overview") && stderr.contains("cannot apply to the MCP"),
+        "the refusal names the flag and the reason: {stderr}"
+    );
+    assert!(
+        stderr.contains("agenttrace mcp --help"),
+        "the refusal routes to the keyword help: {stderr}"
+    );
+
+    let (code, _stdout, stderr) = cli_run(&home, &cache, &["-f", "json", "mcp"]);
+    assert_eq!(Some(2), code);
+    assert!(
+        stderr.contains("--format/-f"),
+        "value flags are refused by their spelled name: {stderr}"
+    );
+
+    // The honored family sails through the refusal arm — it reaches
+    // the server (which then exits rc0 on stdin EOF).
+    let (code, _stdout, _stderr) =
+        mcp_session_raw(&home, &cache, &["--pricing-file", "/dev/null", "mcp"], b"");
+    assert_eq!(
+        Some(0),
+        code,
+        "the config family before the keyword is honored, not refused"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn dir_flag_scopes_the_server_corpus() {
+    // rm-781 (assess F3): `-d` before the keyword used to be parsed
+    // and silently dropped, so an explicitly chosen corpus answered
+    // the auto-discovery remedy. It is now honored — and admitted
+    // with the same rc2 check the report lane runs.
+    let (seeded, _seeded_cache) = seed_home("dirflag-seeded", true);
+    let (empty_home, cache) = seed_home("dirflag-empty", false);
+    let corpus = seeded.join(".hermes").join("sessions");
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session_raw(
+        &empty_home,
+        &cache,
+        &["-d", corpus.to_str().expect("utf-8 path"), "mcp"],
+        requests.as_bytes(),
+    );
+    assert_eq!(Some(0), code);
+    assert_eq!(1, responses.len());
+    assert_eq!(
+        false, responses[0]["result"]["isError"],
+        "the `-d` corpus must be reported even though HOME is empty: {}",
+        responses[0]["result"]["content"][0]["text"]
+    );
+    let payload = text_payload(&responses[0]);
+    assert!(
+        payload["by_model"]
+            .as_array()
+            .expect("by_model")
+            .iter()
+            .any(|row| row["name"] == "gpt-5"),
+        "the seeded corpus must roll up: {payload}"
+    );
+
+    // Admission parity with the report lane: a missing `-d` target is
+    // a usage error (rc2), not an empty corpus.
+    let missing = empty_home.join("does-not-exist");
+    let (code, _stdout, stderr) = cli_run(
+        &empty_home,
+        &cache,
+        &["-d", missing.to_str().expect("utf-8 path"), "mcp"],
+    );
+    assert_eq!(Some(2), code);
+    assert!(
+        stderr.contains("session directory does not exist"),
+        "the admission check names the failure: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(seeded.parent().expect("root"));
+    let _ = std::fs::remove_dir_all(empty_home.parent().expect("root"));
+}
+
+#[test]
+fn config_layer_prices_the_mcp_tools_identically_to_the_cli() {
+    // rm-781 (assess F1): the mcp dispatch used to run BEFORE the
+    // layered configuration was resolved, so a `--config` pricing
+    // override moved the CLI's answer and left the MCP tools on
+    // snapshot pricing under the SAME override (PoC: CLI 0.003 vs MCP
+    // 0.0). Both lanes now resolve the same config: one truth, one
+    // number. The control arm pins the divergence the PoC observed.
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-mcp-configparity-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let pricing = scratch.join("pricing.json");
+    std::fs::write(
+        &pricing,
+        r#"{"prices": {"gpt-5": {"input": 1000.0, "output": 1000.0, "cw": 1000.0, "cr": 1000.0}}, "aliases": {}}"#,
+    )
+    .expect("write pricing override");
+    let config = scratch.join("config.toml");
+    std::fs::write(
+        &config,
+        format!("pricing_file = \"{}\"\n", pricing.display()),
+    )
+    .expect("write config layer");
+
+    let overview_call = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"usage_overview","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+
+    // Priced arm: the explicit config layer reaches the MCP tools.
+    let (home_priced, cache_priced) = seed_home("configparity-priced", true);
+    let (code, responses, _stderr) = mcp_session_raw(
+        &home_priced,
+        &cache_priced,
+        &["--config", config.to_str().expect("utf-8 path"), "mcp"],
+        overview_call.as_bytes(),
+    );
+    assert_eq!(Some(0), code);
+    assert_eq!(1, responses.len());
+    assert_eq!(false, responses[0]["result"]["isError"]);
+    let mcp_cost = text_payload(&responses[0])["summary"]["total_cost"]
+        .as_f64()
+        .expect("total_cost is a number");
+    assert!(
+        (0.002..=0.004).contains(&mcp_cost),
+        "the override must price the MCP answer (expected ~0.003): {mcp_cost}"
+    );
+
+    // CLI parity arm: same config, same home shape — same number.
+    let (home_cli, cache_cli) = seed_home("configparity-cli", true);
+    let (code, stdout, _stderr) = cli_run(
+        &home_cli,
+        &cache_cli,
+        &[
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--overview",
+            "-f",
+            "json",
+        ],
+    );
+    assert_eq!(Some(0), code, "CLI priced arm must succeed");
+    let cli_cost = serde_json::from_str::<Value>(&stdout).expect("overview json")["summary"]
+        ["total_cost"]
+        .as_f64()
+        .expect("total_cost is a number");
+    assert_eq!(
+        mcp_cost, cli_cost,
+        "MCP and CLI must report the same total under the same override"
+    );
+
+    // Control arm: no config layer, snapshot pricing — the two lanes
+    // are still identical, and both far from the override's price.
+    let (home_plain, cache_plain) = seed_home("configparity-plain", true);
+    let (code, responses, _stderr) = mcp_session_raw(
+        &home_plain,
+        &cache_plain,
+        &["mcp"],
+        overview_call.as_bytes(),
+    );
+    assert_eq!(Some(0), code);
+    let plain_cost = text_payload(&responses[0])["summary"]["total_cost"]
+        .as_f64()
+        .expect("total_cost");
+    assert_eq!(
+        0.0, plain_cost,
+        "without the override the snapshot prices 3 tokens at zero"
+    );
+
+    let _ = std::fs::remove_dir_all(home_priced.parent().expect("root"));
+    let _ = std::fs::remove_dir_all(home_cli.parent().expect("root"));
+    let _ = std::fs::remove_dir_all(home_plain.parent().expect("root"));
+    let _ = std::fs::remove_dir_all(&scratch);
 }
