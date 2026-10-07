@@ -109,18 +109,70 @@ pub fn render_doctor_report(
     }
 }
 
-pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
+/// Discovery inputs for [`build_doctor_report`] after the rm-596 demo
+/// gate: the session-cache report, its on-disk size, the walked session
+/// files, and the non-file sessions (SQLite-backed, or the bundled demo
+/// corpus under `--demo`).
+struct DoctorDiscovery {
+    cache: SessionCacheReport,
+    cache_size_bytes: u64,
+    files: Vec<PathBuf>,
+    sessions: Vec<Session>,
+}
+
+/// rm-596: the single demo gate for the doctor report's discovery lanes.
+/// `--doctor --demo` used to gate only the SQLite lane, so the file
+/// discovery lane walked the operator's REAL corpus while the report was
+/// labeled "demo sessions" — real session counts, real project paths,
+/// and a full home walk disclosed under a demo label. Under `demo` every
+/// host-derived lane now short-circuits here: the file lane walks
+/// nothing, the session lane carries the bundled [`crate::demo_sessions`]
+/// corpus, and the session-cache lane reports its path with zeroed
+/// counts (the shape [`doctor_statusline_report`]'s demo arm
+/// established), so a demo report reads no operator state beyond path
+/// strings.
+fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
+    if demo {
+        return DoctorDiscovery {
+            cache: SessionCacheReport {
+                path: session_cache_path(),
+                entries: BTreeMap::new(),
+                dirs: 0,
+            },
+            cache_size_bytes: 0,
+            files: Vec::new(),
+            sessions: crate::demo_sessions().expect("bundled demo corpus"),
+        };
+    }
     let cache = load_session_cache_report();
+    let cache_size_bytes = std::fs::metadata(&cache.path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let files = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
         find_session_files(dir)
     };
-    let sqlite_sessions = if dir.is_none() && !demo {
+    let sessions = if dir.is_none() {
         load_sqlite_backed_sessions()
     } else {
         Vec::new()
     };
+    DoctorDiscovery {
+        cache,
+        cache_size_bytes,
+        files,
+        sessions,
+    }
+}
+
+pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
+    let DoctorDiscovery {
+        cache,
+        cache_size_bytes,
+        files,
+        sessions,
+    } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
         "demo sessions"
@@ -134,8 +186,9 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     let mut disclosures = BTreeMap::new();
     let directories = doctor_directories(
         dir,
+        demo,
         &files,
-        &sqlite_sessions,
+        &sessions,
         &mut project_decode,
         &mut zero_usage,
         &mut disclosures,
@@ -150,15 +203,13 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_entries: cache.entries.len(),
         cache_dirs: cache.dirs,
         cached_valid,
-        cache_size_bytes: std::fs::metadata(&cache.path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
+        cache_size_bytes,
         cache_limits: format!(
             "entries<={}, bytes<={}",
             crate::session_cache::MAX_SESSION_CACHE_ENTRIES,
             crate::session_cache::MAX_SESSION_CACHE_BYTES
         ),
-        sessions: files.len() + sqlite_sessions.len(),
+        sessions: files.len() + sessions.len(),
         session_files: files.len(),
         project_decode,
         zero_usage,
@@ -399,12 +450,33 @@ fn find_reportable_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
 
 fn doctor_directories(
     dir: Option<&Path>,
+    demo: bool,
     files: &[PathBuf],
-    sqlite_sessions: &[Session],
+    sessions: &[Session],
     project_decode: &mut DoctorProjectDecodeReport,
     zero_usage: &mut DoctorZeroUsageReport,
     disclosures: &mut BTreeMap<String, usize>,
 ) -> Vec<DoctorDirReport> {
+    if demo {
+        // rm-596 demo gate: enumerate no real root — both
+        // `known_session_dirs()` and `doctor_sqlite_directories()` probe
+        // the operator's home (paths, `is_dir()`/`is_file()` checks,
+        // symlink targets). The bundled corpus is folded through the
+        // SAME two channels as the non-demo fold below —
+        // `disclosure_counters` and, since rm-526, `line_skips` — so a
+        // scanned session discloses identically regardless of backing
+        // store and the demo report still exercises that aggregate; a
+        // demo fixture with a torn tail must not silently vanish here.
+        for session in sessions {
+            for (key, count) in &session.metrics.disclosure_counters {
+                *disclosures.entry(key.clone()).or_insert(0) += count;
+            }
+            for (key, count) in &session.metrics.line_skips {
+                *disclosures.entry(key.clone()).or_insert(0) += count;
+            }
+        }
+        return Vec::new();
+    }
     let mut cache = load_session_cache();
     if let Some(dir) = dir {
         let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -448,11 +520,12 @@ fn doctor_directories(
             disclosures,
         ));
     }
-    dirs.extend(doctor_sqlite_directories(sqlite_sessions));
-    // SQLite-backed sessions never flow through doctor_dir_report; fold
-    // their disclosure counters in directly so every scanned session
-    // discloses identically regardless of backing store.
-    for session in sqlite_sessions {
+    dirs.extend(doctor_sqlite_directories(sessions));
+    // SQLite-backed sessions (and, under `--demo`, the bundled corpus)
+    // never flow through doctor_dir_report; fold their disclosure
+    // counters in directly so every scanned session discloses
+    // identically regardless of backing store.
+    for session in sessions {
         for (key, count) in &session.metrics.disclosure_counters {
             *disclosures.entry(key.clone()).or_insert(0) += count;
         }
@@ -616,7 +689,7 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
     }
     if demo {
         recommendations.push(
-            "Demo sessions use a temporary directory, so cache reuse is not expected in this mode."
+            "Demo sessions are bundled in memory, so cache reuse does not apply in this mode."
                 .to_string(),
         );
         return recommendations;
@@ -1047,5 +1120,47 @@ mod tests {
             "sanitized disclosure key visible in doctor text"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn demo_directory_lane_folds_every_disclosure_channel() {
+        // rm-596 × rm-526: the demo arm must fold the bundled corpus
+        // through BOTH disclosure channels — `disclosure_counters` and
+        // `line_skips` — exactly like the non-demo fold below it. The
+        // demo arm was authored before rm-526 landed, so a demo fixture
+        // carrying a torn tail would otherwise silently vanish from the
+        // demo doctor report (the rm-449 nothing-silent contract).
+        let mut session = session_at("", "demo://torn-tail.jsonl");
+        session
+            .metrics
+            .disclosure_counters
+            .insert("pi_usage_entry:session".to_string(), 2);
+        session
+            .metrics
+            .line_skips
+            .insert("unparseable_line".to_string(), 3);
+        let mut project_decode = DoctorProjectDecodeReport::default();
+        let mut zero_usage = DoctorZeroUsageReport::default();
+        let mut disclosures = BTreeMap::new();
+        let dirs = doctor_directories(
+            None,
+            true,
+            &[],
+            &[session],
+            &mut project_decode,
+            &mut zero_usage,
+            &mut disclosures,
+        );
+        assert!(dirs.is_empty(), "demo enumerates no real root: {dirs:?}");
+        assert_eq!(
+            disclosures.get("pi_usage_entry:session"),
+            Some(&2),
+            "disclosure_counters fold: {disclosures:?}"
+        );
+        assert_eq!(
+            disclosures.get("unparseable_line"),
+            Some(&3),
+            "line_skips fold (rm-526 channel): {disclosures:?}"
+        );
     }
 }
