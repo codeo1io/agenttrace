@@ -1685,3 +1685,220 @@ fn env_history_knob_sits_below_config_layers_end_to_end() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn side_effect_early_exits_do_not_swallow_coadjacent_actions() {
+    // rm-301 family (cycle 3, assess 7276 A1/A2): the side-effect early
+    // exits used to consult two predicates that each knew only part of
+    // the action surface, so `--clear-cache --doctor` (and
+    // --list-models / --test-match / --statusline-report / --budget)
+    // printed "Session cache cleared." and exited 0 without ever
+    // running the co-requested action. A requested action must never be
+    // silently dropped by a pre-action early exit: both guards consult
+    // one shared helper now, pinned here across the acceptance matrix
+    // {--clear-cache} x {doctor, list-models, test-match,
+    // statusline-report, budget, report verbs}. The --update-pricing
+    // guard shares the same helper; its e2e lane is network-bound
+    // (pricing.rs downloads from LiteLLM), so it is pinned by the
+    // `has_followup_action` unit matrix in main.rs instead.
+    let sandbox = std::env::temp_dir().join(format!(
+        "agenttrace-rm301-matrix-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = sandbox.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &sandbox)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(args)
+            .output()
+            .expect("run agenttrace CLI")
+    };
+
+    // Machine form: stdout is the co-requested action's single JSON
+    // document (the announcement stays on stderr per rm-301), and the
+    // action's own top-level shape is present.
+    let object_rows: &[(&[&str], &str)] = &[
+        (&["--doctor"], "session_files"),
+        (&["--list-models"], "models"),
+        (&["--statusline-report"], "journal"),
+        (&["--budget"], "journal"),
+        (&["--overview", "--demo"], "data_health"),
+    ];
+    for (action, key) in object_rows {
+        let mut argv = vec!["--clear-cache", "-f", "json"];
+        argv.extend_from_slice(action);
+        let out = run(&argv);
+        assert!(
+            out.status.success(),
+            "--clear-cache {action:?} failed: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let doc: serde_json::Value =
+            serde_json::from_str(stdout.trim_end()).unwrap_or_else(|err| {
+                panic!(
+                    "--clear-cache {action:?}: stdout must be the action's JSON document ({err}), got: {stdout}"
+                )
+            });
+        assert!(
+            doc.get(key).is_some(),
+            "--clear-cache {action:?}: report key {key:?} missing, got {:?}",
+            doc.as_object().map(|map| map.keys().collect::<Vec<_>>())
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Session cache cleared."),
+            "--clear-cache {action:?}: announcement must stay on stderr, got: {stderr}"
+        );
+    }
+
+    // --test-match renders the same object envelope as --list-models
+    // (source + one row per probe model), never a top-level array.
+    let out = run(&["--clear-cache", "-f", "json", "--test-match"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim_end()).unwrap_or_else(|err| {
+        panic!("--clear-cache --test-match: stdout must be the test-match JSON document ({err}), got: {stdout}")
+    });
+    assert!(
+        doc.get("models").is_some() && doc.get("source").is_some(),
+        "--clear-cache --test-match: match report missing, got: {stdout}"
+    );
+
+    // Human form: the announcement stays on stdout AND the
+    // co-requested action still runs after it.
+    let human = run(&["--clear-cache", "--doctor"]);
+    assert!(human.status.success());
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("Session cache cleared."),
+        "human path keeps the announcement on stdout, got: {human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("Session files"),
+        "--clear-cache --doctor must still run the doctor report, got: {human_stdout}"
+    );
+
+    // The early exit itself survives: --clear-cache ALONE clears and
+    // exits without running any report or launching the TUI.
+    let alone = run(&["--clear-cache"]);
+    assert!(alone.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&alone.stdout).trim_end(),
+        "Session cache cleared.",
+        "--clear-cache alone keeps the clear-and-exit contract"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn doctor_json_artifact_carries_config_disclosure() {
+    // rm-656 (assess 7276 A5): `--doctor -f json -o <file>` used to
+    // write a report-only artifact while the terminal path printed the
+    // config-layer disclosure doc to stderr (rm-384) — archiving the
+    // run silently lost the layer/knob provenance. The artifact now
+    // embeds the SAME payload as a top-level `config_disclosure`
+    // object; the stdout document and the stderr disclosure doc stay
+    // byte-identical to the terminal contract, and text mode (which
+    // already embeds `config::disclosure_text`) is unchanged.
+    let sandbox = std::env::temp_dir().join(format!(
+        "agenttrace-rm656-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&sandbox).expect("create sandbox");
+    let artifact = sandbox.join("doctor.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &sandbox)
+            .env("XDG_CACHE_HOME", sandbox.join("cache"))
+            .args(args)
+            .output()
+            .expect("run agenttrace CLI")
+    };
+
+    // `-o` form: the artifact is self-contained.
+    let saved = run(&[
+        "--doctor",
+        "-f",
+        "json",
+        "-o",
+        artifact.to_str().expect("utf-8 sandbox path"),
+    ]);
+    assert!(
+        saved.status.success(),
+        "doctor -o failed: {:?}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&artifact).expect("artifact written"))
+            .expect("artifact parses as one JSON document");
+    assert!(
+        file.get("session_files").is_some(),
+        "the report body is intact: {:?}",
+        file.as_object().map(|map| map.keys().collect::<Vec<_>>())
+    );
+    let disclosure = file
+        .get("config_disclosure")
+        .expect("the -o artifact embeds the config-layer disclosure payload (rm-656)");
+    assert!(
+        disclosure.get("knobs").is_some(),
+        "embedded disclosure carries the knob provenance: {disclosure}"
+    );
+
+    // Parity: the embedded payload equals the terminal stderr document.
+    let stderr = String::from_utf8_lossy(&saved.stderr);
+    let stderr_doc: serde_json::Value = serde_json::Deserializer::from_str(stderr.trim_start())
+        .into_iter()
+        .next()
+        .expect("terminal path still prints the disclosure doc to stderr (rm-384)")
+        .expect("stderr disclosure doc parses");
+    assert_eq!(
+        disclosure, &stderr_doc,
+        "artifact payload == terminal payload (rm-656 parity)"
+    );
+
+    // The stdout document keeps the rm-384 terminal contract.
+    let stdout: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&saved.stdout).trim_end())
+            .expect("stdout stays one pure JSON document");
+    assert!(
+        stdout.get("config_disclosure").is_none(),
+        "stdout document is unchanged; the disclosure lives on stderr"
+    );
+
+    // stdout form without -o: rm-384 untouched.
+    let terminal = run(&["--doctor", "-f", "json"]);
+    assert!(terminal.status.success());
+    let terminal_stdout: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&terminal.stdout).trim_end())
+            .expect("stdout form stays one pure JSON document");
+    assert!(terminal_stdout.get("config_disclosure").is_none());
+    assert!(
+        String::from_utf8_lossy(&terminal.stderr).contains("\"knobs\""),
+        "terminal disclosure doc stays on stderr"
+    );
+
+    // Text mode: the disclosure stays embedded exactly as before.
+    let text_path = sandbox.join("doctor.txt");
+    let text = run(&[
+        "--doctor",
+        "-o",
+        text_path.to_str().expect("utf-8 sandbox path"),
+    ]);
+    assert!(text.status.success());
+    let text_file = std::fs::read_to_string(&text_path).expect("text artifact written");
+    assert!(
+        text_file.starts_with("Configuration:"),
+        "text artifacts keep the config::disclosure_text prefix: {}",
+        &text_file[..text_file.len().min(120)]
+    );
+    assert!(text_file.contains("Session files"));
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
