@@ -133,6 +133,30 @@ Overview sections (`--overview` required): `# summary`, `# by_model`,
 bails loudly (`csv format requires --overview or --sessions`) instead of
 silently rendering the text report.
 
+### Local MCP server (rm-623)
+
+`agenttrace mcp` is a local read-only MCP server: newline-delimited
+JSON-RPC 2.0 over stdio, so a coding agent can ask about its own token
+usage from inside the session that burned it. Two tools render the same
+locally discovered sessions the CLI reports on — `usage_overview` (the
+`--overview -f json` document) and `by_model_breakdown` (cost and
+sessions per model). The server opens no sockets, performs no network
+probes, and writes nothing outside the agenttrace session cache; it
+serves until stdin closes.
+
+```json
+{
+  "mcpServers": {
+    "agenttrace": { "command": "agenttrace", "args": ["mcp"] }
+  }
+}
+```
+
+Registration snippets for Claude Code and Codex, the full protocol
+surface, error-arm mapping, and a tool-call transcript:
+[docs/guides/mcp-server.md](docs/guides/mcp-server.md). (The keyword is
+unrelated to the `--mcp-governance` report flag.)
+
 ### Governance reports
 
 ```bash

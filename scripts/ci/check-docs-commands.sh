@@ -79,3 +79,27 @@ fi
 # after the first positional are ignored.
 grep -q 'before the session path\|before the first positional' README.md \
   || fail "README must document that flags go before the positional session path"
+
+# rm-623: the MCP server guide must exist and pin the local-truth
+# posture truthfully — read-only, stdio-only, no network — the same
+# one-truth rule the other guides carry. The guide must also keep the
+# `mcp` keyword disambiguated from the unrelated --mcp-governance
+# report flag, and the binary must actually expose the keyword.
+guide="$repo_root/docs/guides/mcp-server.md"
+[[ -f "$guide" ]] || fail "docs/guides/mcp-server.md is required (rm-623)"
+grep -q 'agenttrace mcp' "$guide" \
+  || fail "mcp-server.md must show the 'agenttrace mcp' host command"
+grep -q 'read-only\|Read-only' "$guide" \
+  || fail "mcp-server.md must state the read-only posture"
+grep -q 'no network\|No network' "$guide" \
+  || fail "mcp-server.md must state the no-network posture"
+grep -q -- '--mcp-governance' "$guide" \
+  || fail "mcp-server.md must disambiguate the --mcp-governance report flag"
+"$bin" mcp --help >"$out_dir/docs/mcp-help.txt"
+grep -q 'agenttrace mcp' "$out_dir/docs/mcp-help.txt" \
+  || fail "'agenttrace mcp --help' must render the keyword help route"
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | "$bin" mcp >"$out_dir/docs/mcp-tools.json"
+node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const names=r.result.tools.map(t=>t.name).sort(); if (names.join(",") !== "by_model_breakdown,usage_overview") { console.error("unexpected tools: " + names); process.exit(1); }' "$out_dir/docs/mcp-tools.json" \
+  || fail "the mcp server must expose exactly usage_overview and by_model_breakdown"

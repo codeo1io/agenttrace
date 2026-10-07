@@ -1365,8 +1365,8 @@ fn keyword_host_commands_have_real_help_routes() {
     // but `<keyword> --help` used to exit 2 with a mislabeled
     // "flag follows the positional session path" error and no help
     // route at all. Both keywords now render per-command help at rc0,
-    // with `-h` parity.
-    for keyword in ["statusline", "upstream"] {
+    // with `-h` parity. `mcp` joined the keyword set in rm-623.
+    for keyword in ["statusline", "upstream", "mcp"] {
         for help_flag in ["--help", "-h"] {
             let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
                 .args([keyword, help_flag])
@@ -1398,7 +1398,7 @@ fn keyword_bad_flag_error_names_the_keyword_not_a_session_path() {
     // discipline stands), but the error must be keyword-scoped usage —
     // not the "positional session path" mislabel — and must point at
     // the keyword's help route.
-    for keyword in ["statusline", "upstream"] {
+    for keyword in ["statusline", "upstream", "mcp"] {
         let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
             .args([keyword, "--bogus-flag"])
             .output()
