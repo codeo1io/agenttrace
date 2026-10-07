@@ -203,15 +203,53 @@ pub fn session_capability(session: &Session) -> &'static str {
 }
 
 pub fn resolve_project(session: &Session) -> ProjectIdentity {
-    let decoded;
-    let raw = if !session.cwd.trim().is_empty() {
-        session.cwd.trim()
-    } else if let Some(path) = decode_agent_project_dir(&session.path) {
-        decoded = path;
-        decoded.as_str()
-    } else {
-        ""
-    };
+    if !session.cwd.trim().is_empty() {
+        let raw = session.cwd.trim();
+        return resolved_from_path(raw);
+    }
+    match decode_agent_project_dir(&session.path) {
+        // The landed rm-381 walk: the whole encoded name verified.
+        ProjectDecode::Path(path) => resolved_from_path(&path),
+        // rm-240: the official format truncates encoded names over 200
+        // chars to 200 and suffixes a hash of the full path. The hash
+        // cannot be inverted, but it is stable — keep it in the identity
+        // so distinct long paths sharing the 200-char prefix stay
+        // distinct. Never let the git-root walk collapse the prefix: the
+        // real project root continues past the truncation, so claiming
+        // the prefix's repo root would over-claim attribution.
+        ProjectDecode::Truncated { prefix, hash } => {
+            let path = lexical_normalize(Path::new(&prefix));
+            let display_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&prefix)
+                .to_string();
+            ProjectIdentity {
+                id: format!("{}#{hash}", path.to_string_lossy()),
+                display_name: format!("{display_name}#{hash}"),
+                root: path.to_string_lossy().to_string(),
+                resolution: "truncated_encoded".to_string(),
+            }
+        }
+        // rm-240: an opaque CLAUDE_CODE_PROJECT_DIR_NAME-style name
+        // encodes no path; the name itself is the operator's chosen
+        // project identity — stable across relocations — so keep it as
+        // the id instead of collapsing distinct projects into `unknown`.
+        // No filesystem root is claimed.
+        ProjectDecode::Opaque { name } => ProjectIdentity {
+            id: name.clone(),
+            display_name: name,
+            root: String::new(),
+            resolution: "opaque_name".to_string(),
+        },
+        // Not filed under a `…/projects/<encoded>/` directory at all —
+        // the unchanged unattributed fallback.
+        ProjectDecode::None => resolved_from_path(""),
+    }
+}
+
+fn resolved_from_path(raw: &str) -> ProjectIdentity {
     if raw.is_empty() || raw.starts_with("history:") {
         return ProjectIdentity {
             id: "unknown".to_string(),
@@ -262,24 +300,156 @@ pub fn resolve_project(session: &Session) -> ProjectIdentity {
 // Residual ambiguity — a verified alternative was shadowed by the
 // longest-run rule at some step — is disclosed through
 // `project_decode_status` / `--doctor` instead of being decided silently.
-fn decode_agent_project_dir(session_path: &str) -> Option<String> {
-    let parts = encoded_project_components(session_path)?;
-    decode_encoded_components(&parts, false).map(|walk| walk.path)
+fn decode_agent_project_dir(session_path: &str) -> ProjectDecode {
+    match encoded_form(session_path) {
+        None => ProjectDecode::None,
+        Some(EncodedForm::Plain(parts)) => match decode_encoded_components(&parts, false) {
+            Some(EncodedWalk { path, .. }) => ProjectDecode::Path(path),
+            None => ProjectDecode::Opaque {
+                name: parts.join("-"),
+            },
+        },
+        Some(EncodedForm::Truncated { head, hash }) => {
+            // Prefer a COMPLETE decode of the head (the official cut can
+            // land on a component boundary); otherwise take the deepest
+            // ancestor the head verifies against. When not even the first
+            // component verifies, the name is opaque — not a truncated
+            // root, and not "unknown".
+            let prefix = decode_encoded_components(&head, false)
+                .map(|EncodedWalk { path, .. }| path)
+                .or_else(|| deepest_verified_prefix(&head));
+            match prefix {
+                Some(prefix) => ProjectDecode::Truncated { prefix, hash },
+                None => ProjectDecode::Opaque {
+                    name: head.join("-"),
+                },
+            }
+        }
+    }
 }
 
-/// The `-`-encoded project directory components of a transcript path
-/// (`…/projects/<encoded>/…`), with the leading '-' (the encoded root
-/// slash) stripped the way the encoders write it.
-fn encoded_project_components(session_path: &str) -> Option<Vec<&str>> {
-    let path = Path::new(session_path);
-    let dir = path.ancestors().find_map(|ancestor| {
+/// What a `-`-encoded projects directory name decoded to: the landed
+/// rm-381 walk plus the two rm-240 residual arms.
+enum ProjectDecode {
+    /// The transcript does not live under a `…/projects/<encoded>/`
+    /// directory at all.
+    None,
+    /// The whole encoded name verified against a directory.
+    Path(String),
+    /// The official >200-char truncate+hash form: `prefix` is the deepest
+    /// directory the truncated head verified against (the cut can land
+    /// mid-component), and the hash tail is opaque-but-stable.
+    Truncated { prefix: String, hash: String },
+    /// Nothing verified: an opaque name kept as its own stable identity.
+    Opaque { name: String },
+}
+
+/// Official truncation limit for `-`-encoded project directory names
+/// (code.claude.com/docs/en/sessions, captured 2026-10-03): names over
+/// 200 chars are truncated to 200 chars and suffixed with '-' + a hash
+/// of the full path. The hash length is not pinned by the official
+/// format, so the whole tail after the separator is kept — opaque, but
+/// stable: two long paths sharing the 200-char prefix stay distinct.
+const ENCODED_NAME_TRUNCATION_LIMIT: usize = 200;
+
+/// The encoded form of a transcript's `…/projects/<encoded>/` directory
+/// name: the plain `-`-split components, or the official >200-char
+/// truncate+hash form split into head components and hash tail.
+enum EncodedForm<'a> {
+    Plain(Vec<&'a str>),
+    Truncated { head: Vec<&'a str>, hash: String },
+}
+
+fn encoded_form(session_path: &str) -> Option<EncodedForm<'_>> {
+    let dir = encoded_project_dir_name(session_path)?;
+    let encoded = dir.trim_start_matches('-');
+    if encoded.is_empty() {
+        return None;
+    }
+    if dir.chars().count() > ENCODED_NAME_TRUNCATION_LIMIT {
+        let cut = char_boundary(dir, ENCODED_NAME_TRUNCATION_LIMIT);
+        let tail = dir[cut..].trim_start_matches('-');
+        if !tail.is_empty() {
+            // The 200-char cut is measured on the raw name — the official
+            // count includes the encoded root slash — and the head is then
+            // trimmed like the plain form.
+            let head = dir[..cut].trim_start_matches('-');
+            return Some(EncodedForm::Truncated {
+                head: head.split('-').collect(),
+                hash: tail.to_string(),
+            });
+        }
+    }
+    Some(EncodedForm::Plain(encoded.split('-').collect()))
+}
+
+/// The `-`-split components of a plain (non-truncated) encoded name —
+/// the walk's input shape; test-facing re-encoding helper.
+#[cfg(test)]
+fn encoded_plain_components(session_path: &str) -> Option<Vec<&str>> {
+    match encoded_form(session_path) {
+        Some(EncodedForm::Plain(parts)) => Some(parts),
+        _ => None,
+    }
+}
+
+/// Byte offset of the `chars`-th character — a boundary-safe cut for
+/// encoded names (ASCII in practice, robust regardless).
+fn char_boundary(value: &str, chars: usize) -> usize {
+    value
+        .char_indices()
+        .nth(chars)
+        .map_or(value.len(), |(index, _)| index)
+}
+
+/// Deepest directory the components of a truncated head verify against,
+/// mirroring the walk's deterministic longest-run rule: at each position
+/// consume the longest run of remaining components that names an existing
+/// directory, stopping at the first wall — the official truncation
+/// usually cuts a name mid-component, so the verified prefix is an
+/// ANCESTOR of the real project directory, never a claim about it.
+/// `None` when not even the first component verifies. Budgeted like the
+/// complete walk.
+fn deepest_verified_prefix(parts: &[&str]) -> Option<String> {
+    let mut current = PathBuf::from("/");
+    let mut probes = 0usize;
+    let mut idx = 0usize;
+    while idx < parts.len() {
+        if probes > DECODE_PROBE_BUDGET {
+            break;
+        }
+        let mut consumed = 0usize;
+        'runs: for len in (1..=parts.len() - idx).rev() {
+            let joined = parts[idx..idx + len].join("-");
+            for candidate in [
+                joined.as_str(),
+                &joined.replace('-', "."),
+                &joined.replace('-', "_"),
+            ] {
+                probes += 1;
+                if !candidate.is_empty() && current.join(candidate).is_dir() {
+                    current = current.join(candidate);
+                    consumed = len;
+                    break 'runs;
+                }
+            }
+        }
+        if consumed == 0 {
+            break;
+        }
+        idx += consumed;
+    }
+    (current != Path::new("/")).then(|| current.to_string_lossy().to_string())
+}
+
+/// The raw `…/projects/<encoded>/` directory name of a transcript path.
+fn encoded_project_dir_name(session_path: &str) -> Option<&str> {
+    Path::new(session_path).ancestors().find_map(|ancestor| {
         let parent = ancestor.parent()?;
         matches!(parent.file_name()?.to_str()?, "projects")
             .then(|| ancestor.file_name()?.to_str())
             .flatten()
-    })?;
-    let encoded = dir.trim_start_matches('-');
-    (!encoded.is_empty()).then(|| encoded.split('-').collect())
+    })
 }
 
 struct EncodedWalk {
@@ -388,7 +558,19 @@ pub enum ProjectDecodeStatus {
     /// other COMPLETE decode of the same encoded name verified
     /// (`shadowed`): the attribution is defensible, not proven.
     Ambiguous { path: String, shadowed: Vec<String> },
-    /// No complete verified decode: attribution falls back to "unknown".
+    /// The official >200-char truncate+hash form (rm-240): the encoded
+    /// name is truncated to 200 chars and suffixed with a hash of the
+    /// full path. `prefix` is the deepest directory the head verified
+    /// against, and the opaque hash tail is kept in the identity so
+    /// distinct long paths sharing the 200-char prefix stay distinct.
+    Truncated { prefix: String, hash: String },
+    /// Nothing verified for an encoded name that encodes no path — a
+    /// `CLAUDE_CODE_PROJECT_DIR_NAME`-style opaque name (rm-240). The
+    /// name itself is the stable identity instead of "unknown".
+    Opaque { name: String },
+    /// No complete verified decode. No longer produced for `-`-encoded
+    /// names (rm-240 resolves them to an opaque identity instead); kept
+    /// so existing matches keep compiling.
     Unresolved { encoded: String },
 }
 
@@ -400,17 +582,33 @@ pub fn project_decode_status(session: &Session) -> ProjectDecodeStatus {
     if !session.cwd.trim().is_empty() {
         return ProjectDecodeStatus::NotConsulted;
     }
-    let Some(parts) = encoded_project_components(&session.path) else {
-        return ProjectDecodeStatus::NotConsulted;
-    };
-    match decode_encoded_components(&parts, true) {
-        Some(EncodedWalk { path, shadowed }) if shadowed.is_empty() => {
-            ProjectDecodeStatus::Resolved { path }
-        }
-        Some(EncodedWalk { path, shadowed }) => ProjectDecodeStatus::Ambiguous { path, shadowed },
-        None => ProjectDecodeStatus::Unresolved {
-            encoded: parts.join("-"),
+    match encoded_form(&session.path) {
+        None => ProjectDecodeStatus::NotConsulted,
+        Some(EncodedForm::Plain(parts)) => match decode_encoded_components(&parts, true) {
+            Some(EncodedWalk { path, shadowed }) if shadowed.is_empty() => {
+                ProjectDecodeStatus::Resolved { path }
+            }
+            Some(EncodedWalk { path, shadowed }) => {
+                ProjectDecodeStatus::Ambiguous { path, shadowed }
+            }
+            None => ProjectDecodeStatus::Opaque {
+                name: parts.join("-"),
+            },
         },
+        // The truncated form reports its verified prefix + opaque hash;
+        // shadowed-alternative disclosure inside a truncated head is
+        // second-order and intentionally not walked here.
+        Some(EncodedForm::Truncated { head, hash }) => {
+            let prefix = decode_encoded_components(&head, false)
+                .map(|EncodedWalk { path, .. }| path)
+                .or_else(|| deepest_verified_prefix(&head));
+            match prefix {
+                Some(prefix) => ProjectDecodeStatus::Truncated { prefix, hash },
+                None => ProjectDecodeStatus::Opaque {
+                    name: head.join("-"),
+                },
+            }
+        }
     }
 }
 
@@ -768,12 +966,17 @@ mod tests {
         let decoded = resolve_project(&session_at("", &transcript.to_string_lossy()));
         assert_eq!(decoded.id, main.id);
 
+        // rm-240: an encoded dir that verifies nowhere is an opaque name
+        // (CLAUDE_CODE_PROJECT_DIR_NAME-style names encode no path) — it
+        // keeps its own stable identity instead of collapsing into
+        // `unknown`. The fixture never creates `/nowhere`.
         let missing = resolve_project(&session_at("", "/nowhere/projects/-gone-dir/s.jsonl"));
-        assert_eq!(missing.display_name, "unknown");
+        assert_eq!(missing.display_name, "gone-dir");
+        assert_eq!(missing.resolution, "opaque_name");
         assert_eq!(
             project_decode_status(&session_at("", "/nowhere/projects/-gone-dir/s.jsonl")),
-            ProjectDecodeStatus::Unresolved {
-                encoded: "gone-dir".to_string()
+            ProjectDecodeStatus::Opaque {
+                name: "gone-dir".to_string()
             }
         );
         // A cwd-bearing session never consults the decoder.
@@ -819,6 +1022,82 @@ mod tests {
             )),
             ProjectDecodeStatus::Resolved { .. }
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn truncated_encoded_names_keep_a_stable_identity() {
+        // rm-240 residual: encoded names over 200 chars are truncated to 200
+        // chars and suffixed with a hash of the full path
+        // (code.claude.com/docs/en/sessions, captured 2026-10-03). The hash
+        // cannot be inverted, but it is stable: the identity must decode to
+        // the verified prefix plus the opaque hash instead of `unknown`, and
+        // two distinct long paths sharing the 200-char prefix must stay
+        // distinct projects.
+        let root = unique_decode_root("truncated");
+        let mut deep = root.clone();
+        for idx in 0..30 {
+            deep = deep.join(format!("seg{idx:02}-component"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let encoded = deep.to_string_lossy().replace('/', "-");
+        assert!(
+            encoded.chars().count() > 220,
+            "fixture must exceed the truncation limit"
+        );
+        let head: String = encoded.chars().take(200).collect();
+        let mk_session = |hash: &str| {
+            let dir = root.join("projects").join(format!("{head}-{hash}"));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("s.jsonl").to_string_lossy().to_string();
+            session_at("", &path)
+        };
+        let first = resolve_project(&mk_session("aaaa1111"));
+        let second = resolve_project(&mk_session("bbbb2222"));
+        assert_ne!(first.display_name, "unknown", "id: {}", first.id);
+        assert_ne!(second.display_name, "unknown", "id: {}", second.id);
+        assert_ne!(first.resolution, "unattributed");
+        assert!(first.id.ends_with("#aaaa1111"), "id: {}", first.id);
+        assert!(second.id.ends_with("#bbbb2222"), "id: {}", second.id);
+        assert_ne!(first.id, second.id);
+        assert!(first.id.starts_with('/'));
+        assert_eq!(resolve_project(&mk_session("aaaa1111")).id, first.id);
+        assert!(matches!(
+            project_decode_status(&mk_session("aaaa1111")),
+            ProjectDecodeStatus::Truncated { .. }
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opaque_encoded_names_keep_their_own_identity() {
+        // rm-240 residual: CLAUDE_CODE_PROJECT_DIR_NAME (v2.1.234+) lets an
+        // operator name a project with an opaque 1-64 `[a-zA-Z0-9_-]` string
+        // that encodes no path and verifies nowhere on disk. Such names must
+        // group under their own stable identity instead of collapsing into
+        // `unknown` — distinct opaque names are distinct projects, and the
+        // same opaque name stays one project across relocations.
+        let root = unique_decode_root("opaque");
+        let first_dir = root.join("projects").join("MyOpaque-Name_77");
+        fs::create_dir_all(&first_dir).unwrap();
+        let first_path = first_dir.join("s.jsonl").to_string_lossy().to_string();
+        let first = resolve_project(&session_at("", &first_path));
+        assert_eq!(first.display_name, "MyOpaque-Name_77");
+        assert_eq!(first.id, "MyOpaque-Name_77");
+        assert_eq!(first.root, "");
+        assert_eq!(first.resolution, "opaque_name");
+        let second_dir = root.join("projects").join("Another77");
+        fs::create_dir_all(&second_dir).unwrap();
+        let second_path = second_dir.join("s.jsonl").to_string_lossy().to_string();
+        let second = resolve_project(&session_at("", &second_path));
+        assert_eq!(second.id, "Another77");
+        assert_ne!(second.id, first.id);
+        assert_eq!(
+            project_decode_status(&session_at("", &first_path)),
+            ProjectDecodeStatus::Opaque {
+                name: "MyOpaque-Name_77".to_string()
+            }
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -870,7 +1149,7 @@ mod tests {
         // Decoy removed: a fresh walk (bypassing the resolve memo) yields the
         // byte-identical attribution — host state cannot flip it.
         fs::remove_dir_all(&decoy).unwrap();
-        let parts = encoded_project_components(&transcript).expect("encoded components");
+        let parts = encoded_plain_components(&transcript).expect("encoded components");
         let walk = decode_encoded_components(&parts, false).expect("decode without decoy");
         assert_eq!(walk.path, true_repo.to_string_lossy().to_string());
         assert!(walk.shadowed.is_empty());
@@ -902,7 +1181,7 @@ mod tests {
                 .join("s.jsonl")
                 .to_string_lossy()
                 .to_string();
-            let parts = encoded_project_components(&transcript).expect("encoded components");
+            let parts = encoded_plain_components(&transcript).expect("encoded components");
             let walk = decode_encoded_components(&parts, false).expect("decode dashed name");
             assert_eq!(walk.path, repo.to_string_lossy().to_string());
         }

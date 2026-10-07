@@ -171,6 +171,15 @@ included), while `-f markdown` and `-f html` are the overview and
 governance surfaces — `--waste -f markdown` is rejected with the guard's
 error naming those actions instead of silently rendering text.
 
+Gate flags evaluate for the machine form: since this report became a
+versioned json contract, `--fail-under-health`, `--fail-on-critical`
+and `--max-tool-fail-rate` judge `--waste -f json` exactly as they
+judge `--overview` and `--compare` — write-then-gate (the json is
+emitted before the nonzero exit), over the filtered session view the
+waste report is drawn from. The waste metrics themselves (`waste_score`,
+cache rating, tool bloat) are not gate inputs and carry no gate flags;
+the human text view and `--diagnostics` stay ungated by design.
+
 ## Overview appendix
 
 `--overview` includes scope, parse/data health, cost audit, prioritized recommendations, MCP governance, context trends, and lightweight delivery evidence in JSON, Markdown, and HTML outputs:

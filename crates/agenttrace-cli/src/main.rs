@@ -453,6 +453,20 @@ fn run() -> anyhow::Result<()> {
         };
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
+        // rm-486 premise rider: rm-544 made `-f json` a versioned machine
+        // contract (`agenttrace.waste.v1`) documented for CI, so the row's
+        // old "--waste ungated BY DESIGN" carve-out — recorded when waste
+        // rendered a human text view — no longer holds for the machine
+        // form. The json arm evaluates the same shared gate contract as
+        // `--overview`, `--governance` and `--compare`: write-then-gate,
+        // so the artifact is still emitted before a failing exit. The
+        // flags judge the filtered session view the report is drawn from;
+        // the waste metrics themselves (waste_score, cache rating, tool
+        // bloat) are not gate inputs and carry no gate flags. The human
+        // text view stays ungated by design.
+        if args.format.as_str() == "json" {
+            enforce_report_gates(&args, &sessions);
+        }
         return Ok(());
     }
 

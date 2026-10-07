@@ -245,6 +245,27 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
                 ));
             }
         }
+        // rm-240 arms: both yield a stable identity, so they count as
+        // resolved — with a sample line stating exactly what happened.
+        ProjectDecodeStatus::Truncated { prefix, hash } => {
+            out.resolved += 1;
+            if out.samples.len() < 6 {
+                out.samples.push(format!(
+                    "truncated: >200-char encoded name decoded to its verified prefix {}#{}; the hash tail is opaque but stable",
+                    crate::statusline::sanitize_line_segment(&prefix),
+                    crate::statusline::sanitize_line_segment(&hash)
+                ));
+            }
+        }
+        ProjectDecodeStatus::Opaque { name } => {
+            out.resolved += 1;
+            if out.samples.len() < 6 {
+                out.samples.push(format!(
+                    "opaque: projects/{} kept as its own stable identity (CLAUDE_CODE_PROJECT_DIR_NAME-style names encode no path)",
+                    crate::statusline::sanitize_line_segment(&name)
+                ));
+            }
+        }
     }
 }
 
