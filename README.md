@@ -225,6 +225,23 @@ it never filters aggregates, audit totals, or recommendations. Governance
 reports are unbounded by default — use `--sample N` for an explicitly
 disclosed bound.
 
+### `--demo` never silently replaces an explicit session source
+
+`--demo` substitutes the bundled demo corpus for session discovery. It is
+therefore a session source itself, and combining it with another one — a
+positional path, `-d/--dir`, or a `--range` other than the default `all` —
+exits with an error naming the ignored flags instead of quietly rendering
+demo numbers as if they were your corpus:
+
+```bash
+agenttrace --demo --overview -d ~/.codex/sessions   # rejected: --demo ignores -d/--dir
+agenttrace --demo --range 30d --sessions            # rejected: --demo ignores --range
+agenttrace --demo --overview                         # works: demo corpus, default range
+```
+
+An explicit `--range all` is indistinguishable from the default and stays
+legal. `--doctor` is unaffected: it honors `-d` alongside `--demo`.
+
 ### `--baseline` and `--compare`
 
 `--baseline <file>` gates an `--overview -f json` run against a previously

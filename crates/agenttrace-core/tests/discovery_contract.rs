@@ -2599,10 +2599,20 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             day.discovered, all.discovered,
             "discovered must be range-independent"
         );
-        let health_all =
-            data_health_scoped(&all.sessions, all.discovered, all.skipped, all.cache_hits);
-        let health_day =
-            data_health_scoped(&day.sessions, day.discovered, day.skipped, day.cache_hits);
+        let health_all = data_health_scoped(
+            &all.sessions,
+            all.discovered,
+            all.skipped,
+            all.cache_hits,
+            all.sqlite_read_failures.clone(),
+        );
+        let health_day = data_health_scoped(
+            &day.sessions,
+            day.discovered,
+            day.skipped,
+            day.cache_hits,
+            day.sqlite_read_failures.clone(),
+        );
         assert_eq!(health_all.parsed, 2);
         assert_eq!(
             health_all.out_of_scope, 0,
@@ -2684,6 +2694,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
+            report.sqlite_read_failures.clone(),
         );
         assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
         assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
@@ -2692,6 +2703,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
+            report.sqlite_read_failures.clone(),
         );
         assert_eq!(clean.non_finite_costs, 0);
     });
@@ -3314,4 +3326,82 @@ fn discovery_skips_non_regular_session_files() {
     let files = find_session_files(Some(&root));
     assert_eq!(files.len(), 1, "expected only the regular file: {files:?}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn corrupt_sqlite_lane_surfaces_in_load_report_data_health_and_doctor() {
+    // rm-734, full journey: a HOME whose hermes state.db exists but is
+    // corrupt must surface through every disclosure layer — the
+    // LoadReport, DataHealth (with confidence degraded to low and the
+    // JSON field present), and the doctor report — instead of silently
+    // shrinking the corpus to the file lanes.
+    let root = temp_root("agenttrace-rm734-journey");
+    let home = root.join("home");
+    let cache = root.join("cache");
+    fs::create_dir_all(home.join(".hermes")).expect("hermes dir");
+    let db = home.join(".hermes").join("state.db");
+    fs::write(&db, b"SQLite format 3\x00corrupted-bytes").expect("corrupt db");
+
+    with_home_and_cache(&home, &cache, || {
+        let report = load_sessions_with_options(None, &LoadOptions::default());
+        assert_eq!(
+            report.sqlite_read_failures.len(),
+            1,
+            "the corrupt database must ride the LoadReport"
+        );
+        let failure = &report.sqlite_read_failures[0];
+        assert_eq!(failure.lane, "hermes");
+        assert_eq!(failure.database, db.to_string_lossy());
+
+        let health = data_health_scoped(
+            &report.sessions,
+            report.discovered,
+            report.skipped,
+            report.cache_hits,
+            report.sqlite_read_failures.clone(),
+        );
+        assert_eq!(
+            health.confidence, "low",
+            "an excluded corpus must degrade confidence"
+        );
+        let json = serde_json::to_string(&health).expect("health json");
+        assert!(
+            json.contains("sqlite_read_failures"),
+            "the JSON report must carry the failure list: {json}"
+        );
+
+        let clean = data_health_scoped(
+            &report.sessions,
+            report.discovered,
+            report.skipped,
+            report.cache_hits,
+            Vec::new(),
+        );
+        let clean_json = serde_json::to_string(&clean).expect("clean health json");
+        assert!(
+            !clean_json.contains("sqlite_read_failures"),
+            "healthy runs must not carry an empty disclosure list"
+        );
+
+        let doctor = build_doctor_report(None, false);
+        assert_eq!(
+            doctor.sqlite_read_failures.len(),
+            1,
+            "doctor must see the same failure"
+        );
+        assert!(
+            doctor.recommendations.iter().any(|r| r.contains("state.db")
+                && r.contains("could not be read")
+                && r.contains("integrity_check")),
+            "doctor must recommend on the unreadable database: {:?}",
+            doctor.recommendations
+        );
+        let text =
+            agenttrace_core::render_doctor_report(None, false, "text").expect("doctor text render");
+        assert!(
+            text.contains("Sqlite session source unreadable"),
+            "the doctor text must name the excluded source"
+        );
+    });
+    let _ = fs::remove_dir_all(root);
 }

@@ -151,7 +151,9 @@ fn session_id(session: &Session) -> String {
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-fn stable_identity_hash(canonical: &str) -> u64 {
+pub(crate) fn stable_identity_hash(canonical: &str) -> u64 {
+    // rm-599 (residual): pub(crate) so the OTel export lane shares this
+    // owned hash for trace/span ids — see otel::trace_id_for.
     canonical.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
     })

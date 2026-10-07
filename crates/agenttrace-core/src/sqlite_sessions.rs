@@ -1,9 +1,51 @@
 use crate::{detect_anomalies, health_score, token_cost, Metrics, Session};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+
+/// rm-734: a sqlite session source that EXISTS but could not be read —
+/// an unopenable database (permissions, lock states), a corrupt header,
+/// or a schema so different the session table cannot even be prepared.
+/// Recorded per failure so reports disclose the exclusion instead of
+/// rendering a silently smaller corpus: it rides the report JSON as
+/// `data_health.sqlite_read_failures`, drives a `--doctor`
+/// recommendation, and is announced on stderr at read time. It also
+/// guards the snapshot cache (the poison gate): a failed read never
+/// banks an empty snapshot, so the next run re-probes the database
+/// instead of serving the failure from cache forever.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SqliteReadFailure {
+    /// Path of the database that failed.
+    pub database: String,
+    /// Which lane owned it: `"hermes"` or `"opencode"`.
+    pub lane: &'static str,
+    /// Human-readable error from the open/prepare boundary.
+    pub error: String,
+}
+
+impl SqliteReadFailure {
+    fn new(path: &Path, lane: &'static str, error: String) -> Self {
+        Self {
+            database: path.to_string_lossy().to_string(),
+            lane,
+            error,
+        }
+    }
+}
+
+/// The loud line for a failed sqlite source. Same disclosure stance as
+/// the history lane's torn-file quarantine: a degraded corpus must be
+/// announced on stderr even when the report itself exits 0.
+fn report_sqlite_read_failure(failure: &SqliteReadFailure) {
+    eprintln!(
+        "agenttrace: sqlite session source could not be read: {} ({}) — {} — \
+         sessions from it are EXCLUDED from this report",
+        failure.database, failure.lane, failure.error
+    );
+}
 
 #[derive(Debug, Default)]
 struct RoleCounts {
@@ -62,17 +104,33 @@ pub fn load_sqlite_backed_sessions() -> Vec<Session> {
 }
 
 pub(crate) fn load_sqlite_backed_sessions_since(since: Option<DateTime<Utc>>) -> Vec<Session> {
+    load_sqlite_backed_sessions_with_failures(since).0
+}
+
+/// rm-734: the sqlite lanes return BOTH the readable sessions and a
+/// record of every database that exists but could not be read. Callers
+/// that only want sessions keep the legacy accessors above; callers
+/// that render reports (discovery walk, doctor) carry the failures
+/// into their disclosures so an excluded corpus is never silent.
+pub fn load_sqlite_backed_sessions_with_failures(
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, Vec<SqliteReadFailure>) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut sessions = Vec::new();
+    let mut failures = Vec::new();
     for path in hermes_state_db_paths(&home) {
-        sessions.extend(load_hermes_sqlite_sessions(&path, since));
+        let (lane_sessions, lane_failures) = load_hermes_sqlite_sessions(&path, since);
+        sessions.extend(lane_sessions);
+        failures.extend(lane_failures);
     }
     for path in opencode_db_paths(&home) {
-        sessions.extend(load_opencode_sqlite_sessions(&path, since));
+        let (lane_sessions, lane_failures) = load_opencode_sqlite_sessions(&path, since);
+        sessions.extend(lane_sessions);
+        failures.extend(lane_failures);
     }
-    sessions
+    (sessions, failures)
 }
 
 pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
@@ -154,22 +212,43 @@ fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
     )
 }
 
-fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn load_hermes_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, Vec<SqliteReadFailure>) {
     if !sqlite_file_exists(path) {
-        return Vec::new();
+        // An absent database is not a failure: the lane may simply not
+        // be installed, and the report scope already discloses which
+        // lanes are present.
+        return (Vec::new(), Vec::new());
     }
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "hermes") {
-        return filter_since(sessions, since);
+        return (filter_since(sessions, since), Vec::new());
     }
-    let sessions = query_hermes_sqlite_sessions(path, None);
-    let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
-    filter_since(sessions, since)
+    match query_hermes_sqlite_sessions(path, None) {
+        Ok(sessions) => {
+            // Only a successful read banks a snapshot. A legitimately
+            // empty database caches its empty (that is honest), but a
+            // FAILED read must not — rm-734's poison gate: banking the
+            // failure as an empty snapshot would serve it from cache
+            // on every later run and permanently hide the database
+            // even after the operator fixes it.
+            let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
+            (filter_since(sessions, since), Vec::new())
+        }
+        Err(error) => {
+            let failure = SqliteReadFailure::new(path, "hermes", error);
+            report_sqlite_read_failure(&failure);
+            (Vec::new(), vec![failure])
+        }
+    }
 }
 
-fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
-    let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
-    };
+fn query_hermes_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<Session>, String> {
+    let db = open_sqlite_read_only(path).map_err(|err| format!("open failed: {err}"))?;
     let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
     let tool_outcomes = hermes_tool_outcome_counts(&db);
     let cwd = if sqlite_has_column(&db, "sessions", "cwd") {
@@ -182,9 +261,9 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, {cwd} from sessions \
          where (?1 is null or started_at >= ?1 or started_at is null or started_at <= 0)"
     );
-    let Ok(mut stmt) = db.prepare(&sql) else {
-        return Vec::new();
-    };
+    let mut stmt = db
+        .prepare(&sql)
+        .map_err(|err| format!("session query failed: {err}"))?;
     let since_unix = since.map(|value| value.timestamp() as f64);
     let Ok(rows) = stmt.query_map([since_unix], |row| {
         Ok(SqliteSessionAgg {
@@ -204,10 +283,11 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             ..SqliteSessionAgg::default()
         })
     }) else {
-        return Vec::new();
+        return Err("session rows could not be read".to_string());
     };
 
-    rows.filter_map(Result::ok)
+    Ok(rows
+        .filter_map(Result::ok)
         .map(|mut agg| {
             if !agg.model.is_empty() {
                 agg.models.insert(agg.model.clone());
@@ -235,34 +315,54 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
             }
             session_from_sqlite_agg(agg)
         })
-        .collect()
+        .collect())
 }
 
-fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn load_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> (Vec<Session>, Vec<SqliteReadFailure>) {
     if !sqlite_file_exists(path) {
-        return Vec::new();
+        // See load_hermes_sqlite_sessions: an absent database is not a
+        // failure — the lane may simply not be installed.
+        return (Vec::new(), Vec::new());
     }
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
-        return filter_since(sessions, since);
+        return (filter_since(sessions, since), Vec::new());
     }
-    let sessions = query_opencode_sqlite_sessions(path, None);
-    let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
-    filter_since(sessions, since)
+    match query_opencode_sqlite_sessions(path, None) {
+        Ok(sessions) => {
+            // rm-734 poison gate: only a successful read banks a
+            // snapshot — a corrupt or unopenable database must
+            // re-probe on the next run, not serve the cached failure.
+            let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
+            (filter_since(sessions, since), Vec::new())
+        }
+        Err(error) => {
+            let failure = SqliteReadFailure::new(path, "opencode", error);
+            report_sqlite_read_failure(&failure);
+            (Vec::new(), vec![failure])
+        }
+    }
 }
 
-fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
-    let Ok(db) = open_sqlite_read_only(path) else {
-        return Vec::new();
-    };
-    let mut aggs = opencode_sqlite_session_rows(&db, path, since);
+fn query_opencode_sqlite_sessions(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<Session>, String> {
+    let db = open_sqlite_read_only(path).map_err(|err| format!("open failed: {err}"))?;
+    let mut aggs = opencode_sqlite_session_rows(&db, path, since)?;
     if aggs.is_empty() {
-        return Vec::new();
+        // A database that reads cleanly but holds no sessions is a
+        // legitimate empty (cached as empty on purpose), not a failure.
+        return Ok(Vec::new());
     }
     add_opencode_sqlite_messages(&db, &mut aggs);
     add_opencode_sqlite_parts(&db, &mut aggs);
     capture_opencode_user_text(&db, &mut aggs);
 
-    aggs.into_values()
+    let sessions = aggs
+        .into_values()
         .map(|mut agg| {
             if agg.model.is_empty() {
                 agg.model = "default".to_string();
@@ -273,7 +373,8 @@ fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> 
             apply_opencode_stored_totals(&mut agg);
             session_from_sqlite_agg(agg)
         })
-        .collect()
+        .collect();
+    Ok(sessions)
 }
 
 /// Prefer the authoritative totals recorded on the session row over
@@ -354,7 +455,9 @@ fn opencode_sqlite_session_rows(
     db: &Connection,
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> HashMap<String, SqliteSessionAgg> {
+) -> Result<HashMap<String, SqliteSessionAgg>, String> {
+    // rm-734: `path` stays in the signature for failure context below.
+    let _ = path;
     let directory = if sqlite_has_column(db, "session", "directory") {
         "directory"
     } else {
@@ -401,9 +504,9 @@ fn opencode_sqlite_session_rows(
         "select id, title, time_created, time_updated, {directory}, {stored_select} from session \
          where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
-    let Ok(mut stmt) = db.prepare(&sql) else {
-        return HashMap::new();
-    };
+    let mut stmt = db
+        .prepare(&sql)
+        .map_err(|err| format!("session query failed: {err}"))?;
     let since_millis = since.map(|value| value.timestamp_millis());
     let Ok(rows) = stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
@@ -431,9 +534,9 @@ fn opencode_sqlite_session_rows(
             },
         ))
     }) else {
-        return HashMap::new();
+        return Err("session rows could not be read".to_string());
     };
-    rows.filter_map(Result::ok).collect()
+    Ok(rows.filter_map(Result::ok).collect())
 }
 
 fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
@@ -994,7 +1097,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions = query_hermes_sqlite_sessions(&path, None)
+            .expect("healthy hermes fixture must read cleanly");
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 2, "both fixture sessions must load");
 
@@ -1036,7 +1140,8 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions = query_hermes_sqlite_sessions(&path, None)
+            .expect("healthy hermes fixture must read cleanly");
         std::fs::remove_dir_all(&root).ok();
 
         // s1: ok 1 / fail 1 -> 50% across the corpus (s2 contributes no
@@ -1056,5 +1161,106 @@ mod tests {
                 .any(|message| message.contains("tool failure rate")),
             "--max-tool-fail-rate must trip on hermes-sourced failures: {failures:?}"
         );
+    }
+
+    /// rm-734: a database whose header is corrupt exists but cannot be
+    /// read. The lane must return it as a [`SqliteReadFailure`] (never
+    /// as a silent empty), and — the poison gate — must NOT bank a
+    /// sqlite snapshot for it: a banked "empty" would serve from cache
+    /// forever, hiding the database even after repair. The repair then
+    /// re-reads live, proving the gate.
+    #[test]
+    fn corrupt_header_is_disclosed_and_never_banks_a_snapshot() {
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm734-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = root.join("state.db");
+        std::fs::write(&path, b"SQLite format 3\x00corrupted-bytes").expect("write corrupt db");
+
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let snapshot = cache.join("hermes-sqlite.json");
+
+        let _env = crate::test_env::lock_env();
+        let previous_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &cache);
+        let (sessions, failures) = load_hermes_sqlite_sessions(&path, None);
+
+        assert!(
+            sessions.is_empty(),
+            "no sessions can come from a corrupt database"
+        );
+        assert_eq!(
+            failures.len(),
+            1,
+            "the corrupt database must be disclosed as exactly one failure"
+        );
+        let failure = &failures[0];
+        assert_eq!(failure.lane, "hermes");
+        assert_eq!(failure.database, path.to_string_lossy());
+        assert!(!failure.error.is_empty(), "the open error must be carried");
+        assert!(
+            !snapshot.exists(),
+            "the poison gate must not bank a snapshot for a failed read — \
+             a banked empty would hide the database even after repair"
+        );
+
+        // Repair: the same path now holds a healthy fixture. The failed
+        // read banked nothing, so the lane must re-probe and find it.
+        std::fs::remove_file(&path).expect("drop corrupt db");
+        let healthy = hermes_state_db_fixture(&root);
+        assert_eq!(healthy, path, "fixture must land on the same path");
+        let (repaired_sessions, repaired_failures) = load_hermes_sqlite_sessions(&path, None);
+        match previous_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            repaired_failures,
+            Vec::new(),
+            "a repaired database must read cleanly"
+        );
+        assert_eq!(
+            repaired_sessions.len(),
+            2,
+            "the repair must be discovered on the very next read — \
+             no banked poison can mask it"
+        );
+    }
+
+    /// rm-734: an unreadable database (mode 000) is disclosed, not
+    /// silently skipped. Skipped when the test user is root (permissions
+    /// do not apply).
+    #[test]
+    fn unreadable_permissions_are_disclosed_as_failures() {
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm734-chmod-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = hermes_state_db_fixture(&root);
+        let original = std::fs::metadata(&path)
+            .expect("fixture metadata")
+            .permissions();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("chmod 000");
+        let original = original.clone();
+        let unreadable = Connection::open(&path).is_err();
+        let (sessions, failures) = if unreadable {
+            load_hermes_sqlite_sessions(&path, None)
+        } else {
+            // Root can open anything; the mode is restored and the
+            // disclosure assertion would be vacuous.
+            std::fs::set_permissions(&path, original.clone()).expect("restore mode");
+            (Vec::new(), Vec::new())
+        };
+        std::fs::set_permissions(&path, original).ok();
+        let _ = std::fs::remove_dir_all(&root);
+        if !unreadable {
+            return; // running as root: nothing to prove here
+        }
+        assert!(sessions.is_empty());
+        assert_eq!(failures.len(), 1, "the chmod-000 database must surface");
+        assert_eq!(failures[0].lane, "hermes");
     }
 }

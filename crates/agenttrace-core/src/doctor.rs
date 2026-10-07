@@ -1,6 +1,7 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
+    load_sqlite_backed_sessions_with_failures, parse_file, skip_sqlite_backed_file_dir, Session,
+    VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -53,6 +54,12 @@ pub struct DoctorReport {
     /// snapshot's date, model count, and age, so reports can disclose
     /// how current the prices behind `cost_estimated` are.
     pub pricing: String,
+    /// rm-734: sqlite session databases that exist but could not be
+    /// read — the doctor's job is to name them (path + lane + error)
+    /// with a repair recommendation. Empty (omitted from JSON) when
+    /// every present database reads cleanly.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteReadFailure>,
     pub recommendations: Vec<String>,
 }
 
@@ -116,8 +123,11 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     } else {
         find_session_files(dir)
     };
+    let mut sqlite_read_failures = Vec::new();
     let sqlite_sessions = if dir.is_none() && !demo {
-        load_sqlite_backed_sessions()
+        let (sessions, failures) = load_sqlite_backed_sessions_with_failures(None);
+        sqlite_read_failures = failures;
+        sessions
     } else {
         Vec::new()
     };
@@ -171,6 +181,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             crate::pricing::bundled_snapshot_model_count(),
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
         ) + &doctor_deprecation_suffix(),
+        sqlite_read_failures,
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
@@ -587,18 +598,40 @@ fn doctor_sqlite_directories(sessions: &[Session]) -> Vec<DoctorDirReport> {
 }
 
 fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool) -> Vec<String> {
+    // rm-734: name every unreadable sqlite source with a repair path.
+    // Computed BEFORE the empty-corpus early return on purpose — a
+    // poisoned database can zero out the corpus entirely, which is
+    // exactly when the operator most needs the pointer.
+    let mut sqlite_repairs: Vec<String> = Vec::new();
+    for failure in &report.sqlite_read_failures {
+        sqlite_repairs.push(format!(
+            "sqlite session source could not be read: {} ({}): {} — \
+             its sessions are excluded from this report; repair the file or its \
+             permissions (run `sqlite3 {} \"pragma integrity_check;\"` to classify \
+             the corruption) and re-run",
+            failure.database, failure.lane, failure.error, failure.database
+        ));
+    }
     if report.sessions == 0 {
         if dir.is_some() {
-            return vec!["No sessions found in this directory. Check `-d <dir>` or point it at a session JSON/JSONL directory.".to_string()];
+            let mut out = vec![
+                "No sessions found in this directory. Check `-d <dir>` or point it at a session JSON/JSONL directory."
+                    .to_string(),
+            ];
+            out.extend(sqlite_repairs);
+            return out;
         }
-        return vec![
+        let mut out = vec![
             "No sessions found. Run `agenttrace --demo` to try the TUI immediately.".to_string(),
         ];
+        out.extend(sqlite_repairs);
+        return out;
     }
     let mut recommendations = vec![
         "Ready: run `agenttrace` for the TUI or `agenttrace --overview -f json` for automation."
             .to_string(),
     ];
+    recommendations.extend(sqlite_repairs);
     // rm-408: present-zero usage is counted as measured, so the corpus
     // share belongs in the recommendations — not folded into "clean".
     // This push sits ABOVE the demo early-return (review F8): demo
@@ -678,6 +711,12 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.statusline.path, statusline_state
     ));
     out.push_str(&format!("Pricing snapshot: {}\n", report.pricing));
+    for failure in &report.sqlite_read_failures {
+        out.push_str(&format!(
+            "Sqlite session source unreadable: {} ({}) — {}\n",
+            failure.database, failure.lane, failure.error
+        ));
+    }
     out.push_str(&format!(
         "Project attribution: {} resolved, {} ambiguous, {} unresolved encoded project dirs\n",
         report.project_decode.resolved,

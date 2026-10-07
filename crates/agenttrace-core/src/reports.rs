@@ -639,6 +639,13 @@ pub fn report_overview_text_with_context(
             counts_cell(&data_health.disclosures)
         ));
     }
+    // rm-734: an excluded corpus must be named, never silent.
+    for failure in &data_health.sqlite_read_failures {
+        out.push_str(&format!(
+            "  Sqlite source unreadable: {} ({}) — {} — its sessions are EXCLUDED\n",
+            failure.database, failure.lane, failure.error
+        ));
+    }
     out.push_str(&format!(
         "  Pricing: {} | exact={} fallback={} unknown={}\n",
         audit.pricing_source,
@@ -674,6 +681,15 @@ pub fn report_overview_markdown_with_context(
             markdown_cell(&counts_cell(&data_health.disclosures))
         ));
     }
+    // rm-734: name every excluded sqlite corpus (path, lane, error).
+    for failure in &data_health.sqlite_read_failures {
+        out.push_str(&format!(
+            "| Sqlite source unreadable | {} ({}) — {} — its sessions are EXCLUDED |\n",
+            markdown_cell(&failure.database),
+            failure.lane,
+            markdown_cell(&failure.error)
+        ));
+    }
     render_recommendations_markdown(&mut out, &recommendations(sessions));
     out
 }
@@ -700,6 +716,15 @@ pub fn report_overview_html_with_context(
         appendix.push_str(&format!(
             "<tr><th>Disclosed facts</th><td>{}</td></tr>",
             html_escape(&counts_cell(&data_health.disclosures))
+        ));
+    }
+    // rm-734: name every excluded sqlite corpus (path, lane, error).
+    for failure in &data_health.sqlite_read_failures {
+        appendix.push_str(&format!(
+            "<tr><th>Sqlite source unreadable</th><td>{} ({}) — {} — its sessions are EXCLUDED</td></tr>",
+            html_escape(&failure.database),
+            failure.lane,
+            html_escape(&failure.error)
         ));
     }
     appendix.push_str("</tbody></table></section>");
