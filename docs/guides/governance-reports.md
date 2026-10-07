@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 32 and the SQLite snapshot is schema 7; the
+The session cache is schema 33 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -109,7 +109,16 @@ Copilot per-model shutdown tracking with the shutdown timestamp tail
 integration as rm-601..rm-603 with rm-555 folded into the landed
 rm-551; schema landed as 31 → 32, re-basing the campaign's own
 26 → 27 bump onto the ceiling) —
-so cached sessions regenerate under the corrected totals; the SQLite snapshot to 7
+and to 33 when the disclosure-plane batch moved the kimi
+usage-alias counters onto the non-loss disclosure channel
+(`kimi_usage_alias:<key>` renders under "Disclosed facts" instead of
+degrading `data_health.confidence` as parse loss, rm-719), widened the
+generic lane's `Event` intake (`model_used` lowercase alias; the
+`cachedContentTokenCount` / `cacheReadInputTokens` spellings of the
+cache-read count normalize onto the canonical key, canonical-wins,
+rm-718), and added the `codex_rollout_no_usage_rows` absence verdict
+for pre-Sept-2026 rollouts that carry no usage rows at all (rm-716) —
+so cached sessions regenerate under the corrected fields; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are

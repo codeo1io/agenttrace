@@ -153,7 +153,18 @@ pub struct Event {
         deserialize_with = "deserialize_usage_map"
     )]
     pub usage: BTreeMap<String, i64>,
-    #[serde(default, rename = "ModelUsed", deserialize_with = "deserialize_string")]
+    // rm-718: the sibling scalar fields accept both spellings; the
+    // generic fallback lane is the only lane that deserializes foreign
+    // JSON into `Event` (the dedicated parsers construct events by
+    // hand), so accepting the lowercase spelling here is exactly the
+    // case-normalization that lane was missing — journals carrying
+    // `model_used` attributed to "default" and priced as unknown.
+    #[serde(
+        default,
+        rename = "ModelUsed",
+        alias = "model_used",
+        deserialize_with = "deserialize_string"
+    )]
     pub model_used: String,
     /// rm-485: cost-only credit attribution in USD. Carried by meta events
     /// whose adapter truth is a session-wide credit counter (Copilot's
@@ -249,6 +260,11 @@ where
 
 fn lenient_usage_map(value: &Value) -> BTreeMap<String, i64> {
     let mut usage = BTreeMap::new();
+    // rm-718 F4 sweep: cross-provider spellings of the cache-read count
+    // normalize onto the canonical key below — the canonical spelling
+    // wins if both appear, deterministically in either key order and
+    // never summed.
+    let mut aliased_cache_read: Option<i64> = None;
     let Some(object) = value.as_object() else {
         return usage;
     };
@@ -264,11 +280,27 @@ fn lenient_usage_map(value: &Value) -> BTreeMap<String, i64> {
                 }
             }
             other => {
-                if let Some(number) = parser::number_as_i64(other) {
-                    usage.insert(key.clone(), number);
+                let Some(number) = parser::number_as_i64(other) else {
+                    continue;
+                };
+                match key.as_str() {
+                    // Gemini wire (`cachedContentTokenCount`, the spelling
+                    // the dedicated gemini lane already maps) and the
+                    // OpenAI-compatible camelCase spelling.
+                    "cachedContentTokenCount" | "cacheReadInputTokens" => {
+                        aliased_cache_read = Some(number);
+                    }
+                    _ => {
+                        usage.insert(key.clone(), number);
+                    }
                 }
             }
         }
+    }
+    if let Some(number) = aliased_cache_read {
+        usage
+            .entry("cache_read_input_tokens".to_string())
+            .or_insert(number);
     }
     usage
 }

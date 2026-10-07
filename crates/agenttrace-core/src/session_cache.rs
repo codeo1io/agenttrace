@@ -5,7 +5,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+// rm-719 (cycle-3 disclosure-plane batch, run 5417681937ae): kimi
+// usage-alias counters moved from `Metrics.line_skips` to
+// `Metrics.disclosure_counters` — the non-loss disclosure channel — so
+// a healthy kimi corpus stops reporting LOW confidence and "Dropped
+// lines" for matching the vendor's real wire keys. rm-718 in the same
+// batch widened the generic lane's `Event` intake (lowercase
+// `model_used` alias; `cachedContentTokenCount` /
+// `cacheReadInputTokens` normalize onto `cache_read_input_tokens`),
+// and rm-716 added the `codex_rollout_no_usage_rows` absence verdict —
+// both change what a re-parse reports for an unchanged source file
+// (model attribution, cache-read totals, disclosures), so cached
+// sessions regenerate under the corrected fields.
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):

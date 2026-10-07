@@ -1637,7 +1637,12 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // codex reasoning/post-compaction counting, copilot
                 // later-record-wins + the shutdown timestamp tail;
                 // re-based off the campaign's 26 -> 27 bump);
-                // Schema 31 (integration of run 254b2417, rm-551 copilot
+                // Schema 33 (cycle-3 disclosure-plane batch, run
+                // 5417681937ae: kimi usage-alias counters moved onto
+                // metrics.disclosure_counters (rm-719), generic-lane
+                // Event model_used alias + cache-read alias spellings
+                // (rm-718), codex no-usage-rollout absence verdict
+                // (rm-716)); schema 31 (integration of run 254b2417, rm-551 copilot
                 // per-model reconciliation — warm v30 entries carried
                 // snapshot-level totals; re-based off the campaign's
                 // 26 -> 27 bump); schema 30 (integration of run
@@ -1663,7 +1668,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":32,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":33,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
