@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 type TokenUsage = BTreeMap<String, i64>;
 type JsonObject = Map<String, Value>;
 type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
+/// rm-592 (clippy type_complexity): the freshest Copilot
+/// usage-checkpoint snapshot — (checkpoint timestamp, per-model usage
+/// rows) — kept whole so shutdown metrics and the last checkpoint
+/// cannot double-count (rm-485).
+type UsageCheckpointSnapshot = Option<(String, Vec<(String, TokenUsage)>)>;
 
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
@@ -237,7 +242,7 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // shutdown metrics were emitted at all.
     let mut max_credit_nano: f64 = 0.0;
     let mut shutdown_metrics_emitted = false;
-    let mut checkpoint_snapshot: Option<(String, Vec<(String, BTreeMap<String, i64>)>)> = None;
+    let mut checkpoint_snapshot: UsageCheckpointSnapshot = None;
     for entry in objs.iter() {
         let typ = string(entry.get("type")).unwrap_or("");
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();

@@ -141,16 +141,24 @@ struct Args {
     order: String,
     #[arg(long, default_value_t = 20)]
     limit: usize,
-    /// Explicitly bound governance reports to the newest N sessions.
-    /// Governance reports audit every matching session by default;
-    /// sampling is always disclosed via audited_sessions/total_sessions
-    /// (pass-8 F8-1).
+    /// Explicitly bound governance reports and --compare to the newest N
+    /// sessions. Governance reports audit every matching session by
+    /// default; sampling is always disclosed via
+    /// audited_sessions/total_sessions (pass-8 F8-1). Every other lane —
+    /// --overview included — rejects --sample loudly rather than
+    /// silently aggregating the full corpus (rm-593).
     #[arg(long)]
     sample: Option<usize>,
     #[arg(long = "clear-cache")]
     clear_cache: bool,
+    /// Merge preserved session titles/metrics (history.json) into
+    /// discovery for session reports; the interactive and utility
+    /// lanes reject this flag loudly (rm-593).
     #[arg(long = "preserve-history")]
     preserve_history: bool,
+    /// Include preserved historical sessions in report discovery;
+    /// the interactive and utility lanes reject this flag loudly
+    /// (rm-593).
     #[arg(long = "include-history")]
     include_history: bool,
 }
@@ -221,6 +229,8 @@ fn run() -> anyhow::Result<()> {
         bail!("csv format requires --overview or --sessions");
     }
     validate_range_applicability(&args)?;
+    validate_sample_applicability(&args)?;
+    validate_history_applicability(&args)?;
 
     let language = report_language(&args.lang)?;
 
@@ -677,16 +687,16 @@ fn enforce_report_gates(args: &Args, sessions: &[Session]) {
     let inspect = if args.demo {
         format!(
             "agenttrace --demo {} -f json",
-            governance_inspect_flag(&args)
+            governance_inspect_flag(args)
         )
     } else if let Some(dir) = args.dir.as_deref() {
         format!(
             "agenttrace -d {:?} {} -f json",
             dir,
-            governance_inspect_flag(&args)
+            governance_inspect_flag(args)
         )
     } else {
-        format!("agenttrace {} -f json", governance_inspect_flag(&args))
+        format!("agenttrace {} -f json", governance_inspect_flag(args))
     };
     eprintln!("- inspect: `{inspect}`");
     std::process::exit(2);
@@ -870,9 +880,12 @@ where
     // Dropping flags silently made documented invocations lie
     // (`sessions.jsonl -o out.txt` exited 0 without writing anything,
     // `sessions.jsonl --clear-cache` left the cache untouched), so name
-    // the dropped arguments and fail loudly. Plain extra positionals
-    // stay tolerated: they are not flags, and the Go-style contract
-    // only ever documented flag handling.
+    // the dropped arguments and fail loudly. rm-439: plain extra
+    // positionals were tolerated the same way, which made
+    // `--compare a.jsonl b.jsonl` audit ONE file while the only
+    // disclosure was the fine-print "(auditing 1 of 1 sessions)" — so
+    // name the dropped operand and fail loudly too (rm-247 house
+    // rule: no silent drops).
     let dropped: Vec<OsString> = args.collect();
     if let Some(flag) = dropped.iter().find(|arg| !is_go_flag_positional(arg)) {
         let tail = dropped
@@ -906,6 +919,26 @@ where
             "flag `{}` follows the positional session path and would be silently dropped \
              (dropped: `{tail}`); place flags before the positional path",
             flag.to_string_lossy()
+        );
+    }
+    if let Some(extra) = dropped.iter().find(|arg| is_go_flag_positional(arg)) {
+        // rm-439: same loud contract for plain extra positionals.
+        let positional = out.last().map(|arg| arg.to_string_lossy().to_string());
+        if positional.as_deref() == Some("statusline") || positional.as_deref() == Some("upstream")
+        {
+            let keyword = positional.unwrap_or_default();
+            bail!(
+                "extra positional `{}` follows the `{keyword}` keyword and would be silently \
+                 dropped; the keyword takes no positional arguments after it — run \
+                 `agenttrace {keyword} --help`",
+                extra.to_string_lossy()
+            );
+        }
+        bail!(
+            "extra positional `{}` follows the positional session path and would be silently \
+             dropped; only one session path is accepted — compare sessions inside one \
+             directory with `-d <dir> --compare`",
+            extra.to_string_lossy()
         );
     }
 
@@ -1527,6 +1560,48 @@ fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The report actions that bound their scope with `--sample`:
+/// the governance reports plus `--compare`.
+fn sample_consumed(args: &Args) -> bool {
+    args.compare
+        || args.audit
+        || args.recommend
+        || args.mcp_governance
+        || args.context_trends
+        || args.delivery_evidence
+}
+
+/// rm-593 (assess N3): `--sample` parsed on every lane but is consumed
+/// only by the governance reports and `--compare` — `--overview
+/// --sample 1` ran the FULL aggregate, byte-identical to unsampled,
+/// while looking bounded (the assess pass proved it with cmp). Same
+/// loud contract as `--range` (rm-244): reject on lanes that ignore
+/// the flag, naming both the flag and the lanes that honor it.
+fn validate_sample_applicability(args: &Args) -> anyhow::Result<()> {
+    if args.sample.is_some() && !sample_consumed(args) {
+        bail!(
+            "--sample bounds governance reports (--audit, --recommend, --mcp-governance, --context-trends, --delivery-evidence) and --compare to the newest N sessions; --overview and every other lane aggregate the full corpus and ignore the flag"
+        );
+    }
+    Ok(())
+}
+
+/// rm-593: `--include-history`/`--preserve-history` are consumed by the
+/// session-report load layer (discovery `LoadOptions` and explicit-path
+/// preparation) and the overview renderers — never by the interactive
+/// TUI (`--demo` and plain TUI discover with their own
+/// `LoadOptions::default()`), so on the interactive and utility lanes
+/// they were accepted and silently ignored. Reject those combinations
+/// loudly, mirroring `--range` (rm-244).
+fn validate_history_applicability(args: &Args) -> anyhow::Result<()> {
+    if (args.include_history || args.preserve_history) && !has_session_action(args) {
+        bail!(
+            "--include-history/--preserve-history require a session report action (for example --overview, --sessions, --diagnostics, --compare, or --audit); the interactive and utility views ignore them"
+        );
+    }
+    Ok(())
+}
+
 /// rm-246 (assess N1): the single-session report is the DEFAULT
 /// action. It renders only when the invocation selects a session
 /// without asking for any report action, because an explicit action
@@ -1889,18 +1964,53 @@ mod tests {
     }
 
     #[test]
-    fn go_flag_compatible_args_tolerates_extra_positionals_after_the_path() {
-        // Only flags are rejected after the positional; plain extra
-        // positionals keep the historical Go-style tolerance.
-        let args = go_flag_compatible_args([
+    fn go_flag_compatible_args_rejects_extra_positionals_after_the_path() {
+        // rm-439: a plain extra positional was dropped silently, which
+        // made `--compare a.jsonl b.jsonl` audit one file while the only
+        // disclosure was the fine-print "(auditing 1 of 1 sessions)".
+        // The dropped operand is named and the invocation fails
+        // loudly, with the honest multi-session route (a `-d` directory
+        // plus `--compare`) in the message.
+        let error = go_flag_compatible_args([
             OsString::from("agenttrace"),
             OsString::from("a.jsonl"),
             OsString::from("b.jsonl"),
         ])
-        .expect("plain extra positionals are not flags");
-        assert_eq!(
-            args,
-            vec![OsString::from("agenttrace"), OsString::from("a.jsonl"),]
+        .expect_err("extra positionals after the path must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("`b.jsonl`"),
+            "names the dropped operand: {message}"
+        );
+        assert!(
+            message.contains("only one session path is accepted"),
+            "states the contract: {message}"
+        );
+        assert!(
+            message.contains("--compare"),
+            "points at the honest multi-session route: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_compatible_args_rejects_extra_positional_after_keyword() {
+        // The keyword hosts (`statusline`, `upstream`) already reject
+        // flags after the keyword (rm-505); extra positionals follow
+        // the same loud contract (rm-439).
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("statusline"),
+            OsString::from("payload.txt"),
+        ])
+        .expect_err("extra positionals after a keyword must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("`payload.txt`"),
+            "names the dropped operand: {message}"
+        );
+        assert!(
+            message.contains("follows the `statusline` keyword"),
+            "names the keyword lane: {message}"
         );
     }
 
@@ -2330,5 +2440,114 @@ mod tests {
         args.overview = true;
         args.range = "7d".to_string();
         assert!(validate_range_applicability(&args).is_ok());
+    }
+
+    #[test]
+    fn sample_on_a_non_sampling_lane_is_rejected() {
+        // rm-593 (assess N3): `--overview --sample 1` used to render
+        // the FULL aggregate byte-identical to unsampled while looking
+        // bounded (proven with cmp on the assess corpus). The flag must
+        // either shape the output or exit non-zero naming the flag and
+        // the lanes that honor it — mirror of the rm-244 --range guard.
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.overview = true;
+        args.sample = Some(1);
+        let err = validate_sample_applicability(&args)
+            .expect_err("must reject --sample under --overview");
+        let message = err.to_string();
+        assert!(
+            message.contains("--sample"),
+            "error must name the flag: {message}"
+        );
+        assert!(
+            message.contains("--overview"),
+            "error must name the ignoring lane: {message}"
+        );
+        assert!(
+            message.contains("--audit") && message.contains("--compare"),
+            "error must name the consuming lanes: {message}"
+        );
+        // The interactive TUI lane (no action at all) rejects it too.
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.sample = Some(2);
+        assert!(
+            validate_sample_applicability(&args).is_err(),
+            "the interactive views ignore --sample and must say so"
+        );
+    }
+
+    #[test]
+    fn sample_on_every_consuming_lane_passes_the_guard() {
+        // --compare and the five governance actions consume --sample.
+        let mut args = compare_args(None);
+        args.sample = Some(2);
+        assert!(validate_sample_applicability(&args).is_ok());
+        let mut governance = compare_args(None);
+        governance.compare = false;
+        governance.audit = true;
+        governance.sample = Some(2);
+        assert!(validate_sample_applicability(&governance).is_ok());
+        let mut recommend = compare_args(None);
+        recommend.compare = false;
+        recommend.recommend = true;
+        assert!(validate_sample_applicability(&recommend).is_ok());
+        let mut mcp = compare_args(None);
+        mcp.compare = false;
+        mcp.mcp_governance = true;
+        assert!(validate_sample_applicability(&mcp).is_ok());
+        let mut trends = compare_args(None);
+        trends.compare = false;
+        trends.context_trends = true;
+        assert!(validate_sample_applicability(&trends).is_ok());
+        let mut evidence = compare_args(None);
+        evidence.compare = false;
+        evidence.delivery_evidence = true;
+        assert!(validate_sample_applicability(&evidence).is_ok());
+        // Unset sample on an ignoring lane stays valid (default case).
+        let mut plain = compare_args(None);
+        plain.compare = false;
+        plain.overview = true;
+        assert!(validate_sample_applicability(&plain).is_ok());
+    }
+
+    #[test]
+    fn history_flags_on_an_ignoring_lane_are_rejected() {
+        // rm-593: `--include-history`/`--preserve-history` were silent
+        // no-ops on the interactive TUI lane (the TUI discovers with
+        // its own LoadOptions::default()). They must exit non-zero
+        // there, naming the flag pair and the consuming lanes.
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.include_history = true;
+        let err = validate_history_applicability(&args)
+            .expect_err("must reject --include-history on the TUI lane");
+        let message = err.to_string();
+        assert!(
+            message.contains("--include-history"),
+            "error must name the flag pair: {message}"
+        );
+        assert!(
+            message.contains("--overview"),
+            "error must suggest a consuming action: {message}"
+        );
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.preserve_history = true;
+        assert!(
+            validate_history_applicability(&args).is_err(),
+            "--preserve-history on the TUI lane must be rejected too"
+        );
+        // A session-report action consumes them at the load layer.
+        let mut args = compare_args(None);
+        args.include_history = true;
+        args.preserve_history = true;
+        assert!(validate_history_applicability(&args).is_ok());
+        let mut overview = compare_args(None);
+        overview.compare = false;
+        overview.overview = true;
+        overview.include_history = true;
+        assert!(validate_history_applicability(&overview).is_ok());
     }
 }

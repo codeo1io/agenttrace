@@ -14,6 +14,27 @@ Before a PASS, ready-for-merge request, or public-surface PR:
 
 Protected public surfaces include `docs/maintainers/launch-kit.md`, release notes, community or social drafts, `SECURITY.md`, `PRIVACY.md`, `LICENSE`, install or release automation, and external announcement copy.
 
+## Merge & Integration Validation
+
+Before declaring any merge, integration, or conflict-resolution round green:
+
+1. Run the Lint CI lane verbatim — `cargo check` + `cargo fmt` are not enough:
+
+   ```bash
+   cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+   ```
+
+2. Also run the batch-contract form over every target:
+
+   ```bash
+   cargo clippy --workspace --all-targets --locked -- -D warnings
+   ```
+
+Root cause this rule closes (2026-10-06, rm-592): every integration round after
+f59a67d ran check + fmt only, so no clippy execution touched the new code until
+the `Lint` CI job failed on `type_complexity` and `needless_borrow` that check
+and fmt cannot see.
+
 ## Quality Gatekeeper
 
 Run protected-surface checks before any PASS verdict.
