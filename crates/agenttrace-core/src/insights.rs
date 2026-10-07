@@ -187,6 +187,15 @@ pub struct DataHealth {
     /// or overflowing pricing inputs). Their costs render as null in
     /// reports; the count keeps the corruption visible (pass-8 F8-5).
     pub non_finite_costs: usize,
+    /// SQLite-backed stores (hermes/opencode) whose read failed
+    /// (rm-722): a transient SQLITE_BUSY/locked or unreadable database
+    /// must be disclosed — those sessions are EXCLUDED from this report,
+    /// never silently reported as a zero-session answer. Detail strings
+    /// carry `<database>: <error>`. Populated by the CLI from the
+    /// loader's failure registry; empty for clean runs, so report bytes
+    /// are unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_store_failures: Vec<String>,
 }
 
 pub fn session_capability(session: &Session) -> &'static str {
@@ -211,11 +220,42 @@ pub fn resolve_project(session: &Session) -> ProjectIdentity {
     let decoded;
     let raw = if !session.cwd.trim().is_empty() {
         session.cwd.trim()
-    } else if let Some(path) = decode_agent_project_dir(&session.path) {
-        decoded = path;
-        decoded.as_str()
     } else {
-        ""
+        match decode_agent_project_dir_detailed(&session.path) {
+            DecodeOutcome::Verified(path) => {
+                decoded = path;
+                decoded.as_str()
+            }
+            // rm-240: the official >200-char form truncates the encoding
+            // and appends a hash of the full path. The hash tail is
+            // opaque-but-stable, so the identity keys on the raw encoded
+            // name (unique per source path) while `root` exposes the
+            // deepest VERIFIED prefix of the truncation. No git-root walk:
+            // the prefix is only a partial reconstruction, and a repo
+            // above the cut would mis-merge distinct long-named projects.
+            DecodeOutcome::Truncated { prefix, encoded } => {
+                let display_name = truncated_display_name(&prefix, &encoded);
+                return ProjectIdentity {
+                    id: encoded,
+                    display_name,
+                    root: prefix,
+                    resolution: "encoded_truncated".to_string(),
+                };
+            }
+            // rm-240: CLAUDE_CODE_PROJECT_DIR_NAME (v2.1.234+) files
+            // transcripts under `projects/<custom-name>/` where the name
+            // is an opaque label naming no path at all — it IS the stable
+            // identity, not `unknown`.
+            DecodeOutcome::Opaque { name } => {
+                return ProjectIdentity {
+                    id: name.clone(),
+                    display_name: name,
+                    root: String::new(),
+                    resolution: "opaque_project_dir_name".to_string(),
+                };
+            }
+            DecodeOutcome::None => "",
+        }
     };
     if raw.is_empty() || raw.starts_with("history:") {
         return ProjectIdentity {
@@ -267,15 +307,96 @@ pub fn resolve_project(session: &Session) -> ProjectIdentity {
 // Residual ambiguity — a verified alternative was shadowed by the
 // longest-run rule at some step — is disclosed through
 // `project_decode_status` / `--doctor` instead of being decided silently.
-fn decode_agent_project_dir(session_path: &str) -> Option<String> {
-    let parts = encoded_project_components(session_path)?;
-    decode_encoded_components(&parts, false).map(|walk| walk.path)
+/// Outcome of reversing a transcript's encoded project directory
+/// (rm-240): a complete verified decode, the official truncated+hash
+/// form, an opaque custom name — or nothing.
+enum DecodeOutcome {
+    /// A complete verified decode of a '-'-encoded name.
+    Verified(String),
+    /// The official form for names over
+    /// [`OFFICIAL_ENCODED_NAME_TRUNCATION`] chars: the encoding is cut to
+    /// that length and a hash of the full path is appended. `prefix` is
+    /// the deepest VERIFIED decode of the truncation; `encoded` is the
+    /// raw on-disk name (the stable identity, unique per source path).
+    Truncated { prefix: String, encoded: String },
+    /// A CLAUDE_CODE_PROJECT_DIR_NAME-style opaque custom name: it names
+    /// no path, so the name itself is the identity.
+    Opaque { name: String },
+    /// No attribution form recognized (not under `…/projects/<encoded>/`),
+    /// or a path-shaped name that simply does not verify.
+    None,
 }
 
-/// The `-`-encoded project directory components of a transcript path
-/// (`…/projects/<encoded>/…`), with the leading '-' (the encoded root
-/// slash) stripped the way the encoders write it.
-fn encoded_project_components(session_path: &str) -> Option<Vec<&str>> {
+/// Official encoded-name truncation length: encoded project dir names
+/// over 200 chars are cut to 200 and suffixed with a hash of the full
+/// path (code.claude.com/docs/en/sessions), so everything past 200 is
+/// opaque — stable per source path, never recoverable.
+const OFFICIAL_ENCODED_NAME_TRUNCATION: usize = 200;
+
+/// CLAUDE_CODE_PROJECT_DIR_NAME opaque custom names (v2.1.234+, used
+/// with CLAUDE_CONFIG_DIR): 1-64 chars of `[a-zA-Z0-9_-]` that name no
+/// path at all.
+fn opaque_project_dir_name(name: &str) -> bool {
+    let mut len = 0usize;
+    name.chars().all(|c| {
+        len += 1;
+        c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    }) && (1..=64).contains(&len)
+}
+
+fn decode_agent_project_dir_detailed(session_path: &str) -> DecodeOutcome {
+    let Some(parts) = encoded_project_components(session_path) else {
+        return DecodeOutcome::None;
+    };
+    if let Some(walk) = decode_encoded_components(&parts, false) {
+        return DecodeOutcome::Verified(walk.path);
+    }
+    let Some(raw) = encoded_project_dir_name(session_path) else {
+        return DecodeOutcome::None;
+    };
+    if raw.len() > OFFICIAL_ENCODED_NAME_TRUNCATION
+        && raw.is_char_boundary(OFFICIAL_ENCODED_NAME_TRUNCATION)
+    {
+        let truncation = &raw[..OFFICIAL_ENCODED_NAME_TRUNCATION];
+        let truncated_parts: Vec<&str> = truncation.trim_start_matches('-').split('-').collect();
+        return DecodeOutcome::Truncated {
+            prefix: deepest_verified_prefix(&truncated_parts),
+            encoded: raw.to_string(),
+        };
+    }
+    // Path-shaped encodings carry a leading '-' (the encoded root
+    // slash); a leading-dash-free label that matches the opaque-name
+    // pattern is a CLAUDE_CODE_PROJECT_DIR_NAME custom name, not a
+    // failed decode.
+    if !raw.starts_with('-') && opaque_project_dir_name(raw) {
+        return DecodeOutcome::Opaque {
+            name: raw.to_string(),
+        };
+    }
+    DecodeOutcome::None
+}
+
+/// Display name for the truncated+hash form: the deepest verified
+/// component of the truncation when one exists, else the final
+/// non-empty component of the truncation itself (the cut-off tail
+/// fragment — an honest reconstruction of what the encoder kept).
+fn truncated_display_name(prefix: &str, encoded: &str) -> String {
+    if let Some(name) = prefix.rsplit('/').find(|component| !component.is_empty()) {
+        return name.to_string();
+    }
+    encoded
+        .get(..OFFICIAL_ENCODED_NAME_TRUNCATION)
+        .unwrap_or(encoded)
+        .rsplit('-')
+        .find(|component| !component.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The raw encoded project directory name of a transcript path
+/// (`…/projects/<encoded>/…`), exactly as the encoder wrote it (leading
+/// '-' included when the source was an absolute path).
+fn encoded_project_dir_name(session_path: &str) -> Option<&str> {
     let path = Path::new(session_path);
     let dir = path.ancestors().find_map(|ancestor| {
         let parent = ancestor.parent()?;
@@ -283,7 +404,14 @@ fn encoded_project_components(session_path: &str) -> Option<Vec<&str>> {
             .then(|| ancestor.file_name()?.to_str())
             .flatten()
     })?;
-    let encoded = dir.trim_start_matches('-');
+    (!dir.is_empty()).then_some(dir)
+}
+
+/// The `-`-encoded project directory components of a transcript path
+/// (`…/projects/<encoded>/…`), with the leading '-' (the encoded root
+/// slash) stripped the way the encoders write it.
+fn encoded_project_components(session_path: &str) -> Option<Vec<&str>> {
+    let encoded = encoded_project_dir_name(session_path)?.trim_start_matches('-');
     (!encoded.is_empty()).then(|| encoded.split('-').collect())
 }
 
@@ -380,6 +508,68 @@ fn explore_encoded_components(
     }
 }
 
+/// Deepest VERIFIED decode of a truncated encoded name's components
+/// (rm-240): the official encoder cuts names over
+/// [`OFFICIAL_ENCODED_NAME_TRUNCATION`] chars, so only a prefix of the
+/// component list is real. Walks with the same longest-run-first,
+/// separator-variant order as `explore_encoded_components`, keeping the
+/// deepest directory reached on any branch even when no branch completes
+/// — the unrecoverable tail is disclosed through the
+/// `encoded_truncated` resolution instead of collapsing to `unknown`.
+/// Same probe budget and determinism guarantees as the complete walk.
+fn deepest_verified_prefix(parts: &[&str]) -> String {
+    struct Best {
+        depth: usize,
+        path: String,
+    }
+    fn explore(
+        parts: &[&str],
+        idx: usize,
+        current: &Path,
+        depth: usize,
+        probes: &mut usize,
+        best: &mut Best,
+    ) {
+        if depth > best.depth {
+            best.depth = depth;
+            best.path = current.to_string_lossy().to_string();
+        }
+        if idx == parts.len() || *probes > DECODE_PROBE_BUDGET {
+            return;
+        }
+        for len in (1..=parts.len() - idx).rev() {
+            let joined = parts[idx..idx + len].join("-");
+            let mut variants = Vec::with_capacity(3);
+            for candidate in [
+                joined.clone(),
+                joined.replace('-', "."),
+                joined.replace('-', "_"),
+            ] {
+                if !candidate.is_empty() && !variants.contains(&candidate) {
+                    variants.push(candidate);
+                }
+            }
+            for candidate in variants {
+                *probes += 1;
+                let next = current.join(&candidate);
+                if next.is_dir() {
+                    explore(parts, idx + len, &next, depth + len, probes, best);
+                }
+            }
+        }
+        if parts[idx].is_empty() {
+            explore(parts, idx + 1, current, depth, probes, best);
+        }
+    }
+    let mut best = Best {
+        depth: 0,
+        path: "/".to_string(),
+    };
+    let mut probes = 0usize;
+    explore(parts, 0, Path::new("/"), 0, &mut probes, &mut best);
+    best.path
+}
+
 /// Outcome of reversing a transcript's `-`-encoded agent project
 /// directory, for `--doctor` disclosure (rm-381).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,6 +585,14 @@ pub enum ProjectDecodeStatus {
     Ambiguous { path: String, shadowed: Vec<String> },
     /// No complete verified decode: attribution falls back to "unknown".
     Unresolved { encoded: String },
+    /// The official >200-char truncated+hash form (rm-240): no complete
+    /// decode exists (the tail past the truncation is a hash of the full
+    /// path), so attribution keys on the raw `encoded` name while
+    /// `prefix` carries the deepest VERIFIED prefix of the truncation.
+    Truncated { prefix: String, encoded: String },
+    /// A CLAUDE_CODE_PROJECT_DIR_NAME-style opaque custom name (rm-240):
+    /// the name labels no path, so it is the stable identity.
+    Opaque { name: String },
 }
 
 /// Reports how a session without a `cwd` was attributed when its project
@@ -408,14 +606,30 @@ pub fn project_decode_status(session: &Session) -> ProjectDecodeStatus {
     let Some(parts) = encoded_project_components(&session.path) else {
         return ProjectDecodeStatus::NotConsulted;
     };
-    match decode_encoded_components(&parts, true) {
-        Some(EncodedWalk { path, shadowed }) if shadowed.is_empty() => {
-            ProjectDecodeStatus::Resolved { path }
-        }
-        Some(EncodedWalk { path, shadowed }) => ProjectDecodeStatus::Ambiguous { path, shadowed },
-        None => ProjectDecodeStatus::Unresolved {
+    match decode_agent_project_dir_detailed(&session.path) {
+        DecodeOutcome::None => ProjectDecodeStatus::Unresolved {
             encoded: parts.join("-"),
         },
+        DecodeOutcome::Verified(_) => {
+            // Re-walk with disclosure on: the chosen path is identical
+            // (same fixed search order), but the shadowed alternatives
+            // are collected for the ambiguity report.
+            match decode_encoded_components(&parts, true) {
+                Some(EncodedWalk { path, shadowed }) if shadowed.is_empty() => {
+                    ProjectDecodeStatus::Resolved { path }
+                }
+                Some(EncodedWalk { path, shadowed }) => {
+                    ProjectDecodeStatus::Ambiguous { path, shadowed }
+                }
+                None => ProjectDecodeStatus::Unresolved {
+                    encoded: parts.join("-"),
+                },
+            }
+        }
+        DecodeOutcome::Truncated { prefix, encoded } => {
+            ProjectDecodeStatus::Truncated { prefix, encoded }
+        }
+        DecodeOutcome::Opaque { name } => ProjectDecodeStatus::Opaque { name },
     }
 }
 
@@ -507,6 +721,25 @@ pub fn session_matches_time_range(session: &Session, range: TimeRange, now: Date
     })
 }
 
+/// Saturating f64 addition for per-source cost totals (rm-723): the
+/// token arm of the same accumulator saturates since rm-529, but the
+/// cost arm used plain `+=`, so a hostile journal pushing
+/// `cost_estimated` values past the f64 boundary surfaced `inf` in
+/// reports (per-session renderers null non-finite costs via
+/// `non_finite_costs`; the aggregated source total had no such guard).
+/// A finite sum above `f64::MAX` clamps to `f64::MAX`; a NaN addend
+/// keeps the sum NaN — clamping it would silently "repair" poisoned
+/// pricing inputs that the `non_finite_costs` disclosure exists to
+/// flag.
+fn saturating_add_cost(total: f64, addend: f64) -> f64 {
+    let sum = total + addend;
+    if sum.is_sign_positive() && sum > f64::MAX {
+        f64::MAX
+    } else {
+        sum
+    }
+}
+
 pub fn report_scope(
     sessions: &[Session],
     range: TimeRange,
@@ -528,7 +761,10 @@ pub fn report_scope(
             });
         entry.sessions += 1;
         entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-        entry.estimated_cost += session.metrics.cost_estimated;
+        // rm-723: the cost arm joins the rm-529 token arms in saturating —
+        // see `saturating_add_cost`.
+        entry.estimated_cost =
+            saturating_add_cost(entry.estimated_cost, session.metrics.cost_estimated);
     }
     ReportScope {
         generated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -557,7 +793,7 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
     // separated, so they fold into `skipped` and out_of_scope stays 0.
     let parsed = sessions.len();
     let skipped = discovered.saturating_sub(parsed);
-    data_health_from_parts(sessions, discovered, skipped, 0, cache_hits)
+    data_health_from_parts(sessions, discovered, skipped, 0, cache_hits, Vec::new())
 }
 
 /// Truthful coverage accounting from the discovery loader (pass-8
@@ -570,6 +806,7 @@ pub fn data_health_scoped(
     discovered: usize,
     parse_failures: usize,
     cache_hits: usize,
+    sqlite_store_failures: Vec<String>,
 ) -> DataHealth {
     let parsed = sessions.len();
     let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
@@ -579,6 +816,7 @@ pub fn data_health_scoped(
         parse_failures,
         out_of_scope,
         cache_hits,
+        sqlite_store_failures,
     )
 }
 
@@ -588,6 +826,7 @@ fn data_health_from_parts(
     skipped: usize,
     out_of_scope: usize,
     cache_hits: usize,
+    sqlite_store_failures: Vec<String>,
 ) -> DataHealth {
     let parsed = sessions.len();
     let unknown_sources = sessions
@@ -676,6 +915,7 @@ fn data_health_from_parts(
         line_skips,
         disclosures,
         non_finite_costs,
+        sqlite_store_failures,
         with_duration: sessions
             .iter()
             .filter(|s| s.metrics.duration_sec > 0.0)
@@ -966,5 +1206,113 @@ mod tests {
         assert!(TimeRange::Today
             .since(now)
             .is_some_and(|start| start <= now));
+    }
+
+    #[test]
+    fn scope_cost_totals_saturate_instead_of_overflowing_to_infinity() {
+        // rm-723 red-first: the token arm of the per-source accumulator
+        // saturates (rm-529), but the cost arm used plain `+=` — two
+        // near-f64::MAX `cost_estimated` values summed to `inf`, which
+        // renderers pass through instead of the disclosed clamp. The cost
+        // arm must saturate at f64::MAX too; a NaN cost must stay NaN so
+        // `non_finite_costs` keeps flagging it rather than the saturating
+        // clamp silently "fixing" poisoned pricing inputs.
+        let mut a = session_at("", "/a.jsonl");
+        a.metrics.source_tool = "claude_code".to_string();
+        a.metrics.cost_estimated = f64::MAX;
+        let mut b = session_at("", "/b.jsonl");
+        b.metrics.source_tool = "claude_code".to_string();
+        b.metrics.cost_estimated = f64::MAX;
+        let scope = report_scope(&[a, b], TimeRange::All, false);
+        let source = scope
+            .sources
+            .iter()
+            .find(|entry| entry.source == "claude_code")
+            .expect("per-source scope entry");
+        assert_eq!(source.sessions, 2);
+        assert_eq!(source.estimated_cost, f64::MAX);
+
+        let mut nan = session_at("", "/c.jsonl");
+        nan.metrics.source_tool = "claude_code".to_string();
+        nan.metrics.cost_estimated = f64::NAN;
+        let scope = report_scope(&[nan], TimeRange::All, false);
+        let source = scope
+            .sources
+            .iter()
+            .find(|entry| entry.source == "claude_code")
+            .expect("per-source scope entry");
+        assert!(source.estimated_cost.is_nan(), "NaN passes through");
+    }
+
+    #[test]
+    fn opaque_project_dir_name_yields_a_stable_identity() {
+        // rm-240 residual red-first: CLAUDE_CODE_PROJECT_DIR_NAME (v2.1.234+)
+        // files transcripts under `projects/<custom-name>/` where the name
+        // is an opaque [a-zA-Z0-9_-]{1,64} label — no leading '-', nothing
+        // path-shaped to decode. The old decoder dash-split it, failed the
+        // filesystem walk, and dumped every such session into `unknown`.
+        // The name must attribute stably instead.
+        let session = session_at("", "/cfg/projects/my-custom-app/s.jsonl");
+        let identity = resolve_project(&session);
+        assert_eq!(identity.display_name, "my-custom-app");
+        assert_eq!(identity.id, "my-custom-app");
+        assert_eq!(identity.resolution, "opaque_project_dir_name");
+        // Two sessions share the identity (stable grouping, no `unknown`
+        // merger), and a cwd-bearing session is never consulted.
+        let other = resolve_project(&session_at("", "/cfg/projects/my-custom-app/t.jsonl"));
+        assert_eq!(other.id, identity.id);
+        assert!(
+            resolve_project(&session_at(
+                "/somewhere",
+                "/cfg/projects/my-custom-app/s.jsonl"
+            ))
+            .resolution
+                != "opaque_project_dir_name"
+        );
+    }
+
+    #[test]
+    fn truncated_encoded_project_name_decodes_the_verified_prefix() {
+        // rm-240 residual red-first: the official encoder cuts names over
+        // 200 chars to 200 and appends a hash of the full path, so the tail
+        // past 200 is opaque-but-stable. The old decoder ran the walk over
+        // truncation+hash, dead-ended on the hash fragment, and answered
+        // `unknown`. The decode must instead reconstruct the truncation:
+        // attribute by the raw encoded name (unique per source path thanks
+        // to the hash) and expose the deepest VERIFIED prefix as the root.
+        let root = unique_decode_root("truncated");
+        let mut repo = root.clone();
+        for i in 0..18 {
+            repo = repo.join(format!("lvl{i:02}a1b2c3d4"));
+        }
+        repo = repo.join("final-project");
+        fs::create_dir_all(&repo).expect("create deep repo");
+        let encoded = repo.to_string_lossy().replace('/', "-");
+        assert!(
+            encoded.len() > 200,
+            "fixture must exercise the >200-char form: {}",
+            encoded.len()
+        );
+        let hashed = format!("{}9f8e7d6c", &encoded[..200]);
+        let transcript = root
+            .join("projects")
+            .join(&hashed)
+            .join("s.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let identity = resolve_project(&session_at("", &transcript));
+        assert_eq!(identity.id, hashed, "identity keys on the raw encoded name");
+        assert_eq!(identity.resolution, "encoded_truncated");
+        assert_ne!(identity.display_name, "unknown");
+        // Deepest verified prefix of the truncation: the walk follows the
+        // real fixture directories and stops where the cut makes the tail
+        // fragment unverifiable — so the root is a strict prefix of the
+        // true repo path, never a misattribution to some other project.
+        let repo_normalized = lexical_normalize(&repo).to_string_lossy().to_string();
+        assert!(
+            repo_normalized.starts_with(&identity.root) && !identity.root.is_empty(),
+            "root {root:?} must be a verified prefix of {repo_normalized:?}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -20,6 +20,13 @@ pub struct DoctorReport {
     /// rm-381 disclosure: outcomes of reversing `-`-encoded agent project
     /// directory names for scanned sessions without a `cwd`.
     pub project_decode: DoctorProjectDecodeReport,
+    /// rm-722 disclosure: SQLite-backed stores (hermes/opencode) whose
+    /// read failed during discovery — a transient SQLITE_BUSY/locked or
+    /// unreadable database. Those stores' sessions are EXCLUDED from
+    /// every report, so the failure is surfaced here instead of reading
+    /// as a zero-session answer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_store_failures: Vec<String>,
     /// rm-408 disclosure: sessions whose transcripts REPORT all-zero
     /// usage blocks, and how many events carry them. Counted as measured
     /// zeros; the share is surfaced so a present-zero corpus never reads
@@ -121,6 +128,17 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     } else {
         Vec::new()
     };
+    // rm-722: sqlite-backed loads that failed during the scan above are
+    // disclosed here — their sessions are excluded, and a transient
+    // lock/SQLITE_BUSY window must never read as a zero-session answer.
+    let sqlite_store_failures = if dir.is_none() && !demo {
+        crate::sqlite_sessions::take_sqlite_store_failures()
+            .into_iter()
+            .map(|failure| format!("{} {}: {}", failure.store, failure.database, failure.error))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
         "demo sessions"
@@ -161,6 +179,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions: files.len() + sqlite_sessions.len(),
         session_files: files.len(),
         project_decode,
+        sqlite_store_failures,
         zero_usage,
         disclosures,
         directories,
@@ -204,6 +223,13 @@ pub struct DoctorProjectDecodeReport {
     pub resolved: usize,
     pub ambiguous: usize,
     pub unresolved: usize,
+    /// Official >200-char truncated+hash forms (rm-240): attributed by
+    /// the raw encoded name with the deepest verified truncation prefix
+    /// as the root, never "unknown".
+    pub truncated: usize,
+    /// CLAUDE_CODE_PROJECT_DIR_NAME-style opaque custom names (rm-240):
+    /// attributed by the name itself, never "unknown".
+    pub opaque: usize,
     /// One representative sample per distinct project, in first-seen
     /// order, at most six (rm-512): repeated projects collapse into a
     /// single line carrying their session count instead of crowding the
@@ -220,9 +246,23 @@ pub struct DoctorProjectDecodeReport {
     ambiguous_tally: BTreeMap<String, (usize, String)>,
     #[serde(skip)]
     unresolved_tally: BTreeMap<String, usize>,
-    /// First-seen order of distinct sample projects (`true` = ambiguous).
     #[serde(skip)]
-    sample_order: Vec<(bool, String)>,
+    truncated_tally: BTreeMap<String, (usize, String)>,
+    #[serde(skip)]
+    opaque_tally: BTreeMap<String, usize>,
+    /// First-seen order of distinct sample projects.
+    #[serde(skip)]
+    sample_order: Vec<(DecodeSampleKind, String)>,
+}
+
+/// Which tally a sample line reads from (rm-512 first-seen interleave,
+/// extended by rm-240's two new attribution kinds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeSampleKind {
+    Ambiguous,
+    Unresolved,
+    Truncated,
+    Opaque,
 }
 
 impl DoctorProjectDecodeReport {
@@ -231,7 +271,8 @@ impl DoctorProjectDecodeReport {
             Entry::Occupied(mut entry) => entry.get_mut().0 += 1,
             Entry::Vacant(vacant) => {
                 vacant.insert((1, shadowed));
-                self.sample_order.push((true, path.to_string()));
+                self.sample_order
+                    .push((DecodeSampleKind::Ambiguous, path.to_string()));
             }
         }
     }
@@ -241,7 +282,30 @@ impl DoctorProjectDecodeReport {
             Entry::Occupied(mut entry) => *entry.get_mut() += 1,
             Entry::Vacant(vacant) => {
                 vacant.insert(1);
-                self.sample_order.push((false, encoded.to_string()));
+                self.sample_order
+                    .push((DecodeSampleKind::Unresolved, encoded.to_string()));
+            }
+        }
+    }
+
+    fn record_truncated(&mut self, encoded: &str, prefix: &str) {
+        match self.truncated_tally.entry(encoded.to_string()) {
+            Entry::Occupied(mut entry) => entry.get_mut().0 += 1,
+            Entry::Vacant(vacant) => {
+                vacant.insert((1, prefix.to_string()));
+                self.sample_order
+                    .push((DecodeSampleKind::Truncated, encoded.to_string()));
+            }
+        }
+    }
+
+    fn record_opaque(&mut self, name: &str) {
+        match self.opaque_tally.entry(name.to_string()) {
+            Entry::Occupied(mut entry) => *entry.get_mut() += 1,
+            Entry::Vacant(vacant) => {
+                vacant.insert(1);
+                self.sample_order
+                    .push((DecodeSampleKind::Opaque, name.to_string()));
             }
         }
     }
@@ -253,35 +317,67 @@ impl DoctorProjectDecodeReport {
     /// preferred inside the six-slot budget.
     pub fn finalize_samples(&mut self) {
         let mut samples = Vec::new();
-        for (ambiguous, project) in &self.sample_order {
+        for (kind, project) in &self.sample_order {
             if samples.len() >= 6 {
                 break;
             }
-            let (line, count) = if *ambiguous {
-                let Some((count, shadowed)) = self.ambiguous_tally.get(project) else {
-                    continue;
-                };
-                (
-                    format!(
-                        "ambiguous: {} attributed via the longest-verified-path rule; \
-                         verified alternatives shadowed: {}",
-                        crate::statusline::sanitize_line_segment(project),
-                        shadowed
-                    ),
-                    *count,
-                )
-            } else {
-                let Some(count) = self.unresolved_tally.get(project) else {
-                    continue;
-                };
-                (
-                    format!(
-                        "unresolved: projects/{} has no verified decode; \
-                         session attributed to `unknown`",
-                        crate::statusline::sanitize_line_segment(project)
-                    ),
-                    *count,
-                )
+            let sanitize = crate::statusline::sanitize_line_segment;
+            let (line, count) = match kind {
+                DecodeSampleKind::Ambiguous => {
+                    let Some((count, shadowed)) = self.ambiguous_tally.get(project) else {
+                        continue;
+                    };
+                    (
+                        format!(
+                            "ambiguous: {} attributed via the longest-verified-path rule; \
+                             verified alternatives shadowed: {}",
+                            sanitize(project),
+                            shadowed
+                        ),
+                        *count,
+                    )
+                }
+                DecodeSampleKind::Unresolved => {
+                    let Some(count) = self.unresolved_tally.get(project) else {
+                        continue;
+                    };
+                    (
+                        format!(
+                            "unresolved: projects/{} has no verified decode; \
+                             session attributed to `unknown`",
+                            sanitize(project)
+                        ),
+                        *count,
+                    )
+                }
+                DecodeSampleKind::Truncated => {
+                    let Some((count, prefix)) = self.truncated_tally.get(project) else {
+                        continue;
+                    };
+                    (
+                        format!(
+                            "truncated: projects/{} exceeds the official 200-char \
+                             truncation; attributed by encoded name, deepest verified \
+                             prefix {}",
+                            sanitize(project),
+                            sanitize(prefix)
+                        ),
+                        *count,
+                    )
+                }
+                DecodeSampleKind::Opaque => {
+                    let Some(count) = self.opaque_tally.get(project) else {
+                        continue;
+                    };
+                    (
+                        format!(
+                            "opaque: projects/{} is a CLAUDE_CODE_PROJECT_DIR_NAME-style \
+                             custom name; attributed by name",
+                            sanitize(project)
+                        ),
+                        *count,
+                    )
+                }
             };
             let mut line = line;
             if count > 1 {
@@ -292,6 +388,8 @@ impl DoctorProjectDecodeReport {
         self.samples = samples;
         self.ambiguous_tally.clear();
         self.unresolved_tally.clear();
+        self.truncated_tally.clear();
+        self.opaque_tally.clear();
         self.sample_order.clear();
     }
 }
@@ -326,6 +424,14 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
         ProjectDecodeStatus::Unresolved { encoded } => {
             out.unresolved += 1;
             out.record_unresolved(&encoded);
+        }
+        ProjectDecodeStatus::Truncated { prefix, encoded } => {
+            out.truncated += 1;
+            out.record_truncated(&encoded, &prefix);
+        }
+        ProjectDecodeStatus::Opaque { name } => {
+            out.opaque += 1;
+            out.record_opaque(&name);
         }
     }
 }
@@ -679,13 +785,20 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     ));
     out.push_str(&format!("Pricing snapshot: {}\n", report.pricing));
     out.push_str(&format!(
-        "Project attribution: {} resolved, {} ambiguous, {} unresolved encoded project dirs\n",
+        "Project attribution: {} resolved, {} ambiguous, {} unresolved encoded project dirs ({} truncated, {} opaque names)\n",
         report.project_decode.resolved,
         report.project_decode.ambiguous,
-        report.project_decode.unresolved
+        report.project_decode.unresolved,
+        report.project_decode.truncated,
+        report.project_decode.opaque
     ));
     for sample in &report.project_decode.samples {
         out.push_str(&format!("    {sample}\n"));
+    }
+    for failure in &report.sqlite_store_failures {
+        out.push_str(&format!(
+            "SQLite store read failure (sessions excluded): {failure}\n"
+        ));
     }
     out.push_str(&format!(
         "Zero-usage reports: {} session(s), {} event(s) counted as measured zeros (rm-408)\n",
@@ -945,6 +1058,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opaque_and_truncated_names_are_attributed_not_unresolved() {
+        // rm-240 doctor arms: CLAUDE_CODE_PROJECT_DIR_NAME custom names
+        // and official >200-char truncated+hash names count in their
+        // own doctor buckets and sample their own lines — they are no
+        // longer buried in `unresolved`.
+        let mut report = DoctorProjectDecodeReport::default();
+        for _ in 0..2 {
+            collect_project_decode(
+                &mut report,
+                &session_at("", "/cfg/projects/my-custom-app/s.jsonl"),
+            );
+        }
+        collect_project_decode(
+            &mut report,
+            &session_at(
+                "",
+                &format!("/cfg/projects/{}9f8e7d6c/s.jsonl", "a".repeat(200)),
+            ),
+        );
+        report.finalize_samples();
+
+        assert_eq!(report.opaque, 2);
+        assert_eq!(report.truncated, 1);
+        assert_eq!(report.unresolved, 0, "neither arm is unresolved");
+        assert_eq!(report.samples.len(), 2, "one line per project");
+        assert!(
+            report.samples.iter().any(|line| {
+                line.contains("opaque")
+                    && line.contains("my-custom-app")
+                    && line.ends_with("(2 sessions)")
+            }),
+            "{:?}",
+            report.samples
+        );
+        assert!(
+            report.samples.iter().any(|line| line.contains("truncated")),
+            "{:?}",
+            report.samples
+        );
+    }
+
+    #[test]
+    fn doctor_report_serializes_sqlite_store_failures_and_hides_empty() {
+        // rm-722 disclosure surface: failures serialize as detail
+        // strings; an empty registry stays out of the JSON entirely
+        // (byte-stable clean reports).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-doctor-rm722-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let mut report = build_doctor_report(Some(&root), false);
+        assert!(
+            serde_json::to_value(&report)
+                .expect("json")
+                .get("sqlite_store_failures")
+                .is_none(),
+            "empty failure list is omitted from clean reports"
+        );
+        report.sqlite_store_failures =
+            vec!["hermes /home/u/.hermes/state.db: database is locked".to_string()];
+        let json = serde_json::to_value(&report).expect("json");
+        assert_eq!(
+            json["sqlite_store_failures"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[test]
     fn sample_budget_prefers_distinct_projects() {
         // rm-512 budget: seven distinct projects keep the sample cap at

@@ -176,7 +176,13 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
+// Bumped 7 → 8 (run 92992276, rm-722): error-derived empty session lists
+// were cached as if they were valid zero-session reads, so a transient
+// SQLITE_BUSY/locked window pinned a store's "0 sessions" until the
+// snapshot was next invalidated. v8 invalidates every v7 sqlite
+// snapshot once on next scan so stores regenerate under honest reads
+// (failures are now disclosed, never stored).
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -512,11 +518,10 @@ fn remove_cache_artifacts(paths: &[PathBuf]) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) fn load_sqlite_snapshot(database: &Path, name: &str) -> Option<Vec<Session>> {
-    load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name))
-}
-
-fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Vec<Session>> {
+pub(crate) fn load_sqlite_snapshot_from(
+    database: &Path,
+    snapshot_path: &Path,
+) -> Option<Vec<Session>> {
     let raw = fs::read(snapshot_path).ok()?;
     let snapshot = serde_json::from_slice::<SqliteSnapshot>(&raw).ok()?;
     if snapshot.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION
@@ -539,15 +544,7 @@ fn load_sqlite_snapshot_from(database: &Path, snapshot_path: &Path) -> Option<Ve
     )
 }
 
-pub(crate) fn store_sqlite_snapshot(
-    database: &Path,
-    name: &str,
-    sessions: &[Session],
-) -> anyhow::Result<()> {
-    store_sqlite_snapshot_at(database, &sqlite_snapshot_path(name), sessions)
-}
-
-fn store_sqlite_snapshot_at(
+pub(crate) fn store_sqlite_snapshot_at(
     database: &Path,
     path: &Path,
     sessions: &[Session],
@@ -672,7 +669,7 @@ pub(crate) fn sweep_orphaned_temps(path: &Path, max_age: std::time::Duration) ->
     removed
 }
 
-fn sqlite_snapshot_path(name: &str) -> PathBuf {
+pub(crate) fn sqlite_snapshot_path(name: &str) -> PathBuf {
     session_cache_path().with_file_name(format!("{name}-sqlite.json"))
 }
 
@@ -1710,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_eight_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1743,11 +1740,13 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version seven (cycle-1 rm-198): hermes tool outcome semantics
-        // changed (ok/fail now derive from the messages table instead of
-        // fabricating ok == tool_call_count), so v6 snapshots carry stale
-        // tool outcome splits and must regenerate.
-        assert_eq!(doc["schema_version"], 7);
+        // Version eight (run 92992276, rm-722): error-derived empty
+        // session lists were cached as if they were valid zero-session
+        // reads, so a transient SQLITE_BUSY window could pin a store's
+        // "0 sessions" until the snapshot next invalidated. v8
+        // invalidates every v7 sqlite snapshot once; failures are now
+        // disclosed and never stored.
+        assert_eq!(doc["schema_version"], 8);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1759,18 +1758,21 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eight cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(6);
+        old["schema_version"] = serde_json::Value::from(7);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema six json"),
+            serde_json::to_vec(&old).expect("schema seven json"),
         )
         .expect("write old snapshot");
-        assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_none(),
+            "v7 snapshots must regenerate under v8 (rm-722 invalidation)"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

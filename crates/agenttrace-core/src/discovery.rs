@@ -36,6 +36,12 @@ pub struct LoadReport {
     pub parsed: usize,
     pub skipped: usize,
     pub cache_hits: usize,
+    /// rm-722: SQLite-backed stores (hermes/opencode) whose read failed
+    /// during this load — transient SQLITE_BUSY/locked or unreadable
+    /// databases. Those stores' sessions are excluded from `sessions`,
+    /// so the failure is reported instead of reading as a zero-session
+    /// answer.
+    pub sqlite_store_failures: Vec<crate::sqlite_sessions::SqliteStoreFailure>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -361,11 +367,17 @@ pub fn load_sessions_with_progress_from_cache_mode(
     if cache.is_dirty() {
         let _ = save_session_cache(cache);
     }
-    if dir.is_none() {
+    // rm-722: drain the store-failure registry AFTER the sqlite loads —
+    // every failure recorded during this pass (either store) lands in
+    // the report; the registry is left empty for the next pass.
+    let sqlite_store_failures = if dir.is_none() {
         sessions.extend(crate::sqlite_sessions::load_sqlite_backed_sessions_since(
             options.since,
         ));
-    }
+        crate::sqlite_sessions::take_sqlite_store_failures()
+    } else {
+        Vec::new()
+    };
     if options.preserve_history {
         let _ = preserve_derived_history(&sessions);
     }
@@ -398,6 +410,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sessions,
         discovered,
         cache_hits,
+        sqlite_store_failures,
     }
 }
 
