@@ -5,7 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 27;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
+// Bumped 27 -> 28 (run 91833f02 cycle 2, rm-616 review fix, review
+// f6b98bc3 F1): the generic-lane alias + counted-lane fold changes
+// what UNCHANGED generic-shaped files report — model_used (was
+// "default" whenever the journal spelled the wire key model_used),
+// token totals, provenance (reported_by_agent instead of
+// estimated_from_text), and the new model_or_usage_dropped /
+// usage_present_not_counted line_skips — so a warm v27 cache keeps
+// serving the pre-fix values verbatim under matching size/mtime
+// fingerprints: no re-parse, no self-heal (proven live by the
+// review's pre-fix-binary cache-warming PoC). Entries regenerate
+// once on next scan.
 // Bumped 26 -> 27 (integration of run b1ff12f8, rm-542, minted
 // campaign-locally as rm-449): the Codex custom-tools response items are
 // now parsed — custom_tool_call / custom_tool_call_output pairs count as
