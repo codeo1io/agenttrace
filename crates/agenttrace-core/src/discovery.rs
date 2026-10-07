@@ -372,6 +372,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     if options.include_history {
         merge_preserved_history(&mut sessions);
     }
+    // rm-545: link Claude Code subagent transcripts to the session that
+    // spawned them AFTER the history merge (so both freshly parsed and
+    // preserved sessions take part) and BEFORE range/filters (so every
+    // view sees the linked shape). Cached parents get re-attributed on
+    // every load; the cache schema stays untouched.
+    crate::subagents::attribute_subagents(&mut sessions);
     sessions.retain(|session| {
         // Sessions with an unknown start time stay visible (unknown-time
         // bucket, N7) instead of being silently dropped from ranged views;

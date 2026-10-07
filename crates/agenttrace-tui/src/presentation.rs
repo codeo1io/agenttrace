@@ -2122,7 +2122,35 @@ pub(super) fn detail_summary_text(session: &Session, language: Language) -> Stri
             format_count(metrics.tool_results as i64)
         ),
     ]);
+    lines.extend(subagent_lines(session, language));
     lines.join("\n")
+}
+
+/// rm-545: subagent rollup (for parents) or the spawning session (for
+/// subagent transcripts), if any. Rendered next to the session's own
+/// totals so spawned work stays visible without double counting. The
+/// fork carries no `locales/*.yml`; bilingual labels go through
+/// `text(language, en, zh)` (app.rs) like every other detail line.
+fn subagent_lines(session: &Session, language: Language) -> Vec<String> {
+    let metrics = &session.metrics;
+    let mut lines = Vec::new();
+    if metrics.subagent_count > 0 {
+        lines.push(format!(
+            "{}: {}  {}  {}",
+            text(language, "Subagents", "子代理"),
+            format_count(metrics.subagent_count as i64),
+            format_compact_cost(metrics.subagent_cost),
+            format_tokens(metrics.subagent_tokens)
+        ));
+    }
+    if !metrics.parent_session.is_empty() {
+        lines.push(format!(
+            "{}: {}",
+            text(language, "Spawned by", "父会话"),
+            short_path(&metrics.parent_session, 58)
+        ));
+    }
+    lines
 }
 
 pub(super) fn detail_diagnosis_text(session: &Session, language: Language) -> String {
@@ -2311,11 +2339,14 @@ pub(super) fn detail_native_text(session: &Session, language: Language) -> Strin
             text(language, "Cost", "成本"),
             format_compact_cost(metrics.cost_estimated)
         ),
+    ];
+    lines.extend(subagent_lines(session, language));
+    lines.extend([
         String::new(),
         text(language, "Next Action", "下一步动作").to_string(),
         "-----------".to_string(),
         format!("- {}", selected_next_action(session, language)),
-    ];
+    ]);
     lines.extend(signal_lines(session, language));
     lines.push(String::new());
     lines.extend(anomaly_lines(session, 4, language));

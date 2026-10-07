@@ -79,3 +79,24 @@ fi
 # after the first positional are ignored.
 grep -q 'before the session path\|before the first positional' README.md \
   || fail "README must document that flags go before the positional session path"
+
+# rm-207: the README flag reference must stay in lockstep with the
+# binary, and no flag's --help description may regress to blank. Both
+# sides move alone in one refactor; this gate fails on either drift.
+help_text="$("$bin" --help 2>/dev/null || true)"
+bin_flags=$(printf '%s\n' "$help_text" | grep -cE '^ {2,6}(-[a-zA-Z], )?--')
+readme_flags=$(grep -cE '^\| `(-[a-zA-Z], )?--' README.md)
+[[ "$bin_flags" -gt 40 ]] || fail "--help enumerated only $bin_flags flags; binary or parser regressed"
+[[ "$bin_flags" -eq "$readme_flags" ]] \
+  || fail "README flag table ($readme_flags rows) must match --help ($bin_flags flags)"
+blank_docs=$(printf '%s\n' "$help_text" | awk '
+  /^ {2,6}(-[a-zA-Z], )?--/ {
+    if (prev_opt) count++
+    prev_opt = 1
+    next
+  }
+  { if (prev_opt && $0 !~ /^ {10}/) count++; prev_opt = 0 }
+  END { print count + 0 }
+')
+[[ "$blank_docs" -eq 0 ]] \
+  || fail "$blank_docs flag(s) render a blank --help description; every Args field needs a doc comment"

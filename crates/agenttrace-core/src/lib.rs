@@ -13,6 +13,7 @@ mod search;
 mod session_cache;
 mod sqlite_sessions;
 mod statusline;
+mod subagents;
 mod waste;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -75,6 +76,7 @@ pub use statusline::{
     statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
     StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
 };
+pub use subagents::attribute_subagents;
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language,
     waste_report_json, WasteReport,
@@ -424,6 +426,23 @@ pub struct Metrics {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosure_counters: BTreeMap<String, usize>,
     pub provenance: MetricProvenance,
+    /// rm-545: subagent transcripts attributed to this session. Kept
+    /// SEPARATE from the totals above so fleet rollups still count each
+    /// transcript exactly once; linked after load, never cached.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub subagent_count: usize,
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub subagent_cost: f64,
+    #[serde(skip_serializing_if = "i64_is_zero")]
+    pub subagent_tokens: i64,
+    /// rm-545: parent transcript path when this session is itself a
+    /// Claude Code subagent transcript (`<session>/subagents/agent-*`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub parent_session: String,
+}
+
+fn i64_is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 fn usize_is_zero(value: &usize) -> bool {

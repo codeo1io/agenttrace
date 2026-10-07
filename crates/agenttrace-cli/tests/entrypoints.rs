@@ -1507,3 +1507,108 @@ fn waste_report_format_matrix_pins_every_machine_surface() {
         "rejection names the format's owning actions: {stderr}"
     );
 }
+
+#[test]
+fn output_to_dev_null_writes_no_file_and_exits_zero() {
+    // rm-489: `-o /dev/null` used to fail with "writing report output
+    // file" because the rm-250 temp-sibling staging cannot rename onto a
+    // character device. A terminal sink is written through the open
+    // handle instead: exit 0, Saved: banner, and no temp litter.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o", "/dev/null"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "-o /dev/null must succeed: {:?}",
+        output
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Saved: /dev/null"),
+        "the Saved banner still names the sink: {stderr}"
+    );
+    // -o is a tee, not a redirect (documented contract): stdout still
+    // carries the report while the sink receives its own copy.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "-o tees: stdout keeps carrying the report: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn output_to_dev_stdout_lands_the_report_on_stdout() {
+    // rm-489: /dev/stdout is the same special-target class; the report
+    // must arrive on the captured stdout pipe itself.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o", "/dev/stdout"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "-o /dev/stdout must succeed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "the report rides the stdout device itself"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn output_to_fifo_writes_through_and_never_replaces_the_pipe() {
+    // rm-489: the assess PoC watched `-o <fifo>` silently REPLACE the
+    // named pipe with a regular file (temp-sibling + rename). The pipe
+    // must survive as a fifo and carry the report bytes.
+    use std::fs;
+    use std::io::Read;
+    use std::os::unix::fs::FileTypeExt;
+
+    let dir = std::env::temp_dir().join(format!("agenttrace-fifo-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create scratch dir");
+    let fifo = dir.join("report.fifo");
+    let _ = fs::remove_file(&fifo);
+    let mkfifo = Command::new("mkfifo")
+        .arg(&fifo)
+        .output()
+        .expect("run mkfifo");
+    assert!(mkfifo.status.success(), "mkfifo failed: {mkfifo:?}");
+
+    // A reader must be draining the pipe or the writer blocks forever.
+    let reader_fifo = fifo.clone();
+    let reader = std::thread::spawn(move || {
+        let mut file = fs::File::open(&reader_fifo).expect("open fifo for reading");
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).expect("drain fifo");
+        bytes
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o"])
+        .arg(&fifo)
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "-o <fifo> must succeed: {:?}",
+        output
+    );
+    let bytes = reader.join().expect("reader thread");
+    let report = String::from_utf8_lossy(&bytes);
+    assert!(
+        !report.trim().is_empty(),
+        "the report must ride the pipe, not vanish"
+    );
+
+    let metadata = fs::metadata(&fifo).expect("fifo still exists");
+    assert!(
+        metadata.file_type().is_fifo(),
+        "the named pipe must never be replaced by a regular file"
+    );
+    let _ = fs::remove_file(&fifo);
+    let _ = fs::remove_dir(&dir);
+}

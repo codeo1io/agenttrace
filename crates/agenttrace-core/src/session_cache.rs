@@ -1436,6 +1436,9 @@ impl GoMetrics {
             upstream_cost_usd: self.upstream_cost_usd,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
+            // rm-545: subagent rollups are re-derived after every load
+            // (discovery.rs), so the cached shape carries zeros here.
+            ..Metrics::default()
         }
     }
 }
