@@ -3375,7 +3375,7 @@ fn codex_line_is_ignorable(line: &str) -> bool {
     let Some(head) = line.get(..line.len().min(160)) else {
         return false;
     };
-    json_key_present(head, r#""type":"event_msg""#)
+    json_key_present_top_level(head, r#""type":"event_msg""#)
         && !json_key_present(line, r#""type":"token_count""#)
 }
 
@@ -3395,6 +3395,57 @@ fn json_key_present(line: &str, needle: &str) -> bool {
         from = start + 1;
     }
     false
+}
+
+/// Like [`json_key_present`], but the needle must sit at the top level
+/// of `line`'s root object (container depth 1) rather than inside a
+/// nested object or array. rm-047 residual (assess F1, 2026-10-05): the
+/// plain `{`/`,` anchor also accepts a NESTED key such as
+/// `"payload":{"z0":{"type":"event_msg"}}` — the nested object's
+/// own opening brace precedes the needle — so a usage-bearing line that
+/// merely mentions the marker inside a payload key was skipped whole
+/// (live PoC flipped cost 0.0168 -> 0.0062 and dropped the model row).
+fn json_key_present_top_level(line: &str, needle: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(at) = line[from..].find(needle) {
+        let start = from + at;
+        let anchored = start == 0 || matches!(bytes[start - 1], b'{' | b',');
+        if anchored && json_container_depth(bytes, start) == 1 {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Container nesting depth at byte offset `pos`: 1 while directly inside
+/// `line`'s root object, 2 inside a child object or array, and so on.
+/// String-aware — braces and brackets inside (possibly corrupt) string
+/// values do not count as structure — and saturating, so truncated
+/// heads cannot underflow the depth.
+fn json_container_depth(bytes: &[u8], pos: usize) -> usize {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in &bytes[..pos] {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'{' || byte == b'[' {
+            depth += 1;
+        } else if byte == b'}' || byte == b']' {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    depth
 }
 
 fn codex_token_count_usage(
@@ -5926,6 +5977,89 @@ mod tests {
         // key-boundary anchor must not treat it as the token_count key.
         let corrupt = r#"{"timestamp":"2026-09-30T01:00:00Z","type":"event_msg","payload":{"delta":"seen "type":"token_count" inline"}}"#;
         assert!(codex_line_is_ignorable(corrupt));
+    }
+
+    #[test]
+    fn codex_ignorable_nested_type_key_does_not_skip() {
+        // rm-047 residual (assess F1, 2026-10-05): the positive probe
+        // anchored on any `{` or `,` before the needle, so a NESTED
+        // {"z0":{"type":"event_msg"}} key (at any depth) made a
+        // usage-bearing line look like event_msg chatter. The live PoC
+        // corpus (/tmp/at-assess-fa0283/probes) flipped cost
+        // 0.0168 -> 0.0062 and dropped the model row because the
+        // token_usage_record line was skipped whole. The probe now
+        // requires the marker at the root object's top level.
+        let bare_nested = r#"{"z0":{"type":"event_msg"}}"#;
+        assert!(
+            !codex_line_is_ignorable(bare_nested),
+            "a nested type key is not an event_msg envelope"
+        );
+
+        let record = r#"{"timestamp":"2026-10-01T09:01:00.000Z","type":"token_usage_record","payload":{"z0":{"type":"event_msg"},"response_id":"resp-9","usage":{"input_tokens":5000,"output_tokens":700,"cached_input_tokens":4000},"model":"gpt-5.3-codex"}}"#;
+        assert!(
+            !codex_line_is_ignorable(record),
+            "the assess PoC's token_usage_record line must not skip"
+        );
+
+        let array_root = r#"[{"type":"event_msg"}]"#;
+        assert!(!codex_line_is_ignorable(array_root));
+
+        // Depth tracking must not be fooled by braces inside string
+        // values: the marker here IS top level and stays skippable.
+        let brace_in_string =
+            r#"{"payload":"{","timestamp":"2026-09-30T01:00:00Z","type":"event_msg"}"#;
+        assert!(codex_line_is_ignorable(brace_in_string));
+
+        // A closed nested container before the marker does not strand
+        // the top-level key at depth 2.
+        let recovered = r#"{"payload":{"a":1},"type":"event_msg","more":{}}"#;
+        assert!(codex_line_is_ignorable(recovered));
+    }
+
+    #[test]
+    fn codex_nested_marker_keeps_usage_identical_to_clean_journal() {
+        // Differential form of the assess F1 PoC: the hostile journal is
+        // byte-identical to the control except for the injected nested
+        // {"z0":{"type":"event_msg"}} key inside the
+        // token_usage_record payload. Parsed metrics must not differ
+        // (pre-fix the line was skipped whole: -64% cost, model row
+        // lost).
+        let meta = r#"{"timestamp":"2026-10-01T09:00:00.000Z","type":"session_meta","payload":{"id":"s-nested","cwd":"/tmp/x","originator":"codex_cli_rs","source":"api"}}"#;
+        let token_count = r#"{"timestamp":"2026-10-01T09:00:30.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":200,"cached_input_tokens":0,"reasoning_output_tokens":0}}}}"#;
+        let record = r#"{"timestamp":"2026-10-01T09:01:00.000Z","type":"token_usage_record","payload":{"response_id":"resp-9","usage":{"input_tokens":5000,"output_tokens":700,"cached_input_tokens":4000},"model":"gpt-5.3-codex"}}"#;
+        let hostile_record = r#"{"timestamp":"2026-10-01T09:01:00.000Z","type":"token_usage_record","payload":{"z0":{"type":"event_msg"},"response_id":"resp-9","usage":{"input_tokens":5000,"output_tokens":700,"cached_input_tokens":4000},"model":"gpt-5.3-codex"}}"#;
+        let compacted = r#"{"timestamp":"2026-10-01T09:01:01.000Z","type":"compacted","payload":{"compaction_response_id":"resp-9"}}"#;
+
+        let control = parse_raw_session(
+            "codex",
+            "control.jsonl",
+            &[meta, token_count, record, compacted].join("\n"),
+        )
+        .expect("control journal parses");
+        let hostile = parse_raw_session(
+            "codex",
+            "hostile.jsonl",
+            &[meta, token_count, hostile_record, compacted].join("\n"),
+        )
+        .expect("hostile journal parses");
+
+        assert_eq!(control.metrics.tokens_input, hostile.metrics.tokens_input);
+        assert_eq!(control.metrics.tokens_output, hostile.metrics.tokens_output);
+        assert_eq!(
+            control.metrics.tokens_cache_r,
+            hostile.metrics.tokens_cache_r
+        );
+        assert_eq!(
+            control.metrics.cost_estimated,
+            hostile.metrics.cost_estimated
+        );
+        assert!(
+            !hostile
+                .metrics
+                .line_skips
+                .contains_key("codex_ignorable_line"),
+            "the injected nested marker must not skip the usage line"
+        );
     }
 
     #[test]
