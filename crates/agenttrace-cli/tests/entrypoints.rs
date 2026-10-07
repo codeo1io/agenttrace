@@ -2157,3 +2157,81 @@ fn dropped_sqlite_rows_are_disclosed_on_report_paths() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn output_flag_creates_missing_parent_directories_recursively() {
+    // rm-784 (run 24ec00eb, repository-maintenance cycle 1): `-o` keeps its
+    // documented mkdir -p semantics — a deep missing path is created
+    // recursively and the report lands at the leaf. Pinned so a future
+    // "fix" cannot quietly drop the behavior fleet users rely on.
+    let sandbox = std::env::temp_dir().join(format!(
+        "at-rm784-mkdir-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let target = sandbox.join("reports/deep/nested/report.txt");
+    let _ = std::fs::remove_dir_all(&sandbox);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o"])
+        .arg(&target)
+        .output()
+        .expect("run agenttrace CLI (-o deep path)");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "mkdir -p must create the parent chain: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(target.is_file(), "report must exist at the requested leaf");
+    let body = std::fs::read_to_string(&target).expect("report readable");
+    assert!(!body.trim().is_empty(), "report has content");
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn output_flag_refusal_names_the_directory_and_target() {
+    // rm-784: when a parent cannot be created (here: it exists as a regular
+    // FILE, the NotADirectory shape), the error must name the directory it
+    // tried to create and the requested -o target — not a bare
+    // "File exists (os error 17)" with no path attached (rm-610 keeps the
+    // full cause chain on stderr).
+    let sandbox = std::env::temp_dir().join(format!(
+        "at-rm784-refuse-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&sandbox).expect("create sandbox");
+    let blocker = sandbox.join("blocker.txt");
+    std::fs::write(&blocker, b"regular file").expect("seed blocking file");
+    let target = blocker.join("x.txt");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--overview", "-o"])
+        .arg(&target)
+        .output()
+        .expect("run agenttrace CLI (-o under a file parent)");
+
+    assert_eq!(out.status.code(), Some(1), "the refusal is an error exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("creating parent directory"),
+        "error must name the mkdir failure: {stderr}"
+    );
+    assert!(
+        stderr.contains(blocker.to_str().expect("path is UTF-8")),
+        "error must name the directory that could not be created: {stderr}"
+    );
+    assert!(
+        stderr.contains(target.to_str().expect("path is UTF-8")),
+        "error must name the requested -o target: {stderr}"
+    );
+    assert!(
+        stderr.contains("File exists"),
+        "the OS cause stays disclosed (rm-610): {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
