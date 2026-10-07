@@ -301,8 +301,7 @@ fn run() -> anyhow::Result<()> {
         } else {
             render_test_match()
         };
-        write_output(&args.output, &out)?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, false)?;
         return Ok(());
     }
 
@@ -313,20 +312,32 @@ fn run() -> anyhow::Result<()> {
         // object; the disclosure goes to stderr as its own document.
         if args.format == "json" {
             eprintln!("{}", config::disclosure_json(&resolved));
+            let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
+            // rm-642 (assess N6): a real `-o` file must carry the
+            // disclosure itself — the consumer reading the artifact
+            // cannot see stderr, so the saved report embeds it as a
+            // sibling `config_disclosure` key. Stdout aliases and the
+            // no `-o` path stay byte-identical to the rm-384
+            // contract (single pure object, disclosure on stderr).
+            let saved = if args.output.is_some() && !output_is_stdout_alias(&args.output) {
+                embed_config_disclosure(&out, &resolved)?
+            } else {
+                out.clone()
+            };
+            write_output(&args.output, &saved)?;
+            if !output_is_stdout_alias(&args.output) {
+                write_stdout(&out)?;
+            }
+            return Ok(());
         } else {
             let out = format!(
                 "{}{}",
                 config::disclosure_text(&resolved),
                 render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?
             );
-            write_output(&args.output, &out)?;
-            write_stdout(&out)?;
+            emit_report(&args, &out, false)?;
             return Ok(());
         }
-        let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
-        write_output(&args.output, &out)?;
-        write_stdout(&out)?;
-        return Ok(());
     }
 
     if args.list_models {
@@ -337,15 +348,13 @@ fn run() -> anyhow::Result<()> {
         } else {
             render_model_pricing_list()
         };
-        write_output(&args.output, &out)?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, false)?;
         return Ok(());
     }
 
     if args.statusline_report {
         let out = agenttrace_core::render_statusline_report(&args.format, resolved.weekly_budget)?;
-        write_output(&args.output, &out)?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, false)?;
         return Ok(());
     }
 
@@ -353,8 +362,7 @@ fn run() -> anyhow::Result<()> {
         // rm-385: the weekly window-burn view — journal-based, no
         // session discovery, mirroring --statusline-report.
         let out = agenttrace_core::render_budget_view(&args.format, resolved.weekly_budget)?;
-        write_output(&args.output, &out)?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, false)?;
         return Ok(());
     }
 
@@ -422,8 +430,7 @@ fn run() -> anyhow::Result<()> {
         };
         let value = attach_audit_coverage(value, sessions.len(), total_sessions, excluded_reason);
         let out = render_governance_report(&value, &args.format)?;
-        write_output(&args.output, &(out.clone() + "\n"))?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, true)?;
         // rm-346 arm-a: the --fail-* gate flags are parsed on every report
         // path but used to be evaluated only under --overview — a gated
         // `--audit` (or sibling governance report) exited rc0 with 0-byte
@@ -482,8 +489,7 @@ fn run() -> anyhow::Result<()> {
             ));
             out
         };
-        write_output(&args.output, &(out.clone() + "\n"))?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, true)?;
         // rm-486: the compare branch's own comment (above) claims the same
         // coverage contract as the governance branch, but it returned Ok(())
         // without ever evaluating the --fail-* gates — a gated `--compare`
@@ -507,8 +513,7 @@ fn run() -> anyhow::Result<()> {
             "json" => waste_report_json(&compute_waste_report(session)),
             _ => render_waste_report_with_language(session, language),
         };
-        write_output(&args.output, &(out.clone() + "\n"))?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, true)?;
         return Ok(());
     }
 
@@ -520,8 +525,7 @@ fn run() -> anyhow::Result<()> {
             "json" => report_json_with_language(session, language),
             _ => report_text_with_language(session, language),
         };
-        write_output(&args.output, &(out.clone() + "\n"))?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, true)?;
         return Ok(());
     }
 
@@ -534,8 +538,7 @@ fn run() -> anyhow::Result<()> {
     if args.sessions || args.diagnostics || args.inspect.is_some() {
         if args.sessions {
             let out = render_session_list(&sessions, &args.format, args.limit);
-            write_output(&args.output, &(out.clone() + "\n"))?;
-            write_stdout(&out)?;
+            emit_report(&args, &out, true)?;
             return Ok(());
         }
         let session = if let Some(rank) = args.inspect {
@@ -553,8 +556,7 @@ fn run() -> anyhow::Result<()> {
             sessions.first().expect("sessions checked non-empty")
         };
         let out = render_diagnostics(session, &sessions, &args.format, language)?;
-        write_output(&args.output, &(out.clone() + "\n"))?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, true)?;
         return Ok(());
     }
 
@@ -565,8 +567,7 @@ fn run() -> anyhow::Result<()> {
         } else {
             report_search_text(&results, query)
         };
-        write_output(&args.output, &(out.clone() + "\n"))?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, true)?;
         return Ok(());
     }
 
@@ -644,8 +645,7 @@ fn run() -> anyhow::Result<()> {
             out = compared;
             baseline_breaches = Some(breaches);
         }
-        write_output(&args.output, &(out.clone() + "\n"))?;
-        write_stdout(&out)?;
+        emit_report(&args, &out, true)?;
         let failures = evaluate_overview_gate(
             &overview,
             &sessions,
@@ -1240,6 +1240,54 @@ fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// rm-641 (assess N3): is the `-o` target one of our own
+/// stdout/stderr fd aliases? Those targets already receive the report
+/// through the descriptor in `write_output_resolved`, so the usual
+/// stdout companion line would emit every report twice.
+fn output_is_stdout_alias(output: &Option<PathBuf>) -> bool {
+    output
+        .as_ref()
+        .is_some_and(|path| is_stdout_alias(path.as_path()))
+}
+
+/// rm-641: the single report emission point. `out` is the canonical
+/// report text; `file_newline` appends the trailing newline the
+/// markdown artifact arms historically wrote to the file but not to
+/// the stdout companion. A stdout/stderr fd-alias `-o` target already
+/// received the content through the descriptor, so the companion
+/// print is suppressed there (it used to double every report).
+fn emit_report(args: &Args, out: &str, file_newline: bool) -> anyhow::Result<()> {
+    if file_newline {
+        write_output(&args.output, &(out.to_string() + "\n"))?;
+    } else {
+        write_output(&args.output, out)?;
+    }
+    if output_is_stdout_alias(&args.output) {
+        return Ok(());
+    }
+    write_stdout(out)?;
+    Ok(())
+}
+
+/// rm-642 (assess N6): embed the config-layer disclosure into a JSON
+/// doctor report as a sibling `config_disclosure` key, preserving the
+/// report's pretty-printed shape. A saved `-o` artifact must carry
+/// the disclosure itself — the machine consumer reading the file
+/// cannot see rm-384's stderr channel.
+fn embed_config_disclosure(
+    report: &str,
+    resolved: &config::ResolvedConfig,
+) -> anyhow::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(report)
+        .with_context(|| "embedding the config disclosure into the doctor report")?;
+    let disclosure: serde_json::Value = serde_json::from_str(&config::disclosure_json(resolved))
+        .with_context(|| "config disclosure JSON")?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("config_disclosure".to_string(), disclosure);
+    }
+    Ok(format!("{}\n", serde_json::to_string_pretty(&value)?))
+}
+
 /// Follow symlinks to the final destination. A dangling link resolves
 /// to its missing target, which then gets created — the link is
 /// honored instead of replaced. Cycles fail loudly after 32 hops.
@@ -1640,6 +1688,11 @@ fn has_post_pricing_action(args: &Args) -> bool {
         || args.diagnostics
         || args.inspect.is_some()
         || args.waste
+        // rm-640 (assess N2): --budget and --statusline-report are
+        // report actions too — the update-pricing early return must
+        // not silently drop them.
+        || args.budget
+        || args.statusline_report
         || args
             .search
             .as_deref()
@@ -1662,6 +1715,11 @@ fn has_session_action(args: &Args) -> bool {
         || args.inspect.is_some()
         || args.waste
         || args.baseline.is_some()
+        // rm-640 (assess N2): --budget and --statusline-report are
+        // report actions too — the clear-cache early return must not
+        // silently drop them.
+        || args.budget
+        || args.statusline_report
         || args
             .search
             .as_deref()
@@ -1676,8 +1734,15 @@ fn has_session_action(args: &Args) -> bool {
 /// silently ignored, which looks exactly like a working filter. Reject
 /// the combination loudly, in the same style as the format
 /// applicability guard in `main`.
+///
+/// rm-640 composition: `--budget` and `--statusline-report` now count
+/// as actions for the action gates, but they are journal-based and
+/// never consume `--range` (and the one-report-action table already
+/// rejects pairing them with a range-consuming report). Keep
+/// rejecting the combination loudly instead of letting the widened
+/// helper turn the guard into a silent accept.
 fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
-    if args.range != "all" && !has_session_action(args) {
+    if args.range != "all" && (!has_session_action(args) || args.budget || args.statusline_report) {
         bail!(
             "--range requires a session report action (for example --overview, --sessions, --diagnostics, --waste, --search QUERY, --compare, or --audit); the interactive and utility views ignore it"
         );
@@ -2738,5 +2803,79 @@ mod tests {
         args.overview = true;
         args.range = "7d".to_string();
         assert!(validate_range_applicability(&args).is_ok());
+    }
+
+    #[test]
+    fn range_with_a_journal_view_is_rejected() {
+        // rm-640 × rm-244: --budget/--statusline-report are actions
+        // now (the clear-cache/update-pricing gates must not drop
+        // them), but they are journal-based and dispatch before every
+        // range consumer — --range beside them can never apply and
+        // must stay loudly rejected, not silently accepted.
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.budget = true;
+        args.range = "7d".to_string();
+        let err =
+            validate_range_applicability(&args).expect_err("--budget shadows every range consumer");
+        assert!(err.to_string().contains("--range"));
+
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.statusline_report = true;
+        args.range = "7d".to_string();
+        let err = validate_range_applicability(&args)
+            .expect_err("--statusline-report shadows every range consumer");
+        assert!(err.to_string().contains("--range"));
+
+        // Even WITH a range-consuming action alongside: the journal
+        // view wins dispatch order, so the range never applies there
+        // either — still loud.
+        let mut args = compare_args(None);
+        args.budget = true;
+        args.range = "7d".to_string();
+        assert!(validate_range_applicability(&args).is_err());
+    }
+
+    #[test]
+    fn action_gates_enumerate_budget_and_statusline_report() {
+        // rm-640 (assess N2): the --clear-cache and --update-pricing
+        // early returns dropped a requested --budget or
+        // --statusline-report — the helpers must see both flags.
+        // Review a90bd511 F2: compare_args(None) ships compare: true,
+        // which already satisfied both helpers at base and made these
+        // positive legs vacuous (the test passed pre-widening). Clear
+        // compare so budget / statusline_report are the only action
+        // flags the helpers can see — re-narrowing either helper now
+        // fails this test.
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.budget = true;
+        assert!(has_session_action(&args));
+        assert!(has_post_pricing_action(&args));
+
+        let mut args = compare_args(None);
+        args.compare = false;
+        args.statusline_report = true;
+        assert!(has_session_action(&args));
+        assert!(has_post_pricing_action(&args));
+
+        let mut args = compare_args(None);
+        args.compare = false; // the fixture sets compare: true; the
+                              // negative control must be a genuinely action-free Args.
+        assert!(!has_session_action(&args));
+        assert!(!has_post_pricing_action(&args));
+    }
+
+    #[test]
+    fn output_is_stdout_alias_matches_fd_aliases_only() {
+        // rm-641: only fd aliases of our own descriptors suppress the
+        // stdout companion; ordinary file targets keep it.
+        assert!(!output_is_stdout_alias(&None));
+        let alias = "/dev/stdout";
+        assert!(output_is_stdout_alias(&Some(PathBuf::from(&alias))));
+        assert!(!output_is_stdout_alias(&Some(PathBuf::from(
+            "/tmp/at-not-an-alias.toml"
+        ))));
     }
 }

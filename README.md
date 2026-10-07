@@ -127,8 +127,13 @@ agenttrace --statusline-report     # same journal; "Budget: ... remaining" line
 
 Unknown keys, tables, arrays, and non-positive budgets are rejected
 with the file, line number, and key — a typo never silently does
-nothing. The same flags exist on the command line (`--history-dir`,
-`--pricing-file`, `--weekly-budget`) and win over every file.
+nothing. A `#` only starts a comment from a comment position: the
+start of a line, after whitespace, directly after the `=` separator,
+or just after a closing quote. A hash elsewhere is part of the value
+(`history_dir = /tmp/h#ist` keeps the full path; a `#` inside quotes
+never opens a comment). The same flags exist on the command line
+(`--history-dir`, `--pricing-file`, `--weekly-budget`) and win over
+every file.
 
 ### CSV statement export (rm-409)
 

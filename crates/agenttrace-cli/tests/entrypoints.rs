@@ -1685,3 +1685,259 @@ fn env_history_knob_sits_below_config_layers_end_to_end() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+fn statusline_capture(day_offset: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let captured_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - day_offset * 86_400;
+    format!(
+        "{{\"captured_at\":{captured_at},\"payload\":{{\"session_id\":\"t{day_offset}\",\"cost\":{{\"total_cost_usd\":2.0}}}}}}\n"
+    )
+}
+
+fn sandboxed(args: &[&str]) -> Command {
+    // rm-640/641/642 entrypoint tests need an isolated cache/config so
+    // the statusline journal and session cache come from fixtures only.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+    command.env("AGENTTRACE_NO_UPDATE_CHECK", "1").args(args);
+    command
+}
+
+#[test]
+fn clear_cache_then_budget_renders_the_budget_view() {
+    // rm-640 (assess N2): the clear-cache early return used to drop a
+    // requested budget report — the user got "Session cache cleared."
+    // with rc 0 and the budget view never rendered.
+    let root = std::env::temp_dir().join(format!(
+        "at-truthful-cli-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.as_path().join("cache");
+    let journal = cache.join("agenttrace");
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::write(journal.join("statusline.jsonl"), statusline_capture(1)).unwrap();
+
+    let mut command = sandboxed(&["--clear-cache", "--budget", "--weekly-budget", "10"]);
+    let output = command
+        .env("HOME", root.as_path())
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_CONFIG_HOME", root.as_path().join("cfg"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Session cache cleared."),
+        "action notice missing: {stdout}"
+    );
+    // The clear-cache action intentionally empties the journal, so the
+    // honest combined behavior is: clear, then render the budget
+    // view's empty state. The notice (not a bare "Session cache
+    // cleared.") proves the report lane ran to completion instead of
+    // being dropped by the early return.
+    assert!(
+        stdout.contains("No statusline captures yet"),
+        "budget view was dropped behind the clear-cache action: {stdout}"
+    );
+}
+
+#[test]
+fn clear_cache_then_statusline_report_renders() {
+    // rm-640: same early-return class for --statusline-report.
+    let root = std::env::temp_dir().join(format!(
+        "at-truthful-cli-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.as_path().join("cache");
+    let journal = cache.join("agenttrace");
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::write(journal.join("statusline.jsonl"), statusline_capture(1)).unwrap();
+
+    let mut command = sandboxed(&["--clear-cache", "--statusline-report"]);
+    let output = command
+        .env("HOME", root.as_path())
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_CONFIG_HOME", root.as_path().join("cfg"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Session cache cleared."),
+        "action notice missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("AGENTTRACE statusline capture"),
+        "statusline report was dropped behind the clear-cache action: {stdout}"
+    );
+}
+
+#[test]
+fn stdout_alias_targets_emit_the_report_once() {
+    // rm-641 (assess N3): `-o /dev/stdout` used to stream the report
+    // through the descriptor AND print the stdout companion, emitting
+    // every report twice.
+    let root = std::env::temp_dir().join(format!(
+        "at-truthful-cli-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.as_path().join("cache");
+    let journal = cache.join("agenttrace");
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::write(journal.join("statusline.jsonl"), statusline_capture(1)).unwrap();
+
+    let plain = sandboxed(&["--statusline-report"])
+        .env("HOME", root.as_path())
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_CONFIG_HOME", root.as_path().join("cfg"))
+        .output()
+        .unwrap();
+    assert!(plain.status.success());
+
+    let aliased = sandboxed(&["--statusline-report", "-o", "/dev/stdout"])
+        .env("HOME", root.as_path())
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_CONFIG_HOME", root.as_path().join("cfg"))
+        .output()
+        .unwrap();
+    assert!(
+        aliased.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&aliased.stdout),
+        String::from_utf8_lossy(&aliased.stderr)
+    );
+
+    let plain_text = String::from_utf8_lossy(&plain.stdout);
+    let aliased_text = String::from_utf8_lossy(&aliased.stdout);
+    assert_eq!(
+        plain_text.trim(),
+        aliased_text.trim(),
+        "stdout alias must emit the report exactly once"
+    );
+}
+
+#[test]
+fn json_stdout_alias_emits_exactly_one_document() {
+    // rm-641 for `-f json`: two JSON documents on one stdout stream
+    // broke machine consumers.
+    let root = std::env::temp_dir().join(format!(
+        "at-truthful-cli-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.as_path().join("cache");
+    let journal = cache.join("agenttrace");
+    std::fs::create_dir_all(&journal).unwrap();
+    std::fs::write(journal.join("statusline.jsonl"), statusline_capture(1)).unwrap();
+
+    let output = sandboxed(&["--statusline-report", "-f", "json", "-o", "/dev/stdout"])
+        .env("HOME", root.as_path())
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_CONFIG_HOME", root.as_path().join("cfg"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+        panic!("stdout was not a single JSON document ({error}): {stdout}")
+    });
+    assert!(
+        value.get("journal").is_some(),
+        "unexpected report shape: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_json_o_file_embeds_config_disclosure() {
+    // rm-642 (assess N6): `--doctor -f json -o FILE` used to save a
+    // report with zero config-layer evidence because rm-384 routed
+    // the disclosure to stderr only — the machine consumer reading
+    // the file could not see the layer provenance. A real -o file now
+    // embeds it as a sibling `config_disclosure` key.
+    let root = std::env::temp_dir().join(format!(
+        "at-truthful-cli-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let cache = root.as_path().join("cache");
+    let scan = root.as_path().join("history");
+    std::fs::create_dir_all(&scan).unwrap();
+    let out_file = root.as_path().join("doctor.json");
+
+    let output = sandboxed(&[
+        "--doctor",
+        "-f",
+        "json",
+        "-o",
+        out_file.to_str().unwrap(),
+        "-d",
+        scan.to_str().unwrap(),
+    ])
+    .env("HOME", root.as_path())
+    .env("XDG_CACHE_HOME", &cache)
+    .env("XDG_CONFIG_HOME", root.as_path().join("cfg"))
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let saved = std::fs::read_to_string(&out_file).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&saved)
+        .unwrap_or_else(|error| panic!("saved doctor report is not JSON ({error}): {saved}"));
+    assert!(
+        value.get("config_disclosure").is_some(),
+        "saved artifact lost the config disclosure: {saved}"
+    );
+
+    // The stdout companion and the rm-384 stderr channel stay
+    // unchanged: stdout is the plain report, stderr the disclosure.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let companion: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+            panic!("stdout was not a single JSON document ({error}): {stdout}")
+        });
+    assert!(
+        companion.get("config_disclosure").is_none(),
+        "stdout companion must stay byte-identical to the rm-384 contract: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("history_dir"),
+        "rm-384 stderr disclosure channel regressed: {stderr}"
+    );
+}

@@ -191,13 +191,24 @@ fn parse_scalar(text: &str) -> anyhow::Result<Scalar> {
 }
 
 /// Strip a trailing `# comment` that sits outside quotes.
+/// Strip a trailing `#` comment from the line. A `#` inside a quoted
+/// string is part of the value, and (rm-643, assess N5) a `#` inside
+/// an unquoted scalar only starts a comment from a comment position:
+/// the start of the line, directly after whitespace, directly after
+/// the `=` separator, or directly after a closing quote. A hash in
+/// the middle of a value — `history_dir = /tmp/h#ist` — is part of
+/// the value instead of silently truncating it.
 fn strip_comment(line: &str) -> &str {
     let mut in_quotes = false;
+    let mut at_comment_position = true; // start-of-line counts
     for (index, character) in line.char_indices() {
         match character {
-            '"' => in_quotes = !in_quotes,
-            '#' if !in_quotes => return &line[..index],
-            _ => {}
+            '"' => {
+                in_quotes = !in_quotes;
+                at_comment_position = !in_quotes; // directly after a closing quote
+            }
+            '#' if !in_quotes && at_comment_position => return &line[..index],
+            _ => at_comment_position = character == ' ' || character == '\t' || character == '=',
         }
     }
     line
@@ -483,6 +494,28 @@ mod tests {
         let path = dir.join("config.toml");
         fs::write(&path, text).unwrap();
         path
+    }
+
+    #[test]
+    fn hash_only_starts_a_comment_at_a_comment_position() {
+        // rm-643 (assess N5): a `#` inside an unquoted scalar used to
+        // truncate the value silently — `history_dir = /tmp/h#ist`
+        // resolved to /tmp/h with rc 0 and no disclosure. A `#` now
+        // only starts a comment at the start of the line, after
+        // whitespace, or directly after a closing quote / `=`.
+        let path = Path::new("config.toml");
+
+        let file = parse_config("history_dir = /tmp/at-x/h#ist\n", path).unwrap();
+        assert_eq!(file.history_dir, Some(PathBuf::from("/tmp/at-x/h#ist")));
+
+        let file = parse_config("pricing_file = /tmp/a#b # real comment\n", path).unwrap();
+        assert_eq!(file.pricing_file, Some(PathBuf::from("/tmp/a#b")));
+
+        let file = parse_config("# full-line comment\nweekly_budget_usd = 4\n", path).unwrap();
+        assert_eq!(file.weekly_budget_usd, Some(4.0));
+
+        let file = parse_config("history_dir = \"/tmp/q#z\" # comment\n", path).unwrap();
+        assert_eq!(file.history_dir, Some(PathBuf::from("/tmp/q#z")));
     }
 
     #[test]
