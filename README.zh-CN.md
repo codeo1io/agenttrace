@@ -117,6 +117,27 @@ agenttrace -f json sessions.jsonl    # -f json 生效
 
 `--limit` 只限制列表视图（例如 overview 的 `recent_sessions`）；它从不过滤聚合值、审计总额或建议。治理报告默认覆盖全部会话——需要显式、带披露的上限时使用 `--sample N`（JSON 中会输出 `audited_sessions` / `total_sessions` / `excluded_reason`）。
 
+### 本地 MCP 服务器（rm-455）
+
+`agenttrace mcp` 是一个本地只读 MCP 服务器：在 stdio 上讲换行分隔的
+JSON-RPC 2.0，让编程 Agent 在烧掉 token 的那个会话里直接问“我的
+token 花在哪了”。两个工具渲染 CLI 同一套本地发现的会话——
+`usage_overview`（即 `--overview -f json` 文档）和 `by_model_breakdown`
+（按模型统计成本与会话数）。服务器不打开任何 socket、不做任何
+网络探测、不在 agenttrace 会话缓存之外写任何东西；stdin 关闭即退出。
+
+```json
+{
+  "mcpServers": {
+    "agenttrace": { "command": "agenttrace", "args": ["mcp"] }
+  }
+}
+```
+
+注册片段、完整协议面、错误码映射与一次工具调用的完整往返见
+[docs/guides/mcp-server.md](docs/guides/mcp-server.md)（英文）。该关键字
+与 `--mcp-governance` 报告过滤标志无关。
+
 ## 你会得到什么
 
 | 需求 | agenttrace 提供 |
@@ -135,6 +156,7 @@ agenttrace -f json sessions.jsonl    # -f json 生效
 - 文档导航：[docs/README.md](docs/README.md)
 - CI 集成：[docs/guides/ci-integration.md](docs/guides/ci-integration.md)
 - 治理报告：[docs/guides/governance-reports.md](docs/guides/governance-reports.md)
+- 本地 MCP 服务器：[docs/guides/mcp-server.md](docs/guides/mcp-server.md)
 - Cursor 导入：[docs/guides/cursor-import.md](docs/guides/cursor-import.md)
 - Parser 指南：[docs/guides/parser-guide.md](docs/guides/parser-guide.md)
 - 发布维护指南：[docs/maintainers/distribution.md](docs/maintainers/distribution.md)

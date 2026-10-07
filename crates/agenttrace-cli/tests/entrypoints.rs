@@ -1481,8 +1481,8 @@ fn keyword_host_commands_have_real_help_routes() {
     // but `<keyword> --help` used to exit 2 with a mislabeled
     // "flag follows the positional session path" error and no help
     // route at all. Both keywords now render per-command help at rc0,
-    // with `-h` parity.
-    for keyword in ["statusline", "upstream"] {
+    // with `-h` parity. `mcp` joined the keyword set in rm-455.
+    for keyword in ["statusline", "upstream", "mcp"] {
         for help_flag in ["--help", "-h"] {
             let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
                 .args([keyword, help_flag])
@@ -1514,7 +1514,7 @@ fn keyword_bad_flag_error_names_the_keyword_not_a_session_path() {
     // discipline stands), but the error must be keyword-scoped usage —
     // not the "positional session path" mislabel — and must point at
     // the keyword's help route.
-    for keyword in ["statusline", "upstream"] {
+    for keyword in ["statusline", "upstream", "mcp"] {
         let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
             .args([keyword, "--bogus-flag"])
             .output()
@@ -1854,6 +1854,51 @@ fn statusline_report_leaves_the_statusline_journal_untouched_e2e() {
         files,
         vec![journal.clone()],
         "no new files may appear under the sandbox: {files:?}"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn statusline_report_wins_over_the_mcp_keyword_e2e() {
+    // Integration fix (rm-455 merge, 2026-10-07): the rm-573 dispatch-order
+    // invariant covers every keyword host command, `mcp` included. Unguarded,
+    // `--statusline-report mcp` starts the stdio server instead of rendering
+    // the report — with stdin at EOF that is a silent rc0 with EMPTY stdout
+    // (the report the user asked for never renders), and on a terminal it
+    // looks hung. Guarded, the report lane runs and answers its own shape.
+    let sandbox =
+        std::env::temp_dir().join(format!("agenttrace-mcp-precedence-{}", std::process::id()));
+    std::fs::create_dir_all(&sandbox).expect("sandbox dir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--statusline-report", "-f", "json", "mcp"])
+        .env("HOME", &sandbox)
+        .env("XDG_CACHE_HOME", sandbox.join("cache"))
+        .env("XDG_CONFIG_HOME", sandbox.join("config"))
+        .env("AGENTTRACE_SESSION_CACHE_DIR", sandbox.join("cache"))
+        .env("AGENTTRACE_HISTORY_DIR", sandbox.join("history"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run agenttrace");
+
+    assert!(
+        out.status.success(),
+        "rc={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: serde_json::Value = match serde_json::from_str(stdout.trim()) {
+        Ok(value) => value,
+        Err(error) => panic!(
+            "--statusline-report must render the report, not the mcp server \
+             (stdout was {:?}: {error})",
+            stdout
+        ),
+    };
+    assert!(
+        report.get("journal").is_some(),
+        "expected the statusline report document, got: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&sandbox);
 }

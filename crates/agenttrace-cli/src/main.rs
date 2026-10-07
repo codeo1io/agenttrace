@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 mod csv_export;
+mod mcp;
 mod upstream;
 
 mod config;
@@ -322,6 +323,21 @@ fn run() -> anyhow::Result<()> {
         let report = upstream::status_report(&args.format, args.fetch)?;
         write_stdout(&report)?;
         return Ok(());
+    }
+    // `agenttrace mcp` is the local MCP server host command (rm-455):
+    // the coding agent asks "where did my tokens go" over the same
+    // locally discovered sessions the CLI reports on. Like the other
+    // host keywords it dispatches before action validation; the server
+    // is fully read-only and offline — stdio only, no sockets, and no
+    // writes outside the session cache the CLI itself maintains. It
+    // serves until stdin closes (host disconnect = clean exit).
+    // rm-573: an explicit --statusline-report wins over keyword host
+    // dispatch here too — otherwise `--statusline-report mcp` silently
+    // swaps the requested report for a stdin-blocked server (the report
+    // never renders; the same keyword-shadowing class rm-573 closed for
+    // statusline/upstream, caught for `mcp` at integration of rm-455).
+    if args.path.as_deref() == Some("mcp") && !args.statusline_report {
+        return mcp::serve();
     }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
@@ -1083,15 +1099,17 @@ where
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
-        // rm-505: `statusline` and `upstream` are keyword host commands
-        // (dispatched in run()), not session paths. `--help` following
-        // them used to die here as a "flag follows the positional
-        // session path" error with no help route at all — even though
-        // `--help` itself teaches both keywords. Give each keyword a
-        // real help route, and a keyword-scoped usage error instead of
-        // the mislabel for other dropped flags.
+        // rm-505: `statusline`, `upstream`, and `mcp` are keyword host
+        // commands (dispatched in run()), not session paths. `--help`
+        // following them used to die here as a "flag follows the
+        // positional session path" error with no help route at all —
+        // even though `--help` itself teaches the keywords. Give each
+        // keyword a real help route, and a keyword-scoped usage error
+        // instead of the mislabel for other dropped flags.
         let positional = out.last().map(|arg| arg.to_string_lossy().to_string());
-        if positional.as_deref() == Some("statusline") || positional.as_deref() == Some("upstream")
+        if positional.as_deref() == Some("statusline")
+            || positional.as_deref() == Some("upstream")
+            || positional.as_deref() == Some("mcp")
         {
             let keyword = positional.unwrap_or_default();
             if dropped.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -1115,7 +1133,7 @@ where
     Ok(out)
 }
 
-/// Per-keyword help (rm-505): the two host keywords dispatch as the
+/// Per-keyword help (rm-505): the host keywords dispatch as the
 /// positional path slot, so clap never renders help for them. Keep the
 /// text aligned with the flag doc comments in `Args` and the guides.
 fn keyword_help_text(keyword: &str) -> String {
@@ -1153,6 +1171,24 @@ fn keyword_help_text(keyword: &str) -> String {
             "  agenttrace --fetch upstream\n",
             "\n",
             "See docs/guides/upstream-status.md.\n",
+        ),
+        "mcp" => concat!(
+            "`agenttrace mcp` — local read-only MCP server (rm-455)\n",
+            "\n",
+            "Speaks newline-delimited JSON-RPC 2.0 over stdio so a coding\n",
+            "agent can ask about its own token usage: initialize, ping,\n",
+            "tools/list, tools/call. Two read-only tools render the same\n",
+            "locally discovered sessions as the CLI — usage_overview (the\n",
+            "--overview -f json document) and by_model_breakdown (cost and\n",
+            "sessions per model). The server opens no sockets, performs no\n",
+            "network probes, and writes nothing outside the agenttrace\n",
+            "session cache; it serves until stdin closes. Note: this\n",
+            "keyword is unrelated to the --mcp-governance flag, which\n",
+            "filters MCP governance findings inside reports.\n",
+            "\n",
+            "This keyword takes no flags; flags after it are rejected.\n",
+            "\n",
+            "See docs/guides/mcp-server.md.\n",
         ),
         _ => "",
     }
@@ -3194,6 +3230,12 @@ mod tests {
         assert!(
             source.contains(r#"== Some("upstream") && !args.statusline_report"#),
             "rm-573: upstream keyword guard missing"
+        );
+        // rm-455 joined the keyword family at integration; the rm-573
+        // precedence invariant covers every host keyword.
+        assert!(
+            source.contains(r#"== Some("mcp") && !args.statusline_report"#),
+            "rm-573: mcp keyword guard missing"
         );
     }
 
