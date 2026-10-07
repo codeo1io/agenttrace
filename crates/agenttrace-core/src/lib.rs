@@ -546,6 +546,108 @@ pub struct SearchResult {
     pub matches: Vec<String>,
 }
 
+/// rm-449 F4 (review fix bd6e4a50 F1): the hermes/generic lane consumes
+/// ONLY the five canonical names from the TOP-LEVEL `usage` field
+/// (`Event` deserializes `usage`; `session_from_events` reads
+/// input/output/reasoning/cache-creation/cache-read there —
+/// [`parser::USAGE_KEYS_CONSUMED`]). A wire key is DISCLOSED, minted
+/// through the shared capped+sanitized helper (rm-594 composition),
+/// whenever this lane's accounting cannot consume it at the location it
+/// appears — never silently zeroed:
+/// - `usage_unknown_key:<name>` — not in the shared alias vocabulary
+///   at all (PoC p4-kimi's 300,190-byte hostile key);
+/// - `usage_alias_unmapped:<name>` — a KNOWN wire synonym from another
+///   tool's format that this lane does not map, wherever it appears
+///   (top-level `prompt_tokens`/`completion_tokens`): tokens were
+///   silently zeroed before this fix;
+/// - `usage_unconsumed_location:<name>` — a CANONICAL key at a place
+///   the accounting never reads: `message.usage`, `providerData.usage`,
+///   or the top-level `usage` of a NON-meta line (the accumulator reads
+///   usage only on `session_meta`/`meta` events).
+///
+/// Precedence is name-first: a known synonym reports as an alias even
+/// at an unread location (the actionable fact is that this lane could
+/// map it); a canonical name reports as relocated. Canonical keys at
+/// the top-level `usage` field of a `session_meta`/`meta` line stay
+/// silent — they are actually accounted. Nested objects flatten numeric
+/// leaves to `{key}_{leaf}` first (mirroring `lenient_usage_map`), so a
+/// nested `"input": {"tokens": 7}` on a meta line is consumed, not
+/// disclosed.
+fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let message_usage = object
+        .get("message")
+        .and_then(|message| message.get("usage"));
+    let provider_usage = object
+        .get("providerData")
+        .and_then(|data| data.get("usage"));
+    // The accounting reads usage only on `session_meta`/`meta` events
+    // (`session_from_events` below): a top-level `usage` on any other
+    // role's line is exactly as unread as `message.usage`, so it gets
+    // the same `usage_unconsumed_location` disclosure instead of the
+    // silent zero it had before (role shape found while fixing review
+    // bd6e4a50 F1 — real hermes journals carry usage on meta lines
+    // only, so this fires on hostile/evolved shapes, not benign ones).
+    let role = object
+        .get("role")
+        .or_else(|| object.get("Role"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let meta_line = matches!(role, "session_meta" | "meta");
+    let mut keys = Vec::new();
+    // (usage value, is this the place the lane's accounting reads?)
+    for (usage, consumed_location) in [
+        (object.get("usage"), meta_line),
+        (message_usage, false),
+        (provider_usage, false),
+    ]
+    .into_iter()
+    .filter_map(|(usage, consumed_location)| usage.map(|usage| (usage, consumed_location)))
+    {
+        let Some(map) = usage.as_object() else {
+            continue;
+        };
+        for (wire_key, wire_value) in map {
+            // Does this entry flatten to a canonical / recognized name
+            // with a numeric value the accounting could take?
+            let (canonical, recognized) = match wire_value {
+                serde_json::Value::Object(nested) => {
+                    let mut canonical = false;
+                    let mut recognized = false;
+                    for (leaf, leaf_value) in nested {
+                        if parser::number_as_i64(leaf_value).is_some() {
+                            let flat = format!("{wire_key}_{leaf}");
+                            canonical |= parser::usage_key_is_consumed(&flat);
+                            recognized |= parser::usage_wire_key_is_recognized(&flat);
+                        }
+                    }
+                    (canonical, recognized)
+                }
+                other => {
+                    let numeric = parser::number_as_i64(other).is_some();
+                    (
+                        numeric && parser::usage_key_is_consumed(wire_key),
+                        numeric && parser::usage_wire_key_is_recognized(wire_key),
+                    )
+                }
+            };
+            let prefix = if canonical && consumed_location {
+                continue; // actually accounted: canonical at the read place
+            } else if canonical {
+                "usage_unconsumed_location"
+            } else if recognized {
+                "usage_alias_unmapped"
+            } else {
+                "usage_unknown_key"
+            };
+            keys.push(parser::disclosure_key(prefix, wire_key));
+        }
+    }
+    keys
+}
+
 pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Session> {
     let mut events = Vec::new();
     let mut line_objects = Vec::new();
@@ -575,6 +677,15 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         let has_event_type = value
             .as_object()
             .is_some_and(|object| object.contains_key("type"));
+        // rm-449 F4: disclose every unconsumed usage wire key before the
+        // event consume below — a usage entry this lane's accounting
+        // cannot take (unknown name, known-but-unmapped alias, or a
+        // recognized key at an ignored location) used to silently
+        // produce zero tokens with no health signal (PoC p4-kimi; review
+        // bd6e4a50 F1 counterexamples f4-alias/f4-loc).
+        for disclosure in unrecognized_usage_keys(&value) {
+            count_skip(&disclosure, &mut line_skips);
+        }
         let Ok(mut event) = serde_json::from_value::<Event>(value) else {
             count_skip("event_schema", &mut line_skips);
             continue;

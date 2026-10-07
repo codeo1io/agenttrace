@@ -695,12 +695,17 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         out.push_str(&format!("    {sample}\n"));
     }
     if !report.disclosures.is_empty() {
+        // rm-595: disclosure keys route through the control-byte
+        // sanitizer at render — mirror of counts_cell in reports.rs; a
+        // hostile key carries no ESC/OSC sequence into doctor text.
         out.push_str(&format!(
             "Disclosed facts: {}\n",
             report
                 .disclosures
                 .iter()
-                .map(|(key, count)| format!("{key}={count}"))
+                .map(|(key, count)| {
+                    format!("{}={count}", crate::parser::capped_disclosure_value(key))
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -1017,5 +1022,30 @@ mod tests {
         assert_eq!(snapshot_age_phrase(0), "0 days old");
         assert_eq!(snapshot_age_phrase(47), "47 days old");
         assert_eq!(snapshot_age_phrase(-1), "-1 days old");
+    }
+
+    #[test]
+    fn disclosure_keys_render_sanitized() {
+        // rm-595: the doctor disclosures arm mirrors counts_cell in
+        // reports.rs — a hostile disclosure key carries no ESC/OSC
+        // terminal-injection sequence into doctor text (PoC p6-ansi
+        // class; mint sites sanitize too, this is the render choke point).
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-doctor-render-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut report = build_doctor_report(Some(&dir), false);
+        report
+            .disclosures
+            .insert("ansi\u{1b}]52;c;cHduYWdlPWNhdA==\u{7}future".to_string(), 3);
+        let text = doctor_report_text(&report);
+        assert!(!text.contains('\u{1b}'), "ESC leaked into doctor text");
+        assert!(!text.contains('\u{7}'), "BEL leaked into doctor text");
+        assert!(
+            text.contains("ansi\u{fffd}]52;c;cHduYWdlPWNhdA==\u{fffd}future=3"),
+            "sanitized disclosure key visible in doctor text"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -119,7 +119,7 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     }
     let parsed_value = serde_json::from_str::<Value>(trimmed).ok();
     if let Some(value) = &parsed_value {
-        if is_qwen_code_value(value) {
+        if is_qwen_code_document(value) {
             return session_from_events(name, path, parse_qwen_code_value(value)?);
         }
         if let Some(events) = parse_openclaw_value(value) {
@@ -2059,11 +2059,60 @@ fn oh_my_pi_recorded_cost_usd(usage: Option<&Value>) -> Option<f64> {
 /// carries neither an ESC/OSC terminal-injection sequence nor a
 /// newline that breaks the one-line text contract. Printable tails
 /// legitimately survive; the contract targets control bytes only.
-fn disclosure_key(prefix: &str, value: &str) -> String {
-    format!(
-        "{prefix}:{}",
-        crate::statusline::sanitize_line_segment(value)
-    )
+///
+/// rm-594: keys are ALSO length-bounded at mint. A hostile or evolved
+/// journal can smuggle megabyte-scale strings in as `type` names and
+/// unknown usage-key names (PoC p1-huge: a 1,048,617-char response_item
+/// type minted a 1,060,176-byte cache entry and 1,054,082-byte
+/// reports). Values longer than [`DISCLOSURE_VALUE_CAP`] chars keep a
+/// visible prefix plus a 12-hex FNV-1a digest of the full sanitized
+/// value: distinct long keys stay distinct, the shape is deterministic
+/// across runs and Rust versions (no SipHash-version drift), and benign
+/// short values are byte-identical to the uncapped form — no
+/// persisted-shape change, no session-cache schema bump. Every mint
+/// site (pi families, codex unmatched types, the hermes unknown-usage
+/// disclosure) routes through this ONE helper so future arms inherit
+/// both guarantees for free.
+pub(crate) fn disclosure_key(prefix: &str, value: &str) -> String {
+    format!("{prefix}:{}", capped_disclosure_value(value))
+}
+
+/// rm-594: maximum CHARS (not bytes — U+FFFD is 3 bytes) a journal-derived
+/// counter value may occupy before the prefix+digest form takes over.
+const DISCLOSURE_VALUE_CAP: usize = 96;
+/// rm-594: visible prefix retained before the digest, so a human reading
+/// the report still sees what the journal actually said.
+const DISCLOSURE_VALUE_PREFIX: usize = 48;
+
+/// FNV-1a 64-bit, low 48 bits rendered as EXACTLY 12 hex chars —
+/// deterministic across runs and toolchain versions, unlike
+/// `DefaultHasher` (rm-594 cap helper; review bd6e4a50 F2: the unmasked
+/// u64 rendered 12–16 digits, contradicting every comment and doc that
+/// said "12 hex" — mask, don't reword). 48 bits keeps distinct long
+/// keys distinct for any realistic hostile corpus.
+fn fnv1a_hex(value: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:012x}", hash & 0xffff_ffff_ffff)
+}
+
+/// rm-594: sanitize first (control bytes die), then cap by chars (no
+/// partial multi-byte truncation), keeping a prefix + digest when long.
+/// Also used by the RENDER choke points (reports.rs counts_cell,
+/// doctor.rs disclosures) so legacy cache entries minted before the cap
+/// (or any future bypass of the shared mint helper) still render bounded
+/// — sanitize is idempotent (U+FFFD is not control) and keys under the
+/// cap pass through byte-identical.
+pub(crate) fn capped_disclosure_value(value: &str) -> String {
+    let sanitized = crate::statusline::sanitize_line_segment(value);
+    if sanitized.chars().count() <= DISCLOSURE_VALUE_CAP {
+        return sanitized;
+    }
+    let prefix: String = sanitized.chars().take(DISCLOSURE_VALUE_PREFIX).collect();
+    format!("{prefix}…#{}", fnv1a_hex(&sanitized))
 }
 
 fn oh_my_pi_message_events(
@@ -2294,6 +2343,27 @@ const CLAUDE_ONLY_JSONL_KEYS: [&str; 5] = [
 /// A claude model string inside `message.model` survives sessionId
 /// scrubbing, and qwen_code never stamps claude models — so one disqualifies
 /// the qwen uuid branch just like the claude-only keys do (rm-345).
+/// rm-488: the whole-file-JSON lane historically probed qwen shape via
+/// [`is_qwen_code_value`] WITHOUT the file-level claude-evidence guard
+/// the JSONL lane applies in [`is_qwen_code_jsonl`], so a
+/// single-document transcript carrying claude-only evidence
+/// (`parentUuid`, camelCase id, a claude model string) misclassified as
+/// qwen_code. Guard the document the same way the line lane guards the
+/// file: one claude-evidence hit anywhere disqualifies the qwen reading.
+fn is_qwen_code_document(value: &Value) -> bool {
+    if !is_qwen_code_value(value) {
+        return false;
+    }
+    match value {
+        Value::Object(obj) => !carries_claude_evidence(obj),
+        Value::Array(items) => !items
+            .iter()
+            .filter_map(Value::as_object)
+            .any(carries_claude_evidence),
+        _ => true,
+    }
+}
+
 fn carries_claude_model(obj: &Map<String, Value>) -> bool {
     obj.get("message")
         .and_then(Value::as_object)
@@ -2311,7 +2381,14 @@ fn is_qwen_code_event(obj: &Map<String, Value>) -> bool {
         return false;
     }
     if obj.contains_key("session_id") {
-        return true;
+        // rm-449 (upstream luoyuctl/agenttrace#304 / 008ca975): a
+        // Claude Code transcript that grew a qwen-shaped snake_case id
+        // alongside its native camelCase `sessionId` is claude's, not
+        // qwen's — the same dual-key disqualifier the uuid arm has
+        // carried since rm-345. Before this, the snake_case arm
+        // returned true unconditionally and whole dual-id journals
+        // misclassified (tokens, model and source all wrong).
+        return !obj.contains_key("sessionId");
     }
     if obj.contains_key("uuid") {
         return !obj.contains_key("sessionId")
@@ -3038,8 +3115,22 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                         // as a failure instead of a silent success.
                         let status = string(payload.get("status")).unwrap_or("completed");
                         let call_id = string(payload.get("call_id")).unwrap_or("").to_string();
-                        if status != "completed" {
-                            failed_custom_calls.insert(call_id.clone());
+                        // rm-542 F3 (dated append, 2026-10-06): an
+                        // id-less call cannot be paired to its output —
+                        // `""` is a legal journal value and every later
+                        // id-less success output inherited the failure
+                        // (PoC p3-emptyid). And a call that REACHES
+                        // "completed" after an earlier non-completed
+                        // attempt under the same id transitions the pair
+                        // to success — the latest status wins, so a
+                        // replayed/duplicate id cannot pin a permanent
+                        // failure on outputs that succeeded.
+                        if !call_id.is_empty() {
+                            if status != "completed" {
+                                failed_custom_calls.insert(call_id.clone());
+                            } else {
+                                failed_custom_calls.remove(&call_id);
+                            }
                         }
                         events.push(Event {
                             role: "assistant".to_string(),
@@ -3111,8 +3202,15 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                         // visible, not silent — the custom-tools gap hid for
                         // a month because unknown payload types incremented
                         // nothing (rm-401 widened-channel precedent).
+                        // rm-594: route unmatched-shape keys through the
+                        // shared capped+sanitized mint helper (same shape
+                        // as before for benign values; hostile/oversized
+                        // values become bounded and control-byte-free).
                         *counters
-                            .entry(format!("codex_unmatched_response_item:{unknown_payload}"))
+                            .entry(disclosure_key(
+                                "codex_unmatched_response_item",
+                                unknown_payload,
+                            ))
                             .or_insert(0) += 1;
                     }
                 }
@@ -3163,8 +3261,11 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             unknown_top_level => {
                 // rm-542: same disclosure duty as the response_item arm —
                 // an unrecognized top-level type is drift, not noise.
+                // rm-401: unknown top-level types surface in parse
+                // diagnostics under a named counter; rm-594 routes the
+                // key through the shared capped+sanitized mint helper.
                 *counters
-                    .entry(format!("codex_unmatched_type:{unknown_top_level}"))
+                    .entry(disclosure_key("codex_unmatched_type", unknown_top_level))
                     .or_insert(0) += 1;
             }
         }
@@ -5247,6 +5348,70 @@ fn repair_lone_surrogates(line: &str) -> Option<String> {
 /// table is a standing guess about other tools' wire formats, so every
 /// alias match is surfaced instead of silently-zeroing usage on a future
 /// key change.
+/// rm-449 F4: every wire key the usage extractor recognizes, across all
+/// alias families (input/output/cache-creation/cache-read) and the
+/// reasoning-token synonyms. The kimi_cli StatusUpdate arm consumes and
+/// discloses these via `usage_from_value_with_keys`; on the
+/// hermes/generic lane the vocabulary separates UNKNOWN keys
+/// (`usage_unknown_key:…`, PoC p4-kimi) and known-but-unmapped ALIASES
+/// (`usage_alias_unmapped:…`, review bd6e4a50 F1) from the five
+/// canonical names that lane actually accounts
+/// ([`USAGE_KEYS_CONSUMED`]).
+const USAGE_WIRE_KEYS_RECOGNIZED: &[&str] = &[
+    "input_tokens",
+    "prompt_tokens",
+    "inputTokens",
+    "promptTokenCount",
+    "input_other",
+    "output_tokens",
+    "completion_tokens",
+    "outputTokens",
+    "candidatesTokenCount",
+    "output",
+    "cache_creation_input_tokens",
+    "cacheCreationInputTokens",
+    "cache_creation",
+    "cacheWriteTokens",
+    "input_cache_creation",
+    "cache_read_input_tokens",
+    "cacheReadInputTokens",
+    "cache_read",
+    "cacheReadTokens",
+    "input_cache_read",
+    "thoughtsTokenCount",
+    "thinkingTokenCount",
+    "thinking_tokens",
+    "reasoning_tokens",
+];
+
+pub(crate) fn usage_wire_key_is_recognized(key: &str) -> bool {
+    USAGE_WIRE_KEYS_RECOGNIZED.contains(&key)
+}
+
+/// rm-449 F4 review fix (review bd6e4a50 F1): the CANONICAL post-flatten
+/// names the hermes/generic lane's accounting actually consumes —
+/// `session_from_events` reads exactly these five names from the
+/// TOP-LEVEL `usage` field (`Event` deserializes no other usage
+/// location). This is NARROWER than [`USAGE_WIRE_KEYS_RECOGNIZED`]:
+/// the vocabulary holds other tools' wire synonyms that the kimi lane
+/// maps but this lane does not. A numeric usage key is CONSUMED here
+/// only when it flattens to one of these names at the top-level
+/// location — a known alias (`prompt_tokens`), an unknown name, or a
+/// canonical name at a scanned-but-ignored location (`message.usage`,
+/// `providerData.usage`) is disclosed instead of silently zeroing
+/// tokens (lib.rs `unrecognized_usage_keys`).
+pub(crate) const USAGE_KEYS_CONSUMED: &[&str] = &[
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+];
+
+pub(crate) fn usage_key_is_consumed(key: &str) -> bool {
+    USAGE_KEYS_CONSUMED.contains(&key)
+}
+
 fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, Vec<&'static str>) {
     let Some(obj) = value.as_object() else {
         return (None, Vec::new());

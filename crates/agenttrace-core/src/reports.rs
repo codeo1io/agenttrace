@@ -42,13 +42,22 @@ impl BaselineBreaches {
 /// disclosures (`pi_branches=2, pi_usage_entry:cache_warm=1`,
 /// rm-436/rm-437). Empty input renders empty so report bytes stay
 /// unchanged for clean corpora.
+/// rm-595/rm-594: keys route through the sanitize+cap helper here as
+/// well — mint sites already cap+sanitize (rm-594 helper), and this
+/// single choke point covers every current and future mint site (and
+/// legacy cache entries) for the terminal, markdown and HTML surfaces
+/// (defense-in-depth; idempotent — U+FFFD is not a control byte, keys
+/// under the cap are byte-identical). JSON output deliberately skips
+/// this sanitizer (lossless JSON escaping, rm-383 contract).
 fn counts_cell(counts: &BTreeMap<String, usize>) -> String {
     if counts.is_empty() {
         return String::new();
     }
     let rendered = counts
         .iter()
-        .map(|(reason, count)| format!("{reason}={count}"))
+        .map(|(reason, count)| {
+            format!("{}={count}", crate::parser::capped_disclosure_value(reason))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     // rm-450 provenance: the workbuddy input-basis counters only carry
