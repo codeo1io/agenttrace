@@ -5,7 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 34;
+// Bumped 33 -> 34 (run feb16bba cycle 2, rm-856 'journal-truth
+// composition repair'): a generic-lane session that ALSO carries usage
+// on a meta-role line stops folding both lanes into the same totals
+// (the cycle-2 assess PoC: meta 100/50 + assistant 7/3 reported
+// total_tokens 160 with no disclosure) — when meta usage is present
+// it is the session's counted lane, the generic fold stands down, and
+// the stood-down conversation lines disclose via
+// usage_present_not_counted — so UNCHANGED journals report corrected
+// (lower) token totals plus a new line_skips entry, and a warm v33
+// cache keeps serving the double-counted values verbatim under
+// matching size/mtime fingerprints (rm-230 convention: behavioral
+// changes to cached derived values bump the schema). Landed against
+// base 96b528e at schema 33 and bumped to 34 there; integration
+// re-bases the bump onto the already-advanced ceiling per the same
+// convention. Entries regenerate once on next scan.
 // Bumped 32 -> 33 (integration of run 91833f02, rm-616 'Generic-lane
 // model/usage truth', review fix 0be11bb1 after review f6b98bc3 F1):
 // the Event.model_used snake_case alias plus the generic-lane counted

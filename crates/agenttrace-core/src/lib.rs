@@ -1065,9 +1065,18 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // put usage on the messages themselves. Events carrying model
         // attribution join the per-model pricing state below so a
         // switched session prices per block like any other family.
+        // rm-856 composition: when the session carries usage on a
+        // meta-role line, THAT arm is the counted lane — the meta block
+        // already aggregates the conversation (native-family precedent
+        // `stray_conversation_usage_disclosed_beside_meta_usage`) — so
+        // the generic fold stands down instead of double-counting both
+        // lanes into the same totals; the stood-down lines disclose
+        // through `usage_present_not_counted` below. `has_meta_usage`
+        // scans the whole slice, so the gate is order-independent.
         let generic_reported_usage = !matches!(event.role.as_str(), "session_meta" | "meta")
             && event.source_tool == "generic"
-            && !event.usage.is_empty();
+            && !event.usage.is_empty()
+            && !has_meta_usage;
         if generic_reported_usage {
             metrics.tokens_input = metrics
                 .tokens_input
@@ -1344,6 +1353,15 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     || event.source_tool == "generic"
             })
             .filter(|event| !event.usage.is_empty())
+            .filter(|event| {
+                // rm-856 composition: when meta usage is present the meta
+                // arm is the session's counted lane — stood-down generic
+                // conversation lines disclose via usage_present_not_counted
+                // and must not PRICE either; the meta block keeps its
+                // per-attribution pricing, so cost stays consistent with
+                // the meta-only totals.
+                !has_meta_usage || matches!(event.role.as_str(), "session_meta" | "meta")
+            })
         {
             if event
                 .recorded_cost_usd
