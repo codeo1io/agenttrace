@@ -85,12 +85,17 @@ pub struct SessionCostAudit {
 
 fn current_cost_estimate(
     model: &str,
+    service_tier: Option<&str>,
     tokens: &TokenBreakdown,
 ) -> Option<(String, PriceBreakdown, PriceBreakdown)> {
     if model == "multiple" {
         return None;
     }
-    let rate = pricing::lookup_price(model);
+    // rm-610: the "current rates" recompute must bill the tier the
+    // session(s) actually ran on — an untiered recompute priced every
+    // flex session at the standard row and flagged a false drift
+    // (current 48 vs stored 36 on a flex+standard corpus).
+    let rate = pricing::lookup_price_tiered(model, service_tier);
     let rates = PriceBreakdown {
         input: rate.input,
         output: rate.output,
@@ -108,7 +113,16 @@ fn current_cost_estimate(
     components.total = round4(
         components.input + components.output + components.cache_write + components.cache_read,
     );
-    Some((pricing::pricing_source_for(model), rates, components))
+    // rm-610: disclose the tier the recompute billed on, mirroring the
+    // provenance label `analyze` stamps on tier-priced sessions.
+    let source = match service_tier {
+        Some(tier) => format!(
+            "{}; service_tier: {tier}",
+            pricing::pricing_source_for(model)
+        ),
+        None => pricing::pricing_source_for(model),
+    };
+    Some((source, rates, components))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -224,6 +238,10 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         specific: usize,
         fallback: usize,
         unknown: usize,
+        // rm-610: the tiers the row's sessions ran on. One agreed tier
+        // re-prices tier-aware; a mix cannot carry one rate row and is
+        // disclosed as such instead of silently pricing standard.
+        tiers: BTreeSet<Option<String>>,
     }
     let mut rows: BTreeMap<(String, String), Aggregate> = BTreeMap::new();
     let mut coverage = PricingCoverage::default();
@@ -232,6 +250,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         let model = normalized_model(&session.metrics.model_used);
         let row = rows.entry((provider, model.clone())).or_default();
         row.sessions += 1;
+        row.tiers.insert(session.metrics.service_tier.clone());
         row.tokens.input = row
             .tokens
             .input
@@ -292,15 +311,30 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
     let mut by_provider_model = rows
         .into_iter()
         .map(|((provider, model), row)| {
-            let current = current_cost_estimate(&model, &row.tokens);
-            let pricing_source = current
-                .as_ref()
-                .map(|(source, _, _)| source.clone())
-                .unwrap_or_else(|| "unavailable: multiple models".to_string());
+            let mixed_tiers = row.tiers.len() > 1;
+            let row_tier = row.tiers.iter().next().and_then(|tier| tier.as_deref());
+            let current = if mixed_tiers {
+                None
+            } else {
+                current_cost_estimate(&model, row_tier, &row.tokens)
+            };
+            let pricing_source = if mixed_tiers {
+                "unavailable: mixed service tiers".to_string()
+            } else {
+                current
+                    .as_ref()
+                    .map(|(source, _, _)| source.clone())
+                    .unwrap_or_else(|| "unavailable: multiple models".to_string())
+            };
             let (pricing_status, pricing_note) = if model == "multiple" {
                 (
                     "aggregate_estimate",
                     "SQLite aggregated multiple model IDs; no single-model exact price applies",
+                )
+            } else if mixed_tiers {
+                (
+                    "aggregate_estimate",
+                    "sessions under this model ran on mixed service tiers; each session's cost prices the tier it ran on, so no single-tier rate row applies",
                 )
             } else if row.unknown > 0 {
                 ("unpriced_or_unknown", "model name is missing or generic")
@@ -398,7 +432,7 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         cache_read: session.metrics.tokens_cache_r,
         total: total_tokens(session),
     };
-    let current = current_cost_estimate(&model, &tokens);
+    let current = current_cost_estimate(&model, session.metrics.service_tier.as_deref(), &tokens);
     let (pricing_status, pricing_note) = if model == "multiple" {
         (
             "aggregate_estimate",
@@ -1136,6 +1170,55 @@ mod tests {
         assert!(aggregate.current_estimated_cost_usd.is_none());
         assert!(aggregate.by_provider_model[0].estimated_cost_usd.is_none());
         assert!(aggregate.by_provider_model[0].component_cost_usd.is_none());
+    }
+
+    #[test]
+    fn audit_reprices_the_service_tier_the_sessions_ran_on() {
+        // rm-610: the "current rates" recompute must be tier-aware. The
+        // live PoC shape: a codex flex turn of 1M in / 1M out on gpt-5.6
+        // costs $12 on the flex row — an untiered recompute claimed $24
+        // "today" and flagged a false drift against the stored $12.
+        let mut flex = session("flex");
+        flex.metrics.model_used = "gpt-5.6".to_string();
+        flex.metrics.source_tool = "codex_cli".to_string();
+        flex.metrics.tokens_input = 1_000_000;
+        flex.metrics.tokens_output = 1_000_000;
+        flex.metrics.cost_estimated = 12.0;
+        flex.metrics.service_tier = Some("flex".to_string());
+
+        let single = session_cost_audit(&flex);
+        assert_eq!(single.estimated_cost_usd, Some(12.0));
+        assert_eq!(single.stored_estimated_cost_usd, 12.0);
+        assert!(single.pricing_source.contains("service_tier: flex"));
+        assert!(
+            !single
+                .pricing_note
+                .contains("recalculate a different total"),
+            "a tier-aware recompute must not flag drift against the tier-priced store: {}",
+            single.pricing_note
+        );
+
+        // One model, two tiers under one (provider, model) row: no
+        // single rate row applies — disclosed, not silently standard.
+        let mut standard = flex.clone();
+        standard.metrics.service_tier = Some("default".to_string());
+        standard.metrics.cost_estimated = 24.0;
+        let audit = cost_audit(&[flex.clone(), standard]);
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.pricing_status, "aggregate_estimate");
+        assert_eq!(row.pricing_source, "unavailable: mixed service tiers");
+        assert!(row.estimated_cost_usd.is_none());
+        assert!(row.rates_per_million_usd.is_none());
+        assert_eq!(audit.stored_estimated_cost_usd, 36.0);
+        assert!(audit.current_estimated_cost_usd.is_none());
+
+        // All sessions on one tier: the row re-prices tier-aware and
+        // agrees with the stored total.
+        let audit = cost_audit(&[flex]);
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.estimated_cost_usd, Some(12.0));
+        assert_eq!(audit.current_estimated_cost_usd, Some(12.0));
+        assert!(row.pricing_source.contains("service_tier: flex"));
     }
 
     #[test]

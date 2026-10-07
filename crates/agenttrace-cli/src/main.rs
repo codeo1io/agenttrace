@@ -1192,6 +1192,7 @@ fn render_test_match_json() -> anyhow::Result<String> {
         "vertex_ai/claude-opus-4-5@20251101",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "openai/gpt-4.1",
+        "gpt-5.6",
         "gpt-4.1-mini-2025-04-14",
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
@@ -1202,12 +1203,19 @@ fn render_test_match_json() -> anyhow::Result<String> {
         .iter()
         .map(|model| {
             let price = lookup_price(model);
+            // rm-610: flex-tier rates disclosed per row (null when the
+            // row carries none — flex turns then bill at the standard
+            // rates above).
             serde_json::json!({
                 "model": model,
                 "input_per_million": price.input,
                 "output_per_million": price.output,
                 "cache_write_per_million": price.cw,
                 "cache_read_per_million": price.cr,
+                "flex_input_per_million": price.input_flex,
+                "flex_output_per_million": price.output_flex,
+                "flex_cache_write_per_million": price.cw_flex,
+                "flex_cache_read_per_million": price.cr_flex,
             })
         })
         .collect();

@@ -280,6 +280,12 @@ struct GoMetrics {
     gaps_sec: Vec<f64>,
     #[serde(default, rename = "ModelUsed")]
     model_used: String,
+    /// rm-610: the service tier the session's usage blocks agreed on.
+    /// Defaulted so pre-existing cache rows deserialize unchanged (they
+    /// are re-priced anyway — the catalog-identity stamp changed when
+    /// the flex slots joined the digest, rm-613).
+    #[serde(default, rename = "ServiceTier")]
+    service_tier: Option<String>,
     #[serde(default, rename = "SourceTool")]
     source_tool: String,
     #[serde(default, rename = "SessionStart")]
@@ -1383,6 +1389,7 @@ impl GoMetrics {
             tokens_cache_r: metrics.tokens_cache_r,
             gaps_sec: metrics.gaps_sec.clone(),
             model_used: metrics.model_used.clone(),
+            service_tier: metrics.service_tier.clone(),
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
@@ -1424,6 +1431,7 @@ impl GoMetrics {
             timestamps: Vec::new(),
             gaps_sec: self.gaps_sec,
             model_used: self.model_used,
+            service_tier: self.service_tier,
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,

@@ -732,6 +732,9 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         agg.cache_write_tokens,
         agg.cache_read_tokens,
         &model,
+        // rm-610: stored sqlite sessions carry no per-turn tier;
+        // aggregate estimates stay at standard rates.
+        None,
     );
     if agg.usage_cost_set {
         cost_estimated = crate::round4(agg.usage_cost);
@@ -829,7 +832,8 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
 }
 
 fn token_cost_raw(input: i64, output: i64, cache_write: i64, cache_read: i64, model: &str) -> f64 {
-    token_cost(input, output, cache_write, cache_read, model)
+    // rm-610: sqlite stores carry no per-turn service tier; standard rates.
+    token_cost(input, output, cache_write, cache_read, model, None)
 }
 
 fn unix_seconds_rfc3339(value: f64) -> String {

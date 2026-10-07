@@ -187,3 +187,73 @@ fn warm_cache_reprices_when_the_override_file_content_changes() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn warm_cache_preserves_the_flex_service_tier_on_hits() {
+    // rm-610 + rm-613 end to end, on the codex flex shape: a flex turn
+    // of 1M in / 1M out on gpt-5.6 costs $12 on the flex row (not $24
+    // standard), the tier rides the session cache so a warm hit replays
+    // the tier-priced cost AND provenance, and the overview audit's
+    // "current rates" recompute stays tier-aware instead of claiming
+    // the session costs double and flagging drift.
+    let root = unique_root("flex");
+    let journal = root.join("corpus/flex.jsonl");
+    fs::write(&journal, fixture_codex_flex_journal()).expect("write codex flex journal");
+
+    let cold = run_agenttrace(&root, None);
+    assert_eq!(cold.cost, 12.0, "1M/1M on the gpt-5.6 flex row is $12");
+    assert!(
+        cold.pricing_source.contains("service_tier: flex"),
+        "cold run must disclose the tier billed on, got {}",
+        cold.pricing_source
+    );
+
+    let warm = run_agenttrace(&root, None);
+    assert_eq!(warm.cost, 12.0);
+    assert!(
+        warm.pricing_source.contains("service_tier: flex"),
+        "a warm cache hit must replay the tier-priced provenance (the tier
+        rides the cache snapshot), got {}",
+        warm.pricing_source
+    );
+
+    // The overview's cost audit agrees with itself: the "current"
+    // estimate is the flex row, and no drift note fires.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["-d", "corpus", "--overview", "-f", "json"])
+        .current_dir(&root)
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("AGENTTRACE_SESSION_CACHE_DIR", root.join("cache/sess"))
+        .env("HOME", &root)
+        .env_remove("AGENTTRACE_PRICING_FILE")
+        .output()
+        .expect("run agenttrace --overview");
+    assert!(output.status.success(), "overview failed");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("overview JSON parses");
+    let audit = &doc["cost_audit"];
+    assert_eq!(
+        audit["stored_estimated_cost_usd"].as_f64(),
+        Some(12.0),
+        "stored total is the flex-priced cost"
+    );
+    assert_eq!(
+        audit["current_estimated_cost_usd"].as_f64(),
+        Some(12.0),
+        "the current-rates recompute must bill the flex row too (was a
+        false 24.0 with a drift note before the tier rode the metrics)"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+fn fixture_codex_flex_journal() -> String {
+    // A codex rollout whose turn_context discloses
+    // thread_settings.service_tier = "flex" (the codeburn #1642 field
+    // shape) and one token_count snapshot of exactly 1M in / 1M out.
+    concat!(
+        "{\"timestamp\":\"2026-10-01T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"cwd\":\"/tmp/x\",\"model\":\"gpt-5.6\"}}\n",
+        "{\"timestamp\":\"2026-10-01T09:00:05Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6\",\"cwd\":\"/tmp/x\",\"thread_settings\":{\"service_tier\":\"flex\"}}}\n",
+        "{\"timestamp\":\"2026-10-01T09:00:10Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000000,\"output_tokens\":1000000}}}}\n"
+    )
+    .to_string()
+}

@@ -48,6 +48,19 @@ for key, value in data.items():
     deprecation = value.get("deprecation_date")
     if isinstance(deprecation, str) and deprecation.strip():
         keep[key]["deprecation_date"] = deprecation.strip()
+    # Flex-tier rates ride along when the source carries them (rm-610).
+    # Zero/absent values are omitted so "carries flex pricing" stays
+    # greppable — a flex turn of a row without them bills at the
+    # standard rates above.
+    for flex_field in (
+        "input_cost_per_token_flex",
+        "output_cost_per_token_flex",
+        "cache_creation_input_token_cost_flex",
+        "cache_read_input_token_cost_flex",
+    ):
+        flex = value.get(flex_field)
+        if isinstance(flex, (int, float)) and flex > 0:
+            keep[key][flex_field] = flex
 snapshot = {
     "_snapshot": {
         "source": "BerriAI/litellm model_prices_and_context_window.json",

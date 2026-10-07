@@ -63,6 +63,21 @@ pub struct Price {
     /// YYYY-MM-DD), when the entry carries one (rm-419).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecation_date: Option<String>,
+    /// Flex-tier rates (LiteLLM `*_cost_per_token_flex`, rm-610): the
+    /// rate a turn that ran on `service_tier: "flex"` bills at.
+    /// Absent on most models and on all override files that do not set
+    /// them; `skip` keeps serialized pricing output byte-identical for
+    /// models without them. A flex turn of a model without flex rates
+    /// bills at the standard rates above (published behavior,
+    /// codeburn #1642) — never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_flex: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_flex: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw_flex: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr_flex: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,12 +116,49 @@ struct LiteLlmModel {
     max_input_tokens: Option<u64>,
     #[serde(default, rename = "deprecation_date")]
     deprecation_date: Option<String>,
+    // Flex-tier rates (rm-610). LiteLLM also publishes
+    // `*_above_272k_tokens_flex` variants (long-context flex tiers);
+    // they are deliberately NOT ingested — the fork has no
+    // long-context tier extraction to pair them with.
+    #[serde(default, rename = "input_cost_per_token_flex")]
+    input_cost_flex: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_flex")]
+    output_cost_flex: Option<f64>,
+    #[serde(default, rename = "cache_creation_input_token_cost_flex")]
+    cache_write_cost_flex: Option<f64>,
+    #[serde(default, rename = "cache_read_input_token_cost_flex")]
+    cache_read_cost_flex: Option<f64>,
 }
 
 pub fn lookup_price(model: &str) -> Price {
+    lookup_price_tiered(model, None)
+}
+
+/// rm-610: resolve a model's rates for the service tier the turn
+/// actually ran on. `Some("flex")` bills at the entry's `*_flex`
+/// slots when the catalog row carries them — input AND output must
+/// both be present, and a missing cache slot falls back to that
+/// standard rate — while every other tier (None, "default",
+/// "priority", ...) bills at the standard rates. A model without
+/// flex rates bills flex turns at the standard rates: that is the
+/// published behavior (codeburn #1642), not a guess.
+pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
     let model = resolve_alias(model, &catalog.aliases);
-    lookup_price_in(&model, &catalog.entries)
+    let mut price = lookup_price_in(&model, &catalog.entries);
+    if service_tier == Some("flex") {
+        if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
+            price.input = input;
+            price.output = output;
+            if let Some(cw) = price.cw_flex {
+                price.cw = cw;
+            }
+            if let Some(cr) = price.cr_flex {
+                price.cr = cr;
+            }
+        }
+    }
+    price
 }
 
 pub fn has_specific_price(model: &str) -> bool {
@@ -283,6 +335,13 @@ pub fn catalog_identity() -> &'static str {
     IDENTITY.get_or_init(|| catalog_identity_of(pricing_catalog()))
 }
 
+/// Digest of every catalog fact that can change a cost or an
+/// attribution: rate values (standard AND flex, rm-610), context
+/// windows, deprecation dates, alias rows, and provider labels
+/// (rm-613). Only `source` and `reference_date` are excluded — they
+/// describe where the data came from, not what it prices. The session
+/// cache freshness key consumes this: a rate-identical provider flip
+/// or a gained flex slot must reprice cached sessions.
 pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
     fn fnv1a(bytes: &[u8], state: u64) -> u64 {
         bytes.iter().fold(state, |hash, byte| {
@@ -300,10 +359,30 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
             price.deprecation_date.as_deref().unwrap_or("").as_bytes(),
             hash,
         );
+        // rm-610: a None slot must hash differently from Some(value) —
+        // the flag byte keeps gained/lost flex pricing from colliding
+        // with a value change.
+        for flex in [
+            price.input_flex,
+            price.output_flex,
+            price.cw_flex,
+            price.cr_flex,
+        ] {
+            hash = fnv1a(&[flex.is_some() as u8], hash);
+            if let Some(value) = flex {
+                hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+            }
+        }
     }
     for (alias, target) in &catalog.aliases {
         hash = fnv1a(alias.as_bytes(), hash);
         hash = fnv1a(target.as_bytes(), hash);
+    }
+    // rm-613: provider labels are attribution the digest used to
+    // miss — a rate-identical provider flip changed nothing here.
+    for (model, provider) in &catalog.providers {
+        hash = fnv1a(model.as_bytes(), hash);
+        hash = fnv1a(provider.as_bytes(), hash);
     }
     format!("{hash:016x}")
 }
@@ -457,6 +536,11 @@ pub fn update_pricing() -> anyhow::Result<usize> {
     };
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
+    // Same redirect parity as the initial catalog: a `--update-pricing`
+    // refresh replaces the singleton, and the codex SKU coverage must
+    // survive it (rm-610) instead of silently reverting to fallback.
+    apply_codex_sku_entries(&mut catalog);
+    apply_codex_sku_aliases(&mut catalog);
     let _ = PRICING_CATALOG.set(catalog);
     Ok(count)
 }
@@ -521,6 +605,7 @@ pub fn render_test_match() -> String {
         "vertex_ai/claude-opus-4-5@20251101",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "openai/gpt-4.1",
+        "gpt-5.6",
         "gpt-4.1-mini-2025-04-14",
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
@@ -532,6 +617,19 @@ pub fn render_test_match() -> String {
             "  {:<50} → in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
             model, p.input, p.output, p.cw, p.cr
         ));
+        // rm-610: disclose the flex-tier rates when the row carries
+        // them, so the rate a `service_tier: "flex"` turn bills at is
+        // answerable from the same probe (absent flex rows bill flex
+        // turns at the standard rates above).
+        if let (Some(in_flex), Some(out_flex)) = (p.input_flex, p.output_flex) {
+            out.push_str(&format!(
+                "      flex: in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+                in_flex,
+                out_flex,
+                p.cw_flex.unwrap_or(p.cw),
+                p.cr_flex.unwrap_or(p.cr)
+            ));
+        }
     }
     out
 }
@@ -542,8 +640,9 @@ pub(crate) fn token_cost(
     cache_write: i64,
     cache_read: i64,
     model: &str,
+    service_tier: Option<&str>,
 ) -> f64 {
-    let price = lookup_price(model);
+    let price = lookup_price_tiered(model, service_tier);
     round4(
         input as f64 / 1e6 * price.input
             + output as f64 / 1e6 * price.output
@@ -564,7 +663,61 @@ fn load_catalog_for_current_env() -> PricingCatalog {
     let mut catalog = load_pricing_cache().unwrap_or_else(fallback_catalog);
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
+    apply_codex_sku_entries(&mut catalog);
+    apply_codex_sku_aliases(&mut catalog);
     catalog
+}
+
+/// Codex SKU redirect rows (rm-610): model ids the codex CLI reports
+/// that LiteLLM's chat-mode catalog carries no row for, mapped to
+/// their published equivalents (codeburn #1642: gpt-reserve is Luna
+/// Reserve pricing as GPT-5.6 Luna; gpt-5.3-spark is Codex Spark
+/// pricing as GPT-5.3 Codex; gpt-5.6-codex is the codex-tuned
+/// GPT-5.6). A redirect is only added when the catalog has NO direct
+/// entry for the id, so it retires itself the day upstream ships a
+/// real row — no manual drop owed at snapshot-refresh time — and a
+/// user override alias for the same id still wins (`or_insert`).
+fn apply_codex_sku_aliases(catalog: &mut PricingCatalog) {
+    for (sku, target) in [
+        ("gpt-5.6-codex", "gpt-5.6"),
+        ("gpt-reserve", "gpt-5.6-luna"),
+        ("gpt-5.3-spark", "gpt-5.3-codex"),
+    ] {
+        if !catalog.entries.contains_key(sku) {
+            catalog
+                .aliases
+                .entry(sku.to_string())
+                .or_insert_with(|| target.to_string());
+        }
+    }
+}
+
+/// The `gpt-5.3-spark` redirect's target row (rm-610): LiteLLM
+/// publishes `gpt-5.3-codex` only under `mode: "responses"`, which
+/// the chat-mode catalog filter (update-snapshot.sh and
+/// `convert_litellm` alike) excludes, so without this row the redirect
+/// had no target and both ids priced at fallback. Rates are LiteLLM's
+/// own row for the model, byte-identical to codeburn #1642's
+/// published numbers ($1.75/M in, $14/M out, $0.175/M cache read, no
+/// cache-write rate, no flex tier published). `or_insert` retires the
+/// row the day upstream ships a chat-mode entry — the same
+/// drop-on-upstream-ship discipline as the aliases, and a user
+/// override price for the id still wins (overrides merge first).
+fn apply_codex_sku_entries(catalog: &mut PricingCatalog) {
+    catalog
+        .entries
+        .entry("gpt-5.3-codex".to_string())
+        .or_insert_with(|| Price {
+            input: 1.75,
+            output: 14.0,
+            cw: 0.0,
+            cr: 0.175,
+            ..Price::default()
+        });
+    catalog
+        .providers
+        .entry("gpt-5.3-codex".to_string())
+        .or_insert_with(|| "openai".to_string());
 }
 
 fn fallback_catalog() -> PricingCatalog {
@@ -817,12 +970,58 @@ fn parse_pricing_overrides(raw: &[u8]) -> Result<PricingOverrideMaps, String> {
         validate_override_price(&model, &price)?;
         prices.insert(normalize_model(&model), price);
     }
-    let aliases = overrides
+    let aliases: BTreeMap<String, String> = overrides
         .aliases
         .into_iter()
         .map(|(alias, model)| (normalize_model(&alias), normalize_model(&model)))
         .collect();
+    // rm-612: `resolve_alias` walks at most ALIAS_HOP_BUDGET hops; a
+    // chain that cannot reach a terminal within that budget silently
+    // priced the model at fallback while the source line still
+    // claimed the file applied. Reject the whole file here — the
+    // same loud class as the invalid-JSON and invalid-rate arms —
+    // naming the offending alias. File-internal chains only: the
+    // walk sees this file's rows alone (bundled alias rows are
+    // single-hop SKU redirects, rm-610). Unresolvable cycles fail
+    // this arm too: they never resolved anywhere, and the source
+    // line's "applied" claim was equally false.
+    if let Some((alias, hops)) = alias_chain_over_budget(&aliases) {
+        return Err(format!(
+            "alias {alias:?} cannot resolve within the {ALIAS_HOP_BUDGET}-hop budget \
+             ({hops} hops walked without reaching a priced model); it would silently \
+             price at fallback while this file claims to apply"
+        ));
+    }
     Ok((prices, aliases))
+}
+
+/// The hop budget `resolve_alias` actually walks (its loop count).
+const ALIAS_HOP_BUDGET: usize = 8;
+
+/// Walk each alias's chain one hop beyond the budget: when the
+/// current key is STILL an alias after `ALIAS_HOP_BUDGET` hops, the
+/// chain is unresolvable within the budget (too deep, or a cycle).
+/// Returns the first offending alias (BTreeMap order — the failure
+/// message is deterministic) and the hops walked.
+fn alias_chain_over_budget(aliases: &BTreeMap<String, String>) -> Option<(&String, usize)> {
+    for alias in aliases.keys() {
+        let mut current = alias.clone();
+        let mut hops = 0;
+        while hops <= ALIAS_HOP_BUDGET {
+            let Some(next) = aliases.get(&current) else {
+                break;
+            };
+            if next == &current {
+                break;
+            }
+            current = next.clone();
+            hops += 1;
+        }
+        if hops > ALIAS_HOP_BUDGET {
+            return Some((alias, hops));
+        }
+    }
+    None
 }
 
 /// Rates must be finite and non-negative before they can touch costing.
@@ -845,6 +1044,28 @@ fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
             return Err(format!(
                 "model {model:?}: {field} rate is negative ({value})"
             ));
+        }
+    }
+    // rm-610: the flex slots are Option-valued — absent means "no
+    // published flex rate"; present must still be finite and
+    // non-negative like every other rate.
+    for (field, value) in [
+        ("input_flex", price.input_flex),
+        ("output_flex", price.output_flex),
+        ("cw_flex", price.cw_flex),
+        ("cr_flex", price.cr_flex),
+    ] {
+        if let Some(value) = value {
+            if !value.is_finite() {
+                return Err(format!(
+                    "model {model:?}: {field} rate is not finite ({value})"
+                ));
+            }
+            if value < 0.0 {
+                return Err(format!(
+                    "model {model:?}: {field} rate is negative ({value})"
+                ));
+            }
         }
     }
     Ok(())
@@ -872,6 +1093,14 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
 struct ConvertedCatalog {
     entries: BTreeMap<String, Price>,
     providers: BTreeMap<String, String>,
+}
+
+/// Per-token flex rate -> per-million flex slot, dropping absent,
+/// zero, negative, non-finite, and overflow-scaling values (rm-610).
+fn flex_slot(rate: Option<f64>) -> Option<f64> {
+    rate.filter(|rate| rate.is_finite() && *rate > 0.0)
+        .map(|rate| rate * 1e6)
+        .filter(|scaled| scaled.is_finite())
 }
 
 fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
@@ -908,6 +1137,15 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
                 .map(str::trim)
                 .filter(|date| !date.is_empty())
                 .map(str::to_string),
+            // Flex-tier slots (rm-610): scaled like the standard rates,
+            // kept only when finite and positive — a zero or absent
+            // flex field means "no published flex rate", never "flex
+            // is free". `flex_slot` filters after scaling so a hostile
+            // near-f64-max per-token flex cost cannot survive as inf.
+            input_flex: flex_slot(model.input_cost_flex),
+            output_flex: flex_slot(model.output_cost_flex),
+            cw_flex: flex_slot(model.cache_write_cost_flex),
+            cr_flex: flex_slot(model.cache_read_cost_flex),
         };
         // Hostile or overflowing catalog rates must not reach costing:
         // the 1e6 scaling can turn a near-f64-max per-token cost into
@@ -2569,6 +2807,260 @@ mod tests {
         assert_eq!(
             catalog.entries["brand-new-model"].max_input_tokens, None,
             "an override for an unknown model has nothing to backfill from"
+        );
+    }
+
+    // --- rm-610: flex-tier rates, SKU redirects, tiered lookup ---------
+
+    #[test]
+    fn flex_slots_ingest_scale_and_filter() {
+        let raw = br#"{"m": {
+            "mode": "chat",
+            "input_cost_per_token": 4e-6,
+            "output_cost_per_token": 2e-5,
+            "input_cost_per_token_flex": 2e-6,
+            "output_cost_per_token_flex": 0,
+            "cache_read_input_token_cost_flex": -1,
+            "input_cost_per_token_above_272k_tokens_flex": 9e-6
+        }}"#;
+        let converted = convert_litellm(raw);
+        let price = &converted.entries["m"];
+        assert_eq!(price.input, 4.0, "standard input scales to per-million");
+        assert_eq!(price.input_flex, Some(2.0), "flex input scales too");
+        assert_eq!(
+            price.output_flex, None,
+            "a zero flex rate is 'no flex rate'"
+        );
+        assert_eq!(price.cr_flex, None, "a negative flex rate is dropped");
+        assert_eq!(
+            price.cw_flex, None,
+            "the _above_272k long-context variant is deliberately not ingested"
+        );
+    }
+
+    #[test]
+    fn tiered_lookup_uses_flex_only_for_flex() {
+        // 4e-6 * 1e6 is not exactly 0.4 in binary — compare with a
+        // tolerance instead of == on the cache slots.
+        fn near(a: f64, b: f64) -> bool {
+            (a - b).abs() < 1e-9
+        }
+        let standard = lookup_price_tiered("gpt-5.6", None);
+        let flex = lookup_price_tiered("gpt-5.6", Some("flex"));
+        assert_eq!((standard.input, standard.output), (4.0, 20.0));
+        assert!(near(standard.cw, 5.0) && near(standard.cr, 0.4));
+        // Codeburn #1642 published numbers for GPT-5.6: flex is half.
+        assert_eq!((flex.input, flex.output), (2.0, 10.0));
+        assert!(near(flex.cw, 2.5) && near(flex.cr, 0.2));
+        for tier in ["default", "priority", "fast", "scale", "garbage"] {
+            let priced = lookup_price_tiered("gpt-5.6", Some(tier));
+            assert_eq!(
+                (priced.input, priced.output),
+                (4.0, 20.0),
+                "tier {tier} is not flex"
+            );
+        }
+        // A model without flex slots bills flex at standard rates.
+        let no_flex = lookup_price_tiered("deepseek-chat", Some("flex"));
+        let plain = lookup_price("deepseek-chat");
+        assert_eq!((no_flex.input, no_flex.output), (plain.input, plain.output));
+    }
+
+    #[test]
+    fn codex_sku_redirects_cover_missing_rows() {
+        // All three ids absent from LiteLLM's chat catalog; each must
+        // resolve to its published equivalent (codeburn #1642).
+        assert_eq!(
+            (
+                lookup_price("gpt-5.6-codex").input,
+                lookup_price("gpt-5.6-codex").output
+            ),
+            (
+                lookup_price("gpt-5.6").input,
+                lookup_price("gpt-5.6").output
+            ),
+            "the codex-tuned GPT-5.6 prices as GPT-5.6"
+        );
+        assert_eq!(
+            (
+                lookup_price("gpt-reserve").input,
+                lookup_price("gpt-reserve").output
+            ),
+            (
+                lookup_price("gpt-5.6-luna").input,
+                lookup_price("gpt-5.6-luna").output
+            ),
+            "Luna Reserve prices as GPT-5.6 Luna"
+        );
+        let spark = lookup_price("gpt-5.3-spark");
+        assert_eq!(
+            (spark.input, spark.output),
+            (1.75, 14.0),
+            "Codex Spark prices as GPT-5.3 Codex"
+        );
+        // A redirect retires itself when a real row ships.
+        let mut catalog = PricingCatalog {
+            entries: BTreeMap::from([("gpt-reserve".to_string(), Price::default())]),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        apply_codex_sku_aliases(&mut catalog);
+        assert!(
+            !catalog.aliases.contains_key("gpt-reserve"),
+            "a direct entry must not be shadowed by a redirect"
+        );
+    }
+
+    #[test]
+    fn codex_sku_entry_is_verified_and_retires_on_upstream_ship() {
+        // The gpt-5.3-codex row LiteLLM publishes only under
+        // mode:"responses" (excluded by the chat filter), lifted
+        // code-side with drop-on-upstream-ship discipline.
+        let mut catalog = PricingCatalog {
+            entries: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        apply_codex_sku_entries(&mut catalog);
+        let row = &catalog.entries["gpt-5.3-codex"];
+        assert_eq!(
+            (row.input, row.output, row.cw, row.cr),
+            (1.75, 14.0, 0.0, 0.175),
+            "the vend row carries LiteLLM's own gpt-5.3-codex rates"
+        );
+        assert_eq!(catalog.providers["gpt-5.3-codex"], "openai");
+        // Retire: an upstream chat row (or a user override merged
+        // earlier) is never clobbered by the vend.
+        let mut shipped = PricingCatalog {
+            entries: BTreeMap::from([(
+                "gpt-5.3-codex".to_string(),
+                Price {
+                    input: 9.0,
+                    ..Price::default()
+                },
+            )]),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        apply_codex_sku_entries(&mut shipped);
+        assert_eq!(
+            shipped.entries["gpt-5.3-codex"].input, 9.0,
+            "a real upstream row must win over the vend"
+        );
+    }
+
+    #[test]
+    fn token_cost_applies_the_tier() {
+        // 1M input, nothing else: $2 at flex, $4 at standard.
+        assert_eq!(token_cost(1_000_000, 0, 0, 0, "gpt-5.6", Some("flex")), 2.0);
+        assert_eq!(token_cost(1_000_000, 0, 0, 0, "gpt-5.6", None), 4.0);
+    }
+
+    #[test]
+    fn override_files_validate_flex_rates() {
+        let raw = br#"{"prices": {"m": {"input": 1, "output": 2, "cw": 0, "cr": 0, "input_flex": -0.5}}}"#;
+        let err = parse_pricing_overrides(raw).unwrap_err();
+        assert!(
+            err.contains("input_flex") && err.contains("negative"),
+            "got: {err}"
+        );
+        let raw = br#"{"prices": {"m": {"input": 1, "output": 2, "cw": 0, "cr": 0, "input_flex": 0.5, "output_flex": 0.25}}}"#;
+        let (prices, _) = parse_pricing_overrides(raw).unwrap();
+        assert_eq!(
+            (prices["m"].input_flex, prices["m"].output_flex),
+            (Some(0.5), Some(0.25)),
+            "override flex slots are accepted when finite and positive"
+        );
+    }
+
+    #[test]
+    fn test_match_discloses_flex_rates() {
+        let text = render_test_match();
+        assert!(text.contains("gpt-5.6"), "the flex probe model is listed");
+        assert!(
+            text.contains("flex:"),
+            "flex rates are disclosed on their own line"
+        );
+    }
+
+    // --- rm-612: alias-chain hop budget ---------------------------------
+
+    #[test]
+    fn alias_chain_within_budget_applies() {
+        // 7 hops: deepseek-chat -> ... -> gpt-4.1 (the assess PoC file).
+        let raw = include_str!("../tests/fixtures/pricing-overrides/chain7.json");
+        let (_, aliases) = parse_pricing_overrides(raw.as_bytes()).unwrap();
+        assert_eq!(aliases.len(), 7);
+        assert_eq!(
+            resolve_alias("deepseek-chat", &aliases),
+            "gpt-4.1",
+            "a 7-hop chain resolves inside the budget"
+        );
+    }
+
+    #[test]
+    fn alias_chain_over_budget_is_rejected_loudly() {
+        // 9 hops: silently priced at fallback before rm-612.
+        let raw = include_str!("../tests/fixtures/pricing-overrides/chain9.json");
+        let err = parse_pricing_overrides(raw.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("8-hop budget") && err.contains("deepseek-chat"),
+            "the rejection names the alias and the budget: {err}"
+        );
+    }
+
+    #[test]
+    fn alias_cycles_are_rejected_not_silently_fallback() {
+        let raw = br#"{"aliases": {"a": "b", "b": "a"}}"#;
+        let err = parse_pricing_overrides(raw).unwrap_err();
+        assert!(
+            err.contains("8-hop budget"),
+            "a cycle never resolves: {err}"
+        );
+    }
+
+    // --- rm-613: catalog identity covers flex slots and providers -------
+
+    #[test]
+    fn catalog_identity_covers_flex_and_providers() {
+        fn catalog_with(input_flex: Option<f64>, provider: &str) -> PricingCatalog {
+            PricingCatalog {
+                entries: BTreeMap::from([(
+                    "m".to_string(),
+                    Price {
+                        input: 1.0,
+                        output: 2.0,
+                        input_flex,
+                        ..Price::default()
+                    },
+                )]),
+                aliases: BTreeMap::new(),
+                source: "test".to_string(),
+                providers: BTreeMap::from([("m".to_string(), provider.to_string())]),
+                reference_date: None,
+            }
+        }
+        let base = catalog_identity_of(&catalog_with(None, "openai"));
+        let gained_flex = catalog_identity_of(&catalog_with(Some(0.5), "openai"));
+        let other_flex = catalog_identity_of(&catalog_with(Some(0.6), "openai"));
+        let provider_flip = catalog_identity_of(&catalog_with(None, "azure"));
+        assert_ne!(
+            base, gained_flex,
+            "gaining a flex slot must reprice the cache"
+        );
+        assert_ne!(
+            gained_flex, other_flex,
+            "a flex value change must reprice the cache"
+        );
+        assert_ne!(
+            base, provider_flip,
+            "a rate-identical provider flip changes attribution and must change the digest (rm-613)"
         );
     }
 }

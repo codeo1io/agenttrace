@@ -2557,9 +2557,18 @@ struct CodexUsageRecord {
     usage: BTreeMap<String, i64>,
     timestamp: String,
     model: String,
+    /// Service tier in force when the record was collected (rm-610),
+    /// stamped from the walk's current turn_context so paired
+    /// compaction events price at the tier they ran on.
+    service_tier: Option<String>,
 }
 
-fn collect_codex_usage_record(record: &Value, into: &mut Vec<CodexUsageRecord>, timestamp: &str) {
+fn collect_codex_usage_record(
+    record: &Value,
+    into: &mut Vec<CodexUsageRecord>,
+    timestamp: &str,
+    service_tier: Option<&str>,
+) {
     // Mirrors the token_count snapshot gate: records without meaningful
     // usage are not buffered.
     let counts = token_usage_map(record.get("usage"));
@@ -2571,12 +2580,18 @@ fn collect_codex_usage_record(record: &Value, into: &mut Vec<CodexUsageRecord>, 
         usage: counts,
         timestamp: timestamp.to_string(),
         model: string(record.get("model")).unwrap_or("unknown").to_string(),
+        service_tier: service_tier.map(str::to_string),
     });
 }
 
 fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, usize>)> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
+    // rm-610: the service tier codex journals disclose per turn in
+    // `payload.thread_settings.service_tier` (e.g. "flex"). Carried
+    // additively onto events; turns and families without the key are
+    // priced at standard rates exactly as before.
+    let mut service_tier: Option<String> = None;
     let mut saw_codex = false;
     let mut prev_token_total: Option<BTreeMap<String, i64>> = None;
     // rm-047: the head-probe fast path used to discard lines invisibly;
@@ -2639,13 +2654,30 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             "turn_context" => {
                 saw_codex = true;
                 if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
+                    let mut context_changed = false;
                     if let Some(next_model) = string(payload.get("model")).filter(|m| !m.is_empty())
                     {
                         model = next_model.to_string();
+                        context_changed = true;
+                    }
+                    // rm-610: the tier arrives at payload depth 2 in
+                    // the thread settings object (codeburn #1616/#1642
+                    // field shape), beside the model.
+                    if let Some(next_tier) = payload
+                        .get("thread_settings")
+                        .and_then(|settings| settings.get("service_tier"))
+                        .and_then(Value::as_str)
+                        .filter(|tier| !tier.is_empty())
+                    {
+                        service_tier = Some(next_tier.to_string());
+                        context_changed = true;
+                    }
+                    if context_changed {
                         events.push(Event {
                             role: "meta".to_string(),
                             timestamp: ts,
                             model_used: model.clone(),
+                            service_tier: service_tier.clone(),
                             source_tool: "codex_cli".to_string(),
                             ..Event::default()
                         });
@@ -2667,6 +2699,7 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                             timestamp: ts,
                             usage,
                             model_used: model.clone(),
+                            service_tier: service_tier.clone(),
                             source_tool: "codex_cli".to_string(),
                             ..Event::default()
                         });
@@ -2867,7 +2900,12 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                         }
                     }
                     if let Some(record) = payload.get("latest_token_usage_record") {
-                        collect_codex_usage_record(record, &mut usage_records, &ts);
+                        collect_codex_usage_record(
+                            record,
+                            &mut usage_records,
+                            &ts,
+                            service_tier.as_deref(),
+                        );
                     }
                 }
             }
@@ -2876,7 +2914,12 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 // carry theirs here; normal turns' usage already lives in the
                 // cumulative token_count snapshots.
                 if let Some(record) = obj.get("payload") {
-                    collect_codex_usage_record(record, &mut usage_records, &ts);
+                    collect_codex_usage_record(
+                        record,
+                        &mut usage_records,
+                        &ts,
+                        service_tier.as_deref(),
+                    );
                 }
             }
             "world_state" => {
@@ -2961,6 +3004,7 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             role: "meta".to_string(),
             timestamp: record.timestamp.clone(),
             model_used: record.model.clone(),
+            service_tier: record.service_tier.clone(),
             source_tool: "codex_cli".to_string(),
             usage,
             ..Event::default()
@@ -6665,5 +6709,58 @@ mod tests {
                 .get("codex_compaction_usage_record"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn codex_service_tier_is_extracted_and_threaded_to_events() {
+        // rm-610: codex journals disclose the turn's billing tier in
+        // turn_context.thread_settings.service_tier (codeburn #1642
+        // reads the same field). The extraction is additive: tier-less
+        // journals keep byte-identical events, and the tier rides both
+        // the turn_context disclosure and every usage event so the
+        // pricing seam can bill the tier the turn actually ran on.
+        let lines = [
+            serde_json::json!({"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.6"}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:00:05Z","type":"turn_context","payload":{"model":"gpt-5.6","cwd":"/tmp/x","thread_settings":{"service_tier":"flex"}}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50}}}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:01:00Z","type":"token_usage_record","payload":{"response_id":"resp_t","usage":{"input_tokens":200,"output_tokens":20}}}),
+        ];
+        let raw = lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_codex_rollout_jsonl(&raw).expect("codex rollout parses");
+        let (events, _skips) = session;
+        let tiered: Vec<(String, Option<String>)> = events
+            .iter()
+            .map(|event| (event.role.clone(), event.service_tier.clone()))
+            .collect();
+        assert!(
+            tiered
+                .iter()
+                .any(|(role, tier)| role == "meta" && tier.as_deref() == Some("flex")),
+            "turn_context disclosure carries the tier: {tiered:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.service_tier.as_deref() == Some("flex")),
+            "usage events carry the tier"
+        );
+        // Additive-only: a journal with no thread_settings parses with
+        // every service_tier None — the legacy shape is unchanged.
+        let plain = [
+            serde_json::json!({"timestamp":"2026-10-01T09:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.6"}}),
+            serde_json::json!({"timestamp":"2026-10-01T09:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50}}}}),
+        ];
+        let raw = plain
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_codex_rollout_jsonl(&raw).expect("tier-less codex rollout parses");
+        let (events, _skips) = session;
+        assert!(events.iter().all(|event| event.service_tier.is_none()));
     }
 }

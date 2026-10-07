@@ -259,7 +259,9 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
         .tokens_input
         .saturating_sub(metrics.tokens_cache_r)
         .max(0);
-    let price = pricing::lookup_price(&metrics.model_used);
+    // rm-610: the unpriced-input cost must bill the tier the session
+    // ran on (a flex session's wasted input costs the flex input rate).
+    let price = pricing::lookup_price_tiered(&metrics.model_used, metrics.service_tier.as_deref());
     let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
     let (rating, suggestion) = if hit_rate >= 80.0 {
         (
