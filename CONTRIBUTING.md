@@ -21,7 +21,7 @@ Run the relevant checks before opening a PR:
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test
 cargo build --release -p agenttrace
 ruby -c homebrew/Formula/agenttrace.rb

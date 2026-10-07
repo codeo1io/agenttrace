@@ -669,12 +669,37 @@ fn pricing_override_models() -> &'static BTreeSet<String> {
 /// redirected or hostile endpoint can stream into memory.
 const PRICING_DOWNLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Ureq-side transport limit for the pricing download. In ureq 3 the
+/// convenience readers (read_to_string/read_to_vec/read_json) cap
+/// bodies at 10 MiB by default — under the LiteLLM table the fork
+/// already ships snapshots of. The streaming reader used here is
+/// unlimited by default; this explicit limit sits ABOVE
+/// PRICING_DOWNLOAD_MAX_BYTES (64 MiB, the upstream #318 precedent)
+/// so a future refactor onto a convenience reader cannot re-trap the
+/// download below the fork's own cap — `read_body_capped` stays the
+/// binding constraint either way.
+const PRICING_TRANSPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+// Compile-time ordering pin: the transport limit must sit above the
+// fork's own cap or the ureq-side limit becomes the binding one (the
+// exact trap the rm-044 migration guards against).
+const _: () = assert!(PRICING_TRANSPORT_MAX_BYTES >= PRICING_DOWNLOAD_MAX_BYTES);
+
 fn download_pricing(timeout: Duration) -> anyhow::Result<(String, ConvertedCatalog)> {
     let response = ureq::get(PRICING_URL)
-        .timeout(timeout)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
         .call()
         .map_err(|err| anyhow!("download failed: {err}"))?;
-    let raw_bytes = read_body_capped(response.into_reader(), PRICING_DOWNLOAD_MAX_BYTES)?;
+    let raw_bytes = read_body_capped(
+        response
+            .into_body()
+            .into_with_config()
+            .limit(PRICING_TRANSPORT_MAX_BYTES)
+            .reader(),
+        PRICING_DOWNLOAD_MAX_BYTES,
+    )?;
     let raw = String::from_utf8(raw_bytes).context("pricing catalog is not valid UTF-8")?;
     let converted = convert_litellm(raw.as_bytes());
     if converted.entries.is_empty() {

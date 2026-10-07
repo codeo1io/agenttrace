@@ -204,6 +204,24 @@ fn otel_export_shape_and_genai_attributes() {
         assert!(span["parentSpanId"].is_null());
         assert_eq!(span["kind"], 1, "INTERNAL");
     }
+    // rm-651: trace ids mirror the span-id validity rule — the all-zero
+    // traceId is the other id a conforming OTLP receiver rejects (again
+    // dropping the ENTIRE export request). Pin non-zero and
+    // unique-per-session across the whole export.
+    let mut trace_ids = std::collections::BTreeSet::new();
+    for span in [claude_span, codex_span, workbuddy_span] {
+        let trace = span["traceId"].as_str().unwrap();
+        assert_ne!(
+            trace, "00000000000000000000000000000000",
+            "all-zero traceId is spec-invalid"
+        );
+        assert!(
+            trace.bytes().any(|b| b != b'0'),
+            "traceId must carry at least one non-zero byte"
+        );
+        trace_ids.insert(trace.to_string());
+    }
+    assert_eq!(trace_ids.len(), 3, "trace ids unique per session");
     // Span ids hash the session identity + ordinal: distinct across
     // sessions (incl. the FIRST span of the export — the old ordinal-0
     // bug) and stable across renders.

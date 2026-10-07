@@ -66,7 +66,6 @@ fn stderr(output: &Output) -> String {
 }
 
 struct Fixture {
-    #[allow(dead_code)]
     root: PathBuf,
     src: PathBuf,
     bare: PathBuf,
@@ -365,4 +364,34 @@ fn fetch_flag_without_the_upstream_command_is_rejected() {
         "expected stray-flag hint, got {:?}",
         stderr(&output)
     );
+}
+
+#[test]
+fn upstream_report_honors_dash_o() {
+    // rm-652: `-o FILE` writes the drift report to FILE like every
+    // other report arm. Red-first pin: before the fix the file never
+    // existed — `agenttrace -o FILE upstream` exited 0 with the report
+    // on stdout and nothing at the -o path.
+    let fixture = Fixture::new("dasho");
+    fixture.fork_commit("fork.txt", "fork: local work");
+    fixture.upstream_commit("up1.txt", "upstream: first");
+    fixture.fetch();
+
+    let out = fixture.root.join("report.md");
+    let output = run_cli(&fixture.fork, &["-o", out.to_str().unwrap(), "upstream"]);
+    assert!(
+        output.status.success(),
+        "upstream -o failed: {}",
+        stderr(&output)
+    );
+    let file = std::fs::read_to_string(&out).expect("-o file is written");
+    let text = stdout(&output);
+    assert!(
+        text.contains("  ahead:            1 commit(s)"),
+        "drift renders on stdout: {text}"
+    );
+    // The file twin is byte-identical to the stdout copy — same report,
+    // same trailing newline, no reformatting for the file lane.
+    assert_eq!(file, text, "file twin matches stdout byte-for-byte");
+    let _ = std::fs::remove_dir_all(&fixture.root);
 }

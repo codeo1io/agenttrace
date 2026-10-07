@@ -225,14 +225,29 @@ fn session_bounds(session: &Session) -> (u64, u64) {
     (start, end.max(start))
 }
 
+/// Render a hash-derived OTel id: the seed zero-padded to 16 hex
+/// digits, repeated `repeat` times (span ids once; trace ids mirror the
+/// seed across both 64-bit halves of the 128-bit width). The all-zero
+/// id is the only invalid value in the OTel id format — a conforming
+/// OTLP receiver rejects it and drops the ENTIRE export request — so a
+/// zero seed folds deterministically to the smallest non-zero id
+/// instead of rendering zeros.
+fn non_zero_hex_id(seed: u64, repeat: usize) -> String {
+    format!("{:016x}", if seed == 0 { 1 } else { seed }).repeat(repeat)
+}
+
 /// Deterministic 32-hex-char trace id derived from the session identity.
+/// rm-651: the id gets the same all-zero guard span ids have had since
+/// rm-599 — the seed mirrors itself across both halves, and a zero seed
+/// now folds instead of rendering the spec-invalid all-zero traceId.
+/// Non-zero seeds render byte-identically to the previous format (no
+/// wire-format change for existing exports).
 fn trace_id_for(session: &Session) -> String {
     let mut hasher = DefaultHasher::new();
     "agenttrace-trace".hash(&mut hasher);
     session.path.hash(&mut hasher);
     session.name.hash(&mut hasher);
-    let h = hasher.finish();
-    format!("{h:016x}{h:016x}")
+    non_zero_hex_id(hasher.finish(), 2)
 }
 
 /// Deterministic 16-hex-char span id derived from the session identity
@@ -250,13 +265,7 @@ fn span_id_for(session: &Session, ordinal: u64) -> String {
     session.name.hash(&mut hasher);
     ordinal.hash(&mut hasher);
     let seed = hasher.finish();
-    if seed == 0 {
-        // The all-zero id is the only invalid value; fold
-        // deterministically to stay spec-valid.
-        "0000000000000001".to_string()
-    } else {
-        format!("{seed:016x}")
-    }
+    non_zero_hex_id(seed, 1)
 }
 
 fn session_span(session: &Session, ordinal: u64) -> Span {
@@ -379,6 +388,35 @@ pub fn gen_ai_system_for_path(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_folds_never_render_the_all_zero_form() {
+        // rm-651: trace ids get the same zero-fold span ids have had
+        // since rm-599 — a zero hash seed must not produce the all-zero
+        // id an OTLP receiver rejects (dropping the whole export).
+        assert_eq!(non_zero_hex_id(0, 1), "0000000000000001");
+        // The fold mirrors the 16-hex-digit half exactly like a real
+        // seed does — both halves identical.
+        assert_eq!(non_zero_hex_id(0, 2), "00000000000000010000000000000001");
+        // Non-zero seeds render verbatim: the trace id stays the
+        // doubled half it has always been (no wire-format change).
+        let seed = 0xdead_beef_cafe_f00d_u64;
+        assert_eq!(non_zero_hex_id(seed, 2), format!("{seed:016x}{seed:016x}"));
+        assert_eq!(non_zero_hex_id(seed, 1), format!("{seed:016x}"));
+        // Adversarial seeds: every width renders 16 hex digits per
+        // repeat, hex-only, with at least one non-zero byte.
+        for seed in [0u64, 1, 42, u64::MAX - 1, u64::MAX] {
+            for repeat in [1usize, 2] {
+                let id = non_zero_hex_id(seed, repeat);
+                assert_eq!(id.len(), 16 * repeat);
+                assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+                assert!(
+                    id.bytes().any(|b| b != b'0'),
+                    "all-zero id leaks through for seed {seed}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn semconv_snapshot_date_is_pinned() {

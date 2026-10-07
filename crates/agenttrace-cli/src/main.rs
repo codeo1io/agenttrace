@@ -217,6 +217,12 @@ fn run() -> anyhow::Result<()> {
     // offline unless --fetch explicitly opts into the network.
     if args.path.as_deref() == Some("upstream") {
         let report = upstream::status_report(&args.format, args.fetch)?;
+        // rm-652: honor -o like every other report arm — the drift report
+        // previously streamed to stdout only, silently ignoring the
+        // flag. write_output is a no-op without -o, so default stdout
+        // behavior is unchanged; the report already ends with a newline,
+        // so the file twin is byte-identical to stdout.
+        write_output(&args.output, &report)?;
         write_stdout(&report)?;
         return Ok(());
     }
