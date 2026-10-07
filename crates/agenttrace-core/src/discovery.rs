@@ -40,6 +40,11 @@ pub struct LoadReport {
     /// databases, dropped session rows) so the CLI can disclose
     /// partial data instead of rendering it as the whole corpus.
     pub sqlite: crate::sqlite_sessions::SqliteIngestReport,
+    /// rm-548: opencode fork copies excluded from aggregation (storage
+    /// session docs with `parentID` set plus opencode db rows with
+    /// `parent_id`). Counted here so the journal disclosure channel can
+    /// report the exclusion instead of dropping sessions silently.
+    pub opencode_fork_excluded: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,7 +292,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
     let mut sessions = Vec::new();
-    let files = find_session_files_cached(dir, cache, true);
+    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -366,11 +371,15 @@ pub fn load_sessions_with_progress_from_cache_mode(
         let _ = save_session_cache(cache);
     }
     let mut sqlite_ingest = crate::sqlite_sessions::SqliteIngestReport::default();
+    // rm-548: the JSON storage lane's fork exclusions (counted during
+    // file discovery) seed the total; the sqlite lane adds its own.
+    let mut opencode_fork_excluded = json_fork_excluded;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
         sessions.extend(sqlite_sessions);
         sqlite_ingest = ingest;
+        opencode_fork_excluded += sqlite_ingest.fork_excluded;
     }
     if options.preserve_history {
         let _ = preserve_derived_history(&sessions);
@@ -411,6 +420,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         discovered,
         cache_hits,
         sqlite: sqlite_ingest,
+        opencode_fork_excluded,
     }
 }
 
@@ -455,12 +465,15 @@ pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, usize) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return vec![dir.to_path_buf()];
+            return (vec![dir.to_path_buf()], 0);
         }
-        return collect_session_files_cached(dir, cache);
+        // rm-548: an explicitly requested directory keeps every file —
+        // a forked copy loaded by explicit path still renders (the
+        // exclusion is an aggregation rule, not a parse block).
+        return (collect_session_files_cached(dir, cache), 0);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -483,7 +496,85 @@ pub(crate) fn find_session_files_cached(
             }
         }
     }
-    sort_paths_by_cache(all, cache)
+    // rm-548: opencode fork copies (session info docs whose `parentID`
+    // is set) re-emit their parent's history, so aggregating them
+    // double-counts usage. Drop them before enumeration and return the
+    // count so the disclosure channel reports it — never silently.
+    // Independent-review fix: the per-file probe is memoized on the
+    // cached dir listing (fingerprint-keyed, see
+    // `opencode_session_fork_parent_cached`) so warm runs stop
+    // re-reading every storage session info doc on discovery.
+    let mut opencode_fork_excluded = 0usize;
+    all.retain(|path| {
+        if opencode_session_fork_parent_cached(path, cache).is_some() {
+            opencode_fork_excluded += 1;
+            false
+        } else {
+            true
+        }
+    });
+    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+}
+
+/// rm-548: an opencode storage session doc (`.../storage/session/info/
+/// <sid>.json`) whose `parentID` field is a non-empty string marks the
+/// session as a fork of that parent (opencode Session.Info schema,
+/// `session.parent_id` / `session_parent_idx` in the sqlite schema;
+/// pinned in docs/guides/opencode-fork-marker.md). Replaying a fork
+/// re-emits the parent's history — ccusage hit the same class as
+/// #1782 — so aggregation must not count both.
+pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
+    let mut components = path.components().rev();
+    let file_is_json = components
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .is_some_and(|name| name.ends_with(".json"));
+    let path_is_session_info = ["info", "session", "storage"].iter().all(|segment| {
+        components
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .is_some_and(|actual| actual == *segment)
+    });
+    if !file_is_json || !path_is_session_info {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("parentID")?
+        .as_str()
+        .filter(|parent| !parent.is_empty())
+        .map(str::to_string)
+}
+
+/// rm-548 (independent-review fix): [`opencode_session_fork_parent`]
+/// behind the session-cache memo. Only opencode-shaped session info
+/// paths are memoized (everything else goes straight to the probe —
+/// no journal growth for non-opencode corpora); a memo is served only
+/// when the file's fingerprint still matches the probe-time one, so a
+/// rewritten doc — one that gained a `parentID`, i.e. the exact state
+/// change rm-548 exists to disclose — always re-probes.
+pub(crate) fn opencode_session_fork_parent_cached(
+    path: &Path,
+    cache: &mut SessionCache,
+) -> Option<String> {
+    let is_info_doc = path
+        .components()
+        .rev()
+        .skip(1)
+        .take(3)
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        == ["info", "session", "storage"];
+    if !is_info_doc {
+        return opencode_session_fork_parent(path);
+    }
+    if let Some(memo) = crate::session_cache::cached_fork_parent(path, cache) {
+        return memo;
+    }
+    let probed = opencode_session_fork_parent(path);
+    crate::session_cache::store_fork_parent_probe(path, probed.clone(), cache);
+    probed
 }
 
 fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {

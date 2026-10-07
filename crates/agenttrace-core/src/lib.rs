@@ -81,9 +81,9 @@ pub use sqlite_sessions::{
 };
 pub use statusline::{
     load_statusline_insights, render_budget_view, render_statusline_report, run_statusline_host,
-    sanitize_line_segment, statusline_budget_series, statusline_capture_path, statusline_insights,
-    statusline_journal_stats, CapturedStatusline, StatuslineBudgetSeries, StatuslineInsights,
-    StatuslineJournalStats, StatuslineRateLimitState,
+    sanitize_line_segment, sanitize_output_document, statusline_budget_series,
+    statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
+    StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
 };
 pub use subagents::attribute_subagents;
 pub use waste::{

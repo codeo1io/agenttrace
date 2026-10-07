@@ -321,7 +321,7 @@ fn run() -> anyhow::Result<()> {
     // rm-573: --statusline-report also wins over the upstream keyword lane.
     if args.path.as_deref() == Some("upstream") && !args.statusline_report {
         let report = upstream::status_report(&args.format, args.fetch)?;
-        write_stdout(&report)?;
+        write_stdout(&dispatch_sanitize(&args.format, report))?;
         return Ok(());
     }
     // `agenttrace mcp` is the local MCP server host command (rm-455):
@@ -427,6 +427,7 @@ fn run() -> anyhow::Result<()> {
         } else {
             render_test_match()
         };
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -445,11 +446,16 @@ fn run() -> anyhow::Result<()> {
                 config::disclosure_text(&resolved),
                 render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?
             );
+            // rm-625: the text doctor lane renders transcript-derived
+            // samples, so it rides the same dispatch choke point as
+            // the fallthrough lane below.
+            let out = dispatch_sanitize(&args.format, out);
             write_output(&args.output, &out)?;
             write_stdout(&out)?;
             return Ok(());
         }
         let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -463,6 +469,7 @@ fn run() -> anyhow::Result<()> {
         } else {
             render_model_pricing_list()
         };
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -470,6 +477,7 @@ fn run() -> anyhow::Result<()> {
 
     if args.statusline_report {
         let out = agenttrace_core::render_statusline_report(&args.format, resolved.weekly_budget)?;
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -479,6 +487,10 @@ fn run() -> anyhow::Result<()> {
         // rm-385: the weekly window-burn view — journal-based, no
         // session discovery, mirroring --statusline-report.
         let out = agenttrace_core::render_budget_view(&args.format, resolved.weekly_budget)?;
+        // rm-625: the budget lane renders journal-derived prose (model
+        // names from statusline captures), so it rides the same
+        // dispatch choke point as --statusline-report.
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
         return Ok(());
@@ -548,6 +560,7 @@ fn run() -> anyhow::Result<()> {
         };
         let value = attach_audit_coverage(value, sessions.len(), total_sessions, excluded_reason);
         let out = render_governance_report(&value, &args.format)?;
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         // rm-346 arm-a: the --fail-* gate flags are parsed on every report
@@ -608,6 +621,7 @@ fn run() -> anyhow::Result<()> {
             ));
             out
         };
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         // rm-486: the compare branch's own comment (above) claims the same
@@ -633,6 +647,7 @@ fn run() -> anyhow::Result<()> {
             "json" => waste_report_json(&compute_waste_report(session)),
             _ => render_waste_report_with_language(session, language),
         };
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         // rm-486 premise rider: rm-544 made `-f json` a versioned machine
@@ -660,6 +675,7 @@ fn run() -> anyhow::Result<()> {
             "json" => report_json_with_language(session, language),
             _ => report_text_with_language(session, language),
         };
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         return Ok(());
@@ -674,6 +690,7 @@ fn run() -> anyhow::Result<()> {
     if args.sessions || args.diagnostics || args.inspect.is_some() {
         if args.sessions {
             let out = render_session_list(&sessions, &args.format, args.limit);
+            let out = dispatch_sanitize(&args.format, out);
             write_output(&args.output, &(out.clone() + "\n"))?;
             write_stdout(&out)?;
             return Ok(());
@@ -693,6 +710,7 @@ fn run() -> anyhow::Result<()> {
             sessions.first().expect("sessions checked non-empty")
         };
         let out = render_diagnostics(session, &sessions, &args.format, language)?;
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         return Ok(());
@@ -705,6 +723,7 @@ fn run() -> anyhow::Result<()> {
         } else {
             report_search_text(&results, query)
         };
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         return Ok(());
@@ -722,6 +741,7 @@ fn run() -> anyhow::Result<()> {
                 report.discovered,
                 report.skipped,
                 report.cache_hits,
+                report.opencode_fork_excluded,
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
@@ -789,6 +809,7 @@ fn run() -> anyhow::Result<()> {
             out = compared;
             baseline_breaches = Some(breaches);
         }
+        let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
         let failures = evaluate_overview_gate(
@@ -922,6 +943,25 @@ fn write_stdout(value: &str) -> anyhow::Result<()> {
     match io::stdout().write_all(out.as_bytes()) {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result.map_err(Into::into),
+    }
+}
+
+/// rm-625: the output-dispatch choke point. Every report emission for
+/// non-JSON formats passes through here at the stdout / `-o` boundary —
+/// one place where raw control bytes from transcript-derived names
+/// (session names, model ids, tool names, message text) die, regardless
+/// of which renderer produced the document. JSON is excluded by
+/// design: serde escaping already encodes control bytes losslessly
+/// (data integrity over terminal trust), and re-processing a serialized
+/// document could corrupt payloads. Renderer-internal escapes (HTML
+/// entities, the rm-540 CSV cell sanitizer) stay as defense-in-depth:
+/// `sanitize_output_document` is idempotent, so composed output is
+/// stable.
+fn dispatch_sanitize(format: &str, out: String) -> String {
+    if format == "json" {
+        out
+    } else {
+        agenttrace_core::sanitize_output_document(&out)
     }
 }
 

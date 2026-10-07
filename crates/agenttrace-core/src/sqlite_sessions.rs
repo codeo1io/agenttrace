@@ -71,6 +71,12 @@ pub struct SqliteIngestReport {
     /// to decode (NULL ids, wrong-typed columns outside the lenient
     /// readers). A dropped row is a lost session, not an empty corpus.
     pub dropped_rows: Vec<SqliteDroppedRows>,
+    /// rm-548: opencode fork copies (`session.parent_id`, pinned in
+    /// docs/guides/opencode-fork-marker.md) excluded from aggregation —
+    /// a fork re-emits its parent's history, so counting both
+    /// double-counts usage. The count is carried here so the cached
+    /// and fresh paths disclose identically.
+    pub fork_excluded: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +171,11 @@ pub fn load_sqlite_backed_sessions_reported(
     for path in hermes_state_db_paths(&home) {
         sessions.extend(load_hermes_sqlite_sessions(&path, since, &mut report));
     }
+    // rm-548: opencode fork copies (`session.parent_id`, pinned in
+    // docs/guides/opencode-fork-marker.md) re-emit their parent's
+    // history, so counting them would double-count usage. They are
+    // excluded inside the loader and counted into the report for
+    // disclosure.
     for path in opencode_db_paths(&home) {
         sessions.extend(load_opencode_sqlite_sessions(&path, since, &mut report));
     }
@@ -398,19 +409,33 @@ fn load_opencode_sqlite_sessions(
     if !sqlite_file_exists(path) {
         return Vec::new();
     }
-    if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
+    if let Some((sessions, fork_excluded)) =
+        crate::session_cache::load_sqlite_snapshot_with_meta(path, "opencode")
+    {
+        // rm-548: the warm snapshot (schema 8) carries the stored
+        // exclusion count, so the disclosure cannot go silent on the
+        // cached path.
+        report.fork_excluded += fork_excluded;
         // rm-753: see load_hermes_sqlite_sessions — an empty snapshot
         // is re-verified, not trusted (pre-fix corrupt databases cached
-        // one; the P14 probe left exactly such a file behind).
+        // one; the P14 probe left exactly such a file behind); the
+        // fresh query recounts the exclusions, so the stored count is
+        // only folded in on the warm-return path.
         if !sessions.is_empty() {
             return filter_since(sessions, since);
         }
     }
-    let (sessions, failures) = query_opencode_sqlite_sessions(path, None);
+    let (sessions, failures, fork_excluded) = query_opencode_sqlite_sessions(path, None);
     let clean = failures.is_clean();
     report.absorb(path, "opencode", failures);
+    report.fork_excluded += fork_excluded;
     if clean {
-        let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
+        let _ = crate::session_cache::store_sqlite_snapshot_with_meta(
+            path,
+            "opencode",
+            &sessions,
+            fork_excluded,
+        );
     }
     filter_since(sessions, since)
 }
@@ -418,19 +443,19 @@ fn load_opencode_sqlite_sessions(
 fn query_opencode_sqlite_sessions(
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> (Vec<Session>, SqliteFileFailures) {
+) -> (Vec<Session>, SqliteFileFailures, usize) {
     let mut failures = SqliteFileFailures::default();
     let db = match open_sqlite_read_only(path) {
         Ok(db) => db,
         Err(error) => {
             failures.unreadable = Some(error.to_string());
-            return (Vec::new(), failures);
+            return (Vec::new(), failures, 0);
         }
     };
-    let (mut aggs, row_failures) = opencode_sqlite_session_rows(&db, path, since);
+    let (mut aggs, row_failures, fork_excluded) = opencode_sqlite_session_rows(&db, path, since);
     failures.merge(row_failures);
     if aggs.is_empty() {
-        return (Vec::new(), failures);
+        return (Vec::new(), failures, fork_excluded);
     }
     add_opencode_sqlite_messages(&db, &mut aggs);
     add_opencode_sqlite_parts(&db, &mut aggs);
@@ -449,7 +474,7 @@ fn query_opencode_sqlite_sessions(
             session_from_sqlite_agg(agg)
         })
         .collect();
-    (sessions, failures)
+    (sessions, failures, fork_excluded)
 }
 
 /// Prefer the authoritative totals recorded on the session row over
@@ -530,12 +555,21 @@ fn opencode_sqlite_session_rows(
     db: &Connection,
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> (HashMap<String, SqliteSessionAgg>, SqliteFileFailures) {
+) -> (HashMap<String, SqliteSessionAgg>, SqliteFileFailures, usize) {
     let mut failures = SqliteFileFailures::default();
     let directory = if sqlite_has_column(db, "session", "directory") {
         "directory"
     } else {
         "''"
+    };
+    // rm-548: `parent_id` (opencode fork marker, session_parent_idx;
+    // docs/guides/opencode-fork-marker.md) is feature-detected like the
+    // stored-total columns so older databases keep working — missing
+    // column reads as null, which is "not a fork".
+    let parent_column = if sqlite_has_column(db, "session", "parent_id") {
+        "parent_id"
+    } else {
+        "null"
     };
     // Authoritative per-session totals (upstream schema): present columns
     // are selected directly, missing ones become null so the row indices
@@ -575,7 +609,8 @@ fn opencode_sqlite_session_rows(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "select id, title, time_created, time_updated, {directory}, {stored_select} from session \
+        "select id, title, time_created, time_updated, {directory}, {stored_select}, \
+         {parent_column} from session \
          where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
     let mut stmt = match db.prepare(&sql) {
@@ -588,14 +623,33 @@ fn opencode_sqlite_session_rows(
             if !error.to_string().contains("no such table") {
                 failures.unreadable = Some(error.to_string());
             }
-            return (HashMap::new(), failures);
+            return (HashMap::new(), failures, 0);
         }
     };
     let since_millis = since.map(|value| value.timestamp_millis());
+    // rm-548: fork copies are dropped at the row boundary — a forked
+    // session's messages are a replay of the parent's history, so
+    // aggregating both double-counts usage. Excluded rows are counted
+    // for the disclosure channel instead of dying silently.
+    let mut fork_excluded = 0usize;
     let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
+        // Lenient read, same rule as every other dynamically-typed
+        // column below: a non-TEXT value in the fork column degrades
+        // to "not a fork" instead of failing the row and silently
+        // dropping the whole session from the aggregate.
+        let fork_parent = row
+            .get::<_, Option<rusqlite::types::Value>>(11)
+            .ok()
+            .flatten()
+            .and_then(|value| match value {
+                rusqlite::types::Value::Text(text) => Some(text),
+                _ => None,
+            })
+            .filter(|parent| !parent.is_empty());
         Ok((
             id.clone(),
+            fork_parent,
             SqliteSessionAgg {
                 id,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -621,22 +675,29 @@ fn opencode_sqlite_session_rows(
         Ok(rows) => rows,
         Err(error) => {
             failures.unreadable = Some(error.to_string());
-            return (HashMap::new(), failures);
+            return (HashMap::new(), failures, 0);
         }
     };
     // rm-753: decode failures are counted and sampled, not
     // filter_map-dropped — the NULL-id ghost row erased a whole
-    // session silently (P11: 4 of 5 sessions "reported").
+    // session silently (P11: 4 of 5 sessions "reported"). rm-548: a
+    // row whose fork marker (`parent_id`) names a parent session is a
+    // fork copy replaying that parent's history — it is excluded from
+    // aggregation and counted for disclosure instead.
     let mut aggs = HashMap::new();
     for row in rows {
         match row {
-            Ok((id, agg)) => {
+            Ok((id, fork_parent, agg)) => {
+                if fork_parent.is_some() {
+                    fork_excluded += 1;
+                    continue;
+                }
                 aggs.insert(id, agg);
             }
             Err(error) => failures.record_dropped(&error),
         }
     }
-    (aggs, failures)
+    (aggs, failures, fork_excluded)
 }
 
 fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
@@ -1362,7 +1423,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_user_text_fixture(&root, true);
-        let (sessions, failures) = query_opencode_sqlite_sessions(&path, None);
+        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "corpus must load clean: {failures:?}");
         assert_eq!(sessions.len(), 1, "one session in the fixture");
@@ -1379,7 +1440,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_user_text_fixture(&root, false);
-        let (sessions, failures) = query_opencode_sqlite_sessions(&path, None);
+        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "corpus must load clean: {failures:?}");
         // Same minimum time (100000000) on two parts: the lower rowid
@@ -1503,7 +1564,7 @@ mod tests {
             std::env::temp_dir().join(format!("agenttrace-rm753-golden-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = opencode_hostile_fixture(&root);
-        let (sessions, failures) = query_opencode_sqlite_sessions(&path, None);
+        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 4, "the four decodable rows load");
         assert_eq!(failures.dropped, 1, "the NULL-id ghost is counted");

@@ -486,10 +486,25 @@ fn relocated_usage_keys_disclose_instead_of_silent_zero() {
         "assistant top-level AND message.usage must each disclose: {:?}",
         session.metrics.line_skips
     );
+    // rm-616 composition (reconciled at integration 2026-10-08, conflict
+    // case 15bdfe5f): the landed rm-616 review fix F3 also fires
+    // `usage_present_not_counted` beside meta usage for conversation
+    // lines whose family's counted lane is the meta arm — this journal's
+    // assistant line is exactly that shape, so its usage discloses on
+    // its own aggregate channel in addition to the two relocated-key
+    // counters. That supersedes this test's older len()==2 pin (the
+    // disclose-not-silently-zero intent only widened); the meta line's
+    // canonical usage still discloses nothing on its own behalf.
+    assert_eq!(
+        session.metrics.line_skips.get("usage_present_not_counted"),
+        Some(&1),
+        "the assistant line's out-of-lane usage discloses beside meta usage (rm-616 F3): {:?}",
+        session.metrics.line_skips
+    );
     assert_eq!(
         session.metrics.line_skips.len(),
-        2,
-        "the meta line's canonical usage discloses NOTHING: {:?}",
+        3,
+        "exactly the two relocated-key counters plus rm-616's beside-meta disclosure: {:?}",
         session.metrics.line_skips
     );
 }

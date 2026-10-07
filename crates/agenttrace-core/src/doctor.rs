@@ -1,7 +1,6 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions_reported, parse_file, skip_sqlite_backed_file_dir, Session,
-    SqliteIngestReport, VERSION,
+    load_sqlite_backed_sessions_reported, parse_file, Session, SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -115,12 +114,16 @@ pub fn render_doctor_report(
 /// files, the non-file sessions (SQLite-backed, or the bundled demo
 /// corpus under `--demo`), and the rm-753 SQLite ingest report (empty
 /// under `--demo` and on custom directories, where no SQLite lane runs).
+/// rm-548: the JSON storage lane's opencode fork-exclusion count (fork
+/// copies dropped from the auto-discovery inventory) rides here too,
+/// so the doctor discloses the same exclusion the loader does.
 struct DoctorDiscovery {
     cache: SessionCacheReport,
     cache_size_bytes: u64,
     files: Vec<PathBuf>,
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
+    opencode_fork_excluded: usize,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -146,16 +149,17 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             files: Vec::new(),
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
+            opencode_fork_excluded: 0,
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let files = if dir.is_none() {
+    let (files, opencode_fork_excluded) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        find_session_files(dir)
+        (find_session_files(dir), 0)
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -163,7 +167,10 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     // parsed=0 failed=0 over discovered-but-unreadable databases
     // (P12/P14) and dropped session rows surface as failures. The demo
     // arm early-returned above, so this lane only runs on the real
-    // discovery path.
+    // discovery path. rm-548: the ingest report carries the opencode
+    // fork-exclusion count as well (the legacy count-dropping wrapper
+    // was deleted at the campaign's review fix), so the doctor
+    // inventory discloses the exclusion like every other lane.
     let (sessions, sqlite_ingest) = if dir.is_none() {
         load_sqlite_backed_sessions_reported(None)
     } else {
@@ -175,6 +182,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         files,
         sessions,
         sqlite_ingest,
+        opencode_fork_excluded,
     }
 }
 
@@ -185,6 +193,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         files,
         sessions,
         sqlite_ingest,
+        opencode_fork_excluded,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
@@ -210,6 +219,16 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     // rm-512: the walk records per-project tallies; render them into the
     // deduplicated sample lines before the report leaves this function.
     project_decode.finalize_samples();
+    let opencode_fork_excluded_total = opencode_fork_excluded + sqlite_ingest.fork_excluded;
+    if opencode_fork_excluded_total > 0 {
+        // Same disclosure key the loader/overview lanes use, so
+        // `--doctor` and `--overview` agree on the exclusion instead
+        // of the doctor silently under-counting.
+        disclosures.insert(
+            "opencode_fork_excluded_sessions".to_string(),
+            opencode_fork_excluded_total,
+        );
+    }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -526,18 +545,30 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
+fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     if dir.is_some() {
-        return find_session_files(dir);
+        return (find_session_files(dir), 0);
     }
-    let mut out = Vec::new();
-    for candidate in crate::discover_session_dirs() {
-        if skip_sqlite_backed_file_dir(&candidate) {
-            continue;
-        }
-        out.extend(crate::collect_session_files(&candidate));
-    }
-    out
+    // rm-548 (independent-review fix): the doctor's auto-discovery
+    // inventory aggregates through the SAME loader primitive the CLI
+    // uses (`find_session_files_cached`), not a private walk — an
+    // opencode fork copy re-emits its parent's history, so counting
+    // both inflates `sessions`/`session_files`, and a private walk
+    // silently diverges from the loader (different dedup, different
+    // fork filter). Sharing the primitive means the doctor also
+    // rides the session-cache memo (fingerprint-keyed fork-probe
+    // results; a rewritten doc always re-probes) instead of
+    // re-reading every storage session info doc, and the exclusion
+    // rides the disclosure channel instead of dying silently. An
+    // explicit `--dir` keeps every file (the exclusion is
+    // aggregation-only, same rule as the loader).
+    let mut cache = crate::session_cache::load_session_cache();
+    let (files, opencode_fork_excluded) =
+        crate::discovery::find_session_files_cached(None, &mut cache, true);
+    // A cache write failure must never fail the doctor (the cache is
+    // an optimization; the inventory answer is already correct).
+    let _ = crate::session_cache::save_session_cache(&mut cache);
+    (files, opencode_fork_excluded)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite

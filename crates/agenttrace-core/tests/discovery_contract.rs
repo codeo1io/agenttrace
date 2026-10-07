@@ -524,7 +524,11 @@ fn generated_sql_builds_an_aggregate_only_session() {
         .unwrap();
     drop(db);
     with_home(&home, || {
-        let sessions = agenttrace_core::load_sqlite_backed_sessions();
+        // rm-548 (independent-review fix): the count-dropping legacy
+        // wrapper is gone — the reported loader returns the sessions
+        // and the ingest report (failures plus the fork-exclusion
+        // count, disclosed, not dropped); `None` means "all time".
+        let (sessions, _ingest) = agenttrace_core::load_sqlite_backed_sessions_reported(None);
         let aggregate = sessions
             .iter()
             .find(|session| session.name == "aggregate")
@@ -2605,10 +2609,20 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             day.discovered, all.discovered,
             "discovered must be range-independent"
         );
-        let health_all =
-            data_health_scoped(&all.sessions, all.discovered, all.skipped, all.cache_hits);
-        let health_day =
-            data_health_scoped(&day.sessions, day.discovered, day.skipped, day.cache_hits);
+        let health_all = data_health_scoped(
+            &all.sessions,
+            all.discovered,
+            all.skipped,
+            all.cache_hits,
+            all.opencode_fork_excluded,
+        );
+        let health_day = data_health_scoped(
+            &day.sessions,
+            day.discovered,
+            day.skipped,
+            day.cache_hits,
+            day.opencode_fork_excluded,
+        );
         assert_eq!(health_all.parsed, 2);
         assert_eq!(
             health_all.out_of_scope, 0,
@@ -2690,6 +2704,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
+            report.opencode_fork_excluded,
         );
         assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
         assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
@@ -2698,6 +2713,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
+            report.opencode_fork_excluded,
         );
         assert_eq!(clean.non_finite_costs, 0);
     });
@@ -3320,4 +3336,251 @@ fn discovery_skips_non_regular_session_files() {
     let files = find_session_files(Some(&root));
     assert_eq!(files.len(), 1, "expected only the regular file: {files:?}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+// ---------------------------------------------------------------------------
+// rm-548: opencode fork-copied history exclusion
+// (docs/guides/opencode-fork-marker.md — parentID / session.parent_id)
+// ---------------------------------------------------------------------------
+
+fn seed_opencode_storage_forks(home: &std::path::Path) -> std::path::PathBuf {
+    let info = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("storage")
+        .join("session")
+        .join("info");
+    fs::create_dir_all(&info).expect("create opencode storage info dir");
+    fs::write(
+        info.join("ses-parent.json"),
+        r#"{"id":"ses-parent","projectID":"proj-test","title":"parent session","timeCreated":1780000000000}"#,
+    )
+    .expect("write parent doc");
+    fs::write(
+        info.join("ses-fork.json"),
+        r#"{"id":"ses-fork","projectID":"proj-test","title":"fork copy","parentID":"ses-parent","timeCreated":1780000100000}"#,
+    )
+    .expect("write fork doc");
+    fs::write(
+        info.join("ses-other.json"),
+        r#"{"id":"ses-other","projectID":"proj-test","title":"independent session","timeCreated":1780000200000}"#,
+    )
+    .expect("write independent doc");
+    // The parser requires message records per session (storage/message/
+    // <sid>/*.json) plus optional part records; the fork needs none —
+    // it is dropped before parsing.
+    let message = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("storage")
+        .join("message");
+    for (sid, mid) in [
+        ("ses-parent", "m1"),
+        ("ses-other", "m2"),
+        ("ses-fork", "m3"),
+    ] {
+        let dir = message.join(sid);
+        fs::create_dir_all(&dir).expect("create message dir");
+        fs::write(
+            dir.join(format!("{mid}.json")),
+            format!(
+                r#"{{"id":"{mid}","sessionID":"{sid}","role":"user","modelID":"claude-sonnet-4-5","time":{{"created":1780000000000}}}}"#
+            ),
+        )
+        .expect("write message record");
+        // Text content lives in part records keyed by MESSAGE id:
+        // storage/part/<mid>/<pid>.json. Without a text part the
+        // session parses to zero events and is skipped by design.
+        let part_dir = home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("storage")
+            .join("part")
+            .join(mid);
+        fs::create_dir_all(&part_dir).expect("create part dir");
+        fs::write(
+            part_dir.join("p1.json"),
+            r#"{"id":"p1","type":"text","text":"hello from opencode"}"#,
+        )
+        .expect("write part record");
+    }
+    home.join(".local")
+        .join("share")
+        .join("opencode")
+        .join("storage")
+}
+
+#[test]
+fn opencode_json_fork_copies_excluded_from_aggregation_and_disclosed() {
+    let root = temp_root("agenttrace-opencode-fork-json");
+    let home = root.join("home");
+    let _storage = seed_opencode_storage_forks(&home);
+
+    with_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+
+        // Fork copy excluded from aggregation: parent + independent only.
+        let mut stems: Vec<String> = report
+            .sessions
+            .iter()
+            .map(|session| {
+                session
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(".json")
+                    .to_string()
+            })
+            .collect();
+        stems.sort();
+        assert_eq!(
+            stems,
+            vec!["ses-other".to_string(), "ses-parent".to_string()]
+        );
+        // ...and the exclusion is counted for disclosure, never silent.
+        assert_eq!(report.opencode_fork_excluded, 1);
+        let health = data_health_scoped(
+            &report.sessions,
+            report.discovered,
+            report.skipped,
+            report.cache_hits,
+            report.opencode_fork_excluded,
+        );
+        assert_eq!(
+            health.disclosures.get("opencode_fork_excluded_sessions"),
+            Some(&1),
+            "the fork exclusion must ride the disclosures channel"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opencode_explicit_dir_still_renders_forked_copy() {
+    let root = temp_root("agenttrace-opencode-fork-explicit");
+    let home = root.join("home");
+    let storage = seed_opencode_storage_forks(&home);
+
+    with_home(&home, || {
+        // An explicitly requested directory is not filtered: the
+        // exclusion is an aggregation rule, not a parse block.
+        let report = load_sessions_with_progress(Some(&storage), &LoadOptions::default(), |_| {});
+        let count = report.sessions.len();
+        assert_eq!(
+            count, 3,
+            "explicit -d must keep parent + fork + independent"
+        );
+        assert_eq!(report.opencode_fork_excluded, 0);
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn doctor_inventory_applies_the_fork_filter_and_discloses_it() {
+    // rm-625 (independent-review fix): `--doctor` used a separate
+    // unfiltered discovery path, so its auto-discovery inventory
+    // counted opencode fork copies that every aggregation lane
+    // excludes — the two views disagreed and the doctor had no
+    // disclosure. The doctor now applies the same fork filter (auto
+    // discovery only; an explicit --dir keeps every file, same
+    // aggregation-only rule as the loader) and rides the same
+    // `opencode_fork_excluded_sessions` disclosure key.
+    let root = temp_root("agenttrace-doctor-fork-disclosure");
+    let home = root.join("home");
+    let storage = seed_opencode_storage_forks(&home);
+    with_home(&home, || {
+        let report = build_doctor_report(None, false);
+        assert_eq!(
+            report.session_files, 2,
+            "auto-discovery inventory: parent + independent only"
+        );
+        assert_eq!(
+            report.disclosures.get("opencode_fork_excluded_sessions"),
+            Some(&1),
+            "the doctor inventory must disclose the fork exclusion like every other lane"
+        );
+        // The explicit --dir arm keeps every file and discloses nothing.
+        let report = build_doctor_report(Some(&storage), false);
+        assert_eq!(
+            report.session_files, 3,
+            "explicit --dir keeps the fork copy"
+        );
+        assert_eq!(
+            report.disclosures.get("opencode_fork_excluded_sessions"),
+            None,
+            "an explicit --dir is never filtered and never discloses an exclusion"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+fn seed_opencode_fork_db(home: &std::path::Path) {
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        "create table session (
+            id text primary key,
+            title text,
+            time_created integer,
+            time_updated integer,
+            parent_id text
+        );
+        create table message (
+            id text primary key,
+            session_id text,
+            data text
+        );
+        create table part (
+            id text primary key,
+            session_id text,
+            data text
+        );
+        insert into session values
+            ('ses-parent', 'parent', 1780000000000, 1780000005000, null),
+            ('ses-fork',   'fork',   1780000100000, 1780000105000, 'ses-parent');
+        -- The fork re-emits the parent's only message: double-count
+        -- source.
+        insert into message values
+            ('m1', 'ses-parent', '{\"role\":\"user\",\"text\":\"shared history\"}'),
+            ('m2', 'ses-fork',   '{\"role\":\"user\",\"text\":\"shared history\"}');",
+    )
+    .expect("seed opencode fork db");
+}
+
+#[test]
+fn opencode_db_fork_rows_excluded_and_disclosed_across_warm_snapshots() {
+    let root = temp_root("agenttrace-opencode-fork-db");
+    let home = root.join("home");
+    seed_opencode_fork_db(&home);
+
+    with_home(&home, || {
+        // Cold load: the parent's session counts once; the fork row is
+        // excluded and disclosed.
+        let cold = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(cold.sessions.len(), 1, "only the parent row may aggregate");
+        assert_eq!(cold.opencode_fork_excluded, 1);
+
+        // Warm load: the snapshot (schema 8) must carry the exclusion
+        // count instead of going silent.
+        let warm = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(warm.sessions.len(), 1);
+        assert_eq!(
+            warm.opencode_fork_excluded, 1,
+            "warm sqlite snapshot must keep disclosing the fork exclusion"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
 }
