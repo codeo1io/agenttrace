@@ -1194,4 +1194,134 @@ mod tests {
             "--max-tool-fail-rate must trip on hermes-sourced failures: {failures:?}"
         );
     }
+
+    #[test]
+    fn busy_timeout_waits_out_a_short_lock_and_fails_closed_without_storing_on_a_long_one() {
+        // rm-626 acceptance pin (independent_review 7d51a912 M1, landed at
+        // review-fix d48c5af7): the busy_timeout on open_sqlite_read_only
+        // is part of the fail-closed contract and must be pinned by a real
+        // concurrent-writer contention test, not only by the corruption
+        // legs. A SHORT exclusive lock (released inside SQLITE_BUSY_TIMEOUT)
+        // must be waited out; a LONG lock (held across the load) must fail
+        // closed AND persist nothing — the same no-store contract as the
+        // corruption legs, reached through the contention door.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm626-contention-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let database = hermes_state_db_fixture(&root);
+        let snapshot = root.join("hermes-sqlite.json");
+
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        use std::sync::mpsc;
+
+        // Leg 0 — the configured timeout itself. rusqlite installs a
+        // 5,000ms default busy timeout on every connection it opens
+        // (rusqlite 0.32.1 sets sqlite3_busy_timeout(db, 5000) in
+        // inner_connection.rs), so deleting our busy_timeout call does
+        // NOT make locked reads fail fast — it silently degrades every
+        // contended statement from a 250ms wait to a 5s wait. The
+        // behavioral legs below cannot see that regression (a short
+        // lock is waited out either way; the long-lock leg just stalls
+        // ~20s instead of ~1s), so the constant is pinned by reading it
+        // back off the connection the loader actually opens.
+        let pinned_timeout = open_sqlite_read_only(&database)
+            .expect("open read-only connection for the pragma probe")
+            .query_row("pragma busy_timeout", [], |row| row.get::<_, i64>(0))
+            .expect("read busy_timeout pragma");
+        assert_eq!(
+            pinned_timeout,
+            SQLITE_BUSY_TIMEOUT.as_millis() as i64,
+            "open_sqlite_read_only must keep SQLITE_BUSY_TIMEOUT (250ms); \
+             rusqlite's silent 5s default is the regression this pins out"
+        );
+
+        // Leg 1 — SHORT lock: released after 100ms (< SQLITE_BUSY_TIMEOUT
+        // 250ms), the loader must wait it out and the load must succeed.
+        // Together with leg 0 this pins busy_timeout: leg 0 pins the
+        // configured wait budget, this leg pins that a short lock is
+        // actually waited out rather than failing the read.
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let short_lock = {
+            let database = database.clone();
+            std::thread::spawn(move || {
+                let writer = rusqlite::Connection::open(&database).expect("open writer");
+                writer
+                    .execute_batch("BEGIN EXCLUSIVE")
+                    .expect("take exclusive lock");
+                locked_tx.send(()).expect("signal lock held");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                writer
+                    .execute_batch("ROLLBACK")
+                    .expect("release short lock");
+            })
+        };
+        locked_rx.recv().expect("wait for the short lock");
+        let short_sessions = load_hermes_sqlite_sessions(&database, None);
+        short_lock.join().expect("short writer thread");
+        assert_eq!(
+            short_sessions.len(),
+            2,
+            "a short exclusive lock must be waited out and the load succeed"
+        );
+        assert!(
+            snapshot.exists(),
+            "the waited-out load must persist its snapshot"
+        );
+
+        // Leg 2 — LONG lock: held across the whole load; the loader must
+        // fail closed and must NOT persist any snapshot — contention is a
+        // MISS, never a store.
+        std::fs::remove_file(&snapshot).expect("wipe snapshot between legs");
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let long_lock = {
+            let database = database.clone();
+            std::thread::spawn(move || {
+                let writer = rusqlite::Connection::open(&database).expect("open writer");
+                writer
+                    .execute_batch("BEGIN EXCLUSIVE")
+                    .expect("take exclusive lock");
+                held_tx.send(()).expect("signal lock held");
+                release_rx.recv().expect("wait for release");
+                let _ = writer.execute_batch("ROLLBACK");
+            })
+        };
+        held_rx.recv().expect("wait for the long lock");
+        let long_sessions = load_hermes_sqlite_sessions(&database, None);
+        assert!(
+            long_sessions.is_empty(),
+            "a permanently locked database must fail closed to zero sessions"
+        );
+        assert!(
+            !snapshot.exists(),
+            "a contended hermes read must not persist any snapshot"
+        );
+        release_tx.send(()).expect("release the long lock");
+        long_lock.join().expect("long writer thread");
+
+        // Leg 3 — recovery: once the lock is gone the same database loads
+        // and stores normally again.
+        let recovered = load_hermes_sqlite_sessions(&database, None);
+        assert_eq!(
+            recovered.len(),
+            2,
+            "after the lock releases the database must load normally"
+        );
+        assert!(
+            snapshot.exists(),
+            "the recovered load must persist its snapshot"
+        );
+
+        match prior_cache {
+            Some(v) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", v),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

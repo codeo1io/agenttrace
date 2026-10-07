@@ -93,8 +93,12 @@ failed database reads no longer persist an empty snapshot that masks a
 healthy database). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
-pruned the next time the cache loads, and the snapshot is bounded at
-20,000 entries (oldest source-file mtime drops first).
+pruned the next time the cache loads, and the JSONL-backed session cache is
+bounded at 20,000 entries (oldest source-file mtime drops first; the cap
+applies to JSONL-sourced sessions only — the per-database SQLite snapshot
+ledger is keyed by database path and each snapshot is rewritten, never
+appended, so it is bounded by the number of databases rather than by this
+cap).
 
 ## Prioritized recommendations
 
