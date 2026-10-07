@@ -21,6 +21,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Retention bound for the capture journal: when the file crosses this
@@ -295,23 +297,101 @@ pub fn append_statusline_capture(payload: &Value) -> io::Result<()> {
     // rm-208: the journal is captured conversation context (session
     // names, project paths, working directories); create it owner-only
     // instead of the fs default (0644/0664).
-    let mut file = crate::session_cache::open_private_append(&path)?;
-    let size_after_append = file.metadata()?.len() + line.len() as u64 + 1;
-    writeln!(file, "{line}")?;
-    if size_after_append > STATUSLINE_CAPTURE_MAX_BYTES {
-        compact_statusline_capture(&path)?;
+    //
+    // rm-166: several status-line invocations and a compaction can be
+    // in flight on the same journal at once. The append used to go
+    // through a lock-less O_APPEND handle while the compaction
+    // replaced the journal with a temp-file rename, so an append
+    // racing the rename landed on the replaced inode and silently
+    // vanished. The whole write-and-maybe-compact critical section now
+    // runs under an exclusive cross-process lock
+    // (`open_locked_journal`).
+    let journal = open_locked_journal(&path)?;
+    let size_after_append = journal.metadata()?.len() + line.len() as u64 + 1;
+    let mut writer = &journal;
+    let appended = writeln!(writer, "{line}").and_then(|()| writer.flush());
+    let compacted = if appended.is_ok() && size_after_append > STATUSLINE_CAPTURE_MAX_BYTES {
+        compact_statusline_capture_locked(&path, STATUSLINE_CAPTURE_MAX_BYTES / 2)
+    } else {
+        Ok(())
+    };
+    let unlocked = journal.unlock();
+    appended.and(compacted).and(unlocked)
+}
+
+/// Bound on lock-acquisition retries. Each retry means the journal was
+/// compacted (renamed) between opening and locking — rare even under
+/// load; a thrashing writer exhausts the budget and surfaces an error
+/// instead of spinning.
+const JOURNAL_LOCK_ATTEMPTS: usize = 64;
+
+/// Opens the journal for appending under an exclusive cross-process
+/// lock (rm-166).
+///
+/// `File::lock` is an open-file-description advisory lock: exclusive
+/// between processes and between separately-opened handles inside one
+/// process, and released automatically when the descriptor closes, so
+/// a crashed status line can never wedge the journal. Because a
+/// compaction renames a fresh inode into place while the lock is held
+/// on the old one, the lock alone cannot serialize a writer that opened
+/// the path before the rename: after acquiring, the descriptor is
+/// revalidated against the path's live inode and the open is retried
+/// when it raced a compaction.
+fn open_locked_journal(path: &Path) -> io::Result<fs::File> {
+    for _ in 0..JOURNAL_LOCK_ATTEMPTS {
+        let journal = crate::session_cache::open_private_append(path)?;
+        journal.lock()?;
+        if journal_descriptor_is_live(path, &journal) {
+            return Ok(journal);
+        }
+        // We locked an inode a completed compaction already replaced:
+        // release it and re-open the journal that is live now.
+        drop(journal);
     }
-    Ok(())
+    Err(io::Error::other(format!(
+        "statusline journal lock lost {JOURNAL_LOCK_ATTEMPTS} races with compaction"
+    )))
 }
 
-/// Retention: drop oldest whole lines until the journal fits half the
-/// bound. Rewritten through a temp file + rename so a crash mid-compaction
-/// cannot truncate the journal to zero.
-fn compact_statusline_capture(path: &Path) -> io::Result<()> {
-    compact_statusline_capture_under(path, STATUSLINE_CAPTURE_MAX_BYTES / 2)
+/// True when `journal`'s descriptor still refers to the inode currently
+/// at `path`. Compaction renames a fresh inode over the path, orphaning
+/// any handle (and lock) opened before the swap.
+fn journal_descriptor_is_live(path: &Path, journal: &fs::File) -> bool {
+    #[cfg(unix)]
+    {
+        match (journal.metadata(), fs::metadata(path)) {
+            (Ok(descriptor), Ok(live)) => descriptor.ino() == live.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // The temp-file rename is a Unix journal pattern; elsewhere the
+        // advisory lock on the open descriptor is the whole protocol.
+        let _ = (path, journal);
+        true
+    }
 }
 
+/// Retention: drop oldest whole lines until the journal fits under
+/// `keep_under` bytes. Rewritten through a temp file + rename so a crash
+/// mid-compaction cannot truncate the journal to zero.
+///
+/// rm-166: the read→rewrite→rename critical section races concurrent
+/// appends unless it runs under the journal lock, so this entry takes the
+/// lock itself. The append path (which already holds the lock — the
+/// open-file-description lock is not reentrant across handles) calls the
+/// locked core directly; no production caller needs the standalone entry
+/// yet, so it is exercised by the journal race fixtures.
+#[allow(dead_code)]
 fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<()> {
+    let journal = open_locked_journal(path)?;
+    let compacted = compact_statusline_capture_locked(path, keep_under);
+    let unlocked = journal.unlock();
+    compacted.and(unlocked)
+}
+
+fn compact_statusline_capture_locked(path: &Path, keep_under: u64) -> io::Result<()> {
     let raw = fs::read_to_string(path)?;
     let mut kept: Vec<&str> = Vec::new();
     let mut kept_bytes = 0u64;
@@ -1459,5 +1539,240 @@ mod tests {
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
+    }
+    // rm-166 regression fixture: hammer the journal from parallel
+    // processes while a compactor continuously rewrites it, then prove
+    // no append was lost. Without the journal lock, an append racing the
+    // compaction's rename landed on the replaced inode and vanished.
+    //
+    // The child processes re-execute this test binary (`--exact` this
+    // test) with AGENTTRACE_JOURNAL_CHILD_ROLE set, taking the child
+    // branch below; coordination between processes is marker files in
+    // the temp root.
+    #[test]
+    fn journal_appends_survive_parallel_compaction() {
+        if let Ok(role) = std::env::var("AGENTTRACE_JOURNAL_CHILD_ROLE") {
+            journal_race_child(&role);
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-journal-race-{}-{}",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id()).replace(char::is_alphabetic, "")
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp root");
+        // Child runs are matched by the leaf name as a substring filter —
+        // unique in this binary. (`--exact` with a constructed module path
+        // is a trap: module_path!() carries a crate-name prefix libtest does
+        // not use, and the mismatched child silently runs zero tests and
+        // "passes" instantly.)
+        let test_name = "journal_appends_survive_parallel_compaction";
+        let exe = std::env::current_exe().expect("test binary path");
+        let spawn = |role: String| {
+            let mut command = std::process::Command::new(&exe);
+            command
+                .arg(test_name)
+                .env("AGENTTRACE_JOURNAL_CHILD_ROLE", role)
+                .env("AGENTTRACE_JOURNAL_ROOT", &root)
+                .env("AGENTTRACE_SESSION_CACHE_DIR", &root)
+                // Captured (not inherited) so child libtest chatter stays
+                // out of the parent's output and stderr is available for
+                // the failure message below.
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            command.spawn().expect("spawn journal race child")
+        };
+        const WRITERS: usize = 3;
+        const HAMMER: usize = 500;
+        let mut children = vec![spawn("compactor".to_string())];
+        for writer in 0..WRITERS {
+            children.push(spawn(format!("writer:{writer}")));
+        }
+        for (index, child) in children.into_iter().enumerate() {
+            let output = child.wait_with_output().expect("journal race child exits");
+            assert!(
+                output.status.success(),
+                "journal race child {index} failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // The fixture is only a race if the compactor actually swapped the
+        // journal under the writers; a degenerate run (compactor erroring
+        // every cycle) would otherwise pass vacuously.
+        let swaps: u32 = fs::read_to_string(root.join("compactor-swaps"))
+            .expect("compactor swap count marker")
+            .trim()
+            .parse()
+            .expect("swap count parses");
+        assert!(
+            swaps > 0,
+            "compactor never swapped the journal — fixture did not race"
+        );
+        let journal = root.join("statusline.jsonl");
+        let captures = read_statusline_captures(&journal);
+        let ids: Vec<String> = captures
+            .iter()
+            .filter_map(|capture| capture.session_id().map(str::to_string))
+            .collect();
+        // 1. Every hammer id must survive: the compactor runs under a
+        //    keep-everything bound (see below), so a missing id is an
+        //    append lost to a rename race — the exact rm-166 defect.
+        for writer in 0..WRITERS {
+            for index in 0..HAMMER {
+                let id = format!("w{writer}-{index}");
+                assert!(ids.contains(&id), "append {id} lost to a compaction race");
+            }
+        }
+        // 2. Every sentinel must survive. Sentinels are appended while
+        //    the compactor is still renaming and are the newest lines at
+        //    rest, so a missing sentinel is an append lost to a rename
+        //    race, not retention.
+        for writer in 0..WRITERS {
+            let sentinel = format!("sentinel-{writer}");
+            assert!(
+                ids.contains(&sentinel),
+                "sentinel {sentinel} lost to a compaction race"
+            );
+        }
+        // 3. Integrity: no id appears twice and each writer's ids appear
+        //    in strictly increasing file order — O_APPEND preserves
+        //    per-writer order, so a reordered or duplicated id means the
+        //    lock protocol failed. (Retention semantics have their own
+        //    fixtures; this one is about the append-vs-rename race.)
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut last_index: BTreeMap<usize, usize> = BTreeMap::new();
+        for capture in &captures {
+            let Some(id) = capture.session_id().map(str::to_string) else {
+                continue;
+            };
+            let Some((writer, index)) = id
+                .strip_prefix('w')
+                .and_then(|rest| rest.split_once('-'))
+                .map(|(writer, index)| (writer.parse::<usize>(), index.parse::<usize>()))
+            else {
+                continue; // sentinels checked above
+            };
+            let (writer, index) = (writer.expect("writer index"), index.expect("entry index"));
+            assert!(seen.insert(id), "journal contains a duplicated id");
+            let last = last_index.entry(writer).or_insert(index);
+            assert!(
+                index >= *last,
+                "writer {writer} entry {index} appears after {:?} — journal order broken",
+                last
+            );
+            *last = index;
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // rm-166 mechanism, pinned deterministically: a compaction renames a
+    // fresh inode over the journal, so any handle opened before the swap
+    // (the pre-lock protocol's O_APPEND fd) writes into the replaced inode
+    // and the entry never reaches the journal at the path. This is the
+    // loss the cross-process fixture races for; here it is forced by
+    // interleaving.
+    #[test]
+    fn journal_lockless_handle_loses_append_to_compaction() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-journal-mechanism-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+        // Under the shared env lock so sibling tests cannot re-point the
+        // cache root mid-append; prior value restored before release.
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let journal = statusline_capture_path();
+        append_statusline_capture(&serde_json::json!({ "session_id": "seed" }))
+            .expect("seed append");
+        // The stale-handle interleaving: open as the pre-lock code did,
+        // let the compaction swap the inode, then write through the stale
+        // handle.
+        let mut stale =
+            crate::session_cache::open_private_append(&journal).expect("open stale append handle");
+        compact_statusline_capture_under(&journal, u64::MAX).expect("compaction swaps inode");
+        writeln!(stale, "{{\"lost\": true}}").expect("write through stale handle");
+        let after_swap = fs::read_to_string(&journal).expect("journal readable");
+        assert!(
+            !after_swap.contains("\"lost\": true"),
+            "write through a stale handle reached the journal at the path"
+        );
+        // The locked protocol lands the same append the compaction raced:
+        // append_statusline_capture revalidates the inode under the lock,
+        // so its write always reaches the journal the path names now.
+        append_statusline_capture(&serde_json::json!({ "session_id": "kept" }))
+            .expect("locked append");
+        let after_append = fs::read_to_string(&journal).expect("journal readable");
+        assert!(after_append.contains("\"session_id\":\"kept\""));
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn journal_race_child(role: &str) {
+        let root = PathBuf::from(std::env::var_os("AGENTTRACE_JOURNAL_ROOT").expect("race root"));
+        let journal = root.join("statusline.jsonl");
+        let wait_for = |marker: &Path| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {marker:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        const WRITERS: usize = 3;
+        const HAMMER: usize = 500;
+        let hammer_done = |writer: usize| root.join(format!("hammer-done-{writer}"));
+        if let Some(writer) = role.strip_prefix("writer:") {
+            let writer: usize = writer.parse().expect("writer index");
+            for index in 0..HAMMER {
+                let payload = serde_json::json!({ "session_id": format!("w{writer}-{index}") });
+                append_statusline_capture(&payload).expect("child append");
+            }
+            fs::write(hammer_done(writer), b"").expect("hammer marker");
+            wait_for(&root.join("sentinel-go"));
+            let payload = serde_json::json!({ "session_id": format!("sentinel-{writer}") });
+            append_statusline_capture(&payload).expect("sentinel append");
+            fs::write(root.join(format!("sentinel-done-{writer}")), b"").expect("sentinel marker");
+        } else if role == "compactor" {
+            // keep-everything bound: the rewrite still swaps the inode in
+            // under the writers (that is the racing surface), but retention
+            // cannot delete a hammer id — the parent asserts all of them.
+            let keep_under = u64::MAX;
+            let mut swaps = 0u32;
+            // Phase 1: tight loop — the rename window stays continuously
+            // open while the writers hammer.
+            while !(0..WRITERS).all(|writer| hammer_done(writer).exists()) {
+                if compact_statusline_capture_under(&journal, keep_under).is_ok() {
+                    swaps += 1;
+                }
+            }
+            let _ = fs::write(root.join("compactor-swaps"), swaps.to_string());
+            fs::write(root.join("sentinel-go"), b"").expect("sentinel-go marker");
+            // Phase 2: keep rewriting until every sentinel has landed, so
+            // the sentinel appends genuinely race the rename, then settle
+            // with one final compaction.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !(0..WRITERS).all(|writer| root.join(format!("sentinel-done-{writer}")).exists())
+            {
+                let _ = compact_statusline_capture_under(&journal, keep_under);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "compactor timed out waiting for sentinels"
+                );
+            }
+            compact_statusline_capture_under(&journal, keep_under).expect("final compaction");
+        } else {
+            panic!("unknown journal race role {role}");
+        }
     }
 }

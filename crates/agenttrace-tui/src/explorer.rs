@@ -148,7 +148,10 @@ impl App {
                 self.explorer_selected = 0;
             }
             KeyCode::Char('s') if self.explorer_view == ExplorerView::Projects => {
-                if let Some(project) = self.explorer_session().map(resolve_project) {
+                if let Some(project) = self
+                    .explorer_session()
+                    .map(|session| self.project_identity(session))
+                {
                     self.project_filter.clear();
                     self.project_id_filter = project.id;
                     self.refresh_filtered();
@@ -265,12 +268,12 @@ impl App {
                 .to_string();
             return;
         };
-        let project = resolve_project(current).id;
+        let project = self.project_identity(current).id;
         let anchor = self
             .sessions
             .iter()
             .filter(|session| {
-                resolve_project(session).id == project
+                self.project_identity(session).id == project
                     && Self::session_key(session) != current_key
                     && !session.metrics.session_start.is_empty()
                     && session.metrics.session_start.as_str() < current_start
@@ -345,7 +348,7 @@ impl App {
         let mut values = BTreeMap::new();
         for session in &self.sessions {
             let (id, label) = if self.explorer_overlay == ExplorerOverlay::ProjectPicker {
-                let project = resolve_project(session);
+                let project = self.project_identity(session);
                 (project.id, project.display_name)
             } else {
                 let source = session.metrics.source_tool.clone();
@@ -548,7 +551,7 @@ impl App {
         let mut names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for index in &self.filtered {
             let session = &self.sessions[*index];
-            let identity = resolve_project(session);
+            let identity = self.project_identity(session);
             let entry = totals.entry(identity.id.clone()).or_insert_with(|| {
                 *names.entry(identity.display_name.clone()).or_insert(0) += 1;
                 ProjectTotals {
@@ -591,7 +594,7 @@ impl App {
                 for index in &indices {
                     let session = &self.sessions[*index];
                     let entry = projects
-                        .entry(resolve_project(session).id)
+                        .entry(self.project_identity(session).id)
                         .or_insert((*index, 0.0));
                     entry.1 += session.metrics.cost_estimated;
                     if session.metrics.session_start > self.sessions[entry.0].metrics.session_start
@@ -988,7 +991,10 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         Line::raw(""),
         preview_field(app.t("Agent", "来源"), display_session_source(session)),
-        preview_field(app.t("Project", "项目"), project_name(session)),
+        preview_field(
+            app.t("Project", "项目"),
+            app.project_identity(session).display_name,
+        ),
         preview_field(app.t("Model", "模型"), metrics.model_used.clone()),
         Line::raw(""),
         Line::from(vec![
@@ -1041,12 +1047,12 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn project_preview(app: &App, session: &Session) -> String {
-    let identity = resolve_project(session);
+    let identity = app.project_identity(session);
     let project = identity.display_name.clone();
     let sessions = app
         .visible_sessions()
         .into_iter()
-        .filter(|item| resolve_project(item).id == identity.id)
+        .filter(|item| app.project_identity(item).id == identity.id)
         .collect::<Vec<_>>();
     let cost: f64 = sessions
         .iter()
@@ -1617,7 +1623,7 @@ fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, ar
         ),
         Line::styled(
             if session.cwd.is_empty() {
-                resolve_project(session).root
+                app.project_identity(session).root
             } else {
                 session.cwd.clone()
             },
@@ -2047,7 +2053,7 @@ fn explorer_row_spans(
         }
         ExplorerView::Projects => {
             let totals = project_totals
-                .and_then(|totals| totals.get(&resolve_project(session).id))
+                .and_then(|totals| totals.get(&app.project_identity(session).id))
                 .cloned()
                 .unwrap_or_default();
             let (count, cost) = (totals.count, totals.cost);

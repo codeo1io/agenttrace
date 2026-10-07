@@ -2152,3 +2152,91 @@ fn report_context_underline_matches_display_width_not_byte_length() {
         "pure-ASCII titles render byte-identical to the byte-length era"
     );
 }
+
+#[test]
+fn project_identity_memo_answers_from_load_not_the_filesystem() {
+    // rm-038: the TUI memo is populated once when sessions load, and
+    // render-loop lookups must answer from that snapshot — not re-walk
+    // the filesystem per frame. Discriminator: same session path, cwd
+    // repointed at a different git root after load. A live walk would
+    // answer the NEW root ("other"); the memo must keep answering the
+    // load-time identity ("outer"). (Basing this on deleting the fixture
+    // would false-green through the process-global git_root cache.)
+    let base = std::env::temp_dir().join(format!("atrm038-{}", std::process::id()));
+    let outer = base.join("outer");
+    let repo = outer.join("repo");
+    let other = base.join("other");
+    fs::create_dir_all(outer.join(".git")).expect("outer git marker");
+    fs::create_dir_all(&repo).expect("repo dir");
+    fs::create_dir_all(other.join(".git")).expect("other git marker");
+    let metrics = Metrics {
+        session_start: "2026-05-02T10:00:00Z".to_string(),
+        ..Metrics::default()
+    };
+    let walked = Session {
+        name: "walked".to_string(),
+        path: repo.join("session.jsonl").to_string_lossy().to_string(),
+        cwd: repo.to_string_lossy().to_string(),
+        metrics,
+        anomalies: Vec::new(),
+        health: 100,
+        tool_warnings: Vec::new(),
+        diagnostics: agenttrace_core::Diagnostics::default(),
+    };
+    let app = App::new(vec![walked], "test", None);
+    let walked = &app.sessions[0];
+    assert_eq!(app.project_identity(walked).display_name, "outer");
+    assert_eq!(app.project_identity(walked).resolution, "git_root");
+    // Same path, cwd repointed at "other": the memo is keyed by session
+    // path and must keep the load-time answer; a live resolution of the
+    // mutated session answers "other" — proving the lookup hit the memo.
+    let mut repointed = walked.clone();
+    repointed.cwd = other.to_string_lossy().to_string();
+    assert_eq!(
+        app.project_identity(&repointed).display_name,
+        "outer",
+        "memo lookups must answer the load-time identity, not re-walk"
+    );
+    assert_eq!(
+        agenttrace_core::resolve_project(&repointed).display_name,
+        "other",
+        "a live resolution of the repointed cwd answers the new root"
+    );
+    fs::remove_dir_all(&base).expect("teardown fixture");
+}
+
+#[test]
+fn project_identity_memo_rebuilds_when_sessions_are_replaced() {
+    // rm-038: reload replaces the session list wholesale; the memo must be
+    // rebuilt from the new list (stale identities dropped) rather than
+    // silently serving entries for sessions that no longer exist.
+    let base = std::env::temp_dir().join(format!("atrm038-rebuild-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("rebuild fixture dir");
+    let present = session("present", "tmp", "claude-4-5", 100, 0.1, "bash");
+    let replaced = session("replaced", "tmp", "claude-4-5", 100, 0.1, "bash");
+    let present_path = present.path.clone();
+    let replaced_path = replaced.path.clone();
+    let mut app = App::new(vec![present, replaced], "test", None);
+    assert!(app.project_identities.contains_key(&present_path));
+    assert!(app.project_identities.contains_key(&replaced_path));
+    // Session replacement (what reload does) without a rebuild leaves a
+    // stale entry — then rebuild_project_identities retires it.
+    app.sessions.retain(|session| session.path == present_path);
+    assert!(
+        app.project_identities.contains_key(&replaced_path),
+        "precondition: stale entry before rebuild"
+    );
+    app.rebuild_project_identities();
+    assert!(!app.project_identities.contains_key(&replaced_path));
+    assert!(app.project_identities.contains_key(&present_path));
+    // A session absent from the memo still resolves through the live
+    // fallback, so a cold path can never answer wrong.
+    let absent = session("absent", "tmp", "claude-4-5", 100, 0.1, "bash");
+    let fallback = app.project_identity(&absent);
+    let live = agenttrace_core::resolve_project(&absent);
+    assert_eq!(fallback.id, live.id);
+    assert_eq!(fallback.display_name, live.display_name);
+    assert_eq!(fallback.root, live.root);
+    assert_eq!(fallback.resolution, live.resolution);
+    let _ = fs::remove_dir_all(&base);
+}
