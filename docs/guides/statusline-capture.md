@@ -34,7 +34,10 @@ script](../../README.md#install) puts it on `~/.local/bin` or `/usr/local/bin`).
 Claude Code invokes the command with the payload as a single line of JSON on
 stdin and expects **exactly one line on stdout**. `agenttrace statusline`:
 
-- renders `name | ctx N% | 5h/7d N% until HH:MM | cache N% | $cost`,
+- renders `name | ctx N% | 5h/7d N% until HH:MM±ZZZZ | cache N% | $cost`, with
+  reset times in the host's local timezone and the UTC offset spelled out (a
+  bare `HH:MM` silently read as local wall-clock was hours off for non-UTC
+  users),
 - exits `0` for **any** input — valid payload, malformed JSON, or empty stdin,
 - exits `0` for any **stdout condition** too — a closed pipe or full disk is
   reported to stderr at most, never a panic (the line is written with the
@@ -89,6 +92,11 @@ Report semantics worth knowing:
   after). A window whose reset passed outside the journal, or a bare
   `resets_at` with no before-side, is not claimed as a crossing.
 - `hit_ratio` is a `0..1` ratio; rendered percentages multiply by 100.
+- The budget window (`--budget`, and the spend keys of `--statusline-report`)
+  is **calendar-bounded**: the seven most recent UTC days ending at the
+  moment of the report. Captures older than that cutoff count zero — a
+  journal idle for a week or more reports an empty window ($0.00), never the
+  last sampled week dressed up as the current one.
 
 ## Reviewing captures
 

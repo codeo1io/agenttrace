@@ -223,13 +223,13 @@ fn render_status_line(payload: &Value) -> String {
         )
         .unwrap_or_default();
         if let Some(used) = state.used_percentage {
+            // rm-165: `resets_at` is a UTC epoch. A bare `HH:MM`
+            // silently reads as local wall-clock and is hours (up to a
+            // day) wrong for every non-UTC user, so the reset renders
+            // in the host's local timezone with the offset labeled.
             let reset = state
                 .resets_at
-                .map(|epoch| {
-                    chrono::DateTime::from_timestamp(epoch, 0)
-                        .map(|at| at.format("%H:%M").to_string())
-                        .unwrap_or_else(|| epoch.to_string())
-                })
+                .map(|epoch| format_reset_time(epoch, &local_offset()))
                 .map(|at| format!(" until {at}"))
                 .unwrap_or_default();
             parts.push(format!("{label} {used:.0}%{reset}"));
@@ -255,6 +255,23 @@ fn render_status_line(payload: &Value) -> String {
     } else {
         parts.join(" | ")
     }
+}
+
+/// rm-165: the host's current UTC offset, resolved once per render.
+fn local_offset() -> chrono::FixedOffset {
+    use chrono::Offset;
+    chrono::Local::now().offset().fix()
+}
+
+/// rm-165: a `resets_at` epoch renders as `HH:MM±ZZZZ` — the time in
+/// the given offset WITH that offset spelled out, so the status line
+/// never presents an unlabeled (and silently wrong) wall-clock time.
+/// A bare `HH:MM` (UTC, unconverted) was up to a day off for every
+/// non-UTC user.
+fn format_reset_time(epoch: i64, offset: &chrono::FixedOffset) -> String {
+    chrono::DateTime::from_timestamp(epoch, 0)
+        .map(|at| at.with_timezone(offset).format("%H:%M%z").to_string())
+        .unwrap_or_else(|| epoch.to_string())
 }
 
 /// Review F1 (cycle 7): payload strings are user-authored (session
@@ -576,7 +593,7 @@ pub fn render_statusline_report(
     let stats = statusline_journal_stats(&path);
     let captures = read_statusline_captures(&path);
     let insights = statusline_insights(&captures);
-    let series = statusline_budget_series(&captures, 7);
+    let series = statusline_budget_series(&captures, 7, chrono::Utc::now().timestamp());
     if format == "json" {
         let mut value = serde_json::json!({ "journal": stats, "insights": insights });
         if let Some(budget) = weekly_budget {
@@ -723,7 +740,7 @@ fn utc_day(epoch: i64) -> String {
 /// (rm-385). Captures carry each session's *cumulative* cost, so a
 /// day's spend is the rise of that cumulative value across the day's
 /// samples; a value that drops (session epoch reset) contributes only
-/// itself. Days are UTC buckets over the trailing window, ascending.
+/// itself. Days are UTC buckets over the calendar window, ascending.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatuslineBudgetSeries {
     /// UTC day (`YYYY-MM-DD`) -> spend in USD, ascending.
@@ -732,9 +749,14 @@ pub struct StatuslineBudgetSeries {
     pub total: f64,
 }
 
+/// `now_epoch` bounds the window: the `days` most recent UTC calendar
+/// days ending at `now_epoch` (rm-628). Days older than the cutoff stop
+/// counting even when they are the newest samples — the last sampled
+/// week never masquerades as the current week.
 pub fn statusline_budget_series(
     captures: &[CapturedStatusline],
     days: usize,
+    now_epoch: i64,
 ) -> StatuslineBudgetSeries {
     use std::collections::BTreeMap;
 
@@ -770,10 +792,18 @@ pub fn statusline_budget_series(
             previous = *cumulative;
         }
     }
-    // Keep only the trailing `days` window.
+    // Keep only the calendar window: the `days` most recent UTC days
+    // ending at `now_epoch` (rm-628). Days older than the cutoff stop
+    // counting even when they are the newest samples — a stale journal
+    // renders an empty window, not the last sampled week. Rises are
+    // computed over the full history first, so a retained day's spend
+    // stays its true rise for that day.
     let mut window: Vec<(String, f64)> = daily.into_iter().collect();
-    if window.len() > days {
-        window = window.split_off(window.len() - days);
+    if days == 0 {
+        window.clear();
+    } else {
+        let cutoff_day = utc_day(now_epoch - (days as i64 - 1) * 86_400);
+        window.retain(|(day, _)| day.as_str() >= cutoff_day.as_str());
     }
     // Review 5b9a9470 F4: an empty window's f64 reduction is lowered
     // by LLVM to the additive identity -0.0 in optimized builds, which
@@ -787,18 +817,48 @@ pub fn statusline_budget_series(
     }
 }
 
-/// rm-385: the `--budget` window-burn view. Renders the trailing
-/// seven days of spend from the capture journal against the resolved
-/// weekly budget. An unset budget is not an error — the view then
-/// shows the spend and how to set the knob. `-f json` renders the
+/// rm-385: the `--budget` window-burn view. Renders the last seven
+/// calendar days (UTC) of spend from the capture journal against the
+/// resolved weekly budget — days older than the cutoff count zero,
+/// even when they are the newest samples (rm-628). An unset budget
+/// is not an error — the view then shows the spend and how to set
+/// the knob. `-f json` renders the
 /// same data as one JSON object (review 5b9a9470 F5: the machine
 /// format must never silently emit prose), mirroring the
 /// `--statusline-report` budget keys.
 pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::Result<String> {
     let path = statusline_capture_path();
     let stats = statusline_journal_stats(&path);
+    // rm-630: the journal is parsed exactly once per invocation and
+    // BOTH format arms render from that single parse — the text arm
+    // used to re-read and re-parse after the JSON arm's early
+    // return, so the empty-journal gate could pass on one parse
+    // while the rendered series came from another (a read-skew
+    // window if the journal rotates mid-invocation).
     let captures = read_statusline_captures(&path);
-    let series = statusline_budget_series(&captures, 7);
+    Ok(render_budget_view_from(
+        format,
+        weekly_budget,
+        &stats,
+        &captures,
+        &path,
+        chrono::Utc::now().timestamp(),
+    ))
+}
+
+/// rm-630: pure renderer over ONE parse of the journal (plus its
+/// line-count stats) at caller-supplied `now`. Taking the captures
+/// as an input is what pins the single-read contract: neither arm
+/// can consult a second parse, and window tests are deterministic.
+fn render_budget_view_from(
+    format: &str,
+    weekly_budget: Option<f64>,
+    stats: &StatuslineJournalStats,
+    captures: &[CapturedStatusline],
+    path: &Path,
+    now_epoch: i64,
+) -> String {
+    let series = statusline_budget_series(captures, 7, now_epoch);
     if format == "json" {
         let mut value = serde_json::json!({
             "journal": stats,
@@ -816,17 +876,18 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             value["weekly_budget_usd"] = serde_json::json!(budget);
             value["remaining_usd"] = serde_json::json!(budget - series.total);
         }
-        return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).expect("Value serializes")
+        );
     }
     if !stats.exists || stats.lines == 0 {
-        return Ok(format!(
+        return format!(
             "No statusline captures yet at {} — the journal is populated by the \
              `agenttrace statusline` host command.\n",
             path.display()
-        ));
+        );
     }
-    let captures = read_statusline_captures(&path);
-    let series = statusline_budget_series(&captures, 7);
     let mut out = String::from("Weekly budget — last 7 days (statusline journal)\n");
     for (day, spend) in &series.daily {
         out.push_str(&format!("  {day}  ${spend:.2}\n"));
@@ -855,7 +916,7 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
              ~/.config/agenttrace/config.toml (or pass --weekly-budget)\n",
         ),
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
@@ -880,7 +941,7 @@ mod tests {
         // "$-0.00" for every fresh install (no cost samples). The sum
         // site normalizes with `+ 0.0`; this pins the sign bit so no
         // future change reintroduces negative zero.
-        let series = statusline_budget_series(&[], 7);
+        let series = statusline_budget_series(&[], 7, 1_760_000_000);
         assert_eq!(series.total.to_bits(), 0.0f64.to_bits(), "{series:?}");
         assert!(series.daily.is_empty());
     }
@@ -943,16 +1004,161 @@ mod tests {
         for n in 3..=10 {
             captures.push(budget_capture("A", day(n), 0.25 * (n - 2) as f64));
         }
-        let series = statusline_budget_series(&captures, 7);
-        // Window keeps the trailing 7 days: day 3 (rise 0 after the
-        // reset) drops off, days 4..=10 burn 0.25 each.
+        let series = statusline_budget_series(&captures, 7, day(10) + 100);
+        // The calendar window keeps the 7 UTC days ending at `now`
+        // (day 10): days 1..3 drop — day 3 rose 0 after the reset —
+        // and days 4..=10 burn 0.25 each.
         assert_eq!(series.daily.len(), 7, "{:?}", series.daily);
         assert!((series.total - 7.0 * 0.25).abs() < 1e-9, "{:?}", series);
         // The full-journal variant still sums the early burn.
-        let full = statusline_budget_series(&captures, 30);
+        let full = statusline_budget_series(&captures, 30, day(10) + 100);
         assert!(
             (full.total - (2.00 + 1.50 + 1.00 + 7.0 * 0.25)).abs() < 1e-9,
             "{full:?}"
+        );
+    }
+
+    #[test]
+    fn budget_series_calendar_cutoff_drops_stale_week() {
+        // rm-628: the window is calendar-bounded, not trailing days-
+        // WITH-SAMPLES. A journal whose newest samples are three weeks
+        // old renders an empty window — the old split_off kept the
+        // last 7 sampled days and counted their whole burn as current.
+        let now = 1_760_000_000; // 2025-10-09T06:13:20Z
+        let stale = now - 21 * 86_400;
+        let captures = vec![
+            budget_capture("stale", stale, 2.00),
+            budget_capture("stale", stale + 3_600, 5.00),
+        ];
+        let series = statusline_budget_series(&captures, 7, now);
+        assert!(series.daily.is_empty(), "{series:?}");
+        assert_eq!(series.total, 0.0);
+        // 5b9a9470 F4 still pins the sign: an empty window is +0.0.
+        assert_eq!(series.total.to_bits(), 0.0f64.to_bits(), "{series:?}");
+    }
+
+    #[test]
+    fn budget_series_calendar_cutoff_boundary_is_inclusive() {
+        // The cutoff day itself counts; the day before it never does,
+        // even when that older day carries the larger burn.
+        let now = 1_760_000_000;
+        let captures = vec![
+            budget_capture("old", now - 7 * 86_400 + 3_600, 9.00),
+            budget_capture("edge", now - 6 * 86_400 + 3_600, 1.00),
+            budget_capture("edge", now, 3.00),
+        ];
+        let series = statusline_budget_series(&captures, 7, now);
+        assert_eq!(series.daily.len(), 2, "{series:?}");
+        assert!((series.total - 3.00).abs() < 1e-9, "{series:?}");
+    }
+
+    #[test]
+    fn budget_view_stale_journal_renders_empty_window_not_last_sampled_week() {
+        // rm-628, view level — the assess PoC corpus: captures dated
+        // 2026-09-16/17 (rise 2.00 + 3.00) reported on 2026-10-06.
+        // The window is calendar-bounded, so the stale week counts
+        // zero: a truthful empty-window line, $0.00 total, and JSON
+        // keys that reflect the cutoff — never the $5.00 the old
+        // trailing-days-WITH-SAMPLES window counted as this week.
+        let now = 1_791_288_000; // 2026-10-06T12:00:00Z
+        let captures = vec![
+            budget_capture("A", 1_789_560_000, 2.00), // 2026-09-16T12:00:00Z
+            budget_capture("A", 1_789_646_400, 5.00), // 2026-09-17T12:00:00Z
+        ];
+        let stats = StatuslineJournalStats {
+            path: "/stale/statusline.jsonl".to_string(),
+            exists: true,
+            lines: 2,
+            bytes: 512,
+            retained_max_bytes: STATUSLINE_CAPTURE_MAX_BYTES,
+        };
+        let text = render_budget_view_from(
+            "text",
+            Some(10.0),
+            &stats,
+            &captures,
+            Path::new("/stale/statusline.jsonl"),
+            now,
+        );
+        assert!(
+            text.contains("(no cost samples in the window)"),
+            "truthful empty-window state: {text}"
+        );
+        assert!(text.contains("7d total $0.00"), "{text}");
+        assert!(text.contains("$10.00 remaining"), "{text}");
+        // No stale dates render as if they were in the window.
+        assert!(!text.contains("2026-09-1"), "{text}");
+        // The machine keys reflect the cutoff too.
+        let json = render_budget_view_from(
+            "json",
+            Some(10.0),
+            &stats,
+            &captures,
+            Path::new("/stale/statusline.jsonl"),
+            now,
+        );
+        let value: Value = serde_json::from_str(json.trim()).expect("json arm parses");
+        assert_eq!(value["daily"].as_array().map(Vec::len), Some(0), "{value}");
+        assert_eq!(value["spend_7d_usd"].as_f64(), Some(0.0));
+        assert_eq!(value["remaining_usd"].as_f64(), Some(10.0));
+    }
+
+    #[test]
+    fn budget_view_contract_one_parse_feeds_gate_and_series() {
+        // rm-630: the renderer takes its captures as input (the
+        // refactored shape is the single-read contract) — the empty
+        // gate and the rendered series come from ONE parse. The
+        // mid-rotation shape pins it: stats counted 3 lines, but the
+        // single parse — taken after compaction dropped the oldest —
+        // yields 2 captures; the output reflects exactly those
+        // captures, and the text and JSON arms agree on the total.
+        let now = 1_760_000_000;
+        let captures = vec![
+            budget_capture("A", now - 2 * 86_400, 2.00),
+            budget_capture("A", now - 2 * 86_400 + 3_600, 3.00),
+        ];
+        let stats = StatuslineJournalStats {
+            path: "/rotated/statusline.jsonl".to_string(),
+            exists: true,
+            lines: 3,
+            bytes: 512,
+            retained_max_bytes: STATUSLINE_CAPTURE_MAX_BYTES,
+        };
+        let text = render_budget_view_from(
+            "text",
+            Some(10.0),
+            &stats,
+            &captures,
+            Path::new("/rotated/statusline.jsonl"),
+            now,
+        );
+        // One parse: the series derives from the 2 given captures
+        // (rise 2.00 + 1.00 on one day), never from a re-read.
+        assert!(text.contains("7d total $3.00"), "{text}");
+        let json = render_budget_view_from(
+            "json",
+            Some(10.0),
+            &stats,
+            &captures,
+            Path::new("/rotated/statusline.jsonl"),
+            now,
+        );
+        let value: Value = serde_json::from_str(json.trim()).expect("json arm parses");
+        assert_eq!(value["spend_7d_usd"].as_f64(), Some(3.0));
+        assert_eq!(value["remaining_usd"].as_f64(), Some(7.0));
+        // The shape is deterministic: identical inputs render
+        // identical bytes (a re-read could not promise that against a
+        // journal rotating between invocations).
+        assert_eq!(
+            text,
+            render_budget_view_from(
+                "text",
+                Some(10.0),
+                &stats,
+                &captures,
+                Path::new("/rotated/statusline.jsonl"),
+                now,
+            )
         );
     }
 
@@ -967,7 +1173,7 @@ mod tests {
         // stripping it defensively anyway.
         let mut stripped = capture;
         stripped.payload.as_object_mut().map(|o| o.remove("cost"));
-        let series = statusline_budget_series(&[stripped], 7);
+        let series = statusline_budget_series(&[stripped], 7, 1_760_000_000);
         assert_eq!(series.daily.len(), 0);
         assert_eq!(series.total, 0.0);
     }
@@ -978,7 +1184,7 @@ mod tests {
             budget_capture("A", 1_000_000_000, 2.00),
             budget_capture("A", 1_000_000_000 + 3_600, 3.00),
         ];
-        let series = statusline_budget_series(&captures, 7);
+        let series = statusline_budget_series(&captures, 7, 1_000_000_000 + 7_200);
         let budget = Some(10.0);
         let text = render_statusline_report_text(
             &StatuslineJournalStats {
@@ -1216,12 +1422,53 @@ mod tests {
         assert!(line.contains("ctx 41%"), "context window pressure");
         assert!(line.contains("5h 84%"), "five-hour limit");
         assert!(line.contains("7d 46%"), "seven-day limit");
+        // rm-165: the reset time renders with an explicit UTC offset
+        // label (`until HH:MM±ZZZZ`, local time), never a bare
+        // unlabeled HH:MM that silently reads as wall-clock.
+        let until = line
+            .split("until ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("reset segment renders");
+        let bytes = until.as_bytes();
+        assert_eq!(until.len(), 10, "HH:MM±ZZZZ shape: {until} in {line:?}");
+        assert_eq!(bytes[2], b':', "HH:MM±ZZZZ shape: {until}");
+        assert!(
+            bytes[5] == b'+' || bytes[5] == b'-',
+            "explicit offset sign: {until}"
+        );
+        assert!(
+            bytes[..2]
+                .iter()
+                .chain(&bytes[3..5])
+                .chain(&bytes[6..])
+                .all(|b| b.is_ascii_digit()),
+            "digits elsewhere: {until}"
+        );
         assert!(line.contains("cache 90%"), "hit_ratio is a 0..1 ratio");
         assert!(line.contains("$1.23"), "running cost");
         // A payload with nothing renderable still yields one honest
         // line, never an empty string (a blank status line breaks the
         // host).
         assert_eq!(render_status_line(&serde_json::json!({})), "agenttrace");
+    }
+
+    #[test]
+    fn reset_time_renders_local_time_with_explicit_offset_across_midnight() {
+        // rm-165: `resets_at` is a UTC epoch. The status line renders
+        // the reset in the viewer's offset WITH that offset spelled
+        // out. The probe crosses UTC midnight in two non-UTC zones to
+        // pin that the time is converted, not relabeled: 2025-10-09
+        // 23:30Z is already Oct 10 in Tokyo and still Oct 9 in Lima.
+        let epoch = 1_760_052_600; // 2025-10-09T23:30:00Z
+        let tokyo = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        let lima = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        assert_eq!(format_reset_time(epoch, &tokyo), "08:30+0900");
+        assert_eq!(format_reset_time(epoch, &lima), "18:30-0500");
+        assert_eq!(format_reset_time(epoch, &utc), "23:30+0000");
+        // Out-of-range epochs keep the honest raw-epoch fallback.
+        assert_eq!(format_reset_time(i64::MAX, &utc), i64::MAX.to_string());
     }
 
     #[test]
