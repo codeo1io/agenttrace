@@ -250,8 +250,8 @@ pub(super) fn active_project_filter_label(app: &App) -> String {
     }
     app.sessions
         .iter()
-        .find(|session| resolve_project(session).id == app.project_id_filter)
-        .map(project_name)
+        .find(|session| app.project_identity(session).id == app.project_id_filter)
+        .map(|session| app.project_identity(session).display_name)
         .unwrap_or_else(|| app.project_id_filter.clone())
 }
 

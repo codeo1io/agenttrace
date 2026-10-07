@@ -1531,7 +1531,7 @@ pub(super) fn project_resolution_line(app: &App) -> String {
     let mut resolutions: BTreeMap<String, usize> = BTreeMap::new();
     let mut roots = std::collections::BTreeSet::new();
     for session in app.visible_sessions() {
-        let project = resolve_project(session);
+        let project = app.project_identity(session);
         *resolutions.entry(project.resolution).or_default() += 1;
         if !project.root.is_empty() {
             roots.insert(project.root);
@@ -1546,7 +1546,9 @@ pub(super) fn project_resolution_line(app: &App) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let selected = app.selected_session().map(resolve_project);
+    let selected = app
+        .selected_session()
+        .map(|session| app.project_identity(session));
     let selected = selected.map_or_else(
         || app.t("none", "无").to_string(),
         |project| {
