@@ -193,6 +193,14 @@ struct ContextAggregate {
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryEvidence {
     pub methodology: String,
+    /// rm-714: the per-row confidence disclaimer hoisted to document
+    /// level. Rows carry the bare confidence word; the "time-window
+    /// heuristic; Git commits are correlated, not attributable proof of
+    /// main-merge or business value" explanation is stated once here
+    /// instead of being re-serialized into every row (a 24,501-row
+    /// --overview -o report.json grew its sessions block by ~3.8 MB of
+    /// 155-byte repeats).
+    pub confidence_note: String,
     pub summary: DeliverySummary,
     pub sessions: Vec<SessionDeliveryEvidence>,
 }
@@ -754,7 +762,9 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
             project: project.display_name,
             level: level.to_string(),
             evidence,
-            confidence: format!("{confidence}: time-window heuristic; Git commits are correlated, not attributable proof of main-merge or business value"),
+            // rm-714: bare word — the disclaimer lives once at document
+            // level (DeliveryEvidence.confidence_note).
+            confidence: confidence.to_string(),
         });
     }
     sort_delivery_records(&mut records);
@@ -767,6 +777,7 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
         } else {
             "Lightweight heuristic based on observed tool authority only. Run --delivery-evidence for read-only local Git timestamp correlation.".to_string()
         },
+        confidence_note: "Confidence is a time-window heuristic; Git commits are correlated, not attributable proof of main-merge or business value".to_string(),
         summary,
         sessions: records,
     }
@@ -1308,7 +1319,11 @@ mod tests {
         let report = delivery_evidence(&[value]);
         assert_eq!(report.summary.medium, 1);
         assert!(report.methodology.contains("heuristic"));
-        assert!(report.sessions[0].confidence.contains("not attributable"));
+        // rm-714: rows carry the bare confidence word; the disclaimer is
+        // hoisted to the document-level confidence_note.
+        assert_eq!(report.sessions[0].confidence, "medium");
+        assert!(report.confidence_note.contains("not attributable"));
+        assert!(report.confidence_note.contains("time-window heuristic"));
     }
 
     #[test]
