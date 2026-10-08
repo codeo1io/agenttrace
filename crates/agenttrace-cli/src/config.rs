@@ -84,6 +84,14 @@ pub fn project_config_path() -> PathBuf {
 /// Parse the scalar `key = value` subset. Errors carry the file path
 /// and 1-based line number.
 pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
+    // rm-775 (run aa41d9b5 cycle 2): Windows editors write a leading
+    // U+FEFF byte-order mark. It is not whitespace, so `trim()` leaves
+    // it and every key in the file parsed as `\u{feff}key` — the
+    // unknown-key error then contradicted itself by listing the very
+    // key it rejected among the supported ones. Exactly ONE BOM is
+    // stripped at the door: a second BOM is data, not encoding, and
+    // still errors.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let shown = path.display();
     let mut file = ConfigFile::default();
     let mut seen: HashSet<String> = HashSet::new();
@@ -483,6 +491,33 @@ mod tests {
         let path = dir.join("config.toml");
         fs::write(&path, text).unwrap();
         path
+    }
+
+    #[test]
+    fn leading_bom_strips_exactly_once() {
+        // rm-775 (run aa41d9b5 cycle 2): Windows editors write a leading
+        // U+FEFF. char::trim does not strip it (it is not whitespace), so
+        // every key in a BOM'd file parsed as `\u{feff}weekly_budget_usd`
+        // and the unknown-key error contradicted itself — rejecting the
+        // key while listing it among the supported ones. Exactly ONE BOM
+        // is stripped at the door: a second BOM is data, not encoding,
+        // and still errors.
+        let dir = std::env::temp_dir().join(format!("at-config-bom-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(&dir, "\u{feff}weekly_budget_usd = 50.0\n");
+        let file = parse_config(&fs::read_to_string(&path).unwrap(), &path).unwrap();
+        assert_eq!(file.weekly_budget_usd, Some(50.0));
+
+        let path = write_config(&dir, "\u{feff}\u{feff}weekly_budget_usd = 50.0\n");
+        let error = parse_config(&fs::read_to_string(&path).unwrap(), &path).unwrap_err();
+        assert!(error.to_string().contains("unknown config key"));
+
+        let path = write_config(&dir, "not_a_real_key = 1\n");
+        let error = parse_config(&fs::read_to_string(&path).unwrap(), &path).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("not_a_real_key"));
+        assert!(!text.contains('\u{feff}'), "clean file, clean key name");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -177,3 +177,94 @@ fn copilot_later_checkpoint_still_ends_the_session() {
     assert_eq!(session.metrics.session_end, "2026-01-04T00:00:30Z");
     assert_eq!(session.metrics.duration_sec, 30.0);
 }
+
+// rm-771 (run aa41d9b5 cycle 2, "measured, not invented"): pre-Sept-2026
+// codex journals persist token_count totals but no per-message usage rows
+// (tokscale #1405 census: 0/40 files with usage Mar-Aug vs 40/40 Sept).
+// The session below has two assistant turns and zero usage rows, so every
+// token it reports is the turns-x-model text estimate. Pre-batch that
+// estimate was presented as measured usage with no disclosure anywhere
+// (PoC 2026-10-07: overview "tokens 4", anomalies empty). The estimator
+// stays — it is all the journal has — but the basis is disclosed: a
+// per-session counter on the rm-538 disclosure channel (aggregated into
+// data_health.disclosures) plus, for the codex schema-age class, an
+// explicit provenance marker naming the class.
+#[test]
+fn codex_schema_age_no_usage_rows_discloses_the_estimate_basis() {
+    let session = fixture("codex-no-usage-rows.jsonl");
+    assert_eq!(session.metrics.source_tool, "codex_cli");
+    assert_eq!(
+        session.metrics.provenance.tokens, "estimated_from_text+no_usage_rows:pre_sept_2026_schema",
+        "the schema-age class is named in-report, not left inferred"
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("usage_basis:estimated_no_usage_rows"),
+        Some(&1),
+        "per-session counter rolls up into data_health.disclosures"
+    );
+    // The estimate itself is kept — labeled, not deleted.
+    assert!(
+        session.metrics.tokens_input + session.metrics.tokens_output > 0,
+        "the text estimate remains the only available signal"
+    );
+}
+
+// rm-772 (same batch): the newer claude wire carries cache_creation as a
+// sub-object { ephemeral_5m_input_tokens, ephemeral_1h_input_tokens }
+// rather than a flat number. usage_from_value_with_keys extracted numbers
+// only, so the ENTIRE write bucket vanished: the fixture below reports
+// 100 in / 40 out / 10 cache-read / 50 5m-write + 500 1h-write, and
+// pre-batch the session reported 150 tokens (cost 0.0009) instead of the
+// true 700 (~0.0041) — a 4.6x understatement on cache-heavy sessions,
+// with the 1h duration information lost. Now the write bucket counts the
+// 5m+1h sum and the 1h component keeps its own metrics field so the
+// tiered-pricing rows (rm-251 arm 3 / rm-164) can price it later; today
+// both are priced at the flat (5m) rate, which the counters state.
+#[test]
+fn claude_ephemeral_cache_sub_object_counts_the_write_bucket() {
+    let session = fixture("claude-ephemeral-cache-split.jsonl");
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_output, 40);
+    assert_eq!(session.metrics.tokens_cache_r, 10);
+    assert_eq!(session.metrics.tokens_cache_w, 550, "50 5m + 500 1h");
+    assert_eq!(session.metrics.tokens_cache_w_1h, 500);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("cache_write:5m_1h_split"),
+        Some(&1)
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("cache_write:1h_priced_as_5m"),
+        Some(&1),
+        "today's flat rate is the 5m rate — the 1h bucket is priced as 5m until rm-251 arm 3 lands"
+    );
+}
+
+// rm-772 second half: a flat numeric cache_creation carries no duration
+// either — the catalog has no 1h field, so pricing it at the 5m rate is
+// an assumption. Pre-batch that assumption was silent; now every priced
+// cache-write states it.
+#[test]
+fn flat_cache_creation_discloses_the_5m_rate_assumption() {
+    let session = fixture("claude-flat-cache.jsonl");
+    assert_eq!(session.metrics.tokens_cache_w, 50);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("cache_write:5m_rate_assumed"),
+        Some(&1)
+    );
+    assert!(!session
+        .metrics
+        .disclosure_counters
+        .contains_key("cache_write:1h_priced_as_5m"));
+}

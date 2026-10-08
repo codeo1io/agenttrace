@@ -5,7 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (run aa41d9b5 cycle 2, rm-771 + rm-772): claude
+// `cache_creation` sub-objects now split — the 5m+1h write buckets sum
+// into `cache_creation_input_tokens` while the 1h component keeps its
+// own `cache_creation_1h_input_tokens` key (a cached session kept
+// serving the write-bucket-less totals with matching fingerprints),
+// and no-usage-row sessions gain the estimated-basis disclosure
+// counter. Parser-semantics changes are invisible to the content
+// digest, so the version is the invalidation (rm-230 convention);
+// integration re-bases the bump onto the advanced ceiling per the
+// 29 -> 30 precedent. Entries regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):
@@ -353,6 +363,8 @@ struct GoMetrics {
     tokens_output: i64,
     #[serde(default, rename = "TokensReasoning")]
     tokens_reasoning: i64,
+    #[serde(default, rename = "TokensCacheW1h")]
+    tokens_cache_w_1h: i64,
     #[serde(default, rename = "TokensCacheW")]
     tokens_cache_w: i64,
     #[serde(default, rename = "TokensCacheR")]
@@ -1460,6 +1472,7 @@ impl GoMetrics {
             tokens_input: metrics.tokens_input,
             tokens_output: metrics.tokens_output,
             tokens_reasoning: metrics.tokens_reasoning,
+            tokens_cache_w_1h: metrics.tokens_cache_w_1h,
             tokens_cache_w: metrics.tokens_cache_w,
             tokens_cache_r: metrics.tokens_cache_r,
             gaps_sec: metrics.gaps_sec.clone(),
@@ -1500,6 +1513,7 @@ impl GoMetrics {
             tokens_input: self.tokens_input,
             tokens_output: self.tokens_output,
             tokens_reasoning: self.tokens_reasoning,
+            tokens_cache_w_1h: self.tokens_cache_w_1h,
             tokens_cache_w: self.tokens_cache_w,
             tokens_cache_r: self.tokens_cache_r,
             timestamps: Vec::new(),

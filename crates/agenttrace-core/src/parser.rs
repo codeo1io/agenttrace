@@ -5313,6 +5313,48 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
             usage.insert(target.to_string(), value);
             matched_keys.push(key);
         }
+
+        // rm-772 (run aa41d9b5 cycle 2): the newer claude wire carries
+        // cache_creation as a sub-object — { ephemeral_5m_input_tokens,
+        // ephemeral_1h_input_tokens } — instead of a flat number. The
+        // numeric-only extraction above dropped the entire write bucket
+        // (the ephemeral fixture reports 150 of its true 700 tokens — a
+        // 4.6x cost understatement on cache-heavy sessions). When no
+        // flat number matched for the write bucket, split the
+        // sub-object: the bucket takes the 5m+1h sum, and the 1h
+        // component keeps its own usage key so tiered pricing (rm-251
+        // arm 3 / rm-164) can price it later — today both are priced at
+        // the flat (5m) rate, which the lane discloses per session.
+        if target == "cache_creation_input_tokens" && !usage.contains_key(target) {
+            for key in keys {
+                let Some(sub) = obj.get(*key).and_then(Value::as_object) else {
+                    continue;
+                };
+                let five_m = sub.get("ephemeral_5m_input_tokens").and_then(number_as_i64);
+                let one_h = sub.get("ephemeral_1h_input_tokens").and_then(number_as_i64);
+                if five_m.is_none() && one_h.is_none() {
+                    continue;
+                }
+                let one_h_present = one_h.is_some();
+                let one_h = one_h.unwrap_or(0);
+                usage.insert(
+                    "cache_creation_input_tokens".to_string(),
+                    five_m.unwrap_or(0).saturating_add(one_h),
+                );
+                usage.insert("cache_creation_1h_input_tokens".to_string(), one_h);
+                // Only the keys the sub-object actually carried — the
+                // matched keys feed the kimi alias-disclosure arm, so a
+                // pushed-but-absent key would mint a false disclosure.
+                matched_keys.push(*key);
+                if five_m.is_some() {
+                    matched_keys.push("ephemeral_5m_input_tokens");
+                }
+                if one_h_present {
+                    matched_keys.push("ephemeral_1h_input_tokens");
+                }
+                break;
+            }
+        }
     }
     // Thinking tokens ride the output rate but are reported separately
     // (Gemini usageMetadata.thoughtsTokenCount and the OpenAI-compatible

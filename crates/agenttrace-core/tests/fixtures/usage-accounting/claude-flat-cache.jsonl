@@ -1,0 +1,2 @@
+{"parentUuid":"a000","type":"user","message":{"role":"user","content":[{"type":"text","text":"cache check"}]},"timestamp":"2026-10-07T10:00:00.000Z"}
+{"parentUuid":"a000","type":"assistant","message":{"id":"msg_flat","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":100,"output_tokens":40,"cache_creation_input_tokens":50,"cache_read_input_tokens":10}},"timestamp":"2026-10-07T10:00:05.000Z"}

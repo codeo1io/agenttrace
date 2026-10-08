@@ -379,6 +379,11 @@ pub struct Metrics {
     /// `tokens_output` (pass-9 CU-20).
     pub tokens_reasoning: i64,
     pub tokens_cache_w: i64,
+    /// Cache write (creation) tokens that arrived via the claude
+    /// ephemeral 1h sub-bucket (rm-772): priced at the flat 5m rate
+    /// until tier selection (rm-251 arm 3 / rm-164) lands, disclosed as
+    /// `cache_write:1h_priced_as_5m`.
+    pub tokens_cache_w_1h: i64,
     pub tokens_cache_r: i64,
     #[serde(skip)]
     pub timestamps: Vec<DateTime<Utc>>,
@@ -650,6 +655,53 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
             metrics.provenance.tokens, zero_usage_events
         );
     }
+
+    // rm-771 (run aa41d9b5 cycle 2): a session with NO usage rows
+    // anywhere — the pre-Sept-2026 codex schema-age class, journals
+    // that persist token_count totals but never per-message usage —
+    // reports turns-x-model text estimates, not measured usage. The
+    // estimate stays (it is all the journal has) but the basis is
+    // disclosed: a per-session counter on the rm-538 disclosure
+    // channel (aggregated into data_health.disclosures), plus — for
+    // the codex schema-age class — an explicit provenance marker so
+    // no surface presents the invented tokens as measured.
+    let has_meta_usage = events.iter().any(|event| {
+        matches!(event.role.as_str(), "session_meta" | "meta") && !event.usage.is_empty()
+    });
+    if !has_meta_usage {
+        *metrics
+            .disclosure_counters
+            .entry("usage_basis:estimated_no_usage_rows".to_string())
+            .or_insert(0) += 1;
+        if metrics.source_tool == "codex_cli" {
+            metrics.provenance.tokens = format!(
+                "{}+no_usage_rows:pre_sept_2026_schema",
+                metrics.provenance.tokens
+            );
+        }
+    }
+
+    // rm-772: cache pricing is duration-blind — the catalog carries no
+    // 1h field, so every cache-write this tool prices rides the flat
+    // (5m) rate. Disclose per session which journal shape produced the
+    // bucket: a split 5m/1h sub-object (the 1h bucket explicitly priced
+    // as 5m until tier selection, rm-251 arm 3 / rm-164, lands) or a
+    // flat number whose 5m duration is an assumption.
+    if metrics.tokens_cache_w_1h > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("cache_write:5m_1h_split".to_string())
+            .or_insert(0) += 1;
+        *metrics
+            .disclosure_counters
+            .entry("cache_write:1h_priced_as_5m".to_string())
+            .or_insert(0) += 1;
+    } else if metrics.tokens_cache_w > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("cache_write:5m_rate_assumed".to_string())
+            .or_insert(0) += 1;
+    }
     let display_name = session_display_name(name, &events);
     metrics.provenance.naming = if display_name != name {
         "first_user_request"
@@ -886,6 +938,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     metrics.tokens_cache_w = metrics
                         .tokens_cache_w
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
+                    metrics.tokens_cache_w_1h = metrics
+                        .tokens_cache_w_1h
+                        .saturating_add(usage_tokens("cache_creation_1h_input_tokens"));
                     metrics.tokens_cache_r = metrics
                         .tokens_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
