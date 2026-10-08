@@ -176,7 +176,12 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
+// rm-790 (run 2023f222 cycle 1): sqlite-backed sessions now carry their
+// source row key (`SessionKey`) and opencode children their parent row id
+// (`ParentSession`), so the derived-history identity is per-row instead of
+// per-(db, second); older snapshots would re-fold same-second sessions onto
+// one id, so they regenerate once.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -409,6 +414,23 @@ struct GoMetrics {
     disclosure_counters: BTreeMap<String, usize>,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
+    /// rm-790: source row identity for sqlite-backed sessions; empty
+    /// for transcript lanes, so the transcript cache stays byte-identical.
+    #[serde(
+        default,
+        rename = "SessionKey",
+        skip_serializing_if = "String::is_empty"
+    )]
+    session_key: String,
+    /// rm-791: raw parent row id for sqlite-backed children — SOURCE DATA
+    /// that must survive the snapshot round-trip so the post-load
+    /// attribution (subagents.rs) can re-derive linkage and rollups.
+    #[serde(
+        default,
+        rename = "ParentSession",
+        skip_serializing_if = "String::is_empty"
+    )]
+    parent_session: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1489,6 +1511,8 @@ impl GoMetrics {
             upstream_cost_usd: metrics.upstream_cost_usd,
             disclosure_counters: metrics.disclosure_counters.clone(),
             provenance: metrics.provenance.clone(),
+            session_key: metrics.session_key.clone(),
+            parent_session: metrics.parent_session.clone(),
         }
     }
 
@@ -1530,8 +1554,13 @@ impl GoMetrics {
             upstream_cost_usd: self.upstream_cost_usd,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
-            // rm-545: subagent rollups are re-derived after every load
-            // (discovery.rs), so the cached shape carries zeros here.
+            // rm-790/rm-791: the source row key and the raw parent row id
+            // round-trip — they are source data the attribution consumes
+            // after load; the rm-545 subagent rollups stay re-derived on
+            // every load (discovery.rs), so the cached shape carries zeros
+            // for them.
+            session_key: self.session_key,
+            parent_session: self.parent_session,
             ..Metrics::default()
         }
     }
@@ -1742,6 +1771,12 @@ mod tests {
             cwd: String::new(),
             metrics: Metrics {
                 stored_totals_delta: 720,
+                // rm-790/rm-791: the source row key and the raw parent row
+                // id are SOURCE DATA — they must survive the snapshot
+                // round-trip so identity and re-attribution hold on cache
+                // hits.
+                session_key: "ses-cached".to_string(),
+                parent_session: "ses-parent".to_string(),
                 provenance: crate::MetricProvenance {
                     tokens: "stored_session_totals".to_string(),
                     duration: "timestamp_span".to_string(),
@@ -1759,11 +1794,12 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version seven (cycle-1 rm-198): hermes tool outcome semantics
-        // changed (ok/fail now derive from the messages table instead of
-        // fabricating ok == tool_call_count), so v6 snapshots carry stale
-        // tool outcome splits and must regenerate.
-        assert_eq!(doc["schema_version"], 7);
+        // Version eight (rm-790, run 2023f222 cycle 1): sqlite-backed
+        // sessions now carry their source row key and opencode children
+        // their parent row id, so the derived-history identity is per-row
+        // instead of per-(db, second); v7 snapshots would re-fold
+        // same-second sessions onto one id and must regenerate.
+        assert_eq!(doc["schema_version"], 8);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1775,15 +1811,23 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eight cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
+        assert_eq!(
+            loaded[0].metrics.session_key, "ses-cached",
+            "rm-790: the source row key round-trips through the snapshot"
+        );
+        assert_eq!(
+            loaded[0].metrics.parent_session, "ses-parent",
+            "rm-791: the raw parent row id round-trips for post-load attribution"
+        );
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(6);
+        old["schema_version"] = serde_json::Value::from(7);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema six json"),
+            serde_json::to_vec(&old).expect("schema seven json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());

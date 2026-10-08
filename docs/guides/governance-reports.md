@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 32 and the SQLite snapshot is schema 7; the
+The session cache is schema 32 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -110,7 +110,11 @@ integration as rm-601..rm-603 with rm-555 folded into the landed
 rm-551; schema landed as 31 → 32, re-basing the campaign's own
 26 → 27 bump onto the ceiling) —
 so cached sessions regenerate under the corrected totals; the SQLite snapshot to 7
-when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
+when Hermes tool outcomes began deriving from message result rows, and to 8 when
+sqlite-backed sessions began carrying their source row key and opencode children
+their parent row id, making derived-history identity per-row instead of
+per-(database, second) so same-second sessions in one database stop folding onto
+a single history record (rm-790, run 2023f222 cycle 1)). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the snapshot is bounded at
