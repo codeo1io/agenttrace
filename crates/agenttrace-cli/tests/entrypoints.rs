@@ -1741,3 +1741,141 @@ fn statusline_report_leaves_the_statusline_journal_untouched_e2e() {
     );
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+/// rm-749: the ungated view lanes early-return before
+/// `enforce_report_gates` can run, so a CI step that passed a gate flag
+/// to them got a silent green — the flag vanished and the pipeline
+/// believed its threshold was enforced. Every ungated view now discloses
+/// on stderr which flags it ignored and names the gated actions where
+/// they DO apply; rc stays 0 (views cannot fail), and stdout stays
+/// machine-stable. The rm-486 byte-stable views (--waste, plain
+/// --diagnostics) are exempt by their named carve-out.
+#[test]
+fn ungated_view_lanes_disclose_ignored_gate_flags_on_stderr() {
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-rm749-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    std::fs::write(
+        work.join("session.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"run the thing"},"sessionId":"s1","timestamp":"2026-05-07T02:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":"done"},"sessionId":"s1","timestamp":"2026-05-07T02:00:05Z"}
+"#,
+    )
+    .expect("write session");
+
+    // rm-301 style sandbox (see compare_honors_the_fail_under_health_gate):
+    // the CLI loads and saves the session cache, so pin HOME/XDG_CACHE_HOME.
+    let cache = work.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let dir = work.to_str().expect("temp dir is valid UTF-8");
+    for lane in [
+        vec!["--sessions"],
+        vec!["--inspect", "1"],
+        vec!["--latest"],
+        vec!["--search", "run"],
+        vec!["--statusline-report"],
+        vec!["--budget"],
+    ] {
+        let mut args = vec!["-d", dir];
+        args.extend_from_slice(&lane);
+        args.extend_from_slice(&["--fail-under-health", "100"]);
+        let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &work)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(&args)
+            .output()
+            .expect("run agenttrace CLI");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "view lanes stay rc0 even with gate flags: {lane:?} -> {stderr}"
+        );
+        assert!(
+            stderr.contains("gates ignored on this action (--fail-under-health 100)"),
+            "lane {lane:?} must disclose the ignored flag, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("--overview"),
+            "disclosure must name where the flags DO apply: {stderr}"
+        );
+        let plain = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &work)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args({
+                let mut base = vec!["-d", dir];
+                base.extend_from_slice(&lane);
+                base
+            })
+            .output()
+            .expect("run agenttrace CLI without gate flags");
+        assert_eq!(
+            plain.stdout, out.stdout,
+            "stdout must be identical with and without gate flags: {lane:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// rm-749 carve-out: --waste and plain --diagnostics are rm-486
+/// byte-stable views. They stay exempt from the disclosure — their
+/// stderr (empty) and stdout are byte-identical with and without a
+/// gate flag, so anything scripted against them keeps working.
+#[test]
+fn waste_and_plain_diagnostics_stay_byte_stable_with_gate_flags() {
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-rm749-carveout-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    std::fs::write(
+        work.join("session.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"run the thing"},"sessionId":"s1","timestamp":"2026-05-07T02:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":"done"},"sessionId":"s1","timestamp":"2026-05-07T02:00:05Z"}
+"#,
+    )
+    .expect("write session");
+    let cache = work.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let dir = work.to_str().expect("temp dir is valid UTF-8");
+    for lane in [vec!["--waste"], vec!["--diagnostics"]] {
+        let mut base = vec!["-d", dir];
+        base.extend_from_slice(&lane);
+        let plain = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &work)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(&base)
+            .output()
+            .expect("run without gate flags");
+        let gated = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &work)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args({
+                let mut with_flag = base.clone();
+                with_flag.extend_from_slice(&["--fail-under-health", "100"]);
+                with_flag
+            })
+            .output()
+            .expect("run with gate flags");
+        assert_eq!(
+            plain.status.code(),
+            Some(0),
+            "carve-out lane must succeed: {lane:?}"
+        );
+        assert_eq!(plain.stdout, gated.stdout, "stdout byte-stable: {lane:?}");
+        assert_eq!(plain.stderr, gated.stderr, "stderr byte-stable: {lane:?}");
+        assert!(
+            !String::from_utf8_lossy(&gated.stderr).contains("gates ignored"),
+            "rm-486 carve-out views must not disclose: {lane:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&work);
+}

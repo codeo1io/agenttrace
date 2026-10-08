@@ -161,12 +161,15 @@ fn load_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "hermes") {
         return filter_since(sessions, since);
     }
-    let sessions = query_hermes_sqlite_sessions(path, None);
+    // rm-750: `filter_since` below is the ONLY time-filter authority for
+    // SQLite-sourced sessions (the cache arm and the query arm both pass
+    // through it), so the query runs unfiltered.
+    let sessions = query_hermes_sqlite_sessions(path);
     let _ = crate::session_cache::store_sqlite_snapshot(path, "hermes", &sessions);
     filter_since(sessions, since)
 }
 
-fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn query_hermes_sqlite_sessions(path: &Path) -> Vec<Session> {
     let Ok(db) = open_sqlite_read_only(path) else {
         return Vec::new();
     };
@@ -177,16 +180,18 @@ fn query_hermes_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Ve
     } else {
         "''"
     };
+    // rm-750: no `since` SQL arm — it was dead (every caller bound None and
+    // filtered through `filter_since`, the single authority), and a second
+    // predicate would drift from the unknown-time semantics documented at
+    // `session_within_since`.
     let sql = format!(
         "select id, model, started_at, ended_at, message_count, tool_call_count, \
-         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, {cwd} from sessions \
-         where (?1 is null or started_at >= ?1 or started_at is null or started_at <= 0)"
+         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, {cwd} from sessions"
     );
     let Ok(mut stmt) = db.prepare(&sql) else {
         return Vec::new();
     };
-    let since_unix = since.map(|value| value.timestamp() as f64);
-    let Ok(rows) = stmt.query_map([since_unix], |row| {
+    let Ok(rows) = stmt.query_map([], |row| {
         Ok(SqliteSessionAgg {
             id: row.get::<_, String>(0)?,
             model: string_or(row.get::<_, Option<String>>(1)?, "default"),
@@ -245,16 +250,18 @@ fn load_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> V
     if let Some(sessions) = crate::session_cache::load_sqlite_snapshot(path, "opencode") {
         return filter_since(sessions, since);
     }
-    let sessions = query_opencode_sqlite_sessions(path, None);
+    // rm-750: single time-filter authority (`filter_since`), see the
+    // hermes lane note above.
+    let sessions = query_opencode_sqlite_sessions(path);
     let _ = crate::session_cache::store_sqlite_snapshot(path, "opencode", &sessions);
     filter_since(sessions, since)
 }
 
-fn query_opencode_sqlite_sessions(path: &Path, since: Option<DateTime<Utc>>) -> Vec<Session> {
+fn query_opencode_sqlite_sessions(path: &Path) -> Vec<Session> {
     let Ok(db) = open_sqlite_read_only(path) else {
         return Vec::new();
     };
-    let mut aggs = opencode_sqlite_session_rows(&db, path, since);
+    let mut aggs = opencode_sqlite_session_rows(&db, path);
     if aggs.is_empty() {
         return Vec::new();
     }
@@ -331,6 +338,12 @@ fn apply_opencode_stored_totals(agg: &mut SqliteSessionAgg) {
     }
 }
 
+/// The single time-filter authority for SQLite-sourced sessions (rm-750):
+/// both the warm-cache arm and the fresh-query arm of every SQLite lane
+/// pass through here, so unknown-time semantics — a session whose start is
+/// null, zero, or unparseable is KEPT, never hidden by a since cut — have
+/// exactly one definition, documented and pinned at
+/// `session_within_since` and its test.
 fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Session> {
     sessions
         .into_iter()
@@ -350,11 +363,7 @@ fn session_within_since(session: &Session, since: Option<DateTime<Utc>>) -> bool
     })
 }
 
-fn opencode_sqlite_session_rows(
-    db: &Connection,
-    path: &Path,
-    since: Option<DateTime<Utc>>,
-) -> HashMap<String, SqliteSessionAgg> {
+fn opencode_sqlite_session_rows(db: &Connection, path: &Path) -> HashMap<String, SqliteSessionAgg> {
     let directory = if sqlite_has_column(db, "session", "directory") {
         "directory"
     } else {
@@ -397,15 +406,15 @@ fn opencode_sqlite_session_rows(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // rm-750: no `since` SQL arm — dead since the cache lane landed;
+    // `filter_since` owns time filtering for both lanes.
     let sql = format!(
-        "select id, title, time_created, time_updated, {directory}, {stored_select} from session \
-         where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
+        "select id, title, time_created, time_updated, {directory}, {stored_select} from session"
     );
     let Ok(mut stmt) = db.prepare(&sql) else {
         return HashMap::new();
     };
-    let since_millis = since.map(|value| value.timestamp_millis());
-    let Ok(rows) = stmt.query_map([since_millis], |row| {
+    let Ok(rows) = stmt.query_map([], |row| {
         let id = row.get::<_, String>(0)?;
         Ok((
             id.clone(),
@@ -513,9 +522,30 @@ fn capture_opencode_user_text(db: &Connection, aggs: &mut HashMap<String, Sqlite
         }
         let text = string(part.get("text"));
         if !text.trim().is_empty() {
-            agg.first_user_text = text.to_string();
+            agg.first_user_text = cap_first_user_text(text);
         }
     }
+}
+
+/// rm-451: bound the first-user-message capture. The aggregate feeds
+/// `display_title_from_text`, which reads only the first ~60 characters —
+/// a pathological or hostile multi-megabyte prompt would otherwise be
+/// retained in full and flow into every snapshot and cache downstream of
+/// the aggregate. 8 KiB keeps every realistic title byte-identical while
+/// bounding retention.
+const FIRST_USER_TEXT_CAPTURE_CAP_BYTES: usize = 8 * 1024;
+
+/// Char-boundary-safe truncation so a cap never splits a multi-byte
+/// character (and can never panic).
+fn cap_first_user_text(text: &str) -> String {
+    if text.len() <= FIRST_USER_TEXT_CAPTURE_CAP_BYTES {
+        return text.to_string();
+    }
+    let mut end = FIRST_USER_TEXT_CAPTURE_CAP_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn add_opencode_sqlite_parts(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
@@ -994,7 +1024,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions = query_hermes_sqlite_sessions(&path);
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(sessions.len(), 2, "both fixture sessions must load");
 
@@ -1036,7 +1066,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("tempdir");
         let path = hermes_state_db_fixture(&root);
-        let sessions = query_hermes_sqlite_sessions(&path, None);
+        let sessions = query_hermes_sqlite_sessions(&path);
         std::fs::remove_dir_all(&root).ok();
 
         // s1: ok 1 / fail 1 -> 50% across the corpus (s2 contributes no
@@ -1056,5 +1086,129 @@ mod tests {
                 .any(|message| message.contains("tool failure rate")),
             "--max-tool-fail-rate must trip on hermes-sourced failures: {failures:?}"
         );
+    }
+
+    #[test]
+    fn since_filtering_has_one_authority_and_keeps_undated_sessions() {
+        // rm-750: the `since` SQL arms on both SQLite queries were dead —
+        // every caller bound None and filtered through `filter_since`, so
+        // a second predicate could drift from the unknown-time rule at
+        // `session_within_since` without any test noticing. The arms are
+        // gone; this pins the surviving contract: the query returns every
+        // row, and the single authority keeps undated sessions while
+        // cutting only known-start sessions before the cutoff.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm750-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = root.join("state.db");
+        let db = Connection::open(&path).expect("open fixture db");
+        db.execute_batch(
+            r#"
+            create table sessions (
+                id text primary key, model text, started_at real, ended_at real,
+                message_count integer, tool_call_count integer,
+                input_tokens integer, output_tokens integer,
+                cache_read_tokens integer, cache_write_tokens integer, cwd text
+            );
+            insert into sessions values
+                ('s_undated', 'claude-sonnet-4', null, null, 1, 0, 1, 1, 0, 0, '/work/x'),
+                ('s_old',     'claude-sonnet-4', 1700000000.0, 1700000100.0, 1, 0, 1, 1, 0, 0, '/work/x'),
+                ('s_new',     'claude-sonnet-4', 1800000000.0, 1800000100.0, 1, 0, 1, 1, 0, 0, '/work/x');
+            "#,
+        )
+        .expect("seed fixture");
+
+        let sessions = query_hermes_sqlite_sessions(&path);
+        assert_eq!(
+            sessions.len(),
+            3,
+            "the query lane has no time filter — every row must load"
+        );
+
+        let since = chrono::DateTime::<chrono::Utc>::from_timestamp(1750000000, 0);
+        let kept: Vec<String> = filter_since(sessions, since)
+            .iter()
+            .map(|session| session.name.clone())
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["s_undated".to_string(), "s_new".to_string()],
+            "undated sessions stay in the unknown-time bucket; only known-start rows before the cutoff drop"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn opencode_first_user_text_capture_is_capped() {
+        // rm-451: the capture previously retained the first user message
+        // in full, so a pathological (or hostile) multi-megabyte prompt
+        // flowed into every aggregate, snapshot, and cache downstream.
+        // The cap bounds retention; the title only reads ~60 characters,
+        // so a capped capture still names the session identically.
+        let marker = "CAPTURE-MARKER line one of a pathological prompt";
+        let hostile = format!("{marker}{}", "x".repeat(2 * 1024 * 1024));
+        let capped = cap_first_user_text(&hostile);
+        assert_eq!(
+            capped.len(),
+            8 * 1024,
+            "capture is capped at 8 KiB, got {}",
+            capped.len()
+        );
+        assert!(capped.starts_with(marker), "cap keeps the head of the text");
+        // Multi-byte safety: cutting at a cap that lands inside a
+        // character must back up to a boundary, never panic or split.
+        let multibyte = "é".repeat(10 * 1024); // 2 bytes per char
+        let capped_mb = cap_first_user_text(&multibyte);
+        assert!(capped_mb.len() <= 8 * 1024);
+        assert!(capped_mb.chars().all(|c| c == 'é'));
+        // Short texts pass through untouched.
+        assert_eq!(cap_first_user_text("short prompt"), "short prompt");
+
+        // End-to-end: a 2 MiB first user message still yields the marker
+        // title through the message-derived naming path.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm451-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = root.join("db.sqlite");
+        let db = Connection::open(&path).expect("open fixture db");
+        db.execute_batch(&format!(
+            r#"
+            create table session (
+                id text primary key, title text, time_created integer, time_updated integer
+            );
+            create table message (
+                id text primary key, session_id text, time_created integer, data text
+            );
+            create table part (
+                id text primary key, message_id text, session_id text,
+                time_created integer, data text
+            );
+            insert into session values
+                ('s_hostile', '', 1800000000000, 1800000001000);
+            insert into message values
+                ('m1', 's_hostile', 1800000000000, '{{"role":"user"}}');
+            insert into part values
+                ('p1', 'm1', 's_hostile', 1800000000000, '{{"type":"text","text":"{hostile}"}}');
+            "#,
+        ))
+        .expect("seed fixture");
+        drop(db);
+
+        let sessions = query_opencode_sqlite_sessions(&path);
+        std::fs::remove_dir_all(&root).ok();
+        let session = sessions
+            .iter()
+            .find(|session| session.name.contains("CAPTURE-MARKER"))
+            .expect("message-derived name must survive the cap");
+        assert!(
+            session.name.starts_with("CAPTURE-MARKER line one of a pathological"),
+            "capped capture still names the session from its head: {}",
+            session.name
+        );
+        assert!(session.name.ends_with('…'), "long titles truncate visibly");
     }
 }

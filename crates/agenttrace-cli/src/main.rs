@@ -123,10 +123,23 @@ struct Args {
     #[arg(long = "search-limit", default_value_t = 20)]
     search_limit: usize,
     #[arg(long = "fail-under-health", default_value_t = 0)]
+    /// Fail (exit 2) when the gated report actions (--overview, --audit,
+    /// --compare, --recommend, --delivery-evidence, --mcp-governance,
+    /// --context-trends) compute an average health below this value.
+    /// Ungated view actions (--sessions, --inspect, --latest, --search,
+    /// --statusline-report) cannot enforce it and disclose "gates
+    /// ignored on this action" on stderr instead; --waste and plain
+    /// --diagnostics stay byte-stable by design.
     fail_under_health: i32,
     #[arg(long = "fail-on-critical")]
+    /// Fail (exit 2) when a gated report action reports a critical
+    /// finding. Ungated views disclose when it is passed to them (see
+    /// --fail-under-health for the exact lane list).
     fail_on_critical: bool,
     #[arg(long = "max-tool-fail-rate")]
+    /// Fail (exit 2) when a gated report action observes a tool failure
+    /// rate above this percentage. Ungated views disclose when it is
+    /// passed to them (see --fail-under-health for the exact lane list).
     max_tool_fail_rate: Option<f64>,
     #[arg(long)]
     baseline: Option<String>,
@@ -354,6 +367,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.statusline_report {
+        disclose_ignored_gates(&args);
         let out = agenttrace_core::render_statusline_report(&args.format, resolved.weekly_budget)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -363,6 +377,7 @@ fn run() -> anyhow::Result<()> {
     if args.budget {
         // rm-385: the weekly window-burn view — journal-based, no
         // session discovery, mirroring --statusline-report.
+        disclose_ignored_gates(&args);
         let out = agenttrace_core::render_budget_view(&args.format, resolved.weekly_budget)?;
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -524,6 +539,7 @@ fn run() -> anyhow::Result<()> {
     }
 
     if single_session_report_requested(&args) {
+        disclose_ignored_gates(&args);
         let sessions = prepare_cli_view(load_sessions(&args)?, &args)?;
         let session =
             latest_session(&sessions).context("No sessions match the requested filters")?;
@@ -544,6 +560,9 @@ fn run() -> anyhow::Result<()> {
 
     if args.sessions || args.diagnostics || args.inspect.is_some() {
         if args.sessions {
+            // rm-749: the session LIST is a view, not a gated report —
+            // disclose ignored gate flags instead of swallowing them.
+            disclose_ignored_gates(&args);
             let out = render_session_list(&sessions, &args.format, args.limit);
             write_output(&args.output, &(out.clone() + "\n"))?;
             write_stdout(&out)?;
@@ -563,6 +582,12 @@ fn run() -> anyhow::Result<()> {
         } else {
             sessions.first().expect("sessions checked non-empty")
         };
+        // Plain --diagnostics is an rm-486 byte-stable view and stays
+        // exempt; the inspect/latest diagnostics lanes disclose like the
+        // other ungated views.
+        if args.inspect.is_some() || args.latest {
+            disclose_ignored_gates(&args);
+        }
         let out = render_diagnostics(session, &sessions, &args.format, language)?;
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
@@ -570,6 +595,10 @@ fn run() -> anyhow::Result<()> {
     }
 
     if let Some(query) = args.search.as_deref() {
+        // rm-749: --search is an ungated view (it early-returns before
+        // enforce_report_gates can run); a passed gate flag is disclosed,
+        // not silently swallowed.
+        disclose_ignored_gates(&args);
         let results = search_sessions(&sessions, query, args.search_limit);
         let out = if args.format == "json" {
             report_search_json(&results)
@@ -721,6 +750,34 @@ fn run() -> anyhow::Result<()> {
     }
 
     bail!("no report action selected")
+}
+
+/// rm-749: the ungated view lanes early-return before
+/// `enforce_report_gates` can run, so a CI step that passed a gate flag
+/// got a silent green — the flag vanished without a trace and the
+/// pipeline believed its threshold was enforced. Every lane that skips
+/// gate enforcement now discloses on stderr exactly which flags it
+/// ignored and where they DO apply; stdout stays machine-stable. The
+/// rm-486 views (--waste, plain --diagnostics) keep their byte-stable
+/// output contract and are exempt by their own named carve-out.
+fn disclose_ignored_gates(args: &Args) {
+    let mut ignored: Vec<String> = Vec::new();
+    if args.fail_under_health != 0 {
+        ignored.push(format!("--fail-under-health {}", args.fail_under_health));
+    }
+    if args.fail_on_critical {
+        ignored.push("--fail-on-critical".to_string());
+    }
+    if let Some(rate) = args.max_tool_fail_rate {
+        ignored.push(format!("--max-tool-fail-rate {rate}"));
+    }
+    if ignored.is_empty() {
+        return;
+    }
+    eprintln!(
+        "agenttrace: gates ignored on this action ({}): gate flags only apply to the gated report actions (--overview, --audit, --compare, --recommend, --delivery-evidence, --mcp-governance, --context-trends); this view cannot fail on them",
+        ignored.join(", ")
+    );
 }
 
 /// rm-486: the --fail-* report gate, evaluated identically by every report

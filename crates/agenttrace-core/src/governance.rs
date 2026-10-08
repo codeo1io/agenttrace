@@ -21,6 +21,11 @@ pub struct CostAudit {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PricingCoverage {
     pub priced_sessions: usize,
+    /// rm-748: "exact" = user rate, the maker's own row, or a curated
+    /// row. This estimate bucket also holds reseller stand-ins and
+    /// variant-strip claims — real catalog prices, but not the model's
+    /// own listing; `by_provider_model.pricing_status` discloses which
+    /// (variant_estimate / reseller_estimate / fallback_estimate).
     pub fallback_priced_sessions: usize,
     pub unpriced_or_unknown_sessions: usize,
     pub exact_pricing_pct: f64,
@@ -257,7 +262,12 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         if matches!(model.as_str(), "default" | "unknown" | "multiple") {
             row.unknown += 1;
             coverage.unpriced_or_unknown_sessions += 1;
-        } else if pricing::has_specific_price(&model) {
+        } else if pricing::pricing_tier(&model).is_exact() {
+            // rm-748: only user rates, maker rows, and curated rows
+            // count as exact. A reseller stand-in or a variant-strip
+            // claim is a real price but not the model's own listing —
+            // it falls to the estimate bucket (pricing_status shows
+            // which).
             row.specific += 1;
             coverage.priced_sessions += 1;
         } else {
@@ -305,10 +315,20 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             } else if row.unknown > 0 {
                 ("unpriced_or_unknown", "model name is missing or generic")
             } else if row.fallback > 0 {
-                (
-                    "fallback_estimate",
-                    "no exact catalog match; built-in fallback rate used",
-                )
+                match pricing::pricing_tier(&model) {
+                    pricing::PricingTier::Variant { .. } => (
+                        "variant_estimate",
+                        "priced via a related model's catalog row (generation may differ); not an exact match",
+                    ),
+                    pricing::PricingTier::Reseller { .. } => (
+                        "reseller_estimate",
+                        "priced via a reseller/gateway catalog row; no maker row for this model",
+                    ),
+                    _ => (
+                        "fallback_estimate",
+                        "no exact catalog match; built-in fallback rate used",
+                    ),
+                }
             } else {
                 (
                     "catalog_estimate",

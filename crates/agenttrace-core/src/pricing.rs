@@ -283,6 +283,13 @@ pub fn catalog_identity() -> &'static str {
     IDENTITY.get_or_init(|| catalog_identity_of(pricing_catalog()))
 }
 
+/// Claim-logic version (rm-748): hashed into every catalog identity so a
+/// change to HOW models claim catalog rows (maker-first claiming, variant
+/// downgrades) invalidates cached per-session costs exactly once per logic
+/// change. Pure relabel-only changes must NOT bump this: a label flip
+/// should keep warm caches hitting.
+const CLAIM_LOGIC_VERSION: &str = "rm748-maker-first-v1";
+
 pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
     fn fnv1a(bytes: &[u8], state: u64) -> u64 {
         bytes.iter().fold(state, |hash, byte| {
@@ -290,6 +297,9 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         })
     }
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // rm-748: versioned first so claim-rule changes invalidate exactly
+    // once even when the catalog bytes are identical.
+    hash = fnv1a(CLAIM_LOGIC_VERSION.as_bytes(), hash);
     for (name, price) in &catalog.entries {
         hash = fnv1a(name.as_bytes(), hash);
         for value in [price.input, price.output, price.cw, price.cr] {
@@ -368,6 +378,94 @@ fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
         .filter(|provider| !provider.trim().is_empty())
 }
 
+/// How a model's price was claimed (rm-748). A catalog row is not
+/// always the model's own listing: a bare id may be priced by a
+/// reseller/gateway stand-in (no maker row anywhere), or by stripping
+/// trailing id segments until something matches (a variant, possibly a
+/// different numeric generation). The tier makes that distinction
+/// machine-readable so coverage never counts a stand-in as exact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PricingTier {
+    /// A user-set rate (`--pricing-override`): beats everything.
+    Override,
+    /// The model's own listing, claimed by the vendor's row
+    /// (`<maker>/<id>`, maker-priority provider).
+    Maker { claimed: String, provider: String },
+    /// A reseller/gateway row stood in for a bare id that has no maker
+    /// row in the catalog. A real price, but not the vendor's rate.
+    Reseller { claimed: String, provider: String },
+    /// The row carried no provider record (degraded/builtin catalog);
+    /// nothing to disclose beyond the row itself.
+    Unattributed { claimed: String },
+    /// Claimed by stripping trailing id segments (`mistral-large-4` ->
+    /// `mistral-large`): an estimate from a related model, never exact —
+    /// the strip may cross a numeric generation.
+    Variant { resolved: String, claimed: String },
+    /// No catalog row at all: the built-in default rate.
+    Fallback,
+}
+
+impl PricingTier {
+    /// rm-748: whether this tier counts toward exact pricing coverage.
+    /// User rates, maker-claimed rows, and provider-less curated rows
+    /// are exact; reseller stand-ins and variant strips are estimates
+    /// and count as fallback-priced.
+    pub fn is_exact(&self) -> bool {
+        matches!(
+            self,
+            Self::Override | Self::Maker { .. } | Self::Unattributed { .. }
+        )
+    }
+}
+
+/// The claim tier of `model`'s price under the ACTIVE catalog and
+/// overrides. Mirrors the exact resolution chain `lookup_price` uses.
+pub fn pricing_tier(model: &str) -> PricingTier {
+    pricing_tier_for(model, &pricing_catalog(), pricing_override_models())
+}
+
+fn pricing_tier_for(
+    model: &str,
+    catalog: &PricingCatalog,
+    override_models: &BTreeSet<String>,
+) -> PricingTier {
+    let normalized = normalize_model(model);
+    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
+        return PricingTier::Fallback;
+    };
+    if key != resolved {
+        // The claim survived a segment strip, so the row is a related
+        // model's, not this id's own listing — a numeric generation may
+        // have been crossed (mistral-large-4 -> mistral-large). This is
+        // an estimate even when the base row is user-priced: the user
+        // set a rate for the related model, not this one.
+        return PricingTier::Variant {
+            resolved,
+            claimed: key,
+        };
+    }
+    if override_models.contains(&key) {
+        return PricingTier::Override;
+    }
+    match catalog
+        .providers
+        .get(&key)
+        .cloned()
+        .filter(|provider| !provider.trim().is_empty())
+    {
+        Some(provider) if is_maker_provider(&provider) => PricingTier::Maker {
+            claimed: key,
+            provider,
+        },
+        Some(provider) => PricingTier::Reseller {
+            claimed: key,
+            provider,
+        },
+        None => PricingTier::Unattributed { claimed: key },
+    }
+}
+
 fn pricing_source_for_catalog(
     model: &str,
     catalog: &PricingCatalog,
@@ -378,7 +476,27 @@ fn pricing_source_for_catalog(
     let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
         return "built-in fallback".to_string();
     };
-    if override_models.contains(&key) {
+    // rm-748 claim disclosure: a catalog row is not always this model's
+    // own listing — a reseller/gateway row may stand in for a bare id
+    // (no maker row anywhere in the catalog), or the claim may have
+    // survived a trailing-segment strip (a related model, possibly a
+    // different numeric generation). The provenance line says which row
+    // stood in; the user-set arm below beats the catalog and stays
+    // untouched (override wins over everything).
+    let tier = pricing_tier_for(model, catalog, override_models);
+    let claim = match &tier {
+        PricingTier::Maker { claimed, provider } => {
+            format!(" (maker claim: {provider}/{claimed})")
+        }
+        PricingTier::Reseller { claimed, provider } => format!(
+            " (claimed via reseller {provider}; no maker row for {claimed})"
+        ),
+        PricingTier::Variant { claimed, .. } => {
+            format!(" (variant claim: priced as {claimed}; not an exact match)")
+        }
+        _ => String::new(),
+    };
+    if matches!(tier, PricingTier::Override) {
         // rm-419: a user-set rate keeps the vendor retirement
         // disclosure — the status is catalog knowledge, not a rate
         // claim, so it carries no "unverified" qualifier.
@@ -412,9 +530,10 @@ fn pricing_source_for_catalog(
             })
             .unwrap_or_default();
         format!(
-            "{} via user override alias{}",
+            "{} via user override alias{}{}",
             catalog_source(catalog),
-            deprecated
+            deprecated,
+            claim
         )
     } else if let Some(reference) = catalog.reference_date {
         // Deprecation disclosure (rm-419): a session priced on a model
@@ -427,14 +546,15 @@ fn pricing_source_for_catalog(
             .filter(|price| past_deprecated(price, reference))
         {
             Some(price) => format!(
-                "{}; model deprecated {} (rate unverified)",
+                "{}; model deprecated {} (rate unverified){}",
                 catalog_source(catalog),
-                price.deprecation_date.as_deref().unwrap_or("unknown date")
+                price.deprecation_date.as_deref().unwrap_or("unknown date"),
+                claim
             ),
-            None => catalog_source(catalog),
+            None => format!("{}{}", catalog_source(catalog), claim),
         }
     } else {
-        catalog_source(catalog)
+        format!("{}{}", catalog_source(catalog), claim)
     }
 }
 
@@ -888,11 +1008,22 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         };
     };
     let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    // rm-748 "maker wins even at $0": a maker's own zero-priced row
+    // (genuinely-free listings) may CONTEST a key that some reseller
+    // row priced, but a $0 row never CREATES a catalog key — LiteLLM
+    // uses 0/0 both for free listings and for unpriced new models,
+    // and only the contest case can be told apart. Two passes: price
+    // selection first, then $0 maker rows replace non-maker winners.
+    let mut zero_price_maker_rows: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
         };
-        if model.mode != "chat" || (model.input_cost == 0.0 && model.output_cost == 0.0) {
+        if model.mode != "chat" {
+            continue;
+        }
+        let unpriced = model.input_cost == 0.0 && model.output_cost == 0.0;
+        if unpriced && !is_maker_provider(&model.provider) {
             continue;
         }
         let normalized = normalize_model(&key);
@@ -928,11 +1059,35 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             continue;
         }
         let priority = provider_priority(&model.provider);
+        if unpriced {
+            // $0 maker rows park in the contest map (highest priority
+            // wins) and are reconciled against priced winners below.
+            match zero_price_maker_rows.get(&normalized) {
+                Some((existing, _, _)) if *existing >= priority => {}
+                _ => {
+                    zero_price_maker_rows.insert(normalized, (priority, price, model.provider));
+                }
+            }
+            continue;
+        }
         match selected.get(&normalized) {
             Some((existing, _, _)) if *existing >= priority => {}
             _ => {
                 selected.insert(normalized, (priority, price, model.provider));
             }
+        }
+    }
+    for (name, (priority, price, provider)) in zero_price_maker_rows {
+        // A maker's priced row stays: the maker's own priced listing
+        // beats its free variant, and a $0 maker row never displaces
+        // another maker's priced row either. Only a reseller/gateway
+        // winner is displaced — and a $0 row never creates a key.
+        let displaces = selected
+            .get(&name)
+            .map(|(_, _, winner)| !is_maker_provider(winner))
+            .unwrap_or(false);
+        if displaces {
+            selected.insert(name, (priority, price, provider));
         }
     }
     let mut entries = BTreeMap::new();
@@ -944,10 +1099,43 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
     ConvertedCatalog { entries, providers }
 }
 
+/// rm-748 maker tier: providers whose rows are the model vendor's own
+/// listing (`<maker>/<id>`, maker-band priority) rather than a
+/// gateway/reseller/hoster stand-in. A bare id claimed by one of these
+/// rows carries the vendor's rate and counts as exact; any other
+/// provider's row is a stand-in and must be labeled as such. The band
+/// (>= 9) is the maker end of `provider_priority` — anthropic, openai,
+/// deepseek, gemini, xai, mistral, and cohere (a maker itself, ranked
+/// just under the 10s for claiming purposes).
+fn is_maker_provider(provider: &str) -> bool {
+    provider_priority(provider) >= 9
+}
+
+/// rm-748 maker-first claiming: when several rows normalize to the
+/// same bare catalog key (aihubmix/grok-4.6, azure_ai/grok-4.6,
+/// xai/grok-4.6 all land on `grok-4.6`), the maker's own row must win
+/// the claim before any reseller/gateway row. Ranked by band:
+/// literal makers (10) > cohere (9) > openrouter (8) > gateways (7/6)
+/// > hosters (5) > unknown (0).
+///
+/// The maker band covers providers that are the LITERAL maker of every
+/// model they list under `<maker>/<id>` two-segment keys. Deliberately
+/// EXCLUDED even though they also carry first-party rows: dashscope,
+/// qwencloud, qwen_ai_platform, tencent and perplexity resell OTHER
+/// makers' models under the same two-segment shape
+/// (`dashscope/deepseek-v4-flash`, `perplexity/llama-3.1-70b-instruct`),
+/// so their rows claim as reseller stand-ins, never as maker rows;
+/// where the true maker's own row exists it already outranks them.
 fn provider_priority(provider: &str) -> i32 {
     match provider {
         "anthropic" | "openai" | "deepseek" | "gemini" | "xai" | "mistral" => 10,
-        "cohere" => 9,
+        // Literal makers added in rm-748: every snapshot row under these
+        // providers is the maker's own listing (glm -> zai, kimi ->
+        // moonshot, command -> cohere, nova -> amazon, muse -> meta,
+        // jamba -> ai21, mimo -> xiaomi, hunyuan stays hoster-tier).
+        "meta" | "moonshot" | "minimax" | "zai" | "amazon_nova" | "xiaomi_mimo"
+        | "ai21" | "palm" | "inception" | "v0" | "cognition" => 10,
+        "cohere" | "cohere_chat" => 9,
         "openrouter" => 8,
         "vercel_ai_gateway" => 7,
         "github_copilot" => 6,
@@ -2578,3 +2766,4 @@ mod tests {
         );
     }
 }
+
