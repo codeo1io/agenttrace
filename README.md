@@ -32,6 +32,10 @@
 
 One `agenttrace` binary provides both interfaces: run it without a report action to open the TUI, or pass flags such as `--sessions` and `--overview` for CLI output.
 
+### Pi session layouts
+
+Pi journals are discovered structurally, not by exact path: `~/.pi/agent/sessions/<encoded-project>/<session>.jsonl` is the canonical layout, but the discovery walk accepts forks that relocate the whole root (`~/.senpi`, `~/.omo`, `~/.omp`) and agent-dir variants inside a root (`~/.pi/agent-cliproxy-only/sessions/…`), wherever a `sessions/` tree with JSONL transcripts lives under a Pi-family root. Encoded project dir names (dash-encoded repo paths, including the >200-char truncate+hash form) are decoded against the real filesystem — see `agenttrace --doctor` for per-session decode disclosures (ambiguous shadows, opaque names, budget-bounded scans).
+
 ## Why agenttrace?
 
 AI coding agents now behave like small build systems: they call tools, retry, stall, and spend tokens while you only see the final answer.

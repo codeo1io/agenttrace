@@ -485,15 +485,28 @@ const DECODE_PROBE_BUDGET: usize = 1024;
 /// decode, which yields the identical chosen path at a fraction of the
 /// probes.
 fn decode_encoded_components(parts: &[&str], disclose: bool) -> Option<EncodedWalk> {
+    decode_encoded_components_checked(parts, disclose).0
+}
+
+/// rm-770: also reports whether DECODE_PROBE_BUDGET cut the scan, so callers
+/// disclose boundedness instead of attributing silently.
+fn decode_encoded_components_checked(
+    parts: &[&str],
+    disclose: bool,
+) -> (Option<EncodedWalk>, bool) {
     let mut out = Vec::new();
     let mut probes = 0usize;
     explore_encoded_components(parts, 0, Path::new("/"), &mut out, &mut probes, disclose);
+    let budget_exhausted = probes > DECODE_PROBE_BUDGET;
     let mut iter = out.into_iter();
-    let path = iter.next()?;
-    Some(EncodedWalk {
-        path,
-        shadowed: iter.collect(),
-    })
+    let path = iter.next();
+    (
+        path.map(|path| EncodedWalk {
+            path,
+            shadowed: iter.collect(),
+        }),
+        budget_exhausted,
+    )
 }
 
 fn explore_encoded_components(
@@ -559,10 +572,23 @@ pub enum ProjectDecodeStatus {
     NotConsulted,
     /// Every step of the walk verified exactly one candidate.
     Resolved { path: String },
+    /// rm-770: decode completed deterministically, but DECODE_PROBE_BUDGET
+    /// cut the ambiguity scan — `shadowed` is partial. The chosen `path` is
+    /// unchanged (fixed search order); only disclosure completeness is
+    /// bounded.
+    ResolvedScanTruncated { path: String, shadowed: Vec<String> },
+    /// rm-770: DECODE_PROBE_BUDGET cut the walk before ANY decode completed;
+    /// the encoded name may still decode under a larger budget.
+    ScanExhausted { name: String },
     /// The deterministic longest-run rule chose `path`, but at least one
     /// other COMPLETE decode of the same encoded name verified
     /// (`shadowed`): the attribution is defensible, not proven.
     Ambiguous { path: String, shadowed: Vec<String> },
+    /// rm-240 form, rm-770 cut variant: the head's decode scan hit
+    /// DECODE_PROBE_BUDGET and fell back to `deepest_verified_prefix` —
+    /// `prefix` is a budget-bounded attribution, not a fully probed one;
+    /// the opaque hash tail keeps distinct long paths distinct.
+    TruncatedScanCut { prefix: String, hash: String },
     /// The official >200-char truncate+hash form (rm-240): the encoded
     /// name is truncated to 200 chars and suffixed with a hash of the
     /// full path. `prefix` is the deepest directory the head verified
@@ -589,27 +615,39 @@ pub fn project_decode_status(session: &Session) -> ProjectDecodeStatus {
     }
     match encoded_form(&session.path) {
         None => ProjectDecodeStatus::NotConsulted,
-        Some(EncodedForm::Plain(parts)) => match decode_encoded_components(&parts, true) {
-            Some(EncodedWalk { path, shadowed }) if shadowed.is_empty() => {
-                ProjectDecodeStatus::Resolved { path }
+        Some(EncodedForm::Plain(parts)) => {
+            // rm-770: budget exhaustion is disclosed, never silent.
+            let (walk, budget_exhausted) = decode_encoded_components_checked(&parts, true);
+            match walk {
+                Some(EncodedWalk { path, shadowed }) if budget_exhausted => {
+                    ProjectDecodeStatus::ResolvedScanTruncated { path, shadowed }
+                }
+                Some(EncodedWalk { path, shadowed }) if shadowed.is_empty() => {
+                    ProjectDecodeStatus::Resolved { path }
+                }
+                Some(EncodedWalk { path, shadowed }) => {
+                    ProjectDecodeStatus::Ambiguous { path, shadowed }
+                }
+                None if budget_exhausted => ProjectDecodeStatus::ScanExhausted {
+                    name: parts.join("-"),
+                },
+                None => ProjectDecodeStatus::Opaque {
+                    name: parts.join("-"),
+                },
             }
-            Some(EncodedWalk { path, shadowed }) => {
-                ProjectDecodeStatus::Ambiguous { path, shadowed }
-            }
-            None => ProjectDecodeStatus::Opaque {
-                name: parts.join("-"),
-            },
-        },
+        }
         // The truncated form reports its verified prefix + opaque hash;
         // shadowed-alternative disclosure inside a truncated head is
         // second-order and intentionally not walked here.
         Some(EncodedForm::Truncated { head, hash }) => {
-            let prefix = decode_encoded_components(&head, false)
+            let (walk, budget_exhausted) = decode_encoded_components_checked(&head, false);
+            let prefix = walk
                 .map(|EncodedWalk { path, .. }| path)
                 .or_else(|| deepest_verified_prefix(&head));
-            match prefix {
-                Some(prefix) => ProjectDecodeStatus::Truncated { prefix, hash },
-                None => ProjectDecodeStatus::Opaque {
+            match (prefix, budget_exhausted) {
+                (Some(prefix), false) => ProjectDecodeStatus::Truncated { prefix, hash },
+                (Some(prefix), true) => ProjectDecodeStatus::TruncatedScanCut { prefix, hash },
+                (None, _) => ProjectDecodeStatus::Opaque {
                     name: head.join("-"),
                 },
             }
@@ -1245,5 +1283,77 @@ mod tests {
         assert!(TimeRange::Today
             .since(now)
             .is_some_and(|start| start <= now));
+    }
+
+    #[test]
+    fn probe_budget_exhaustion_is_disclosed_not_silent() {
+        // rm-770: a dash-free component chain long enough to exceed
+        // DECODE_PROBE_BUDGET (1024) must disclose the cut instead of
+        // reporting an undecodable name (Opaque) — the name was never
+        // fully probed.
+        //
+        // Cost arithmetic: the greedy walk tries every longer run before
+        // the true single-part run at every level, so a chain of k
+        // dash-free components costs roughly 3·Σ(remaining) probes — k=27
+        // plus the temp-root prefix clears 1024 mid-walk, before the first
+        // complete decode can be pushed.
+        let root = unique_decode_root("budget");
+        let mut chain = root.clone();
+        for i in 0..27 {
+            chain = chain.join(format!("g{i:02}"));
+        }
+        fs::create_dir_all(&chain).expect("create chain");
+        let encoded = chain.to_string_lossy().replace('/', "-");
+        let transcript = root.join("projects").join(&encoded).join("session.jsonl");
+        fs::create_dir_all(&transcript).expect("create transcript dir");
+        let session = session_at("", &transcript.join("s.jsonl").to_string_lossy());
+        let status = project_decode_status(&session);
+        assert!(
+            matches!(status, ProjectDecodeStatus::ScanExhausted { .. }),
+            "expected ScanExhausted disclosure, got {status:?}"
+        );
+        // The truncated-head lane keeps its disclosed fallback under the
+        // same budget discipline: deepest_verified_prefix stays linear.
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shallow_chain_stays_resolved_under_the_budget() {
+        // Boundary control for rm-770: the same fixture shape, shallower
+        // (≈600 probes < 1024), decodes normally — the disclosure above is
+        // budget-driven, not shape-driven.
+        let root = unique_decode_root("shallow");
+        let mut chain = root.clone();
+        for i in 0..14 {
+            chain = chain.join(format!("s{i:02}"));
+        }
+        fs::create_dir_all(&chain).expect("create chain");
+        let encoded = chain.to_string_lossy().replace('/', "-");
+        let transcript = root.join("projects").join(&encoded).join("session.jsonl");
+        fs::create_dir_all(&transcript).expect("create transcript dir");
+        let session = session_at("", &transcript.join("s.jsonl").to_string_lossy());
+        let status = project_decode_status(&session);
+        assert!(
+            matches!(status, ProjectDecodeStatus::Resolved { .. }),
+            "expected Resolved, got {status:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decode_checked_wrapper_reports_budget_flag() {
+        // rm-770 plumbing pin: the checked wrapper threads the
+        // budget-exhausted flag (false for any decodeable short chain,
+        // true only when the walk was cut).
+        let root = unique_decode_root("wrapper");
+        let repo = root.join("wrap").join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        let encoded = repo.to_string_lossy().replace('/', "-");
+        let parts: Vec<String> = encoded.split('-').map(str::to_string).collect();
+        let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let (walk, budget_exhausted) = decode_encoded_components_checked(&parts_ref, true);
+        assert!(!budget_exhausted, "short chain must not exhaust the budget");
+        assert!(walk.is_some(), "short chain must decode");
+        let _ = fs::remove_dir_all(root);
     }
 }

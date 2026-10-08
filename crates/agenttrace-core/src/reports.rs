@@ -2724,9 +2724,32 @@ fn report_html_code_list(values: &[String]) -> String {
         .join(", ")
 }
 
+/// rm-764: the control-byte pass shared by the markdown/HTML cell escapes.
+/// C0/C1 control bytes (terminal-injection payloads: ESC, BEL, OSC heads…)
+/// become U+FFFD; `\n`/`\r`/`\t` are layout bytes the renderers themselves
+/// translate (`\n`/`\r` → `<br>` in markdown cells, whitespace in HTML) and
+/// survive, mirroring the carve-outs in the disclosure-cell contract
+/// (tests/hostile_journal_disclosure.rs). Runs BEFORE the entity/table
+/// escapes so bytes die in the same pass that handles printable HTML.
+fn neutralize_control_bytes_preserving_layout(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 fn html_escape(value: &str) -> String {
+    // rm-764: control bytes die first — terminal-injection sequences (ESC/
+    // BEL/…) must not reach any markup consumer. Layout bytes survive per
+    // neutralize_control_bytes_preserving_layout's contract.
     let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
+    for ch in neutralize_control_bytes_preserving_layout(value).chars() {
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -2905,16 +2928,23 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 /// nodes, before the pipe/newline table-safety escapes run. The `<br>` this
 /// function emits itself is the only raw HTML a plain cell may contain.
 ///
-/// Merge note: the control-byte sanitizer family (fc197c5e's lane) must run
-/// BEFORE the entity escape at merge time — control bytes first, then
-/// printable HTML — so both byte classes die in one pass.
+/// Merge note (rm-764, wired): the control-byte sanitizer family (fc197c5e's
+/// lane) runs BEFORE the entity escape — control bytes first, then printable
+/// HTML — so both byte classes die in one pass
+/// (neutralize_control_bytes_preserving_layout).
 fn markdown_cell(value: &str) -> String {
-    value
+    // rm-764: control bytes first (the merge note below, wired), then the
+    // printable HTML character set. CR review fix (independent review
+    // 8b4da943 F1): CommonMark treats a lone CR as a line ending, so raw `\r`
+    // must not survive into a markdown cell — `\r\n` and lone `\r` translate
+    // to `<br>` exactly like `\n` (CRLF once, never doubled).
+    neutralize_control_bytes_preserving_layout(value)
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('|', "\\|")
-        .replace('\n', "<br>")
+        .replace("\r\n", "<br>")
+        .replace(['\r', '\n'], "<br>")
 }
 
 /// Escapes a transcript-derived string for a GFM inline code span (rm-403).

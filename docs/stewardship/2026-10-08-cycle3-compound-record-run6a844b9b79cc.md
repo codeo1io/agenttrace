@@ -1,0 +1,81 @@
+# Cycle-3 compound record — run 6a844b9b79cc (repository-maintenance b5aab57c, cycle 3)
+
+Date: 2026-10-08 · Compound attempt: 2e88fcd75a604a688e7713850abc6992 after provider-reaped 55872977b08d449eadb66db567cfe3ad (typed envelope absent; event log reaped at 4 messages with an in-attempt restart — two `delegate_turn_started` — before it; worktree census byte-equal to the implement/full_tests handoff: exactly 8 M files, 0 untracked, so zero durable work existed; phase redone from scratch and declared) · Base: `aa5544af58d29ac64db9967cd8fa5a7c1fdfc48d` (worktree `run-6a844b9b79cc-6a844b9b`) · Theme: **honest faces — hostile strings die at the render boundary, silent losses surface**
+
+State at compound: uncommitted 8-file implement delta (+444/−30: `ROADMAP.md` +60 is the roadmap phase's own layer, untouched by implement; code = 7 files +384/−30: `reports.rs` +36/−8, `parser.rs` +49/−2, `otel.rs` +54/−2, `insights.rs` +148/−17, `doctor.rs` +75/−5, `README.md` +4, `tests/markdown_escape_contract.rs` +48) on top of base aa5544a. ZERO untracked. NO session-cache schema change. This compound adds: the ROADMAP compound layer (banner + 5 candidate→implemented flips with EXECUTED addenda + rm-342 residual-close + rm-766 cede + rm-767 fold), this record, and the dated addendum on the provider-reaped prevention doc. **No test/validation command was executed at compound** — every gate below is consumed as recorded evidence from the targeted and full folds, per the compound contract.
+
+## Cycle outcome (all-green chain, pre-review)
+
+| phase | attempt | outcome |
+|---|---|---|
+| assess | 783c9f24 | fresh adversarial pass over the 4 cycles since e9e8fd9 (92149bd discovery/cache identity, 64ef9b1 hostile-key hardening, bd46a7d usage-disclosure + doctor demo, 84be17b upstream + report gates), live probes from a fresh release build, pinned HOME/cache dirs; F1 MED capital-Usage (`usageInputTokens`) skips accounting w/o line_skips vs lowercase sibling; F2 MED report cells carry raw ESC/BEL control bytes through markdown/html (PoC'd live); F3 LOW `upstream` keyword never honors `-o` (main.rs:221-227); corpora banked in /tmp/at-assess-783c9f24 |
+| research | f0bf4f77 | pass-11 dedupe-first: upstream #294-#318 wave fully owned on this wall; R1 Gemini-CLI claiming lane gate-or-retire (evidence gate absent, parser.rs:4090-4130), R2 ZCode/Z.ai glm-5.3 (ccusage #1831/#1832, GLM-5.3 pricing), R3 pi-adjacent dashboards (pi-usage-audit, slop-statistics), R4 AgentMeasure conformance receipts, R5 LiteLLM 4,486-key pricing census; riders appended to rm-044/rm-087/rm-486-adjacent rows; next dossier numeral ≥ 71 |
+| roadmap | e9f9e92e (after reaped 865dcc5c) | wall +60: F3 evidence rider onto rm-605, minted rm-764..rm-770 (title-checked, past live fleet bands max rm-763), mint comment with fleet census; 254 def rows, footer last |
+| prioritize | 10c3b92c | batch = rm-764 LEAD (72.0) + rm-342-residual + rm-765 (54.0) + rm-768 (52.0) + rm-770 (48.0) + rm-769 (45.0); full 25-dirty-worktree fleet conflict screen; **re-adjudicated 2 of the campaign's own 7 mints pre-implementation: rm-766 CEDED (sibling a7110bf0's rm-734 actively implementing the same sqlite lane), rm-767 FOLDED (assess K2 observed rm-342's designed coercion arm)**; NO schema bump (rm-595 dynamic-disclosure precedent) |
+| stewardship | 354787b4 | structured request filed; a7110bf0 hunk-audit confirmed line-disjoint vs this batch's 5 target files |
+| implement | 7282b0fb | six arms executed red-first; rm-765 narrowed to docs-residual by code inspection; grep caught + removed a drafted PI_CONFIG_DIR/PI_HOME overclaim before landing; +444/−30 across 8 files; live hostile-fixture PoC (zero raw control bytes in markdown/html) |
+| targeted_tests | 09d4ed04 (after reaped 44678a28) | core lib 219/0 + 6 contract suites 27/0 + clippy -D warnings rc0 + fmt rc0; digest re-derived with engine code (`validation_policy`) == dispatch token, twice |
+| full_tests | 70fffc75 | ci.yml push-event suite mirrored lane-for-lane (PR-T): 21/21 lanes rc0, 615 passed / 0 failed, ~21min; cargo-deny crossterm 0.28+0.29 duplicate warning-only; digest `validation:v1:ab5fc426b7c1…c2845` stable pre- and post-battery |
+
+Digest lineage: `validation:v1:ab5fc426b7c18d2939481f5888e883b670db730c97ed26ffc53da0e6a18c2845` declared at both validation turns, each independently re-derived live with the engine's own code; the post-edit replica at compound (this record + ROADMAP/docs drift only) re-derives byte-identical — ROADMAP/docs are digest-immobile under the engine classifier, so the full-validation gate inherits a still-valid stamp.
+
+## Roadmap accounting (this compound's edits)
+
+- **rm-764 / rm-765 / rm-768 / rm-769 / rm-770 flipped candidate → implemented** with dated EXECUTED addenda (flips at compound; `done` stays reserved for the commit gate, rm-012 convention).
+- **rm-342** (already implemented) gains the dated residual-close line: review 384979754's reject-non-finite arm executed via `numeric_string_as_i64` → `parse::<f64>().ok().filter(is_finite)`; spellings reject into the existing non-numeric skip class — NO new disclosure counter (the row's coerce-or-disclose contract is met by skip-class parity); fractional-truncation disclosure stays open, parked on rm-767.
+- **rm-766 cede line**: stays candidate, records the cede to a7110bf0's rm-734 (active implementer on the same sqlite_sessions.rs silent-lane); reconcile BY TITLE at integration.
+- **rm-767 fold line**: stays candidate, parks exactly one open arm (fractional-truncation disclosure 12.9→12), with a do-not-implement note against the already-designed integer-string arm.
+- **Compound c3 banner** added at the top of the banner stack (newest-first), above the 84be17b33 compound c1 banner.
+- **ZERO ids minted at compound.** Wall: 254 def rows before and after (verified: unique leading-id extraction = 254, duplicates = 0); managed footer still last. Fleet numbering untouched: this campaign's band stays rm-764..rm-770.
+
+## Premise corrections and disclosed limits (the honest-faces ledger)
+
+1. **rm-765 was docs-residual ONLY** — code inspection at implement showed pi discovery/sessions are structural since landed rm-084 and README:31 already named Pi; the acceptance's discovery-check arm is satisfied by the existing structural lane rather than a new probe. A drafted `PI_CONFIG_DIR`/`PI_HOME` claim was caught by grep (the fork has no such env handling) and removed before landing. Remaining-open (small, parked): planted-fixture pi-count probe + documented end-to-end example.
+2. **rm-768's fix is the STRICTER otel-attribute discipline** (`\n`/`\t` also neutralize), not a mirror of the report-cell mapping the acceptance guessed.
+3. **rm-770's ResolvedScanTruncated/TruncatedScanCut are wired, exhaustiveness-checked and arithmetically reachable but have NO fs-reachable fixture** — `projects/<encoded>` path components cap at 255 bytes before the walk can be driven past 1024 probes after a first decode; ScanExhausted carries the disclosed-budget semantics e2e. Recorded on-row as a DISCLOSED LIMIT, not claimed as covered.
+4. **rm-767's mint premise was partially wrong** — assess K2's PoC observed landed rm-342's designed coercion; the fold audit happened at prioritize, before any parallel implementation wasted the lane.
+
+## Prevention rules (record-embedded, reusable)
+
+1. **Adjudicate every fresh "silent coercion/skip" PoC against the owning row's DESIGNED acceptance before minting.** rm-767 was minted from a PoC of designed behavior; the prioritize-time fold audit caught it before implementation. Standing prioritize step now: for each mint, re-read the landed row's acceptance and check whether the PoC observed the designed arm.
+2. **Cede on active-collision, not on overlap:** the fleet screen distinguished rm-766 (sibling ACTIVELY at targeted_tests on the same file+fixtures → cede) from the batch's other rows (landed or inert → implement). Title-based reconciliation at integration, never id-based.
+3. **Grep-before-claim for docs arms:** every claims-bearing docs sentence gets a code-verification grep (caught PI_CONFIG_DIR/PI_HOME). The same rule at report level is this cycle's theme — hostile strings die at the render boundary, and unverified claims die at the docs boundary.
+4. **Exhaustiveness-without-fixture honesty:** when a wired state has no fs-reachable fixture (255-byte path-component cap vs 1024-probe budget), disclose it as a limit on-row instead of letting the test count imply coverage. The `-- Doctor`/insights lanes now carry three such disclosure states with tests only where reachable.
+5. **Dead-attempt forensics, 3-for-3 this run:** absent typed envelope + reaped event log + porcelain census equal to the prior phase's handoff = zero-durable verdict; redo, never adopt. New shape recorded: a repeated `delegate_turn_started` inside one attempt id is an in-attempt session restart, not a second work pass. (Dated addendum on `docs/solutions/workflow-issues/provider-reaped-delegate-attempts-redo-from-scratch-on-census-match.md`.)
+
+## Residuals and open scope (banked for later cycles)
+
+- **rm-767's one open arm:** fractional-truncation disclosure (12.9→12 silent) — coordinate with aa41d9b5's rm-774 (negative/boolean Number arms) if that band lands first.
+- **rm-765's small parked arm:** planted-fixture pi-count probe + end-to-end pi example, if the dashboard competition sharpens.
+- **Assess F1 (capital-Usage) / F3 (`upstream -o`)** belong to their owners: F1 → rm-756/rm-760 (whose owners' implement is in flight); F3 evidence-refreshed onto rm-605, blocked on rm-628 keyword-precedence.
+- **CHANGELOG rider owed at the commit/PR gate:** the batch changes user-facing behavior (markdown/html cells sanitize control bytes; doctor text labels split; OTel span names sanitized+bounded; non-finite usage spellings rejected) — per fleet convention the CHANGELOG entry rides the merge, not compound.
+- **Sweep-volatile corpora:** `/tmp/at-assess-783c9f24/` (low/cap/str/hostile fixtures + trunc tree + probe out), `/tmp/at-run7282-home/`, `/tmp/at-full-6a844b9b/ci-art` — /tmp is swept between phases; this record + the delegate envelopes carry the durable facts.
+- **Flake-screen (verified negative):** the fleet's known ENV_LOCK lib-suite flake (`failed_loads_neither_store_nor_trust_an_empty_snapshot`, sqlite_sessions.rs) does NOT exist in this tree at base aa5544a — full-tree grep = 0 hits — so the 615/0 full-suite result carries no probabilistic caveat at this base; re-screen at any future base.
+
+## Next-cycle context (recorded, not re-decided)
+
+- **Natural next lead: rm-605** (`upstream` honors `-o`) once rm-628 keyword-precedence lands; this run's assess F3 live-PoC'd it again (file never created, main.rs:221-227).
+- **Ceded/folded reconcile set for integration:** rm-766 ↔ a7110bf0's rm-734 (by title); rm-767 integer-string arm ↔ landed rm-342 (already folded, do not implement).
+- **Research leads banked with evidence:** R1 Gemini-CLI gate-or-retire (rm-758's owner, strongest strategy/correctness candidate — parser.rs:4090-4130 claims any object with usage/usageMetadata/tokenUsage with no evidence gate); R2 ZCode/Z.ai (rm-762's owner — chatgpt/-prefix alias normalization first; ccusage #1831/#1832); Antigravity 2.16 quota wrapper (rm-761's owner — fixture-first); R4 AgentMeasure conformance receipts (watch).
+- **Watch items carried:** upstream tip 15ed07f UNMOVED since 2026-10-06T06:49Z (5th consecutive check — the #318 ureq-3 port manifest is stable); ccusage #1831/#1832; OTel GenAI semconv zero new tags; @zack78/agenttrace still latest 0.10.1, unscoped name still 404s.
+- **Parked epics at the top band** (unselected this cycle, priority-verified live at prioritize): rm-251 (88.0), rm-421 (85.0), rm-195 (78.0), rm-448 (77.0 v0.10.0 blocks port), rm-239 (77.0), rm-232 (76.0 dedup/caching).
+
+## Integration handoff (for the review + commit gates)
+
+Payload = the 8 M implement files + ROADMAP compound layer (banner + 5 flips + 3 dated addenda + cede + fold) + this record + the prevention-doc addendum. Apply the crosstalk defense: re-read file bytes + numstat against the census before any edit at the gate; `git add` explicit paths only (never `-A`); stage the 2 new/edited docs paths explicitly (`docs/stewardship/2026-10-08-cycle3-compound-record-run6a844b9b79cc.md`, `docs/solutions/workflow-issues/provider-reaped-delegate-attempts-redo-from-scratch-on-census-match.md`); verify staged numstat + post-commit porcelain empty; assert commit parent == aa5544a. Done-flips (rm-764/rm-765/rm-768/rm-769/rm-770; rm-342's residual close) reserved to the gate. CHANGELOG bullet rides the merge. IDs reconcile by TITLE at integration, never by id (rm-766↔rm-734 explicitly; the wider fleet's rm-771..775 double-hold is foreign to this campaign but the rule stands).
+
+## Verification (static — no tests executed at compound)
+
+`git status --porcelain` = 9 M files (the implement 8 + the prevention doc) + 1 untracked (this record); ROADMAP def rows 254 with zero duplicate leading ids (anchored extraction) and the managed footer last; banner stack newest-first with compound c3 above compound c1 (84be17b33); 5 flips + 3 dated addenda + cede + fold present (grep-verified); fleet id sweep (live 2026-10-08): this wall max rm-770, uncommitted fleet high-water rm-801 (6cb2756a's band), spool mentions rm-802/803/816/817 — content-sweep before any future mint; digest replica re-derived with engine code over base aa5544a == `validation:v1:ab5fc426b7c18d2939481f5888e883b670db730c97ed26ffc53da0e6a18c2845` (ROADMAP/docs drift digest-immobile); spool scratch `2e88fcd7…-scratch/` carries the ROADMAP diff patch and a copy of this record.
+
+## Review cycle addendum (2026-10-08, independent review 8b4da943 → review-fix 66ebbb9f)
+
+Independent review verdict was NEEDS_CHANGES (2 MEDIUM, 2 LOW). Fixes landed in the review-fix turn:
+
+- **F1 (MEDIUM) fixed** — `markdown_cell` (reports.rs) left `\r` untranslated: CommonMark treats a lone CR as a line ending, so a raw CR reached the markdown face via `message.model` (copied verbatim into `model_used` at parser.rs oh_my_pi_message_events; session names collapse whitespace upstream, model strings do not — live PoC rendered `evil^Mm…` in the Model cell). Fix: `\r\n` and lone `\r` now translate to `<br>` exactly like `\n` (CRLF once, never doubled); pinned in `tests/markdown_escape_contract.rs` (no raw CR in the markdown face + `red<br>evil` display-faithfulness). Sibling markdown-cell emitters (`markdown_inline_code`, `report_markdown_code_list`) were reachability-checked, not changed: their inputs (`source_tool` vocabulary → `tool_display_name`'s constant map + authority category labels) are constant-assigned today, so no session-derived bytes can reach them; the check is recorded in the review-fix result envelope.
+- **F2 (MEDIUM) fixed** — the Base sha on line 3 of this record carried a one-char typo (`…cd7fa5…`, a nonexistent commit); corrected to the real `aa5544af58d29ac64db9967cd8fa5a7c1fdfc48d` (= `git rev-parse HEAD`, engine dispatch base_sha, both validation head.sha files). Digest derivation from the typo'd string yields `derivation_failed=True` (digest 22b18db6… ≠ stamp ab5fc426…) — final_validation must assert base == `$(git rev-parse HEAD)`, never trust a recorded full sha. The same prose typo lives immutably in cycle-3 phase-result envelopes (spool-side); every machine leg carried the real sha.
+- **F3 (LOW)** — ResolvedScanTruncated/TruncatedScanCut no-fixture limit stands as disclosed (fs-reachable fixture impossible under the 255-byte path-component cap; `Label()` parity is pinned). No change.
+- **F4 (LOW)** — rm-765's parked arms stay visible for the done-flip decision at the commit gate. No change this turn.
+
+Tree after the review-fix turn: the implement delta grows to 9 tracked files (reports.rs and tests/markdown_escape_contract.rs extended for F1; docs layer = ROADMAP + record + prevention doc), zero repo-root scratch; targeted gates re-run green (lib, markdown_escape_contract, clippy -D warnings, fmt), live PoC re-run clean, digest re-derived and declared in the review-fix result envelope (the compound-phase stamp ab5fc426… describes the PRE-fix tree and is superseded for executable surfaces).
+
