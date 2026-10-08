@@ -1,0 +1,205 @@
+{
+  "pack": "agenttrace token-accounting conformance pack",
+  "version": 1,
+  "roadmap": "rm-053",
+  "derived_from": "AgentMeasure 2026-09 audit taxonomy (github.com/roy-tong/AgentMeasure, campaigns/audit-report-2026-09.md): five recurring billing-bug classes measured across ~110 usage tools — re-emitted/resumed events double-counted, cache-tokens priced as input, price-table drift vs vendor consoles, resume/fork lineage loss, overflow/clamp handling.",
+  "pricing_basis": {
+    "rule": "Every expected cost in this pack is a TOTAL derived from the bundled snapshot (crates/agenttrace-core/src/pricing_snapshot.json) through the catalog formula in crates/agenttrace-core/src/lib.rs (round4 of sum(tokens_class/1e6 * price_class), cache classes at their own rates). The pack embeds no price table of its own: crates/agenttrace-core/tests/token_conformance.rs re-derives every literal from pricing::lookup_price/default_price at run time and fails if a literal drifts from the live snapshot by more than one round4 step (6e-5), so a snapshot refresh that moves a used model's rates forces a pack refresh instead of silently re-blessing old totals.",
+    "snapshot_date_at_derivation": "2026-10-04",
+    "formula_tolerance": 6e-5
+  },
+  "classes": {
+    "overflow_clamp": "hostile token counts (i64::MAX / 1e300 floats) saturate, never panic or wrap; clamped totals carry the calculated_from_tokens_clamped marker",
+    "re_emitted_event": "usage re-emitted on the same message id counts once (fold at max per class), never once per emission",
+    "cache_priced_as_input": "cache write/read tokens price at their own snapshot rates and stay out of net input; cache-inclusive input-basis subtractions are disclosed, not silently zeroed",
+    "price_table_drift": "rendered totals stay derivable from the bundled snapshot (runtime re-derivation guard); the frozen-first-model misprice is xfail-pinned to rm-663",
+    "resume_fork_lineage": "post-compaction (rewound cumulative) usage windows count forward once each — no high-water refusal undercount, no double count",
+    "unprovable_total": "absent/zero/partial evidence renders zero with a disclosure marker or rescues only the provable part; nothing is invented",
+    "loud_parse_failure": "unparseable hostile journals exit nonzero with a reason; totals are never silently zero"
+  },
+  "cases": [
+    {
+      "id": "001-rm046-session-one",
+      "class": "overflow_clamp",
+      "fixture": "cases/rm046-session-one.jsonl",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/session-one.jsonl) — rm-053's acceptance names this corpus as the first conformance case",
+      "verbatim_of": "testdata/generated/adversarial/session-one.jsonl",
+      "expect": {
+        "rc": 0,
+        "model": "claude-sonnet-4",
+        "source_tool": "claude_code",
+        "tokens": { "input": 9223372036854775807, "output": 9223372036854775807, "cache_w": 1, "cache_r": 1, "reasoning": 0 },
+        "cost_estimated": null,
+        "cost_assert": "finite_nonnegative",
+        "cost_provenance": "calculated_from_tokens_clamped"
+      }
+    },
+    {
+      "id": "002-rm046-session-two",
+      "class": "overflow_clamp",
+      "fixture": "cases/rm046-session-two.jsonl",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/session-two.jsonl); twin of case 001 under a different session id — proves clamping is per session, not corpus-wide",
+      "verbatim_of": "testdata/generated/adversarial/session-two.jsonl",
+      "expect": {
+        "rc": 0,
+        "model": "claude-sonnet-4",
+        "source_tool": "claude_code",
+        "tokens": { "input": 9223372036854775807, "output": 9223372036854775807, "cache_w": 1, "cache_r": 1, "reasoning": 0 },
+        "cost_estimated": null,
+        "cost_assert": "finite_nonnegative",
+        "cost_provenance": "calculated_from_tokens_clamped"
+      }
+    },
+    {
+      "id": "003-rm046-pi-adv",
+      "class": "loud_parse_failure",
+      "fixture": "cases/rm046-pi-adv.jsonl",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/pi-adv.jsonl); an i64::MAX-aliased hostile pi journal whose totals cannot be proven fails loudly",
+      "verbatim_of": "testdata/generated/adversarial/pi-adv.jsonl",
+      "expect": {
+        "rc": 1,
+        "stderr_contains": "no parseable events"
+      }
+    },
+    {
+      "id": "004-rm046-generic-loss",
+      "class": "unprovable_total",
+      "fixture": "cases/rm046-generic-loss.jsonl",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/generic-loss.jsonl); only the provable nested usage (input.tokens=7) counts, broken escape lines are skipped — no invented totals",
+      "verbatim_of": "testdata/generated/adversarial/generic-loss.jsonl",
+      "expect": {
+        "rc": 0,
+        "model": "default",
+        "source_tool": "generic",
+        "tokens": { "input": 7, "output": 0, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0
+      }
+    },
+    {
+      "id": "005-rm046-wb-adv",
+      "class": "cache_priced_as_input",
+      "fixture": "cases/rm046-wb-adv.jsonl",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/wb-adv.jsonl); the workbuddy cache-inclusive input basis subtracts the cache read down to a disclosed zero instead of silently pricing cache as input",
+      "verbatim_of": "testdata/generated/adversarial/wb-adv.jsonl",
+      "expect": {
+        "rc": 0,
+        "model": "glm-5.2",
+        "source_tool": "workbuddy",
+        "tokens": { "input": 0, "output": 10, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0
+      }
+    },
+    {
+      "id": "006-rm046-unicode-escape",
+      "class": "loud_parse_failure",
+      "fixture": "cases/rm046-unicode-escape.jsonl",
+      "source": "imported verbatim from the rm-046 adversarial corpus (testdata/generated/adversarial/unicode-escape.jsonl); a journal with no provable usage exits nonzero — never a silent zero-total session",
+      "verbatim_of": "testdata/generated/adversarial/unicode-escape.jsonl",
+      "expect": {
+        "rc": 1,
+        "stderr_contains": "unsupported session format"
+      }
+    },
+    {
+      "id": "007-claude-reemit-dedup",
+      "class": "re_emitted_event",
+      "fixture": "cases/claude-reemit-dedup.jsonl",
+      "source": "pack-owned fixture; the same message id re-emits its usage three times (resume/stream replay) beside one fresh turn — the fold keeps one usage per id at the max per class. Truth: msg_1 1000/100 once + msg_2 500/50 = 1500/150; double-counting would report 3500/350",
+      "expect": {
+        "rc": 0,
+        "model": "claude-sonnet-4-5",
+        "source_tool": "claude_code",
+        "tokens": { "input": 1500, "output": 150, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0068,
+        "cost_derivation": "round4(1500*3e-6 + 150*15e-6) = round4(0.00675)"
+      }
+    },
+    {
+      "id": "008-claude-cache-rates",
+      "class": "cache_priced_as_input",
+      "fixture": "cases/claude-cache-rates.jsonl",
+      "source": "pack-owned fixture; net input 1000, output 100, cache write 2000, cache read 5000 on claude-sonnet-4-5. Truth at the snapshot's own cache rates: round4(1000*3e-6 + 100*15e-6 + 2000*3.75e-6 + 5000*0.3e-6) = 0.0135; pricing cache as input would render 0.0255 and folding cache into input would render 0.027",
+      "expect": {
+        "rc": 0,
+        "model": "claude-sonnet-4-5",
+        "source_tool": "claude_code",
+        "tokens": { "input": 1000, "output": 100, "cache_w": 2000, "cache_r": 5000, "reasoning": 0 },
+        "cost_estimated": 0.0135
+      }
+    },
+    {
+      "id": "009-claude-snapshot-derived",
+      "class": "price_table_drift",
+      "fixture": "cases/claude-snapshot-derived.jsonl",
+      "source": "pack-owned sentinel; a plain 3000/300 claude-sonnet-4-5 block whose total (0.0135) must stay derivable from the bundled snapshot — the runtime re-derivation guard fails this case when a snapshot refresh moves the rates and the pack is not refreshed",
+      "expect": {
+        "rc": 0,
+        "model": "claude-sonnet-4-5",
+        "source_tool": "claude_code",
+        "tokens": { "input": 3000, "output": 300, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0135
+      }
+    },
+    {
+      "id": "010-codex-compaction-lineage",
+      "class": "resume_fork_lineage",
+      "fixture": "cases/codex-compaction-lineage.jsonl",
+      "source": "pack-owned fixture in the rm-554 landed shape; cumulative totals 1000/400, rewound 200/60, regrown 600/300 (last 250/150) — every window's fresh usage counts once: 1000+200+250 in / 400+60+150 out. High-water refusal would report 1000/400 (undercount); summing cumulative totals would report 1800/760 (double count)",
+      "expect": {
+        "rc": 0,
+        "model": "default",
+        "source_tool": "codex_cli",
+        "tokens": { "input": 1450, "output": 610, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0135,
+        "cost_derivation": "default_price() 3.0/15.0 per MTok: round4(1450*3e-6 + 610*15e-6)"
+      }
+    },
+    {
+      "id": "011-claude-zero-usage",
+      "class": "unprovable_total",
+      "fixture": "cases/claude-zero-usage.jsonl",
+      "source": "pack-owned port of AgentMeasure open issue #24's highest-fidelity malformed vector (message_start-only usage with zero totals): zeros render as zero WITH the zero_usage_reported disclosure — never padded by text estimates, never negative",
+      "expect": {
+        "rc": 0,
+        "model": "claude-sonnet-4-5",
+        "source_tool": "claude_code",
+        "tokens": { "input": 0, "output": 0, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0,
+        "tokens_provenance": "reported_by_agent+zero_usage_reported:1"
+      }
+    },
+    {
+      "id": "012-claude-multi-model-frozen",
+      "class": "price_table_drift",
+      "fixture": "cases/claude-multi-model-frozen.jsonl",
+      "source": "imported from run 6d254aad's assess corpus (/tmp/at-assess-a01f, cc-multi.jsonl): msg_1 claude-sonnet-4-5 1000/100 then msg_2 claude-opus-4-1 2000/200. TRUTH is per-block: round4(0.0045 + 0.045) = 0.0495; the parser currently freezes the first model onto every usage meta and renders 0.0135 (all-sonnet)",
+      "verbatim_of": "/tmp/at-assess-a01f/corpus/cc-multi.jsonl",
+      "xfail": {
+        "pinned_to": "rm-663",
+        "current_cost_baseline": 0.0135,
+        "note": "xfail-pinned: the current tree MUST NOT match truth. When rm-663's per-event model stamping lands this case turns green — flip it to a regular case (drop the xfail block) as part of that landing's pack refresh"
+      },
+      "expect": {
+        "rc": 0,
+        "model": "claude-sonnet-4-5",
+        "source_tool": "claude_code",
+        "tokens": { "input": 3000, "output": 300, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0495
+      }
+    },
+    {
+      "id": "013-claude-opus-control",
+      "class": "price_table_drift",
+      "fixture": "cases/claude-opus-control.jsonl",
+      "source": "imported from run 6d254aad's assess corpus (/tmp/at-assess-a01f, cc-opus.jsonl); the single-model control for case 012 — opus 3000/300 prices at the family rate: round4(3000*15e-6 + 300*75e-6) = 0.0675",
+      "verbatim_of": "/tmp/at-assess-a01f/corpus/cc-opus.jsonl",
+      "expect": {
+        "rc": 0,
+        "model": "claude-opus-4-1",
+        "source_tool": "claude_code",
+        "tokens": { "input": 3000, "output": 300, "cache_w": 0, "cache_r": 0, "reasoning": 0 },
+        "cost_estimated": 0.0675
+      }
+    }
+  ]
+}

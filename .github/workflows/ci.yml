@@ -243,6 +243,73 @@ jobs:
       - name: Lockfile enforcement (cargo --locked)
         run: scripts/ci/check-locked-cargo.sh
 
+  conformance:
+    # rm-053, cycle 2 ("Conformance guardrail: token-accounting truth"):
+    # the checked-in conformance pack (testdata/conformance/ — manifest
+    # plus fixtures derived from the five audited AgentMeasure billing-bug
+    # classes, first cases importing the rm-046 adversarial corpus
+    # verbatim) runs against parser+pricing through both halves: the
+    # library harness (crates/agenttrace-core/tests/token_conformance.rs,
+    # which also re-derives every cost literal from the bundled pricing
+    # snapshot so a snapshot refresh forces a pack refresh) and the
+    # offline CLI runner (scripts/conformance/run.sh). Any silent
+    # double-count, mis-price, or unprovable total fails the job.
+    #
+    # Gating (rm-053 acceptance: "gates PRs touching parser.rs or
+    # pricing.rs"): the audit step below greps the PR diff for that
+    # surface and states it greppably, but the pack itself is cheap and
+    # fully offline, so the job runs on every event like `deny` — a
+    # conditionally-skipped job can never actually gate a PR, and the
+    # superset also guards against token-accounting drift introduced
+    # from files the acceptance did not name.
+    name: Token conformance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # rm-173: same pin as the Lint/full jobs / rust-toolchain.toml.
+          toolchain: "1.98.1"
+
+      - name: Gate surface audit
+        # rm-053: names, in the run log, whether this PR touches the
+        # gated surface (parser.rs / pricing.rs) or the pack itself.
+        # Best-effort on shallow checkouts; the pack runs regardless.
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
+            git fetch --quiet --depth=250 origin "$GITHUB_BASE_REF" || true
+            BASE="origin/$GITHUB_BASE_REF"
+            if CHANGED=$(git diff --name-only "$BASE"...HEAD 2>/dev/null); then
+              if echo "$CHANGED" | grep -E 'crates/agenttrace-core/src/(parser|pricing)\.rs'; then
+                echo "conformance gate: GATED SURFACE TOUCHED (parser.rs/pricing.rs) — pack must hold"
+              elif echo "$CHANGED" | grep -E '(testdata/conformance/|scripts/conformance/|crates/agenttrace-core/tests/token_conformance\.rs)'; then
+                echo "conformance gate: conformance pack itself changed — self-check"
+              else
+                echo "conformance gate: gated surface untouched — pack still runs (guards silent token drift)"
+              fi
+              echo "$CHANGED" | sed 's/^/  changed: /'
+            else
+              echo "conformance gate: diff unavailable on this shallow checkout — pack runs unconditionally"
+            fi
+          else
+            echo "conformance gate: non-PR event — pack runs unconditionally"
+          fi
+
+      - name: Library conformance harness
+        run: cargo test --locked -p agenttrace-core --test token_conformance
+
+      - name: Binary conformance runner
+        run: |
+          cargo build --locked -p agenttrace
+          AGENTTRACE_BIN=target/debug/agenttrace scripts/conformance/run.sh
+
+      - name: Validate runner script
+        run: bash -n scripts/conformance/run.sh
+
   deny:
     # rm-010, cycle 1 ("Trusted transport, gated supply chain"): dependency
     # policy gate — advisories (RUSTSEC), licenses, bans, sources — against
