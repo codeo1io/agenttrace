@@ -36,6 +36,14 @@ pub struct LoadReport {
     pub parsed: usize,
     pub skipped: usize,
     pub cache_hits: usize,
+    /// rm-734: sqlite-backed databases that exist but could not be
+    /// read (unopenable, corrupt header, unpreparable schema). Their
+    /// sessions are EXCLUDED from `sessions` above; carrying the
+    /// failure records here lets the report layers disclose the
+    /// exclusion instead of rendering a silently smaller corpus.
+    /// Empty when every present database read cleanly (the
+    /// `skip_serializing_if` on DataHealth keeps it out of JSON then).
+    pub sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteReadFailure>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -361,10 +369,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     if cache.is_dirty() {
         let _ = save_session_cache(cache);
     }
+    let mut sqlite_read_failures = Vec::new();
     if dir.is_none() {
-        sessions.extend(crate::sqlite_sessions::load_sqlite_backed_sessions_since(
-            options.since,
-        ));
+        let (sqlite_sessions, failures) =
+            crate::sqlite_sessions::load_sqlite_backed_sessions_with_failures(options.since);
+        sessions.extend(sqlite_sessions);
+        sqlite_read_failures = failures;
     }
     if options.preserve_history {
         let _ = preserve_derived_history(&sessions);
@@ -398,6 +408,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sessions,
         discovered,
         cache_hits,
+        sqlite_read_failures,
     }
 }
 
