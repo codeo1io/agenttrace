@@ -2250,3 +2250,52 @@ fn dropped_sqlite_rows_are_disclosed_on_report_paths() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn waste_json_discloses_synthetic_loop_cost_basis() {
+    // rm-857 e2e: a session whose only loop dollars are constant-derived
+    // (synthetic basis — the parser's default when no priced retry cost is
+    // recorded) must disclose that basis in the machine contract, the same
+    // contract `--diagnostics` already carries via LoopCost.cost_basis.
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-waste-basis-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&work).expect("create temp dir");
+    // Identical tool_use repeated -> a detected loop -> synthetic loop dollars.
+    std::fs::write(
+        work.join("loopy.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"run it"},"sessionId":"s1","timestamp":"2026-05-07T02:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"bash","input":{"command":"ls"}}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:05Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu2","name":"bash","input":{"command":"ls"}}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:10Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu3","name":"bash","input":{"command":"ls"}}]},"sessionId":"s1","timestamp":"2026-05-07T02:00:15Z"}
+"#,
+    )
+    .expect("write loopy session");
+    let cache = work.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "-d",
+            work.to_str().expect("temp dir is valid UTF-8"),
+            "--waste",
+            "-f",
+            "json",
+        ])
+        .output()
+        .expect("run waste json");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("agenttrace.waste.v1"),
+        "waste.v1 schema banner expected, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"loop_cost_basis\": \"synthetic\""),
+        "rm-857: the machine contract must carry the basis key, got: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}

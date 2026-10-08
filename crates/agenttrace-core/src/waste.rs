@@ -1,3 +1,4 @@
+use crate::diagnostics::LoopCostBasis;
 use crate::{
     format_cost, format_tokens, loop_waste_percent, pricing, round4, Metrics, ReportLanguage,
     Session, VERSION,
@@ -44,6 +45,10 @@ pub struct WasteReport {
     waste_level: &'static str,
     total_wasted: f64,
     loop_percent: f64,
+    /// rm-857: `priced` (token mass x event rates) or `synthetic`
+    /// (constant-derived estimate) — the basis contract LoopCost.cost_basis
+    /// lands on the diagnostics surface, propagated to every waste surface.
+    loop_cost_basis: LoopCostBasis,
     /// Session-level estimated cost that the per-tool figures are
     /// allocated from. Per-tool "cost" is an allocated share, never
     /// measured per-tool spend (rm-004).
@@ -83,6 +88,7 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
             }),
     );
     let loop_cost = session.diagnostics.loop_cost.total_loop_cost;
+    let loop_basis = session.diagnostics.loop_cost.cost_basis;
     let loop_percent = loop_waste_percent(loop_cost, session.metrics.cost_estimated);
     let mut total_wasted = cache.wasted_cost + loop_cost;
     if bloat.bloat_score > 50 {
@@ -123,21 +129,39 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         15..=39 => "yellow",
         _ => "green",
     };
+    let synthetic_loop_disclosure = loop_basis == LoopCostBasis::Synthetic && loop_cost > 0.0;
     let summary = match waste_level {
         "green" => "efficient session - no significant waste".to_string(),
         "yellow" => format!(
-            "minor waste - cache {:.0}% hit, room for optimization",
-            cache.hit_rate
+            "minor waste - cache {:.0}% hit, room for optimization{}",
+            cache.hit_rate,
+            if synthetic_loop_disclosure {
+                " (loop portion is a synthetic estimate)"
+            } else {
+                ""
+            }
         ),
         "orange" => format!(
-            "wasting ${:.2}: loops {:.0}%, tools {:.1}/turn",
-            total_wasted, loop_percent, bloat.tools_per_turn
-        ),
-        "red" => format!(
-            "severe waste ${:.2}: loops {:.0}%, {} stuck, no cache",
+            "wasting ${:.2}: loops {:.0}%, tools {:.1}/turn{}",
             total_wasted,
             loop_percent,
-            stuck.len()
+            bloat.tools_per_turn,
+            if synthetic_loop_disclosure {
+                " (synthetic estimate)"
+            } else {
+                ""
+            }
+        ),
+        "red" => format!(
+            "severe waste ${:.2}: loops {:.0}%, {} stuck, no cache{}",
+            total_wasted,
+            loop_percent,
+            stuck.len(),
+            if synthetic_loop_disclosure {
+                " (synthetic estimate)"
+            } else {
+                ""
+            }
         ),
         _ => String::new(),
     };
@@ -158,8 +182,14 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
     }
     if loop_percent > 20.0 {
         top_actions.push(format!(
-            "loop waste ${:.2} ({:.0}%) - add max retries limit",
-            loop_cost, loop_percent
+            "loop waste ${:.2} ({:.0}%{}) - add max retries limit",
+            loop_cost,
+            loop_percent,
+            if loop_basis == LoopCostBasis::Synthetic {
+                ", synthetic estimate"
+            } else {
+                ""
+            }
         ));
     }
     if top_actions.is_empty() {
@@ -174,6 +204,7 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         waste_level,
         total_wasted,
         loop_percent,
+        loop_cost_basis: loop_basis,
         session_cost: session.metrics.cost_estimated.max(0.0),
         summary,
         top_actions,
@@ -206,6 +237,11 @@ pub fn waste_report_json(report: &WasteReport) -> String {
         "waste_level": report.waste_level,
         "total_wasted_cost": round4(report.total_wasted),
         "loop_waste_percent": (report.loop_percent * 10.0).round() / 10.0,
+        "loop_cost_basis": if report.loop_cost_basis == LoopCostBasis::Synthetic {
+            "synthetic"
+        } else {
+            "priced"
+        },
         "session_cost": round4(report.session_cost),
         "cache": {
             "rating": report.cache.rating,
@@ -374,6 +410,17 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         t(language, "Wasted", "浪费成本"),
         format_cost(report.total_wasted)
     ));
+    if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            t(language, "Loop cost basis", "循环成本基础"),
+            t(
+                language,
+                "synthetic estimate, not price-derived",
+                "合成估算，非定价推导"
+            )
+        ));
+    }
     out.push_str(&format!("  {}\n", waste_summary(report, language)));
     out.push('\n');
     out.push_str(t(language, "  -- Cache --\n", "  -- 缓存 --\n"));
@@ -475,17 +522,34 @@ fn waste_summary(report: &WasteReport, language: ReportLanguage) -> String {
     match report.waste_level {
         "green" => "会话效率良好，未发现明显浪费".to_string(),
         "yellow" => format!(
-            "轻微浪费：缓存命中率 {:.0}%，仍有优化空间",
-            report.cache.hit_rate
+            "轻微浪费：缓存命中率 {:.0}%，仍有优化空间{}",
+            report.cache.hit_rate,
+            if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
+                "（循环部分为合成估算）"
+            } else {
+                ""
+            }
         ),
         "orange" => format!(
-            "浪费 ${:.2}：循环 {:.0}%，每轮工具调用 {:.1} 次",
-            report.total_wasted, report.loop_percent, report.bloat.tools_per_turn
+            "浪费 ${:.2}：循环 {:.0}%，每轮工具调用 {:.1} 次{}",
+            report.total_wasted,
+            report.loop_percent,
+            report.bloat.tools_per_turn,
+            if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
+                "（循环部分为合成估算）"
+            } else {
+                ""
+            }
         ),
         _ => format!(
-            "严重浪费 ${:.2}：{} 个卡住信号，且未有效使用缓存",
+            "严重浪费 ${:.2}：{} 个卡住信号，且未有效使用缓存{}",
             report.total_wasted,
-            report.stuck.len()
+            report.stuck.len(),
+            if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
+                "（循环部分为合成估算）"
+            } else {
+                ""
+            }
         ),
     }
 }
@@ -559,6 +623,7 @@ fn action_text(action: &str, language: ReportLanguage) -> String {
             .replace("x - reduce or batch", " 次，请减少调用或批处理"),
         _ if action.starts_with("loop waste ") => action
             .replace("loop waste ", "循环浪费 ")
+            .replace(", synthetic estimate", "，合成估算")
             .replace(" - add max retries limit", "，请限制最大重试次数"),
         _ => action.to_string(),
     }
@@ -710,5 +775,155 @@ mod tests {
         let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
         assert!(rendered.contains("allocated share of session cost"));
         assert!(rendered.contains("75% of session"));
+    }
+}
+
+#[cfg(test)]
+mod loop_cost_basis_disclosure_tests {
+    use super::*;
+    use crate::diagnostics::{Diagnostics, LoopCost};
+
+    fn session_with_loop(basis: LoopCostBasis) -> Session {
+        Session {
+            name: String::from("loop-basis-probe"),
+            path: String::from("/tmp/loop-basis-probe.jsonl"),
+            cwd: String::new(),
+            metrics: Metrics {
+                cost_estimated: 1.0,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics {
+                loop_cost: LoopCost {
+                    cost_basis: basis,
+                    total_loop_cost: 0.9,
+                    retry_events: 4,
+                    retry_cost: 0.0,
+                    tool_loop_cost: 0.0,
+                    loop_groups: 1,
+                    loop_type: String::from("identical"),
+                    turns: 5,
+                },
+                ..Diagnostics::default()
+            },
+        }
+    }
+
+    #[test]
+    fn synthetic_loop_cost_basis_is_disclosed_on_every_surface() {
+        let session = session_with_loop(LoopCostBasis::Synthetic);
+        let report = compute_waste_report(&session);
+        assert_eq!(report.loop_cost_basis, LoopCostBasis::Synthetic);
+        let json = waste_report_json(&report);
+        assert!(
+            json.contains("\"loop_cost_basis\": \"synthetic\""),
+            "rm-857: waste.v1 JSON must carry the basis key: {json}"
+        );
+        assert!(
+            report.summary.contains("synthetic estimate"),
+            "rm-857: summary must mark the synthetic loop figure: {}",
+            report.summary
+        );
+        assert!(
+            report
+                .top_actions
+                .iter()
+                .any(|action| action.contains("synthetic estimate")),
+            "rm-857: loop action must carry the marker: {:?}",
+            report.top_actions
+        );
+        let en = waste_report_text(&report, ReportLanguage::En);
+        assert!(
+            en.contains("synthetic estimate, not price-derived"),
+            "rm-857: EN text report must disclose the loop basis: {en}"
+        );
+        let zh = waste_report_text(&report, ReportLanguage::Zh);
+        assert!(
+            zh.contains("合成估算，非定价推导") || zh.contains("（循环部分为合成估算）"),
+            "rm-857: zh text report must carry the marker: {zh}"
+        );
+    }
+
+    #[test]
+    fn priced_loop_cost_basis_stays_unmarked() {
+        let session = session_with_loop(LoopCostBasis::Priced);
+        let report = compute_waste_report(&session);
+        assert_eq!(report.loop_cost_basis, LoopCostBasis::Priced);
+        let json = waste_report_json(&report);
+        assert!(
+            json.contains("\"loop_cost_basis\": \"priced\""),
+            "rm-857: priced basis must serialize: {json}"
+        );
+        assert!(
+            !report.summary.contains("synthetic estimate"),
+            "priced summary must stay unmarked: {}",
+            report.summary
+        );
+        let en = waste_report_text(&report, ReportLanguage::En);
+        assert!(
+            !en.contains("synthetic estimate, not price-derived"),
+            "priced EN text must stay unmarked: {en}"
+        );
+        // review fix: the priced loop ACTION must not claim a synthetic estimate either
+        assert!(
+            !report
+                .top_actions
+                .iter()
+                .any(|action| action.contains("synthetic")),
+            "priced loop action must not claim a synthetic estimate: {:?}",
+            report.top_actions
+        );
+        assert!(
+            report
+                .top_actions
+                .iter()
+                .any(|action| action.contains("loop waste") && !action.contains("synthetic")),
+            "priced loop action must still exist without the marker: {:?}",
+            report.top_actions
+        );
+    }
+
+    fn session_without_loop(basis: LoopCostBasis) -> Session {
+        let mut session = session_with_loop(basis);
+        session.diagnostics.loop_cost.total_loop_cost = 0.0;
+        session.diagnostics.loop_cost.retry_events = 0;
+        session.diagnostics.loop_cost.tool_loop_cost = 0.0;
+        session.diagnostics.loop_cost.loop_groups = 0;
+        session.diagnostics.loop_cost.turns = 0;
+        session
+    }
+
+    #[test]
+    fn loopless_waste_sessions_do_not_disclose_a_loop_basis() {
+        let session = session_without_loop(LoopCostBasis::Synthetic);
+        let report = compute_waste_report(&session);
+        // the machine contract still declares the basis honestly
+        let json = waste_report_json(&report);
+        assert!(
+            json.contains("\"loop_cost_basis\": \"synthetic\""),
+            "loopless JSON must still declare the basis"
+        );
+        // but no human-facing surface claims a synthetic "loop portion" that does not exist
+        assert!(
+            !report.summary.contains("synthetic"),
+            "loopless summary must stay unmarked: {}",
+            report.summary
+        );
+        let en = waste_report_text(&report, ReportLanguage::En);
+        assert!(
+            !en.contains("Loop cost basis"),
+            "loopless EN text must not print the basis line: {en}"
+        );
+        assert!(
+            !en.contains("synthetic"),
+            "loopless EN text must stay fully unmarked: {en}"
+        );
+        let zh = waste_report_text(&report, ReportLanguage::Zh);
+        assert!(
+            !zh.contains("合成估算"),
+            "loopless zh text must stay unmarked: {zh}"
+        );
     }
 }

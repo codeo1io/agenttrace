@@ -2450,7 +2450,7 @@ pub(super) fn diagnostics_native_text(session: &Session, language: Language) -> 
     let diagnostics = &session.diagnostics;
     if diagnostics.loop_cost.total_loop_cost > 0.0 {
         lines.push(format!(
-            "{}: {}={} {}={} {}={} type={} turns={}",
+            "{}: {}={} {}={} {}={} type={} turns={} basis={}",
             text(language, "Loop analysis", "循环分析"),
             text(language, "cost", "成本"),
             format_compact_cost(diagnostics.loop_cost.total_loop_cost),
@@ -2459,7 +2459,12 @@ pub(super) fn diagnostics_native_text(session: &Session, language: Language) -> 
             text(language, "groups", "组数"),
             diagnostics.loop_cost.loop_groups,
             diagnostics.loop_cost.loop_type,
-            diagnostics.loop_cost.turns
+            diagnostics.loop_cost.turns,
+            if diagnostics.loop_cost.cost_basis == agenttrace_core::LoopCostBasis::Synthetic {
+                "synthetic"
+            } else {
+                "priced"
+            }
         ));
     }
     for warning in &session.tool_warnings {
@@ -3959,4 +3964,51 @@ pub(super) fn format_duration(seconds: f64) -> String {
         return format!("{:.1}y", seconds / (365.0 * 86_400.0));
     }
     format!("{:.1}d", seconds / 86_400.0)
+}
+
+#[cfg(test)]
+mod loop_basis_disclosure_tests {
+    use super::*;
+    use agenttrace_core::{Diagnostics, LoopCost, LoopCostBasis, Metrics};
+
+    fn session_with_loop(basis: LoopCostBasis) -> Session {
+        Session {
+            name: String::from("loop-basis"),
+            path: String::from("/tmp/loop-basis.jsonl"),
+            cwd: String::new(),
+            metrics: Metrics {
+                cost_estimated: 1.0,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics {
+                loop_cost: LoopCost {
+                    cost_basis: basis,
+                    total_loop_cost: 0.9,
+                    retry_events: 4,
+                    retry_cost: 0.0,
+                    tool_loop_cost: 0.0,
+                    loop_groups: 1,
+                    loop_type: String::from("identical"),
+                    turns: 5,
+                },
+                ..Diagnostics::default()
+            },
+        }
+    }
+
+    #[test]
+    fn diagnostics_loop_line_discloses_cost_basis() {
+        let session = session_with_loop(LoopCostBasis::Synthetic);
+        let en = diagnostics_native_text(&session, Language::En);
+        assert!(en.contains("basis=synthetic"), "rm-857: {en}");
+        let priced = session_with_loop(LoopCostBasis::Priced);
+        let en_priced = diagnostics_native_text(&priced, Language::En);
+        assert!(
+            !en_priced.contains("basis=synthetic"),
+            "priced must stay unmarked: {en_priced}"
+        );
+    }
 }

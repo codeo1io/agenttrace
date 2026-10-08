@@ -80,7 +80,7 @@ pub struct SqliteIngestReport {
     pub fork_excluded: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SqliteUnreadableDb {
     pub path: PathBuf,
     pub source: &'static str,
