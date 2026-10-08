@@ -28,3 +28,31 @@ In every observed instance the progress pings carried no evidence of completed w
 - Original statement of the porcelain-census discriminator: `docs/stewardship/2026-10-06-cycle2-compound-record-runb1ff12f8.md` ("Attempts and forensics").
 - Four-instance corroboration and the compound-time re-verification for attempt `70651ebb`: `docs/stewardship/2026-10-07-cycle1-compound-record-run460d0633.md`.
 - Sibling class (fold rejected for a missing attestation, not infra death): the KTD13 changed-surfaces repairs recorded in runs `b1ff12f8` and `3c24960c` — different failure, same "verify before adopting" rule.
+
+## 2026-10-08 extension — reaped attempts that DID finish (two adoption classes)
+
+Run `749cd29820f3` (repository-maintenance dda534730 cycle 1) hit four provider deaths and
+proved the "zero tree drift" assumption above is a COMMON case, not a law. Two of the four
+left complete, verified, adoptable work:
+
+1. **Tree drift (implement 44a88914 → adopted by a0ef8a86).** Reaped at 24 messages with
+   no envelope, but the worktree carried the entire implemented batch (~+460 lines over 6
+   code/doc files). Adoption gate = the work-order lineage (run/action/base identity),
+   verified first-hand before any adoption; the tree trail is only the CANDIDATE, never the
+   proof (same rule as 73fe8e1e's 05563e2a case).
+2. **Detached survivor runner (full_tests cd85a837 → adopted by 2152ef02).** Reaped
+   05:58:36Z — but its backgrounded lane runner had already finished ALL 23 ci.yml lanes
+   rc=0 at 05:56Z, two minutes BEFORE the reap decision window. Third fleet instance of the
+   pattern (9a4d37af original; f4df3f3f same-day on run c0f141d1). Consequences:
+   - Hour-scale batteries run DETACHED with logs + CI_OUT under `/tmp`, named for the
+     attempt — never inside the repo, never only in the dying session's stdout.
+   - A successor phase SWEEPS for completed survivors before re-running hours of lanes.
+   - Adoption needs legs, not vibes: script identity (cd's into THIS worktree), independent
+     lane re-derivation from ci.yml, tree immobility (porcelain + mtimes predate the
+     runner), log genuineness (embedded paths, gate outputs), digest re-derivation.
+
+The heartbeat-only case still holds: this run's compound 6394648a (3 messages, pings only)
+and prioritize 51984e11 (message 4) were correctly redone from scratch — rules 1–3 above
+remain the fast path, and this extension adds two checks to run after they come back
+clean-or-dirty: **tree drift as candidate work, detached /tmp artifacts as candidate
+results.** Recorded in PR-Y of docs/stewardship/2026-10-08-cycle1-compound-record-run749cd29820f3.md.

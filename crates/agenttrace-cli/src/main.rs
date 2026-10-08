@@ -337,7 +337,33 @@ fn run() -> anyhow::Result<()> {
     // never renders; the same keyword-shadowing class rm-573 closed for
     // statusline/upstream, caught for `mcp` at integration of rm-455).
     if args.path.as_deref() == Some("mcp") && !args.statusline_report {
-        return mcp::serve();
+        // rm-781: this arm used to reach `serve()` before the CLI's
+        // layered configuration was resolved, so file-layer pricing
+        // and history knobs (user/project config.toml, `--config`,
+        // `--pricing-file`, `--history-dir`) never reached the runtime
+        // consumers on the mcp path — the CLI reported $0.003 for a
+        // corpus the MCP tools priced at $0.00 under the SAME override
+        // (assess F1 PoC), and the README's "same locally discovered
+        // sessions" parity claim was half-true. Resolve and install
+        // the SAME config the report lane installs below, so the
+        // parity the docs promise is the parity the server delivers.
+        refuse_inapplicable_mcp_flags(&args);
+        if let Some(dir) = args.dir.as_deref() {
+            // rm-781: an explicit `-d` corpus is the user's most
+            // explicit signal — honor it on the mcp lane too, with
+            // the same rc2 admission check the report lane runs (a
+            // missing directory is a usage error, not an empty
+            // corpus). It used to be parsed by clap and silently
+            // dropped, and a `-d`-scoped empty corpus answered a
+            // misleading "point HOME" remedy (assess F3 PoC).
+            validate_dir_flag_or_exit(dir);
+        }
+        let resolved = config::resolve(&args)?;
+        agenttrace_core::set_runtime_config(agenttrace_core::RuntimeConfigOverrides {
+            history_dir: resolved.history_dir.clone(),
+            pricing_file: resolved.pricing_file.clone(),
+        });
+        return mcp::serve(args.dir.as_deref().map(Path::new));
     }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
@@ -901,6 +927,121 @@ fn enforce_report_gates(args: &Args, sessions: &[Session]) {
     std::process::exit(2);
 }
 
+/// `-d/--dir` admission, shared by the report lane and (since
+/// rm-781) the `mcp` host lane: a missing or non-directory corpus
+/// root is a usage error (rc2) on both paths — the same explicit
+/// user choice must not degrade differently per lane.
+fn validate_dir_flag_or_exit(dir: &str) {
+    let path = Path::new(dir);
+    if !path.exists() {
+        eprintln!("agenttrace: session directory does not exist: {dir}");
+        eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
+        std::process::exit(2);
+    }
+    if !path.is_dir() {
+        eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
+        std::process::exit(2);
+    }
+}
+
+/// rm-781: flags placed BEFORE the `mcp` keyword used to be accepted
+/// by clap and then silently ignored — the dispatch arm ran with none
+/// of them applied (`agenttrace -d <seeded> mcp` discarded the user's
+/// corpus choice and answered a misleading "point HOME" remedy;
+/// `--overview mcp` just ran the server as if nothing was asked;
+/// assess F3/F5 PoCs). The lane now honors exactly the flags that
+/// genuinely apply — `-d/--dir` (corpus root) and the layered-config
+/// family (`--config`, `--history-dir`, `--pricing-file`) — and
+/// refuses every report/render/gate flag loudly at rc2: the same
+/// keyword-shadowing discipline rm-505/rm-573 established for flags
+/// AFTER the keyword and for --statusline-report. A refusal names the
+/// refused flag(s), the honored set, and the help route.
+fn refuse_inapplicable_mcp_flags(args: &Args) {
+    let mut refused: Vec<&str> = Vec::new();
+    let mut flag = |set: bool, name: &'static str| {
+        if set {
+            refused.push(name);
+        }
+    };
+    // Value flags: refused whenever they differ from clap's default
+    // (an explicitly-passed no-op value is indistinguishable from the
+    // default and harmless either way).
+    flag(args.format != "text", "--format/-f");
+    flag(args.model != "default", "--model/-m");
+    flag(args.lang != "en", "--lang");
+    flag(args.range != "all", "--range");
+    flag(!args.project.is_empty(), "--project");
+    flag(!args.source.is_empty(), "--source");
+    flag(!args.model_filter.is_empty(), "--model-filter");
+    flag(!args.query.is_empty(), "--query");
+    flag(!args.health.is_empty(), "--health");
+    flag(!args.cost.is_empty(), "--cost");
+    flag(!args.anomaly.is_empty(), "--anomaly");
+    flag(args.sort != "recent", "--sort");
+    flag(args.order != "desc", "--order");
+    flag(args.limit != 20, "--limit");
+    flag(args.search_limit != 20, "--search-limit");
+    flag(args.search.is_some(), "--search");
+    flag(args.fail_under_health != 0, "--fail-under-health");
+    flag(args.fail_on_critical, "--fail-on-critical");
+    flag(args.max_tool_fail_rate.is_some(), "--max-tool-fail-rate");
+    flag(args.baseline.is_some(), "--baseline");
+    flag(
+        args.baseline_max_duration_delta_pct != 0.0,
+        "--baseline-max-duration-delta-pct",
+    );
+    flag(
+        args.baseline_max_cost_delta_pct != 0.0,
+        "--baseline-max-cost-delta-pct",
+    );
+    flag(
+        args.baseline_max_token_delta_pct != 0.0,
+        "--baseline-max-token-delta-pct",
+    );
+    flag(args.no_baseline_gate, "--no-baseline-gate");
+    // Boolean report/render/gate actions that have no meaning for a
+    // stdio server.
+    flag(args.compare, "--compare");
+    flag(args.audit, "--audit");
+    flag(args.recommend, "--recommend");
+    flag(args.mcp_governance, "--mcp-governance");
+    flag(args.context_trends, "--context-trends");
+    flag(args.delivery_evidence, "--delivery-evidence");
+    flag(args.overview, "--overview");
+    flag(args.sessions, "--sessions");
+    flag(args.diagnostics, "--diagnostics");
+    flag(args.inspect.is_some(), "--inspect");
+    flag(args.output.is_some(), "--output/-o");
+    flag(args.latest, "--latest");
+    flag(args.waste, "--waste");
+    flag(args.list_models, "--list-models");
+    flag(args.update_pricing, "--update-pricing");
+    flag(args.test_match, "--test-match");
+    flag(args.fetch, "--fetch");
+    flag(args.weekly_budget.is_some(), "--weekly-budget");
+    flag(args.budget, "--budget");
+    flag(args.demo, "--demo");
+    flag(args.doctor, "--doctor");
+    flag(args.sample.is_some(), "--sample");
+    flag(args.clear_cache, "--clear-cache");
+    flag(args.preserve_history, "--preserve-history");
+    flag(args.include_history, "--include-history");
+    if refused.is_empty() {
+        return;
+    }
+    eprintln!(
+        "agenttrace: flag(s) {} precede the `mcp` keyword but cannot apply to the MCP \
+         server; refusing instead of silently dropping",
+        refused.join(", ")
+    );
+    eprintln!(
+        "- the mcp lane honors exactly: -d/--dir (corpus root) and the config family \
+         (--config, --history-dir, --pricing-file), placed BEFORE the keyword"
+    );
+    eprintln!("- run `agenttrace mcp --help` for the keyword contract");
+    std::process::exit(2);
+}
+
 fn write_stderr(value: &str) -> anyhow::Result<()> {
     match io::stderr().write_all(value.as_bytes()) {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
@@ -1180,13 +1321,22 @@ fn keyword_help_text(keyword: &str) -> String {
             "tools/list, tools/call. Two read-only tools render the same\n",
             "locally discovered sessions as the CLI — usage_overview (the\n",
             "--overview -f json document) and by_model_breakdown (cost and\n",
-            "sessions per model). The server opens no sockets, performs no\n",
-            "network probes, and writes nothing outside the agenttrace\n",
-            "session cache; it serves until stdin closes. Note: this\n",
-            "keyword is unrelated to the --mcp-governance flag, which\n",
-            "filters MCP governance findings inside reports.\n",
+            "sessions per model), with the CLI's layered configuration\n",
+            "(config.toml layers, --pricing-file, --history-dir) applied\n",
+            "identically (rm-781). The server speaks MCP protocol\n",
+            "revisions 2026-07-28, 2025-11-25, and 2025-06-18, answering\n",
+            "initialize with the newest mutually supported revision\n",
+            "(rm-780). It opens no sockets, performs no network probes,\n",
+            "and writes nothing outside the agenttrace session cache; it\n",
+            "serves until stdin closes. Note: this keyword is unrelated\n",
+            "to the --mcp-governance flag, which filters MCP governance\n",
+            "findings inside reports.\n",
             "\n",
-            "This keyword takes no flags; flags after it are rejected.\n",
+            "Flags: the config family (--config, --history-dir,\n",
+            "--pricing-file) and -d/--dir (corpus root) are honored when\n",
+            "placed BEFORE the keyword; every other flag cannot apply to\n",
+            "the server and is refused loudly (rc2);\n",
+            "flags after it are rejected.\n",
             "\n",
             "See docs/guides/mcp-server.md.\n",
         ),
@@ -1339,17 +1489,10 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // "No session files found in …" error as a genuinely empty
     // directory — the two need different messages and different exit
     // codes (2 = the request itself is wrong; 1 = nothing matched).
+    // rm-781: extracted so the `mcp` host lane admits `-d` the same
+    // way before serving (same rc2, same messages).
     if let Some(dir) = args.dir.as_deref() {
-        let path = Path::new(dir);
-        if !path.exists() {
-            eprintln!("agenttrace: session directory does not exist: {dir}");
-            eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
-            std::process::exit(2);
-        }
-        if !path.is_dir() {
-            eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
-            std::process::exit(2);
-        }
+        validate_dir_flag_or_exit(dir);
     }
     let range = parse_range(args)?;
     let report = load_sessions_with_options(
@@ -2538,6 +2681,31 @@ mod tests {
 
         args.cost = "expensive".to_string();
         assert!(prepare_cli_view(filtered, &args).is_err());
+    }
+
+    #[test]
+    fn mcp_lane_refusal_passes_the_honored_flag_family() {
+        // rm-781: the refusal arm must fire on exactly the flags that
+        // cannot apply to a stdio server. The default invocation and
+        // the honored family (-d plus the config layer flags) must
+        // pass through it untouched — the rc2 arms are pinned e2e by
+        // tests/mcp_server.rs, so here a wrong refusal would exit the
+        // test binary itself and fail loudly.
+        let args = Args::try_parse_from([
+            "agenttrace",
+            "-d",
+            "/tmp",
+            "--config",
+            "/tmp/agenttrace-mcp-probe.toml",
+            "--history-dir",
+            "/tmp/history",
+            "--pricing-file",
+            "/tmp/pricing.json",
+            "mcp",
+        ])
+        .expect("honored family parses");
+        assert_eq!(Some("mcp"), args.path.as_deref());
+        refuse_inapplicable_mcp_flags(&args);
     }
 
     #[test]

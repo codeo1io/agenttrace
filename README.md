@@ -163,9 +163,19 @@ JSON-RPC 2.0 over stdio, so a coding agent can ask about its own token
 usage from inside the session that burned it. Two tools render the same
 locally discovered sessions the CLI reports on — `usage_overview` (the
 `--overview -f json` document) and `by_model_breakdown` (cost and
-sessions per model). The server opens no sockets, performs no network
-probes, and writes nothing outside the agenttrace session cache; it
-serves until stdin closes.
+sessions per model) — through the same layered configuration the CLI
+resolves: a `--config` layer or `--pricing-file` override prices both
+lanes identically (rm-781). `initialize` negotiates the newest
+mutually supported protocol revision — `2026-07-28`, `2025-11-25`, or
+`2025-06-18` — never a blind echo (rm-780). The server opens no
+sockets, performs no network probes, and writes nothing outside the
+agenttrace session cache; it serves until stdin closes, answering
+non-UTF-8 and over-cap lines with `-32700` instead of dying (rm-782).
+
+Place flags BEFORE the `mcp` keyword: `-d/--dir` and the config family
+(`--config`, `--history-dir`, `--pricing-file`) are honored, and every
+flag that cannot apply to a server is refused at exit 2 instead of
+being silently dropped (rm-781).
 
 ```json
 {
