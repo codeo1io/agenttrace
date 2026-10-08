@@ -5,7 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (run 32f3b7a1 cycle 3, rm-726 'magnitude-clamp
+// disclosure + implausible-magnitude anomaly class', batch 'honest
+// magnitudes, honest paths'): number_as_i64 clamps (u64 payloads
+// above i64::MAX, saturating f64s, numeric strings) now count on the
+// magnitude_clamped:* disclosure family, analyze() adds the
+// negative-to-zero and above-plausibility-bound censuses, and
+// detect_anomalies grows the high-severity implausible_magnitude
+// class — the served report changes for UNCHANGED files (a hostile
+// {input_tokens: 1e19} journal now discloses its clamp count beside
+// the cost total and drops below HEALTH 100 instead of rendering a
+// clean $42.7T), so a warm v32 cache keeps serving the pre-
+// disclosure report with matching fingerprints: no re-parse, no
+// self-heal (rm-230 convention: report-changing parser/disclosure
+// semantics bump the schema so cached sessions regenerate). Entries
+// regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):

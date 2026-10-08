@@ -4929,6 +4929,27 @@ fn sum_numbers(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
         .fold(0i64, i64::saturating_add)
 }
 
+// rm-726: `number_as_i64` clamps magnitudes that cannot fit i64 (u64
+// payloads above i64::MAX, saturating f64s) onto the i64 bounds so a
+// hostile journal cannot wrap totals — but a silent clamp is silent
+// cost truth ($42.7T rendered as a clean, anomaly-free run). Count
+// every clamp on this thread-local census; `session_from_events`
+// drains it onto Metrics.disclosure_counters so the run reports how
+// many values were clamped and detect_anomalies flags them.
+thread_local! {
+    static MAGNITUDE_CLAMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_magnitude_clamp() {
+    MAGNITUDE_CLAMPS.with(|census| census.set(census.get().saturating_add(1)));
+}
+
+/// rm-726: take (and reset) the current thread's parse-scope count of
+/// magnitude clamps performed by `number_as_i64`.
+pub(crate) fn take_magnitude_clamp_count() -> u64 {
+    MAGNITUDE_CLAMPS.with(|census| census.replace(0))
+}
+
 pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Number(number) => number.as_i64().or_else(|| {
@@ -4937,7 +4958,13 @@ pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
                 // Clamp instead of wrapping: u64 values above i64::MAX
                 // previously cast to a negative i64 through `as i64`,
                 // letting corrupt logs flip token totals negative.
-                .map(|n| n.min(i64::MAX as u64) as i64)
+                .map(|n| {
+                    // rm-726: the clamp itself is a disclosure fact.
+                    if n > i64::MAX as u64 {
+                        note_magnitude_clamp();
+                    }
+                    n.min(i64::MAX as u64) as i64
+                })
                 .or_else(|| {
                     number
                         .as_f64()
@@ -4945,7 +4972,17 @@ pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
                         // magnitudes (e.g. 1e300) land on the i64 bounds
                         // instead of wrapping; downstream aggregation is
                         // saturating as well.
-                        .map(|n| n as i64)
+                        .map(|n| {
+                            // rm-726: i64::MAX as f64 rounds up to 2^63,
+                            // so `>= 2^63` saturates; i64::MIN as f64 is
+                            // exact, so only strictly smaller values
+                            // clamp at the low bound. Counted either way.
+                            if n >= 9_223_372_036_854_775_808.0 || n < -9_223_372_036_854_775_808.0
+                            {
+                                note_magnitude_clamp();
+                            }
+                            n as i64
+                        })
                 })
         }),
         Value::String(text) => numeric_string_as_i64(text),
@@ -4966,7 +5003,14 @@ fn numeric_string_as_i64(text: &str) -> Option<i64> {
     }
     // `as` casts from f64 to i64 saturate, mirroring the Number arm for
     // magnitudes beyond i64::MAX.
-    trimmed.parse::<f64>().ok().map(|value| value as i64)
+    trimmed.parse::<f64>().ok().map(|value| {
+        // rm-726: string-encoded floats clamp through the same census
+        // as the Number arm ("1e300" above i64::MAX).
+        if value >= 9_223_372_036_854_775_808.0 || value < -9_223_372_036_854_775_808.0 {
+            note_magnitude_clamp();
+        }
+        value as i64
+    })
 }
 
 fn boolish(value: Option<&Value>) -> bool {
@@ -7225,4 +7269,52 @@ mod tests {
             Some(&1)
         );
     }
+}
+
+#[test]
+fn number_as_i64_counts_magnitude_clamps_on_the_disclosure_census() {
+    // rm-726: u64 payloads above i64::MAX and saturating f64s land on
+    // the i64 bounds — silently before this. Every clamp must land on
+    // the thread-local census that session_from_events drains onto
+    // Metrics.disclosure_counters (magnitude_clamped:above_i64).
+    let _ = take_magnitude_clamp_count(); // reset for this thread
+
+    // In-range values never count.
+    assert_eq!(
+        number_as_i64(&serde_json::json!(1_000_000_000_000i64)),
+        Some(1_000_000_000_000)
+    );
+    assert_eq!(number_as_i64(&serde_json::json!(-5000)), Some(-5000));
+    assert_eq!(
+        number_as_i64(&serde_json::json!(1e18)),
+        Some(1_000_000_000_000_000_000)
+    );
+    assert_eq!(take_magnitude_clamp_count(), 0);
+
+    // u64 above i64::MAX clamps onto i64::MAX, counted.
+    assert_eq!(
+        number_as_i64(&serde_json::json!(10_000_000_000_000_000_000u64)),
+        Some(i64::MAX)
+    );
+    assert_eq!(take_magnitude_clamp_count(), 1);
+
+    // Saturating f64s (positive and negative) count too; the negative
+    // bound saturates at i64::MIN.
+    assert_eq!(number_as_i64(&serde_json::json!(1e300)), Some(i64::MAX));
+    assert_eq!(take_magnitude_clamp_count(), 1);
+    assert_eq!(number_as_i64(&serde_json::json!(-1e300)), Some(i64::MIN));
+    assert_eq!(take_magnitude_clamp_count(), 1);
+
+    // Numeric strings coerce through the same census.
+    assert_eq!(number_as_i64(&serde_json::json!("1e300")), Some(i64::MAX));
+    assert_eq!(take_magnitude_clamp_count(), 1);
+
+    // In-range floats and strings do not count (1.0 truncation is not
+    // a magnitude clamp; 1e12 is huge but fits i64).
+    assert_eq!(number_as_i64(&serde_json::json!(1.5)), Some(1));
+    assert_eq!(
+        number_as_i64(&serde_json::json!("9007199254740993")),
+        Some(9_007_199_254_740_993i64)
+    );
+    assert_eq!(take_magnitude_clamp_count(), 0);
 }

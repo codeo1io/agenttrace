@@ -8,10 +8,22 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
+/// rm-726: CostAudit serde guard — clamp count only appears when
+/// nonzero, so clean audits keep their exact prior JSON shape.
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CostAudit {
     pub pricing_source: String,
     pub total_estimated_cost: f64,
+    /// rm-726: how many implausible-magnitude values were clamped
+    /// (i64 bounds, negative-to-zero, above the plausibility bound)
+    /// across the audited sessions — zero means the totals price
+    /// untouched values.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub clamped_values: usize,
     pub stored_estimated_cost_usd: f64,
     pub current_estimated_cost_usd: Option<f64>,
     pub pricing_coverage: PricingCoverage,
@@ -227,6 +239,22 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
     }
     let mut rows: BTreeMap<(String, String), Aggregate> = BTreeMap::new();
     let mut coverage = PricingCoverage::default();
+    // rm-726: the audit discloses the magnitude-clamp census beside the
+    // total — clamped values are priced at the i64 bounds, and the
+    // summary must say how many there were instead of implying clean
+    // arithmetic.
+    let clamped_values: usize = sessions
+        .iter()
+        .map(|session| {
+            session
+                .metrics
+                .disclosure_counters
+                .iter()
+                .filter(|(key, _)| key.starts_with("magnitude_clamped:"))
+                .map(|(_, count)| count)
+                .sum::<usize>()
+        })
+        .sum();
     for session in sessions {
         let provider = session.metrics.source_tool.clone();
         let model = normalized_model(&session.metrics.model_used);
@@ -381,6 +409,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
     CostAudit {
         pricing_source: pricing::pricing_source(),
         total_estimated_cost: stored_estimated_cost_usd,
+        clamped_values,
         stored_estimated_cost_usd,
         current_estimated_cost_usd,
         pricing_coverage: coverage,

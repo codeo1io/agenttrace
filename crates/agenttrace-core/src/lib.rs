@@ -490,6 +490,10 @@ pub struct Session {
 pub struct Overview {
     pub total_sessions: usize,
     pub total_cost: f64,
+    /// rm-726: count of implausible-magnitude clamps disclosed by the
+    /// member sessions (`magnitude_clamped:*` counters) — rendered
+    /// beside the total cost so a clamped $42.7T cannot look clean.
+    pub clamped_values: usize,
     pub healthy: usize,
     pub warning: usize,
     pub critical: usize,
@@ -636,6 +640,19 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
         }
     }
     let mut metrics = analyze(&events, &model);
+    // rm-726: drain the parser's thread-local magnitude-clamp census
+    // (number_as_i64 clamps: u64 payloads above i64::MAX, saturating
+    // f64s and strings) onto the disclosure channel at the one choke
+    // point every format passes through — before anomaly detection, so
+    // the cost truth carries its clamp count instead of rendering a
+    // clean $42.7T from clamped bounds.
+    let magnitude_clamped_above_i64 = crate::parser::take_magnitude_clamp_count() as usize;
+    if magnitude_clamped_above_i64 > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("magnitude_clamped:above_i64".to_string())
+            .or_default() += magnitude_clamped_above_i64;
+    }
     // rm-408 disclosure (arm a): count present-but-zero usage blocks at
     // the one choke point every format passes through, and flag them in
     // the provenance string so no surface reports clean zeros silently.
@@ -801,6 +818,13 @@ fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
+/// rm-726: documented plausibility bound for a single usage value —
+/// no real per-message token magnitude approaches it (largest model
+/// contexts are ~2M tokens), so values at/above it are priced as
+/// parsed but flagged implausible on the disclosure channel rather
+/// than rendered as clean truth.
+const IMPLAUSIBLE_TOKEN_MAGNITUDE: i64 = 1_000_000_000_000;
+
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let price = pricing::lookup_price(model);
     let mut metrics = Metrics {
@@ -841,8 +865,26 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         .iter()
         .find(|event| !event.source_tool.is_empty())
         .map(|event| event.source_tool.clone());
+    // rm-726: implausible usage magnitudes are disclosed, never
+    // silently priced. Negative usage values are zeroed by the
+    // `.max(0)` clamp inside the loop below, and values at/above the
+    // documented plausibility bound are priced as parsed — both are
+    // counted here so the disclosure channel (and the
+    // implausible_magnitude anomaly) carries the facts.
+    let mut negative_usage_values = 0usize;
+    let mut implausible_usage_values = 0usize;
 
     for event in events {
+        // rm-726 census: negatives are zeroed below (`.max(0)`), values
+        // at/above the plausibility bound are priced as parsed — both
+        // counted on the disclosure channel, never silent.
+        for value in event.usage.values() {
+            if *value < 0 {
+                negative_usage_values += 1;
+            } else if *value >= IMPLAUSIBLE_TOKEN_MAGNITUDE {
+                implausible_usage_values += 1;
+            }
+        }
         if metrics.source_tool.is_empty()
             && !event.source_tool.is_empty()
             && event.role != "meta"
@@ -1196,11 +1238,63 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         metrics.provenance.pricing_source =
             format!("{} + recorded cost", metrics.provenance.pricing_source);
     }
+    // rm-726: fold the usage-magnitude census onto the non-loss
+    // disclosure channel — same channel as the workbuddy/kimi facts,
+    // visible in every disclosure fold (doctor, diagnostics, markdown
+    // overview) without touching confidence.
+    if negative_usage_values > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("magnitude_clamped:negative_to_zero".to_string())
+            .or_default() += negative_usage_values;
+    }
+    if implausible_usage_values > 0 {
+        *metrics
+            .disclosure_counters
+            .entry("magnitude_clamped:above_plausibility_bound".to_string())
+            .or_default() += implausible_usage_values;
+    }
     metrics
 }
 
 pub fn detect_anomalies(metrics: &Metrics) -> Vec<Anomaly> {
     let mut anomalies = Vec::new();
+    // rm-726: implausible token magnitudes are a first-class anomaly
+    // class. The parser clamps u64 payloads above i64::MAX (and
+    // saturating f64s/strings) onto the i64 bounds and the aggregator
+    // zeroes negative usage — pricing then multiplies the clamped
+    // values at real rates, so a hostile or corrupted journal renders
+    // a $42.7T total that otherwise sails through as HEALTH 100 with
+    // "No anomalies detected". The clamp census rides the
+    // disclosure_counters; surface it as a high-severity anomaly so
+    // health reflects the corrupted cost truth.
+    let mut magnitude_facts: Vec<String> = Vec::new();
+    let mut magnitude_clamped_total = 0usize;
+    for (key, count) in &metrics.disclosure_counters {
+        if !key.starts_with("magnitude_clamped:") {
+            continue;
+        }
+        magnitude_clamped_total += *count;
+        match key.as_str() {
+            "magnitude_clamped:above_i64" => {
+                magnitude_facts.push(format!("{count} value(s) clamped at the i64 bounds"))
+            }
+            "magnitude_clamped:negative_to_zero" => {
+                magnitude_facts.push(format!("{count} negative usage value(s) zeroed"))
+            }
+            "magnitude_clamped:above_plausibility_bound" => magnitude_facts.push(format!(
+                "{count} usage value(s) ≥ {IMPLAUSIBLE_TOKEN_MAGNITUDE} tokens"
+            )),
+            _ => {}
+        }
+    }
+    if magnitude_clamped_total > 0 {
+        anomalies.push(Anomaly {
+            kind: "implausible_magnitude".to_string(),
+            severity: "high".to_string(),
+            detail: magnitude_facts.join("; "),
+        });
+    }
     if !metrics.gaps_sec.is_empty() {
         let mut gaps = metrics.gaps_sec.clone();
         gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1543,6 +1637,15 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         let provider_entry = overview.by_provider.entry(provider).or_default();
         provider_entry.sessions += 1;
         provider_entry.cost += session.metrics.cost_estimated;
+
+        // rm-726: surface the magnitude-clamp census beside the total.
+        overview.clamped_values += session
+            .metrics
+            .disclosure_counters
+            .iter()
+            .filter(|(key, _)| key.starts_with("magnitude_clamped:"))
+            .map(|(_, count)| count)
+            .sum::<usize>();
 
         let task_type_entry = overview
             .by_task_type
@@ -3105,4 +3208,41 @@ mod tests {
             .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
         assert_eq!(session.metrics.tokens_input, 500);
     }
+}
+
+#[test]
+fn detect_anomalies_flags_implausible_magnitudes_from_the_disclosure_channel() {
+    // rm-726: the magnitude_clamped:* disclosure family is a
+    // first-class anomaly (severity high → health 70), while clean
+    // metrics stay at zero anomalies of this class.
+    let mut metrics = Metrics::default();
+    metrics
+        .disclosure_counters
+        .insert("magnitude_clamped:above_i64".to_string(), 1);
+    metrics
+        .disclosure_counters
+        .insert("magnitude_clamped:above_plausibility_bound".to_string(), 2);
+    metrics
+        .disclosure_counters
+        .insert("magnitude_clamped:negative_to_zero".to_string(), 2);
+    let anomaly = detect_anomalies(&metrics)
+        .into_iter()
+        .find(|anomaly| anomaly.kind == "implausible_magnitude")
+        .expect("clamp census must produce the anomaly");
+    assert_eq!(anomaly.severity, "high");
+    assert!(anomaly.detail.contains("i64 bounds"), "{}", anomaly.detail);
+    assert!(anomaly.detail.contains("negative"), "{}", anomaly.detail);
+    assert!(
+        anomaly.detail.contains("1000000000000"),
+        "{}",
+        anomaly.detail
+    );
+
+    let clean = detect_anomalies(&Metrics::default());
+    assert!(
+        !clean
+            .iter()
+            .any(|anomaly| anomaly.kind == "implausible_magnitude"),
+        "clean metrics must stay clean"
+    );
 }
