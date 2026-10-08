@@ -42,7 +42,7 @@ agenttrace --recommend --range 30d -f markdown -o recommendations.md
 agenttrace --audit --range 30d -f json
 ```
 
-The audit groups sessions by source and normalized model, and reports input, output, cache-write, and cache-read tokens; per-million-token rates; estimated component costs; and pricing confidence. Thinking tokens (Gemini `thoughtsTokenCount` and OpenAI-compatible `reasoning_tokens`/`thinking_tokens` aliases) are billed at the output rate: they are folded into the output count and additionally broken out as `tokens.reasoning` plus a `reasoning_share_pct` of billed output tokens per model row.
+The audit groups sessions by source and normalized model, and reports input, output, cache-write, and cache-read tokens; per-million-token rates; estimated component costs; and pricing confidence. Thinking tokens (Gemini `thoughtsTokenCount` and OpenAI-compatible `reasoning_tokens`/`thinking_tokens` aliases) are billed at the output rate: they are folded into the output count and additionally broken out as `tokens.reasoning` plus a `reasoning_share_pct` of billed output tokens per model row. Sessions whose journal carries a vendor-recorded cost (an upstream `usage.cost.total`) are compared on that recorded basis — the row's `recorded_cost_usd` and `pricing_note` say so, and they are deliberately not re-priced at current catalog rates — while estimate-only rows are re-priced as usual. A row mixing recorded and estimate-only spend compares the whole row on the recorded basis and names the split — estimate-only sessions and estimate-at-ingest dollars — in its note.
 
 Pricing status is intentionally explicit:
 

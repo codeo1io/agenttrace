@@ -41,6 +41,11 @@ pub struct ModelCostAudit {
     pub component_cost_usd: Option<PriceBreakdown>,
     pub estimated_cost_usd: Option<f64>,
     pub stored_estimated_cost_usd: f64,
+    /// Vendor-recorded cost carried by these sessions (upstream
+    /// `usage` cost totals), when any — `Some` marks a
+    /// recorded-basis row whose comparison basis is the recorded
+    /// cost rather than a catalog re-price (rm-570).
+    pub recorded_cost_usd: Option<f64>,
     pub pricing_status: String,
     pub pricing_note: String,
 }
@@ -79,6 +84,10 @@ pub struct SessionCostAudit {
     pub component_cost_usd: Option<PriceBreakdown>,
     pub estimated_cost_usd: Option<f64>,
     pub stored_estimated_cost_usd: f64,
+    /// Vendor-recorded cost this session carries, when any — `Some`
+    /// marks a recorded-basis audit whose comparison basis is the
+    /// recorded cost rather than a catalog re-price (rm-570).
+    pub recorded_cost_usd: Option<f64>,
     pub pricing_status: String,
     pub pricing_note: String,
 }
@@ -224,6 +233,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         specific: usize,
         fallback: usize,
         unknown: usize,
+        // rm-570: vendor-recorded cost folded into the row, and how
+        // many sessions carry it — a row with any recorded cost is
+        // recorded-basis and must not be re-priced at catalog rates.
+        recorded_cost: f64,
+        recorded_sessions: usize,
     }
     let mut rows: BTreeMap<(String, String), Aggregate> = BTreeMap::new();
     let mut coverage = PricingCoverage::default();
@@ -254,6 +268,10 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
         row.cost += session.metrics.cost_estimated;
+        if session.metrics.upstream_cost_usd > 0.0 {
+            row.recorded_sessions += 1;
+            row.recorded_cost += session.metrics.upstream_cost_usd;
+        }
         if matches!(model.as_str(), "default" | "unknown" | "multiple") {
             row.unknown += 1;
             coverage.unpriced_or_unknown_sessions += 1;
@@ -293,10 +311,21 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         .into_iter()
         .map(|((provider, model), row)| {
             let current = current_cost_estimate(&model, &row.tokens);
-            let pricing_source = current
-                .as_ref()
-                .map(|(source, _, _)| source.clone())
-                .unwrap_or_else(|| "unavailable: multiple models".to_string());
+            // rm-570 (run e88f2da2 cycle 3): a row carrying
+            // vendor-recorded cost compares on the recorded cost.
+            // Re-pricing the full token breakdown at current catalog
+            // rates against it is phantom drift — a $0.07 recorded
+            // session on non-catalog rates read as 86% "drift". The
+            // recorded basis is disclosed instead of alarmed.
+            let recorded_basis = row.recorded_sessions > 0;
+            let pricing_source = if recorded_basis {
+                "vendor-recorded cost; not re-priced".to_string()
+            } else {
+                current
+                    .as_ref()
+                    .map(|(source, _, _)| source.clone())
+                    .unwrap_or_else(|| "unavailable: multiple models".to_string())
+            };
             let (pricing_status, pricing_note) = if model == "multiple" {
                 (
                     "aggregate_estimate",
@@ -315,7 +344,48 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                     "exact normalized model match in pricing catalog",
                 )
             };
-            let pricing_note = if current
+            let pricing_note = if recorded_basis {
+                // Review 9af53c3f F1 (rm-570): the recorded basis is
+                // per-row aggregate — one recorded session (or even
+                // one recorded usage entry inside a session) makes
+                // the whole (provider, model) row compare on the
+                // stored sum, and neither estimate-only sessions nor
+                // the estimate-at-ingest dollars of stored cost are
+                // separately re-priced. Name that split so the
+                // aggregate semantics are disclosed, not implied
+                // (member-level re-pricing is a roadmap candidate,
+                // not this contract). Pure recorded rows keep the
+                // original note verbatim.
+                let estimate_only_sessions = row.sessions - row.recorded_sessions;
+                let estimate_only_usd = (row.cost - row.recorded_cost).max(0.0);
+                let mut split: Vec<String> = Vec::new();
+                if estimate_only_sessions > 0 {
+                    split.push(format!("{} estimate-only session(s)", estimate_only_sessions));
+                }
+                if estimate_only_usd > 0.005 {
+                    split.push(format!(
+                        "${:.4} of the stored total estimated at ingest",
+                        estimate_only_usd
+                    ));
+                }
+                if split.is_empty() {
+                    format!(
+                        "{pricing_note}; {} session(s) carry ${:.4} vendor-recorded cost; \
+                         recorded cost is the comparison basis, not re-priced at current rates",
+                        row.recorded_sessions, row.recorded_cost
+                    )
+                } else {
+                    format!(
+                        "{pricing_note}; {} of {} session(s) carry ${:.4} vendor-recorded \
+                         cost; recorded cost is the comparison basis for the whole row, not \
+                         re-priced at current rates ({} included, not separately re-priced)",
+                        row.recorded_sessions,
+                        row.sessions,
+                        row.recorded_cost,
+                        split.join(" and ")
+                    )
+                }
+            } else if current
                 .as_ref()
                 .is_some_and(|(_, _, components)| (components.total - row.cost).abs() > 0.0001)
             {
@@ -325,12 +395,19 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             } else {
                 pricing_note.to_string()
             };
-            let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
-                .map(|(_, rates, components)| {
-                    let total = components.total;
-                    (Some(rates), Some(components), Some(total))
-                })
-                .unwrap_or((None, None, None));
+            let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = if recorded_basis
+            {
+                // Comparison basis is the recorded/stored cost — no
+                // catalog rates or components are claimed for it.
+                (None, None, Some(round4(row.cost)))
+            } else {
+                current
+                    .map(|(_, rates, components)| {
+                        let total = components.total;
+                        (Some(rates), Some(components), Some(total))
+                    })
+                    .unwrap_or((None, None, None))
+            };
             let reasoning_share_pct = if row.tokens.reasoning > 0 && row.tokens.output > 0 {
                 Some(round4(
                     row.tokens.reasoning as f64 / row.tokens.output as f64 * 100.0,
@@ -349,6 +426,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 component_cost_usd,
                 estimated_cost_usd,
                 stored_estimated_cost_usd: round4(row.cost),
+                recorded_cost_usd: if row.recorded_cost > 0.0 {
+                    Some(round4(row.recorded_cost))
+                } else {
+                    None
+                },
                 pricing_status: pricing_status.to_string(),
                 pricing_note,
             }
@@ -399,6 +481,11 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         total: total_tokens(session),
     };
     let current = current_cost_estimate(&model, &tokens);
+    // rm-570 (run e88f2da2 cycle 3): a session carrying
+    // vendor-recorded cost compares on the recorded cost — the
+    // catalog re-price of its full token breakdown is not a
+    // meaningful comparison for it (phantom drift).
+    let recorded_basis = session.metrics.upstream_cost_usd > 0.0;
     let (pricing_status, pricing_note) = if model == "multiple" {
         (
             "aggregate_estimate",
@@ -420,7 +507,13 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
             "no exact catalog match; built-in fallback rate used",
         )
     };
-    let pricing_note = if current.as_ref().is_some_and(|(_, _, components)| {
+    let pricing_note = if recorded_basis {
+        format!(
+            "{pricing_note}; ${:.4} vendor-recorded cost; \
+             recorded cost is the comparison basis, not re-priced at current rates",
+            session.metrics.upstream_cost_usd
+        )
+    } else if current.as_ref().is_some_and(|(_, _, components)| {
         (components.total - session.metrics.cost_estimated).abs() > 0.0001
     }) {
         format!(
@@ -429,16 +522,24 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
     } else {
         pricing_note.to_string()
     };
-    let pricing_source = current
-        .as_ref()
-        .map(|(source, _, _)| source.clone())
-        .unwrap_or_else(|| "unavailable: multiple models".to_string());
-    let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
-        .map(|(_, rates, components)| {
-            let total = components.total;
-            (Some(rates), Some(components), Some(total))
-        })
-        .unwrap_or((None, None, None));
+    let pricing_source = if recorded_basis {
+        "vendor-recorded cost; not re-priced".to_string()
+    } else {
+        current
+            .as_ref()
+            .map(|(source, _, _)| source.clone())
+            .unwrap_or_else(|| "unavailable: multiple models".to_string())
+    };
+    let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = if recorded_basis {
+        (None, None, Some(round4(session.metrics.cost_estimated)))
+    } else {
+        current
+            .map(|(_, rates, components)| {
+                let total = components.total;
+                (Some(rates), Some(components), Some(total))
+            })
+            .unwrap_or((None, None, None))
+    };
     SessionCostAudit {
         pricing_source,
         stored_pricing_source: if session.metrics.provenance.pricing_source.is_empty() {
@@ -454,6 +555,11 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         component_cost_usd,
         estimated_cost_usd,
         stored_estimated_cost_usd: round4(session.metrics.cost_estimated),
+        recorded_cost_usd: if recorded_basis {
+            Some(round4(session.metrics.upstream_cost_usd))
+        } else {
+            None
+        },
         pricing_status: pricing_status.to_string(),
         pricing_note,
     }
@@ -1099,6 +1205,188 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         }
+    }
+
+    #[test]
+    fn cost_audit_recorded_cost_is_the_comparison_basis() {
+        // rm-570 (run e88f2da2 cycle 3) red-first: the journal
+        // recorded this session's cost (usage cost.total →
+        // upstream_cost_usd), so pricing the whole token breakdown at
+        // current catalog rates and alarming about the difference is
+        // phantom drift (the 0.07 recorded / ~0.13 catalog PoC). A
+        // recorded-basis row must compare on the recorded cost and
+        // say so explicitly instead of re-pricing.
+        let mut recorded = session("recorded");
+        recorded.metrics.model_used = "claude-sonnet-4-5".to_string();
+        recorded.metrics.tokens_input = 38_500;
+        recorded.metrics.tokens_output = 950;
+        recorded.metrics.cost_estimated = 0.07;
+        recorded.metrics.upstream_cost_usd = 0.07;
+        let audit = cost_audit(&[recorded]);
+        let row = &audit.by_provider_model[0];
+        assert!((row.stored_estimated_cost_usd - 0.07).abs() < 1e-9);
+        let current = row.estimated_cost_usd.expect("comparison present");
+        assert!(
+            (current - 0.07).abs() < 1e-4,
+            "recorded cost is the comparison basis, not a catalog re-price: {current}"
+        );
+        assert!(
+            row.pricing_note.contains("not re-priced"),
+            "explicit recorded-cost note: {}",
+            row.pricing_note
+        );
+        assert!(
+            !row.pricing_note.contains("recalculate a different total"),
+            "no phantom drift on a recorded-basis row: {}",
+            row.pricing_note
+        );
+        let top = audit.current_estimated_cost_usd.expect("sum present");
+        assert!((top - 0.07).abs() < 1e-4, "top level agrees: {top}");
+    }
+
+    #[test]
+    fn cost_audit_estimate_only_rows_still_reprice_at_current_rates() {
+        // rm-570 regression arm: estimate-only sessions keep the
+        // current-rates comparison and the drift note.
+        let mut plain = session("estimate-only");
+        plain.metrics.model_used = "claude-sonnet-4-5".to_string();
+        plain.metrics.tokens_input = 38_500;
+        plain.metrics.tokens_output = 950;
+        plain.metrics.cost_estimated = 0.05;
+        let audit = cost_audit(&[plain]);
+        let row = &audit.by_provider_model[0];
+        let current = row.estimated_cost_usd.expect("re-priced");
+        assert!(
+            (current - 0.05).abs() > 0.01,
+            "estimate-only keeps the catalog comparison: {current}"
+        );
+        assert!(row.pricing_note.contains("recalculate a different total"));
+    }
+
+    #[test]
+    fn cost_audit_mixed_row_names_the_split_and_keeps_the_recorded_basis() {
+        // rm-570 mixed-row arm (review 9af53c3f F1): the
+        // pre-registered evidence recipe named "mixed sessions" but
+        // nothing pinned them. One recorded session ($0.07) + one
+        // estimate-only session on the same (provider, model) row:
+        // the basis is AGGREGATE — the whole row compares on the
+        // stored sum (no catalog re-price, no drift note, even for
+        // the estimate-only member) — and the note must NAME the
+        // split so the semantics are disclosed rather than implied.
+        // The live shape: the parser drops pi message-inline usage
+        // cost, manufacturing estimate-only sessions that co-locate
+        // with recorded ones under the same provider+model.
+        let mut recorded = session("mixed-recorded");
+        recorded.metrics.model_used = "claude-sonnet-4-5".to_string();
+        recorded.metrics.tokens_input = 38_500;
+        recorded.metrics.tokens_output = 950;
+        recorded.metrics.cost_estimated = 0.07;
+        recorded.metrics.upstream_cost_usd = 0.07;
+        let mut estimate_only = session("mixed-estimate-only");
+        estimate_only.metrics.model_used = "claude-sonnet-4-5".to_string();
+        estimate_only.metrics.tokens_input = 38_500;
+        estimate_only.metrics.tokens_output = 950;
+        estimate_only.metrics.cost_estimated = 0.05;
+        let audit = cost_audit(&[recorded, estimate_only]);
+        assert_eq!(audit.by_provider_model.len(), 1, "same row");
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.sessions, 2);
+        assert!((row.stored_estimated_cost_usd - 0.12).abs() < 1e-9);
+        assert!((row.recorded_cost_usd.expect("recorded cost") - 0.07).abs() < 1e-9);
+        // Aggregate recorded basis: the comparison is the stored sum,
+        // NOT a catalog re-price of the estimate-only member's tokens
+        // (which `cost_audit_estimate_only_rows_still_reprice_at_current_rates`
+        // proves happens on estimate-ONLY rows).
+        let current = row.estimated_cost_usd.expect("comparison present");
+        assert!(
+            (current - 0.12).abs() < 1e-4,
+            "mixed row compares on the stored sum: {current}"
+        );
+        assert_eq!(row.pricing_source, "vendor-recorded cost; not re-priced");
+        assert!(
+            row.pricing_note.contains("1 of 2 session(s)"),
+            "the note names the session split: {}",
+            row.pricing_note
+        );
+        assert!(
+            row.pricing_note.contains("1 estimate-only session(s)"),
+            "estimate-only sessions are disclosed: {}",
+            row.pricing_note
+        );
+        assert!(
+            row.pricing_note
+                .contains("$0.0500 of the stored total estimated at ingest"),
+            "estimate-at-ingest dollars are disclosed: {}",
+            row.pricing_note
+        );
+        assert!(
+            !row.pricing_note.contains("recalculate a different total"),
+            "no drift note on a recorded-basis row: {}",
+            row.pricing_note
+        );
+        let top = audit.current_estimated_cost_usd.expect("sum present");
+        assert!((top - 0.12).abs() < 1e-4, "top level agrees: {top}");
+    }
+
+    #[test]
+    fn cost_audit_recorded_session_with_estimate_at_ingest_portion_names_the_usd_split() {
+        // rm-570 mixed shape as it manifests live (review 9af53c3f
+        // F1's mixed-row-poc.jsonl): the pi journal parses to ONE
+        // session carrying a $0.07 vendor-recorded usage entry AND
+        // ~$13.50 of tokens with no recorded cost, so the recorded
+        // dollars and the estimate-at-ingest dollars share a single
+        // (provider, model) row and a single stored total. The row
+        // still compares on the stored sum (aggregate basis), and
+        // the note must name the DOLLAR split too — "1 session(s)
+        // carry $0.0700" alone would imply the whole $13.57 stored
+        // total is vendor-recorded.
+        let mut mixed = session("recorded-plus-estimate");
+        mixed.metrics.model_used = "claude-sonnet-4-5".to_string();
+        mixed.metrics.tokens_input = 4_038_500;
+        mixed.metrics.tokens_output = 100_950;
+        mixed.metrics.cost_estimated = 13.57;
+        mixed.metrics.upstream_cost_usd = 0.07;
+        let audit = cost_audit(&[mixed]);
+        assert_eq!(audit.by_provider_model.len(), 1);
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.sessions, 1);
+        assert_eq!(
+            row.pricing_note,
+            "exact normalized model match in pricing catalog; 1 of 1 session(s) carry \
+             $0.0700 vendor-recorded cost; recorded cost is the comparison basis for the \
+             whole row, not re-priced at current rates ($13.5000 of the stored total \
+             estimated at ingest included, not separately re-priced)"
+        );
+        assert!(
+            !row.pricing_note.contains("recalculate a different total"),
+            "no drift note on a recorded-basis row: {}",
+            row.pricing_note
+        );
+        let current = row.estimated_cost_usd.expect("comparison present");
+        assert!(
+            (current - 13.57).abs() < 1e-4,
+            "compares on the stored sum: {current}"
+        );
+    }
+
+    #[test]
+    fn session_cost_audit_recorded_basis_compares_on_recorded_cost() {
+        // rm-570 session-level arm: same recorded-cost rule for
+        // --audit <session>.
+        let mut recorded = session("recorded-session");
+        recorded.metrics.model_used = "claude-sonnet-4-5".to_string();
+        recorded.metrics.tokens_input = 38_500;
+        recorded.metrics.tokens_output = 950;
+        recorded.metrics.cost_estimated = 0.07;
+        recorded.metrics.upstream_cost_usd = 0.07;
+        let audit = session_cost_audit(&recorded);
+        let current = audit.estimated_cost_usd.expect("comparison present");
+        assert!(
+            (current - 0.07).abs() < 1e-4,
+            "recorded cost is the comparison basis: {current}"
+        );
+        assert!(audit.pricing_note.contains("not re-priced"));
+        assert!(!audit.pricing_note.contains("recalculate a different total"));
     }
 
     #[test]
