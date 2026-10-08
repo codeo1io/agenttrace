@@ -1400,8 +1400,14 @@ mod tests {
         // load stores nothing; (b) even a pre-existing empty snapshot
         // (written by a pre-fix binary) is distrusted and re-verified.
         // The cache location is env-derived, so the test isolates it
-        // (and restores on exit).
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // (and restores on exit). The SHARED lock_env() — not a local
+        // lock — serializes against the pricing/session-cache/statusline
+        // env tests: a local lock let them re-point or remove
+        // AGENTTRACE_SESSION_CACHE_DIR mid-window, resolving
+        // session_cache_path() to the REAL host cache (where a real
+        // opencode-sqlite.json snapshot lives) — a latent full-suite
+        // flake caught while stress-revalidating review fix b45f8690;
+        // the same per-module-lock class test_env's doc describes.
         struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for EnvRestore {
             fn drop(&mut self) {
@@ -1413,9 +1419,7 @@ mod tests {
                 }
             }
         }
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock_env();
         let _restore = EnvRestore(
             [
                 (

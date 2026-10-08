@@ -20,6 +20,23 @@ struct DerivedSession {
     cost: f64,
     health: i32,
     anomalies: Vec<(String, String)>,
+    /// rm-787: subagent rollups this session carried while it was
+    /// live. Persisted so `--include-history` re-materializes them
+    /// verbatim instead of rendering every preserved parent as
+    /// `SUBAGENTS=0 / SUBAGENT_COST=0.0000`: the restored row's
+    /// synthetic `history:{id}` path can never re-join the real-path
+    /// attribution index (subagents.rs), so the numbers must travel
+    /// with the record. `#[serde(default)]` keeps records written
+    /// before rm-787 loadable; those legacy rows keep the zero shape
+    /// (disclosed) until their transcripts are re-preserved.
+    #[serde(default)]
+    subagent_count: usize,
+    #[serde(default)]
+    subagent_cost: f64,
+    #[serde(default)]
+    subagent_tokens: i64,
+    #[serde(default)]
+    parent_session: String,
 }
 
 pub fn history_path() -> PathBuf {
@@ -207,6 +224,10 @@ impl DerivedSession {
                 .iter()
                 .map(|item| (item.kind.clone(), item.severity.clone()))
                 .collect(),
+            subagent_count: session.metrics.subagent_count,
+            subagent_cost: session.metrics.subagent_cost,
+            subagent_tokens: session.metrics.subagent_tokens,
+            parent_session: session.metrics.parent_session.clone(),
         }
     }
 
@@ -227,6 +248,10 @@ impl DerivedSession {
                 tokens_cache_w: self.cache_write,
                 tokens_cache_r: self.cache_read,
                 cost_estimated: self.cost,
+                subagent_count: self.subagent_count,
+                subagent_cost: self.subagent_cost,
+                subagent_tokens: self.subagent_tokens,
+                parent_session: self.parent_session,
                 ..Metrics::default()
             },
             anomalies: self
@@ -486,5 +511,47 @@ mod tests {
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_records_without_subagent_fields_restore_zeroed() {
+        // rm-787 keep-compat pin (independent_review 355e05af: the
+        // claim had no test) — records written before the subagent
+        // fields existed must still load through the durable path: the
+        // per-field `#[serde(default)]` turns the missing keys into the
+        // disclosed zero shape instead of a decode failure, and
+        // into_session re-materializes exactly that shape (never an
+        // invented link, never a phantom rollup).
+        let legacy = serde_json::json!({
+            "id": "34235f44",
+            "project": "proj",
+            "source": "claude_code",
+            "model": "claude-sonnet-4-5",
+            "start": "2026-10-01T00:00:00Z",
+            "end": "2026-10-01T00:01:00Z",
+            "duration": 60.0,
+            "input": 100,
+            "output": 50,
+            "cache_write": 0,
+            "cache_read": 0,
+            "cost": 0.01,
+            "health": 95,
+            "anomalies": []
+        });
+        let raw = serde_json::to_vec(&BTreeMap::from([("legacy".to_string(), legacy)])).unwrap();
+        let records = decode_records(&raw);
+        assert_eq!(records.len(), 1, "legacy record must still decode");
+        let record = records.into_values().next().unwrap();
+        assert_eq!(record.subagent_count, 0);
+        assert_eq!(record.subagent_cost, 0.0);
+        assert_eq!(record.subagent_tokens, 0);
+        assert!(record.parent_session.is_empty());
+        let restored = record.into_session();
+        assert_eq!(restored.name, "history-34235f44");
+        assert_eq!(restored.path, "history:34235f44");
+        assert_eq!(restored.metrics.subagent_count, 0);
+        assert_eq!(restored.metrics.subagent_cost, 0.0);
+        assert_eq!(restored.metrics.subagent_tokens, 0);
+        assert!(restored.metrics.parent_session.is_empty());
     }
 }
