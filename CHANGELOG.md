@@ -4,6 +4,51 @@
 
 ### Fixed
 
+- Fixed negative per-token rates reaching cost estimates through the
+  LiteLLM catalog intake (rm-751, run 397538bc cycle 3, honest intake,
+  honest diagnostics): `convert_litellm` admitted any finite rate, so a
+  hand-crafted or corrupted cache (or a hostile upstream catalog)
+  carrying `input_cost_per_token: -1.0` cost sessions negative
+  (`cost_estimated: -1000.0`, zero disclosures) while the user-override
+  lane rejected the same values by name. The converter now enforces the
+  same per-field domain on every catalog lane — bundled snapshot,
+  download, and cache read — finite AND non-negative across
+  input/output/cache-write/cache-read rates, skipping a hostile entry
+  whole (no partial acceptance: the model lands in fallback pricing and
+  `data_health` as `fallback_pricing`, exactly like the non-finite
+  guard beside it) and naming it in a hostile-row report. The cache
+  loader quarantines a poisoned catalog — renamed beside itself with a
+  `.hostile` suffix (bytes preserved for inspection, provenance stamp
+  carried along), disclosed on stderr at the moment it happens, and the
+  load falls back to the bundled snapshot — so a poisoned cache cannot
+  outlive the run that read it; `--update-pricing` refuses to persist a
+  downloaded catalog carrying hostile rows (named error, previous cache
+  stays). Unit pins `convert_litellm_rejects_negative_rates` and
+  `load_pricing_cache_quarantines_a_poisoned_cache`; E2E pin
+  `poisoned_pricing_cache_never_costs_negative`.
+- Fixed permission-denied session directories silently narrowing scan
+  coverage (rm-249, same batch): the discovery walks recorded nothing
+  when `read_dir` failed with `PermissionDenied`, so `-d` on an
+  unreadable root reported `No session files found in …` (exit 1 — a
+  readable-looking no that hid an unreadable yes) and `--doctor`
+  printed `Session files: 0` then exited 0. Both walks now report the
+  unreadable directory set: `LoadReport` carries `unreadable_dirs`, the
+  CLI announces `N session directories not readable — coverage
+  narrowed` (sample paths) on stderr while stdout stays a pure report,
+  and `-d` itself validates as a usage error (exit 2) with three
+  distinct messages — does not exist, takes-a-directory-not-a-file
+  (naming the positional lane as the fix), and not-readable-with-the
+  OS reason. Passing both `-d` and a positional session file is now
+  refused (exit 2) instead of the positional silently winning and
+  dropping the directory scan. `--doctor` gains a `failed_checks`
+  vector (JSON `failed_checks`, text `Failed checks:`) covering an
+  unusable `-d` value and unreadable directories — auto-discovered and
+  `-d` roots alike — and exits 3 when any check fails, distinct from
+  clap's usage 2 and the action-failure 1, so CI can gate on the
+  diagnostic instead of parsing text (rm-752, same batch). E2E pins
+  `unreadable_session_root_is_disclosed_not_erased` and
+  `dir_flag_names_its_lane_and_refuses_conflicts`.
+
 - Fixed a deadlock in `agenttrace --fetch upstream` when a `git fetch` subprocess exits but a grandchild process inherits and holds the output pipes: the bounded runner now kills and waits the direct child, then returns the named upstream-timeout error without joining the reader threads, so the fetch fails at its 30 s deadline instead of hanging forever (rm-583, run d65f72c7 cycle 1, honest failure boundaries; regression pin `run_bounded_timeout_survives_a_grandchild_holding_the_pipes`).
 - Fixed silent data loss when a codex session journal contains non-object JSON lines or lines with a missing/empty top-level `type`: both shapes now land in `line_skips` diagnostics as `codex_non_object_line:<kind>` and `codex_missing_type` instead of being dropped without disclosure, and typeless custom-tool call payloads now parse or disclose rather than disappear (rm-584, run d65f72c7 cycle 1, honest failure boundaries; regression pin `codex_line_skips_disclose_every_dropped_shape`).
 - Fixed the positional path lane collapsing not-a-regular-file into does-not-exist (rm-590, run d65f72c7 cycle 1, honest failure boundaries): passing e.g. `/dev/null` through the positional lane now fails with the path's true class instead of the false “session path does not exist”, while missing-path and directory errors are unchanged — the three-way contract the candidate wanted (mirroring the `--dir` lane) is provided by the shared admission helper landed earlier as rm-212 (`admit_session_path`), which is a superset of the candidate's inline arm: character devices, fifos, sockets and block devices are named with their kind (“session path is not a regular file or directory: /dev/null (character device)”), a symlink to a special file names the target's true class (“symbolic link to character device”), and only genuinely dangling links are called dangling — so the candidate's inline message arm was superseded at integration and the landed helper kept. (rm-587 landed in the same batch: `deny.toml` now sets an explicit `unsound = "transitive"` advisory policy so cargo-deny flags unsoundness advisories instead of silently passing them; its original dated carve-out for RUSTSEC-2026-0253 was dropped at integration per its own removal rule because the lru 0.18.5 bump (rm-552) had already landed in this tree — the policy alone survives.)

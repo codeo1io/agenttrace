@@ -444,6 +444,20 @@ pub fn pricing_cache_path() -> PathBuf {
 
 pub fn update_pricing() -> anyhow::Result<usize> {
     let (raw, converted) = download_pricing(Duration::from_secs(30))?;
+    // rm-751: never persist a catalog whose raw bytes carry hostile
+    // (non-finite or negative) rates — the loader quarantines such
+    // caches on sight, so writing one would be write-then-quarantine
+    // churn. The named error shows exactly which upstream rows were
+    // refused; the previous cache (if any) stays in place.
+    let (_, hostile) = convert_litellm_reported(raw.as_bytes());
+    if !hostile.is_empty() {
+        anyhow::bail!(
+            "downloaded pricing carries {} hostile rate {} (e.g. {}); not cached",
+            hostile.len(),
+            if hostile.len() == 1 { "row" } else { "rows" },
+            hostile.first().map(String::as_str).unwrap_or("?"),
+        );
+    }
     write_pricing_cache(&raw)?;
     let count = converted.entries.len();
     // Publish the fresh catalog to later pricing_catalog() consumers in
@@ -631,7 +645,17 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         .map(|age| age > CACHE_MAX_AGE)
         .unwrap_or(false);
     let raw = std::fs::read(&path).ok()?;
-    let converted = convert_litellm(&raw);
+    let (converted, hostile) = convert_litellm_reported(&raw);
+    if !hostile.is_empty() {
+        // rm-751: a cached catalog carrying hostile (non-finite or
+        // negative) rates is quarantined — renamed beside itself with a
+        // `.hostile` suffix — instead of being served or silently
+        // ignored, and this load falls back to the bundled snapshot.
+        // Only hand-crafted or corrupted bytes can get here: the
+        // download writer refuses such catalogs.
+        quarantine_pricing_cache(&path, &hostile);
+        return None;
+    }
     if converted.entries.is_empty() {
         return None;
     }
@@ -710,6 +734,33 @@ struct PricingCacheMeta {
 
 fn write_pricing_cache(raw: &str) -> anyhow::Result<()> {
     write_pricing_cache_at(&pricing_cache_path(), raw)
+}
+
+/// rm-751: quarantine a poisoned pricing cache. Rename (never delete)
+/// so the hostile bytes stay inspectable on disk, carry the provenance
+/// stamp along, disclose on stderr at the moment it happens, and let
+/// the catalog fall back to the bundled snapshot on this and later
+/// loads until a fresh `--update-pricing` writes a clean cache.
+fn quarantine_pricing_cache(path: &Path, hostile: &[String]) {
+    let quarantined = path.with_extension("json.hostile");
+    if std::fs::rename(path, &quarantined).is_ok() {
+        let _ = std::fs::rename(
+            path.with_extension("meta.json"),
+            path.with_extension("meta.json.hostile"),
+        );
+    }
+    eprintln!(
+        "agenttrace: pricing cache quarantined: {} model {} carried non-finite or negative rates \
+         (e.g. {}); renamed to {} — falling back to the bundled snapshot",
+        hostile.len(),
+        if hostile.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        },
+        hostile.first().map(String::as_str).unwrap_or("?"),
+        quarantined.display(),
+    );
 }
 
 fn write_pricing_cache_at(path: &Path, raw: &str) -> anyhow::Result<()> {
@@ -881,13 +932,27 @@ struct ConvertedCatalog {
 }
 
 fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
+    convert_litellm_reported(raw).0
+}
+
+/// rm-751: conversion with a hostile-row report. Rows whose scaled
+/// per-token rates are non-finite OR negative are skipped whole — no
+/// partial acceptance, the same per-field domain the user-override
+/// lane enforces by name in `validate_override_price` — and named in
+/// the report so the cache loader can quarantine a poisoned catalog
+/// instead of serving it.
+fn convert_litellm_reported(raw: &[u8]) -> (ConvertedCatalog, Vec<String>) {
     let Ok(Value::Object(source)) = serde_json::from_slice::<Value>(raw) else {
-        return ConvertedCatalog {
-            entries: BTreeMap::new(),
-            providers: BTreeMap::new(),
-        };
+        return (
+            ConvertedCatalog {
+                entries: BTreeMap::new(),
+                providers: BTreeMap::new(),
+            },
+            Vec::new(),
+        );
     };
     let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    let mut hostile: Vec<String> = Vec::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -917,14 +982,14 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         };
         // Hostile or overflowing catalog rates must not reach costing:
         // the 1e6 scaling can turn a near-f64-max per-token cost into
-        // inf, which used to survive into reports (pass-8 F8-5). Skip
-        // the entry; the model falls back to default pricing and shows
-        // up in data_health as fallback_pricing.
-        if !(price.input.is_finite()
-            && price.output.is_finite()
-            && price.cw.is_finite()
-            && price.cr.is_finite())
-        {
+        // inf, which used to survive into reports (pass-8 F8-5), and a
+        // negative rate used to cost sessions negative through the
+        // cached-catalog lane while the override lane rejected the same
+        // values (rm-751; PoC: cost_estimated -1000.0, zero
+        // disclosures). Skip the entry; the model falls back to default
+        // pricing and shows up in data_health as fallback_pricing.
+        if !price_rates_admissible(&price) {
+            hostile.push(normalized.clone());
             continue;
         }
         let priority = provider_priority(&model.provider);
@@ -941,7 +1006,19 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         providers.insert(name.clone(), provider);
         entries.insert(name, price);
     }
-    ConvertedCatalog { entries, providers }
+    (ConvertedCatalog { entries, providers }, hostile)
+}
+
+/// Per-field rate domain shared by every catalog intake lane (rm-751):
+/// a rate is admissible only when it is finite AND non-negative.
+/// Bundled snapshot bytes, downloaded bytes, and cached bytes all pass
+/// this one predicate — mirroring `validate_override_price`'s domain
+/// for the user-override lane, where the same values are rejected by
+/// name instead of skipped.
+fn price_rates_admissible(price: &Price) -> bool {
+    [price.input, price.output, price.cw, price.cr]
+        .into_iter()
+        .all(|rate| rate.is_finite() && rate >= 0.0)
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -2152,6 +2229,86 @@ mod tests {
             !catalog.entries.contains_key("poisoned-model"),
             "entries whose scaled price is non-finite are dropped"
         );
+    }
+
+    #[test]
+    fn convert_litellm_rejects_negative_rates() {
+        // rm-751: negative per-token rates used to pass the converter's
+        // finite-only guard and cost sessions negative through the
+        // cached-catalog lane (PoC: cost_estimated -1000.0) while the
+        // user-override lane rejected the same values by name. The
+        // per-field domain is now mirrored: the entry skips whole (no
+        // partial acceptance), the model lands in fallback pricing, and
+        // the hostile row is reported so the cache loader can
+        // quarantine a catalog carrying it.
+        let hostile = serde_json::json!({
+            "finite-model": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015,
+                "mode": "chat",
+                "litellm_provider": "finite"
+            },
+            "poisoned-model": {
+                "input_cost_per_token": -1.0,
+                "output_cost_per_token": 0.0,
+                "mode": "chat",
+                "litellm_provider": "poisoned"
+            }
+        });
+        let (catalog, reported) = convert_litellm_reported(
+            serde_json::to_vec(&hostile)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        assert!(
+            catalog.entries.contains_key("finite-model"),
+            "finite entries survive the conversion"
+        );
+        assert!(
+            !catalog.entries.contains_key("poisoned-model"),
+            "entries whose scaled price is negative are dropped"
+        );
+        assert_eq!(
+            reported,
+            vec!["poisoned-model".to_string()],
+            "the hostile row is named for the quarantine disclosure"
+        );
+    }
+
+    #[test]
+    fn load_pricing_cache_quarantines_a_poisoned_cache() {
+        // rm-751: reading a poisoned cache must never serve it. The
+        // cache is quarantined (renamed to `pricing.json.hostile`, bytes
+        // preserved for inspection) and the load returns None so the
+        // catalog falls back to the bundled snapshot — the poisoned
+        // file cannot outlive the run that read it.
+        let _env = crate::test_env::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-hostile-pricing-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("HOME", &root);
+        std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+        let path = pricing_cache_path();
+        std::fs::create_dir_all(path.parent().expect("cache dir parent"))
+            .expect("create cache dir");
+        std::fs::write(
+            &path,
+            r#"{"poisoned-model":{"input_cost_per_token":-1.0,"output_cost_per_token":0.0,"mode":"chat","litellm_provider":"poisoned"}}"#,
+        )
+        .expect("write poisoned cache");
+        let catalog = load_pricing_cache();
+        assert!(catalog.is_none(), "a poisoned cache is never served");
+        assert!(
+            !path.exists(),
+            "the poisoned cache is quarantined, not kept in place"
+        );
+        assert!(
+            path.with_extension("json.hostile").exists(),
+            "quarantine preserves the bytes for inspection"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

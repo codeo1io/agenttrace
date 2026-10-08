@@ -1,6 +1,7 @@
 use crate::{
-    cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions, parse_file, skip_sqlite_backed_file_dir, Session, VERSION,
+    cached_session, collect_session_files_reported, find_session_files_reported,
+    known_session_dirs, load_session_cache, load_sqlite_backed_sessions, parse_file,
+    skip_sqlite_backed_file_dir, Session, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -53,6 +54,13 @@ pub struct DoctorReport {
     /// snapshot's date, model count, and age, so reports can disclose
     /// how current the prices behind `cost_estimated` are.
     pub pricing: String,
+    /// rm-752: checks that failed while assembling this report — an
+    /// unusable `-d` value or session directories the walk could not
+    /// read (rm-249). `--doctor` exits 3 when this is non-empty, so CI
+    /// can gate on diagnostics instead of parsing the rendered text;
+    /// empty for a healthy environment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_checks: Vec<String>,
     pub recommendations: Vec<String>,
 }
 
@@ -102,20 +110,62 @@ pub fn render_doctor_report(
     format: &str,
 ) -> anyhow::Result<String> {
     let report = build_doctor_report(dir, demo);
+    doctor_report_render(&report, format)
+}
+
+/// rm-752: render an already-built report. `render_doctor_report`
+/// builds and renders in one call; the CLI needs the built report
+/// afterwards to decide the doctor exit code, so the two steps split
+/// here.
+pub fn doctor_report_render(report: &DoctorReport, format: &str) -> anyhow::Result<String> {
     if format == "json" {
-        Ok(serde_json::to_string_pretty(&report)? + "\n")
+        Ok(serde_json::to_string_pretty(report)? + "\n")
     } else {
-        Ok(doctor_report_text(&report))
+        Ok(doctor_report_text(report))
     }
 }
 
 pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     let cache = load_session_cache_report();
-    let files = if dir.is_none() {
-        find_reportable_session_files(None)
-    } else {
-        find_session_files(dir)
+    let mut failed_checks = Vec::new();
+    let (files, unreadable) = match dir {
+        None => find_reportable_session_files(None),
+        // rm-249: name an unusable -d value instead of reporting
+        // `Session files: 0` against it — the walk is silent about a
+        // root it cannot open, and permission-denied used to read as
+        // absence.
+        Some(dir) if !dir.exists() => {
+            failed_checks.push(format!(
+                "session directory does not exist: {}",
+                dir.display()
+            ));
+            (Vec::new(), Vec::new())
+        }
+        Some(dir) if !dir.is_dir() => {
+            failed_checks.push(format!(
+                "-d/--dir takes a directory, not a file: {}",
+                dir.display()
+            ));
+            (Vec::new(), Vec::new())
+        }
+        Some(dir) => find_session_files_reported(Some(dir)),
     };
+    for path in unreadable {
+        let phrase = match std::fs::read_dir(&path) {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => "permission denied",
+            _ => "not readable",
+        };
+        failed_checks.push(format!(
+            "unreadable session directory: {} ({})",
+            path.display(),
+            phrase
+        ));
+    }
+    if failed_checks.len() > 8 {
+        let extra = failed_checks.len() - 8;
+        failed_checks.truncate(8);
+        failed_checks.push(format!("… and {extra} more failed checks"));
+    }
     let sqlite_sessions = if dir.is_none() && !demo {
         load_sqlite_backed_sessions()
     } else {
@@ -171,6 +221,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             crate::pricing::bundled_snapshot_model_count(),
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
         ) + &doctor_deprecation_suffix(),
+        failed_checks,
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
@@ -383,18 +434,21 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
+fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if dir.is_some() {
-        return find_session_files(dir);
+        return find_session_files_reported(dir);
     }
     let mut out = Vec::new();
+    let mut unreadable = Vec::new();
     for candidate in crate::discover_session_dirs() {
         if skip_sqlite_backed_file_dir(&candidate) {
             continue;
         }
-        out.extend(crate::collect_session_files(&candidate));
+        let (files, denied) = collect_session_files_reported(&candidate);
+        unreadable.extend(denied);
+        out.extend(files);
     }
-    out
+    (out, unreadable)
 }
 
 fn doctor_directories(
@@ -665,6 +719,15 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first)\n",
         report.cache_size_bytes, report.cache_limits
     ));
+    if !report.failed_checks.is_empty() {
+        out.push_str(&format!(
+            "Failed checks: {} (exit 3)\n",
+            report.failed_checks.len()
+        ));
+        for check in &report.failed_checks {
+            out.push_str(&format!("  ! {check}\n"));
+        }
+    }
     let statusline_state = if report.statusline.exists {
         format!(
             "{} captures, {} distinct sessions, {} bytes",

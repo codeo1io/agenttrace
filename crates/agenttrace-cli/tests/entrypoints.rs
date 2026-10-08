@@ -236,6 +236,264 @@ fn baseline_regression_gates_the_exit_code_and_opt_out_flags_work() {
     let _ = std::fs::remove_dir_all(work);
 }
 
+/// rm-751 red-first PoC pin: a poisoned pricing cache (negative per-token
+/// rates) used to flow straight through the LiteLLM catalog intake and cost
+/// sessions negative — `cost_estimated -1000.0` attributed "LiteLLM (cached
+/// catalog)" with zero disclosures, while the user-override lane rejects the
+/// same values. After the fix the poisoned entry never prices anything: the
+/// model falls to the disclosed fallback lane (data_health.fallback_pricing),
+/// no cost goes negative, and the poisoned cache file is quarantined so it
+/// cannot outlive the run that read it.
+#[test]
+fn poisoned_pricing_cache_never_costs_negative() {
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-poisoned-pricing-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = work.join("cache");
+    let sessions = work.join("sessions");
+    let cache_agenttrace = cache.join("agenttrace");
+    std::fs::create_dir_all(&cache_agenttrace).expect("create cache dir");
+    std::fs::create_dir_all(&sessions).expect("create sessions dir");
+    // Exact PoC fixture bytes from the cycle-3 assess pass (run 397538bc).
+    std::fs::write(
+        sessions.join("neg-abc123.jsonl"),
+        r#"{"timestamp":"2026-10-06T10:00:00.000Z","type":"assistant","sessionId":"neg-abc123","message":{"model":"poisoned-model","usage":{"input_tokens":1000,"output_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+    )
+    .expect("write session");
+    let poisoned_cache = cache_agenttrace.join("pricing.json");
+    std::fs::write(
+        &poisoned_cache,
+        r#"{"poisoned-model":{"max_tokens":8192,"max_input_tokens":8192,"max_output_tokens":8192,"input_cost_per_token":-1.0,"output_cost_per_token":0.0,"litellm_provider":"anthropic","mode":"chat"}}"#,
+    )
+    .expect("write poisoned pricing cache");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "-d",
+            sessions.to_str().expect("sessions dir is valid UTF-8"),
+            "--overview",
+            "-f",
+            "json",
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "report must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("-1000"),
+        "poisoned cache must never flow into costs: {}",
+        stdout
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("parse overview JSON");
+    let fallback = report
+        .pointer("/data_health/fallback_pricing")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    assert!(
+        fallback >= 1,
+        "the poisoned model must land in the fallback disclosure, got {} in {}",
+        fallback,
+        stdout
+    );
+    assert!(
+        !poisoned_cache.exists(),
+        "a poisoned pricing cache cannot outlive the run that read it"
+    );
+    let _ = std::fs::remove_dir_all(work);
+}
+
+/// rm-249 + rm-752 red-first pins: an existing-but-unreadable session root
+/// used to be reported as `Session files: 0` with exit 0 (doctor) and
+/// "directory exists but holds no session files" with exit 1 (--sessions);
+/// and `--doctor` mapped every outcome to Ok(()) so CI could never gate on
+/// it. After the fix: doctor exits 3 with a named unreadable-directory
+/// failure, `--sessions -d` exits 2 with a permission-denied message, and
+/// the healthy fixture corpus stays rc 0.
+#[cfg(unix)]
+#[test]
+fn unreadable_session_root_is_disclosed_not_erased() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-unreadable-root-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = work.join("cache");
+    let locked = work.join("locked");
+    std::fs::create_dir_all(&cache).expect("create cache dir");
+    std::fs::create_dir_all(&locked).expect("create locked dir");
+    std::fs::write(locked.join("hidden.jsonl"), "{}\n").expect("write hidden session");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+        .expect("lock directory");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "--doctor",
+            "-d",
+            locked.to_str().expect("path"),
+            "-f",
+            "json",
+        ])
+        .output()
+        .expect("run doctor on locked root");
+    assert_eq!(
+        doctor.status.code(),
+        Some(3),
+        "--doctor must exit 3 when a check fails, got {:?}",
+        doctor.status
+    );
+    let doctor_stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        doctor_stdout.contains("unreadable session directory"),
+        "doctor must name the unreadable directory, got: {doctor_stdout}"
+    );
+
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args(["--sessions", "-d", locked.to_str().expect("path")])
+        .output()
+        .expect("run sessions on locked root");
+    assert_eq!(
+        sessions.status.code(),
+        Some(2),
+        "permission-denied -d must be a usage error (exit 2), got {:?}",
+        sessions.status
+    );
+    let stderr = String::from_utf8_lossy(&sessions.stderr);
+    assert!(
+        stderr.contains("not readable") && stderr.contains("permission"),
+        "the -d error must name permission denial and hint at permissions, got: {stderr}"
+    );
+
+    // Healthy corpus stays clean: rc 0, no failed checks.
+    let healthy = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "--doctor",
+            "-d",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../agenttrace-core/tests/fixtures/pi-oh-my-pi")
+                .to_str()
+                .expect("fixture dir is valid UTF-8"),
+            "-f",
+            "json",
+        ])
+        .output()
+        .expect("run doctor on healthy corpus");
+    assert_eq!(
+        healthy.status.code(),
+        Some(0),
+        "healthy corpus must stay rc 0, got {:?}: {}",
+        healthy.status,
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&healthy.stdout).contains("unreadable session directory"),
+        "no unreadable-directory failures on a healthy corpus"
+    );
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("unlock for cleanup");
+    let _ = std::fs::remove_dir_all(work);
+}
+
+/// rm-249: `-d` is a directory lane; pointing it at a file, or claiming
+/// both input lanes at once (`-d <dir> <file>` used to silently drop -d),
+/// are usage errors that name the positional alternative. A missing
+/// directory keeps its existing distinct message.
+#[test]
+fn dir_flag_names_its_lane_and_refuses_conflicts() {
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-dir-lane-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = work.join("cache");
+    let sessions = work.join("sessions");
+    std::fs::create_dir_all(&cache).expect("create cache dir");
+    std::fs::create_dir_all(&sessions).expect("create sessions dir");
+    let one = sessions.join("one.jsonl");
+    std::fs::write(&one, "{}\n").expect("write session");
+
+    let file_lane = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args(["--sessions", "-d", one.to_str().expect("file path")])
+        .output()
+        .expect("run -d against a file");
+    assert_eq!(
+        file_lane.status.code(),
+        Some(2),
+        "-d on a file is a usage error"
+    );
+    let file_stderr = String::from_utf8_lossy(&file_lane.stderr);
+    assert!(
+        file_stderr.contains("takes a directory") && file_stderr.contains("positional"),
+        "the error must point at the positional lane, got: {file_stderr}"
+    );
+
+    let conflict = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "--sessions",
+            "-d",
+            sessions.to_str().expect("dir path"),
+            one.to_str().expect("file path"),
+        ])
+        .output()
+        .expect("run -d plus positional");
+    assert_eq!(
+        conflict.status.code(),
+        Some(2),
+        "-d plus a positional path must be a usage error, not a silent pick, got {:?}",
+        conflict.status
+    );
+    let conflict_stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(
+        conflict_stderr.contains("choose one"),
+        "the conflict error must tell the user to choose one lane, got: {conflict_stderr}"
+    );
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &work)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args([
+            "--sessions",
+            "-d",
+            work.join("no-such-dir").to_str().expect("path"),
+        ])
+        .output()
+        .expect("run -d against missing dir");
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("does not exist"),
+        "missing-directory message stays distinct"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
 fn run_json(args: &[&str]) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .args(args)

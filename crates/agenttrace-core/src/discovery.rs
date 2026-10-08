@@ -36,6 +36,12 @@ pub struct LoadReport {
     pub parsed: usize,
     pub skipped: usize,
     pub cache_hits: usize,
+    /// rm-249: directories the walk could not read (permission
+    /// denied). Coverage was silently narrowed by these before the
+    /// disclosure existed — the count and paths are announced on
+    /// stderr by the CLI and ride the report for consumers that want
+    /// the skip set themselves.
+    pub unreadable_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -221,18 +227,27 @@ fn canonical_identity(path: &Path) -> PathBuf {
 }
 
 pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
+    find_session_files_reported(dir).0
+}
+
+/// rm-249: `find_session_files` with the unreadable-directory skip set
+/// (deduplicated when multiple roots alias one unreadable directory).
+pub fn find_session_files_reported(dir: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return vec![dir.to_path_buf()];
+            return (vec![dir.to_path_buf()], Vec::new());
         }
-        return collect_session_files(dir);
+        return collect_session_files_reported(dir);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
     let mut identities: HashSet<PathBuf> = HashSet::new();
+    let mut unreadable: HashSet<PathBuf> = HashSet::new();
     let mut all = Vec::new();
     for dir in dirs {
-        for path in collect_session_files(&dir) {
+        let (files, denied) = collect_session_files_reported(&dir);
+        unreadable.extend(denied);
+        for path in files {
             // rm-338: dedup across roots by canonical identity so roots
             // aliasing or nesting one canonical directory cannot
             // double-count a session file; listed paths are kept as-is.
@@ -246,7 +261,10 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
-    sort_paths_by_mod_time(all)
+    (
+        sort_paths_by_mod_time(all),
+        unreadable.into_iter().collect(),
+    )
 }
 
 pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
@@ -283,7 +301,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
     let mut sessions = Vec::new();
-    let files = find_session_files_cached(dir, cache, true);
+    let (files, unreadable_dirs) = find_session_files_cached_reported(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -398,6 +416,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sessions,
         discovered,
         cache_hits,
+        unreadable_dirs,
     }
 }
 
@@ -419,13 +438,23 @@ fn matches_filter(value: &str, filter: &str) -> bool {
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
+    collect_session_files_reported(dir).0
+}
+
+/// rm-249: `collect_session_files` with the unreadable-directory skip
+/// set. The walk itself stays infallible (an unreadable subtree yields
+/// no files); this variant additionally names every directory the
+/// filesystem refused, so callers can disclose the narrowed coverage
+/// instead of presenting it as absence.
+pub fn collect_session_files_reported(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if is_cline_task_dir(dir) {
-        return vec![dir.to_path_buf()];
+        return (vec![dir.to_path_buf()], Vec::new());
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
     let mut file_targets = SessionFileTargets::new();
+    let mut unreadable = Vec::new();
     walk_session_files(
         dir,
         0,
@@ -433,31 +462,35 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         &mut items,
         &mut visited,
         &mut file_targets,
+        &mut unreadable,
     );
     items.sort_by_key(|item| Reverse(item.1));
-    items.into_iter().map(|item| item.0).collect()
+    (items.into_iter().map(|item| item.0).collect(), unreadable)
 }
 
-pub(crate) fn find_session_files_cached(
+pub(crate) fn find_session_files_cached_reported(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return vec![dir.to_path_buf()];
+            return (vec![dir.to_path_buf()], Vec::new());
         }
-        return collect_session_files_cached(dir, cache);
+        return collect_session_files_cached_reported(dir, cache);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
     let mut seen = HashSet::new();
+    let mut unreadable: HashSet<PathBuf> = HashSet::new();
     let mut all = Vec::new();
     for dir in dirs {
         if skip_sqlite_backed && skip_sqlite_backed_file_dir(&dir) {
             continue;
         }
-        for path in collect_session_files_cached(&dir, cache) {
+        let (files, denied) = collect_session_files_cached_reported(&dir, cache);
+        unreadable.extend(denied);
+        for path in files {
             // rm-338: dedup across roots by canonical identity (see
             // canonical_identity); listed paths are kept as-is.
             let identity = if cross_root {
@@ -470,17 +503,29 @@ pub(crate) fn find_session_files_cached(
             }
         }
     }
-    sort_paths_by_cache(all, cache)
+    (
+        sort_paths_by_cache(all, cache),
+        unreadable.into_iter().collect(),
+    )
 }
 
-fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {
+/// rm-249: cached-walk twin of `collect_session_files_reported` — the
+/// same unreadable-directory skip set on the lane the CLI loads
+/// through (warm cache replays list cached listings, so a permission
+/// denial is only observable on a cold read; the report is exactly as
+/// fresh as the walk).
+fn collect_session_files_cached_reported(
+    dir: &Path,
+    cache: &mut SessionCache,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if is_cline_task_dir(dir) {
-        return vec![dir.to_path_buf()];
+        return (vec![dir.to_path_buf()], Vec::new());
     }
     let max_depth = max_session_dir_depth(dir);
     let mut items = Vec::new();
     let mut visited = SymlinkTargets::new(dir);
     let mut file_targets = SessionFileTargets::new();
+    let mut unreadable = Vec::new();
     walk_session_files_cached(
         dir,
         0,
@@ -489,8 +534,9 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
         &mut items,
         &mut visited,
         &mut file_targets,
+        &mut unreadable,
     );
-    sort_paths_by_cache(items, cache)
+    (sort_paths_by_cache(items, cache), unreadable)
 }
 
 /// Loop guard for symlinked session directories (Codex `#42135`):
@@ -598,6 +644,11 @@ fn entry_is_dir_entry(file_type: &fs::FileType, path: &Path) -> bool {
     false
 }
 
+// 8 walk parameters (cache + the two admission guards + the three
+// collectors + the rm-249 unreadable report) — grouping them into a
+// context struct would churn every recursive call for no gain; the
+// file already carries this allow at :1128.
+#[allow(clippy::too_many_arguments)]
 fn walk_session_files_cached(
     dir: &Path,
     depth: usize,
@@ -606,6 +657,7 @@ fn walk_session_files_cached(
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    unreadable: &mut Vec<PathBuf>,
 ) {
     if depth > max_depth {
         return;
@@ -614,8 +666,16 @@ fn walk_session_files_cached(
         items.push(dir.to_path_buf());
         return;
     }
-    let Ok(metadata) = fs::metadata(dir) else {
-        return;
+    let metadata = match fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            // rm-249: name permission denials instead of presenting
+            // the subtree as absent (see walk_session_files).
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                unreadable.push(dir.to_path_buf());
+            }
+            return;
+        }
     };
     if !metadata.is_dir() {
         return;
@@ -639,14 +699,24 @@ fn walk_session_files_cached(
                     items,
                     visited,
                     file_targets,
+                    unreadable,
                 );
             }
         }
         return;
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            // rm-249: see walk_session_files — only PermissionDenied is
+            // a coverage denial; anything else is a race and stays
+            // silent.
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                unreadable.push(dir.to_path_buf());
+            }
+            return;
+        }
     };
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -711,6 +781,7 @@ fn walk_session_files_cached(
             items,
             visited,
             file_targets,
+            unreadable,
         );
     }
 }
@@ -722,12 +793,23 @@ fn walk_session_files(
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    unreadable: &mut Vec<PathBuf>,
 ) {
     if depth > max_depth {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            // rm-249: a directory the filesystem refuses narrows
+            // coverage silently otherwise; name it so the caller can
+            // disclose it (a vanished path is a race, not a denial —
+            // only PermissionDenied is recorded).
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                unreadable.push(dir.to_path_buf());
+            }
+            return;
+        }
     };
     // rm-597 review fix: collect candidates first and admit them in
     // sorted order, mirroring the cached walk (files.sort() before the
@@ -754,7 +836,15 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            walk_session_files(
+                &path,
+                depth + 1,
+                max_depth,
+                items,
+                visited,
+                file_targets,
+                unreadable,
+            );
             continue;
         }
         let name = entry.file_name();

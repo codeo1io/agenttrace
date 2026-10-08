@@ -31,12 +31,15 @@ pub use diagnostics::{
 };
 
 pub use discovery::{
-    collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
+    collect_session_files, collect_session_files_reported, discover_session_dirs,
+    find_session_files, find_session_files_reported, known_session_dirs, load_sessions_from_dir,
+    load_sessions_with_options, load_sessions_with_progress,
     load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
     KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
 };
-pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
+pub use doctor::{
+    build_doctor_report, doctor_report_render, render_doctor_report, DoctorDirReport, DoctorReport,
+};
 pub use governance::{
     context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance,
     recommendations, session_cost_audit, ContextTrend, ContextTrendTotals, CostAudit,

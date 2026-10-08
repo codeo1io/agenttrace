@@ -115,6 +115,9 @@ agenttrace
 #   > ~/.config/agenttrace/config.toml > AGENTTRACE_* env > defaults
 # Every layer only fills keys left unset above it, and --doctor
 # discloses which files were found and where each knob came from.
+# --doctor exits 3 when a check fails (an unusable -d value, session
+# directories the walk cannot read) instead of printing "Session
+# files: 0" and exiting 0 — CI can gate on the exit code.
 agenttrace --doctor
 
 # ~/.config/agenttrace/config.toml — all keys optional:
@@ -151,6 +154,13 @@ as clean or silently falling back to the text estimate (absent usage
 keeps `estimated_from_text`). `--doctor` aggregates the share over the
 discovered session-transcript census (SQLite-backed agent databases are
 not part of this census yet).
+`-d/--dir` is a directory lane: a missing path, a file, or a directory
+the process cannot read are three distinct usage errors (exit 2),
+passing both `-d` and a positional session file is refused instead of
+silently scanning only the file, and session directories the walk
+cannot read are named on stderr (`N session directories not readable —
+coverage narrowed`) instead of presenting their contents as absent;
+`--doctor` surfaces the same set under `Failed checks:`.
 Overview sections (`--overview` required): `# summary`, `# by_model`,
 `# by_provider`, `# by_task_type`. `-f csv` outside this composable set
 bails loudly (`csv format requires --overview or --sessions`) instead of

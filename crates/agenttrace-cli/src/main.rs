@@ -1,16 +1,17 @@
 use agenttrace_core::{
-    add_baseline_comparison, average_health, compute_overview, compute_waste_report,
-    context_trends, cost_audit, data_health, data_health_scoped, delivery_evidence_with_git,
-    demo_sessions, evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
-    list_pricing, load_sessions_with_options, lookup_price, mcp_governance, parse_file,
-    parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
-    render_doctor_report, render_model_pricing_list, render_test_match,
-    render_waste_report_with_language, report_compare_json, report_json_with_language,
-    report_overview_html_with_context, report_overview_json_with_context,
-    report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
-    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
-    session_capability, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
-    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
+    add_baseline_comparison, average_health, build_doctor_report, compute_overview,
+    compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
+    delivery_evidence_with_git, demo_sessions, doctor_report_render, evaluate_overview_gate,
+    filter_sessions, fix_suggestions, inspect_first, list_pricing, load_sessions_with_options,
+    lookup_price, mcp_governance, parse_file, parse_stdin_bytes, predict_cost_anomaly,
+    pricing_cache_path, pricing_source, recommendations, render_model_pricing_list,
+    render_test_match, render_waste_report_with_language, report_compare_json,
+    report_json_with_language, report_overview_html_with_context,
+    report_overview_json_with_context, report_overview_markdown_with_context,
+    report_overview_text_with_context, report_search_json, report_search_text,
+    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
+    tool_fail_rate, total_tokens, update_pricing, waste_report_json, BaselineThresholds,
+    LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -41,7 +42,12 @@ struct Args {
         value_parser = ["text", "json", "csv", "markdown", "md", "html", "otel"]
     )]
     format: String,
-    /// Session directory to scan instead of auto-discovered agent homes
+    /// Session directory to scan instead of auto-discovered agent homes.
+    /// Takes a directory (for a single session FILE use the positional
+    /// path — passing both is refused with exit 2). A `-d` value that is
+    /// missing, a file, or not readable is a usage error (exit 2), and
+    /// directories the walk cannot read are named on stderr instead of
+    /// silently narrowing coverage (rm-249)
     #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
     #[arg(long)]
@@ -116,6 +122,10 @@ struct Args {
     version: bool,
     #[arg(long)]
     demo: bool,
+    /// Print environment diagnostics. Exits 3 when any check fails
+    /// (an unusable -d value, session directories the walk cannot
+    /// read) so CI can gate on the diagnostic instead of parsing the
+    /// text; a healthy environment exits 0 (rm-752)
     #[arg(long)]
     doctor: bool,
     #[arg(long)]
@@ -319,24 +329,29 @@ fn run() -> anyhow::Result<()> {
 
     if args.doctor {
         let doctor_dir = args.dir.as_deref().map(PathBuf::from);
-        // rm-384: disclose the configuration layers and the winning
-        // source of every knob. JSON mode keeps stdout a single pure
-        // object; the disclosure goes to stderr as its own document.
+        // rm-752: doctor is a diagnostic, and a diagnostic that reports
+        // "Session files: 0" against an unreadable directory — or exits
+        // 0 while checks failed — is worse than none. Build once, print
+        // the report either way (JSON keeps stdout a single pure object,
+        // with the rm-384 disclosure on stderr), then exit 3 (the
+        // harnesses' "diagnostic failed" convention, distinct from
+        // clap's usage 2 and the action-failure 1) when any check
+        // failed.
+        let report = build_doctor_report(doctor_dir.as_deref(), args.demo);
+        let failed = !report.failed_checks.is_empty();
+        let body = doctor_report_render(&report, &args.format)?;
         if args.format == "json" {
             eprintln!("{}", config::disclosure_json(&resolved));
+            write_output(&args.output, &body)?;
+            write_stdout(&body)?;
         } else {
-            let out = format!(
-                "{}{}",
-                config::disclosure_text(&resolved),
-                render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?
-            );
+            let out = format!("{}{}", config::disclosure_text(&resolved), body);
             write_output(&args.output, &out)?;
             write_stdout(&out)?;
-            return Ok(());
         }
-        let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
-        write_output(&args.output, &out)?;
-        write_stdout(&out)?;
+        if failed {
+            std::process::exit(3);
+        }
         return Ok(());
     }
 
@@ -1198,7 +1213,22 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
             std::process::exit(2);
         }
         if !path.is_dir() {
-            eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
+            // rm-249: a file under -d used to read as a generic
+            // "is not a directory"; name the two lanes so the fix is
+            // one copy-paste away (the positional lane takes files).
+            eprintln!("agenttrace: -d/--dir takes a directory, not a file: {dir}");
+            eprintln!("- inspect: pass a session FILE as the positional instead: agenttrace {dir}");
+            std::process::exit(2);
+        }
+        // rm-249: permission-denied on the scan root used to fall
+        // through to "No session files found in …" (exit 1) — a
+        // readable-looking no that hid an unreadable yes. The request
+        // is wrong in a way the user must fix, so it is a usage error
+        // (exit 2) with the denial named, mirroring the nested-directory
+        // disclosure the walk reports.
+        if let Err(err) = std::fs::read_dir(path) {
+            eprintln!("agenttrace: session directory is not readable: {dir} ({err})");
+            eprintln!("- inspect: check the directory's permissions (and the parent's)");
             std::process::exit(2);
         }
     }
@@ -1215,6 +1245,37 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         },
     );
     let sessions = report.sessions.clone();
+    // rm-249: directories the walk could not read narrow coverage
+    // silently otherwise; name the count and the first paths on stderr
+    // at the moment the walk sees them (stdout stays a pure report).
+    // The LoadReport carries the full skip set for consumers that want
+    // it. The -d root itself is validated (and exits 2) above, so this
+    // is nested directories and auto-discovered agent homes.
+    if !report.unreadable_dirs.is_empty() {
+        let sample = report
+            .unreadable_dirs
+            .iter()
+            .take(3)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = report.unreadable_dirs.len().saturating_sub(3);
+        eprintln!(
+            "agenttrace: {} session director{} not readable — coverage narrowed; check permissions ({}{})",
+            report.unreadable_dirs.len(),
+            if report.unreadable_dirs.len() == 1 {
+                "y is"
+            } else {
+                "ies are"
+            },
+            sample,
+            if extra > 0 {
+                format!(", +{extra} more")
+            } else {
+                String::new()
+            }
+        );
+    }
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
@@ -1777,6 +1838,21 @@ fn single_session_report_requested(args: &Args) -> bool {
 }
 
 fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
+    // rm-249: `-d` and the positional session path are two input lanes.
+    // The positional used to win silently and drop `-d` on the floor —
+    // a user asking for a directory scan got a single-file report that
+    // looked complete. Exit 2 (the clap usage-error convention, like
+    // the -d validation in load_sessions_report) rather than bail!,
+    // because the request itself is malformed.
+    if let (Some(dir), Some(path)) = (args.dir.as_deref(), args.path.as_deref()) {
+        eprintln!(
+            "agenttrace: -d/--dir and the positional session path are two input lanes — choose one"
+        );
+        eprintln!(
+            "- inspect: drop `-d {dir}` for a directory scan, or drop the positional `{path}` to load one file"
+        );
+        std::process::exit(2);
+    }
     // --fetch only means something for the upstream command; staying
     // silent about it elsewhere would let a typo'd invocation report
     // stale data while looking refreshed.
