@@ -16,6 +16,10 @@ struct RoleCounts {
 #[derive(Debug, Default)]
 struct SqliteSessionAgg {
     id: String,
+    /// rm-791: opencode `session.parent_id` — links a subagent child row
+    /// to its parent row within the same database. `None` for hermes rows
+    /// and for opencode schemas without the column.
+    parent_id: Option<String>,
     title: String,
     model: String,
     models: BTreeSet<String>,
@@ -72,11 +76,17 @@ pub struct SqliteIngestReport {
     /// to decode (NULL ids, wrong-typed columns outside the lenient
     /// readers). A dropped row is a lost session, not an empty corpus.
     pub dropped_rows: Vec<SqliteDroppedRows>,
-    /// rm-548: opencode fork copies (`session.parent_id`, pinned in
-    /// docs/guides/opencode-fork-marker.md) excluded from aggregation —
-    /// a fork re-emits its parent's history, so counting both
-    /// double-counts usage. The count is carried here so the cached
-    /// and fresh paths disclose identically.
+    /// rm-548: opencode fork copies excluded from aggregation — a fork
+    /// re-emits its parent's history, so counting both double-counts
+    /// usage. The count is carried here so the cached and fresh paths
+    /// disclose identically.
+    ///
+    /// Superseded in the SQLITE lane at integration (run 2023f222,
+    /// rm-791, ranked above rm-548): live host measurement showed
+    /// `session.parent_id` rows are subagent children with their own
+    /// message ids — retained and attributed, not excluded — so only
+    /// the JSON storage lane (`parentID` marker, counted during file
+    /// discovery) feeds this counter now; the sqlite lane reports 0.
     pub fork_excluded: usize,
 }
 
@@ -172,11 +182,12 @@ pub fn load_sqlite_backed_sessions_reported(
     for path in hermes_state_db_paths(&home) {
         sessions.extend(load_hermes_sqlite_sessions(&path, since, &mut report));
     }
-    // rm-548: opencode fork copies (`session.parent_id`, pinned in
-    // docs/guides/opencode-fork-marker.md) re-emit their parent's
-    // history, so counting them would double-count usage. They are
-    // excluded inside the loader and counted into the report for
-    // disclosure.
+    // rm-548 (JSON-lane scope after the rm-791 supersession): fork
+    // copies re-emit their parent's history, so counting them would
+    // double-count usage; they are excluded in file discovery and
+    // counted into the report for disclosure. The sqlite lane's
+    // `parent_id` rows are subagent children (rm-791) and are retained
+    // and attributed instead — see `opencode_sqlite_session_rows`.
     for path in opencode_db_paths(&home) {
         sessions.extend(load_opencode_sqlite_sessions(&path, since, &mut report));
     }
@@ -413,9 +424,11 @@ fn load_opencode_sqlite_sessions(
     if let Some((sessions, fork_excluded)) =
         crate::session_cache::load_sqlite_snapshot_with_meta(path, "opencode")
     {
-        // rm-548: the warm snapshot (schema 8) carries the stored
+        // rm-548: the warm snapshot (schema 9) carries the stored
         // exclusion count, so the disclosure cannot go silent on the
-        // cached path.
+        // cached path. v9 snapshots bank 0 for the sqlite lane (the
+        // rm-791 supersession); the count survives for the JSON lane's
+        // benefit through the shared field.
         report.fork_excluded += fork_excluded;
         // rm-753: see load_hermes_sqlite_sessions — an empty snapshot
         // is re-verified, not trusted (pre-fix corrupt databases cached
@@ -566,15 +579,6 @@ fn opencode_sqlite_session_rows(
     } else {
         "''"
     };
-    // rm-548: `parent_id` (opencode fork marker, session_parent_idx;
-    // docs/guides/opencode-fork-marker.md) is feature-detected like the
-    // stored-total columns so older databases keep working — missing
-    // column reads as null, which is "not a fork".
-    let parent_column = if sqlite_has_column(db, "session", "parent_id") {
-        "parent_id"
-    } else {
-        "null"
-    };
     // Authoritative per-session totals (upstream schema): present columns
     // are selected directly, missing ones become null so the row indices
     // stay stable across schemas.
@@ -612,10 +616,19 @@ fn opencode_sqlite_session_rows(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // rm-791 (superseding rm-548's sqlite-lane fork reading of the same
+    // column at integration): opencode's `parent_id` links subagent
+    // child sessions to their parent row; guarded like the stored
+    // columns so an older database without the column still loads
+    // (parentless).
+    let parent_select = if sqlite_has_column(db, "session", "parent_id") {
+        "parent_id"
+    } else {
+        "null"
+    };
     let sql = format!(
-        "select id, title, time_created, time_updated, {directory}, {stored_select}, \
-         {parent_column} from session \
-         where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
+        "select id, title, time_created, time_updated, {directory}, {stored_select}, {parent_select} \
+         from session where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
     let mut stmt = match db.prepare(&sql) {
         Ok(stmt) => stmt,
@@ -631,29 +644,10 @@ fn opencode_sqlite_session_rows(
         }
     };
     let since_millis = since.map(|value| value.timestamp_millis());
-    // rm-548: fork copies are dropped at the row boundary — a forked
-    // session's messages are a replay of the parent's history, so
-    // aggregating both double-counts usage. Excluded rows are counted
-    // for the disclosure channel instead of dying silently.
-    let mut fork_excluded = 0usize;
     let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
-        // Lenient read, same rule as every other dynamically-typed
-        // column below: a non-TEXT value in the fork column degrades
-        // to "not a fork" instead of failing the row and silently
-        // dropping the whole session from the aggregate.
-        let fork_parent = row
-            .get::<_, Option<rusqlite::types::Value>>(11)
-            .ok()
-            .flatten()
-            .and_then(|value| match value {
-                rusqlite::types::Value::Text(text) => Some(text),
-                _ => None,
-            })
-            .filter(|parent| !parent.is_empty());
         Ok((
             id.clone(),
-            fork_parent,
             SqliteSessionAgg {
                 id,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -670,6 +664,10 @@ fn opencode_sqlite_session_rows(
                 stored_reasoning: sqlite_value_as_i64(row.get(8)?),
                 stored_cache_read: sqlite_value_as_i64(row.get(9)?),
                 stored_cache_write: sqlite_value_as_i64(row.get(10)?),
+                // rm-791: lenient like the stored totals — a non-text
+                // parent_id degrades to "no linkage" instead of failing
+                // (and thereby dropping) the whole session row.
+                parent_id: sqlite_value_as_text(row.get(11)?),
                 source_tool: "opencode_db".to_string(),
                 path: path.to_string_lossy().to_string(),
                 ..SqliteSessionAgg::default()
@@ -684,24 +682,23 @@ fn opencode_sqlite_session_rows(
     };
     // rm-753: decode failures are counted and sampled, not
     // filter_map-dropped — the NULL-id ghost row erased a whole
-    // session silently (P11: 4 of 5 sessions "reported"). rm-548: a
-    // row whose fork marker (`parent_id`) names a parent session is a
-    // fork copy replaying that parent's history — it is excluded from
-    // aggregation and counted for disclosure instead.
+    // session silently (P11: 4 of 5 sessions "reported").
+    // rm-791: a row carrying `parent_id` is a subagent child, NOT a
+    // fork copy — it stays in the aggregate with its parent marker
+    // parked on the agg (`SqliteSessionAgg::parent_id`) for
+    // `attribute_subagents` to resolve and roll up; the third return
+    // element (the rm-548 fork-exclusion count) is 0 for this lane
+    // after the integration supersession of rm-548's sqlite arm.
     let mut aggs = HashMap::new();
     for row in rows {
         match row {
-            Ok((id, fork_parent, agg)) => {
-                if fork_parent.is_some() {
-                    fork_excluded += 1;
-                    continue;
-                }
+            Ok((id, agg)) => {
                 aggs.insert(id, agg);
             }
             Err(error) => failures.record_dropped(&error),
         }
     }
-    (aggs, failures, fork_excluded)
+    (aggs, failures, 0)
 }
 
 fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
@@ -1075,6 +1072,13 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         metrics.duration_sec = agg.end_unix - agg.start_unix;
         metrics.provenance.duration = "timestamp_span".to_string();
     }
+    // rm-790: the source row id makes the derived-history identity per-row
+    // (two same-second sessions from one database no longer hash to one
+    // history record). rm-791: the raw parent row id is the pre-link marker
+    // that `attribute_subagents` resolves into linkage + rollups after
+    // load (subagents.rs) — never a stale link on its own.
+    metrics.session_key = agg.id.clone();
+    metrics.parent_session = agg.parent_id.unwrap_or_default();
     let anomalies = detect_anomalies(&metrics);
     // Research candidate 34: OpenCode fills `title` with a
     // `New session - <timestamp>` placeholder on every session it does
@@ -1160,6 +1164,17 @@ fn sqlite_value_as_i64(value: Option<rusqlite::types::Value>) -> Option<i64> {
         Some(SqliteValue::Integer(number)) => Some(number),
         Some(SqliteValue::Real(number)) => Some(number as i64),
         Some(SqliteValue::Text(text)) => text.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// rm-791: lenient TEXT reader for the opencode `parent_id` column —
+/// only a real TEXT row id yields linkage; NULL, wrong-typed or blob
+/// values degrade to "no parent" instead of failing the row.
+fn sqlite_value_as_text(value: Option<rusqlite::types::Value>) -> Option<String> {
+    use rusqlite::types::Value as SqliteValue;
+    match value {
+        Some(SqliteValue::Text(text)) => Some(text),
         _ => None,
     }
 }
@@ -1699,5 +1714,201 @@ mod tests {
                     && session.metrics.tokens_output >= 0),
             "lenient readers keep negative token values clamped at 0"
         );
+    }
+
+    /// rm-790/rm-791 lineage fixture: one opencode database where a parent
+    /// row and three children all start inside the SAME second
+    /// (1762000000123 / 1762000000200 ms — the assess PoC shape), two
+    /// children point at the parent via `parent_id`, one at an absent row,
+    /// and one parentless sibling exists. `with_parent_column = false`
+    /// reproduces an older opencode schema without `parent_id`.
+    fn opencode_lineage_fixture(dir: &Path, with_parent_column: bool) -> PathBuf {
+        let path = dir.join("opencode.db");
+        let db = Connection::open(&path).expect("open fixture db");
+        let parent_column = if with_parent_column {
+            ", parent_id text"
+        } else {
+            ""
+        };
+        let parent_values = if with_parent_column {
+            ", parent_id"
+        } else {
+            ""
+        };
+        // Every row lands in second 1762000000 except ses-solo.
+        let rows = if with_parent_column {
+            r#"
+                ('ses-parent', 'proj-a', 1762000000123, 1762000000900, '/work/a', 1.0, 100, 0, 0, 0, 0, NULL),
+                ('ses-c1', 'proj-b', 1762000000123, 1762000000200, '/work/a', 0.5, 40, 0, 0, 0, 0, 'ses-parent'),
+                ('ses-c2', 'proj-b', 1762000000123, 1762000000200, '/work/a', 0.25, 10, 0, 0, 0, 0, 'ses-parent'),
+                ('ses-orphan', 'proj-c', 1762000000123, 1762000000200, '/work/a', 0.1, 5, 0, 0, 0, 0, 'ses-gone'),
+                ('ses-solo', 'proj-d', 1762000005000, 1762000005100, '/work/a', 9.0, 900, 0, 0, 0, 0, NULL)
+            "#
+        } else {
+            r#"
+                ('ses-parent', 'proj-a', 1762000000123, 1762000000900, '/work/a', 1.0, 100, 0, 0, 0, 0),
+                ('ses-c1', 'proj-b', 1762000000123, 1762000000200, '/work/a', 0.5, 40, 0, 0, 0, 0),
+                ('ses-c2', 'proj-b', 1762000000123, 1762000000200, '/work/a', 0.25, 10, 0, 0, 0, 0),
+                ('ses-orphan', 'proj-c', 1762000000123, 1762000000200, '/work/a', 0.1, 5, 0, 0, 0, 0),
+                ('ses-solo', 'proj-d', 1762000005000, 1762000005100, '/work/a', 9.0, 900, 0, 0, 0, 0)
+            "#
+        };
+        db.execute_batch(&format!(
+            r#"
+            create table session (
+                id text primary key,
+                title text,
+                time_created integer,
+                time_updated integer,
+                directory text,
+                cost real,
+                tokens_input integer,
+                tokens_output integer,
+                tokens_reasoning integer,
+                tokens_cache_read integer,
+                tokens_cache_write integer{parent_column}
+            );
+            insert into session (id, title, time_created, time_updated, directory, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write{parent_values}) values
+                {rows};
+            "#,
+        ))
+        .expect("seed lineage fixture");
+        path
+    }
+
+    #[test]
+    fn opencode_rows_carry_source_key_and_distinct_identity_within_one_second() {
+        // rm-790: same-second rows from one database previously shared one
+        // derived-history id (FNV-1a over path|start — the DB path is the
+        // session path for sqlite lanes). Post-fix every row carries its
+        // source `session_key`, so identities stay distinct while the
+        // per-second session_start is identical.
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm790-key-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = opencode_lineage_fixture(&root, true);
+        let (sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(failures.is_clean(), "fixture must load clean: {failures:?}");
+        assert_eq!(sessions.len(), 5);
+        for row in ["ses-parent", "ses-c1", "ses-c2", "ses-orphan", "ses-solo"] {
+            assert!(
+                sessions
+                    .iter()
+                    .any(|session| session.metrics.session_key == row),
+                "every row carries its source session id ({row} missing)"
+            );
+        }
+        let starts: std::collections::HashSet<&str> = sessions
+            .iter()
+            .filter(|session| session.metrics.session_key != "ses-solo")
+            .map(|session| session.metrics.session_start.as_str())
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "the four same-second rows share one start second (the collision shape): {starts:?}"
+        );
+        let keys: std::collections::HashSet<&str> = sessions
+            .iter()
+            .map(|session| session.metrics.session_key.as_str())
+            .collect();
+        assert_eq!(keys.len(), 5, "keys are all distinct");
+    }
+
+    #[test]
+    fn opencode_parent_id_rolls_children_into_the_parent_session() {
+        // rm-791: the loader parks the raw `parent_id` marker in
+        // `parent_session`; `attribute_subagents` resolves it by
+        // `session_key` within the same database and rolls each child's
+        // cost/tokens into the parent's subagent_* rollups — never into
+        // the parent's own metrics.
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm791-rollup-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = opencode_lineage_fixture(&root, true);
+        let (mut sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(failures.is_clean(), "fixture must load clean: {failures:?}");
+        // Pre-attribution: children carry the raw parent row marker.
+        let raw = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.metrics.session_key.as_str(),
+                    session.metrics.parent_session.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(raw.contains(&("ses-c1", "ses-parent")));
+        crate::subagents::attribute_subagents(&mut sessions);
+        let parent = sessions
+            .iter()
+            .find(|session| session.metrics.session_key == "ses-parent")
+            .expect("parent row");
+        assert_eq!(parent.metrics.subagent_count, 2);
+        assert!((parent.metrics.subagent_cost - 0.75).abs() < 1e-9);
+        assert_eq!(parent.metrics.subagent_tokens, 50);
+        assert_eq!(
+            parent.metrics.tokens_input, 100,
+            "parent's own metrics never absorb the children"
+        );
+        assert_eq!(parent.metrics.cost_estimated, 1.0);
+        let children: Vec<&Session> = sessions
+            .iter()
+            .filter(|session| {
+                session.metrics.session_key == "ses-c1" || session.metrics.session_key == "ses-c2"
+            })
+            .collect();
+        assert_eq!(children.len(), 2);
+        assert!(children
+            .iter()
+            .all(|child| child.metrics.parent_session == "ses-parent"));
+        // Children stay in the fleet (counted once each).
+        assert_eq!(sessions.len(), 5);
+        let orphan = sessions
+            .iter()
+            .find(|session| session.metrics.session_key == "ses-orphan")
+            .expect("orphan row");
+        assert!(
+            orphan.metrics.parent_session.is_empty(),
+            "an absent parent leaves no stale link"
+        );
+        let solo = sessions
+            .iter()
+            .find(|session| session.metrics.session_key == "ses-solo")
+            .expect("solo row");
+        assert_eq!(solo.metrics.subagent_count, 0);
+        assert!(solo.metrics.parent_session.is_empty());
+        // Idempotent re-run keeps the lineage without double rollups.
+        crate::subagents::attribute_subagents(&mut sessions);
+        let parent = sessions
+            .iter()
+            .find(|session| session.metrics.session_key == "ses-parent")
+            .expect("parent row");
+        assert_eq!(parent.metrics.subagent_count, 2);
+        assert_eq!(parent.metrics.subagent_tokens, 50);
+    }
+
+    #[test]
+    fn opencode_schema_without_parent_column_still_loads() {
+        // rm-791 rider: an older opencode database without `parent_id`
+        // (the column is guarded like the stored token columns) must
+        // still load every row, parentless, clean.
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm791-nocol-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = opencode_lineage_fixture(&root, false);
+        let (mut sessions, failures, _fork_excluded) = query_opencode_sqlite_sessions(&path, None);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(failures.is_clean(), "fixture must load clean: {failures:?}");
+        assert_eq!(sessions.len(), 5, "every row loads");
+        assert!(sessions
+            .iter()
+            .all(|session| session.metrics.parent_session.is_empty()));
+        crate::subagents::attribute_subagents(&mut sessions);
+        assert!(sessions
+            .iter()
+            .all(|session| session.metrics.subagent_count == 0));
     }
 }

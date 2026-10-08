@@ -497,9 +497,20 @@ pub struct Metrics {
     #[serde(skip_serializing_if = "i64_is_zero")]
     pub subagent_tokens: i64,
     /// rm-545: parent transcript path when this session is itself a
-    /// Claude Code subagent transcript (`<session>/subagents/agent-*`).
-    #[serde(skip_serializing_if = "String::is_empty")]
+    /// Claude Code subagent transcript (`<session>/subagents/agent-*`),
+    /// or — rm-791 — the source parent row id for a sqlite-backed
+    /// subagent child (opencode `parent_id`), resolved and rolled up by
+    /// `attribute_subagents` after load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent_session: String,
+    /// rm-790: per-source row identity for DB-resident lanes (opencode
+    /// `session.id`, hermes sessions `id`); empty for transcript lanes.
+    /// Joins the derived-history session id preimage so two sessions
+    /// from the same database file that start in the same second no
+    /// longer fold onto one history row, and anchors rm-791's parent
+    /// linkage for sqlite-backed children.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_key: String,
 }
 
 fn i64_is_zero(value: &i64) -> bool {

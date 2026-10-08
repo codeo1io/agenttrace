@@ -40,10 +40,14 @@ pub struct LoadReport {
     /// databases, dropped session rows) so the CLI can disclose
     /// partial data instead of rendering it as the whole corpus.
     pub sqlite: crate::sqlite_sessions::SqliteIngestReport,
-    /// rm-548: opencode fork copies excluded from aggregation (storage
-    /// session docs with `parentID` set plus opencode db rows with
-    /// `parent_id`). Counted here so the journal disclosure channel can
-    /// report the exclusion instead of dropping sessions silently.
+    /// rm-548 (JSON-lane scope after the rm-791 supersession, run
+    /// 2023f222): opencode fork copies excluded from aggregation —
+    /// storage session docs with `parentID` set. The sqlite lane's
+    /// `parent_id` rows are subagent children under rm-791 (retained
+    /// and attributed; that lane's `fork_excluded` is 0), so only the
+    /// doc lane feeds this count. Kept here so the journal disclosure
+    /// channel can report the exclusion instead of dropping sessions
+    /// silently.
     pub opencode_fork_excluded: usize,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
@@ -406,7 +410,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
     }
     let mut sqlite_ingest = crate::sqlite_sessions::SqliteIngestReport::default();
     // rm-548: the JSON storage lane's fork exclusions (counted during
-    // file discovery) seed the total; the sqlite lane adds its own.
+    // file discovery) seed the total; the sqlite lane adds its own —
+    // zero after the rm-791 supersession (its parent_id rows are
+    // retained, attributed children), but the lane-level sum keeps the
+    // shared carrier honest for both lanes.
     let mut opencode_fork_excluded = json_fork_excluded;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =

@@ -157,7 +157,25 @@ fn session_id(session: &Session) -> String {
     // them via `same_derived_session` and `preserve_derived_history` folds
     // them away — an upgrade neither re-admits them as duplicate "history-"
     // rows nor leaves both keys in the file.
-    let canonical = format!("{}|{}", session.path, session.metrics.session_start);
+    //
+    // rm-790: sqlite-backed sessions share `path` (the source DB file) and
+    // can legally share `session_start` (per-second timestamps,
+    // sqlite_sessions.rs), so a same-second pair hashed to ONE id and
+    // `records.insert` in preserve_derived_history silently overwrote the
+    // earlier row. When the lane carries its per-row source key
+    // (`Metrics::session_key`: opencode `session.id`, hermes sessions `id`)
+    // it joins the preimage; keyless (transcript) sessions keep the exact
+    // `path|start` bytes so existing history ids never drift. Pre-fix sqlite
+    // rows (keyless ids) still fold into their keyed successors through
+    // `same_derived_session` — the legacy-row semantics above.
+    let canonical = if session.metrics.session_key.is_empty() {
+        format!("{}|{}", session.path, session.metrics.session_start)
+    } else {
+        format!(
+            "{}|{}|{}",
+            session.path, session.metrics.session_key, session.metrics.session_start
+        )
+    };
     format!("{:016x}", stable_identity_hash(&canonical))
 }
 
@@ -425,6 +443,75 @@ mod tests {
     }
 
     #[test]
+    fn rm790_session_key_disambiguates_same_second_sessions() {
+        // rm-790: two sqlite-backed sessions from one database file that
+        // start in the same second previously hashed to ONE id, and
+        // preserve_derived_history's records.insert overwrote the earlier
+        // row (assess PoC /tmp/at-assess-cd02/poc-history-collision).
+        let session = |key: &str| Session {
+            name: "session".to_string(),
+            path: "/home/u/.local/share/opencode/opencode.db".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                source_tool: "opencode_db".to_string(),
+                session_start: "2025-11-01T12:26:40Z".to_string(),
+                session_key: key.to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let alpha = session_id(&session("alpha-session"));
+        let beta = session_id(&session("beta-session"));
+        assert_ne!(alpha, beta, "same-second rows must not collide");
+        // The id is a pure function of (path, key, start).
+        assert_eq!(alpha, session_id(&session("alpha-session")));
+        let mut other_start = session("alpha-session");
+        other_start.metrics.session_start = "2025-11-01T12:26:41Z".to_string();
+        assert_ne!(alpha, session_id(&other_start));
+        // Pinned vector: keyed ids are FNV-1a over `path|key|start`.
+        assert_eq!(
+            alpha,
+            format!(
+                "{:016x}",
+                stable_identity_hash(
+                    "/home/u/.local/share/opencode/opencode.db|alpha-session|2025-11-01T12:26:40Z"
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn rm790_keyless_session_ids_are_byte_identical_to_the_legacy_preimage() {
+        // rm-790: transcript lanes (empty session_key) keep the exact
+        // `path|start` preimage, so every existing history file dedupes
+        // against ids computed by this build without migration.
+        let session = Session {
+            name: "session".to_string(),
+            path: "/tmp/private/session.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                source_tool: "codex_cli".to_string(),
+                session_start: "2026-07-19T00:00:00Z".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 95,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        assert_eq!(
+            session_id(&session),
+            format!(
+                "{:016x}",
+                stable_identity_hash("/tmp/private/session.jsonl|2026-07-19T00:00:00Z")
+            )
+        );
+    }
+
+    #[test]
     fn session_id_is_deterministic_hex_and_path_sensitive() {
         let session = Session {
             name: "secret task".to_string(),
@@ -451,6 +538,98 @@ mod tests {
         let mut other = session.clone();
         other.path = "/tmp/private/other.jsonl".to_string();
         assert_ne!(id, session_id(&other));
+    }
+
+    #[test]
+    fn rm790_same_second_sqlite_rows_survive_and_legacy_keyless_rows_fold() {
+        // rm-790 end-to-end: the assess PoC's exact shape — two opencode
+        // sessions from ONE database file starting in the same second
+        // (per-second timestamps, sqlite_sessions.rs) previously collapsed
+        // to one history record via records.insert overwrite. Post-fix both
+        // survive, and a pre-fix keyless-era row still folds into its
+        // keyed successor (upgrade path) instead of duplicating.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm790-e2e-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+
+        let sqlite_session = |row: &str, input: i64| Session {
+            name: format!("proj-{row}"),
+            path: "/home/u/.local/share/opencode/opencode.db".to_string(),
+            cwd: "/work/poc".to_string(),
+            metrics: Metrics {
+                source_tool: "opencode_db".to_string(),
+                session_start: "2025-11-01T12:26:40Z".to_string(),
+                session_end: "2025-11-01T12:26:41Z".to_string(),
+                duration_sec: 1.0,
+                tokens_input: input,
+                session_key: row.to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let alpha = sqlite_session("alpha-session", 10);
+        let beta = sqlite_session("beta-session", 5);
+        preserve_derived_history(&[alpha.clone(), beta.clone()]).expect("preserve history");
+        let path = root.join("history.json");
+        let file: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read history file"))
+                .expect("history file is a json map");
+        assert_eq!(file.len(), 2, "both same-second rows must survive");
+        assert!(file.contains_key(&session_id(&alpha)));
+        assert!(file.contains_key(&session_id(&beta)));
+
+        // Upgrade path: replace alpha's row with the pre-fix keyless form
+        // (the id every pre-rm-790 sqlite session wrote). It must fold into
+        // the keyed live session on merge, and a preserve cycle must
+        // converge the file back to the keyed id.
+        let keyed_id = session_id(&alpha);
+        let mut legacy = alpha.clone();
+        legacy.metrics.session_key.clear();
+        let legacy_id = session_id(&legacy);
+        assert_ne!(keyed_id, legacy_id);
+        let mut file: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("re-read history"))
+                .expect("history file is a json map");
+        let mut record = file.remove(&keyed_id).expect("keyed alpha row").clone();
+        record.as_object_mut().expect("record is an object").insert(
+            "id".to_string(),
+            serde_json::Value::String(legacy_id.clone()),
+        );
+        file.insert(legacy_id.clone(), record);
+        std::fs::write(&path, serde_json::to_string(&file).expect("serialize")).expect("write");
+
+        let mut live = vec![alpha.clone(), beta.clone()];
+        merge_preserved_history(&mut live);
+        assert_eq!(
+            live.len(),
+            2,
+            "legacy keyless row folds into the keyed session (no history- duplicate), got {live:?}"
+        );
+        preserve_derived_history(&[alpha.clone(), beta.clone()]).expect("re-preserve");
+        let file: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("converged read"))
+                .expect("history file is a json map");
+        assert_eq!(file.len(), 2);
+        assert!(
+            file.contains_key(&keyed_id) && !file.contains_key(&legacy_id),
+            "preserve cycle converges onto the keyed id"
+        );
+
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

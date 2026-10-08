@@ -3353,7 +3353,11 @@ fn discovery_skips_non_regular_session_files() {
 
 // ---------------------------------------------------------------------------
 // rm-548: opencode fork-copied history exclusion
-// (docs/guides/opencode-fork-marker.md — parentID / session.parent_id)
+// (docs/guides/opencode-fork-marker.md — parentID / session.parent_id).
+// Integration split (run 2023f222, conflict case 0da4ace218e64e45a6401ff18aaf6074):
+// the JSON-storage lane (parentID info docs) keeps rm-548's exclusion;
+// the SQLITE lane's parent_id rows are subagent children (rm-791) —
+// retained and attributed, see the rewritten db test below.
 // ---------------------------------------------------------------------------
 
 fn seed_opencode_storage_forks(home: &std::path::Path) -> std::path::PathBuf {
@@ -3564,8 +3568,9 @@ fn seed_opencode_fork_db(home: &std::path::Path) {
         insert into session values
             ('ses-parent', 'parent', 1780000000000, 1780000005000, null),
             ('ses-fork',   'fork',   1780000100000, 1780000105000, 'ses-parent');
-        -- The fork re-emits the parent's only message: double-count
-        -- source.
+        -- The parent_id row is a subagent child (rm-791 semantics):
+        -- retained, linked, and rolled into the parent's subagent_*
+        -- rollups (its own message row stays its own usage).
         insert into message values
             ('m1', 'ses-parent', '{\"role\":\"user\",\"text\":\"shared history\"}'),
             ('m2', 'ses-fork',   '{\"role\":\"user\",\"text\":\"shared history\"}');",
@@ -3574,26 +3579,71 @@ fn seed_opencode_fork_db(home: &std::path::Path) {
 }
 
 #[test]
-fn opencode_db_fork_rows_excluded_and_disclosed_across_warm_snapshots() {
+fn opencode_db_parent_id_rows_retain_and_attribute_across_warm_snapshots() {
+    // Rewritten at integration (run 2023f222, conflict case
+    // 0da4ace218e64e45a6401ff18aaf6074): this test pinned landed
+    // rm-548's SQLITE-lane exclusion (any `session.parent_id` row read
+    // as a fork copy, excluded and disclosed). rm-791 superseded that
+    // arm by the authority order — live host measurement shows the
+    // parent_id rows are subagent children with their own message
+    // ids (an attribution defect, not a double-count) — so the merged
+    // contract is RETAIN + ATTRIBUTE: both rows aggregate, the child
+    // links to its parent by `session_key` and rolls its cost/tokens
+    // into the parent's subagent_* rollups, and the sqlite lane
+    // contributes ZERO to `opencode_fork_excluded` (the JSON-storage
+    // lane's `parentID` exclusion still feeds that counter; see the
+    // json-lane test above).
     let root = temp_root("agenttrace-opencode-fork-db");
     let home = root.join("home");
     seed_opencode_fork_db(&home);
 
     with_home(&home, || {
-        // Cold load: the parent's session counts once; the fork row is
-        // excluded and disclosed.
+        // Cold load: both rows aggregate — the parent keeps its own
+        // usage and gains the child's rollup, never absorbing it.
         let cold = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
-        assert_eq!(cold.sessions.len(), 1, "only the parent row may aggregate");
-        assert_eq!(cold.opencode_fork_excluded, 1);
-
-        // Warm load: the snapshot (schema 8) must carry the exclusion
-        // count instead of going silent.
-        let warm = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
-        assert_eq!(warm.sessions.len(), 1);
         assert_eq!(
-            warm.opencode_fork_excluded, 1,
-            "warm sqlite snapshot must keep disclosing the fork exclusion"
+            cold.sessions.len(),
+            2,
+            "parent and child rows both aggregate"
         );
+        assert_eq!(
+            cold.opencode_fork_excluded, 0,
+            "the sqlite lane reports no fork exclusion"
+        );
+        let parent = cold
+            .sessions
+            .iter()
+            .find(|session| session.metrics.session_key == "ses-parent")
+            .expect("parent row present");
+        assert_eq!(
+            parent.metrics.subagent_count, 1,
+            "the child rolls into the parent"
+        );
+        let child = cold
+            .sessions
+            .iter()
+            .find(|session| session.metrics.session_key == "ses-fork")
+            .expect("child row present");
+        assert_eq!(
+            child.metrics.parent_session, "ses-parent",
+            "the child carries its raw parent row id for post-load attribution"
+        );
+
+        // Warm load: the snapshot (schema 9) round-trips the same
+        // shape — lineage survives the cache and the lane still
+        // reports zero exclusions.
+        let warm = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(warm.sessions.len(), 2);
+        assert_eq!(
+            warm.opencode_fork_excluded, 0,
+            "warm sqlite snapshot keeps the retain+attribute contract"
+        );
+        let warm_parent = warm
+            .sessions
+            .iter()
+            .find(|session| session.metrics.session_key == "ses-parent")
+            .expect("parent row present on the warm path");
+        assert_eq!(warm_parent.metrics.subagent_count, 1);
     });
 
     let _ = fs::remove_dir_all(root);

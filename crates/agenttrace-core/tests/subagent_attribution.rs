@@ -122,7 +122,9 @@ fn orphan_subagent_stays_unlinked_and_serde_stays_stable() {
     assert!(
         !serialized.contains("subagent_count")
             && !serialized.contains("parent_session")
-            && !serialized.contains("subagent_cost"),
+            && !serialized.contains("subagent_cost")
+            // rm-790: same guard for the source-row key — sqlite lanes only.
+            && !serialized.contains("session_key"),
         "ordinary sessions must not grow subagent noise in JSON: {serialized}"
     );
 }

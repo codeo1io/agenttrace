@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 39 and the SQLite snapshot is schema 8; the
+The session cache is schema 39 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -165,9 +165,19 @@ block (rm-834 of run f7f81aeaf57b, minted campaign-locally as rm-693;
 schema landed as 32 → 33 at the run's base, re-based at integration
 onto the advanced ceiling as 38 → 39) — so cached sessions regenerate
 under the corrected totals; the SQLite snapshot to 7
-when Hermes tool outcomes began deriving from message result rows, and to 8
+when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
-entries cannot silently under-disclose (rm-548). Older versions are discarded and
+entries cannot silently under-disclose (rm-548 — whose sqlite-lane
+exclusion scope was superseded at integration of run 2023f222 by rm-791:
+`session.parent_id` rows are subagent children, retained and attributed,
+not fork copies to exclude; the JSON-storage-lane `parentID` exclusion
+stands and still feeds the disclosed count), and to 9 when sqlite-backed
+sessions began carrying their source row key and opencode children their
+parent row id, making derived-history identity per-row instead of
+per-(database, second) so same-second sessions in one database stop
+folding onto a single history record (rm-790, run 2023f222 cycle 1 —
+landed at its base 611242d1 as 7 → 8, re-based at integration onto the
+advanced ceiling as 8 → 9). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the snapshot is bounded at

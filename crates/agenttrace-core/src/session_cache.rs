@@ -318,7 +318,18 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 39;
 // a since-repaired database — the fingerprint (size+mtime) would
 // otherwise match and keep serving the poisoned entry. Healthy v7
 // snapshots re-bank unchanged under both rationales.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
+// Bumped 8 → 9 at integration (rm-790, run 2023f222 cycle 1; one
+// invalidation either way per the rm-230 convention — the candidate
+// landed its own 7 → 8 at base 611242d1 while the advanced ceiling had
+// already taken 8 via rm-548/rm-734, so the merged wall re-bases to
+// 8 → 9): sqlite-backed sessions now carry their source row key
+// (`SessionKey`) and opencode children their parent row id
+// (`ParentSession`), so the derived-history identity is per-row
+// instead of per-(db, second); v8 snapshots would re-fold same-second
+// sessions onto one id and mis-report the retired sqlite-lane
+// fork-exclusion count (rm-791 supersession — children are retained
+// and attributed), so they regenerate once.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 9;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -423,7 +434,11 @@ struct SqliteSnapshot {
     /// rm-548: opencode fork copies excluded from `sessions` when the
     /// snapshot was written. Carried so warm snapshots keep disclosing
     /// the exclusion instead of going silent. The schema bump to 8
-    /// retires snapshots written before the exclusion existed.
+    /// retires snapshots written before the exclusion existed. After
+    /// the rm-791 supersession (schema 9) the SQLITE lane banks 0
+    /// here — parent_id rows are retained and attributed children,
+    /// not exclusions — while the field stays the shared carrier the
+    /// report sums across lanes.
     #[serde(default)]
     fork_excluded: usize,
 }
@@ -570,6 +585,23 @@ struct GoMetrics {
     disclosure_counters: BTreeMap<String, usize>,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
+    /// rm-790: source row identity for sqlite-backed sessions; empty
+    /// for transcript lanes, so the transcript cache stays byte-identical.
+    #[serde(
+        default,
+        rename = "SessionKey",
+        skip_serializing_if = "String::is_empty"
+    )]
+    session_key: String,
+    /// rm-791: raw parent row id for sqlite-backed children — SOURCE DATA
+    /// that must survive the snapshot round-trip so the post-load
+    /// attribution (subagents.rs) can re-derive linkage and rollups.
+    #[serde(
+        default,
+        rename = "ParentSession",
+        skip_serializing_if = "String::is_empty"
+    )]
+    parent_session: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1811,6 +1843,8 @@ impl GoMetrics {
             upstream_cost_usd: metrics.upstream_cost_usd,
             disclosure_counters: metrics.disclosure_counters.clone(),
             provenance: metrics.provenance.clone(),
+            session_key: metrics.session_key.clone(),
+            parent_session: metrics.parent_session.clone(),
         }
     }
 
@@ -1853,8 +1887,13 @@ impl GoMetrics {
             upstream_cost_usd: self.upstream_cost_usd,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
-            // rm-545: subagent rollups are re-derived after every load
-            // (discovery.rs), so the cached shape carries zeros here.
+            // rm-790/rm-791: the source row key and the raw parent row id
+            // round-trip — they are source data the attribution consumes
+            // after load; the rm-545 subagent rollups stay re-derived on
+            // every load (discovery.rs), so the cached shape carries zeros
+            // for them.
+            session_key: self.session_key,
+            parent_session: self.parent_session,
             ..Metrics::default()
         }
     }
@@ -2052,7 +2091,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_eight_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_nine_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -2068,6 +2107,12 @@ mod tests {
             cwd: String::new(),
             metrics: Metrics {
                 stored_totals_delta: 720,
+                // rm-790/rm-791: the source row key and the raw parent row
+                // id are SOURCE DATA — they must survive the snapshot
+                // round-trip so identity and re-attribution hold on cache
+                // hits.
+                session_key: "ses-cached".to_string(),
+                parent_session: "ses-parent".to_string(),
                 provenance: crate::MetricProvenance {
                     tokens: "stored_session_totals".to_string(),
                     duration: "timestamp_span".to_string(),
@@ -2085,16 +2130,23 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version eight carries two rationales: rm-548 — snapshots
+        // Version nine carries three rationales: rm-548 — snapshots
         // now carry their opencode fork-exclusion count, so v7
         // snapshots would disclose a silently-missing count and must
-        // regenerate; and the rm-734 poison gate — a failed read banks
+        // regenerate; the rm-734 poison gate — a failed read banks
         // nothing and any EMPTY v7 snapshot a pre-gate run banked for
         // an unreadable database is evicted (the fingerprint alone
-        // would keep serving it). Version seven (cycle-1 rm-198):
-        // hermes tool outcome semantics changed (ok/fail now derive
-        // from the messages table), so v6 snapshots carry stale splits.
-        assert_eq!(doc["schema_version"], 8);
+        // would keep serving it); and rm-790 — sqlite-backed sessions
+        // now carry their source row key and opencode children their
+        // parent row id, so the derived-history identity is per-row
+        // instead of per-(db, second) and v8 snapshots would re-fold
+        // same-second sessions onto one id (one invalidation either
+        // way: the candidate's own 7 → 8 landed at base 611242d1 and
+        // re-bases onto the advanced ceiling as 8 → 9). Version seven
+        // (cycle-1 rm-198): hermes tool outcome semantics changed
+        // (ok/fail now derive from the messages table), so v6 snapshots
+        // carry stale splits.
+        assert_eq!(doc["schema_version"], 9);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -2106,16 +2158,24 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eight cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema nine cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
+        assert_eq!(
+            loaded[0].metrics.session_key, "ses-cached",
+            "rm-790: the source row key round-trips through the snapshot"
+        );
+        assert_eq!(
+            loaded[0].metrics.parent_session, "ses-parent",
+            "rm-791: the raw parent row id round-trips for post-load attribution"
+        );
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(7);
+        old["schema_version"] = serde_json::Value::from(8);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema six json"),
+            serde_json::to_vec(&old).expect("schema eight json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
