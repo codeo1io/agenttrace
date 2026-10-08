@@ -76,7 +76,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+        # rm-654: the wall-discipline form — test/bench/example targets
+        # too. Clippy-on-lib-only let real errors rot in the Lint lane
+        # before (check+fmt-only merge rounds); both forms run every
+        # merge round, mirroring the local gate.
+        run: |
+          cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Lockfile enforcement (cargo --locked)
         run: scripts/ci/check-locked-cargo.sh
@@ -125,7 +131,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+        # rm-654: the wall-discipline form — test/bench/example targets
+        # too. Clippy-on-lib-only let real errors rot in the Lint lane
+        # before (check+fmt-only merge rounds); both forms run every
+        # merge round, mirroring the local gate.
+        run: |
+          cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Rust tests
         run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace

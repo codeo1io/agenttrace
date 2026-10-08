@@ -330,7 +330,17 @@ fn run() -> anyhow::Result<()> {
     // rm-573: --statusline-report also wins over the upstream keyword lane.
     if args.path.as_deref() == Some("upstream") && !args.statusline_report {
         let report = upstream::status_report(&args.format, args.fetch)?;
-        write_stdout(&dispatch_sanitize(&args.format, report))?;
+        // rm-625: the drift report rides the same dispatch choke point
+        // as every other report lane (control bytes sanitized outside
+        // -f json) — and rm-652: honor -o like every other report arm,
+        // the report previously streamed to stdout only, silently
+        // ignoring the flag. write_output is a no-op without -o, so
+        // default stdout behavior is unchanged; the sanitized twin is
+        // byte-identical on stdout and in the file (the report already
+        // ends with a newline, no reformatting for the file lane).
+        let out = dispatch_sanitize(&args.format, report);
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
         return Ok(());
     }
     // `agenttrace mcp` is the local MCP server host command (rm-455):
