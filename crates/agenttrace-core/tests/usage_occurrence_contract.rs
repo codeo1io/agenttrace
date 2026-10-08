@@ -107,10 +107,10 @@ fn qwen_multi_result_usage_accumulates_per_turn() {
 /// skips at confidence "high", and of v32 totals undercounted by the
 /// pre-rm-711 parsers.
 #[test]
-fn warm_cache_replays_cold_disclosure_and_schema_39_invalidates_v32() {
+fn warm_cache_replays_cold_disclosure_and_schema_40_invalidates_v32() {
     assert_eq!(
-        SESSION_CACHE_SCHEMA_VERSION, 39,
-        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, and to 39 at the rm-834 report-truthfulness stream-fold integration, so this assert pins the live constant)"
+        SESSION_CACHE_SCHEMA_VERSION, 40,
+        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834 report-truthfulness stream-fold integration, and to 40 at the rm-585/rm-730 honest-attribution integration, so this assert pins the live constant)"
     );
     let root = std::env::temp_dir().join(format!(
         "agenttrace-contract-warmcold-{}",

@@ -1389,6 +1389,7 @@ mod tests {
             name: name.to_string(),
             path: format!("/tmp/{name}"),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 assistant_turns: 10,
                 cost_estimated: cost,
@@ -1596,6 +1597,7 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
             cwd: String::new(),
+            branch: String::new(),
         };
         session.diagnostics.loop_cost.loop_groups = 1;
         let findings = session_findings(&session, &[]);
@@ -1669,6 +1671,7 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
             cwd: String::new(),
+            branch: String::new(),
         }
     }
 

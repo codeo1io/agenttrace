@@ -71,7 +71,12 @@ grep -q "session cache is schema $session_schema" "$guide" \
 if grep -qiE 'refreshed automatically|refresh.*in the background|background.*refresh' "$guide"; then
   fail "guide must not claim automatic background refresh: pricing runs are network-free outside --update-pricing"
 fi
-if grep -qE 'schema 4' "$guide"; then
+# The 4 must be a COMPLETE number, not a digit prefix: the session cache
+# ceiling crossed 40 at run 4c3ca863's integration (by_branch invalidation),
+# and the truthful "schema 40" sentence the dynamic check above REQUIRES
+# matches a bare `schema 4` grep — a false fail that would block the whole
+# docs lane on the correct sentence.
+if grep -qE 'schema 4([^0-9]|$)' "$guide"; then
   fail "guide still claims the stale schema-4 snapshot version"
 fi
 

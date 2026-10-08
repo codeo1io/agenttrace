@@ -334,6 +334,7 @@ mod tests {
             name: "adversarial".to_string(),
             path: "/tmp/adversarial.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 tokens_input: i64::MAX,
                 tokens_output: i64::MAX,

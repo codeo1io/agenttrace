@@ -619,6 +619,7 @@ mod tests {
             name: "会话".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -641,6 +642,7 @@ mod tests {
             name: "s".to_string(),
             path: "/tmp/s".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 gaps_sec: vec![130.0, 140.0, 150.0],
                 ..Metrics::default()
@@ -672,6 +674,7 @@ mod tests {
             name: "s".to_string(),
             path: "/tmp/s".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 assistant_turns: 10,
                 cost_estimated: 10.0,

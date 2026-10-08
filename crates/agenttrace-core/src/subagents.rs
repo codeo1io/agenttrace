@@ -126,6 +126,7 @@ mod tests {
             name: path.to_string(),
             path: path.to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 cost_estimated: cost,
                 tokens_input: input,

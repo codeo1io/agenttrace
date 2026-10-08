@@ -1631,6 +1631,19 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 40 (integration of run 4c3ca863, the
+                // "honest attribution" batch — rm-585 spend-by-branch
+                // first cut: Session/GoSession carry the new `branch`
+                // field with serde default, so warm entries decode but
+                // the by_branch rollup buckets every cached session
+                // under "unknown" until regenerated, and rm-730 moved
+                // the codex structural counters (codex_ignorable_line,
+                // codex_world_state) onto
+                // metrics.disclosure_counters, so warm entries kept
+                // serving a Dropped-lines row and degraded confidence
+                // for unchanged files; landed at its base e9e8fd9 as
+                // the campaign's 32 -> 33 bump, re-based here onto the
+                // advanced ceiling, 39 being the rm-834 rung below);
                 // Schema 39 (integration of run f7f81aeaf57b, cycle-1
                 // "report truthfulness & honest surfacing" — rm-834
                 // (minted campaign-locally as rm-693, rebound at
@@ -1739,7 +1752,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":39,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":40,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
@@ -1904,6 +1917,7 @@ fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: 
         name: name.to_string(),
         path: format!("/tmp/{name}.jsonl"),
         cwd: "/tmp".to_string(),
+        branch: String::new(),
         metrics,
         anomalies: Vec::new(),
         health,
@@ -2253,6 +2267,7 @@ fn project_identity_memo_answers_from_load_not_the_filesystem() {
         name: "walked".to_string(),
         path: repo.join("session.jsonl").to_string_lossy().to_string(),
         cwd: repo.to_string_lossy().to_string(),
+        branch: String::new(),
         metrics,
         anomalies: Vec::new(),
         health: 100,

@@ -1005,6 +1005,7 @@ mod tests {
             name: "s".to_string(),
             path: path.to_string(),
             cwd: cwd.to_string(),
+            branch: String::new(),
             metrics: crate::Metrics::default(),
             anomalies: Vec::new(),
             health: 100,

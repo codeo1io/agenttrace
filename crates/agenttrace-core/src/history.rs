@@ -249,6 +249,7 @@ impl DerivedSession {
             name: format!("history-{short_id}"),
             path: format!("history:{}", self.id),
             cwd: self.project,
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: self.source,
                 model_used: self.model,
@@ -288,6 +289,7 @@ mod tests {
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "codex_cli".to_string(),
                 model_used: "gpt-5".to_string(),
@@ -407,6 +409,7 @@ mod tests {
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 95,
@@ -452,6 +455,7 @@ mod tests {
             name: "session".to_string(),
             path: "/home/u/.local/share/opencode/opencode.db".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "opencode_db".to_string(),
                 session_start: "2025-11-01T12:26:40Z".to_string(),
@@ -492,6 +496,7 @@ mod tests {
             name: "session".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "codex_cli".to_string(),
                 session_start: "2026-07-19T00:00:00Z".to_string(),
@@ -517,6 +522,7 @@ mod tests {
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "codex_cli".to_string(),
                 model_used: "gpt-5".to_string(),
@@ -562,6 +568,7 @@ mod tests {
             name: format!("proj-{row}"),
             path: "/home/u/.local/share/opencode/opencode.db".to_string(),
             cwd: "/work/poc".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "opencode_db".to_string(),
                 session_start: "2025-11-01T12:26:40Z".to_string(),
@@ -652,6 +659,7 @@ mod tests {
             name: "legacy row".to_string(),
             path: "/tmp/private/legacy.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "codex_cli".to_string(),
                 model_used: "gpt-5".to_string(),

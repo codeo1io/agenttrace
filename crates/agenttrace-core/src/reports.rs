@@ -504,6 +504,10 @@ pub fn report_overview_json_with_health(
     let models = group_items(&overview.by_model, false);
     let projects = group_items(&overview.by_project, false);
     let providers = group_items(&overview.by_provider, false);
+    // rm-585 (spend-by-branch, first cut): same GroupOverview shape as
+    // by_provider; missing / detached-HEAD / no-branch lanes roll up
+    // under the explicit "unknown" bucket (compute_overview_iter).
+    let branches = group_items(&overview.by_branch, false);
     let task_types = task_type_items(&overview.by_task_type, overview.total_cost);
     let top_cost_drivers = top_cost_driver_rows(&ordered, 3)
         .into_iter()
@@ -559,6 +563,7 @@ pub fn report_overview_json_with_health(
         "by_model": models,
         "by_project": projects,
         "by_provider": providers,
+        "by_branch": branches,
         "by_task_type": task_types,
         "top_cost_drivers": top_cost_drivers,
         "recent_sessions": recent_sessions,
@@ -1111,6 +1116,23 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     }
     out.push('\n');
 
+    // rm-585 (spend-by-branch, first cut): branch values come only
+    // from the claude-code gitBranch envelope; missing, detached-HEAD
+    // and other lanes share the explicit "unknown" bucket.
+    out.push_str("  ── By Branch ──\n");
+    for (branch, group) in overview_text_model_groups(&overview.by_branch)
+        .into_iter()
+        .take(8)
+    {
+        out.push_str(&format!(
+            "    {:<25} {:>4} Sessions  {:>8}\n",
+            branch,
+            format_count(group.sessions),
+            format_cost(group.cost)
+        ));
+    }
+    out.push('\n');
+
     out.push_str("  ── By Task Type ──\n");
     for (task_type, group) in &overview.by_task_type {
         out.push_str(&format!(
@@ -1269,6 +1291,20 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         ));
     }
 
+    // rm-585 (spend-by-branch, first cut): every session lands in
+    // exactly one branch bucket; "unknown" covers missing,
+    // detached-HEAD and lanes without a branch concept.
+    out.push_str("\n## By branch\n\n");
+    out.push_str("| Branch | Sessions | Cost |\n|---|---:|---:|\n");
+    for (branch, group) in sorted_model_groups(&overview.by_branch) {
+        out.push_str(&format!(
+            "| {} | {} | {} |\n",
+            markdown_cell(&branch),
+            format_count(group.sessions),
+            format_cost(group.cost)
+        ));
+    }
+
     out.push_str("\n## By task type\n\n");
     out.push_str(
         "| Task type | Sessions | Tokens in | Tokens out | Cost |\n|---|---:|---:|---:|---:|\n",
@@ -1340,6 +1376,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     let agents = sorted_agent_groups(&overview.by_agent);
     let models = sorted_model_groups(&overview.by_model);
     let providers = sorted_model_groups(&overview.by_provider);
+    let branches = sorted_model_groups(&overview.by_branch);
 
     let mut out = String::new();
     let mut w = |line: String| {
@@ -1511,6 +1548,18 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(provider),
+            format_count(group.sessions),
+            format_cost(group.cost)
+        ));
+    }
+    w("</tbody></table></section>".to_string());
+
+    // rm-585 (spend-by-branch, first cut).
+    w("<section><h2>By branch</h2><table><thead><tr><th>Branch</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
+    for (branch, group) in branches.iter().take(12) {
+        w(format!(
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            html_escape(branch),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -3041,6 +3090,7 @@ mod tests {
             name: "adversarial".to_string(),
             path: "/tmp/adversarial.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 tokens_input: i64::MAX,
                 tokens_output: i64::MAX,
@@ -3077,6 +3127,7 @@ mod tests {
             name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
             path: "/tmp/osc.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics,
             anomalies: vec![crate::Anomaly {
                 kind: "tool_failures".to_string(),
@@ -3102,6 +3153,7 @@ mod tests {
             name: "session".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 assistant_turns: 2,
                 tool_calls_total: 4,
@@ -3126,6 +3178,7 @@ mod tests {
             name: "打开中文文件并生成排查报告的长会话名称".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 assistant_turns: 2,
                 tool_calls_total: 4,
@@ -3149,6 +3202,7 @@ mod tests {
             name: "会话".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 assistant_turns: 2,
                 tool_calls_total: 4,

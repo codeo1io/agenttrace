@@ -95,6 +95,7 @@ fn overview_high_authority_tools_follow_go_classifier() {
         name: "authority".to_string(),
         path: "/tmp/authority.jsonl".to_string(),
         cwd: String::new(),
+        branch: String::new(),
         metrics,
         anomalies: Vec::new(),
         health: 100,

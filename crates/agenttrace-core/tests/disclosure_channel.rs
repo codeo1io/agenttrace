@@ -253,3 +253,143 @@ fn report_renders_disclosed_facts_without_a_dropped_lines_row() {
         "confidence stays high through the report arm:\n{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// rm-730 (run 4c3ca863, cycle 3): codex structural-skip counters are
+// assumption disclosures, not parse loss. The live 39acfe43 PoC: a real
+// ~/.codex corpus parsed 97/97 files with 0 skipped and every cost
+// finite, yet data_health.confidence read "low" because 1,125
+// codex_ignorable_line + codex_world_state counters — deterministic,
+// known-non-loss shapes the codex format defines as ignorable chatter
+// and as a deliberately-ignored sub-registry record — rode line_skips
+// and tripped the dropped-lines degrade. The adjudication moved those
+// two STRUCTURAL counters onto the disclosure_counters channel (the
+// rm-538 split this file pins): still counted, still disclosed in the
+// report and data_health.disclosures, but no longer degrading an
+// otherwise-exact parse. TRUE loss (codex_unparseable_line,
+// codex_non_object_line:*, codex_missing_type, codex_unmatched_*)
+// stays on line_skips and keeps degrading confidence.
+// ---------------------------------------------------------------------------
+
+const CODEX_EXACT_PARSE_WITH_STRUCTURAL_LINES: &str = concat!(
+    r#"{"timestamp":"2026-10-04T12:00:00Z","type":"session_meta","payload":{"cwd":"/tmp/probe","model":"gpt-5.3-codex"}}"#,
+    "\n",
+    r#"{"timestamp":"2026-10-04T12:00:01Z","type":"event_msg","payload":{"type":"agent_message_delta","delta":"chatter one"}}"#,
+    "\n",
+    r#"{"timestamp":"2026-10-04T12:00:02Z","type":"event_msg","payload":{"type":"agent_message_delta","delta":"chatter two"}}"#,
+    "\n",
+    r#"{"timestamp":"2026-10-04T12:00:03Z","type":"world_state","payload":{"registry":"opaque"}}"#,
+    "\n",
+    r#"{"timestamp":"2026-10-04T12:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":0}}}}"#,
+);
+
+#[test]
+fn codex_structural_counters_ride_the_disclosure_channel_not_line_skips() {
+    let session = parse_fixture("rm730-structural", CODEX_EXACT_PARSE_WITH_STRUCTURAL_LINES);
+
+    assert_eq!(
+        session.metrics.tokens_input, 100,
+        "the token_count line is still rescued and counted"
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("codex_ignorable_line"),
+        Some(&2),
+        "event_msg chatter stays counted, on the disclosure channel: {:?}",
+        session.metrics.disclosure_counters
+    );
+    assert_eq!(
+        session.metrics.disclosure_counters.get("codex_world_state"),
+        Some(&1),
+        "the world_state registry record stays counted, on the disclosure channel"
+    );
+    assert!(
+        session.metrics.line_skips.is_empty(),
+        "known-non-loss shapes must not render as dropped lines (rm-730): {:?}",
+        session.metrics.line_skips
+    );
+}
+
+#[test]
+fn codex_structural_counters_do_not_degrade_an_exact_parse_confidence() {
+    // The 39acfe43 corpus shape: every file parsed, nothing skipped,
+    // costs finite — confidence must read high even though 1,125→3
+    // structural counters are disclosed.
+    let session = parse_fixture("rm730-confidence", CODEX_EXACT_PARSE_WITH_STRUCTURAL_LINES);
+    let health = data_health(std::slice::from_ref(&session), 1, 0);
+
+    assert_eq!(
+        health.confidence, "high",
+        "the exact-parse corpus the 39acfe43 PoC measured must not read low"
+    );
+    assert_eq!(
+        health.disclosures.get("codex_ignorable_line"),
+        Some(&2),
+        "the structural counter stays visible in json data_health.disclosures"
+    );
+    assert_eq!(
+        health.disclosures.get("codex_world_state"),
+        Some(&1),
+        "both structural counters survive the move onto disclosures"
+    );
+}
+
+#[test]
+fn codex_true_loss_still_degrades_confidence_through_line_skips() {
+    // The boundary the adjudication preserved: a genuinely dropped
+    // line (torn tail / bare scalar) is real parse loss and keeps the
+    // 39acfe43 contract — line_skips non-empty, confidence low.
+    let mut raw = CODEX_EXACT_PARSE_WITH_STRUCTURAL_LINES.to_string();
+    raw.push('\n');
+    raw.push_str("{ not json");
+    let session = parse_fixture("rm730-loss", &raw);
+
+    assert_eq!(
+        session.metrics.line_skips.get("codex_unparseable_line"),
+        Some(&1),
+        "a non-JSON line stays a true parse loss: {:?}",
+        session.metrics.line_skips
+    );
+    let health = data_health(std::slice::from_ref(&session), 1, 0);
+    assert_eq!(
+        health.confidence, "low",
+        "dropped lines must still degrade confidence alongside the disclosures"
+    );
+}
+
+#[test]
+fn codex_structural_counters_render_as_disclosed_facts_not_dropped_lines() {
+    let session = parse_fixture("rm730-render", CODEX_EXACT_PARSE_WITH_STRUCTURAL_LINES);
+    let session_ref = &session;
+    let health = data_health(std::slice::from_ref(session_ref), 1, 0);
+    let text = report_overview_markdown_with_context(
+        &compute_overview(std::slice::from_ref(session_ref)),
+        std::slice::from_ref(session_ref),
+        &health,
+        TimeRange::All,
+        false,
+    );
+
+    assert!(
+        text.contains("Disclosed facts"),
+        "the structural counters render in the disclosure row:\n{text}"
+    );
+    assert!(
+        text.contains("codex_ignorable_line=2"),
+        "the chatter counter renders with its count:\n{text}"
+    );
+    assert!(
+        text.contains("codex_world_state=1"),
+        "the world_state counter renders with its count:\n{text}"
+    );
+    assert!(
+        !text.contains("Dropped lines"),
+        "an otherwise-exact codex parse must not present a parse-loss row:\n{text}"
+    );
+    assert!(
+        text.contains("| Confidence | high |"),
+        "the report arm agrees confidence is high:\n{text}"
+    );
+}

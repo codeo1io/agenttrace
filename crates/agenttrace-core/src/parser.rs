@@ -143,7 +143,28 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             // worth disclosing (ignorable lines, counted/deduped/unpaired
             // token_usage_records).
             for (key, count) in parse_counters {
-                *session.metrics.line_skips.entry(key).or_insert(0) += count;
+                // rm-730: the two STRUCTURAL counters are deterministic
+                // known-non-loss shapes — event_msg chatter the format
+                // defines as ignorable, and the world_state sub-registry
+                // record that is deliberately neither tool nor message —
+                // so they are assumption-class disclosures under the
+                // rm-538 channel split and ride disclosure_counters,
+                // where they stay fully visible (report Disclosed-facts
+                // row, data_health.disclosures, doctor) but stop tanking
+                // data_health.confidence for an otherwise-exact parse
+                // (the 39acfe43 live PoC: 97/97 parsed, 0 skipped files,
+                // yet confidence "low" via 1,125 structural counters).
+                // True loss (codex_unparseable_line,
+                // codex_non_object_line:*, codex_missing_type,
+                // codex_unmatched_*) and the compaction usage-record
+                // accounting decisions stay on line_skips and keep the
+                // 39acfe43 contract: genuinely dropped lines degrade
+                // confidence.
+                if key == "codex_ignorable_line" || key == "codex_world_state" {
+                    *session.metrics.disclosure_counters.entry(key).or_insert(0) += count;
+                } else {
+                    *session.metrics.line_skips.entry(key).or_insert(0) += count;
+                }
             }
             return Ok(session);
         }
@@ -3901,9 +3922,21 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         if cwd.is_empty() {
             if let Some(body_cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty()) {
                 cwd = body_cwd.to_string();
+                // rm-585 (spend-by-branch, first cut): gitBranch rides
+                // the same envelope as cwd on every claude-code line;
+                // capture it onto the session_meta event so the session
+                // carries the branch it ran on. Detached HEAD writes
+                // the literal "HEAD" — kept verbatim here, normalized
+                // to the "unknown" bucket only in the overview rollup
+                // (never a panic: the value is a plain map key).
+                let branch = string(obj.get("gitBranch"))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("")
+                    .to_string();
                 events.push(Event {
                     role: "session_meta".to_string(),
                     cwd: cwd.clone(),
+                    branch,
                     model_used: model.clone(),
                     source_tool: "claude_code".to_string(),
                     ..Event::default()
@@ -6465,10 +6498,22 @@ mod tests {
         let session =
             parse_raw_session("codex", "rollout.jsonl", &raw).expect("codex rollout parses");
         assert_eq!(session.metrics.tokens_input, 100);
+        // rm-730 pin change: the ignorable-line counter moved from
+        // line_skips to disclosure_counters (assumption-class, not
+        // loss) — the counter stays visible, but no longer degrades
+        // data_health.confidence.
         assert_eq!(
-            session.metrics.line_skips.get("codex_ignorable_line"),
+            session
+                .metrics
+                .disclosure_counters
+                .get("codex_ignorable_line"),
             Some(&2),
             "skipped codex chatter is visible in parse diagnostics"
+        );
+        assert!(
+            session.metrics.line_skips.is_empty(),
+            "structural skips must not render as dropped lines: {:?}",
+            session.metrics.line_skips
         );
     }
 
@@ -6566,11 +6611,13 @@ mod tests {
         assert_eq!(session.metrics.tokens_reasoning, 4_259);
         assert_eq!(session.metrics.tokens_cache_r, 192_128);
         // Disclosure pins: world_state is explicitly ignored AND counted
-        // (1 in the census), and nothing in this real-shape fixture is
-        // unmatched — every response_item payload type it carries is
-        // handled, so the unmatched-disclosure counters must be absent.
+        // (1 in the census) — rm-730 routes that structural counter onto
+        // the disclosure channel — and nothing in this real-shape
+        // fixture is unmatched: every response_item payload type it
+        // carries is handled, so the unmatched-disclosure counters
+        // (which stay on line_skips) must be absent.
         assert_eq!(
-            session.metrics.line_skips.get("codex_world_state"),
+            session.metrics.disclosure_counters.get("codex_world_state"),
             Some(&1)
         );
         let unmatched: Vec<&String> = session
@@ -7642,6 +7689,53 @@ mod tests {
             parsed.metrics.source_tool, "claude_code",
             "a claude model string must disqualify the qwen uuid branch"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_code_git_branch_rides_the_session_meta_event() {
+        // rm-585 (spend-by-branch, first cut): the claude-code envelope
+        // carries gitBranch beside cwd on every line; the session must
+        // expose it so the by_branch rollup can attribute spend. The
+        // detached-HEAD literal "HEAD" is preserved verbatim here (the
+        // overview normalizes it to the "unknown" bucket), and a
+        // journal with no gitBranch parses with an empty branch —
+        // never a panic, never an invented value.
+        let dir = std::env::temp_dir().join("agenttrace-rm585-git-branch");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let branchy = dir.join("branchy.jsonl");
+        std::fs::write(
+            &branchy,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"parentUuid\":\"u0\",\"timestamp\":\"2026-10-07T09:00:00Z\",\"cwd\":\"/work/proj\",\"gitBranch\":\"feature/rm585\",\"sessionId\":\"s1\",\"message\":{\"role\":\"user\",\"content\":\"on a branch\"}}\n",
+        )
+        .unwrap();
+        let parsed = parse_file(&branchy).expect("claude journal parses");
+        assert_eq!(
+            parsed.metrics.source_tool, "claude_code",
+            "parentUuid keeps the journal on the claude lane"
+        );
+        assert_eq!(parsed.branch, "feature/rm585");
+        assert_eq!(parsed.cwd, "/work/proj");
+
+        let detached = dir.join("detached.jsonl");
+        std::fs::write(
+            &detached,
+            "{\"type\":\"user\",\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"timestamp\":\"2026-10-07T09:01:00Z\",\"cwd\":\"/work/proj\",\"gitBranch\":\"HEAD\",\"sessionId\":\"s2\",\"message\":{\"role\":\"user\",\"content\":\"detached\"}}\n",
+        )
+        .unwrap();
+        let parsed = parse_file(&detached).expect("detached-HEAD journal parses");
+        assert_eq!(parsed.branch, "HEAD");
+
+        let bare = dir.join("bare.jsonl");
+        std::fs::write(
+            &bare,
+            "{\"type\":\"user\",\"uuid\":\"u3\",\"parentUuid\":\"u2\",\"timestamp\":\"2026-10-07T09:02:00Z\",\"cwd\":\"/work/proj\",\"sessionId\":\"s3\",\"message\":{\"role\":\"user\",\"content\":\"no branch\"}}\n",
+        )
+        .unwrap();
+        let parsed = parse_file(&bare).expect("branchless journal parses");
+        assert_eq!(parsed.branch, "");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

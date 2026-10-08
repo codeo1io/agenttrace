@@ -669,9 +669,13 @@ fn doctor_directories(
             *disclosures.entry(key.clone()).or_insert(0) += count;
         }
         // rm-526: `line_skips` (unparseable_line, non_object_line,
-        // event_schema, codex_ignorable_line, …) is a disclosure
+        // event_schema, codex_unparseable_line, …) is a disclosure
         // channel too — doctor surfaced only disclosure_counters, so
         // torn tails and format-parser drops were invisible here.
+        // (rm-730 moved the codex structural counters —
+        // codex_ignorable_line, codex_world_state — onto
+        // disclosure_counters, so they reach this fold through the
+        // loop above; true-loss counters stay on line_skips.)
         for (key, count) in &session.metrics.line_skips {
             *disclosures.entry(key.clone()).or_insert(0) += count;
         }
@@ -1121,6 +1125,7 @@ mod tests {
             name: "session.jsonl".to_string(),
             path: path.to_string(),
             cwd: cwd.to_string(),
+            branch: String::new(),
             metrics: crate::Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
