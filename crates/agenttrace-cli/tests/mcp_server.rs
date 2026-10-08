@@ -288,6 +288,70 @@ fn refusal_arms_match_json_rpc_error_codes() {
 }
 
 #[test]
+fn non_object_arguments_is_invalid_params_and_does_not_execute() {
+    // rm-840 (renumbered from campaign-local rm-800): `arguments` must be an object when present. The assess
+    // pipe PoC sent `"garbage-not-object"` where the arguments object
+    // belongs and the tool silently executed with default arguments;
+    // the guard answers -32602 naming the tool and the violated
+    // constraint and never runs the tool. Omitted `arguments` (and
+    // JSON null — this codebase's optional-value convention) keep the
+    // spec-legal empty-object default and DO execute against the
+    // seeded fixture; a real object still executes.
+    let (home, cache) = seed_home("rm800-guard", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":"garbage-not-object"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"usage_overview","arguments":9001}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":false}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"usage_overview","arguments":[1,2,3]}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"by_model_breakdown"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":null}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "refusals still exit rc0 on EOF");
+    assert_eq!(7, responses.len(), "one response per request line");
+
+    // The four non-object arms refuse with -32602, name the tool and
+    // the violated constraint, and carry no result — the tool did not
+    // execute.
+    for response in responses.iter().take(4) {
+        let error = &response["error"];
+        assert_eq!(
+            Some(-32602),
+            error["code"].as_i64(),
+            "non-object arguments: {error}"
+        );
+        let message = error["message"].as_str().expect("message");
+        assert!(
+            message.contains("arguments")
+                && message.contains("must be an object")
+                && (message.contains("by_model_breakdown") || message.contains("usage_overview")),
+            "message names the tool and the constraint: {message}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "the tool must not execute: {response}"
+        );
+    }
+
+    // Absent, null, and a real object all execute against the seeded
+    // fixture: a result comes back, not an error.
+    for response in responses.iter().skip(4) {
+        assert!(
+            response.get("result").is_some(),
+            "default arguments are spec-legal: {response}"
+        );
+    }
+}
+
+#[test]
 fn empty_home_is_a_tool_error_not_a_crash() {
     // No discovered homes at all: the tools report `isError` and the
     // server still exits 0 — the host connection is not the failure.

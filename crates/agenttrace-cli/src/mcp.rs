@@ -221,6 +221,17 @@ fn tool_execution_error(message: String) -> Result<Value, (i64, String)> {
 /// structurally bad params are `-32602` (the JSON-RPC twin of the
 /// CLI's rc2 usage error), corpus-level failures are `isError`
 /// results (the twin of the CLI's rc1 bail).
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 fn call_tool(params: Value) -> Result<Value, (i64, String)> {
     let invalid = |message: String| (CODE_INVALID_PARAMS, message);
     let Some(name) = params.get("name").and_then(Value::as_str) else {
@@ -228,7 +239,26 @@ fn call_tool(params: Value) -> Result<Value, (i64, String)> {
             "Invalid params: `name` must name a tool".to_string(),
         ));
     };
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    // rm-840 (renumbered from campaign-local rm-800 at compound 387529f7): `arguments` must be an object when present. Every tool
+    // takes an optional object; a string/number/bool/array value used
+    // to fall through `unwrap_or(json!({}))` and silently execute the
+    // tool with default arguments — a client bug became an unintended
+    // run (the assess pipe PoC sent `"garbage-not-object"` and got
+    // default-range execution). Absent (and JSON null — this file's
+    // own convention for optional values, `parse_range_argument`
+    // treats `"range": null` the same way) keeps the spec-legal
+    // empty-object default.
+    let arguments = match params.get("arguments") {
+        None | Some(Value::Null) => json!({}),
+        Some(value) if value.is_object() => value.clone(),
+        Some(other) => {
+            return Err(invalid(format!(
+                "Invalid params: `arguments` for tool `{name}` must be an object \
+                 when present, got {}",
+                json_type_name(other)
+            )));
+        }
+    };
     let range = match parse_range_argument(&arguments) {
         Ok(range) => range,
         Err(message) => return Err(invalid(message)),

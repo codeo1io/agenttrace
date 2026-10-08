@@ -22,10 +22,15 @@ fn first_writer_wins_in_a_fresh_process() {
     let first = RuntimeConfigOverrides {
         history_dir: Some(PathBuf::from("/tmp/first")),
         pricing_file: Some(PathBuf::from("/tmp/first.json")),
+        // rm-298 capacity arm added the third knob after this target
+        // landed; unset here so the write-once assertions below stay
+        // about the table mechanism, not any one knob's value.
+        session_cache_entries: None,
     };
     let second = RuntimeConfigOverrides {
         history_dir: Some(PathBuf::from("/tmp/second")),
         pricing_file: None,
+        session_cache_entries: None,
     };
     // Fresh process, sole writer: the first set() installs.
     assert!(

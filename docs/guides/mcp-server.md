@@ -70,7 +70,13 @@ in, one per line out, flushed per message.
 
 JSON-RPC batching is rejected (`-32600`), matching the current MCP
 spec revision. Malformed JSON answers `-32700`; unknown methods answer
-`-32601`; invalid tool parameters answer `-32602`. A corpus that
+`-32601`; invalid tool parameters answer `-32602`. In `tools/call`, a
+`name` that does not name a tool and an `arguments` value that is not
+an object when present (a string/number/boolean/array) both answer
+`-32602` naming the violated constraint, and the tool does not execute
+— a client bug must not become an unintended run. Omitting `arguments`
+(or sending JSON `null`) keeps the spec-legal empty-object default.
+A corpus that
 discovered no sessions for the requested window is **not** a protocol
 error: the call returns a tool result with `isError: true` carrying
 the same "No session files found" message the CLI prints, and the

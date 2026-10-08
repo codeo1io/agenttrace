@@ -121,6 +121,7 @@ agenttrace --doctor
 #   history_dir = "/data/agenttrace-history"   # where history.json lives
 #   pricing_file = "pricing-overrides.json"     # per-model price overrides
 #   weekly_budget_usd = 25.0                     # weekly USD spend budget
+#   session_cache_entries = 5000                 # parsed-session cache bound (rm-298)
 agenttrace --budget                # window-burn view: per-day spend vs budget
 agenttrace --statusline-report     # same journal; "Budget: ... remaining" line
 ```
@@ -310,7 +311,13 @@ Claude Code invokes the command on every prompt with a single-line JSON
 payload on stdin; agenttrace renders the status line and appends the raw
 payload to a local journal (`~/.cache/agenttrace/statusline.jsonl`, capped at
 10 MiB, oldest lines compacted away; set `AGENTTRACE_SESSION_CACHE_DIR` to
-relocate it). Cache files are written owner-only (`0600` on Unix) and
+relocate it). The parsed-session cache is bounded by entries and
+bytes; raise or lower the entry bound with `session_cache_entries` in
+the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
+variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
+discloses the bound actually in force, which layer supplied it, and how
+many session files the last scan re-parsed from source instead of the
+cache. Cache files are written owner-only (`0600` on Unix) and
 compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
 load reclaims if a crash leaves one behind (see PRIVACY.md). The command
 never fails the host — bad or empty input still

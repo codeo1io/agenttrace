@@ -391,6 +391,75 @@ pub const MAX_SESSION_CACHE_DIRS: usize = 20_000;
 /// budget.
 pub const MAX_SESSION_CACHE_DIR_BYTES: usize = MAX_SESSION_CACHE_BYTES / 8;
 
+/// rm-298 (capacity arm): the inclusive floor for a CONFIGURED entry
+/// bound. The default [`MAX_SESSION_CACHE_ENTRIES`] is a compile-time
+/// constant, but a runtime knob (`session_cache_entries` config key /
+/// `AGENTTRACE_SESSION_CACHE_ENTRIES` env) must never zero the cache
+/// out from under a running process — a bound of 0 would evict every
+/// entry at save time and silently turn the cache into a no-op, so
+/// smaller requests clamp up to 1.
+pub const MIN_CONFIGURED_SESSION_CACHE_ENTRIES: usize = 1;
+
+/// rm-298 (capacity arm): the inclusive ceiling for a CONFIGURED entry
+/// bound. Entries carry full tool-arg maps, so a runaway
+/// `AGENTTRACE_SESSION_CACHE_ENTRIES=999999999` would trade the count
+/// bound for a memory bound the process never agreed to; larger
+/// requests clamp down to this and `--doctor` discloses the effective
+/// value that actually governs eviction.
+pub const MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES: usize = 1_000_000;
+
+/// Resolve the effective entry bound (rm-298 capacity arm). The
+/// config-table value (installed by the CLI from the layered config)
+/// outranks the `AGENTTRACE_SESSION_CACHE_ENTRIES` env knob, which
+/// outranks the built-in [`MAX_SESSION_CACHE_ENTRIES`] default — the
+/// same precedence chain `history::history_path` applies to its knob.
+/// Both layers are clamped into
+/// [`MIN_CONFIGURED_SESSION_CACHE_ENTRIES`,
+/// `MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES`]; a knob that does not
+/// parse as a positive integer is ignored, leaving the default in
+/// charge (env knobs are best-effort, like every other `AGENTTRACE_*`).
+/// A lowered bound evicts on the NEXT save, not at load — the loaded
+/// snapshot is read-only until the writer runs.
+fn resolve_session_cache_entries(table: Option<usize>, env: Option<&str>) -> usize {
+    let requested = table.or_else(|| env.and_then(|raw| raw.trim().parse::<usize>().ok()));
+    match requested {
+        Some(value) => value.clamp(
+            MIN_CONFIGURED_SESSION_CACHE_ENTRIES,
+            MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES,
+        ),
+        None => MAX_SESSION_CACHE_ENTRIES,
+    }
+}
+
+/// The entry bound `save_session_cache` enforces for THIS process:
+/// the default const, or the configured knob (config file > env),
+/// clamped into the legal range.
+pub fn effective_session_cache_entries() -> usize {
+    resolve_session_cache_entries(
+        crate::runtime_config::get().session_cache_entries,
+        std::env::var("AGENTTRACE_SESSION_CACHE_ENTRIES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Which layer supplied the effective entry bound — for `--doctor`'s
+/// disclosure (`"config file"` / `"env"` / `"default"`), so
+/// `entries<=N` can be checked against where N came from.
+pub fn session_cache_entries_source() -> &'static str {
+    if crate::runtime_config::get().session_cache_entries.is_some() {
+        "config file"
+    } else if std::env::var("AGENTTRACE_SESSION_CACHE_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .is_some()
+    {
+        "env"
+    } else {
+        "default"
+    }
+}
+
 /// Walk-semantics version for cached directory listings. Bumped when the
 /// discovery walk's directory set changes so stale listings are dropped
 /// once at load (see `load_session_cache`). v2: symlinked child
@@ -1653,13 +1722,16 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
     if cache.path.as_os_str().is_empty() {
         return Ok(());
     }
-    // Hard bounds before serializing: beyond MAX_SESSION_CACHE_ENTRIES
-    // the oldest-fingerprint entries are dropped (pass-8 F8-3); the
-    // dirs map keeps its own count and byte budgets (rm-298); and the
-    // serialized document is capped at MAX_SESSION_CACHE_BYTES over
-    // every byte this function writes — keys, punctuation, top-level
-    // fields, and dirs included (pass-9 CU-22; byte-true rm-298).
-    enforce_entry_bound(cache, MAX_SESSION_CACHE_ENTRIES);
+    // Hard bounds before serializing: beyond the EFFECTIVE entry
+    // bound (the default const, or the configured
+    // `session_cache_entries`/`AGENTTRACE_SESSION_CACHE_ENTRIES` knob,
+    // rm-298 capacity arm) the oldest-fingerprint entries are dropped
+    // (pass-8 F8-3); the dirs map keeps its own count and byte budgets
+    // (rm-298); and the serialized document is capped at
+    // MAX_SESSION_CACHE_BYTES over every byte this function writes —
+    // keys, punctuation, top-level fields, and dirs included (pass-9
+    // CU-22; byte-true rm-298).
+    enforce_entry_bound(cache, effective_session_cache_entries());
     enforce_dirs_bound(cache, MAX_SESSION_CACHE_DIRS, MAX_SESSION_CACHE_DIR_BYTES);
     enforce_byte_bound(cache, MAX_SESSION_CACHE_BYTES);
     if let Some(parent) = cache.path.parent() {
@@ -2564,6 +2636,162 @@ mod tests {
         let dropped_again = enforce_entry_bound(&mut cache, 3);
         assert_eq!(dropped_again, 0);
         assert_eq!(cache.dirty, before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn entry_bound_resolution_precedence_and_clamping() {
+        // rm-298 capacity arm: the effective bound resolves config
+        // table > env > default, and both knob layers clamp into
+        // [MIN_CONFIGURED, MAX_CONFIGURABLE]. The resolver is pure so
+        // every arm is testable without touching the process-global
+        // table or the environment.
+        assert_eq!(
+            resolve_session_cache_entries(None, None),
+            MAX_SESSION_CACHE_ENTRIES,
+            "no knob set: the built-in default governs"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(None, Some("1500")),
+            1_500,
+            "env knob parses and wins over the default"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(None, Some(" 42 ")),
+            42,
+            "surrounding whitespace is tolerated, like a shell export"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(Some(777), Some("1500")),
+            777,
+            "the config table outranks the env knob"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(None, Some("garbage-not-a-number")),
+            MAX_SESSION_CACHE_ENTRIES,
+            "an unparseable env knob is ignored, not fatal"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(None, Some("-5")),
+            MAX_SESSION_CACHE_ENTRIES,
+            "a negative value fails usize parsing and falls to default"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(None, Some("0")),
+            MIN_CONFIGURED_SESSION_CACHE_ENTRIES,
+            "zero clamps up to the floor instead of disabling the cache"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(None, Some("999999999")),
+            MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES,
+            "a runaway value clamps down to the ceiling"
+        );
+        assert_eq!(
+            resolve_session_cache_entries(Some(0), None),
+            MIN_CONFIGURED_SESSION_CACHE_ENTRIES,
+            "the table layer clamps too — the CLI validates, but the
+            bound must be safe against any table value"
+        );
+    }
+
+    #[test]
+    fn effective_entry_bound_reads_the_env_knob() {
+        // rm-298 capacity arm: the live wrapper threads the real
+        // environment into the resolver. The process-global config
+        // table is deliberately NOT exercised here — the
+        // runtime_config tests may have installed one by now, and its
+        // first-writer-wins shape means this test cannot assert the
+        // table arm without racing them; the table value for this
+        // knob is None in every table any current test installs, so
+        // the env arm below is what this assert pins.
+        let _env = crate::test_env::lock_env();
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        assert_eq!(effective_session_cache_entries(), MAX_SESSION_CACHE_ENTRIES);
+        assert_eq!(session_cache_entries_source(), "default");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
+        assert_eq!(effective_session_cache_entries(), 1_500);
+        assert_eq!(session_cache_entries_source(), "env");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "999999999");
+        assert_eq!(
+            effective_session_cache_entries(),
+            MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES
+        );
+        // An unparseable knob leaves the default in charge.
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "many");
+        assert_eq!(effective_session_cache_entries(), MAX_SESSION_CACHE_ENTRIES);
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+    }
+
+    #[test]
+    fn entry_bound_honors_a_configured_maximum_at_save_time() {
+        // rm-298 capacity arm: save_session_cache enforces the
+        // EFFECTIVE bound, not the const — with the env knob set to a
+        // smaller value, a save evicts down to it. This is the
+        // eviction arm the doctor's `entries<=N` line discloses.
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "2");
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-configured-bound-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let cache_path = root.join("sessions.json");
+        let mut cache = SessionCache {
+            path: cache_path.clone(),
+            ..SessionCache::default()
+        };
+        let mut stamps = Vec::new();
+        for i in 0..4u64 {
+            let file = root
+                .join(format!("session-{i}.jsonl"))
+                .to_string_lossy()
+                .to_string();
+            fs::write(&file, b"session").expect("write source file");
+            let stamp =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000 + i);
+            let handle = fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open for mtime");
+            handle.set_modified(stamp).expect("deterministic mtime");
+            drop(handle);
+            stamps.push(file.clone());
+            let session = Session {
+                name: format!("session-{i}"),
+                path: file,
+                cwd: String::new(),
+                metrics: Metrics::default(),
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: Diagnostics::default(),
+                branch: String::new(),
+            };
+            store_session(Path::new(&stamps[i as usize]), &session, &mut cache)
+                .expect("store entry");
+        }
+        assert_eq!(cache.entry_count(), 4);
+        save_session_cache(&mut cache).expect("save under bound 2");
+        assert_eq!(
+            cache.entry_count(),
+            2,
+            "the configured bound — not the 20,000 const — governs eviction"
+        );
+        assert!(
+            !cache
+                .entries
+                .contains_key(&cache_key(Path::new(&stamps[0]))),
+            "the oldest sources are the ones the configured bound drops"
+        );
+        assert!(
+            cache
+                .entries
+                .contains_key(&cache_key(Path::new(&stamps[3]))),
+            "the newest sources survive"
+        );
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
         let _ = fs::remove_dir_all(root);
     }
     #[test]

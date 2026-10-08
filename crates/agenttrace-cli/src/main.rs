@@ -390,6 +390,10 @@ fn run() -> anyhow::Result<()> {
     agenttrace_core::set_runtime_config(agenttrace_core::RuntimeConfigOverrides {
         history_dir: resolved.history_dir.clone(),
         pricing_file: resolved.pricing_file.clone(),
+        // rm-298 capacity arm: the config-file layer outranks the env
+        // knob; when unset here core falls back to
+        // AGENTTRACE_SESSION_CACHE_ENTRIES, then the built-in default.
+        session_cache_entries: resolved.session_cache_entries,
     });
 
     // rm-301: stdout purity under machine formats. The side-effect
