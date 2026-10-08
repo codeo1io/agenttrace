@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 32 and the SQLite snapshot is schema 7; the
+The session cache is schema 33 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -109,6 +109,12 @@ Copilot per-model shutdown tracking with the shutdown timestamp tail
 integration as rm-601..rm-603 with rm-555 folded into the landed
 rm-551; schema landed as 31 → 32, re-basing the campaign's own
 26 → 27 bump onto the ceiling) —
+so cached sessions regenerate under the corrected totals, and to 33 when
+the report-truthfulness batch made streaming re-emissions count the
+message once — Claude stream snapshots fold per message id into their
+final form, so turns, tool calls, tool results, `session_end` and
+duration describe the message at its last emission instead of once per
+streamed block (rm-693; schema 32 → 33) —
 so cached sessions regenerate under the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):

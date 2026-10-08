@@ -3366,7 +3366,15 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // 5-block stream tripled the reported output). Exact duplicates
     // collapse to the same values; id-less messages keep the legacy
     // behavior of counting every emission (pinned by fixture).
+    // rm-693: the fold is not usage-only — a re-emission is a full
+    // SNAPSHOT of the message, so the per-id assistant event is replaced
+    // in place by the latest (richest) snapshot and the meta slot's
+    // timestamp advances to the last emission. Turns, tool calls and
+    // session_end/duration therefore describe the message once, at its
+    // final state — instead of once per streamed block.
     let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
+    let mut assistant_by_message: BTreeMap<String, usize> = BTreeMap::new();
+    let mut tool_results_by_message: BTreeSet<(String, String)> = BTreeSet::new();
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
@@ -3410,6 +3418,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             for (key, value) in usage {
                                 let slot = events[index].usage.entry(key).or_insert(0);
                                 *slot = (*slot).max(value);
+                            }
+                            // rm-693: the running total's last emission is
+                            // the message's last activity — keep the meta
+                            // slot at the final timestamp so session_end and
+                            // duration cover the whole stream, not the first
+                            // block.
+                            if !ts.is_empty() {
+                                events[index].timestamp = ts.clone();
                             }
                         }
                         None => {
@@ -3458,20 +3474,33 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             name: string(block.get("name")).unwrap_or("").to_string(),
                             args: jsonish(block.get("input").or_else(|| block.get("arguments"))),
                         }),
-                        "tool_result" => events.push(Event {
-                            role: "tool".to_string(),
-                            timestamp: ts.clone(),
-                            tool_call_id: string(block.get("tool_use_id"))
-                                .unwrap_or("")
-                                .to_string(),
-                            content: tool_result_content(block),
-                            is_error: block
-                                .get("is_error")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            source_tool: "claude_code".to_string(),
-                            ..Event::default()
-                        }),
+                        "tool_result" => {
+                            // rm-693: within one message id a re-emission
+                            // repeats the tool_result blocks it already
+                            // carried — only the first copy is a distinct
+                            // result. Id-less rows keep legacy behavior.
+                            let tool_use_id =
+                                string(block.get("tool_use_id")).unwrap_or("").to_string();
+                            let message_id = string(message.get("id")).unwrap_or("");
+                            if !message_id.is_empty()
+                                && !tool_results_by_message
+                                    .insert((message_id.to_string(), tool_use_id.clone()))
+                            {
+                                continue;
+                            }
+                            events.push(Event {
+                                role: "tool".to_string(),
+                                timestamp: ts.clone(),
+                                tool_call_id: tool_use_id,
+                                content: tool_result_content(block),
+                                is_error: block
+                                    .get("is_error")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false),
+                                source_tool: "claude_code".to_string(),
+                                ..Event::default()
+                            })
+                        }
                         _ => {}
                     }
                 }
@@ -3479,7 +3508,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     || !reasoning_parts.is_empty()
                     || !tool_calls.is_empty()
                 {
-                    events.push(Event {
+                    let assistant_event = Event {
                         role: "assistant".to_string(),
                         content: assistant_parts.join("\n"),
                         reasoning: reasoning_parts.join("\n"),
@@ -3488,7 +3517,24 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         model_used: model.clone(),
                         source_tool: "claude_code".to_string(),
                         ..Event::default()
-                    });
+                    };
+                    // rm-693: fold the snapshot per message id — the last
+                    // re-emission (the complete one) replaces the earlier
+                    // partial snapshot in place, so turns, tool calls,
+                    // anomalies and spans see the message once. Id-less
+                    // rows keep one event per row (pinned legacy).
+                    let message_id = string(message.get("id")).unwrap_or("");
+                    if message_id.is_empty() {
+                        events.push(assistant_event);
+                    } else {
+                        match assistant_by_message.get_mut(message_id) {
+                            Some(index) => events[*index] = assistant_event,
+                            None => {
+                                assistant_by_message.insert(message_id.to_string(), events.len());
+                                events.push(assistant_event);
+                            }
+                        }
+                    }
                 }
             }
             _ => {}

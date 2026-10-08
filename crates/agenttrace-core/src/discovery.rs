@@ -36,6 +36,15 @@ pub struct LoadReport {
     pub parsed: usize,
     pub skipped: usize,
     pub cache_hits: usize,
+    /// rm-695: how many discovered files failed to parse (the parse
+    /// share of `skipped`, counted explicitly so callers can tell an
+    /// exhausted parse lane from a filter miss).
+    pub parse_failures: usize,
+    /// rm-695: the first parse failure's message, in discovery order —
+    /// path plus the parser's own hint (e.g. the zstd-compressed
+    /// rollout hint), so an all-corrupt directory can say what actually
+    /// happened instead of "no sessions match the filters".
+    pub first_parse_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -288,11 +297,16 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let mut cache_hits = 0;
     let mut skipped = 0;
     // Slots hold (parsed session, came from cache); progress is still emitted in file order.
-    let mut slots: Vec<Option<(Option<Session>, bool)>> = Vec::with_capacity(files.len());
+    // rm-695: third slot carries the parse-failure message (cache hits
+    // parse fine by construction, so theirs is None).
+    /// Parsed session (None on failure), rm-695 parse-failure message,
+    /// cache-hit flag.
+    type Slot = Option<(Option<Session>, Option<String>, bool)>;
+    let mut slots: Vec<Slot> = Vec::with_capacity(files.len());
     let mut misses = Vec::new();
     for (index, path) in files.iter().enumerate() {
         match cached_session(path, cache) {
-            Some(session) => slots.push(Some((Some(session), true))),
+            Some(session) => slots.push(Some((Some(session), None, true))),
             None => {
                 slots.push(None);
                 misses.push(index);
@@ -310,7 +324,14 @@ pub fn load_sessions_with_progress_from_cache_mode(
         .min(misses.len())
         .max(1);
     let next_miss = std::sync::atomic::AtomicUsize::new(0);
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>)>();
+    // rm-695: the parse error used to die at `.ok()` — an all-corrupt
+    // directory then bailed to the CLI as "no sessions match the
+    // requested filters", hiding the real story (and the zstd hint the
+    // explicit-path lane already surfaces). Failures now ride the
+    // LoadReport so the CLI can say what actually happened.
+    let mut parse_failures = 0usize;
+    let mut first_parse_failure: Option<String> = None;
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
@@ -319,7 +340,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
                 while let Some(&index) =
                     misses.get(next_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    if tx.send((index, parse_file(&files[index]).ok())).is_err() {
+                    let parsed = parse_file(&files[index]);
+                    let failure = parsed.as_ref().err().map(|error| format!("{error:#}"));
+                    if tx.send((index, parsed.ok(), failure)).is_err() {
                         break;
                     }
                 }
@@ -328,15 +351,24 @@ pub fn load_sessions_with_progress_from_cache_mode(
         drop(tx);
 
         let mut next = 0;
-        let mut drain = |slots: &mut Vec<Option<(Option<Session>, bool)>>,
-                         cache: &mut SessionCache| {
-            while let Some((result, from_cache)) = slots.get_mut(next).and_then(Option::take) {
+        let mut drain = |slots: &mut Vec<Slot>, cache: &mut SessionCache| {
+            while let Some((result, failure, from_cache)) =
+                slots.get_mut(next).and_then(Option::take)
+            {
                 match (&result, from_cache) {
                     (Some(_), true) => cache_hits += 1,
                     (Some(session), false) => {
                         let _ = store_session(&files[next], session, cache);
                     }
-                    (None, _) => skipped += 1,
+                    (None, _) => {
+                        skipped += 1;
+                        // rm-695: keep the first failure's parser message
+                        // (discovery order) for the LoadReport.
+                        if first_parse_failure.is_none() {
+                            first_parse_failure = failure;
+                        }
+                        parse_failures += 1;
+                    }
                 }
                 report_load_progress(
                     result,
@@ -352,8 +384,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
             }
         };
         drain(&mut slots, cache);
-        for (index, result) in rx {
-            slots[index] = Some((result, false));
+        for (index, result, failure) in rx {
+            slots[index] = Some((result, failure, false));
             drain(&mut slots, cache);
         }
     });
@@ -376,9 +408,14 @@ pub fn load_sessions_with_progress_from_cache_mode(
         // Sessions with an unknown start time stay visible (unknown-time
         // bucket, N7) instead of being silently dropped from ranged views;
         // data_health counts them via `unknown_time_sessions`.
+        //
+        // rm-694: the since filter admits by OVERLAP — last known
+        // activity (session_end where known, else the start) at or after
+        // the cutoff — matching insights::session_matches_time_range, so
+        // an overnight session no longer vanishes from `--range today`.
         options.since.is_none_or(|since| {
-            DateTime::parse_from_rfc3339(&session.metrics.session_start)
-                .map(|time| time.with_timezone(&Utc) >= since)
+            crate::insights::session_last_activity(session)
+                .map(|time| time >= since)
                 .unwrap_or(true)
         }) && matches_project_filter(session, &options.project)
             && matches_filter(&session.metrics.source_tool, &options.source)
@@ -398,6 +435,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sessions,
         discovered,
         cache_hits,
+        parse_failures,
+        first_parse_failure,
     }
 }
 
