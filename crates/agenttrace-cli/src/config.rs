@@ -68,10 +68,36 @@ const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd";
 /// The user-level configuration path:
 /// `$XDG_CONFIG_HOME/agenttrace/config.toml` or
 /// `~/.config/agenttrace/config.toml`.
+///
+/// A set-but-empty `XDG_CONFIG_HOME` (or `HOME`) is treated as unset —
+/// the XDG Base Directory Specification v0.8 says a variable that is
+/// "set, but empty" must be ignored — mirroring the `XDG_CACHE_HOME`
+/// guard in the statusline capture path. Without the guard,
+/// `XDG_CONFIG_HOME=` joined an empty base into the *relative*
+/// `agenttrace/config.toml`, which then resolved against whatever
+/// directory the CLI was launched from (a `--doctor` probe printed
+/// that relative path).
 pub fn user_config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    resolve_user_config_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Pure resolution core for [`user_config_path`]: the same rules,
+/// without touching process environment state, so the empty-env
+/// fallbacks are unit-testable without mutating (unsafe) globals.
+fn resolve_user_config_path(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let base = xdg_config_home
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })?;
     Some(base.join("agenttrace").join("config.toml"))
 }
 
@@ -483,6 +509,40 @@ mod tests {
         let path = dir.join("config.toml");
         fs::write(&path, text).unwrap();
         path
+    }
+
+    #[test]
+    fn user_config_path_table_covers_empty_env_fallbacks() {
+        use std::ffi::OsStr;
+        let cases: &[(Option<&OsStr>, Option<&OsStr>, Option<PathBuf>)] = &[
+            // A non-empty absolute XDG base wins outright.
+            (
+                Some(OsStr::new("/xdg")),
+                Some(OsStr::new("/home")),
+                Some(PathBuf::from("/xdg/agenttrace/config.toml")),
+            ),
+            // Set-but-empty XDG is UNSET per spec (v0.8: "set, but
+            // empty" must be ignored) → the HOME fallback applies.
+            (
+                Some(OsStr::new("")),
+                Some(OsStr::new("/home")),
+                Some(PathBuf::from("/home/.config/agenttrace/config.toml")),
+            ),
+            // No XDG at all → the documented HOME fallback.
+            (
+                None,
+                Some(OsStr::new("/home")),
+                Some(PathBuf::from("/home/.config/agenttrace/config.toml")),
+            ),
+            // Empty XDG AND empty HOME → no user config at all, and
+            // never a *relative* path that resolves against the CWD
+            // (the pre-fix behavior joined an empty base).
+            (Some(OsStr::new("")), Some(OsStr::new("")), None),
+            (None, None, None),
+        ];
+        for (xdg, home, expected) in cases {
+            assert_eq!(&resolve_user_config_path(*xdg, *home), expected);
+        }
     }
 
     #[test]

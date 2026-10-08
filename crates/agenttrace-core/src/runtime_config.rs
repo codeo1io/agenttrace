@@ -47,10 +47,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_table_is_all_none_and_first_writer_wins() {
-        // A fresh process state cannot be simulated with OnceLock, so
-        // assert the public contract shape: get() never panics and the
-        // first set() wins over a second one with different values.
+    fn set_is_write_once_and_rejected_writers_never_mutate_the_table() {
+        // rm-684 (2026-10-07): this lib binary shares the
+        // process-global table with every other core test — any test
+        // that resolves a knob (history_path, pricing) default-
+        // initializes the OnceLock through get()'s get_or_init, so
+        // whether this test is the first writer depends on thread
+        // order. The DETERMINISTIC first-writer contract lives in its
+        // own process at tests/runtime_config_first_writer.rs. What
+        // must hold under ANY ordering: at most one set() ever
+        // installs, a rejected set() never mutates the table, and
+        // get() is a stable handle.
         let first = RuntimeConfigOverrides {
             history_dir: Some(PathBuf::from("/first-history")),
             pricing_file: Some(PathBuf::from("/first-pricing.json")),
@@ -59,17 +66,27 @@ mod tests {
             history_dir: Some(PathBuf::from("/second-history")),
             pricing_file: None,
         };
-        // Both writers target the same process-global table; exactly
-        // one of them installs. Assert get() is stable across calls.
         let installed_first = set(first.clone());
-        let _ = set(second);
+        let installed_second = set(second.clone());
+        assert!(
+            !(installed_first && installed_second),
+            "two writers cannot both install: {installed_first}/{installed_second}"
+        );
+        let before = get().clone();
+        let _ = set(RuntimeConfigOverrides {
+            history_dir: Some(PathBuf::from("/third-history")),
+            pricing_file: None,
+        });
+        assert_eq!(get(), &before, "a rejected writer mutated the table");
         let current = get();
-        assert_eq!(current, current); // stable handle
+        assert_eq!(current, get()); // stable handle
+                                    // When this test WAS the first writer, the whole table (not
+                                    // just one field) must be the first writer's, and the second
+                                    // set() must have been rejected.
         if installed_first {
+            assert!(!installed_second);
             assert_eq!(current.history_dir, first.history_dir);
+            assert_eq!(current.pricing_file, first.pricing_file);
         }
-        // Regardless of test ordering, the table is never empty-panic
-        // and always reports Some/None values, never garbage.
-        assert!(current.history_dir.is_some() || current.history_dir.is_none());
     }
 }

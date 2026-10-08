@@ -972,7 +972,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            model,
+            text_cell(&model, 25),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -989,7 +989,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     {
         out.push_str(&format!(
             "    {:<25} {:>4} Sessions  {:>8}\n",
-            provider,
+            text_cell(&provider, 25),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
@@ -1000,7 +1000,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     for (task_type, group) in &overview.by_task_type {
         out.push_str(&format!(
             "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
-            task_type,
+            text_cell(task_type, 15),
             format_count(group.sessions),
             format_cost(group.cost),
             format_tokens(group.tokens_input),
@@ -2728,6 +2728,19 @@ fn text_wrapped_key_values(label: &str, values: &[String], limit: usize) -> Vec<
 }
 
 fn text_cell(value: &str, limit: usize) -> String {
+    // rm-239 (2026-10-07): text report cells route through the same
+    // terminal-control sanitizer as the statement/statusline paths
+    // (`sanitize_line_segment`, rm-034) — an OSC-52 clipboard-write or
+    // CSI cursor payload carried by a session title, model name, or
+    // MCP server name must never reach the terminal as raw escape
+    // bytes. The sanitizer SUBSTITUTES every C0/C1 control byte with
+    // U+FFFD (the rm-034/rm-540 house contract — nothing is stripped
+    // or blanked), and the whitespace squash below then folds away
+    // nothing of it; rune truncation happens after sanitization, so
+    // the `...` tail of an over-long cell is clean too. The
+    // json/md/html/csv lanes never pass through here and stay
+    // byte-identical.
+    let value = sanitize_line_segment(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
@@ -2898,6 +2911,39 @@ fn possible_cost_driver_note_strict(session: &Session) -> Option<String> {
 mod tests {
     use super::*;
     use crate::Metrics;
+
+    #[test]
+    fn text_cell_sanitizes_terminal_control_bytes_from_every_payload_class() {
+        // rm-239 (2026-10-07) regression fixture: the payload classes
+        // that reach text report lanes are session titles, model
+        // names, and MCP server names. The pinned contract is the one
+        // every render boundary already shares (rm-034 statusline,
+        // rm-540 CSV): NO raw control byte survives — ESC from
+        // OSC-52/CSI, BEL, DEL, C1 — each replaced by a visible
+        // U+FFFD marker; the printable body around them stays
+        // readable, and the OSC body left behind is inert once its
+        // introducer byte is gone.
+        let osc_52 = "\u{1b}]52;c;aGVsbG8=\u{1b}\\Evil Title";
+        let csi = "\u{1b}[2J\u{1b}[Hgemini-2.5-pro";
+        let bel = "context7\u{7}";
+        for payload in [osc_52, csi, bel] {
+            let cell = text_cell(payload, 80);
+            assert!(
+                !cell.chars().any(|c| c.is_control()),
+                "raw control byte survived in {cell:?}"
+            );
+            assert!(
+                cell.contains('\u{FFFD}'),
+                "control bytes must be visibly replaced in {cell:?}"
+            );
+        }
+        assert!(text_cell(osc_52, 80).contains("Evil Title"));
+        assert!(text_cell(csi, 80).contains("gemini-2.5-pro"));
+        assert_eq!(text_cell("plain title", 80), "plain title");
+        // Truncation still applies after sanitization.
+        let long = "x".repeat(90);
+        assert_eq!(text_cell(&long, 40).chars().count(), 40);
+    }
 
     #[test]
     fn overview_summary_totals_saturate_across_sessions() {
