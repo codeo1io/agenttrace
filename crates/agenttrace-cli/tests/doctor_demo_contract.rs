@@ -89,6 +89,15 @@ fn doctor_demo_discloses_no_operator_home_paths() {
         Some(0),
         "demo must not enumerate the operator's discovery roots"
     );
+    // rm-298 capacity arm: the doctor JSON discloses the entry bound
+    // actually in force, its layer, and the re-parse cost. In the
+    // planted home no knob is set, so the defaults hold.
+    assert_eq!(
+        demo["cache_entry_bound"],
+        agenttrace_core::MAX_SESSION_CACHE_ENTRIES as u64
+    );
+    assert_eq!(demo["cache_entry_bound_source"], "default");
+    assert_eq!(demo["reparsed_this_scan"], 0u64);
 
     // Control: without --demo the planted corpus IS discovered and
     // disclosed — the demo gate must not change the real lane.

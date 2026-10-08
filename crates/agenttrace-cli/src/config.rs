@@ -44,6 +44,11 @@ pub struct ConfigFile {
     /// Weekly spend budget in USD (consumed by `--statusline-report`
     /// and `--budget`).
     pub weekly_budget_usd: Option<f64>,
+    /// Session-cache entry bound (rm-298 capacity arm; overrides
+    /// `AGENTTRACE_SESSION_CACHE_ENTRIES`). Clamped into
+    /// [1, 1_000_000] by core at read time; validated here so a typo'd
+    /// file fails loudly at parse instead of silently clamping.
+    pub session_cache_entries: Option<usize>,
 }
 
 impl ConfigFile {
@@ -59,11 +64,14 @@ impl ConfigFile {
         if upper.weekly_budget_usd.is_some() {
             self.weekly_budget_usd = upper.weekly_budget_usd;
         }
+        if upper.session_cache_entries.is_some() {
+            self.session_cache_entries = upper.session_cache_entries;
+        }
         self
     }
 }
 
-const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd";
+const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd, session_cache_entries";
 
 /// The user-level configuration path:
 /// `$XDG_CONFIG_HOME/agenttrace/config.toml` or
@@ -110,8 +118,10 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
         // TOML rejects duplicates and so does the subset. Only known
         // keys reach this check — unknown keys already bail in the
         // match below.
-        if matches!(key, "history_dir" | "pricing_file" | "weekly_budget_usd")
-            && !seen.insert(key.to_string())
+        if matches!(
+            key,
+            "history_dir" | "pricing_file" | "weekly_budget_usd" | "session_cache_entries"
+        ) && !seen.insert(key.to_string())
         {
             bail!(
                 "{shown}:{number}: duplicate key `{key}` — set each key once per file \
@@ -142,6 +152,28 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
                 bail!(
                     "{shown}:{number}: `{key}` expects a path string, got the \
                      number `{amount}`"
+                );
+            }
+            ("session_cache_entries", Scalar::Number(entries)) => {
+                // Integral and inside core's clamp range: the resolver
+                // clamps anyway, but a config file is authored once —
+                // reject the out-of-range value loudly at parse time
+                // instead of silently clamping the author's intent.
+                let ceiling = agenttrace_core::MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES as f64;
+                let floor = agenttrace_core::MIN_CONFIGURED_SESSION_CACHE_ENTRIES as f64;
+                if entries.fract() != 0.0 || entries < floor || entries > ceiling {
+                    bail!(
+                        "{shown}:{number}: session_cache_entries must be a whole \
+                         number between {floor} and {ceiling}, got `{entries}`"
+                    );
+                }
+                file.session_cache_entries = Some(entries as usize);
+            }
+            ("session_cache_entries", Scalar::String(text)) => {
+                bail!(
+                    "{shown}:{number}: session_cache_entries expects a whole \
+                     number, got the string `{}`",
+                    text.display()
                 );
             }
             ("weekly_budget_usd", Scalar::String(text)) => {
@@ -226,14 +258,21 @@ pub struct ResolvedConfig {
     pub pricing_file: Option<PathBuf>,
     /// Winning weekly budget in USD.
     pub weekly_budget: Option<f64>,
+    /// Winning session-cache entry bound (rm-298 capacity arm; no CLI
+    /// flag — config file > env > default).
+    pub session_cache_entries: Option<usize>,
     /// Env-knob values for display only: when no layer set the knob,
     /// these remain the effective level-5 values core falls back to.
     pub env_history_dir: Option<PathBuf>,
     /// `AGENTTRACE_PRICING_FILE` value, same display-only role.
     pub env_pricing_file: Option<PathBuf>,
+    /// `AGENTTRACE_SESSION_CACHE_ENTRIES` raw value, same display-only
+    /// role (kept as the string the environment holds; the effective
+    /// number is core's to resolve and `--doctor` renders it).
+    pub env_session_cache_entries: Option<String>,
     /// Where each winning knob came from (`CLI flag`, `config file`,
     /// `env`, or `default`).
-    pub sources: [(&'static str, &'static str); 3],
+    pub sources: [(&'static str, &'static str); 4],
 }
 
 /// Resolve the configuration for this invocation: discover the user
@@ -311,6 +350,7 @@ pub fn resolve_with_paths(
         .clone()
         .or_else(|| merged.pricing_file.clone());
     let weekly_budget = args.weekly_budget.or(merged.weekly_budget_usd);
+    let session_cache_entries = merged.session_cache_entries;
 
     let source_for = |flag: bool, file: bool, env: bool| -> &'static str {
         if flag {
@@ -329,6 +369,7 @@ pub fn resolve_with_paths(
     // effective level-5 value instead of a misleading "(unset)".
     let env_history_dir = std::env::var_os("AGENTTRACE_HISTORY_DIR").map(PathBuf::from);
     let env_pricing_file = std::env::var_os("AGENTTRACE_PRICING_FILE").map(PathBuf::from);
+    let env_session_cache_entries = std::env::var("AGENTTRACE_SESSION_CACHE_ENTRIES").ok();
     let sources = [
         (
             "history_dir",
@@ -356,6 +397,19 @@ pub fn resolve_with_paths(
                 false,
             ),
         ),
+        (
+            "session_cache_entries",
+            source_for(
+                false,
+                layers
+                    .iter()
+                    .any(|layer| layer.file.session_cache_entries.is_some()),
+                env_session_cache_entries
+                    .as_deref()
+                    .and_then(|raw| raw.trim().parse::<usize>().ok())
+                    .is_some(),
+            ),
+        ),
     ];
 
     Ok(ResolvedConfig {
@@ -364,8 +418,10 @@ pub fn resolve_with_paths(
         history_dir,
         pricing_file,
         weekly_budget,
+        session_cache_entries,
         env_history_dir,
         env_pricing_file,
+        env_session_cache_entries,
         sources,
     })
 }
@@ -376,7 +432,33 @@ use std::path::{Path, PathBuf};
 
 /// The `--doctor` disclosure as a standalone JSON document (emitted
 /// on stderr so stdout stays one pure JSON object in JSON mode).
+/// Effective session-cache entry bound for disclosure (review-fix 123c2cd0, review finding
+/// ac089711-3): the winning configured value clamped to the same [MIN, MAX] band the core
+/// resolver enforces, so the CLI disclosure reports the bound the cache actually uses and
+/// `--doctor` displays. Returns `(effective, raw)`; `None` when the knob is unset. When the
+/// two differ the caller annotates the source with "clamped from {raw}".
+fn session_cache_entries_effective(config: &ResolvedConfig) -> Option<(usize, usize)> {
+    config
+        .session_cache_entries
+        .or_else(|| {
+            config
+                .env_session_cache_entries
+                .as_deref()
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+        })
+        .map(|raw| {
+            (
+                raw.clamp(
+                    agenttrace_core::MIN_CONFIGURED_SESSION_CACHE_ENTRIES,
+                    agenttrace_core::MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES,
+                ),
+                raw,
+            )
+        })
+}
+
 pub fn disclosure_json(config: &ResolvedConfig) -> String {
+    let session_cache_knob = session_cache_entries_effective(config);
     let knob = |key: &str, value: serde_json::Value, source: &str| serde_json::json!({ "key": key, "value": value, "source": source });
     let doc = serde_json::json!({
         "layers": config.layers.iter().map(|layer| serde_json::json!({
@@ -413,6 +495,19 @@ pub fn disclosure_json(config: &ResolvedConfig) -> String {
                 config.weekly_budget.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
                 config.sources[2].1,
             ),
+            knob(
+                "session_cache_entries",
+                session_cache_knob
+                    .map(|(effective, _)| serde_json::Value::from(effective))
+                    .unwrap_or(serde_json::Value::Null),
+                match session_cache_knob {
+                    Some((effective, raw)) if effective != raw => {
+                        format!("{}, clamped from {raw}", config.sources[3].1)
+                    }
+                    _ => config.sources[3].1.to_string(),
+                }
+                .as_str(),
+            ),
         ],
     });
     serde_json::to_string_pretty(&doc).unwrap_or_default()
@@ -439,6 +534,13 @@ pub fn disclosure_text(config: &ResolvedConfig) -> String {
     if config.layers.is_empty() && config.absent.is_empty() {
         out.push_str("  no config files discovered\n");
     }
+    let session_cache_knob = session_cache_entries_effective(config);
+    let session_cache_source = match session_cache_knob {
+        Some((effective, raw)) if effective != raw => {
+            format!("{}, clamped from {raw}", config.sources[3].1)
+        }
+        _ => config.sources[3].1.to_string(),
+    };
     let knobs = [
         (
             config.sources[0].0,
@@ -467,6 +569,13 @@ pub fn disclosure_text(config: &ResolvedConfig) -> String {
                 .map(|amount| format!("${amount:.2}"))
                 .unwrap_or_else(|| "(unset)".to_string()),
             config.sources[2].1,
+        ),
+        (
+            config.sources[3].0,
+            session_cache_knob
+                .map(|(effective, _)| effective.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
+            session_cache_source.as_str(),
         ),
     ];
     for (key, value, source) in knobs {
@@ -527,11 +636,115 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_entries_parses_whole_numbers_in_range() {
+        // rm-298 capacity arm: the config-file layer of the entry-bound
+        // knob. A bare integer parses; out-of-range, fractional, and
+        // string values fail loudly with the accepted range.
+        let dir = std::env::temp_dir().join(format!("at-config-entries-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let parsed = parse_config("session_cache_entries = 5000\n", &path).expect("parse");
+        assert_eq!(parsed.session_cache_entries, Some(5_000));
+
+        let edge = parse_config(
+            &format!(
+                "session_cache_entries = {}\n",
+                agenttrace_core::MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES
+            ),
+            &path,
+        )
+        .expect("ceiling parses");
+        assert_eq!(
+            edge.session_cache_entries,
+            Some(agenttrace_core::MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES)
+        );
+
+        for raw in [
+            "session_cache_entries = 0\n",
+            "session_cache_entries = -3\n",
+            "session_cache_entries = 12.5\n",
+            "session_cache_entries = 2000000000\n",
+            "session_cache_entries = \"many\"\n",
+        ] {
+            let error = parse_config(raw, &path).unwrap_err().to_string();
+            assert!(
+                error.contains("session_cache_entries")
+                    && (error.contains("expects a whole number")
+                        || error.contains("must be a whole number")),
+                "{raw} -> {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn disclosure_reports_clamped_effective_session_cache_entries() {
+        // Review-fix 123c2cd0 (finding ac089711-3): the CLI disclosure
+        // reports the clamped effective bound, matching `--doctor` and
+        // the core resolver, and annotates the raw value when clamping
+        // changed it. In-range values render exactly as before.
+        let clamped = ResolvedConfig {
+            layers: vec![],
+            absent: vec![],
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            session_cache_entries: None,
+            env_history_dir: None,
+            env_pricing_file: None,
+            env_session_cache_entries: Some("999999999".to_string()),
+            sources: [
+                ("history_dir", "default"),
+                ("pricing_file", "default"),
+                ("weekly_budget", "default"),
+                ("AGENTTRACE_SESSION_CACHE_ENTRIES", "env"),
+            ],
+        };
+        let json = disclosure_json(&clamped);
+        let flat_json: String = json.split_whitespace().collect();
+        assert!(
+            flat_json.contains("\"key\":\"session_cache_entries\",\"value\":1000000"),
+            "json shows clamped effective: {json}"
+        );
+        assert!(
+            flat_json.contains("clampedfrom999999999") || json.contains("clamped from 999999999"),
+            "json annotates raw: {json}"
+        );
+        let text = disclosure_text(&clamped);
+        assert!(
+            text.contains(
+                "AGENTTRACE_SESSION_CACHE_ENTRIES: 1000000 (env, clamped from 999999999)"
+            ),
+            "text shows clamped effective + annotation: {text}"
+        );
+
+        let in_range = ResolvedConfig {
+            layers: vec![],
+            absent: vec![],
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            session_cache_entries: Some(20_000),
+            env_history_dir: None,
+            env_pricing_file: None,
+            env_session_cache_entries: None,
+            sources: [
+                ("history_dir", "default"),
+                ("pricing_file", "default"),
+                ("weekly_budget", "default"),
+                ("session_cache_entries", "config file"),
+            ],
+        };
+        assert!(!disclosure_json(&in_range).contains("clamped"));
+        assert!(disclosure_text(&in_range).contains("session_cache_entries: 20000 (config file)"));
+    }
+
+    #[test]
     fn layering_lets_higher_layers_override_only_set_keys() {
         let user = ConfigFile {
             history_dir: Some(PathBuf::from("/user-history")),
             pricing_file: Some(PathBuf::from("/user-pricing.json")),
             weekly_budget_usd: Some(10.0),
+            session_cache_entries: Some(40_000),
         };
         let project = ConfigFile {
             history_dir: Some(PathBuf::from("/project-history")),
@@ -544,6 +757,7 @@ mod tests {
             Some(PathBuf::from("/user-pricing.json"))
         );
         assert_eq!(merged.weekly_budget_usd, Some(10.0));
+        assert_eq!(merged.session_cache_entries, Some(40_000));
     }
 
     #[test]

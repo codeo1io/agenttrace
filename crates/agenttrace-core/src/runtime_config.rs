@@ -27,6 +27,11 @@ pub struct RuntimeConfigOverrides {
     pub history_dir: Option<PathBuf>,
     /// Pricing override file; overrides `AGENTTRACE_PRICING_FILE`.
     pub pricing_file: Option<PathBuf>,
+    /// Session-cache entry bound (rm-298 capacity arm); overrides
+    /// `AGENTTRACE_SESSION_CACHE_ENTRIES`. The resolved value is
+    /// clamped by `session_cache::resolve_session_cache_entries` —
+    /// an out-of-range or unparseable knob never reaches the bound.
+    pub session_cache_entries: Option<usize>,
 }
 
 static OVERRIDES: OnceLock<RuntimeConfigOverrides> = OnceLock::new();
@@ -62,10 +67,12 @@ mod tests {
         let first = RuntimeConfigOverrides {
             history_dir: Some(PathBuf::from("/first-history")),
             pricing_file: Some(PathBuf::from("/first-pricing.json")),
+            session_cache_entries: None,
         };
         let second = RuntimeConfigOverrides {
             history_dir: Some(PathBuf::from("/second-history")),
             pricing_file: None,
+            session_cache_entries: Some(1),
         };
         // Both writers target the same process-global table; exactly
         // one of them installs. Assert get() is stable across calls.

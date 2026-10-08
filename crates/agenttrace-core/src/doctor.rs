@@ -39,9 +39,25 @@ pub struct DoctorReport {
     pub disclosures: BTreeMap<String, usize>,
     /// On-disk size of `sessions.json`, zero when absent.
     pub cache_size_bytes: u64,
-    /// The hard bounds `save_session_cache` enforces before serializing
-    /// (entries and serialized bytes; pass-9 CU-22).
+    /// The bounds `save_session_cache` enforces before serializing:
+    /// the EFFECTIVE entry bound (rm-298 capacity arm: the
+    /// `session_cache_entries` config key / `AGENTTRACE_SESSION_CACHE_ENTRIES`
+    /// env knob when set, else the built-in default) and the
+    /// serialized-bytes cap (pass-9 CU-22).
     pub cache_limits: String,
+    /// rm-298 capacity arm: the entry bound actually in force this
+    /// run (`cache_limits` renders it as `entries<=N`); kept numeric
+    /// so JSON consumers can compare it against `cache_entries`.
+    pub cache_entry_bound: usize,
+    /// rm-298 capacity arm: which layer supplied the entry bound —
+    /// `"config file"`, `"env"`, or `"default"`.
+    pub cache_entry_bound_source: String,
+    /// rm-298 capacity arm: discovered session files this scan could
+    /// NOT serve from the cache (no entry, or size/mtime stale) and
+    /// therefore re-parses from source — the recurring CPU cost the
+    /// assess run measured directly (2,768 of 25,889 reusable on the
+    /// operator corpus). `session_files - cached_valid`.
+    pub reparsed_this_scan: usize,
     pub sessions: usize,
     pub session_files: usize,
     pub directories: Vec<DoctorDirReport>,
@@ -187,6 +203,12 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sqlite_ingest,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
+    // rm-298 capacity arm: disclose the bound actually in force (and
+    // its layer) plus the re-parse cost this scan paid — the honest
+    // numbers the entry-bound knob exists to tune.
+    let entry_bound = crate::session_cache::effective_session_cache_entries();
+    let entry_bound_source = crate::session_cache::session_cache_entries_source();
+    let reparsed_this_scan = files.len().saturating_sub(cached_valid);
     let mode = if demo {
         "demo sessions"
     } else if dir.is_some() {
@@ -220,9 +242,12 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_size_bytes,
         cache_limits: format!(
             "entries<={}, bytes<={}",
-            crate::session_cache::MAX_SESSION_CACHE_ENTRIES,
+            entry_bound,
             crate::session_cache::MAX_SESSION_CACHE_BYTES
         ),
+        cache_entry_bound: entry_bound,
+        cache_entry_bound_source: entry_bound_source.to_string(),
+        reparsed_this_scan,
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         project_decode,
@@ -858,8 +883,12 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.cache_entries, report.cached_valid, report.cache_dirs
     ));
     out.push_str(&format!(
-        "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first)\n",
-        report.cache_size_bytes, report.cache_limits
+        "  {} of {} session file(s) re-parsed from source this scan (not served by the cache)\n",
+        report.reparsed_this_scan, report.session_files
+    ));
+    out.push_str(&format!(
+        "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first; entry bound from {})\n",
+        report.cache_size_bytes, report.cache_limits, report.cache_entry_bound_source
     ));
     let statusline_state = if report.statusline.exists {
         format!(
@@ -1066,6 +1095,41 @@ mod tests {
     /// rm-512 dedup/budget/surface semantics under test are unchanged.
     fn unresolved_session(encoded_dir: &str) -> Session {
         session_at("", &format!("/nowhere/projects/-{encoded_dir}/s.jsonl"))
+    }
+
+    #[test]
+    fn cache_bound_and_reparse_disclosures_cover_knob_and_waste() {
+        // rm-298 capacity arm: the doctor report discloses the entry
+        // bound actually in force, the layer it came from, and how
+        // many session files this scan re-parsed from source. Demo
+        // mode is hermetic (no host walk, zero session files), so the
+        // waste arm reads zero here; the knob arms are the report's.
+        let _env = crate::test_env::lock_env();
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        let report = build_doctor_report(None, true);
+        assert_eq!(
+            report.cache_entry_bound,
+            crate::session_cache::MAX_SESSION_CACHE_ENTRIES
+        );
+        assert_eq!(report.cache_entry_bound_source, "default");
+        assert_eq!(report.reparsed_this_scan, 0, "demo mode discovers no files");
+        assert!(report
+            .cache_limits
+            .contains(&format!("entries<={}", report.cache_entry_bound)));
+        let text = doctor_report_text(&report);
+        assert!(text.contains("entry bound from default"), "{text}");
+        assert!(
+            text.contains("0 of 0 session file(s) re-parsed from source"),
+            "{text}"
+        );
+
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
+        let report = build_doctor_report(None, true);
+        assert_eq!(report.cache_entry_bound, 1_500);
+        assert_eq!(report.cache_entry_bound_source, "env");
+        assert!(report.cache_limits.contains("entries<=1500"));
+        assert!(doctor_report_text(&report).contains("entry bound from env"));
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
     }
 
     #[test]
