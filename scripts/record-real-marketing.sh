@@ -34,7 +34,20 @@ node - "$tmpdir/sessions.json" "$snapshot" <<'NODE'
 const fs = require("fs");
 const path = require("path");
 const [input, output] = process.argv.slice(2);
-const sessions = JSON.parse(fs.readFileSync(input, "utf8"));
+const parsed = JSON.parse(fs.readFileSync(input, "utf8"));
+// rm-798: --sessions -f json wraps the rows ({matched_sessions,
+// returned_sessions, truncated, limit, sessions}) instead of a bare
+// array. The marketing snapshot wants the top-500 rows either way;
+// log the truncation flag so a capped harvest is visible in the log.
+if (Array.isArray(parsed)) {
+  console.error("bare-array sessions json (pre-rm-798 binary?)");
+  var sessions = parsed;
+} else {
+  if (parsed.truncated) {
+    console.error(`sessions json is truncated: ${parsed.returned_sessions} of ${parsed.matched_sessions} matching (limit ${parsed.limit})`);
+  }
+  var sessions = parsed.sessions;
+}
 for (const [index, session] of sessions.entries()) {
   const metrics = session.metrics;
   const source = metrics.source_tool || "generic";

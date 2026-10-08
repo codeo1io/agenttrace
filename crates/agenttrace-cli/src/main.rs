@@ -81,7 +81,14 @@ struct Args {
     /// List sessions as rows (TSV text by default; `--format` json/csv
     /// for machine use). The TSV ends with the subagent rollup columns
     /// SUBAGENTS and SUBAGENT_COST — attributed spawned work, kept
-    /// separate from the session's own COST/TOKENS cells.
+    /// separate from the session's own COST/TOKENS cells. Rollups are
+    /// corpus-scope: they count every child in the loaded corpus, not
+    /// only the rows surviving the active view filters (rm-798).
+    /// Machine formats never let `--limit` read as the whole corpus:
+    /// json wraps the rows with matched_sessions/returned_sessions/
+    /// truncated/limit, and csv appends a `# truncated:` marker row
+    /// when rows were dropped (rm-798); csv also carries the subagent
+    /// parity columns subagents/subagent_cost/parent_session (rm-855).
     #[arg(long)]
     sessions: bool,
     /// Render per-session diagnostics: findings, evidence, fix
@@ -728,6 +735,16 @@ fn run() -> anyhow::Result<()> {
 
     if args.sessions || args.diagnostics || args.inspect.is_some() {
         if args.sessions {
+            // rm-798: out-of-band truncation note for every format —
+            // json/csv carry the counts in-band too, but a human or a
+            // TSV consumer should not have to go looking for them.
+            if args.limit < sessions.len() {
+                eprintln!(
+                    "Note: --limit caps this list view only: showing {} of {} matching sessions.",
+                    args.limit,
+                    sessions.len()
+                );
+            }
             let out = render_session_list(&sessions, &args.format, args.limit);
             let out = dispatch_sanitize(&args.format, out);
             write_output(&args.output, &(out.clone() + "\n"))?;
@@ -1536,6 +1553,7 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // cannot mistake partial data for the whole corpus. stdout (and
     // -f json) stays clean; exit codes are unchanged.
     disclose_sqlite_ingest(&report.sqlite);
+    disclose_unlinked_subagents(report.unlinked_subagents);
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
@@ -1605,6 +1623,19 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         eprintln!("agenttrace: warning: {advisory}");
     }
     Ok((sessions, Some(report)))
+}
+
+/// rm-799: one stderr line when subagent transcripts could not be
+/// linked to a parent session — an orphaned child renders as a
+/// standalone row (its own usage only) and is rolled into no parent,
+/// which reads as "no subagent work happened" unless the count is
+/// disclosed. Report output on stdout is unaffected.
+fn disclose_unlinked_subagents(count: usize) {
+    if count > 0 {
+        eprintln!(
+            "agenttrace: warning: {count} subagent transcript(s) have no parent session in the loaded corpus; they render as standalone rows and roll into no parent"
+        );
+    }
 }
 
 /// rm-753: one stderr line per SQLite-backed ingestion failure — a
@@ -2098,14 +2129,28 @@ fn matches_number(value: f64, filter: &str) -> bool {
 }
 
 fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
+    // rm-798: --limit is a DISPLAY cap, and a capped machine format
+    // must never read as the whole corpus: the json arm wraps the rows
+    // with matched/returned/truncated counts, and the csv arm gets a
+    // `# truncated:` marker row from sessions_csv_bounded.
+    let matched = sessions.len();
     let sessions = sessions.iter().take(limit).collect::<Vec<_>>();
     if format == "json" {
-        return serde_json::to_string_pretty(&sessions).expect("sessions serialize");
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "matched_sessions": matched,
+            "returned_sessions": sessions.len(),
+            "truncated": sessions.len() < matched,
+            "limit": limit,
+            "sessions": sessions,
+        }))
+        .expect("sessions serialize");
     }
     if format == "csv" {
         // rm-409: RFC 4180 statement export. rm-383 sanitation composes
         // BEFORE quoting (control bytes never ride into a cell), and the
         // rm-408 disclosure column rides along so zeros never read clean.
+        // rm-855: subagent parity columns mirror the TSV's
+        // SUBAGENTS/SUBAGENT_COST and the JSON parent_session field.
         let rows = sessions
             .iter()
             .map(|session| csv_export::SessionCsvRow {
@@ -2119,9 +2164,12 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
                 fail: session.metrics.tool_calls_fail,
                 anomalies: session.anomalies.len(),
                 zero_usage_events: session.metrics.zero_usage_events,
+                subagents: session.metrics.subagent_count,
+                subagent_cost: session.metrics.subagent_cost,
+                parent_session: sanitize_line_segment(&session.metrics.parent_session),
             })
             .collect::<Vec<_>>();
-        return csv_export::sessions_csv(&rows);
+        return csv_export::sessions_csv_bounded(&rows, matched, limit);
     }
     let mut lines = vec![
         "SESSION\tHEALTH\tDATA\tSOURCE\tMODEL\tCOST\tTOKENS\tFAIL\tANOMALIES\tSUBAGENTS\tSUBAGENT_COST"
@@ -2681,6 +2729,94 @@ mod tests {
         assert!(
             cells.contains(&"0.0105"),
             "own cost stays its own cell: {row}"
+        );
+    }
+
+    #[test]
+    fn session_list_json_discloses_limit_truncation() {
+        // rm-798: the json arm must never render a bare array — a
+        // `jq '. | length' == 20` consumer cannot tell a capped list
+        // from the whole corpus. The wrapper carries matched/returned/
+        // truncated/limit and the rows under "sessions".
+        let sessions: Vec<Session> = (0..5)
+            .map(|i| Session {
+                name: format!("s{i}"),
+                path: format!("/tmp/s{i}.jsonl"),
+                cwd: String::new(),
+                branch: String::new(),
+                metrics: Metrics::default(),
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: agenttrace_core::Diagnostics::default(),
+            })
+            .collect();
+        let full = render_session_list(&sessions, "json", 20);
+        let payload = serde_json::from_str::<serde_json::Value>(&full).expect("valid json");
+        assert_eq!(payload["matched_sessions"], 5);
+        assert_eq!(payload["returned_sessions"], 5);
+        assert_eq!(payload["truncated"], false);
+        assert_eq!(payload["limit"], 20);
+        assert_eq!(payload["sessions"].as_array().map(Vec::len), Some(5));
+        let capped = render_session_list(&sessions, "json", 2);
+        let payload = serde_json::from_str::<serde_json::Value>(&capped).expect("valid json");
+        assert_eq!(payload["matched_sessions"], 5);
+        assert_eq!(payload["returned_sessions"], 2);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["limit"], 2);
+        assert_eq!(payload["sessions"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn session_list_csv_carries_subagent_parity_and_truncation() {
+        // rm-855: csv parity — subagents/subagent_cost/parent_session
+        // mirror the TSV rollup columns and the JSON parent_session
+        // field, so no format hides what another shows. rm-798: a
+        // capped csv gets a `# truncated:` marker row; an uncapped one
+        // does not.
+        let mut parent = Session {
+            name: "parent".to_string(),
+            path: "/tmp/parent.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: 0.0105,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: agenttrace_core::Diagnostics::default(),
+        };
+        parent.metrics.subagent_count = 2;
+        parent.metrics.subagent_cost = 0.0053;
+        let mut child = parent.clone();
+        child.name = "child".to_string();
+        child.path = "/tmp/parent/subagents/agent-a1.jsonl".to_string();
+        child.metrics.subagent_count = 0;
+        child.metrics.subagent_cost = 0.0;
+        child.metrics.parent_session = "/tmp/parent.jsonl".to_string();
+        let csv = render_session_list(&[parent.clone(), child.clone()], "csv", 20);
+        let header = csv.lines().nth(1).expect("header");
+        assert!(
+            header.ends_with("zero_usage_events,subagents,subagent_cost,parent_session"),
+            "csv header must carry the rm-855 columns: {header}"
+        );
+        let parent_row = csv.lines().nth(2).expect("parent row");
+        let cells: Vec<&str> = parent_row.split(',').collect();
+        assert_eq!(cells[cells.len() - 3], "2");
+        assert_eq!(cells[cells.len() - 2], "0.0053");
+        assert_eq!(cells[cells.len() - 1], "");
+        let child_row = csv.lines().nth(3).expect("child row");
+        let cells: Vec<&str> = child_row.split(',').collect();
+        assert_eq!(cells[cells.len() - 1], "/tmp/parent.jsonl");
+        assert!(!csv.contains("# truncated"));
+        let capped = render_session_list(&[parent, child], "csv", 1);
+        assert!(
+            capped
+                .lines()
+                .any(|line| line == "# truncated: showing 1 of 2 matching sessions (--limit 1)"),
+            "capped csv must disclose: {capped}"
         );
     }
 

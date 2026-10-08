@@ -33,6 +33,11 @@ use agenttrace_core::{sanitize_line_segment, Overview};
 /// One `--sessions -f csv` row; mirrors the TSV columns plus the
 /// rm-408 disclosure column, so the statement never reports clean
 /// zeros silently.
+///
+/// rm-855: TSV/CSV parity — `subagents`/`subagent_cost` mirror the
+/// TSV's SUBAGENTS/SUBAGENT_COST rollup columns and `parent_session`
+/// mirrors the JSON metrics field (empty for standalone rows), so no
+/// format hides the subagent picture another format shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionCsvRow {
     pub session: String,
@@ -48,6 +53,15 @@ pub struct SessionCsvRow {
     /// rm-408: all-zero usage blocks the transcript reported, counted
     /// as measured and disclosed.
     pub zero_usage_events: usize,
+    /// rm-855: subagent transcripts rolled INTO this row (corpus
+    /// scope — every child in the loaded corpus, not just children
+    /// surviving the active view filters).
+    pub subagents: usize,
+    /// rm-855: summed estimated cost of those children.
+    pub subagent_cost: f64,
+    /// rm-855: parent transcript path when this row IS a subagent;
+    /// empty string for standalone sessions.
+    pub parent_session: String,
 }
 
 pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
@@ -64,6 +78,9 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             "fail",
             "anomalies",
             "zero_usage_events",
+            "subagents",
+            "subagent_cost",
+            "parent_session",
         ],
     );
     for row in rows {
@@ -78,7 +95,29 @@ pub fn sessions_csv(rows: &[SessionCsvRow]) -> String {
             &row.fail.to_string(),
             &row.anomalies.to_string(),
             &row.zero_usage_events.to_string(),
+            &row.subagents.to_string(),
+            &format!("{:.4}", row.subagent_cost),
+            &row.parent_session,
         ]));
+    }
+    out
+}
+
+/// rm-798: [`sessions_csv`] plus an explicit truncation statement.
+/// When `--limit` dropped rows, a trailing `#`-marker row says how
+/// many of how many matching sessions are shown — a `jq`/spreadsheet
+/// consumer parsing the data rows must never mistake a capped list
+/// for the whole corpus. `#`-prefix marker rows are already part of
+/// this dialect's table framing (`# sessions`, `# summary`, ...), so
+/// consumers skip them today. Uncapped lists are byte-identical to
+/// [`sessions_csv`].
+pub fn sessions_csv_bounded(rows: &[SessionCsvRow], matched: usize, limit: usize) -> String {
+    let shown = rows.len();
+    let mut out = sessions_csv(rows);
+    if shown < matched {
+        out.push_str(&csv_row(&[&format!(
+            "# truncated: showing {shown} of {matched} matching sessions (--limit {limit})"
+        )]));
     }
     out
 }
@@ -350,18 +389,52 @@ mod tests {
             fail: 0,
             anomalies: 0,
             zero_usage_events: 2,
+            subagents: 1,
+            subagent_cost: 0.5,
+            parent_session: "/p/proj/abc.jsonl".to_string(),
         }]);
         let lines: Vec<&str> = out.split("\r\n").collect();
         assert_eq!(lines[0], "# sessions");
         assert_eq!(
             lines[1],
-            "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events"
+            "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session"
         );
         assert_eq!(
             lines[2],
-            "\"fix the \"\"bug\"\", today\",98,green,claude_code,claude-sonnet-4-5,1.2500,900,0,0,2"
+            "\"fix the \"\"bug\"\", today\",98,green,claude_code,claude-sonnet-4-5,1.2500,900,0,0,2,1,0.5000,/p/proj/abc.jsonl"
         );
         assert!(out.ends_with("\r\n"));
+    }
+
+    #[test]
+    fn bounded_csv_discloses_truncation_only_when_capped() {
+        // rm-798: an uncapped list is byte-identical to sessions_csv;
+        // a capped one appends one `#` marker row carrying shown /
+        // matched / limit.
+        let row = SessionCsvRow {
+            session: "s".to_string(),
+            health: 100,
+            data: "green".to_string(),
+            source: "claude_code".to_string(),
+            model: "m".to_string(),
+            cost: 0.0,
+            tokens: 0,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 0,
+            subagents: 0,
+            subagent_cost: 0.0,
+            parent_session: String::new(),
+        };
+        let rows = vec![row.clone(), row.clone(), row];
+        assert_eq!(sessions_csv_bounded(&rows, 3, 10), sessions_csv(&rows));
+        let capped = sessions_csv_bounded(&rows[..1], 3, 1);
+        let lines: Vec<&str> = capped.split("\r\n").collect();
+        assert_eq!(
+            lines[lines.len() - 2],
+            "# truncated: showing 1 of 3 matching sessions (--limit 1)"
+        );
+        assert!(capped.ends_with("\r\n"));
     }
 
     #[test]

@@ -23,6 +23,10 @@ fn corpus() -> std::path::PathBuf {
 /// sees it (post history-merge, pre range-filter) without touching any
 /// real cache on the host.
 fn load() -> Vec<Session> {
+    load_with_report().1
+}
+
+fn load_with_report() -> (agenttrace_core::LoadReport, Vec<Session>) {
     let mut cache = SessionCache::default();
     let report = load_sessions_with_progress_from_cache(
         Some(&corpus()),
@@ -35,7 +39,7 @@ fn load() -> Vec<Session> {
         "corpus must fully discover (parent, 2 children, grandchild, unrelated, orphan): {}",
         report.sessions.len()
     );
-    report.sessions
+    (report.clone(), report.sessions)
 }
 
 fn by_suffix<'a>(sessions: &'a [Session], suffix: &str) -> &'a Session {
@@ -109,10 +113,16 @@ fn parent_rolls_up_children_without_double_counting() {
 
 #[test]
 fn orphan_subagent_stays_unlinked_and_serde_stays_stable() {
-    let sessions = load();
+    let (report, sessions) = load_with_report();
     let orphan = by_suffix(&sessions, "agent-orphan.jsonl");
     assert!(orphan.metrics.parent_session.is_empty());
     assert_eq!(orphan.metrics.subagent_count, 0);
+    // rm-799: the orphan is COUNTED, not silently dropped — the CLI
+    // turns this into a stderr disclosure.
+    assert_eq!(
+        report.unlinked_subagents, 1,
+        "exactly the orphan counts as unlinked"
+    );
 
     // The new metrics fields are skip_serializing_if-guarded, so the
     // historical JSON shape for ordinary sessions is byte-identical
@@ -179,5 +189,12 @@ fn tsv_session_list_carries_the_subagent_columns() {
     assert!(
         parent_row.split('\t').any(|cell| cell == "2"),
         "parent row must show its subagent count: {parent_row}"
+    );
+    // rm-799: the orphan in this corpus must be disclosed on stderr,
+    // not silently rendered as a standalone row.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 subagent transcript(s) have no parent session"),
+        "unlinked subagent disclosure on stderr, got: {stderr}"
     );
 }

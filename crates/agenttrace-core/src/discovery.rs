@@ -60,6 +60,12 @@ pub struct LoadReport {
     /// rollout hint), so an all-corrupt directory can say what actually
     /// happened instead of "no sessions match the filters".
     pub first_parse_failure: Option<String>,
+    /// rm-799: subagent transcripts whose parent session is NOT part
+    /// of the loaded corpus (orphaned children — moved transcripts,
+    /// partial copies). They still render as standalone rows, but the
+    /// count is disclosed so "SUBAGENTS 0" never reads as "no
+    /// subagent work happened".
+    pub unlinked_subagents: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -433,7 +439,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // preserved sessions take part) and BEFORE range/filters (so every
     // view sees the linked shape). Cached parents get re-attributed on
     // every load; the cache schema stays untouched.
-    crate::subagents::attribute_subagents(&mut sessions);
+    // rm-799: the call returns the orphan count (children whose parent
+    // transcript is absent from the loaded corpus) for disclosure.
+    let unlinked_subagents = crate::subagents::attribute_subagents(&mut sessions);
     sessions.retain(|session| {
         // Sessions with an unknown start time stay visible (unknown-time
         // bucket, N7) instead of being silently dropped from ranged views;
@@ -472,6 +480,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         opencode_fork_excluded,
         parse_failures,
         first_parse_failure,
+        unlinked_subagents,
     }
 }
 
@@ -691,8 +700,13 @@ impl SymlinkTargets {
 /// kinds. Off Unix, std exposes no portable file index, so the canonical
 /// path covers symlink aliases and hardlink aliasing is documented as
 /// uncovered there.
+///
+/// rm-797: `attribute_subagents` (subagents.rs) reuses this identity
+/// to resolve subagent parents, keeping linkage and discovery's dedup
+/// on ONE identity model — a parent reachable under two spellings
+/// links from every spelling, not just the one the dedup kept.
 #[derive(Eq, PartialEq, Hash)]
-enum SameFileIdentity {
+pub(crate) enum SameFileIdentity {
     #[cfg(unix)]
     DevIno(u64, u64),
     #[cfg(not(unix))]
@@ -718,7 +732,7 @@ impl SessionFileTargets {
     }
 }
 
-fn same_file_identity(path: &Path) -> Option<SameFileIdentity> {
+pub(crate) fn same_file_identity(path: &Path) -> Option<SameFileIdentity> {
     // Follows symlinks: a symlink alias must resolve to its target's
     // identity, not the link's own.
     let metadata = fs::metadata(path).ok()?;
