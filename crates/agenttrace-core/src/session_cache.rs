@@ -227,8 +227,13 @@ pub const MAX_SESSION_CACHE_DIR_BYTES: usize = MAX_SESSION_CACHE_BYTES / 8;
 /// noise the blocklist exists to remove. The session-cache schema
 /// version cannot cover this one: schema 22 already shipped (rm-400/401)
 /// with the pre-blocklist walker, so a schema-22 journal can still carry
-/// stale v2 listings.
-const DIR_LISTING_WALK_VERSION: i64 = 3;
+/// stale v2 listings. v4 (rm-732, cycle 1): the replay arm re-validates
+/// file kind — a v3 journal written before the rm-212 regular-file gate
+/// (or between a valid walk and a later fifo creation) still names
+/// non-regular entries as files, and admitting one by name wedged every
+/// load path on the parser's blocking open; pre-v4 listings are dropped
+/// once and re-walked through the gate.
+const DIR_LISTING_WALK_VERSION: i64 = 4;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")

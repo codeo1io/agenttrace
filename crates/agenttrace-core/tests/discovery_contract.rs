@@ -3315,3 +3315,110 @@ fn discovery_skips_non_regular_session_files() {
     assert_eq!(files.len(), 1, "expected only the regular file: {files:?}");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+#[cfg(unix)]
+fn warm_replay_revalidates_file_kind_for_stored_listings() {
+    // rm-732: the cached replay in discovery used to extend
+    // `listing.files` filtered by name only — the cold walk's
+    // regular-file gate above (rm-212) was never re-checked — so one
+    // fifo-shaped entry in a stored listing re-admitted it on every
+    // load path and wedged the parser's blocking open with no message
+    // and no timeout (the 2026-10-07 assess PoC wedged rc124 at the
+    // 15 s harness bound). Two arms pin the two halves of the fix: a
+    // v3 journal is retired by the DIR_LISTING_WALK_VERSION bump
+    // (dropped once, re-walked through the gate), and a
+    // CURRENT-version journal that names a fifo must still be filtered
+    // by the replay's file-kind re-validation — the version bump alone
+    // cannot defend against a fifo created after a valid walk.
+    let root = generated_fixture("warm-replay-file-kind");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create fixture root");
+    std::fs::write(root.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    let fifo_path = root.join("evil.jsonl");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo available");
+    assert!(status.success(), "mkfifo failed");
+
+    with_session_cache(&root.join("cache"), || {
+        // Prime a warm journal: the cold walk filters the fifo, so the
+        // stored listing names only the regular file.
+        let primed = load_sessions_from_dir(Some(&root));
+        assert_eq!(primed.len(), 1, "one real session parsed: {primed:?}");
+
+        let journal = session_cache_path();
+        let plant = |version: i64| {
+            let raw = std::fs::read_to_string(&journal).expect("read journal");
+            let mut doc: Value = serde_json::from_str(&raw).expect("journal json");
+            doc["dir_listing_version"] = serde_json::json!(version);
+            doc["dirs"].as_object_mut().expect("dirs member").insert(
+                root.to_string_lossy().to_string(),
+                serde_json::json!({
+                    "mod_time": file_mod_time_nanos_for_test(
+                        &std::fs::metadata(&root).expect("root metadata")
+                    ),
+                    "files": [
+                        root.join("real.jsonl").to_string_lossy().to_string(),
+                        fifo_path.to_string_lossy().to_string(),
+                    ],
+                    "dirs": [],
+                }),
+            );
+            std::fs::write(
+                &journal,
+                serde_json::to_string(&doc).expect("serialize planted journal"),
+            )
+            .expect("write planted journal");
+        };
+
+        // Arm 1 — stale-version retirement: a v3 journal (what any
+        // pre-rm-732 binary writes) naming the fifo must be dropped and
+        // re-walked, never replayed. On unfixed code (walk version 3)
+        // this journal is current, the replay admits the fifo by name,
+        // and the load below wedges on the parser's blocking open.
+        plant(3);
+        let stale_started = std::time::Instant::now();
+        let stale = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        assert_eq!(
+            stale.sessions.len(),
+            1,
+            "stale journal retired, cold walk filtered: {:?}",
+            stale.sessions
+        );
+        assert_eq!(stale.discovered, 1, "only the regular file was discovered");
+        assert!(
+            stale_started.elapsed() < std::time::Duration::from_secs(5),
+            "a stale listing must never wedge the load (took {:?})",
+            stale_started.elapsed()
+        );
+
+        // Arm 2 — current-version re-validation: the same listing at
+        // the CURRENT walk version is exactly what a fifo created after
+        // a valid walk looks like; only the replay's file-kind check
+        // keeps it from the parser's blocking open.
+        plant(4);
+        let current_started = std::time::Instant::now();
+        let replayed = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        assert_eq!(
+            replayed.sessions.len(),
+            1,
+            "replay re-validates file kind: {:?}",
+            replayed.sessions
+        );
+        assert_eq!(
+            replayed.discovered, 1,
+            "the fifo must not count as discovered"
+        );
+        assert!(
+            current_started.elapsed() < std::time::Duration::from_secs(5),
+            "a current listing naming a fifo must never wedge the load (took {:?})",
+            current_started.elapsed()
+        );
+
+        let files = find_session_files(Some(&root));
+        assert_eq!(files.len(), 1, "cold path unaffected: {files:?}");
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
