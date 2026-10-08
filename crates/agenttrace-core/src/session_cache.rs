@@ -5,7 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 36;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 37;
+// Bumped 36 -> 37 (integration of run bbde21568cd4, "honest numbers",
+// rm-754; conflict case 615546e27c2b4f2d86e02b511f23ddd1): loop
+// costs are now priced from the session's own model rates x the
+// loop's token mass (with a disclosed synthetic fallback when a
+// counted call carries no usable usage block) instead of the
+// pricing-independent constants, and LoopCost gained the serialized
+// cost_basis field -- the dollar figures change for UNCHANGED source
+// files, so the cache invalidates once (the rm-230 convention). The
+// batch landed against its base 1c5edd1 at schema 32 and bumped it
+// to 33 there; integration re-bases the bump onto the
+// already-advanced ceiling (33 was the run-91833f02 rm-616 batch,
+// 34 was the run-73fe8e1e rm-710 batch, 35 was the run-3ec6cec08fb9
+// rm-720/rm-721 batch, 36 was the run-6aaf51aa rm-502 batch) per the
+// same convention. Entries regenerate once on next scan.
 // Bumped 35 -> 36 (integration of run 6aaf51aa, rm-502 'Naive-ISO
 // timestamps parse for --overview but vanish from --sessions and
 // --diagnostics'): timestamp parsing is unified onto lib.rs

@@ -485,7 +485,13 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
                 ),
                 vec![
                     format!("session={}", session.name),
-                    format!("loop_cost=${loop_cost:.4}"),
+                    // rm-754: the dollar figure names its basis -- a
+                    // constant-derived synthetic estimate can no longer
+                    // wear a plain $ label in the advice.
+                    format!(
+                        "loop_cost=${loop_cost:.4} ({})",
+                        session.diagnostics.loop_cost.cost_basis.disclosure()
+                    ),
                 ],
                 loop_cost,
                 0,
@@ -540,7 +546,16 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
             .diagnostics
             .tool_latencies
             .iter()
-            .find(|item| item.is_slow)
+            // rm-755: cite the WORST slow tool, not whichever entry
+            // the diagnostics max_sec sort happens to surface first. A
+            // max_sec leader with a lower p95 used to displace the
+            // max-p95 entry, so the advice cited the wrong percentile.
+            .filter(|item| item.is_slow)
+            .min_by(|a, b| {
+                b.p95_sec
+                    .total_cmp(&a.p95_sec)
+                    .then_with(|| a.tool_name.cmp(&b.tool_name))
+            })
             .or_else(|| {
                 session
                     .diagnostics
@@ -1460,6 +1475,87 @@ mod tests {
                 .contains(&GIT_PROBE_TIMEOUT.as_secs().to_string()),
             "methodology must disclose the probe bound: {}",
             report.methodology
+        );
+    }
+    #[test]
+    fn slow_tool_recommendation_cites_max_p95_entry() {
+        // rm-755: tool_latencies sorts by max_sec, so the first
+        // `is_slow` entry is the max_sec leader -- but the advice must
+        // cite the WORST p95 among slow tools, not the leader's
+        // percentile. Here the leader's p95 (31s) is well under the
+        // second slow entry's (45s): the evidence must name the 45s
+        // tool. The pre-fix `.find(is_slow)` cited 31s.
+        let mut s = session("rm-755");
+        s.diagnostics.tool_latencies = vec![
+            crate::diagnostics::ToolLatency {
+                tool_name: "WebSearch".to_string(),
+                count: 10,
+                avg_sec: 20.0,
+                p95_sec: 31.0,
+                max_sec: 60.0,
+                min_sec: 1.0,
+                unmatched: 0,
+                is_slow: true,
+            },
+            crate::diagnostics::ToolLatency {
+                tool_name: "Mcp__deploy__release".to_string(),
+                count: 8,
+                avg_sec: 30.0,
+                p95_sec: 45.0,
+                max_sec: 45.0,
+                min_sec: 10.0,
+                unmatched: 0,
+                is_slow: true,
+            },
+        ];
+        let items = recommendations(&[s]);
+        let item = items
+            .iter()
+            .find(|item| item.id == "slow-tool")
+            .expect("slow-tool recommendation present");
+        assert!(
+            item.evidence.iter().any(
+                |line| line.contains("tool=Mcp__deploy__release") && line.contains("p95=45.0s")
+            ),
+            "evidence must cite the max-p95 slow entry: {item:?}"
+        );
+    }
+
+    #[test]
+    fn retry_loop_recommendation_discloses_cost_basis() {
+        // rm-754: a loop-cost dollar figure may no longer wear a plain
+        // $ label -- the evidence line names its basis in both arms.
+        // (Separate recommendations() calls: the (category, title)
+        // dedupe would collapse two retry-loop rows from one batch.)
+        let mut priced = session("rm-754-priced");
+        priced.diagnostics.loop_cost.total_loop_cost = 0.5;
+        priced.diagnostics.loop_cost.loop_groups = 1;
+        priced.diagnostics.loop_cost.cost_basis = crate::diagnostics::LoopCostBasis::Priced;
+        let items = recommendations(&[priced]);
+        let item = items
+            .iter()
+            .find(|item| item.id == "retry-loop")
+            .expect("retry-loop recommendation present");
+        assert!(
+            item.evidence
+                .iter()
+                .any(|line| line.contains("loop_cost=$0.5000 (priced at session model rates)")),
+            "priced arm must disclose its basis: {item:?}"
+        );
+
+        let mut synthetic = session("rm-754-synthetic");
+        synthetic.diagnostics.loop_cost.total_loop_cost = 0.5;
+        synthetic.diagnostics.loop_cost.loop_groups = 1;
+        synthetic.diagnostics.loop_cost.cost_basis = crate::diagnostics::LoopCostBasis::Synthetic;
+        let items = recommendations(&[synthetic]);
+        let item = items
+            .iter()
+            .find(|item| item.id == "retry-loop")
+            .expect("retry-loop recommendation present");
+        assert!(
+            item.evidence.iter().any(|line| line
+                .contains("synthetic estimate -- no token mass recorded, not price-derived")),
+            "synthetic arm must disclose its basis: {item:?}"
         );
     }
 }
