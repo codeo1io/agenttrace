@@ -424,6 +424,65 @@ fn alias_usage_keys_disclose_instead_of_silent_zero() {
     );
 }
 
+/// integration review fe4827ef (rm-720 sweep): the antigravity
+/// usage fold added `cachedContentTokenCount` and `reasoningTokens`
+/// to the shared extractor vocabulary (`usage_from_value_with_keys`;
+/// `gemini_usage` already mapped the cache-read one), so
+/// `USAGE_WIRE_KEYS_RECOGNIZED` must list them too — otherwise the
+/// hermes/generic lane files these KNOWN synonyms under
+/// `usage_unknown_key` (hostile-garbage tier) instead of the truthful
+/// `usage_alias_unmapped` tier the vocabulary exists to separate.
+#[test]
+fn antigravity_rpc_usage_synonyms_disclose_as_known_aliases() {
+    let raw = [
+        serde_json::json!({
+            "type": "message",
+            "role": "session_meta",
+            "timestamp": "2026-10-06T01:00:00Z"
+        }),
+        serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "timestamp": "2026-10-06T01:00:00Z",
+            "usage": {"cachedContentTokenCount": 7, "reasoningTokens": 5}
+        }),
+    ]
+    .iter()
+    .map(|line| line.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    let session = parse_raw_session("t", "session.jsonl", &raw).expect("alias line parses");
+    assert_eq!(session.metrics.tokens_input, 0, "alias is not consumed");
+    assert_eq!(session.metrics.tokens_output, 0, "alias is not consumed");
+    assert_eq!(
+        session
+            .metrics
+            .line_skips
+            .get("usage_alias_unmapped:cachedContentTokenCount"),
+        Some(&1),
+        "gemini/antigravity cache-read synonym is a KNOWN alias, not unknown garbage: {:?}",
+        session.metrics.line_skips
+    );
+    assert_eq!(
+        session
+            .metrics
+            .line_skips
+            .get("usage_alias_unmapped:reasoningTokens"),
+        Some(&1),
+        "antigravity reasoning synonym is a KNOWN alias, not unknown garbage: {:?}",
+        session.metrics.line_skips
+    );
+    assert!(
+        !session
+            .metrics
+            .line_skips
+            .keys()
+            .any(|key| key.contains("unknown")),
+        "recognized synonyms never land in the unknown tier: {:?}",
+        session.metrics.line_skips
+    );
+}
+
 #[test]
 fn relocated_usage_keys_disclose_instead_of_silent_zero() {
     // review bd6e4a50 F1 counterexamples f4-loc AND f4-control, plus the

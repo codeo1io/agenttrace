@@ -1631,6 +1631,16 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 35 (integration of run 3ec6cec08fb9,
+                // rm-720/rm-721 agent-lane truth — Antigravity
+                // per-generation usage fold + Copilot agent-host
+                // request-class counting with SUMMED per-model credit
+                // meters; warm v32-era entries kept serving the
+                // pre-batch token estimates and $0 credits for
+                // unchanged files, review 3e3a2198 F1; landed at its
+                // base as the campaign's 32 -> 33 bump, re-based here
+                // onto the advanced ceiling, 33 being the landed
+                // rm-616 rung and 34 the landed rm-710 rung below);
                 // Schema 34 (integration of run 73fe8e1e, rm-710
                 // occurrence-aware usage — codex post-compaction
                 // token_count windows count their fresh `last`
@@ -1684,7 +1694,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":34,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":35,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

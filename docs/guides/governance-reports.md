@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 34 and the SQLite snapshot is schema 8; the
+The session cache is schema 35 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -123,7 +123,14 @@ pre-rm-526 v32-era entries replayed hidden torn-tail skips at confidence
 "high" (the occurrence batch, rm-710/rm-711, one bump covering both
 defect classes; landed at its base 1c5edd1 as 32 → 33, re-based at
 integration onto the advanced ceiling) — so cached sessions regenerate
-under the corrected totals; the SQLite snapshot to 7
+under the corrected totals, and to 35 when the agent-lane usage
+truthfulness batch folded Antigravity per-generation usage blocks, named
+the Copilot agent-host request classes, and summed the agent-host
+per-model credit meters instead of a global max (rm-720/rm-721 of run
+3ec6cec08fb9 cycle 2, landed with its review fix; landed at its base
+1c5edd1 as 32 → 33, re-based at integration onto the advanced ceiling
+as 34 → 35) — so cached sessions regenerate under the corrected
+agent-lane totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, and to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548). Older versions are discarded and

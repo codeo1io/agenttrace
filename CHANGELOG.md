@@ -8,6 +8,40 @@
 
 ### Fixed
 
+- Antigravity sessions report real usage and price the standalone model (rm-720, run
+  3ec6cec08fb9 cycle 2): both antigravity lanes (trajectory + jsonl) now fold per-message
+  usage blocks (input/output tokens, cache reads) and resolve the model id, priced via
+  lookup or surfaced as unknown_models — never a silent $0 (codeburn #1655's usageStats
+  field map adopted as the accounting reference). Cumulative quota events were considered
+  and declined by recorded decision: a summed cumulative meter double-counts against the
+  per-generation fold.
+- Copilot agent-host turns are audited, not swallowed (rm-721, run 3ec6cec08fb9 cycle 2):
+  the agent-host journal's un-counted request classes — turn markers, IDE-command hooks
+  (userPromptSubmitted hook.start/hook.end, permission.requested/completed) and the
+  sub-issue lifecycle marker (subagent.deselected) — are each NAMED exactly once via
+  copilot_uncounted_entry_type disclosure counters instead of dropped, and the rollup's
+  per-model totalNanoAiu meters sum at emit, so a two-model session (250e6+100e6 nano =
+  $0.0035 on the fixture) no longer reports only the largest model's bill (codeburn
+  #1651's class-enumeration shape adopted; its unified-platform journal shape deferred to
+  research pass 14). At integration the un-counted-class carrier's journal-derived keys
+  were routed through the rm-594 capped+sanitized disclosure mint helper like every
+  other site (a hostile agent-host `type` field can no longer mint an over-long or
+  control-bearing counter key; pinned by
+  `agent_host_hostile_entry_types_mint_capped_sanitized_keys`).
+- Session-cache schema bumped to 35 at integration (run 3ec6cec08fb9 cycle 2; landed at
+  its base 1c5edd1 as 32 → 33, re-based onto the advanced ceiling as 34 → 35 because run
+  91833f02's rm-616 and run 73fe8e1e's rm-710 batches had already taken 33 and 34 — one
+  invalidation either way, the rm-230 convention): warm pre-batch caches kept serving
+  token estimates and $0 credits for unchanged files, masking both agent-lane rollups
+  above; pre-batch caches now retire once on first scan and regenerate under the corrected
+  accounting, pinned by the stale-schema-32 test. The same-unit set moved together: the
+  TUI planted warm-cache fixture literal, the governance-guide schema sentence
+  `scripts/ci/check-docs-commands.sh` verifies against the live constant, and the
+  rm-710 occurrence-contract schema-literal oracle
+  (`tests/usage_occurrence_contract.rs` — fn name, assert and message re-based
+  34 → 35 at this merge per its own always-red sweep rule; its degraded-fixture
+  leg keeps planting a below-live schema-32 entry).
+
 - Atomic writes refuse symlink-planted staging paths instead of following them (rm-693): every report/cache/history writer staged its content through a create+truncate open at a predictable `{name}.tmp.{pid}.{seq}` path, so a symlink planted at that name was opened and truncated through — clobbering the victim file behind it — and the subsequent rename left the destination itself pointing at the victim (assess PoC 849d4b1a). All staging writes now share one exclusive helper: O_EXCL creation at mode 0600, a sequence-bump retry when the candidate name already exists (≤16 attempts), and a loud refusal when the whole window is poisoned — the pre-planted symlink is never followed, and the file behind it is never touched (Unix; non-Unix keeps the plain-write fallback). Adopted at the `-o` report lane, the session-cache save and SQLite snapshot writers, both pricing-cache write arms (which also closes their 0644 gap — the cache file is now 0600), the derived-history save, and statusline-journal compaction; the statusline journal append opens append-only under the same exclusivity and inspects a pre-existing path before writing. Pinned red-first by six tests planting symlinks at the staged temp name and asserting refusal, victim-intact, and the sequence bump (red-by-construction on base — the helpers do not exist there; the live stash-red runs were recorded for rm-697/rm-704).
 - Negative or non-finite baseline totals are rejected instead of sign-inverting the comparison (rm-697): a baseline report with negative totals passed every existing admission check — the landed rm-569 hardening covered wrong shape, version and missing fields but not sign — so `total_tokens: -5000` rendered a real regression as growth, and non-finite values (JSON `1e400` parses to infinity) leaked into NaN/inf deltas. The baseline reader now rejects negative totals and non-finite numbers at admission with the same regeneration guidance, pinned red-first by a demo-contract test on a negative-totals baseline.
 - Successive corrupt history events quarantine separately instead of overwriting each other (rm-703): a second corrupt session renamed `history.json` onto the same `history.json.corrupt`, destroying the first event's forensic bytes. Quarantine now uniques the name (`history.json.corrupt.{N}`) so every generation survives for inspection, pinned by a corrupt-twice test.

@@ -5,7 +5,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 34;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 35;
+// Bumped 34 -> 35 (integration of run 3ec6cec08fb9, rm-720 'Agent-
+// lane usage truthfulness' + rm-721 copilot agent-host audit; review
+// fix 8a3231c6 over implement b127341f): the batch corrects
+// cost/usage for UNCHANGED agent-lane files — antigravity journals
+// fold per-generation usage blocks they previously dropped (tokens 0
+// / $0 by construction), and copilot agent-host rollups read the
+// per-model totalNanoAiu meters (now SUMMED across models, review
+// 3e3a2198 F4) they previously ignored — so a warm v34 cache keeps
+// serving the pre-batch $0/token totals with matching fingerprints
+// and never re-parses (rm-230 convention; the stewardship's original
+// 'no schema bump' decision is corrected by review finding F1: the
+// cached GoMetrics shape covers credit_usd, so only a schema bump
+// regenerates the disclosed numbers). The batch landed against its
+// base 1c5edd1 at schema 32 and bumped it to 33 there; integration
+// re-bases the bump onto the already-advanced ceiling (33 was the
+// run-91833f02 rm-616 generic-lane batch, 34 was the run-73fe8e1e
+// rm-710 truthful-usage batch — its parallel 32 -> 33 lane landed
+// first via case 2ac5bbe1, so this merge stacks onto its ceiling per
+// the one-invalidation rule). Entries regenerate once on next scan.
 // Bumped 33 -> 34 (integration of run 73fe8e1e, rm-710 'truthful usage
 // accounting across parse -> cache -> report', assess SL1/SL2/NN2 of
 // run 6d574820): the batch corrects derived token totals for UNCHANGED
