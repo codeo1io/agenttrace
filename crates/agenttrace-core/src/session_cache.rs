@@ -1,11 +1,11 @@
-use crate::{Anomaly, Diagnostics, Metrics, Session, ToolWarning};
+use crate::{Anomaly, Diagnostics, Metrics, ModelLedgerRow, Session, ToolWarning};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
+pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 29;
 // Bumped 27 -> 28 (integration of run 66e75e39, rm-529 'Clamp cache
 // counts to cache-inclusive input (port upstream open PR #316)'):
 // the shared subtract_cached_input clamps each cache count to what is
@@ -112,7 +112,7 @@ pub(crate) const SESSION_CACHE_SCHEMA_VERSION: i64 = 28;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 7;
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -249,6 +249,32 @@ struct GoSession {
     diagnostics: Diagnostics,
 }
 
+/// rm-020: cache mirror of `Metrics::model_ledger`. `serde(default)`
+/// on the whole vector keeps a cache written before the ledger existed
+/// parseable — it deserializes with an empty ledger — but
+/// invalidation rides the v29 schema bump above (rm-230 convention):
+/// per-model pricing changes the reported cost for unchanged files,
+/// which mtime/size alone cannot detect.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GoModelLedgerRow {
+    #[serde(default, rename = "Model")]
+    model: String,
+    #[serde(default, rename = "TokensInput")]
+    tokens_input: i64,
+    #[serde(default, rename = "TokensOutput")]
+    tokens_output: i64,
+    #[serde(default, rename = "TokensCacheW")]
+    tokens_cache_w: i64,
+    #[serde(default, rename = "TokensCacheR")]
+    tokens_cache_r: i64,
+    #[serde(default, rename = "RateSource")]
+    rate_source: String,
+    #[serde(default, rename = "CostUsd")]
+    cost_usd: f64,
+    #[serde(default, rename = "RecordedCostUsd")]
+    recorded_cost_usd: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GoMetrics {
     #[serde(default, rename = "EventsTotal")]
@@ -297,6 +323,8 @@ struct GoMetrics {
     gaps_sec: Vec<f64>,
     #[serde(default, rename = "ModelUsed")]
     model_used: String,
+    #[serde(default, rename = "ModelLedger")]
+    model_ledger: Vec<GoModelLedgerRow>,
     #[serde(default, rename = "SourceTool")]
     source_tool: String,
     #[serde(default, rename = "SessionStart")]
@@ -1400,6 +1428,20 @@ impl GoMetrics {
             tokens_cache_r: metrics.tokens_cache_r,
             gaps_sec: metrics.gaps_sec.clone(),
             model_used: metrics.model_used.clone(),
+            model_ledger: metrics
+                .model_ledger
+                .iter()
+                .map(|row| GoModelLedgerRow {
+                    model: row.model.clone(),
+                    tokens_input: row.tokens_input,
+                    tokens_output: row.tokens_output,
+                    tokens_cache_w: row.tokens_cache_w,
+                    tokens_cache_r: row.tokens_cache_r,
+                    rate_source: row.rate_source.clone(),
+                    cost_usd: row.cost_usd,
+                    recorded_cost_usd: row.recorded_cost_usd,
+                })
+                .collect(),
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
@@ -1441,6 +1483,20 @@ impl GoMetrics {
             timestamps: Vec::new(),
             gaps_sec: self.gaps_sec,
             model_used: self.model_used,
+            model_ledger: self
+                .model_ledger
+                .into_iter()
+                .map(|row| ModelLedgerRow {
+                    model: row.model,
+                    tokens_input: row.tokens_input,
+                    tokens_output: row.tokens_output,
+                    tokens_cache_w: row.tokens_cache_w,
+                    tokens_cache_r: row.tokens_cache_r,
+                    rate_source: row.rate_source,
+                    cost_usd: row.cost_usd,
+                    recorded_cost_usd: row.recorded_cost_usd,
+                })
+                .collect(),
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,
@@ -1646,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_seven_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -1679,11 +1735,11 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session]).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version seven (cycle-1 rm-198): hermes tool outcome semantics
-        // changed (ok/fail now derive from the messages table instead of
-        // fabricating ok == tool_call_count), so v6 snapshots carry stale
-        // tool outcome splits and must regenerate.
-        assert_eq!(doc["schema_version"], 7);
+        // Version eight (cycle-2 rm-020): per-model token buckets and
+        // the per-model ledger joined the opencode aggregate, so v7
+        // snapshots carry blended last-model prices for multi-model
+        // sessions and must regenerate.
+        assert_eq!(doc["schema_version"], SQLITE_SNAPSHOT_SCHEMA_VERSION);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1694,16 +1750,15 @@ mod tests {
             Some(&serde_json::Value::from(720)),
             "the stored-versus-derived delta must survive the snapshot cache"
         );
-        let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
+        let loaded = load_sqlite_snapshot_from(&database, &snapshot).expect("schema cache hit");
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
         assert_eq!(loaded[0].metrics.provenance.tokens, "stored_session_totals");
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(6);
+        old["schema_version"] = serde_json::Value::from(SQLITE_SNAPSHOT_SCHEMA_VERSION - 1);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema six json"),
+            serde_json::to_vec(&old).expect("older-schema json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
@@ -1884,6 +1939,39 @@ mod tests {
         });
         let legacy: GoMetrics = serde_json::from_value(legacy).expect("legacy entry parses");
         assert_eq!(legacy.tokens_reasoning, 0);
+    }
+
+    #[test]
+    fn model_ledger_survives_the_cache_round_trip() {
+        // rm-020: the per-model ledger is part of the cached metrics
+        // (ModelLedger rows); a cache written by this build restores it,
+        // and one written before the field existed deserializes to an
+        // empty ledger instead of failing (no schema bump).
+        let metrics = Metrics {
+            model_ledger: vec![ModelLedgerRow {
+                model: "claude-opus-4-1".to_string(),
+                tokens_input: 2000,
+                tokens_output: 200,
+                tokens_cache_w: 0,
+                tokens_cache_r: 0,
+                rate_source: "catalog:anthropic".to_string(),
+                cost_usd: 0.045,
+                recorded_cost_usd: 0.0,
+            }],
+            ..Metrics::default()
+        };
+        let cached = GoMetrics::from_metrics(&metrics);
+        assert_eq!(cached.model_ledger.len(), 1);
+        let restored: Metrics = cached.into_metrics();
+        assert_eq!(restored.model_ledger, metrics.model_ledger);
+
+        // Old-schema JSON without ModelLedger deserializes empty.
+        let legacy = serde_json::json!({
+            "TokensInput": 5,
+            "TokensOutput": 5
+        });
+        let legacy: GoMetrics = serde_json::from_value(legacy).expect("legacy entry parses");
+        assert!(legacy.model_ledger.is_empty());
     }
 
     #[test]

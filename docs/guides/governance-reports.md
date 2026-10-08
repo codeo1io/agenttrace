@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 28 and the SQLite snapshot is schema 7; the
+The session cache is schema 29 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -85,9 +85,14 @@ to 27 when Codex custom-tools response items began counting as tool
 calls, results, and reasoning (custom_tool_call/custom_tool_call_output
 pairing and standalone reasoning items, rm-542), and to 28 when
 WorkBuddy cache counts began clamping to the cache-inclusive input (the
-upstream #316 port, rm-529), so cached sessions regenerate under
-the corrected totals; the SQLite snapshot to 7
-when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
+upstream #316 port, rm-529), and to 29 when per-model pricing joined the
+persisted metrics — the per-model token ledger, per-event model stamping
+replacing the frozen-first-model attribution in the Claude-transcript and
+opencode lanes (rm-020/rm-663), and the Codex token_count shape-gap
+disclosure counter (rm-659) — so cached sessions regenerate under
+the corrected totals; the SQLite snapshot to 8 when per-model buckets and
+the per-model ledger joined the opencode aggregate (the same rm-020 pricing
+semantics for the SQLite lane); 7 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the snapshot is bounded at

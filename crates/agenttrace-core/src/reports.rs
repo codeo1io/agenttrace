@@ -306,6 +306,29 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         // terminal like every other text-renderer field.
         sanitize_line_segment(&metrics.model_used)
     ));
+    // rm-020: for multi-model sessions the ledger names what each model
+    // burned at its own rate — one row per model, sorted by cost, under
+    // the blended session cost above. Single-model sessions omit the
+    // section (the ledger restates that one line).
+    if metrics.model_ledger.len() > 1 {
+        let mut ledger_rows = metrics.model_ledger.clone();
+        ledger_rows.sort_by(|a, b| {
+            b.cost_usd
+                .partial_cmp(&a.cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        for row in &ledger_rows {
+            out.push_str(&format!(
+                "    · {:<28} {:>10} in {:>8} out  {}\n",
+                sanitize_line_segment(&row.model),
+                format_tokens(row.tokens_input),
+                format_tokens(row.tokens_output),
+                format_cost(row.cost_usd)
+            ));
+        }
+        out.push('\n');
+    }
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
     out.push_str(&sub);
@@ -979,6 +1002,27 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     }
     out.push('\n');
 
+    // rm-020: the per-model ledger rollup — what each model burned at
+    // its own catalog rate. A multi-model session contributes one row
+    // per model here, instead of its blended session cost under "By
+    // Model" above; single-model corpora show the same total split out
+    // by token class.
+    let per_model = per_model_rollup(&ordered);
+    if !per_model.is_empty() {
+        out.push_str("  ── Per Model (catalog-priced) ──\n");
+        for entry in per_model.iter().take(8) {
+            out.push_str(&format!(
+                "    {:<25} {:>4} Sessions  {:>10} in {:>8} out {:>8}\n",
+                entry.model,
+                format_count(entry.sessions),
+                format_tokens(entry.tokens_input),
+                format_tokens(entry.tokens_output),
+                format_cost(entry.cost)
+            ));
+        }
+        out.push('\n');
+    }
+
     // rm-245: vendor and task-type dimensions beside by-model. Providers
     // come from the pricing catalog row that prices each model;
     // unresolvable models land in the explicit "unknown" bucket.
@@ -1068,6 +1112,30 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         number_obj(&summary, "tool_calls"),
         number_obj(&summary, "tool_fail_rate")
     ));
+
+    // rm-020: per-model ledger rollup — each model's own tokens and
+    // catalog-priced cost across the corpus, so multi-model sessions
+    // show what each model burned instead of a blended cell.
+    let per_model = per_model_rollup(&ordered);
+    if !per_model.is_empty() {
+        out.push_str("## Per model (catalog-priced)\n\n");
+        out.push_str(
+            "| Model | Sessions | Input | Output | Cache write | Cache read | Cost |\n|---|---:|---:|---:|---:|---:|---:|\n",
+        );
+        for entry in per_model.iter().take(12) {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                markdown_cell(&entry.model),
+                format_count(entry.sessions),
+                format_tokens(entry.tokens_input),
+                format_tokens(entry.tokens_output),
+                format_tokens(entry.tokens_cache_w),
+                format_tokens(entry.tokens_cache_r),
+                format_cost(entry.cost)
+            ));
+        }
+        out.push('\n');
+    }
 
     if authority.has_data {
         out.push_str("## Tool authority\n\n");
@@ -1820,6 +1888,23 @@ fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
         "total_cost": round4(overview.total_cost),
         "total_duration_seconds": round4(total_duration),
         "total_tokens": total_tokens,
+        "per_model_breakdown": per_model_rollup(sessions)
+            .iter()
+            .map(|entry| {
+                json!({
+                    "model": entry.model,
+                    "sessions": entry.sessions,
+                    "tokens": {
+                        "input": entry.tokens_input,
+                        "output": entry.tokens_output,
+                        "cache_write": entry.tokens_cache_w,
+                        "cache_read": entry.tokens_cache_r,
+                    },
+                    "cost": round4(entry.cost),
+                    "recorded_cost_usd": round4(entry.recorded),
+                })
+            })
+            .collect::<Vec<_>>(),
         "tool_calls": total_tools,
         "tool_failures": failed_tools,
         "tool_fail_rate": if total_tools > 0 { round4(failed_tools as f64 / total_tools as f64 * 100.0) } else { 0.0 },
@@ -1838,6 +1923,62 @@ fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
             "counts": authority_counts,
         },
     })
+}
+
+/// rm-020: one rolled-up per-model row across the whole corpus. Each
+/// model accumulates the tokens and cost its own ledger rows recorded,
+/// so a multi-model session contributes one entry per model instead of
+/// its blended session cost, and `sessions` counts the sessions in
+/// which that model appears (the ledger holds at most one row per
+/// model per session).
+struct PerModelRollup {
+    model: String,
+    sessions: usize,
+    tokens_input: i64,
+    tokens_output: i64,
+    tokens_cache_w: i64,
+    tokens_cache_r: i64,
+    cost: f64,
+    recorded: f64,
+}
+
+fn per_model_rollup(sessions: &[Session]) -> Vec<PerModelRollup> {
+    let mut by_model: BTreeMap<String, PerModelRollup> = BTreeMap::new();
+    for session in sessions {
+        for row in &session.metrics.model_ledger {
+            let entry = by_model
+                .entry(row.model.clone())
+                .or_insert_with(|| PerModelRollup {
+                    model: row.model.clone(),
+                    sessions: 0,
+                    tokens_input: 0,
+                    tokens_output: 0,
+                    tokens_cache_w: 0,
+                    tokens_cache_r: 0,
+                    cost: 0.0,
+                    recorded: 0.0,
+                });
+            entry.sessions += 1;
+            entry.tokens_input = entry.tokens_input.saturating_add(row.tokens_input);
+            entry.tokens_output = entry.tokens_output.saturating_add(row.tokens_output);
+            entry.tokens_cache_w = entry.tokens_cache_w.saturating_add(row.tokens_cache_w);
+            entry.tokens_cache_r = entry.tokens_cache_r.saturating_add(row.tokens_cache_r);
+            // rm-697 discipline: non-finite ledger costs are rejected
+            // upstream, so a plain sum cannot go non-finite here
+            // except through +inf accumulation, which round4 keeps out
+            // of the rendered value.
+            entry.cost += row.cost_usd;
+            entry.recorded += row.recorded_cost_usd;
+        }
+    }
+    let mut items: Vec<PerModelRollup> = by_model.into_values().collect();
+    items.sort_by(|a, b| {
+        b.cost
+            .partial_cmp(&a.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    items
 }
 
 fn group_items(groups: &BTreeMap<String, GroupOverview>, agent_display: bool) -> Vec<Value> {

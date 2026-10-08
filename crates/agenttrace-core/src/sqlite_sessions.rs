@@ -2,7 +2,7 @@ use crate::{detect_anomalies, health_score, token_cost, Metrics, Session};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
@@ -18,6 +18,12 @@ struct SqliteSessionAgg {
     title: String,
     model: String,
     models: BTreeSet<String>,
+    /// rm-020: per-model token buckets (input, output, cache_read,
+    /// cache_write), populated from message and step-finish token rows
+    /// at the model each row resolved to. Feeds the session's per-model
+    /// ledger so a multi-model aggregate shows what each model burned
+    /// instead of one blended number priced at the last model.
+    per_model_tokens: BTreeMap<String, (i64, i64, i64, i64)>,
     start_unix: f64,
     end_unix: f64,
     events: usize,
@@ -568,6 +574,12 @@ fn add_opencode_sqlite_message_tokens(
     if !model.is_empty() {
         agg.usage_cost += token_cost_raw(input, output, cache_write, cache_read, &model);
         agg.usage_cost_set = true;
+        // rm-020: bucket this message's tokens under its own model.
+        let bucket = agg.per_model_tokens.entry(model).or_insert((0, 0, 0, 0));
+        bucket.0 = bucket.0.saturating_add(input);
+        bucket.1 = bucket.1.saturating_add(output);
+        bucket.2 = bucket.2.saturating_add(cache_read);
+        bucket.3 = bucket.3.saturating_add(cache_write);
     }
     true
 }
@@ -583,6 +595,15 @@ fn add_opencode_step_finish_tokens(
     if !agg.model.is_empty() {
         agg.usage_cost += token_cost_raw(input, output, cache_write, cache_read, &agg.model);
         agg.usage_cost_set = true;
+        // rm-020: step-finish parts bucket under the sticky model.
+        let bucket = agg
+            .per_model_tokens
+            .entry(agg.model.clone())
+            .or_insert((0, 0, 0, 0));
+        bucket.0 = bucket.0.saturating_add(input);
+        bucket.1 = bucket.1.saturating_add(output);
+        bucket.2 = bucket.2.saturating_add(cache_read);
+        bucket.3 = bucket.3.saturating_add(cache_write);
     }
 }
 
@@ -741,6 +762,31 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     } else {
         crate::pricing::pricing_source_for(&model)
     };
+    // rm-020: the aggregate's per-model ledger — one row per model that
+    // carried token rows, priced at that model's own rate. Rows keyed by
+    // the empty fallback render as `default`, matching the session
+    // model semantics above.
+    let model_ledger: Vec<crate::ModelLedgerRow> = agg
+        .per_model_tokens
+        .iter()
+        .map(|(entry_model, (input, output, cache_read, cache_write))| {
+            let row_model = if entry_model.is_empty() {
+                "default".to_string()
+            } else {
+                entry_model.clone()
+            };
+            crate::ModelLedgerRow {
+                model: row_model.clone(),
+                tokens_input: *input,
+                tokens_output: *output,
+                tokens_cache_w: *cache_write,
+                tokens_cache_r: *cache_read,
+                rate_source: crate::pricing::pricing_source_for(&row_model),
+                cost_usd: token_cost_raw(*input, *output, *cache_write, *cache_read, &row_model),
+                recorded_cost_usd: 0.0,
+            }
+        })
+        .collect();
     let mut metrics = Metrics {
         events_total: agg.events,
         user_messages: agg.user_messages,
@@ -754,6 +800,7 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         tokens_cache_w: agg.cache_write_tokens,
         tokens_cache_r: agg.cache_read_tokens,
         model_used: model,
+        model_ledger,
         source_tool: agg.source_tool,
         session_start: unix_seconds_rfc3339(agg.start_unix),
         session_end: unix_seconds_rfc3339(agg.end_unix),
@@ -920,10 +967,21 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_multi_model_aggregate_is_not_exactly_priced_as_one_model() {
+    fn sqlite_multi_model_aggregate_carries_per_model_ledger() {
+        // rm-020: a multi-model sqlite aggregate no longer only
+        // ACKNOWLEDGES the mix — it carries a per-model token ledger
+        // priced at each model's own catalog rate, so reports and the
+        // TUI can show what each model burned instead of one blended
+        // number priced at the last model seen.
         let session = session_from_sqlite_agg(SqliteSessionAgg {
             model: "gpt-5".to_string(),
             models: BTreeSet::from(["gpt-5".to_string(), "claude-sonnet-4".to_string()]),
+            input_tokens: 1500,
+            output_tokens: 250,
+            per_model_tokens: BTreeMap::from([
+                ("gpt-5".to_string(), (1000i64, 200i64, 0i64, 0i64)),
+                ("claude-sonnet-4".to_string(), (500i64, 50i64, 0i64, 0i64)),
+            ]),
             usage_cost: 1.25,
             usage_cost_set: true,
             ..SqliteSessionAgg::default()
@@ -934,6 +992,23 @@ mod tests {
             "SQLite aggregate: multiple models"
         );
         assert_eq!(session.metrics.cost_estimated, 1.25);
+        let ledger = &session.metrics.model_ledger;
+        assert_eq!(ledger.len(), 2, "one row per model: {ledger:?}");
+        let gpt = ledger
+            .iter()
+            .find(|row| row.model == "gpt-5")
+            .expect("gpt-5 row");
+        assert_eq!((gpt.tokens_input, gpt.tokens_output), (1000, 200));
+        assert_eq!(gpt.cost_usd, token_cost_raw(1000, 200, 0, 0, "gpt-5"));
+        let sonnet = ledger
+            .iter()
+            .find(|row| row.model == "claude-sonnet-4")
+            .expect("sonnet row");
+        assert_eq!((sonnet.tokens_input, sonnet.tokens_output), (500, 50));
+        assert_eq!(
+            sonnet.cost_usd,
+            token_cost_raw(500, 50, 0, 0, "claude-sonnet-4")
+        );
     }
 
     /// Minimal hermes `state.db` fixture: two sessions. `s1` recorded two

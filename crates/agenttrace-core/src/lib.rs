@@ -351,6 +351,36 @@ pub struct MetricProvenance {
     pub naming: String,
 }
 
+/// rm-020: one row of a session's per-model token ledger. Sessions
+/// that rotate models mid-flight used to price every token at the
+/// first model's rate (the parser froze the model, and even with
+/// per-block attribution there was no per-model record); the ledger
+/// prices each model's tokens at that model's catalog rate and sums
+/// to the session's token-priced cost, so the report, JSON, and TUI
+/// can show what each model actually burned instead of a blended
+/// number.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct ModelLedgerRow {
+    pub model: String,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_cache_w: i64,
+    pub tokens_cache_r: i64,
+    /// Pricing provenance for this model's rate (same string the
+    /// session-level `pricing_source` uses for single-model sessions).
+    pub rate_source: String,
+    /// Catalog-priced cost for this model's tokens, plus any
+    /// upstream-recorded USD attributed to this model's usage blocks
+    /// (pi recorded-cost events are carried at face value, not
+    /// estimated).
+    pub cost_usd: f64,
+    /// USD the source journal recorded for this model's usage blocks;
+    /// zero unless the journal prices usage itself. Serialized only
+    /// when set so single-source rows stay compact.
+    #[serde(skip_serializing_if = "is_zero_f64")]
+    pub recorded_cost_usd: f64,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Metrics {
     pub events_total: usize,
@@ -383,6 +413,13 @@ pub struct Metrics {
     pub timestamps: Vec<DateTime<Utc>>,
     pub gaps_sec: Vec<f64>,
     pub model_used: String,
+    /// rm-020: per-model token ledger (see `ModelLedgerRow`). One row
+    /// per model that produced usage — or, for estimate-only sessions,
+    /// per model that produced content — priced at that model's rate.
+    /// Empty when the session has no attributable tokens, so it stays
+    /// out of their serialized output.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_ledger: Vec<ModelLedgerRow>,
     pub source_tool: String,
     pub session_start: String,
     pub session_end: String,
@@ -1136,6 +1173,123 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     } else {
         round4(catalog_cost + metrics.upstream_cost_usd)
     };
+    // rm-020: the per-model token ledger. One row per model that
+    // produced usage, priced with exactly the rules the session total
+    // uses above — per-block attribution for meta usage (blocks without
+    // model attribution bucket under the session model, mirroring the
+    // per-block fallback), upstream-recorded blocks carried at their
+    // recorded value instead of the catalog formula, and estimate-only
+    // sessions bucketed per event model. The rows sum to `token_priced`
+    // (before the rm-485 credit floor) for usage-reporting sessions, so
+    // the rendered breakdown explains the session cost instead of
+    // approximating it; estimate-only sessions bucket per event model,
+    // which diverges from the blended estimate exactly when models
+    // rotate without usage blocks — the per-model split is the honest
+    // number there.
+    #[derive(Default)]
+    struct LedgerBucket {
+        tokens: [i64; 4],
+        upstream: [i64; 4],
+        recorded: f64,
+    }
+    let ledger_event_model = |event: &Event| -> String {
+        if matches!(event.model_used.as_str(), "" | "unknown") && session_model_is_real {
+            model.to_string()
+        } else {
+            event.model_used.clone()
+        }
+    };
+    let mut ledger_state: BTreeMap<String, LedgerBucket> = BTreeMap::new();
+    let usage_class = |usage: &BTreeMap<String, i64>, key: &str| -> i64 {
+        usage.get(key).copied().unwrap_or(0).max(0)
+    };
+    if has_meta_usage {
+        for event in events
+            .iter()
+            .filter(|event| matches!(event.role.as_str(), "session_meta" | "meta"))
+            .filter(|event| {
+                // Same rule the session formula applies: a block with a
+                // valid recorded cost counts even when it carries no
+                // token class at all (the rm-436 review F-C rule) —
+                // skipping it here would leave the ledger summing
+                // below the session total that includes that cost.
+                !event.usage.is_empty()
+                    || event
+                        .recorded_cost_usd
+                        .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+            })
+        {
+            let bucket = ledger_state.entry(ledger_event_model(event)).or_default();
+            let tokens = [
+                usage_class(&event.usage, "input_tokens"),
+                usage_class(&event.usage, "output_tokens"),
+                usage_class(&event.usage, "cache_creation_input_tokens"),
+                usage_class(&event.usage, "cache_read_input_tokens"),
+            ];
+            for (slot, value) in bucket.tokens.iter_mut().zip(tokens) {
+                *slot = slot.saturating_add(value);
+            }
+            if let Some(cost) = event
+                .recorded_cost_usd
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            {
+                // Same exclusion the session formula applies: these
+                // tokens are priced at the recorded value below, not at
+                // the catalog rate.
+                for (slot, value) in bucket.upstream.iter_mut().zip(tokens) {
+                    *slot = slot.saturating_add(value);
+                }
+                bucket.recorded += cost;
+            }
+        }
+    } else {
+        for event in events {
+            let adds_output = !event.reasoning.is_empty()
+                || (event.role == "assistant" && !event.content.is_empty());
+            let adds_input = event.role == "user" && !event.content.is_empty();
+            if !adds_input && !adds_output {
+                continue;
+            }
+            let bucket = ledger_state.entry(ledger_event_model(event)).or_default();
+            if adds_input {
+                bucket.tokens[0] = bucket.tokens[0]
+                    .saturating_add(std::cmp::max(1, estimate_tokens_from_text(&event.content)));
+            }
+            if !event.reasoning.is_empty() {
+                bucket.tokens[1] = bucket.tokens[1].saturating_add(std::cmp::max(
+                    1,
+                    estimate_tokens_from_text(&event.reasoning),
+                ));
+            }
+            if event.role == "assistant" && !event.content.is_empty() {
+                bucket.tokens[1] = bucket.tokens[1]
+                    .saturating_add(std::cmp::max(1, estimate_tokens_from_text(&event.content)));
+            }
+        }
+    }
+    metrics.model_ledger = ledger_state
+        .into_iter()
+        .map(|(entry_model, bucket)| {
+            let price = pricing::lookup_price(&entry_model);
+            let catalog = round4(
+                bucket.tokens[0].saturating_sub(bucket.upstream[0]) as f64 / 1e6 * price.input
+                    + bucket.tokens[1].saturating_sub(bucket.upstream[1]) as f64 / 1e6
+                        * price.output
+                    + bucket.tokens[2].saturating_sub(bucket.upstream[2]) as f64 / 1e6 * price.cw
+                    + bucket.tokens[3].saturating_sub(bucket.upstream[3]) as f64 / 1e6 * price.cr,
+            );
+            ModelLedgerRow {
+                model: entry_model.clone(),
+                tokens_input: bucket.tokens[0],
+                tokens_output: bucket.tokens[1],
+                tokens_cache_w: bucket.tokens[2],
+                tokens_cache_r: bucket.tokens[3],
+                rate_source: pricing::pricing_source_for(&entry_model),
+                cost_usd: round4(catalog + bucket.recorded),
+                recorded_cost_usd: bucket.recorded,
+            }
+        })
+        .collect();
     // rm-485: a session-wide credit counter is billing truth — never
     // report below it, never stack it on top of the token-priced
     // estimate. (Integration of run 32192d92: `token_priced` is the

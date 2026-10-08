@@ -805,4 +805,26 @@ fn zero_token_usage_entry_still_passes_recorded_cost() {
         "the entry is still disclosed: {:?}",
         metrics.disclosure_counters
     );
+    // rm-020 ledger parity for this exact shape: the meta event has an
+    // EMPTY usage map (no token class survives non_empty_usage), so a
+    // ledger that only includes usage-bearing meta rows would drop the
+    // $0.015 and sum below the session total it is supposed to
+    // reconcile — the row must carry the recorded cost at face value
+    // (pre-parity-fix the sum came out $0.015 low).
+    let ledger = &metrics.model_ledger;
+    let row = ledger
+        .iter()
+        .find(|row| row.model == "claude-sonnet-4-5")
+        .expect("ledger row for the session model");
+    assert_eq!((row.tokens_input, row.tokens_output), (100, 50));
+    assert_eq!(
+        row.recorded_cost_usd, 0.015,
+        "recorded cost rides the row even with no token class"
+    );
+    let sum: f64 = ledger.iter().map(|row| row.cost_usd).sum();
+    assert!(
+        (sum - metrics.cost_estimated).abs() < 1e-9,
+        "ledger rows sum to the session cost: {sum} vs {}",
+        metrics.cost_estimated
+    );
 }

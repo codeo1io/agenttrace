@@ -1522,6 +1522,43 @@ fn styled_detail_text(text: &str, reason: &str) -> Vec<Line<'static>> {
 
 fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, area: Rect) {
     let audit = session_cost_audit(session);
+    // rm-020: a multi-model session lists each model's own tokens and
+    // catalog-priced cost (most expensive first, capped at four rows)
+    // under the blended `multiple` model field, so the sidebar explains
+    // the spend instead of stamping one model's name on it. Single-model
+    // sessions keep their one-row layout.
+    let model_rows: Vec<Line<'static>> = if session.metrics.model_ledger.len() > 1 {
+        let mut ledger = session.metrics.model_ledger.clone();
+        ledger.sort_by(|a, b| {
+            b.cost_usd
+                .partial_cmp(&a.cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ledger
+            .iter()
+            .take(4)
+            .map(|row| {
+                // Not a sidebar_field: the 9-char label column would eat
+                // the model name ("claude..."). One full-width line per
+                // model, same phrasing as the text report's ledger rows.
+                Line::from(vec![
+                    Span::styled(
+                        filters::short(&row.model, 20),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{} in / {} out", row.tokens_input, row.tokens_output),
+                        Style::default(),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(format_compact_cost(row.cost_usd), Style::default()),
+                ])
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let text = vec![
         Line::styled(
             app.t("Session at a glance", "会话概况"),
@@ -1540,6 +1577,12 @@ fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, ar
             session.metrics.model_used.clone(),
             Style::default(),
         ),
+    ];
+    let mut text = text;
+    // rm-020: splice the per-model rows in directly after the blended
+    // Model row they break down.
+    text.splice(4..4, model_rows);
+    text.extend(vec![
         sidebar_field(
             app.t("Health", "健康"),
             session.health.to_string(),
@@ -1629,7 +1672,7 @@ fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, ar
             Style::default().fg(Color::Cyan),
         ),
         Line::styled(session.path.clone(), Style::default().fg(Color::Gray)),
-    ];
+    ]);
     frame.render_widget(
         Paragraph::new(text)
             .block(left_rule())

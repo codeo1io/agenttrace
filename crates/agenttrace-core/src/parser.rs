@@ -2676,18 +2676,34 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     continue;
                 };
                 if string(payload.get("type")) == Some("token_count") {
-                    if let Some((usage, next_total)) =
-                        codex_token_count_usage(payload.get("info"), prev_token_total.as_ref())
-                    {
-                        prev_token_total = next_total;
-                        events.push(Event {
-                            role: "meta".to_string(),
-                            timestamp: ts,
-                            usage,
-                            model_used: model.clone(),
-                            source_tool: "codex_cli".to_string(),
-                            ..Event::default()
-                        });
+                    match codex_token_count_usage(payload.get("info"), prev_token_total.as_ref()) {
+                        Some((usage, next_total)) => {
+                            prev_token_total = next_total;
+                            events.push(Event {
+                                role: "meta".to_string(),
+                                timestamp: ts,
+                                usage,
+                                model_used: model.clone(),
+                                source_tool: "codex_cli".to_string(),
+                                ..Event::default()
+                            });
+                        }
+                        None => {
+                            // rm-659: a token_count line the snapshot
+                            // gate cannot read is disclosed, not
+                            // dropped — pre-2026-09 rollouts carry
+                            // token_count events with no count-bearing
+                            // `info` shape, and silently zeroing them
+                            // made a pre-count session indistinguishable
+                            // from a genuinely count-less one. Only the
+                            // shape gap is disclosed; a present-but-zero
+                            // snapshot is a real zero, not a gap.
+                            if codex_token_count_missing_totals(payload.get("info")) {
+                                *counters
+                                    .entry("codex_token_count_without_totals".to_string())
+                                    .or_insert(0) += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -3029,6 +3045,20 @@ fn json_key_present(line: &str, needle: &str) -> bool {
     false
 }
 
+fn codex_token_count_missing_totals(raw_info: Option<&Value>) -> bool {
+    // rm-659: pre-2026-09 codex rollouts emit token_count events whose
+    // `info` carries neither of the count-bearing shapes the snapshot
+    // gate reads. Only key absence on BOTH arms counts as a gap — a
+    // present-but-zero snapshot is a real measured zero, not a gap, so
+    // those sessions stay out of the disclosure.
+    match raw_info.and_then(Value::as_object) {
+        None => true,
+        Some(info) => {
+            info.get("total_token_usage").is_none() && info.get("last_token_usage").is_none()
+        }
+    }
+}
+
 fn codex_token_count_usage(
     raw_info: Option<&Value>,
     prev_total: Option<&TokenUsage>,
@@ -3165,11 +3195,15 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 let Some(message) = obj.get("message").and_then(Value::as_object) else {
                     continue;
                 };
-                if model == "unknown" {
-                    if let Some(next_model) = string(message.get("model")).filter(|m| !m.is_empty())
-                    {
-                        model = next_model.to_string();
-                    }
+                // rm-663: per-event model stamping. The sticky `model`
+                // tracks the CURRENT assistant model, so a mid-session
+                // switch (sonnet -> opus) is attributed to the events
+                // that follow it — usage blocks included — instead of
+                // freezing the first model onto the whole session and
+                // mispricing every post-switch block at the pre-switch
+                // rate. Empty strings never overwrite a known model.
+                if let Some(next_model) = string(message.get("model")).filter(|m| !m.is_empty()) {
+                    model = next_model.to_string();
                 }
                 if let Some(usage_value) = message.get("usage") {
                     let message_id = string(message.get("id")).unwrap_or("");
@@ -3921,19 +3955,26 @@ fn parse_opencode_storage_session(
     sort_opencode_records(&mut messages);
 
     let mut model = opencode_session_model(session);
-    let mut usage = BTreeMap::new();
+    // rm-663: usage accumulates PER MODEL — one bucket per model that
+    // produced messages — instead of one session-wide map, so a
+    // two-model session prices each bucket at its own rate instead of
+    // stamping the first model's name onto every token.
+    let mut usage_by_model: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
     let mut body = Vec::new();
     for msg in messages {
-        if model == "unknown" {
-            let msg_model = opencode_message_model(&msg.doc);
-            if !msg_model.is_empty() {
-                model = msg_model;
-            }
+        // rm-663: the sticky `model` tracks the CURRENT message model,
+        // so a mid-session switch is attributed to the events that
+        // follow it instead of freezing the first model seen. Empty
+        // strings never overwrite a known model.
+        let msg_model = opencode_message_model(&msg.doc);
+        if !msg_model.is_empty() {
+            model = msg_model;
         }
-        let message_had_usage = add_opencode_tokens(&mut usage, msg.doc.get("tokens"));
+        let usage_bucket = usage_by_model.entry(model.clone()).or_default();
+        let message_had_usage = add_opencode_tokens(usage_bucket, msg.doc.get("tokens"));
         let (events, part_usage) =
             parse_opencode_message(&storage_root, &msg.doc, &model, message_had_usage);
-        add_usage(&mut usage, &part_usage);
+        add_usage(usage_bucket, &part_usage);
         body.extend(events);
     }
     if body.is_empty() {
@@ -3941,18 +3982,23 @@ fn parse_opencode_storage_session(
     }
 
     let mut events = Vec::new();
-    if model != "unknown" || usage_has_values(&usage) {
-        events.push(Event {
-            role: "meta".to_string(),
-            model_used: model,
-            source_tool: "opencode".to_string(),
-            usage: if usage_has_values(&usage) {
-                usage
-            } else {
-                BTreeMap::new()
-            },
-            ..Event::default()
-        });
+    // rm-663: one meta per model bucket, each stamped with its own
+    // model, so the per-block pricing lane and the rm-020 ledger price
+    // every bucket at that model's catalog rate.
+    for (usage_model, usage) in usage_by_model {
+        if usage_model != "unknown" || usage_has_values(&usage) {
+            events.push(Event {
+                role: "meta".to_string(),
+                model_used: usage_model,
+                source_tool: "opencode".to_string(),
+                usage: if usage_has_values(&usage) {
+                    usage
+                } else {
+                    BTreeMap::new()
+                },
+                ..Event::default()
+            });
+        }
     }
     events.extend(body);
     Ok(events)

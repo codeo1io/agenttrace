@@ -150,7 +150,9 @@ zeros and flagged `zero_usage_reported` in provenance instead of reading
 as clean or silently falling back to the text estimate (absent usage
 keeps `estimated_from_text`). `--doctor` aggregates the share over the
 discovered session-transcript census (SQLite-backed agent databases are
-not part of this census yet).
+not part of this census yet). A `-d`/`--dir` target that exists but is a
+file, not a directory, is named as `not a directory` in the Providers
+list and its recommendation instead of rendering as `missing` (rm-660).
 Overview sections (`--overview` required): `# summary`, `# by_model`,
 `# by_provider`, `# by_task_type`. `-f csv` outside this composable set
 bails loudly (`csv format requires --overview or --sessions`) instead of

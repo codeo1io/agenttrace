@@ -1,5 +1,5 @@
 use super::*;
-use agenttrace_core::{Anomaly, Metrics};
+use agenttrace_core::{Anomaly, Metrics, ModelLedgerRow};
 use crossterm::event::KeyModifiers;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -87,6 +87,56 @@ fn explorer_footer_shows_language_shortcut_in_list_and_detail() {
         .draw(|frame| render_explorer(frame, &mut app))
         .expect("render chinese footer");
     assert!(format!("{:?}", terminal.backend().buffer()).contains("L 切换语言"));
+}
+
+#[test]
+fn explorer_detail_sidebar_lists_per_model_ledger_rows() {
+    // rm-020: under a blended "multiple" Model row, the wide-layout
+    // detail sidebar must spell out each model's own tokens and cost —
+    // the sidebar is the surface a reader uses to reconcile a
+    // multi-model session price.
+    let mut item = session("ledger", "claude_code", "multiple", 90, 0.0495, "rg");
+    item.metrics.model_ledger = vec![
+        ModelLedgerRow {
+            model: "claude-opus-4-1".to_string(),
+            tokens_input: 2000,
+            tokens_output: 200,
+            tokens_cache_w: 0,
+            tokens_cache_r: 0,
+            rate_source: "catalog".to_string(),
+            cost_usd: 0.045,
+            recorded_cost_usd: 0.0,
+        },
+        ModelLedgerRow {
+            model: "claude-sonnet-4-5".to_string(),
+            tokens_input: 1000,
+            tokens_output: 100,
+            tokens_cache_w: 0,
+            tokens_cache_r: 0,
+            rate_source: "catalog".to_string(),
+            cost_usd: 0.0045,
+            recorded_cost_usd: 0.0,
+        },
+    ];
+    let mut app = App::new(vec![item], "test", None);
+    app.explorer_view = ExplorerView::All;
+    app.explorer_detail = Some(DetailSection::Summary);
+    // Wide layout (>=150x28 content area) is what renders the sidebar;
+    // at 160x44 the inner content column is 30 rows tall after the
+    // header/footer/tabs/margins are taken out.
+    let mut terminal = Terminal::new(TestBackend::new(160, 44)).expect("terminal");
+    terminal
+        .draw(|frame| render_explorer(frame, &mut app))
+        .expect("render detail");
+    let rendered = format!("{:?}", terminal.backend().buffer());
+    assert!(
+        rendered.contains("claude-opus-4-1") && rendered.contains("claude-sonnet-4-5"),
+        "sidebar lists one row per model under the blended `multiple` row:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("in /"),
+        "ledger rows carry the token/cost shape:\n{rendered}"
+    );
 }
 
 #[test]
@@ -1647,7 +1697,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":28,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":29,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

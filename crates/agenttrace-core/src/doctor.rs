@@ -67,6 +67,14 @@ pub struct DoctorDirReport {
     pub name: String,
     pub path: String,
     pub exists: bool,
+    /// rm-660: the path exists but is NOT a directory (a `-d` target
+    /// pointing at a regular file, or a known session dir replaced by
+    /// one). Distinct from `exists: false` so the doctor names the
+    /// wrong-kind condition instead of implying the path is absent.
+    /// Never set on the sqlite DB rows, whose paths are files by
+    /// design.
+    #[serde(skip_serializing_if = "bool_is_false")]
+    pub not_a_directory: bool,
     pub files: usize,
     pub parsed: usize,
     pub failed: usize,
@@ -501,6 +509,7 @@ fn doctor_dir_report(
         name: name.to_string(),
         path: path.to_string_lossy().to_string(),
         exists: path.is_dir(),
+        not_a_directory: path.exists() && !path.is_dir(),
         files: files.len(),
         parsed,
         failed: files.len().saturating_sub(parsed),
@@ -559,6 +568,7 @@ fn doctor_sqlite_directories(sessions: &[Session]) -> Vec<DoctorDirReport> {
             name: name.to_string(),
             path: path.to_string_lossy().to_string(),
             exists,
+            not_a_directory: false,
             files,
             parsed: files,
             failed: 0,
@@ -570,9 +580,26 @@ fn doctor_sqlite_directories(sessions: &[Session]) -> Vec<DoctorDirReport> {
     dirs
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool) -> Vec<String> {
     if report.sessions == 0 {
         if dir.is_some() {
+            // rm-660: a `-d` target that exists but is not a directory
+            // is a wrong-kind condition — name it, instead of the
+            // not-found phrasing that implies the path is absent.
+            if let Some(target) = report
+                .directories
+                .iter()
+                .find(|directory| directory.not_a_directory)
+                .map(|directory| directory.path.clone())
+            {
+                return vec![format!(
+                    "The -d/--dir target is not a directory: {target}. Pass a directory containing session journals."
+                )];
+            }
             return vec!["No sessions found in this directory. Check `-d <dir>` or point it at a session JSON/JSONL directory.".to_string()];
         }
         return vec![
@@ -691,7 +718,16 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
-        let status = if dir.exists { "found" } else { "missing" };
+        // rm-660: three states, not two — a target that exists but is
+        // not a directory is named as such instead of rendering as
+        // `missing`.
+        let status = if dir.exists {
+            "found"
+        } else if dir.not_a_directory {
+            "not a directory"
+        } else {
+            "missing"
+        };
         let symlink = match &dir.symlink_target {
             Some(target) => format!(" (symlink -> {target})"),
             None => String::new(),
@@ -1001,5 +1037,59 @@ mod tests {
         assert_eq!(snapshot_age_phrase(0), "0 days old");
         assert_eq!(snapshot_age_phrase(47), "47 days old");
         assert_eq!(snapshot_age_phrase(-1), "-1 days old");
+    }
+
+    /// rm-660: `-d` pointing at an existing REGULAR FILE is a wrong-kind
+    /// condition, not a missing path. The doctor used to render it as
+    /// `missing` with the "No sessions found in this directory"
+    /// recommendation — conflating not-found with wrong-kind.
+    #[test]
+    fn doctor_names_a_regular_file_d_target_as_not_a_directory() {
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm660-doctor-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let file = root.join("sessions.jsonl");
+        std::fs::write(&file, "{}\n").expect("fixture regular file");
+
+        let report = build_doctor_report(Some(&file), false);
+        let custom = report
+            .directories
+            .iter()
+            .find(|dir| dir.name == "custom")
+            .expect("custom directory row present");
+        assert!(
+            custom.not_a_directory,
+            "existing non-directory target must be flagged: {custom:?}"
+        );
+        assert_eq!(custom.files, 0);
+
+        let text = doctor_report_text(&report);
+        assert!(
+            text.contains("not a directory"),
+            "the status column names the wrong-kind condition:\n{text}"
+        );
+        assert!(
+            text.contains("not a directory: "),
+            "the recommendation names the actual path:\n{text}"
+        );
+        assert!(
+            !text.contains("No sessions found in this directory"),
+            "the missing-path recommendation must not fire for a wrong-kind target:\n{text}"
+        );
+
+        let json = serde_json::to_value(&report).expect("doctor json");
+        let custom_json = json
+            .get("directories")
+            .and_then(|dirs| dirs.as_array())
+            .expect("directories array")
+            .iter()
+            .find(|dir| dir.get("name").and_then(|n| n.as_str()) == Some("custom"))
+            .expect("custom dir json row");
+        assert_eq!(
+            custom_json.get("not_a_directory"),
+            Some(&serde_json::json!(true))
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

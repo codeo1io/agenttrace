@@ -991,7 +991,7 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // regenerate under corrected accounting.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(28)
+            Some(29)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1164,7 +1164,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         // ceiling by rm-450).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
-            Some(28)
+            Some(29)
         );
         let entry = doc
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
@@ -1683,7 +1683,13 @@ fn rust_claude_code_jsonl_uses_body_cwd_like_go() {
 }
 
 #[test]
-fn rust_claude_code_jsonl_keeps_first_non_unknown_model_like_go() {
+fn rust_claude_code_jsonl_attributes_models_per_event() {
+    // rm-020/rm-663: this test used to pin the Go-parity model freeze
+    // (the FIRST assistant model named the whole session, and the
+    // 20/5-token qwen block above priced at glm's rate). The freeze is
+    // gone: each usage block carries the model that produced it, the
+    // session model renders as "multiple", and each block prices at
+    // its own rate in the per-model ledger.
     let root = temp_root("agenttrace-rust-claude-model-order");
     fs::create_dir_all(&root).expect("create claude temp dir");
     let session_path = root.join("claude.jsonl");
@@ -1697,9 +1703,16 @@ fn rust_claude_code_jsonl_keeps_first_non_unknown_model_like_go() {
 
     let parsed = parse_file(&session_path).expect("parse claude jsonl");
     assert_eq!(parsed.metrics.source_tool, "claude_code");
-    assert_eq!(parsed.metrics.model_used, "glm-5.1");
+    assert_eq!(parsed.metrics.model_used, "multiple");
     assert_eq!(parsed.metrics.tokens_input, 120);
     assert_eq!(parsed.metrics.tokens_output, 15);
+    let ledger_models: Vec<&str> = parsed
+        .metrics
+        .model_ledger
+        .iter()
+        .map(|row| row.model.as_str())
+        .collect();
+    assert_eq!(ledger_models, vec!["glm-5.1", "qwen3.7-max"]);
 
     let _ = fs::remove_dir_all(root);
 }
