@@ -71,7 +71,7 @@ grep -q "session cache is schema $session_schema" "$guide" \
 if grep -qiE 'refreshed automatically|refresh.*in the background|background.*refresh' "$guide"; then
   fail "guide must not claim automatic background refresh: pricing runs are network-free outside --update-pricing"
 fi
-if grep -qE 'schema 4' "$guide"; then
+if grep -qE 'schema 4([^0-9]|$)' "$guide"; then
   fail "guide still claims the stale schema-4 snapshot version"
 fi
 

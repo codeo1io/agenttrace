@@ -117,6 +117,21 @@ pub struct ContextUtilization {
     /// sessions diagnosed before this field existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub window_source: String,
+    /// rm-871: the numerator actually used for `utilization_pct`:
+    /// vendor-measured tokens when the journal reports usage, or the sum
+    /// of the heuristic components otherwise. Defaulted for sessions
+    /// diagnosed before this field existed (cached shapes deserialize as 0).
+    #[serde(default)]
+    pub used: usize,
+    /// rm-871: `"usage"` — the numerator came from the most recent
+    /// usage-bearing event (input + cache_read + cache_creation + that
+    /// turn's output; thinking already counted by the vendor where the
+    /// family retains it) — or `"heuristic_bytes"` — the historic
+    /// bytes/2 + tools*300 + 12k estimate, used only when no event in
+    /// the session reports usage at all. Empty on sessions diagnosed
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub numerator_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -979,8 +994,11 @@ fn context_utilization(events: &[Event], model: &str) -> ContextUtilization {
     // divided by a name-substring 200k guess); (2) the legacy
     // name-substring ladder for models the catalog cannot resolve,
     // labeled `window_source: "fallback"` so the estimate is disclosed
-    // instead of silently asserted. The numerator is deliberately
-    // untouched (see rm-436 for the separate numerator defect).
+    // instead of silently asserted. The numerator (rm-871) is
+    // usage-derived whenever any event reports vendor usage; the byte
+    // heuristic survives only inside that fallback, disclosed via
+    // `numerator_source: "heuristic_bytes"` (see context_utilization_with
+    // for the exact fold).
     let (total, window_source) = match crate::pricing::lookup_context_window(model) {
         Some(window) => (window as usize, "catalog"),
         None => (fallback_context_window(model), "fallback"),
@@ -1010,44 +1028,135 @@ fn context_utilization_with(
     total: usize,
     window_source: &str,
 ) -> ContextUtilization {
-    let tools = events
-        .iter()
-        .flat_map(|event| &event.tool_calls)
-        .map(|call| call.name.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-        .max(8)
-        * 300;
-    let history = events
-        .iter()
-        .map(|event| event.content.len() + event.reasoning.len())
-        .sum::<usize>()
-        / 2;
-    let system = 12_000;
-    let used = tools + history + system;
+    // rm-871: the numerator is vendor-measured when any event reports
+    // usage. The most recent usage-bearing event describes the context
+    // exactly as the vendor measured it for that turn: input_tokens +
+    // cache_read_input_tokens + cache_creation_input_tokens (everything
+    // the prompt occupies, cached or not) plus that turn's output_tokens
+    // (which becomes context for the next turn). On model families that
+    // retain thinking blocks the vendor counts those tokens inside
+    // output_tokens (docs.claude.com/en/docs/build-with-claude/
+    // context-windows: "the API keeps previous thinking blocks by
+    // default, and they count toward the context window like any other
+    // input tokens"), so no extra thinking term is added. The historic
+    // bytes/2 estimate survives only as a DISCLOSED fallback
+    // (`numerator_source: "heuristic_bytes"`) for journals that carry
+    // no usage at all; its tool/system allowances are heuristic
+    // components and are reported as 0 in the usage lane because the
+    // vendor number already contains them.
+    let last_usage = events.iter().rev().find(|e| !e.usage.is_empty());
+    let (used, history, tools, system, numerator_source) = match last_usage {
+        Some(event) => {
+            let usage = &event.usage;
+            // hostile journals carry attacker-controlled token counts:
+            // saturate instead of overflowing (the adversarial corpus in
+            // tests/discovery_contract.rs feeds i64-scale values).
+            let value = |key: &str| (usage.get(key).copied().unwrap_or(0)).max(0) as usize;
+            let prompt = value("input_tokens")
+                .saturating_add(value("cache_read_input_tokens"))
+                .saturating_add(value("cache_creation_input_tokens"));
+            let completion = value("output_tokens");
+            let measured = prompt.saturating_add(completion);
+            (measured, measured, 0, 0, "usage")
+        }
+        None => {
+            let tools = events
+                .iter()
+                .flat_map(|event| &event.tool_calls)
+                .map(|call| call.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                .max(8)
+                * 300;
+            let history = events
+                .iter()
+                .map(|event| event.content.len() + event.reasoning.len())
+                .sum::<usize>()
+                / 2;
+            let system = 12_000;
+            (
+                tools + history + system,
+                history,
+                tools,
+                system,
+                "heuristic_bytes",
+            )
+        }
+    };
     let available = total.saturating_sub(used);
+    let risk = context_risk_level(used, total, available);
     ContextUtilization {
         estimated_total: total,
         tool_definitions: tools,
         conversation_history: history,
         system_prompt: system,
         available_for_task: available,
-        utilization_pct: used as f64 / total as f64 * 100.0,
-        risk_level: if available < 20_000 {
-            "critical"
-        } else if available < 50_000 {
-            "warning"
-        } else {
-            "good"
-        }
-        .to_string(),
-        suggestion: if available < 50_000 {
+        utilization_pct: crate::round4(used as f64 / total as f64 * 100.0),
+        risk_level: risk.clone(),
+        suggestion: if matches!(risk.as_str(), "warning" | "critical") {
             "Reduce conversation or tool context before continuing.".to_string()
         } else {
             String::new()
         },
         window_source: window_source.to_string(),
+        used,
+        numerator_source: numerator_source.to_string(),
     }
+}
+
+/// rm-871: risk is the STRICTER of two ladders, so it stays meaningful
+/// at every window size:
+/// * occupancy — how full the window is (critical >= 90%, warning >=
+///   75%, caution >= 40%);
+/// * absolute headroom — the historic thresholds (available < 20_000
+///   critical, < 50_000 warning), kept because a small window (32k/64k)
+///   can be mostly empty yet still lack room for a real task.
+///
+/// On the 200k windows the historic ladder was calibrated for, the two
+/// arms reproduce the historic thresholds (20k/200k = 90%, 50k/200k =
+/// 75%) up to one quantum: at the exact boundary (available == 20_000,
+/// occupancy == 0.90) the occupancy arm fires critical where the absolute
+/// arm fires warning — one step toward stricter, the only divergence on
+/// 200k windows. Otherwise the occupancy arm only adds signal on
+/// 1M-class windows, where headroom alone stayed
+/// `good` until 95% used — the assess probe at 401.5k/1M read 1.44% /
+/// `good` before the numerator fix and must never read `good` again.
+/// `caution` is display-only: the gating consumers (governance
+/// recommendations, TUI context filters) still fire from `warning` up.
+fn context_risk_level(used: usize, total: usize, available: usize) -> String {
+    let occupancy = if total == 0 {
+        1.0
+    } else {
+        used as f64 / total as f64
+    };
+    let absolute = if available < 20_000 {
+        "critical"
+    } else if available < 50_000 {
+        "warning"
+    } else {
+        "good"
+    };
+    let relative = if occupancy >= 0.90 {
+        "critical"
+    } else if occupancy >= 0.75 {
+        "warning"
+    } else if occupancy >= 0.40 {
+        "caution"
+    } else {
+        "good"
+    };
+    let rank = |level: &str| match level {
+        "critical" => 3,
+        "warning" => 2,
+        "caution" => 1,
+        _ => 0,
+    };
+    if rank(relative) >= rank(absolute) {
+        relative
+    } else {
+        absolute
+    }
+    .to_string()
 }
 
 fn large_params(events: &[Event]) -> Vec<LargeParam> {

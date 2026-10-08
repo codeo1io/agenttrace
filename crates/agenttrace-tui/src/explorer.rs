@@ -2786,6 +2786,7 @@ fn risk_color(risk: &str) -> Color {
     match risk {
         "critical" => Color::LightRed,
         "warning" => Color::Yellow,
+        "caution" => Color::LightYellow,
         _ => Color::Cyan,
     }
 }

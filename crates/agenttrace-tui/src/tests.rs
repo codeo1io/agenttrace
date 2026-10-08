@@ -1725,7 +1725,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":38,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":49,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
@@ -2418,4 +2418,18 @@ fn explorer_timeline_renders_naive_iso_step_times_as_local_times() {
             "{label} timeline must not fall back to the raw step stamp"
         );
     }
+}
+
+#[test]
+fn localized_level_renders_caution_in_zh_and_passes_en_through() {
+    // rm-871 review fix (834a5133 F3): the caution tier must localize on
+    // every render path, not just the i18n risk_label arm.
+    assert_eq!(
+        super::presentation::localized_level("caution", Language::Zh),
+        "注意"
+    );
+    assert_eq!(
+        super::presentation::localized_level("caution", Language::En),
+        "caution"
+    );
 }
