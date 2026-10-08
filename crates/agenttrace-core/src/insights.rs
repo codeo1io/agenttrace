@@ -193,6 +193,15 @@ pub struct DataHealth {
     /// or overflowing pricing inputs). Their costs render as null in
     /// reports; the count keeps the corruption visible (pass-8 F8-5).
     pub non_finite_costs: usize,
+    /// rm-734: sqlite-backed session databases that exist but could not
+    /// be read (unopenable, corrupt header, unpreparable schema — the
+    /// landed rm-753 ingest-report records). The sessions inside them
+    /// are EXCLUDED from every count above — this field is the
+    /// disclosure that makes the exclusion visible, and a non-empty
+    /// list forces `confidence: low`. Empty (and omitted from JSON)
+    /// when every present database read cleanly.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
 }
 
 pub fn session_capability(session: &Session) -> &'static str {
@@ -761,7 +770,7 @@ pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -
     // separated, so they fold into `skipped` and out_of_scope stays 0.
     let parsed = sessions.len();
     let skipped = discovered.saturating_sub(parsed);
-    data_health_from_parts(sessions, discovered, skipped, 0, cache_hits)
+    data_health_from_parts(sessions, discovered, skipped, 0, cache_hits, Vec::new())
 }
 
 /// Truthful coverage accounting from the discovery loader (pass-8
@@ -775,6 +784,7 @@ pub fn data_health_scoped(
     parse_failures: usize,
     cache_hits: usize,
     opencode_fork_excluded: usize,
+    sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
 ) -> DataHealth {
     let parsed = sessions.len();
     let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
@@ -784,6 +794,7 @@ pub fn data_health_scoped(
         parse_failures,
         out_of_scope,
         cache_hits,
+        sqlite_read_failures,
     );
     // rm-548: fork copies excluded from aggregation are disclosed in
     // the same channel as parse-time journal disclosures — a count the
@@ -807,7 +818,11 @@ fn data_health_from_parts(
     skipped: usize,
     out_of_scope: usize,
     cache_hits: usize,
+    sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
 ) -> DataHealth {
+    // rm-734: degraded before the struct literal so the move below
+    // does not orphan the confidence computation.
+    let sqlite_degraded = !sqlite_read_failures.is_empty();
     let parsed = sessions.len();
     let unknown_sources = sessions
         .iter()
@@ -861,6 +876,7 @@ fn data_health_from_parts(
         skipped,
         out_of_scope,
         cache_hits,
+        sqlite_read_failures,
         unknown_sources,
         unknown_models,
         fallback_pricing,
@@ -875,6 +891,7 @@ fn data_health_from_parts(
             || unknown_sources > 0
             || unknown_models > 0
             || non_finite_costs > 0
+            || sqlite_degraded
             || !line_skips.is_empty()
         {
             "low"

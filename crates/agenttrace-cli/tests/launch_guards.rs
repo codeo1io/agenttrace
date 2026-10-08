@@ -93,11 +93,30 @@ fn range_without_a_session_action_exits_with_a_flag_naming_error() {
 #[test]
 fn range_with_a_session_action_still_works_piped() {
     // The guard must not over-reject: with a report action consuming it,
-    // --range keeps filtering. The pinned demo timestamps fall outside
-    // a 30d window, so the legitimate outcome here is either the
-    // overview or the pre-existing empty-filter error - never the
-    // applicability guard and never a panic.
-    let (code, stdout, stderr) = run_with_pipes(&["--demo", "--range", "30d", "--overview"]);
+    // --range keeps filtering. rm-735 moved this control off the demo
+    // corpus (--demo now refuses explicit session sources including a
+    // non-default --range, pinned in demo_source_* tests below), so the
+    // range filter is exercised against a real freshly-timestamped -d
+    // corpus instead: two days old, inside a 30d window. The pinned
+    // outcome is the overview (or the pre-existing empty-filter error)
+    // - never the applicability guard and never a panic.
+    let root = std::env::temp_dir().join(format!(
+        "agenttrace-launch-guard-range-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("temp corpus dir");
+    let ts = (chrono::Utc::now() - chrono::Duration::days(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let corpus = format!(
+        "{{\"type\":\"user\",\"timestamp\":\"{ts}\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n\
+         {{\"type\":\"assistant\",\"timestamp\":\"{ts}\",\"message\":{{\"id\":\"msg_01\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":{{\"input_tokens\":300,\"output_tokens\":30}}}}}}\n"
+    );
+    let file = root.join("range-control.jsonl");
+    std::fs::write(&file, corpus).expect("corpus write");
+    let dir_arg = root.to_string_lossy().to_string();
+    let (code, stdout, stderr) =
+        run_with_pipes(&["--overview", "-d", dir_arg.as_str(), "--range", "30d"]);
+    let _ = std::fs::remove_dir_all(&root);
     assert_ne!(code, 101, "must not panic; stderr: {stderr}");
     let message = format!("{stdout}{stderr}");
     assert!(
@@ -108,4 +127,114 @@ fn range_with_a_session_action_still_works_piped() {
         stdout.contains("sessions") || stderr.contains("No sessions match"),
         "expected the overview or the pre-existing empty-filter error, got: {message}"
     );
+}
+
+#[test]
+fn demo_with_any_explicit_session_source_fails_loudly_not_silently() {
+    // rm-735 (assess F2, run 06cc5c7d): `--demo` used to silently
+    // substitute the bundled demo corpus for every explicit session
+    // source. Pre-fix, `--demo --overview -d /real/logs` rendered DEMO
+    // numbers presented as the user's corpus. The guard now fires once
+    // at launch, before any lane dispatch, so every session-reading
+    // action is covered by construction; this matrix pins each conflict pair
+    // (positional path, -d/--dir, --range) against a representative
+    // spread of those actions.
+    const SOURCE_FLAGS: [(&str, [&str; 4]); 3] = [
+        (
+            "a positional path",
+            ["--demo", "--overview", "probe.jsonl", ""],
+        ),
+        (
+            "-d/--dir",
+            ["--demo", "--overview", "-d", "/tmp/probe-logs"],
+        ),
+        ("--range", ["--demo", "--overview", "--range", "30d"]),
+    ];
+    for (source_name, argv) in SOURCE_FLAGS {
+        let mut argv = argv.to_vec();
+        argv.retain(|s| !s.is_empty());
+        let (code, stdout, stderr) = run_with_pipes(&argv);
+        assert_ne!(
+            code, 0,
+            "--demo + {source_name} must not report success (argv: {argv:?}); stdout: {stdout}"
+        );
+        assert_ne!(
+            code, 101,
+            "must fail with an error, not a panic; stderr: {stderr}"
+        );
+        let message = format!("{stdout}{stderr}");
+        assert!(
+            message.contains("--demo"),
+            "error must name --demo, got: {message}"
+        );
+        assert!(
+            message.contains(source_name),
+            "error must name the ignored source ({source_name}), got: {message}"
+        );
+        assert!(
+            message.to_ascii_lowercase().contains("ignores"),
+            "error must state the substitution is refused, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn demo_source_guard_covers_every_session_reading_action() {
+    // rm-735 acceptance leg (2): pin the conflict pair on EVERY
+    // session-reading action, not just --overview. The launch guard
+    // fires before any lane dispatch, so --doctor is in the sweep
+    // too (integration: landed rm-596 made `--doctor --demo` render
+    // only the bundled corpus, which silently discarded `-d`); each
+    // must exit non-zero naming --demo instead of substituting.
+    let actions: [(&str, Vec<&str>); 11] = [
+        ("--sessions", vec!["--sessions"]),
+        ("--search", vec!["--search", "probe"]),
+        ("--diagnostics", vec!["--diagnostics"]),
+        ("--waste", vec!["--waste"]),
+        ("--compare", vec!["--compare"]),
+        ("--audit", vec!["--audit"]),
+        ("--recommend", vec!["--recommend"]),
+        ("--inspect", vec!["--inspect", "1"]),
+        ("--latest", vec!["--latest"]),
+        ("--doctor", vec!["--doctor"]),
+        ("single-session report", vec![]),
+    ];
+    for (label, action) in actions {
+        let mut argv = vec!["--demo", "-d", "/tmp/probe-logs"];
+        argv.extend(action.iter().copied());
+        if action.is_empty() {
+            argv.push("probe.jsonl");
+        }
+        let argv_refs: Vec<&str> = argv.to_vec();
+        let (code, stdout, stderr) = run_with_pipes(&argv_refs);
+        assert_ne!(
+            code, 0,
+            "--demo + -d on {label} must not report success; stdout: {stdout}"
+        );
+        let message = format!("{stdout}{stderr}");
+        assert!(
+            message.contains("--demo") && message.contains("-d/--dir"),
+            "{label}: error must name --demo and -d/--dir, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn demo_source_guard_leaves_legal_demo_invocations_alone() {
+    // rm-735 control: the guard must not over-reject. A bare --demo
+    // overview still works (rc 0), and an explicit `--range all` is
+    // indistinguishable from the clap default and stays legal.
+    let (code, stdout, stderr) = run_with_pipes(&["--demo", "--overview"]);
+    assert_eq!(
+        code, 0,
+        "bare --demo --overview must keep working; stderr: {stderr}"
+    );
+    assert!(stdout.contains("sessions"), "expected a rendered overview");
+
+    let (code, stdout, stderr) = run_with_pipes(&["--demo", "--overview", "--range", "all"]);
+    assert_eq!(
+        code, 0,
+        "explicit --range all is the default and must stay legal; stderr: {stderr}"
+    );
+    assert!(stdout.contains("sessions"), "expected a rendered overview");
 }

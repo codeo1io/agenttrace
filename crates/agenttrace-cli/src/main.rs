@@ -371,6 +371,16 @@ fn run() -> anyhow::Result<()> {
         bail!("otel format requires --overview");
     }
     validate_range_applicability(&args)?;
+    // rm-735: --demo is itself a session source; an explicit source
+    // beside it bails here — before any side effect and before any
+    // lane dispatch — so every demo-reading lane is covered by one
+    // guard instead of one per lane: the report actions, the
+    // single-session report, the interactive TUI, and --doctor's
+    // demo corpus (landed rm-596 made `--doctor --demo` render only
+    // the bundled corpus, so a `-d` beside `--demo` would otherwise
+    // be silently discarded there — the exact substitution this
+    // guard exists to refuse).
+    reject_demo_source_conflict(&args)?;
 
     let language = report_language(&args.lang)?;
     // rm-384: resolve the layered configuration and install the
@@ -498,6 +508,12 @@ fn run() -> anyhow::Result<()> {
 
     if !has_session_action(&args) {
         if args.demo {
+            // rm-735: the interactive demo TUI is the same silent
+            // substitution arm as the report lane (`--demo -d /logs`
+            // used to open the demo TUI and discard the flag); the
+            // launch-guard at the top of main has already refused
+            // the conflict, so the TUI never opens on a swallowed
+            // source.
             let sessions = demo_sessions()?;
             // rm-341: --demo honors --lang like the discovery TUI path
             // instead of silently dropping it.
@@ -742,6 +758,7 @@ fn run() -> anyhow::Result<()> {
                 report.skipped,
                 report.cache_hits,
                 report.opencode_fork_excluded,
+                report.sqlite.unreadable.clone(),
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
@@ -1350,8 +1367,55 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
     load_sessions_report(args).map(|(sessions, _)| sessions)
 }
 
+/// rm-735: `--demo` is itself a session source — it substitutes the
+/// bundled demo corpus for discovery. Combined with an explicit
+/// session source (a positional path, `-d/--dir`, or a `--range`
+/// other than the `all` default) it used to silently discard the
+/// explicit source and serve the demo corpus instead (`--demo
+/// --overview -d /real/logs` rendered demo numbers as if they were
+/// the user's, assess F2, run 06cc5c7d). The combination now bails
+/// loudly, naming every ignored source flag, so the substitution can
+/// never be silent. Explicit `--range all` is indistinguishable from
+/// the default (clap `default_value`) and stays legal — an explicit
+/// "all" discards no distinct intent. `--doctor`'s demo lane is
+/// covered too: since landed rm-596 `--doctor --demo` renders ONLY
+/// the bundled demo corpus, so a `-d` beside `--demo` would be
+/// silently discarded there — the launch-guard call at the top of
+/// main fires before the doctor dispatch. The host commands
+/// (`statusline`, `upstream`, `mcp`) dispatch before any session
+/// loading and stay outside this guard.
+fn reject_demo_source_conflict(args: &Args) -> anyhow::Result<()> {
+    // Self-gated: the launch call site runs on every invocation, so
+    // a run without --demo (e.g. plain `-d X --range 30d`) must pass
+    // through untouched — only the demo substitution is in scope.
+    if !args.demo {
+        return Ok(());
+    }
+    let mut sources = Vec::new();
+    if args.path.is_some() {
+        sources.push("a positional path");
+    }
+    if args.dir.is_some() {
+        sources.push("-d/--dir");
+    }
+    if args.range != "all" {
+        sources.push("--range");
+    }
+    if sources.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "--demo ignores explicit session sources ({}): drop --demo to analyze the \
+         explicit source, or drop the source flags to explore the demo corpus",
+        sources.join(", ")
+    );
+}
+
 fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
     if args.demo {
+        // rm-735: the demo substitution must never silently swallow an
+        // explicit session source (see reject_demo_source_conflict).
+        reject_demo_source_conflict(args)?;
         return Ok((prepare_explicit_sessions(demo_sessions()?, args)?, None));
     }
     if let Some(path) = args.path.as_deref() {

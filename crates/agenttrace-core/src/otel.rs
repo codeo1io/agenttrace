@@ -29,8 +29,6 @@
 
 use crate::Session;
 use serde::Serialize;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 /// Date the GenAI semantic-convention attribute names used below were
@@ -229,12 +227,26 @@ fn session_bounds(session: &Session) -> (u64, u64) {
 }
 
 /// Deterministic 32-hex-char trace id derived from the session identity.
+///
+/// rm-599 (residual): the hash is the owned FNV-1a behind the history
+/// lane's [`crate::history::stable_identity_hash`] — same rationale as
+/// the rm-212 identity stamps: `DefaultHasher`'s SipHash output is
+/// stable on today's toolchain but Rust does NOT guarantee it across
+/// releases, and these ids are exported for cross-run correlation
+/// (dedupe/joins in a collector), so a toolchain bump silently
+/// re-keying every id defeats the export's purpose. Ids change exactly
+/// once at this switch; they are computed at export time and no
+/// on-disk artifact persists them, so there is nothing to migrate.
 fn trace_id_for(session: &Session) -> String {
-    let mut hasher = DefaultHasher::new();
-    "agenttrace-trace".hash(&mut hasher);
-    session.path.hash(&mut hasher);
-    session.name.hash(&mut hasher);
-    let h = hasher.finish();
+    trace_id_from_identity(&session.path, &session.name)
+}
+
+/// The pure derivation behind [`trace_id_for`], exposed as a seam so
+/// the golden vectors in the test module can pin exact ids without
+/// depending on a fixture file's on-disk path.
+fn trace_id_from_identity(path: &str, name: &str) -> String {
+    let canonical = format!("agenttrace-trace|{path}|{name}");
+    let h = crate::history::stable_identity_hash(&canonical);
     format!("{h:016x}{h:016x}")
 }
 
@@ -247,12 +259,16 @@ fn trace_id_for(session: &Session) -> String {
 /// identity also keeps ids distinct across sessions that share an
 /// ordinal position.
 fn span_id_for(session: &Session, ordinal: u64) -> String {
-    let mut hasher = DefaultHasher::new();
-    "agenttrace-span".hash(&mut hasher);
-    session.path.hash(&mut hasher);
-    session.name.hash(&mut hasher);
-    ordinal.hash(&mut hasher);
-    let seed = hasher.finish();
+    span_id_from_identity(&session.path, &session.name, ordinal)
+}
+
+fn span_id_from_identity(path: &str, name: &str, ordinal: u64) -> String {
+    // rm-599 (residual): FNV-1a over a delimited canonical string —
+    // see trace_id_from_identity for why the owned hash replaced
+    // DefaultHasher. The delimiter guards against identity collisions
+    // that space-free concatenation would admit ("a|bc" vs "ab|c").
+    let canonical = format!("agenttrace-span|{path}|{name}|{ordinal}");
+    let seed = crate::history::stable_identity_hash(&canonical);
     if seed == 0 {
         // The all-zero id is the only invalid value; fold
         // deterministically to stay spec-valid.
@@ -418,5 +434,53 @@ mod tests {
         assert!(!rendered.contains("\\u009b"));
         assert!(!rendered.contains("\\u007f"));
         assert!(rendered.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn trace_and_span_ids_pin_fnv1a_golden_vectors() {
+        // rm-599 (residual): the exported ids are the owned FNV-1a
+        // (history::stable_identity_hash), not std's DefaultHasher —
+        // cross-run correlation in a collector assumes the SAME
+        // session re-keys to the SAME id on every toolchain. These
+        // vectors were derived independently from the FNV-1a 64-bit
+        // reference constants (offset basis 0xcbf29ce484222325, prime
+        // 0x100000001b3), so a regression to DefaultHasher — or any
+        // accidental change to the canonical string shape, including
+        // the '|' delimiters — flips the pin.
+        let path = "/tmp/at/sessions/claude.jsonl";
+        let name = "claude-4";
+        assert_eq!(
+            trace_id_from_identity(path, name),
+            "b17fe45ad4d93ba1b17fe45ad4d93ba1",
+            "trace id golden (doubled 64-bit FNV-1a)"
+        );
+        assert_eq!(
+            span_id_from_identity(path, name, 0),
+            "ae053c09d3677036",
+            "span id golden at ordinal 0"
+        );
+        assert_eq!(
+            span_id_from_identity(path, name, 7),
+            "ae053f09d367754f",
+            "span id golden at ordinal 7 — ordinals must re-key the hash"
+        );
+        // The delimiter is load-bearing: identity-collision inputs
+        // ("a|bc" vs "ab|c" concatenations) must not collapse.
+        assert_ne!(
+            span_id_from_identity("a", "bc|0", 0),
+            span_id_from_identity("ab", "c", 0),
+            "'|' delimiters must separate path from name from ordinal"
+        );
+        // Trace ids are 32 lowercase hex chars; span ids 16.
+        let trace = trace_id_from_identity(path, name);
+        assert_eq!(trace.len(), 32);
+        assert!(trace
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        let span = span_id_from_identity(path, name, 42);
+        assert_eq!(span.len(), 16);
+        assert!(span
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

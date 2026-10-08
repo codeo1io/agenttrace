@@ -262,6 +262,19 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 37;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
+// Bumped 7 → 8 (rm-548): snapshots now carry the opencode
+// fork-exclusion count, so v7 snapshots would disclose a
+// silently-missing count and must regenerate. The same 7 → 8 bump also
+// carries the rm-734 poison-gate eviction (run a7110bf0): the sqlite
+// snapshot cache predates the read-failure gate — a corrupt or
+// unopenable database could bank an EMPTY snapshot ("read succeeded,
+// zero sessions"), which every later run then served as truth with no
+// way to re-probe the database even after the operator fixed it. The
+// poison gate refuses to bank on failure (landed rm-753), and the
+// shared bump evicts any empty snapshot a v7 cache already banked for
+// a since-repaired database — the fingerprint (size+mtime) would
+// otherwise match and keep serving the poisoned entry. Healthy v7
+// snapshots re-bank unchanged under both rationales.
 const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
@@ -2029,13 +2042,15 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version seven (cycle-1 rm-198): hermes tool outcome semantics
-        // changed (ok/fail now derive from the messages table instead of
-        // fabricating ok == tool_call_count), so v6 snapshots carry stale
-        // tool outcome splits and must regenerate. Version eight
-        // (rm-548): snapshots now carry their opencode fork-exclusion
-        // count, so v7 snapshots would disclose a silently-missing
-        // count and must regenerate too.
+        // Version eight carries two rationales: rm-548 — snapshots
+        // now carry their opencode fork-exclusion count, so v7
+        // snapshots would disclose a silently-missing count and must
+        // regenerate; and the rm-734 poison gate — a failed read banks
+        // nothing and any EMPTY v7 snapshot a pre-gate run banked for
+        // an unreadable database is evicted (the fingerprint alone
+        // would keep serving it). Version seven (cycle-1 rm-198):
+        // hermes tool outcome semantics changed (ok/fail now derive
+        // from the messages table), so v6 snapshots carry stale splits.
         assert_eq!(doc["schema_version"], 8);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
@@ -2048,7 +2063,7 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema seven cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eight cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);

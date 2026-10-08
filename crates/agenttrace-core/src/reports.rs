@@ -647,6 +647,15 @@ pub fn report_overview_text_with_context(
             counts_cell(&data_health.disclosures)
         ));
     }
+    // rm-734: an excluded corpus must be named, never silent.
+    for failure in &data_health.sqlite_read_failures {
+        out.push_str(&format!(
+            "  Sqlite source unreadable: {} ({}) — {} — its sessions are EXCLUDED\n",
+            failure.path.display(),
+            failure.source,
+            failure.reason
+        ));
+    }
     out.push_str(&format!(
         "  Pricing: {} | exact={} fallback={} unknown={}\n",
         audit.pricing_source,
@@ -682,6 +691,16 @@ pub fn report_overview_markdown_with_context(
             markdown_cell(&counts_cell(&data_health.disclosures))
         ));
     }
+    // rm-734 riding the landed rm-753 records: name every excluded
+    // sqlite corpus (path, lane, reason).
+    for failure in &data_health.sqlite_read_failures {
+        out.push_str(&format!(
+            "| Sqlite source unreadable | {} ({}) — {} — its sessions are EXCLUDED |\n",
+            markdown_cell(&failure.path.display().to_string()),
+            failure.source,
+            markdown_cell(&failure.reason)
+        ));
+    }
     render_recommendations_markdown(&mut out, &recommendations(sessions));
     out
 }
@@ -708,6 +727,16 @@ pub fn report_overview_html_with_context(
         appendix.push_str(&format!(
             "<tr><th>Disclosed facts</th><td>{}</td></tr>",
             html_escape(&counts_cell(&data_health.disclosures))
+        ));
+    }
+    // rm-734 riding the landed rm-753 records: name every excluded
+    // sqlite corpus (path, lane, reason).
+    for failure in &data_health.sqlite_read_failures {
+        appendix.push_str(&format!(
+            "<tr><th>Sqlite source unreadable</th><td>{} ({}) — {} — its sessions are EXCLUDED</td></tr>",
+            html_escape(&failure.path.display().to_string()),
+            failure.source,
+            html_escape(&failure.reason)
         ));
     }
     appendix.push_str("</tbody></table></section>");

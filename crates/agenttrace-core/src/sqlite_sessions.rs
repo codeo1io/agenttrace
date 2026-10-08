@@ -1,6 +1,7 @@
 use crate::{detect_anomalies, health_score, token_cost, Metrics, Session};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -79,7 +80,7 @@ pub struct SqliteIngestReport {
     pub fork_excluded: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SqliteUnreadableDb {
     pub path: PathBuf,
     pub source: &'static str,
@@ -1530,6 +1531,112 @@ mod tests {
             "empty snapshot must be distrusted so failures re-surface"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn corrupt_hermes_header_is_disclosed_and_never_banks_a_snapshot() {
+        // rm-734 fixture class adopted onto the landed rm-753 report
+        // channel: a hermes `state.db` carrying a sqlite magic header
+        // but corrupt bytes behind it must ride `unreadable` (never
+        // `Ok(empty)`), must bank no snapshot, and — after repair —
+        // must be re-discovered on the very next read.
+        let _env = crate::test_env::lock_env();
+        let previous_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm734-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &cache);
+        let snapshot = cache.join("hermes-sqlite.json");
+        let path = root.join("state.db");
+        std::fs::write(&path, b"SQLite format 3\x00corrupted-bytes").expect("write corrupt db");
+
+        let mut report = SqliteIngestReport::default();
+        let sessions = load_hermes_sqlite_sessions(&path, None, &mut report);
+        assert!(
+            sessions.is_empty(),
+            "no sessions can come from a corrupt db"
+        );
+        assert_eq!(
+            report.unreadable.len(),
+            1,
+            "the corrupt database must be disclosed as exactly one unreadable"
+        );
+        let unreadable = &report.unreadable[0];
+        assert_eq!(unreadable.source, "hermes");
+        assert_eq!(unreadable.path, path);
+        assert!(
+            !unreadable.reason.is_empty(),
+            "the open error must be carried"
+        );
+        assert!(
+            !snapshot.exists(),
+            "the poison gate must not bank a snapshot for a failed read — \
+             a banked empty would hide the database even after repair"
+        );
+
+        // Repair: the same path now holds the healthy fixture. The
+        // failed read banked nothing, so the lane must re-probe it.
+        std::fs::remove_file(&path).expect("drop corrupt db");
+        let healthy = hermes_state_db_fixture(&root);
+        assert_eq!(healthy, path, "fixture must land on the same path");
+        let mut repaired_report = SqliteIngestReport::default();
+        let repaired = load_hermes_sqlite_sessions(&path, None, &mut repaired_report);
+        match previous_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            repaired_report.unreadable.is_empty() && repaired_report.dropped_rows.is_empty(),
+            "a repaired database must read cleanly: {repaired_report:?}"
+        );
+        assert_eq!(
+            repaired.len(),
+            2,
+            "the repair must be discovered on the very next read — \
+             no banked poison can mask it"
+        );
+    }
+
+    #[test]
+    fn unreadable_permissions_are_disclosed_as_unreadable() {
+        // rm-734 fixture class adopted onto the landed rm-753 report
+        // channel: a chmod-000 database is found-but-unreadable, not
+        // absent. Root can open anything, so the leg is skipped (the
+        // mode is restored) when the probe itself opens cleanly.
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm734-chmod-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let path = hermes_state_db_fixture(&root);
+        let original = std::fs::metadata(&path)
+            .expect("fixture metadata")
+            .permissions();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("chmod 000");
+        let unreadable = Connection::open(&path).is_err();
+        let mut report = SqliteIngestReport::default();
+        let sessions = if unreadable {
+            load_hermes_sqlite_sessions(&path, None, &mut report)
+        } else {
+            // Running as root: the disclosure assertion would be
+            // vacuous, and the mode must be restored either way.
+            Vec::new()
+        };
+        std::fs::set_permissions(&path, original).ok();
+        let _ = std::fs::remove_dir_all(&root);
+        if !unreadable {
+            return; // running as root: nothing to prove here
+        }
+        assert!(sessions.is_empty());
+        assert_eq!(
+            report.unreadable.len(),
+            1,
+            "the chmod-000 database must surface as unreadable"
+        );
+        assert_eq!(report.unreadable[0].source, "hermes");
     }
 
     /// The P11 hostile corpus, re-crafted at runtime: five session rows

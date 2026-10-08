@@ -199,12 +199,36 @@ fn guard_formula(raw: &str) -> String {
     let starts_formula = raw
         .chars()
         .find(|ch| !ch.is_whitespace())
-        .is_some_and(|first| matches!(first, '=' | '+' | '@' | '-'));
+        .is_some_and(is_formula_introducer);
     if starts_formula {
         format!("'{raw}")
     } else {
         raw.to_string()
     }
+}
+
+/// rm-540 (residual, assess F3): the introducer set covers the ASCII
+/// formula starters AND their fullwidth forms — U+FF1D `＝`, U+FF0B
+/// `＋`, U+FF20 `＠`, U+FF0D `－`. Spreadsheet apps (Excel, Sheets,
+/// LibreOffice) normalize fullwidth introducers to their ASCII meaning
+/// when a cell is entered or imported, so `＝1+2` executes exactly like
+/// `=1+2`; the sanitizer upstream only strips control characters, so
+/// the fullwidth bytes survive to this guard (live PoC
+/// `csv-fullwidth-model.jsonl`, run 06cc5c7d). Guarding is the safe
+/// direction: a false positive costs a leading apostrophe, a false
+/// negative executes a formula. Fullwidth "numbers" such as `－１.５`
+/// fail `f64::from_str` and are guarded too — conservative on purpose.
+fn is_formula_introducer(first: char) -> bool {
+    matches!(
+        first,
+        '=' | '+'
+            | '@'
+            | '-'
+            | '\u{FF1D}' // FULLWIDTH EQUALS SIGN
+            | '\u{FF0B}' // FULLWIDTH PLUS SIGN
+            | '\u{FF20}' // FULLWIDTH COMMERCIAL AT
+            | '\u{FF0D}' // FULLWIDTH HYPHEN-MINUS
+    )
 }
 
 #[cfg(test)]
@@ -248,6 +272,38 @@ mod tests {
         // Whitespace-padded numerics still import as values.
         assert_eq!(csv_cell(" -1.5"), " -1.5");
         assert_eq!(csv_cell(" 0"), " 0");
+    }
+
+    #[test]
+    fn fullwidth_formula_introducers_are_guarded() {
+        // rm-540 residual (assess PoC F3, run 06cc5c7d
+        // `csv-fullwidth-model.jsonl`): fullwidth ＝＋＠－ introduce
+        // formulas in every major spreadsheet once normalized, and the
+        // control-character sanitizer does not touch them, so the
+        // introducer guard is the layer that catches each one.
+        assert_eq!(csv_cell("\u{FF1D}1+1"), "'\u{FF1D}1+1");
+        assert_eq!(csv_cell("\u{FF0B}SUM(A1)"), "'\u{FF0B}SUM(A1)");
+        assert_eq!(csv_cell("\u{FF20}cmd"), "'\u{FF20}cmd");
+        assert_eq!(csv_cell("\u{FF0D}1+1"), "'\u{FF0D}1+1");
+        // The assess PoC payload itself: a model field shaped as a
+        // fullwidth formula in a one-line JSONL journal.
+        assert_eq!(
+            csv_cell("\u{FF1D}cmd|' /C calc.exe"),
+            "'\u{FF1D}cmd|' /C calc.exe"
+        );
+        // Fullwidth "numeric" shapes are guarded too: they fail
+        // f64::from_str, and a guarded cell costs one apostrophe while
+        // a missed introducer costs an executed formula.
+        assert_eq!(
+            csv_cell("\u{FF0D}\u{FF11}.\u{FF15}"),
+            "'\u{FF0D}\u{FF11}.\u{FF15}"
+        );
+        // Control: CJK text that merely CONTAINS a fullwidth character
+        // mid-cell still passes through untouched.
+        assert_eq!(csv_cell("会話\u{FF1D}セッション"), "会話\u{FF1D}セッション");
+        // Control: the ASCII numeric exemptions from the pinned tests
+        // above survive the introducer-set extraction unchanged.
+        assert_eq!(csv_cell("-1.5"), "-1.5");
     }
 
     #[test]
