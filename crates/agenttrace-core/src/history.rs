@@ -107,6 +107,51 @@ fn load_records() -> BTreeMap<String, DerivedSession> {
     records_from_bytes(&path, &raw)
 }
 
+/// rm-703 residual (assess 21b66103 N3, 2026-10-08): claims the next
+/// free quarantine generation name EXCLUSIVELY. The pre-fix pick was
+/// `while quarantine.exists()` followed by a plain rename — two
+/// concurrent corrupt-session events (two agenttrace processes deriving
+/// history from one home) could both select the SAME generation, and
+/// the second rename silently clobbered the first forensic copy (rename
+/// replaces an existing destination on Unix). The exclusive create
+/// holds the name; the caller's rename replaces the empty claim with
+/// the quarantined bytes, and a rename that fails — the source already
+/// moved aside by a peer — must withdraw its claim so no bogus empty
+/// generation survives the race.
+fn claim_quarantine_slot(path: &Path) -> PathBuf {
+    let mut quarantine = path.with_extension("json.corrupt");
+    let mut generation = 0u32;
+    loop {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&quarantine) {
+            Ok(_) => return quarantine,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if generation >= 10_000 {
+                    // Pathological bound, unchanged from the serial fix:
+                    // past 10_000 generations the last slot is REUSED
+                    // rather than looping forever — the same trade
+                    // rm-703 made serially, and one no test can reach.
+                    return quarantine;
+                }
+                generation += 1;
+                quarantine = path.with_extension(format!("json.corrupt.{generation}"));
+            }
+            Err(_) => {
+                // Unwritable directory (or equivalent): hand the name
+                // back so the caller's rename attempt and its error
+                // report keep their original behavior.
+                return quarantine;
+            }
+        }
+    }
+}
+
 /// Decode history bytes; a torn or corrupt file is quarantined (renamed
 /// to `<name>.json.corrupt`, kept for inspection) instead of silently
 /// zeroing the only durable record of derived sessions (pass-7 P7-5).
@@ -121,18 +166,24 @@ fn records_from_bytes(path: &Path, raw: &[u8]) -> BTreeMap<String, DerivedSessio
             // `<name>.json.corrupt`, `.corrupt.1`, `.corrupt.2`, ...;
             // the bound only guards a pathological directory (the
             // last slot is reused rather than looping forever).
-            let mut quarantine = path.with_extension("json.corrupt");
-            let mut generation = 0u32;
-            while quarantine.exists() && generation < 10_000 {
-                generation += 1;
-                quarantine = path.with_extension(format!("json.corrupt.{generation}"));
+            // rm-703 residual (N3): the generation is CLAIMED
+            // exclusively (`claim_quarantine_slot`) before the rename,
+            // so two concurrent quarantines can never land on the
+            // same generation and clobber each other.
+            let quarantine = claim_quarantine_slot(path);
+            match std::fs::rename(path, &quarantine) {
+                Ok(()) => eprintln!(
+                    "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
+                    path.display(),
+                    quarantine.display()
+                ),
+                Err(_) => {
+                    // The source vanished under us — a concurrent peer
+                    // quarantined it first and already reported. Withdraw
+                    // our claim so no bogus empty generation survives.
+                    let _ = std::fs::remove_file(&quarantine);
+                }
             }
-            let _ = std::fs::rename(path, &quarantine);
-            eprintln!(
-                "agenttrace: history file {} was unreadable; quarantined as {} (new history starts empty)",
-                path.display(),
-                quarantine.display()
-            );
             BTreeMap::new()
         }
     }
@@ -362,6 +413,85 @@ mod tests {
             "the second generation's bytes must be preserved too"
         );
         assert!(!path.exists(), "the live file moved aside both times");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_slot_claims_are_exclusive_across_concurrent_pickers() {
+        // rm-703 residual (assess 21b66103 N3): the generation pick was
+        // exists()+rename — two concurrent corrupt-session events could
+        // both select history.json.corrupt.1 and the second rename
+        // silently clobbered the first forensic copy. Slot picking must
+        // CLAIM the name exclusively (O_EXCL-style) before any rename
+        // happens, so two pickers racing on one path can never hold the
+        // same generation. Red-by-construction on the pre-fix tree: the
+        // exclusive claim did not exist there (base reuses the bare
+        // `.corrupt` name, overwriting) — the same shape rm-703 itself
+        // recorded when the uniquing writer landed.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-claim-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("history.json");
+        let first = claim_quarantine_slot(&path);
+        let second = claim_quarantine_slot(&path);
+        assert_ne!(
+            first, second,
+            "two pickers racing on one path must never claim the same generation"
+        );
+        assert!(
+            first.is_file() && second.is_file(),
+            "a claim holds its name — only its owner's rename may replace it"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_corrupt_session_events_never_leave_a_bogus_generation() {
+        // rm-703 residual, concurrent shape: eight threads hit the same
+        // corrupt history file at once. Whoever wins the rename keeps
+        // the bytes and reports; every loser's rename fails (the source
+        // moved aside) and must WITHDRAW its claim — no empty placeholder
+        // generation may survive, and the live file is gone.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-history-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("history.json");
+        std::fs::write(&path, b"{\"race\": ").expect("write corrupt history");
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            joins.push(std::thread::spawn(move || {
+                records_from_bytes(&path, b"{\"race\": ");
+            }));
+        }
+        for join in joins {
+            join.join()
+                .expect("a racing quarantine thread must not panic");
+        }
+        assert!(!path.exists(), "the live file moved aside");
+        let mut survivors = 0usize;
+        for entry in std::fs::read_dir(&root).expect("read quarantine dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("history.json.corrupt") {
+                let bytes = std::fs::read(entry.path()).expect("read quarantine");
+                assert!(
+                    !bytes.is_empty(),
+                    "no empty placeholder generation may survive the race: {name}"
+                );
+                survivors += 1;
+            }
+        }
+        assert!(
+            survivors >= 1,
+            "at least one quarantine generation survives"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -1631,6 +1631,13 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 36 (run 66fc09b893f6 stewardship,
+                // rm-825 antigravity per-model pricing: the fold
+                // emits one usage meta event PER MODEL, so a
+                // multi-model session's cached cost, model_used and
+                // disclosure counters all change for UNCHANGED
+                // journals — plus rm-711's codex ledger-rollover
+                // disclosure; direct wall implement, no re-base);
                 // Schema 35 (integration of run 3ec6cec08fb9,
                 // rm-720/rm-721 agent-lane truth — Antigravity
                 // per-generation usage fold + Copilot agent-host
@@ -1694,7 +1701,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":35,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":36,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
