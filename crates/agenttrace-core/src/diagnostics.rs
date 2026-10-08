@@ -29,6 +29,33 @@ pub struct TraceStep {
     pub parent_id: String,
 }
 
+/// rm-754: what a `LoopCost`'s dollar figures are made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopCostBasis {
+    /// Every counted call was priced at its event's model rates x
+    /// that event's token mass, from the session's own price table.
+    #[default]
+    Priced,
+    /// At least one counted call carried no usable usage block, so
+    /// the figure is the historical constant estimate -- labeled as
+    /// synthetic everywhere it appears.
+    Synthetic,
+}
+
+impl LoopCostBasis {
+    /// rm-754: the disclosure that rides every governance-facing
+    /// loop-cost dollar figure.
+    pub fn disclosure(&self) -> &'static str {
+        match self {
+            LoopCostBasis::Priced => "priced at session model rates",
+            LoopCostBasis::Synthetic => {
+                "synthetic estimate -- no token mass recorded, not price-derived"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoopCost {
     pub retry_cost: f64,
@@ -38,6 +65,11 @@ pub struct LoopCost {
     pub loop_groups: usize,
     pub loop_type: String,
     pub turns: usize,
+    /// rm-754: the basis of the dollar figures above, serialized into
+    /// the diagnostics JSON so a constant-derived estimate can never
+    /// wear a plain `$` label again.
+    #[serde(default)]
+    pub cost_basis: LoopCostBasis,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,7 +351,7 @@ fn p95_gap(session: &Session) -> f64 {
 
 pub(crate) fn analyze_diagnostics(events: &[Event], metrics: &Metrics) -> Diagnostics {
     Diagnostics {
-        loop_cost: loop_cost(events, metrics.cost_estimated),
+        loop_cost: loop_cost(events, metrics.cost_estimated, &metrics.model_used),
         loop_fingerprints: loop_fingerprints(events),
         tool_latencies: tool_latencies(events),
         context_utilization: context_utilization(events, &metrics.model_used),
@@ -678,52 +710,102 @@ fn canonical_args(args: &str) -> String {
     // are canonicalized above.
 }
 
-fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
+fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost {
     // rm-233 (campaign-local rm-028): a retry is the same call
     // re-issued -- same tool AND same
     // arguments. Keying on the tool name alone counted a parallel batch
     // of distinct-argument calls in one assistant turn as a retry loop
     // and priced it into loop_cost (the `Bash_loop` false positive).
+    //
+    // rm-754: the dollar figures are priced, not constant. Each counted
+    // call costs its event's usage at the event's own model rates
+    // (session-model fallback for events that record no model),
+    // mirroring lib.rs's per-block pricing. When ANY counted call has
+    // no usable usage block, the arm falls back to the historical
+    // constant estimate and the figures carry an explicit `synthetic`
+    // cost basis so a constant-derived number never wears a plain `$`
+    // label again.
     let mut last: Option<(&str, String)> = None;
     let mut consecutive = 0;
     let mut max_consecutive = 0;
     let mut max_tool = "";
     let mut retries = 0;
     let mut groups = 0;
-    for call in events.iter().flat_map(|event| &event.tool_calls) {
-        let call_args = canonical_args(&call.args);
-        let same_call =
-            matches!(&last, Some((name, args)) if *name == call.name && *args == call_args);
-        if same_call {
-            consecutive += 1;
-            if consecutive >= 3 {
-                retries += 1;
+    // rm-754 priced bookkeeping.
+    let mut run_cost = 0.0f64; // priced cost of the run being scanned
+    let mut max_run_cost = 0.0f64; // priced cost of the longest run
+    let mut retry_cost_priced = 0.0f64;
+    let mut unpriced_calls = 0usize;
+    for event in events.iter() {
+        let call_cost = priced_event_cost(event, session_model);
+        for call in event.tool_calls.iter() {
+            let call_args = canonical_args(&call.args);
+            let same_call =
+                matches!(&last, Some((name, args)) if *name == call.name && *args == call_args);
+            let counted_cost = match call_cost {
+                Some(cost) => cost,
+                None => {
+                    unpriced_calls += 1;
+                    0.0
+                }
+            };
+            if same_call {
+                consecutive += 1;
+                run_cost += counted_cost;
+                if consecutive >= 3 {
+                    retries += 1;
+                    retry_cost_priced += counted_cost;
+                }
+            } else {
+                if consecutive > max_consecutive {
+                    max_consecutive = consecutive;
+                    max_tool = last.map(|(name, _)| name).unwrap_or("");
+                    max_run_cost = run_cost;
+                }
+                if consecutive >= 3 {
+                    groups += 1;
+                }
+                consecutive = 1;
+                run_cost = counted_cost;
+                last = Some((call.name.as_str(), call_args));
             }
-        } else {
-            if consecutive > max_consecutive {
-                max_consecutive = consecutive;
-                max_tool = last.map(|(name, _)| name).unwrap_or("");
-            }
-            if consecutive >= 3 {
-                groups += 1;
-            }
-            consecutive = 1;
-            last = Some((call.name.as_str(), call_args));
         }
     }
     if consecutive > max_consecutive {
         max_consecutive = consecutive;
         max_tool = last.map(|(name, _)| name).unwrap_or("");
+        max_run_cost = run_cost;
     }
     if consecutive >= 3 {
         groups += 1;
     }
-    let tool = if max_consecutive >= 3 {
-        max_consecutive as f64 * 0.015
+    let (tool, retry, cost_basis) = if unpriced_calls > 0 {
+        // rm-754 synthetic fallback: at least one counted call carried
+        // no token mass, so no honest rate-derived total exists. Keep
+        // the historical constant estimate and disclose the basis.
+        (
+            if max_consecutive >= 3 {
+                max_consecutive as f64 * 0.015
+            } else {
+                0.0
+            },
+            retries as f64 * 0.0075,
+            LoopCostBasis::Synthetic,
+        )
     } else {
-        0.0
+        // rm-754 priced arm: every counted call had a usable usage
+        // block, so these dollars are the session's own rates applied
+        // to the loop's token mass.
+        (
+            if max_consecutive >= 3 {
+                max_run_cost
+            } else {
+                0.0
+            },
+            retry_cost_priced,
+            LoopCostBasis::Priced,
+        )
     };
-    let retry = retries as f64 * 0.0075;
     let raw_total = tool + retry;
     let total = if total_cost.is_finite() && total_cost > 0.0 {
         raw_total.min(total_cost)
@@ -747,7 +829,38 @@ fn loop_cost(events: &[Event], total_cost: f64) -> LoopCost {
             String::new()
         },
         turns: max_consecutive,
+        cost_basis,
     }
+}
+
+/// rm-754: the per-call dollar cost of one counted tool call. Mirrors
+/// lib.rs's per-block pricing (per-million rates from the bundled
+/// snapshot, session-model fallback for events that record no model)
+/// and splits the event's cost evenly across its tool calls so a
+/// multi-call event is not priced once per call. Returns None when the
+/// event carries no usable usage block -- the caller then falls back
+/// to the disclosed synthetic estimate.
+fn priced_event_cost(event: &Event, session_model: &str) -> Option<f64> {
+    let input = event.usage.get("input_tokens").copied().unwrap_or(0).max(0);
+    let output = event
+        .usage
+        .get("output_tokens")
+        .copied()
+        .unwrap_or(0)
+        .max(0);
+    if input == 0 && output == 0 {
+        return None;
+    }
+    let price = if event.model_used.is_empty() || event.model_used == "unknown" {
+        crate::pricing::lookup_price(session_model)
+    } else {
+        crate::pricing::lookup_price(&event.model_used)
+    };
+    let calls = event.tool_calls.len().max(1) as f64;
+    Some(
+        (input as f64 / 1_000_000.0 * price.input + output as f64 / 1_000_000.0 * price.output)
+            / calls,
+    )
 }
 
 fn loop_fingerprints(events: &[Event]) -> Vec<LoopFingerprint> {
@@ -1607,5 +1720,137 @@ mod tests {
         assert_eq!(fallback_context_window("gpt-5.2"), 128_000);
         assert_eq!(fallback_context_window("deepseek-v4"), 128_000);
         assert_eq!(fallback_context_window("totally-unknown"), 131_072);
+    }
+
+    fn loop_cost_event(model: &str, with_usage: bool) -> Event {
+        let mut usage = std::collections::BTreeMap::new();
+        if with_usage {
+            usage.insert("input_tokens".to_string(), 200_000i64);
+            usage.insert("output_tokens".to_string(), 50_000i64);
+        }
+        Event {
+            role: "assistant".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "call-0".to_string(),
+                name: "read".to_string(),
+                args: "{}".to_string(),
+            }],
+            model_used: model.to_string(),
+            usage,
+            ..Event::default()
+        }
+    }
+
+    fn loop_cost_six_call_run(model: &str, with_usage: bool) -> Vec<Event> {
+        (0..6).map(|_| loop_cost_event(model, with_usage)).collect()
+    }
+
+    #[test]
+    fn loop_cost_figures_are_priced_from_session_rates() {
+        // rm-754 golden: identical six-call retry loops priced at
+        // haiku vs opus rates must produce genuinely different dollar
+        // figures. The pre-fix constants (0.015/0.0075 per call) were
+        // pricing-independent and rendered the same number for both
+        // models -- an opus-magnitude figure on a mini-class session.
+        let per_call = |model: &str| {
+            let price = crate::pricing::lookup_price(model);
+            200_000.0 / 1_000_000.0 * price.input + 50_000.0 / 1_000_000.0 * price.output
+        };
+        // Six same-call events: the whole run prices the max-run arm,
+        // calls 3..=6 (four of them) price the retry arm.
+        let haiku = loop_cost(
+            &loop_cost_six_call_run("claude-haiku-4-5", true),
+            1_000_000.0,
+            "",
+        );
+        let opus = loop_cost(
+            &loop_cost_six_call_run("claude-opus-4-5", true),
+            1_000_000.0,
+            "",
+        );
+        assert_eq!(haiku.cost_basis, LoopCostBasis::Priced);
+        assert_eq!(opus.cost_basis, LoopCostBasis::Priced);
+        for (label, lc, model) in [
+            ("haiku", &haiku, "claude-haiku-4-5"),
+            ("opus", &opus, "claude-opus-4-5"),
+        ] {
+            let call_cost = per_call(model);
+            assert!(
+                (lc.tool_loop_cost - 6.0 * call_cost).abs() < 1e-9,
+                "{label} tool_loop_cost {} != 6 x {call_cost}",
+                lc.tool_loop_cost
+            );
+            assert!(
+                (lc.retry_cost - 4.0 * call_cost).abs() < 1e-9,
+                "{label} retry_cost {} != 4 x {call_cost}",
+                lc.retry_cost
+            );
+        }
+        // The snapshot's opus rates are multiples of haiku's, so the
+        // priced figures diverge -- no constant arm can do that.
+        assert!(
+            opus.total_loop_cost > haiku.total_loop_cost * 2.0,
+            "priced figures must diverge by model rates: haiku={} opus={}",
+            haiku.total_loop_cost,
+            opus.total_loop_cost
+        );
+    }
+
+    #[test]
+    fn loop_cost_synthetic_fallback_is_labeled() {
+        // rm-754: when a counted call carries no usable usage block,
+        // the figure falls back to the historical constant estimate and
+        // the basis says so -- a constant-derived number never wears a
+        // plain $ label again.
+        let lc = loop_cost(&loop_cost_six_call_run("", false), 1_000_000.0, "");
+        assert_eq!(lc.cost_basis, LoopCostBasis::Synthetic);
+        assert!((lc.tool_loop_cost - 0.09).abs() < 1e-9); // 6 x 0.015
+        assert!((lc.retry_cost - 0.03).abs() < 1e-9); // 4 x 0.0075
+        assert_eq!(lc.retry_events, 4);
+        assert_eq!(lc.loop_groups, 1);
+        let rendered = serde_json::to_string(&lc).expect("serialize LoopCost");
+        assert!(
+            rendered.contains("\"cost_basis\":\"synthetic\""),
+            "JSON must carry the explicit synthetic label: {rendered}"
+        );
+        assert_eq!(
+            lc.cost_basis.disclosure(),
+            "synthetic estimate -- no token mass recorded, not price-derived"
+        );
+    }
+
+    #[test]
+    fn loop_cost_json_names_the_priced_basis() {
+        // rm-754: the priced arm is labeled too, so the basis field is
+        // always meaningful, never an omission.
+        let lc = loop_cost(
+            &loop_cost_six_call_run("claude-haiku-4-5", true),
+            1_000_000.0,
+            "",
+        );
+        let rendered = serde_json::to_string(&lc).expect("serialize LoopCost");
+        assert!(
+            rendered.contains("\"cost_basis\":\"priced\""),
+            "JSON must name the priced basis: {rendered}"
+        );
+        assert_eq!(lc.cost_basis.disclosure(), "priced at session model rates");
+    }
+
+    #[test]
+    fn loop_cost_events_without_model_fall_back_to_session_model_rates() {
+        // rm-754: an event that records no model prices at the session
+        // model's rates -- mirroring lib.rs's per-block fallback -- and
+        // stays on the priced arm.
+        let lc = loop_cost(
+            &loop_cost_six_call_run("", true),
+            1_000_000.0,
+            "claude-haiku-4-5",
+        );
+        assert_eq!(lc.cost_basis, LoopCostBasis::Priced);
+        let price = crate::pricing::lookup_price("claude-haiku-4-5");
+        let call_cost =
+            200_000.0 / 1_000_000.0 * price.input + 50_000.0 / 1_000_000.0 * price.output;
+        assert!((lc.tool_loop_cost - 6.0 * call_cost).abs() < 1e-9);
     }
 }

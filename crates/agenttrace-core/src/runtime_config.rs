@@ -47,10 +47,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_table_is_all_none_and_first_writer_wins() {
-        // A fresh process state cannot be simulated with OnceLock, so
-        // assert the public contract shape: get() never panics and the
-        // first set() wins over a second one with different values.
+    fn second_writer_never_wins_in_shared_process_state() {
+        // rm-753: the process-global table cannot be reset from a
+        // test, so the deterministic first-writer pin lives in the
+        // fresh-process target (tests/runtime_config_contract.rs),
+        // where this file is the table's only writer and "did the
+        // first writer install" is always true. What CAN be pinned
+        // here -- in any process state and any test order, and unlike
+        // the tautologies this replaces, able to fail -- is that a
+        // second set() is rejected and a rejected writer never
+        // changes what get() reports.
         let first = RuntimeConfigOverrides {
             history_dir: Some(PathBuf::from("/first-history")),
             pricing_file: Some(PathBuf::from("/first-pricing.json")),
@@ -59,17 +65,17 @@ mod tests {
             history_dir: Some(PathBuf::from("/second-history")),
             pricing_file: None,
         };
-        // Both writers target the same process-global table; exactly
-        // one of them installs. Assert get() is stable across calls.
-        let installed_first = set(first.clone());
-        let _ = set(second);
-        let current = get();
-        assert_eq!(current, current); // stable handle
-        if installed_first {
-            assert_eq!(current.history_dir, first.history_dir);
-        }
-        // Regardless of test ordering, the table is never empty-panic
-        // and always reports Some/None values, never garbage.
-        assert!(current.history_dir.is_some() || current.history_dir.is_none());
+        let _first_installed = set(first);
+        let before = get();
+        let second_installed = set(second);
+        let after = get();
+        assert!(
+            !second_installed,
+            "write-once: a second set() must be reported as rejected"
+        );
+        assert_eq!(
+            after, before,
+            "a rejected writer must not alter what get() reports"
+        );
     }
 }
