@@ -1,0 +1,2 @@
+{"uuid": "u1", "timestamp": "2026-10-01T09:00:00Z", "type": "user", "message": {"role": "user", "content": "hi"}}
+{"uuid": "r0", "timestamp": "2026-10-01T09:00:10Z", "type": "result", "result": "done", "usage": {}, "stats": {"models": {"qwen3-coder": {"tokens": {"input": 100, "input_tokens": 100, "output": 50, "output_tokens": 50}}}}}

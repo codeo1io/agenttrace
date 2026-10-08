@@ -5,7 +5,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (run 2f02ecafb267 cycle 2, 'usage-accounting
+// truthfulness closeout', rm-685 + rm-686 + rm-602 extension): codex
+// token_count freshness is occurrence-adjacent instead of a
+// journal-wide set of distinct totals (a post-compaction window whose
+// running total merely happens to be value-equal to an earlier one now
+// counts; an identical last snapshot under a new total falls to the
+// totals delta; the ledger is the previous event's total and snapshot
+// plus a capped value-dedup ring for the legacy delta path), the generic usage
+// extractor nets Gemini-inclusive promptTokenCount against
+// cachedContentTokenCount, and the qwen stats/modelUsage arms take the
+// first PRESENT alias per class instead of summing dual spellings —
+// reported totals change for UNCHANGED files in all three shapes, so a
+// warm v32 cache keeps serving the pre-fix totals with matching
+// fingerprints and never re-parses (rm-230 convention:
+// parser-semantics changes that alter reported totals for unchanged
+// files bump the schema so cached sessions regenerate under corrected
+// accounting). Entries regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):
