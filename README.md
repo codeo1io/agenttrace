@@ -143,7 +143,8 @@ agenttrace --sessions -f csv
 agenttrace --overview -f csv
 ```
 
-Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events`.
+Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session`.
+The `subagents`/`subagent_cost` columns mirror the TSV's SUBAGENTS/SUBAGENT_COST rollup columns and `parent_session` names the parent transcript on subagent rows (empty otherwise), so no format hides the subagent picture another format shows. Rollups are corpus-scope: they reflect every child in the loaded corpus, not only rows surviving the active view filters (`--since`/`--project` etc.). When `--limit` drops rows, the table ends with a `# truncated: showing N of M matching sessions (--limit L)` marker row — a capped statement never reads as the whole corpus. In the same position, `--sessions -f json` wraps the rows as `{matched_sessions, returned_sessions, truncated, limit, sessions: [...]}` instead of a bare array, so a `jq '.sessions | length'` consumer can always tell a capped list from the corpus (and `jq '. | length' == 5` becomes an error, not a silent 5).
 `zero_usage_events` carries the rm-408 disclosure: transcripts that
 REPORT `{input_tokens: 0, output_tokens: 0, …}` are counted as measured
 zeros and flagged `zero_usage_reported` in provenance instead of reading
@@ -286,7 +287,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--context-trends` |  | Render context-utilization trends over the session corpus (window pressure, cache reuse, growth by turn) |
 | `--delivery-evidence` |  | Render the delivery-evidence report: verifiable outcome signals per session rather than effort metrics |
 | `--overview` |  | Render the corpus overview report: totals, health mix, and model/provider/project breakdowns |
-| `--sessions` |  | List sessions as rows (TSV text by default; `--format` json/csv for machine use). The TSV ends with the subagent rollup columns SUBAGENTS and SUBAGENT_COST — attributed spawned work, kept separate from the session's own COST/TOKENS cells |
+| `--sessions` |  | List sessions as rows (TSV text by default; `--format` json/csv for machine use). The TSV ends with the subagent rollup columns SUBAGENTS and SUBAGENT_COST — attributed spawned work, kept separate from the session's own COST/TOKENS cells; rollups are corpus-scope (every child in the loaded corpus, not just rows surviving the view filters), `--limit` truncation is disclosed in-band for json/csv and on stderr, and csv carries the subagents/subagent_cost/parent_session parity columns |
 | `--diagnostics` |  | Render per-session diagnostics: findings, evidence, fix suggestions, and next actions |
 | `--inspect <INSPECT>` |  | Inspect a single session by its `--sessions` list index (1-based) instead of the whole corpus |
 | `-m <MODEL>` | `default` | Reference model for `--compare` framing (cost-rate attribution in the comparison narrative; not a session filter — see `--model-filter`) |

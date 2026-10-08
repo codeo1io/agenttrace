@@ -98,12 +98,14 @@ fn sessions_csv_carries_the_disclosure_column_and_crlf_rows() {
     assert_eq!(lines[0], "# sessions", "table marker first");
     assert_eq!(
         lines[1],
-        "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events"
+        "session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session"
     );
-    // rm-408: the reported-zero block is disclosed in the statement.
+    // rm-408: the reported-zero block is disclosed in the statement;
+    // rm-800: the row ends with the subagent parity cells — 0/0.0000
+    // and an EMPTY parent_session for a standalone session.
     assert!(
-        lines[2].ends_with(",1"),
-        "zero_usage_events=1 on the data row, got: {}",
+        lines[2].ends_with(",1,0,0.0000,"),
+        "zero_usage_events=1 plus empty rm-800 tail on the data row, got: {}",
         lines[2]
     );
     assert!(out.ends_with("\r\n"));
@@ -331,4 +333,70 @@ fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
         );
     }
     fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn sessions_machine_formats_carry_subagent_truth_and_truncation() {
+    // rm-797/rm-798/rm-799/rm-800 end-to-end against the subagent
+    // corpus: the csv statement carries the SAME rollups the TSV
+    // shows (parity columns), child rows name their surviving parent,
+    // and --limit is disclosed in-band (json wrapper + `# truncated:`
+    // csv marker) instead of rendering a capped list as the corpus.
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../agenttrace-core/tests/fixtures/subagent-corpus");
+
+    let csv = run_csv(&corpus, &["--sessions", "-f", "csv"]);
+    let header = csv.split("\r\n").nth(1).expect("header");
+    assert!(
+        header.ends_with("zero_usage_events,subagents,subagent_cost,parent_session"),
+        "rm-800 parity columns on the csv header: {header}"
+    );
+    // Parent row: rolls 2 children at 0.0053, no parent of its own
+    // (trailing empty cell). Values pinned against the TSV rendering
+    // of the same corpus.
+    let parent = csv
+        .lines()
+        .find(|l| l.starts_with("research x,"))
+        .expect("parent row");
+    let cells: Vec<&str> = parent.split(',').collect();
+    assert_eq!(cells[cells.len() - 3], "2");
+    assert_eq!(cells[cells.len() - 2], "0.0053");
+    assert_eq!(cells[cells.len() - 1], "");
+    // Child row: standalone zeros for its own rollup, and the parent
+    // transcript path in the last cell.
+    let child = csv
+        .lines()
+        .find(|l| l.starts_with("do subtask 1,"))
+        .expect("child row");
+    let cells: Vec<&str> = child.split(',').collect();
+    assert!(cells[cells.len() - 1].ends_with("p1-1111.jsonl"));
+    // Orphan child (rm-799): standalone row, no parent cell, and the
+    // unlinked count is disclosed on stderr (asserted by the
+    // subagent_attribution e2e; stdout stays clean here).
+    let orphan = csv
+        .lines()
+        .find(|l| l.starts_with("orphan subagent,"))
+        .expect("orphan row");
+    assert!(orphan.ends_with(",0,0.0000,"), "orphan row: {orphan}");
+
+    // rm-798 json wrapper: a capped list must self-describe.
+    let json = run_csv(&corpus, &["--sessions", "-f", "json", "--limit", "2"]);
+    assert!(
+        json.contains("\"matched_sessions\": 6"),
+        "matched count: {json}"
+    );
+    assert!(json.contains("\"returned_sessions\": 2"));
+    assert!(json.contains("\"truncated\": true"));
+    assert!(json.contains("\"limit\": 2"));
+
+    // rm-798 csv marker row: same statement in the csv dialect.
+    let capped = run_csv(&corpus, &["--sessions", "-f", "csv", "--limit", "2"]);
+    assert!(
+        capped
+            .split("\r\n")
+            .any(|l| l == "# truncated: showing 2 of 6 matching sessions (--limit 2)"),
+        "truncation marker row: {capped}"
+    );
+    // Uncapped csv stays marker-free.
+    assert!(!csv.contains("# truncated"));
 }
