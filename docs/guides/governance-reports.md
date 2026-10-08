@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 32 and the SQLite snapshot is schema 7; the
+The session cache is schema 33 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -94,7 +94,12 @@ workbuddy input-basis disclosure counters
 `:zeroed_suspected_mismatch`) moved from `Metrics.line_skips` to
 `Metrics.disclosure_counters` — the non-loss disclosure channel — so an
 assumption-disclosure no longer renders under "Dropped lines" or
-degrade `data_health.confidence` (rm-538), and to 31 when Copilot usage
+degrade `data_health.confidence` (rm-538; the same channel later took
+the codex structural counters `codex_ignorable_line` and
+`codex_world_state` — deterministic known-non-loss shapes the rollout
+format defines as ignorable or registry-only — so a fully parsed
+codex corpus no longer reads `confidence: low` merely for carrying
+them; genuinely dropped lines still degrade it, rm-730), and to 31 when Copilot usage
 reconciliation became per-model — a checkpoint or shutdown replaces the
 per-model entries it names while preserving every omitted model's
 last-known values, so rotations across checkpoints and partial shutdowns
@@ -109,7 +114,12 @@ Copilot per-model shutdown tracking with the shutdown timestamp tail
 integration as rm-601..rm-603 with rm-555 folded into the landed
 rm-551; schema landed as 31 → 32, re-basing the campaign's own
 26 → 27 bump onto the ceiling) —
-so cached sessions regenerate under the corrected totals; the SQLite snapshot to 7
+so cached sessions regenerate under the corrected totals; and to 33 when
+sessions began carrying the branch they ran on, captured from the
+claude-code lane's `gitBranch` envelope onto the session-meta event —
+the field deserializes with a default for older caches, so the bump is
+the regeneration trigger, not a decode gate (rm-585, run 4c3ca863) —
+so cached sessions regenerate under the corrected fold. The SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
@@ -209,6 +219,13 @@ The overview also carries attribution dimensions over the same scope:
   come from the pricing-catalog row that prices each model — never
   from the model name's prefix — and models the catalog cannot resolve
   bucket explicitly under `unknown` instead of being dropped.
+- `by_branch`: which branch the spend ran on. The branch comes from the
+  claude-code lane's `gitBranch` envelope on the session-meta event —
+  the only lane that records one today — so every codex, qwen, copilot
+  and branchless claude session lands in one explicit `unknown` bucket
+  alongside detached-HEAD sessions (the literal `HEAD`) instead of
+  being invented or dropped. Extending the branch capture to the other
+  lanes is future work as their journals grow the field (rm-585).
 - `by_task_type`: a heuristic re-slice of the same parsed aggregates
   into `coding` (write-capable or test/build tool authority observed),
   `debugging` (failure-driven work: at least one failed tool call with

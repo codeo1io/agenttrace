@@ -2154,6 +2154,7 @@ mod tests {
             name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
             path: "/tmp/osc.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "pi\u{0007}".to_string(),
                 model_used: "m\u{001b}[2J".to_string(),
@@ -2839,6 +2840,7 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 session_start: session_start.to_string(),
                 ..Metrics::default()

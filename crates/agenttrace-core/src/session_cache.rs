@@ -5,7 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (run 4c3ca863 cycle 3, 'honest attribution' batch:
+// rm-585 'Spend by branch' LEAD + rm-730 rider 'codex structural
+// skips are assumption disclosures'): (a) Session/GoSession gain a
+// `branch` field carried from the claude-code lane's gitBranch
+// envelope — a warm v32 entry has no branch, so every cached session
+// would roll up under the by_branch "unknown" bucket until its file
+// changed; (b) the codex structural counters (codex_ignorable_line,
+// codex_world_state) moved from metrics.line_skips to
+// metrics.disclosure_counters, so a warm v32 entry keeps serving an
+// otherwise-exact parse with a Dropped-lines row and degraded
+// data_health.confidence — the served report changes for UNCHANGED
+// files either way (rm-230 convention: parser-semantics changes that
+// alter the served report bump the schema so cached sessions
+// regenerate; same re-basing discipline rm-538 applied at 29 -> 30).
+// Entries regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):
@@ -301,6 +316,12 @@ struct GoSession {
     path: String,
     #[serde(default, rename = "CWD")]
     cwd: String,
+    /// rm-585: branch the session ran on (claude-code gitBranch,
+    /// first cut). Serde-default keeps older caches decodable (empty
+    /// branch -> "unknown" bucket); the schema bump above regenerates
+    /// them anyway.
+    #[serde(default, rename = "Branch")]
+    branch: String,
     #[serde(default, rename = "Metrics")]
     metrics: GoMetrics,
     #[serde(default, rename = "Anomalies")]
@@ -1360,6 +1381,7 @@ impl GoSession {
             name: session.name.clone(),
             path: session.path.clone(),
             cwd: session.cwd.clone(),
+            branch: session.branch.clone(),
             metrics: GoMetrics::from_metrics(&session.metrics),
             anomalies: session
                 .anomalies
@@ -1385,6 +1407,7 @@ impl GoSession {
                 self.path
             },
             cwd: self.cwd,
+            branch: self.branch,
             metrics: self.metrics.into_metrics(),
             anomalies: self
                 .anomalies
@@ -1616,6 +1639,7 @@ mod tests {
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -1671,6 +1695,7 @@ mod tests {
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -1696,6 +1721,7 @@ mod tests {
                 name: "cached".to_string(),
                 path: database.to_string_lossy().to_string(),
                 cwd: String::new(),
+                branch: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -1724,6 +1750,7 @@ mod tests {
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics {
                 stored_totals_delta: 720,
                 provenance: crate::MetricProvenance {
@@ -1825,6 +1852,7 @@ mod tests {
             name: "cached".to_string(),
             path: live.to_string_lossy().to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -1889,6 +1917,7 @@ mod tests {
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
+                branch: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -1978,6 +2007,7 @@ mod tests {
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
+                branch: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -2057,6 +2087,7 @@ mod tests {
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
+                branch: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -2109,6 +2140,7 @@ mod tests {
                 name: format!("session-{i}"),
                 path: path.clone(),
                 cwd: String::new(),
+                branch: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -2762,6 +2794,7 @@ mod tests {
             name: "private session".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: "/work/secret".to_string(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,

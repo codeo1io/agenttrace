@@ -1087,6 +1087,7 @@ mod tests {
             name: name.to_string(),
             path: format!("/tmp/{name}.jsonl"),
             cwd: "/tmp/project".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 model_used: "unknown".to_string(),
                 tokens_input: 100,

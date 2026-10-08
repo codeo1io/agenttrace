@@ -130,6 +130,19 @@ pub struct Event {
         deserialize_with = "deserialize_string"
     )]
     pub cwd: String,
+    /// rm-585 (spend-by-branch, first cut): the branch the session ran
+    /// on, captured from the claude-code lane's `gitBranch` envelope
+    /// field onto the `session_meta` event beside `cwd`. Other lanes
+    /// leave it empty and the `by_branch` rollup buckets them under
+    /// "unknown"; the detached-HEAD literal "HEAD" is preserved here
+    /// verbatim and normalized to the same bucket only in the rollup.
+    #[serde(
+        default,
+        rename = "branch",
+        alias = "Branch",
+        deserialize_with = "deserialize_string"
+    )]
+    pub branch: String,
     #[serde(
         default,
         rename = "tool_calls",
@@ -479,6 +492,12 @@ pub struct Session {
     pub path: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub cwd: String,
+    /// rm-585: branch the session ran on (claude-code `gitBranch`,
+    /// first cut). Empty when the lane carries no branch; the overview
+    /// `by_branch` rollup buckets empty and detached-HEAD ("HEAD")
+    /// values under "unknown" instead of inventing a value.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub branch: String,
     pub metrics: Metrics,
     pub anomalies: Vec<Anomaly>,
     pub health: i32,
@@ -500,6 +519,13 @@ pub struct Overview {
     /// invented from name prefixes). Models the catalog cannot resolve
     /// bucket explicitly under "unknown" instead of being dropped.
     pub by_provider: BTreeMap<String, GroupOverview>,
+    /// rm-585 (spend-by-branch, first cut): branch attribution from the
+    /// claude-code lane's `gitBranch` envelope. Every session lands in
+    /// exactly one bucket: a branch name when carried, "unknown" when
+    /// missing, detached-HEAD ("HEAD"), or from a lane that has no
+    /// branch concept yet (codex/qwen/copilot — gap disclosed in the
+    /// governance guide). Sessions and cost only, like by_provider.
+    pub by_branch: BTreeMap<String, GroupOverview>,
     /// rm-245: heuristic task-type attribution. Correlation over parsed
     /// aggregates, not ground truth; see `infer_task_type`.
     pub by_task_type: BTreeMap<String, TaskTypeOverview>,
@@ -624,12 +650,18 @@ fn jsonl_source_tool(objects: &[serde_json::Map<String, Value>]) -> &'static str
 pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow::Result<Session> {
     let mut model = "default".to_string();
     let mut cwd = String::new();
+    let mut branch = String::new();
     for event in &events {
         if !event.model_used.is_empty() && event.model_used != "unknown" {
             model = event.model_used.clone();
         }
         if cwd.is_empty() && !event.cwd.is_empty() {
             cwd = event.cwd.clone();
+        }
+        // rm-585: the branch rides the same session_meta/meta event as
+        // cwd (claude-code writes both envelope fields on every line).
+        if branch.is_empty() && !event.branch.is_empty() {
+            branch = event.branch.clone();
         }
         if model != "default" && !cwd.is_empty() {
             break;
@@ -665,6 +697,7 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
         name: display_name,
         path: path.to_string(),
         cwd,
+        branch,
         metrics,
         anomalies,
         health,
@@ -1576,6 +1609,23 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .or_default();
         project_entry.sessions += 1;
         project_entry.cost += session.metrics.cost_estimated;
+
+        // rm-585 (spend-by-branch, first cut): branch values come only
+        // from the claude-code lane's gitBranch envelope. Missing,
+        // detached-HEAD ("HEAD") and no-branch-concept lanes all roll
+        // up under one stable "unknown" bucket, so every session lands
+        // in exactly one bucket and the sum over buckets always equals
+        // total_sessions. No token totals ride this dimension
+        // (GroupOverview, like by_provider), so nothing here needs the
+        // clamp+saturate contract the token-bearing dimensions obey.
+        let branch_bucket = if session.branch.is_empty() || session.branch == "HEAD" {
+            "unknown".to_string()
+        } else {
+            session.branch.clone()
+        };
+        let branch_entry = overview.by_branch.entry(branch_bucket).or_default();
+        branch_entry.sessions += 1;
+        branch_entry.cost += session.metrics.cost_estimated;
 
         for anomaly in &session.anomalies {
             overview.anomalies_top.push(AnomalyTop {
@@ -2945,6 +2995,7 @@ mod tests {
             name: "test".to_string(),
             path: "test".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,

@@ -264,6 +264,7 @@ mod tests {
             name: "billing".to_string(),
             path: "/tmp/billing.jsonl".to_string(),
             cwd: String::new(),
+            branch: String::new(),
             metrics,
             anomalies: Vec::new(),
             health: 100,

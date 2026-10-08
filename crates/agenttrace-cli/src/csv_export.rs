@@ -98,6 +98,10 @@ pub fn overview_csv(overview: &Overview) -> String {
     for (name, rows) in [
         ("by_model", &overview.by_model),
         ("by_provider", &overview.by_provider),
+        // rm-585 (spend-by-branch, first cut): same GroupOverview
+        // shape; "unknown" covers missing, detached-HEAD and lanes
+        // without a branch concept.
+        ("by_branch", &overview.by_branch),
     ] {
         if rows.is_empty() {
             continue;
@@ -318,6 +322,16 @@ mod tests {
                 cost: 2.0,
             },
         );
+        // rm-585 (spend-by-branch, first cut): the corpus carries no
+        // branches, so every session rolls up under one explicit
+        // unknown bucket — never dropped, never invented.
+        overview.by_branch.insert(
+            "unknown".to_string(),
+            agenttrace_core::GroupOverview {
+                sessions: 3,
+                cost: 2.5,
+            },
+        );
         let out = overview_csv(&overview);
         let lines: Vec<&str> = out.split("\r\n").collect();
         assert_eq!(lines[0], "# summary");
@@ -326,5 +340,30 @@ mod tests {
         assert!(out.contains("# by_model"));
         assert!(out.contains("claude-sonnet-4-5,2,2.0000"));
         assert!(!out.contains("# by_provider")); // empty sections omitted
+        assert!(
+            out.contains("# by_branch"),
+            "the branch section renders beside by_model: {out}"
+        );
+        assert!(out.contains("unknown,3,2.5000"));
+    }
+
+    #[test]
+    fn overview_csv_renders_named_branch_buckets() {
+        // rm-585: a claude-lane session carrying gitBranch attributes
+        // its spend to the named branch beside the unknown bucket.
+        use agenttrace_core::{compute_overview, demo_sessions};
+        let mut sessions = demo_sessions().expect("demo sessions parse");
+        sessions[0].branch = "feature/rm585-spend-by-branch".to_string();
+        sessions[1].branch = "feature/rm585-spend-by-branch".to_string();
+        let overview = compute_overview(&sessions);
+        let out = overview_csv(&overview);
+        assert!(
+            out.contains("feature/rm585-spend-by-branch,2,"),
+            "the named branch renders with its session count: {out}"
+        );
+        assert!(
+            out.contains("unknown,1,"),
+            "the branchless session still lands under unknown: {out}"
+        );
     }
 }

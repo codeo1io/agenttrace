@@ -216,6 +216,7 @@ impl DerivedSession {
             name: format!("history-{short_id}"),
             path: format!("history:{}", self.id),
             cwd: self.project,
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: self.source,
                 model_used: self.model,
@@ -255,6 +256,7 @@ mod tests {
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "codex_cli".to_string(),
                 model_used: "gpt-5".to_string(),
@@ -335,6 +337,7 @@ mod tests {
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 95,
@@ -376,6 +379,7 @@ mod tests {
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "codex_cli".to_string(),
                 model_used: "gpt-5".to_string(),
@@ -419,6 +423,7 @@ mod tests {
             name: "legacy row".to_string(),
             path: "/tmp/private/legacy.jsonl".to_string(),
             cwd: "/work/project".to_string(),
+            branch: String::new(),
             metrics: Metrics {
                 source_tool: "codex_cli".to_string(),
                 model_used: "gpt-5".to_string(),

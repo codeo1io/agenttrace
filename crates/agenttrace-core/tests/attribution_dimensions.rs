@@ -369,3 +369,124 @@ fn infer_task_type_is_public_for_documentation_examples() {
     let _: Option<Metrics> = None;
     let _: Option<&Session> = None;
 }
+
+// ---------------------------------------------------------------------------
+// rm-585 (run 4c3ca863, cycle 3): spend by branch — FIRST CUT, claude
+// lane only. The claude-code journal envelope carries gitBranch beside
+// cwd on every line; the session folds it and the overview exposes a
+// by_branch rollup beside by_provider. The cut is honest about its
+// gap: only the claude lane carries a branch today, so missing,
+// detached-HEAD ("HEAD") and every other lane roll up under one
+// stable "unknown" bucket — the gap is disclosed in the governance
+// guide, never hidden by inventing a branch name.
+// ---------------------------------------------------------------------------
+
+fn branched_demo_sessions() -> Vec<Session> {
+    let mut sessions = demo_sessions().expect("demo sessions parse");
+    // Two sessions on a named branch, one with no branch at all — the
+    // claude-vs-unknown shape the first cut ships with.
+    sessions[0].branch = "feature/rm585-spend-by-branch".to_string();
+    sessions[1].branch = "feature/rm585-spend-by-branch".to_string();
+    sessions
+}
+
+#[test]
+fn overview_json_exposes_by_branch_dimension() {
+    let sessions = branched_demo_sessions();
+    let overview = compute_overview(&sessions);
+    let report: Value = serde_json::from_str(&report_overview_json(&overview, &sessions))
+        .expect("valid overview json");
+    let branches = report["by_branch"]
+        .as_array()
+        .expect("by_branch is an array");
+    let named: Vec<&Value> = branches
+        .iter()
+        .filter(|item| item["name"].as_str() == Some("feature/rm585-spend-by-branch"))
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "sessions on the same branch share one bucket: {branches:?}"
+    );
+    assert_eq!(
+        named[0]["sessions"].as_u64(),
+        Some(2),
+        "both branch sessions attribute to the branch bucket"
+    );
+    let session_sum: usize = branches
+        .iter()
+        .map(|item| item["sessions"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    let total_sessions = report["summary"]["total_sessions"].as_u64().unwrap_or(0) as usize;
+    assert_eq!(
+        session_sum, total_sessions,
+        "branch buckets must account for every session exactly once"
+    );
+}
+
+#[test]
+fn by_branch_unknown_bucket_covers_missing_detached_and_other_lanes() {
+    let mut sessions = demo_sessions().expect("demo sessions parse");
+    for (index, session) in sessions.iter_mut().enumerate() {
+        session.branch = match index % 3 {
+            0 => "feature/rm585".to_string(),
+            1 => "HEAD".to_string(),
+            _ => String::new(),
+        };
+    }
+    let overview = compute_overview(&sessions);
+    let names: Vec<&str> = overview.by_branch.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        vec!["feature/rm585", "unknown"],
+        "detached-HEAD and missing branches roll up under one stable unknown bucket"
+    );
+    assert_eq!(
+        overview.by_branch["unknown"].sessions,
+        sessions.len() - overview.by_branch["feature/rm585"].sessions,
+        "unknown is the complement of the named buckets, never a dropped session"
+    );
+    // The detached literal itself is preserved verbatim on the session
+    // (only the rollup normalizes it).
+    let detached: Vec<&Session> = sessions.iter().filter(|s| s.branch == "HEAD").collect();
+    assert_eq!(
+        detached.len(),
+        1,
+        "the raw detached literal survives on the session for other surfaces"
+    );
+}
+
+#[test]
+fn by_branch_costs_match_by_model_baseline() {
+    // The branch lane is a re-slice of the same parsed totals, so its
+    // cost sums must equal the by-model rollup over the same corpus.
+    let sessions = branched_demo_sessions();
+    let overview = compute_overview(&sessions);
+    let by_branch_cost: f64 = overview.by_branch.values().map(|g| g.cost).sum();
+    let by_model_cost: f64 = overview.by_model.values().map(|g| g.cost).sum();
+    assert!(
+        (by_branch_cost - by_model_cost).abs() < 1e-9,
+        "bucket costs must reconcile with the by-model bill: {by_branch_cost} vs {by_model_cost}"
+    );
+}
+
+#[test]
+fn by_branch_renders_on_every_surface() {
+    // Same coherence pin the rm-245 dimensions carry: json, text,
+    // markdown and html all expose the branch rollup.
+    let sessions = branched_demo_sessions();
+    let overview = compute_overview(&sessions);
+    let text = report_overview_text(&overview, &sessions);
+    assert!(
+        text.contains("── By Branch ──"),
+        "text surface carries the branch rollup: {text}"
+    );
+    assert!(
+        text.contains("feature/rm585-spend-by-branch"),
+        "the named branch renders with its spend: {text}"
+    );
+    let markdown = report_overview_markdown(&overview, &sessions);
+    assert!(markdown.contains("## By branch"), "markdown: {markdown}");
+    let html = report_overview_html(&overview, &sessions);
+    assert!(html.contains("<h2>By branch</h2>"), "html");
+}
