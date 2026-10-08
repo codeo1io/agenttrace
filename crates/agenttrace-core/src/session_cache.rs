@@ -5,7 +5,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 40;
+// Bumped 32 -> 40 (integration of run 14954d7a, "journal truth:
+// contain hostile input, surface hidden wire", rm-880 + rm-406's
+// dated 2026-10-07 arm): Metrics gained two persisted-only fields —
+// `wire_metadata` (codex 0.160.1 session identity/lineage/quota wire
+// the fork of record read and dropped) and `model_attribution`
+// (per-model token/cost attribution for multi-model sessions, Claude
+// Code advisor turns) — round-tripped through the Go mirror above so
+// a cache hit keeps disclosing them. Same keys, same fingerprints: a
+// warm v32 cache would keep serving sessions whose hidden wire and
+// advisor split silently vanished on the cache hit (rm-230
+// convention: persisted-shape changes bump the schema so cached
+// sessions regenerate). The batch landed against its base aa5544af
+// at schema 32 and bumped it to 33 there; the commit gate re-bases
+// the bump onto the already-advanced ceiling (33 was run 32f3b7a1's
+// committed journal-restoration bump, 34..39 landed with other
+// campaigns while this cycle ran — origin/master 190b706 sits at 39;
+// landing 33 would have downgraded the cache format) per the same
+// convention. Entries regenerate once on next scan.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):
@@ -407,6 +425,26 @@ struct GoMetrics {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     disclosure_counters: BTreeMap<String, usize>,
+    /// rm-880: journal wire facts the accounting reads but does not
+    /// consume (codex 0.160.1 identity/lineage/quota wire),
+    /// round-tripped so a cache hit keeps disclosing the hidden wire
+    /// instead of silently dropping it — the rm-230 case class that
+    /// forced schema v40.
+    #[serde(
+        default,
+        rename = "WireMetadata",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    wire_metadata: BTreeMap<String, String>,
+    /// rm-406 (dated 2026-10-07 arm): per-model attribution for
+    /// multi-model sessions (Claude Code advisor turns), round-tripped
+    /// so cache hits keep the by_model split.
+    #[serde(
+        default,
+        rename = "ModelAttribution",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    model_attribution: BTreeMap<String, crate::ModelAttribution>,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
 }
@@ -1475,6 +1513,8 @@ impl GoMetrics {
             zero_usage_events: metrics.zero_usage_events,
             upstream_cost_usd: metrics.upstream_cost_usd,
             disclosure_counters: metrics.disclosure_counters.clone(),
+            wire_metadata: metrics.wire_metadata.clone(),
+            model_attribution: metrics.model_attribution.clone(),
             provenance: metrics.provenance.clone(),
         }
     }
@@ -1516,6 +1556,8 @@ impl GoMetrics {
             zero_usage_events: self.zero_usage_events,
             upstream_cost_usd: self.upstream_cost_usd,
             disclosure_counters: self.disclosure_counters,
+            wire_metadata: self.wire_metadata,
+            model_attribution: self.model_attribution,
             provenance: self.provenance,
         }
     }

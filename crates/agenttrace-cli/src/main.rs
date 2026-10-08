@@ -145,6 +145,16 @@ struct Args {
     lang: String,
     #[arg(long, default_value = "all")]
     range: String,
+    /// rm-779: keep only sessions whose resolved project matches this
+    /// filter. Matching is a case-insensitive SUBSTRING test against
+    /// any of the project's resolved identity, display name, and
+    /// filesystem root, so `--project storefront` keeps both
+    /// `/work/storefront` and `storefront-api`; use the encoded
+    /// `-work-projects-storefront` spelling for claude-encoded session
+    /// directories. The project resolves through the same identity
+    /// machinery as the report's by_project rollup (git-root grouping
+    /// when a `.git` is discoverable, else the normalized cwd, else
+    /// the encoded/unattributed fallbacks).
     #[arg(long, default_value = "")]
     project: String,
     #[arg(long, default_value = "")]

@@ -20,6 +20,15 @@ that way yet: on the interactive view they are accepted and ignored.
 
 Supported controls include `--range today|7d|30d|all`, `--project`, `--source`, `--model-filter`, `--query`, `--health`, `--cost`, `--anomaly`, `--sort`, `--order`, and `--limit`.
 
+`--project` matches by case-insensitive SUBSTRING against any of the
+resolved project identity, display name, and filesystem root (rm-779):
+`--project storefront` keeps `/work/storefront` and `storefront-api`
+alike, and an encoded Claude session directory matches its
+`-work-projects-storefront` spelling. Resolution mirrors the by_project
+rollup: git-root grouping when a `.git` is discoverable from the session
+cwd, else the normalized cwd itself, else the encoded/unattributed
+fallbacks.
+
 By default every governance report audits **every** session in scope, and the
 report discloses its coverage: `audited_sessions` / `total_sessions` /
 `excluded_reason` in JSON, and a leading `(auditing N of M sessions)` line in
@@ -69,7 +78,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 32 and the SQLite snapshot is schema 7; the
+The session cache is schema 40 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -109,7 +118,17 @@ Copilot per-model shutdown tracking with the shutdown timestamp tail
 integration as rm-601..rm-603 with rm-555 folded into the landed
 rm-551; schema landed as 31 → 32, re-basing the campaign's own
 26 → 27 bump onto the ceiling) —
-so cached sessions regenerate under the corrected totals; the SQLite snapshot to 7
+so cached sessions regenerate under the corrected totals, and to 40 when
+the journal-truth batch joined `Metrics.wire_metadata` (codex 0.160.1
+identity/lineage/quota wire, rm-880 — minted campaign-locally as
+rm-776 and rebound at the commit gate; schema landed as 33 → 40,
+re-basing the campaign's own 32 → 33 bump onto the ceiling since
+advanced to 39 by other campaigns' landings) and `Metrics.model_attribution`
+(per-model token/cost attribution for multi-model sessions, rm-406) to
+the persisted metrics — a warm cache that predates the fields would keep
+serving sessions whose hidden wire and advisor split silently vanished
+on the cache hit —
+the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are

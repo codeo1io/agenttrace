@@ -104,6 +104,65 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
     session_from_events(&name, &dir.to_string_lossy(), events)
 }
 
+/// rm-778: journal-derived session cwd is hostile-input surface. A
+/// journal can declare a cwd of unbounded length and depth, and every
+/// consumer built on it — lexical normalization, git-root discovery,
+/// project grouping — then does work proportional to the hostile
+/// string (assess 0ff2b543 F1: a 500k-component cwd drove a 133.9 s
+/// cold overview). Every lane that reads a cwd off the journal caps
+/// it at parse time, and the truncation stays visible as a
+/// `cwd_truncated:<source_tool>` disclosure counter instead of
+/// silently rewriting the record. Bytes, not chars: a byte cap keeps
+/// the worst case exactly one allocation of this size, with a
+/// char-boundary backoff so no multi-byte scalar is split.
+pub(crate) const SESSION_CWD_BYTE_CAP: usize = 4096;
+
+/// Cap a journal-derived cwd at [`SESSION_CWD_BYTE_CAP`] bytes (UTF-8
+/// boundary safe). Returns the capped string and whether truncation
+/// happened, so call sites can mint the disclosure.
+pub(crate) fn cap_session_cwd(raw: &str) -> (String, bool) {
+    if raw.len() <= SESSION_CWD_BYTE_CAP {
+        return (raw.to_string(), false);
+    }
+    let mut cut = SESSION_CWD_BYTE_CAP;
+    while cut > 0 && !raw.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (raw[..cut].to_string(), true)
+}
+
+/// The `cwd_truncated:<lane>` disclosure map for a truncation result —
+/// empty (and therefore absent from every serialized shape) when the
+/// journal's cwd was within the cap.
+pub(crate) fn cwd_truncation_disclosure(lane: &str, truncated: bool) -> BTreeMap<String, i64> {
+    if truncated {
+        [(format!("cwd_truncated:{lane}"), 1_i64)]
+            .into_iter()
+            .collect()
+    } else {
+        BTreeMap::new()
+    }
+}
+
+/// rm-880: put a journal-derived wire value into the session's wire
+/// metadata map. Values are journal-controlled strings, so they pass
+/// through the shared rm-594 treatment — control bytes die, and a
+/// hostile-length value renders as prefix+digest instead of flowing
+/// into reports and the session cache at full size.
+fn put_wire_str(map: &mut BTreeMap<String, String>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        map.insert(key.to_string(), capped_disclosure_value(value));
+    }
+}
+
+/// Numeric wire facts (ordinals, offsets) join the map through the
+/// same bounded path as strings.
+fn put_wire_u64(map: &mut BTreeMap<String, String>, key: &str, value: Option<&Value>) {
+    if let Some(number) = value.and_then(number_as_i64) {
+        map.insert(key.to_string(), number.to_string());
+    }
+}
+
 pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Session> {
     // Strip one UTF-8 BOM at offset 0 and nowhere else (pass-7 P7-2):
     // every parse path funnels through this entry, so a single strip
@@ -316,18 +375,25 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         let timestamp = string(entry.get("timestamp")).unwrap_or("").to_string();
         let data = entry.get("data").and_then(Value::as_object);
         match typ {
-            "session.start" => events.push(Event {
-                role: "session_meta".to_string(),
-                timestamp,
-                cwd: data
-                    .and_then(|data| data.get("context"))
-                    .and_then(|context| context.get("cwd"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                source_tool: "copilot_cli".to_string(),
-                ..Event::default()
-            }),
+            "session.start" => {
+                // rm-778: cap the journal-derived cwd at parse time and
+                // disclose the truncation instead of carrying the
+                // hostile string into every downstream walk.
+                let (cwd, cwd_truncated) = cap_session_cwd(
+                    data.and_then(|data| data.get("context"))
+                        .and_then(|context| context.get("cwd"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                events.push(Event {
+                    role: "session_meta".to_string(),
+                    timestamp,
+                    cwd,
+                    source_tool: "copilot_cli".to_string(),
+                    disclosure_counters: cwd_truncation_disclosure("copilot_cli", cwd_truncated),
+                    ..Event::default()
+                });
+            }
             "user.message" | "assistant.message" => events.push(Event {
                 role: typ.trim_end_matches(".message").to_string(),
                 content: data
@@ -1065,7 +1131,12 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
             .and_then(number_as_i64)
             .map(timestamp_millis)
             .unwrap_or_default();
-        let cwd = string(entry.get("cwd")).unwrap_or("").to_string();
+        // rm-778: cap the journal-derived cwd at parse time; the
+        // truncation disclosure rides every event that carries the cwd
+        // (workbuddy journals repeat cwd on every entry, so the counter
+        // counts truncated observations, not sessions).
+        let (cwd, cwd_truncated) = cap_session_cwd(string(entry.get("cwd")).unwrap_or(""));
+        let cwd_disclosure = cwd_truncation_disclosure("workbuddy", cwd_truncated);
         match string(entry.get("type")).unwrap_or("") {
             "message" => {
                 let role = string(entry.get("role")).unwrap_or("");
@@ -1078,6 +1149,7 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
                         cwd,
                         model_used: model.clone(),
                         source_tool: "workbuddy".to_string(),
+                        disclosure_counters: cwd_disclosure.clone(),
                         ..Event::default()
                     });
                 }
@@ -1114,6 +1186,7 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
                         cwd,
                         model_used: model.clone(),
                         source_tool: "workbuddy".to_string(),
+                        disclosure_counters: cwd_disclosure.clone(),
                         ..Event::default()
                     });
                 }
@@ -1137,6 +1210,7 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
                     }],
                     model_used: model.clone(),
                     source_tool: "workbuddy".to_string(),
+                    disclosure_counters: cwd_disclosure.clone(),
                     ..Event::default()
                 });
             }
@@ -1149,6 +1223,7 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
                 is_error: string(entry.get("status")).is_some_and(|status| status != "completed"),
                 model_used: model.clone(),
                 source_tool: "workbuddy".to_string(),
+                disclosure_counters: cwd_disclosure.clone(),
                 ..Event::default()
             }),
             _ => {}
@@ -1815,11 +1890,14 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
             }
             seen_header = true;
             if let Some(cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty()) {
+                // rm-778: cap the journal-derived cwd at parse time.
+                let (cwd, cwd_truncated) = cap_session_cwd(cwd);
                 header_meta_index = Some(meta_events.len());
                 meta_events.push(Event {
                     role: "meta".to_string(),
-                    cwd: cwd.to_string(),
+                    cwd,
                     source_tool: source_tool.clone(),
+                    disclosure_counters: cwd_truncation_disclosure("oh_my_pi", cwd_truncated),
                     ..Event::default()
                 });
             }
@@ -2908,6 +2986,13 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     // growth inside the old envelope even though those context re-sends
     // are billed usage.
     let mut codex_totals = CodexTotals::default();
+    // rm-880: session-level quota wire extracted off token_count
+    // rate_limits snapshots (stable identity facts: plan, limit id /
+    // name) plus the observed-line count. The values ride the token
+    // meta events; the fold in `analyze` is last-wins, so the freshest
+    // snapshot a journal carried is the one the report serves.
+    let mut codex_rate_wire: BTreeMap<String, String> = BTreeMap::new();
+    let mut codex_rate_limit_lines: i64 = 0;
     // rm-047: the head-probe fast path used to discard lines invisibly;
     // count every skip so parse diagnostics can surface it. rm-401
     // widened the map to the compaction-usage decisions too.
@@ -2962,12 +3047,92 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             "session_meta" => {
                 saw_codex = true;
                 let mut cwd = String::new();
+                // rm-880: codex 0.160.1 persists identity, lineage, and
+                // quota wire on session_meta that the accounting never
+                // consumes (research ee3cd7c2 C1, upstream #47113 +
+                // #51415): creator identity, fork/parent lineage,
+                // history_base, and the agent_* persona fields. Extract
+                // them into the session's wire metadata — JSON-disclosed,
+                // token totals untouched — and mint
+                // `codex_fork_lineage_unfollowed` when the session is a
+                // fork/child so the unfollowed lineage stays visible
+                // until rm-402 composes it.
+                let mut wire: BTreeMap<String, String> = BTreeMap::new();
                 if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
                     if let Some(next_model) = string(payload.get("model")).filter(|m| !m.is_empty())
                     {
                         model = next_model.to_string();
                     }
                     cwd = string(payload.get("cwd")).unwrap_or("").to_string();
+                    put_wire_str(
+                        &mut wire,
+                        "codex_creator_user_id",
+                        string(payload.get("creator_user_id")),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_creator_account_id",
+                        string(payload.get("creator_account_id")),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_agent_nickname",
+                        string(payload.get("agent_nickname")),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_agent_role",
+                        string(payload.get("agent_role")),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_agent_path",
+                        string(payload.get("agent_path")),
+                    );
+                    put_wire_str(&mut wire, "codex_source", string(payload.get("source")));
+                }
+                // Lineage keys can ride either the payload directly
+                // (forked_from_id / parent_thread_id) or the nested
+                // history_base thread reference; both are linkage keys
+                // for rm-402's composition.
+                let payload = obj.get("payload");
+                if let Some(payload) = payload.and_then(Value::as_object) {
+                    put_wire_str(
+                        &mut wire,
+                        "codex_forked_from_id",
+                        string(payload.get("forked_from_id")),
+                    );
+                    put_wire_u64(
+                        &mut wire,
+                        "codex_forked_from_ordinal_exclusive",
+                        payload.get("forked_from_ordinal_exclusive"),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_parent_thread_id",
+                        string(payload.get("parent_thread_id")),
+                    );
+                    if let Some(base) = payload.get("history_base").and_then(Value::as_object) {
+                        put_wire_str(
+                            &mut wire,
+                            "codex_history_base_thread_id",
+                            string(base.get("thread_id")),
+                        );
+                        put_wire_u64(
+                            &mut wire,
+                            "codex_history_base_end_ordinal_exclusive",
+                            base.get("end_ordinal_exclusive"),
+                        );
+                    }
+                }
+                // rm-778: cap the journal-derived cwd at parse time.
+                let (cwd, cwd_truncated) = cap_session_cwd(&cwd);
+                let mut disclosure = cwd_truncation_disclosure("codex_cli", cwd_truncated);
+                let forked = wire.contains_key("codex_forked_from_id")
+                    || wire.contains_key("codex_parent_thread_id")
+                    || wire.contains_key("codex_history_base_thread_id");
+                if forked {
+                    disclosure.insert("codex_fork_lineage_unfollowed".to_string(), 1);
                 }
                 events.push(Event {
                     role: "meta".to_string(),
@@ -2975,6 +3140,8 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     cwd,
                     model_used: model.clone(),
                     source_tool: "codex_cli".to_string(),
+                    disclosure_counters: disclosure,
+                    wire_metadata: wire,
                     ..Event::default()
                 });
             }
@@ -2999,19 +3166,96 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
                     continue;
                 };
-                if string(payload.get("type")) == Some("token_count") {
+                let payload_type = string(payload.get("type"));
+                if payload_type == Some("token_count") {
+                    // rm-880: the rate_limits snapshot rides the token
+                    // line itself (codex 0.160.1 wire) — extract its
+                    // stable identity facts and count the observation;
+                    // the per-window numbers are churn, not session
+                    // identity, and stay out of the accounting.
+                    if let Some(rate_limits) = payload.get("rate_limits").and_then(Value::as_object)
+                    {
+                        codex_rate_limit_lines += 1;
+                        put_wire_str(
+                            &mut codex_rate_wire,
+                            "codex_plan_type",
+                            string(rate_limits.get("plan_type")),
+                        );
+                        put_wire_str(
+                            &mut codex_rate_wire,
+                            "codex_rate_limit_id",
+                            string(rate_limits.get("limit_id")),
+                        );
+                        put_wire_str(
+                            &mut codex_rate_wire,
+                            "codex_rate_limit_name",
+                            string(rate_limits.get("limit_name")),
+                        );
+                    }
                     if let Some(usage) =
                         codex_token_count_usage(payload.get("info"), &mut codex_totals)
                     {
+                        let mut disclosure = BTreeMap::new();
+                        if codex_rate_limit_lines > 0 {
+                            disclosure.insert(
+                                "codex_rate_limits_observed".to_string(),
+                                codex_rate_limit_lines,
+                            );
+                        }
                         events.push(Event {
                             role: "meta".to_string(),
                             timestamp: ts,
                             usage,
                             model_used: model.clone(),
                             source_tool: "codex_cli".to_string(),
+                            disclosure_counters: disclosure,
+                            wire_metadata: codex_rate_wire.clone(),
                             ..Event::default()
                         });
                     }
+                } else if payload_type == Some("session_configured") {
+                    // rm-880: codex 0.160.1 persists a session_configured
+                    // event (upstream #51415) carrying the thread's
+                    // human title, provider, and service tier. Extract
+                    // into wire metadata — token totals untouched (the
+                    // event carries no usage).
+                    let mut wire: BTreeMap<String, String> = BTreeMap::new();
+                    put_wire_str(
+                        &mut wire,
+                        "codex_thread_name",
+                        string(payload.get("thread_name")),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_model_provider_id",
+                        string(payload.get("model_provider_id")),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_service_tier",
+                        string(payload.get("service_tier")),
+                    );
+                    // Fork linkage re-asserted on session_configured
+                    // (the authoritative copy is session_meta's, which
+                    // also mints the unfollowed disclosure).
+                    put_wire_str(
+                        &mut wire,
+                        "codex_forked_from_id",
+                        string(payload.get("forked_from_id")),
+                    );
+                    put_wire_str(
+                        &mut wire,
+                        "codex_parent_thread_id",
+                        string(payload.get("parent_thread_id")),
+                    );
+                    events.push(Event {
+                        role: "meta".to_string(),
+                        timestamp: ts,
+                        model_used: model.clone(),
+                        source_tool: "codex_cli".to_string(),
+                        wire_metadata: wire,
+                        ..Event::default()
+                    });
                 }
             }
             "response_item" => {
@@ -3365,7 +3609,10 @@ fn json_value_kind(value: &Value) -> &'static str {
 // Codex rollouts are dominated by event_msg payloads (item_completed carries
 // full tool output); skip them before JSON-decoding the line. The usage-bearing
 // token_count event is the one event_msg worth keeping: rescue it whenever its
-// marker appears anywhere in the line at a key boundary. compacted lines
+// marker appears anywhere in the line at a key boundary. session_configured
+// (rm-880: thread_name / model_provider_id / service_tier / fork linkage —
+// persisted since codex 0.160.1, upstream #47113/#51415) is rescued the
+// same way so the wire never reverts to silently dropped. compacted lines
 // deliberately do NOT take this fast path (rm-401): they are rare (one
 // per compaction boundary) and they now carry the pairing data
 // (compaction_response_id / latest_token_usage_record) for the compaction
@@ -3377,6 +3624,7 @@ fn codex_line_is_ignorable(line: &str) -> bool {
     };
     json_key_present(head, r#""type":"event_msg""#)
         && !json_key_present(line, r#""type":"token_count""#)
+        && !json_key_present(line, r#""type":"session_configured""#)
 }
 
 /// True when `needle` occurs in `line` at a JSON key position (the byte
@@ -3528,17 +3776,27 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // collapse to the same values; id-less messages keep the legacy
     // behavior of counting every emission (pinned by fixture).
     let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
+    // rm-406 (dated 2026-10-07 arm): message ids whose usage.iterations[]
+    // array was already mined — the streaming re-emission problem rm-601
+    // solved for top-level usage applies to the iterations array verbatim
+    // (every re-emission repeats it in full).
+    let mut iterations_mined: BTreeSet<String> = BTreeSet::new();
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
         if cwd.is_empty() {
             if let Some(body_cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty()) {
-                cwd = body_cwd.to_string();
+                // rm-778: cap the journal-derived cwd at parse time
+                // (assess 0ff2b543 F1: the claude lane's unbounded cwd
+                // was the 500k-component PoC's entry point).
+                let (capped, cwd_truncated) = cap_session_cwd(body_cwd);
+                cwd = capped;
                 events.push(Event {
                     role: "session_meta".to_string(),
                     cwd: cwd.clone(),
                     model_used: model.clone(),
                     source_tool: "claude_code".to_string(),
+                    disclosure_counters: cwd_truncation_disclosure("claude_code", cwd_truncated),
                     ..Event::default()
                 });
             }
@@ -3588,6 +3846,16 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         }
                     }
                 }
+                // rm-406 (dated 2026-10-07 arm): Claude Code advisor-model
+                // usage rides message.usage.iterations[] (tokscale #1386):
+                // advisor turns report their own model and their own usage
+                // while top-level usage covers the main model only, so a
+                // journal with an active advisor under-reports by exactly
+                // the advisor's spend. Mine the array per message id (once —
+                // streaming re-emissions repeat it verbatim); type:"message"
+                // entries are sub-turn duplicates of the top-level numbers
+                // and are NEVER folded, only disclosed.
+                claude_iterations_events(message, &ts, &model, &mut iterations_mined, &mut events);
                 let mut assistant_parts = Vec::new();
                 let mut reasoning_parts = Vec::new();
                 let mut tool_calls = Vec::new();
@@ -3659,6 +3927,108 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         non_empty(events)
     } else {
         None
+    }
+}
+
+/// rm-406 (dated 2026-10-07 arm): mine `message.usage.iterations[]`
+/// (Claude Code advisor turns, tokscale #1386) into per-model usage
+/// attribution. Advisor turns name their own model, so each folded
+/// entry rides its OWN meta event — `analyze` then folds it into the
+/// session totals (additive) and per-block catalog pricing prices it
+/// at the advisor model's rate. type:"message" entries are sub-turn
+/// duplicates of the top-level usage and never fold — they and every
+/// unrecognized shape surface as disclosure counters instead of
+/// silently vanishing or double-counting.
+fn claude_iterations_events(
+    message: &JsonObject,
+    ts: &str,
+    model: &str,
+    mined: &mut BTreeSet<String>,
+    events: &mut Vec<Event>,
+) {
+    let message_id = string(message.get("id")).unwrap_or("");
+    // Id-less messages mirror the legacy rm-601 behavior for top-level
+    // usage (every emission counts); an id-bearing message is mined
+    // exactly once no matter how many streaming rows repeat the array.
+    if !message_id.is_empty() && !mined.insert(message_id.to_string()) {
+        return;
+    }
+    let Some(iterations) = message
+        .get("usage")
+        .and_then(|usage| usage.get("iterations"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    // Folded/declined counters for this array land on one disclosure
+    // event so they reach metrics.disclosure_counters without
+    // inflating the event stream.
+    let mut disclosure: BTreeMap<String, i64> = BTreeMap::new();
+    let mut attributed: i64 = 0;
+    for iteration in iterations {
+        let Some(entry) = iteration.as_object() else {
+            *disclosure
+                .entry("claude_iterations_non_object".to_string())
+                .or_insert(0) += 1;
+            continue;
+        };
+        let typ = string(entry.get("type")).unwrap_or("");
+        if typ == "message" {
+            // Sub-turn duplicate of the top-level usage — folding it
+            // would double the session totals.
+            *disclosure
+                .entry("claude_iterations_message_unfolded".to_string())
+                .or_insert(0) += 1;
+            continue;
+        }
+        let advisor_model = string(entry.get("model")).filter(|model| !model.is_empty());
+        if typ == "advisor_message" {
+            if let Some(advisor_model) = advisor_model {
+                if let Some(usage) = usage_from_value(iteration) {
+                    attributed += 1;
+                    events.push(Event {
+                        role: "meta".to_string(),
+                        timestamp: ts.to_string(),
+                        usage,
+                        model_used: advisor_model.to_string(),
+                        source_tool: "claude_code".to_string(),
+                        ..Event::default()
+                    });
+                    continue;
+                }
+                // Advisor entry whose usage keys are absent: disclose,
+                // never guess zeros.
+                *disclosure
+                    .entry("claude_iterations_advisor_usage_missing".to_string())
+                    .or_insert(0) += 1;
+                continue;
+            }
+        }
+        // Unknown or model-less shapes: disclosed by wire type, capped
+        // by the shared rm-594 treatment.
+        let shape = if typ.trim().is_empty() {
+            "missing_type"
+        } else {
+            typ
+        };
+        let key = disclosure_key("claude_iterations_unknown", shape);
+        *disclosure.entry(key).or_insert(0) += 1;
+    }
+    if attributed > 0 {
+        disclosure.insert(
+            "claude_iterations_advisor_attributed".to_string(),
+            attributed,
+        );
+    }
+    if !disclosure.is_empty() {
+        events.push(Event {
+            role: "meta".to_string(),
+            timestamp: ts.to_string(),
+            model_used: model.to_string(),
+            source_tool: "claude_code".to_string(),
+            disclosure_counters: disclosure,
+            ..Event::default()
+        });
     }
 }
 

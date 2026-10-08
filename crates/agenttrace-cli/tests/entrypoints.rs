@@ -27,6 +27,39 @@ fn cli_entrypoint_reads_generated_fixture() {
 }
 
 #[test]
+fn project_filter_no_match_exits_loud() {
+    // rm-779 review fix F2 (run 14954d7a independent_review): a
+    // --project filter that matches nothing must be a loud rc!=0
+    // error on stderr — never an empty success — matching the
+    // contract documented in `--help` and the governance guide. The
+    // matching/keeping semantics are pinned at the unit in
+    // agenttrace-core (`project_matches_is_case_insensitive_substring_over_all_identities`).
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--overview",
+            "-f",
+            "json",
+            "--project",
+            "zzz-nomatch-pin",
+            generated_fixture("detailed-tool-steps.jsonl")
+                .to_str()
+                .expect("fixture path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !output.status.success(),
+        "no-match --project must exit non-zero, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No sessions match the requested filters"),
+        "expected the loud filter error, got: {stderr:?}"
+    );
+}
+
+#[test]
 fn cli_version_wins_over_action_validation() {
     // Pass-6 P6-2: `--overview --version` used to exit 1 because action
     // validation ran before the version early-return while `--version` is

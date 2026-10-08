@@ -638,6 +638,13 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 // Project views resolve thousands of sessions per frame; the filesystem walk is memoized per cwd.
+// rm-778: the memo is size-bounded — hostile or corrupted journals can
+// mint unlimited DISTINCT cwd strings, and an unbounded map would grow
+// with the corpus until the process dies. The eviction is whole-map
+// (simple, and re-populates from the live view); parse-time cwd caps
+// keep any single key ≤ SESSION_CWD_BYTE_CAP+ bytes.
+const GIT_ROOT_MEMO_MAX_ENTRIES: usize = 10_000;
+
 fn git_root(path: &Path) -> Option<PathBuf> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -648,13 +655,25 @@ fn git_root(path: &Path) -> Option<PathBuf> {
     }
     let found = find_git_root(path);
     if let Ok(mut map) = cache.lock() {
+        if map.len() >= GIT_ROOT_MEMO_MAX_ENTRIES {
+            map.clear();
+        }
         map.insert(path.to_path_buf(), found.clone());
     }
     found
 }
 
+// rm-778: the ancestor walk is DEPTH-bounded. Unbounded, a hostile
+// cwd (deep component stack or a chain of not-yet-capped generic-lane
+// paths) turns one resolve into thousands of stat calls; 64 levels is
+// far beyond any real repository layout (the kernel sits at ~15) and
+// past it the path simply has no discoverable git root — it resolves
+// as `cwd`, the honest answer for a path that deep.
+const GIT_ROOT_MAX_DEPTH: usize = 64;
+
 fn find_git_root(path: &Path) -> Option<PathBuf> {
     let mut current = if path.is_dir() { path } else { path.parent()? };
+    let mut depth = 0;
     loop {
         let marker = current.join(".git");
         if marker.is_dir() {
@@ -662,6 +681,10 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
         }
         if marker.is_file() {
             return Some(worktree_main_root(&marker).unwrap_or_else(|| current.to_path_buf()));
+        }
+        depth += 1;
+        if depth >= GIT_ROOT_MAX_DEPTH {
+            return None;
         }
         current = current.parent()?;
     }
@@ -989,6 +1012,31 @@ mod tests {
             project_decode_status(&session_at("/somewhere", "/any/projects/-x/s.jsonl")),
             ProjectDecodeStatus::NotConsulted
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_matches_is_case_insensitive_substring_over_all_identities() {
+        // rm-779 review fix F2 (run 14954d7a independent_review): the
+        // --project contract, pinned at the unit it lives in — an
+        // empty/whitespace filter keeps everything, otherwise a
+        // case-insensitive substring match over the resolved project
+        // identity: id, display name, or root. This is the documented
+        // contract in `--help` and the governance guide.
+        let root = unique_decode_root("projectfilter");
+        let repo = root.join("My-Repo");
+        fs::create_dir_all(repo.join(".git")).expect("create fixture repo");
+        let session = session_at(&repo.to_string_lossy(), "/x.jsonl");
+        let project = resolve_project(&session);
+        assert_eq!(project.display_name, "My-Repo");
+
+        assert!(project_matches(&session, ""));
+        assert!(project_matches(&session, "   "));
+        assert!(project_matches(&session, "my-repo"));
+        assert!(project_matches(&session, "MY-REPO"));
+        assert!(project_matches(&session, "my-rep"));
+        assert!(project_matches(&session, "projectfilter"));
+        assert!(!project_matches(&session, "zzz-nomatch"));
         let _ = fs::remove_dir_all(root);
     }
 
