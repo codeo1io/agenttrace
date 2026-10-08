@@ -803,70 +803,151 @@ fn antigravity_model_id(obj: &Map<String, Value>) -> Option<String> {
         .filter(|model| !model.is_empty())
 }
 
-/// rm-720 fold state: sums per-generation usage blocks and emits ONE
-/// meta event carrying the session totals, the last-seen model id and
-/// the basis counters (lib.rs's meta arm folds usage maps additively,
-/// so a single totals event is exactly right for summed blocks).
-struct AntigravityUsageFold {
+/// rm-825: one model's accumulated totals inside the fold. Kept per
+/// model (not session-wide) so lib.rs's per-block pricing arm can bill
+/// each model's usage block at THAT model's rates.
+struct AntigravityModelTotals {
     usage: BTreeMap<String, i64>,
-    model: String,
-    models_seen: usize,
     generations: usize,
     latest_timestamp: String,
+}
+
+impl AntigravityModelTotals {
+    fn new() -> Self {
+        AntigravityModelTotals {
+            usage: BTreeMap::new(),
+            generations: 0,
+            latest_timestamp: String::new(),
+        }
+    }
+}
+
+/// rm-720/rm-825 fold state: sums per-generation usage blocks PER MODEL
+/// and emits one meta event per observed model (plus one for usage that
+/// carries no model id). lib.rs's meta arm folds usage maps additively
+/// and its per-block pricing arm (`usage_blocks_multi_model`) bills each
+/// model's block at that model's rates — so a multi-model session no
+/// longer prices every token at the LAST generation's model (the assess
+/// PoC: 1M in / 100k out on gemini-2.5-pro plus the same on
+/// gemini-2.5-flash priced $1.10 all at flash rates where the truthful
+/// per-model sum is $2.80). Single-model journals are byte-identical in
+/// behavior to the old single-meta fold (catalog pricing, same basis
+/// counter).
+struct AntigravityUsageFold {
+    per_model: BTreeMap<String, AntigravityModelTotals>,
+    unattributed: BTreeMap<String, i64>,
+    unattributed_generations: usize,
+    generations: usize,
 }
 
 impl AntigravityUsageFold {
     fn new() -> Self {
         AntigravityUsageFold {
-            usage: BTreeMap::new(),
-            model: String::new(),
-            models_seen: 0,
+            per_model: BTreeMap::new(),
+            unattributed: BTreeMap::new(),
+            unattributed_generations: 0,
             generations: 0,
-            latest_timestamp: String::new(),
         }
     }
 
     fn fold(&mut self, usage: &BTreeMap<String, i64>, model: Option<String>, timestamp: &str) {
         self.generations += 1;
-        for (key, value) in usage {
-            *self.usage.entry(key.clone()).or_insert(0) += *value;
+        match model {
+            Some(model) => {
+                let totals = self
+                    .per_model
+                    .entry(model)
+                    .or_insert_with(AntigravityModelTotals::new);
+                totals.generations += 1;
+                for (key, value) in usage {
+                    *totals.usage.entry(key.clone()).or_insert(0) += *value;
+                }
+                totals.latest_timestamp = later_rfc3339(&totals.latest_timestamp, timestamp);
+            }
+            None => {
+                // rm-825: a generation with usage but no model id is NOT
+                // attributed to the last-seen model — that was exactly the
+                // mispricing this row fixes. It folds into its own block,
+                // which lib.rs prices at the session default, and the
+                // disclosure carrier names it
+                // (`generation_model_unattributed`).
+                self.unattributed_generations += 1;
+                for (key, value) in usage {
+                    *self.unattributed.entry(key.clone()).or_insert(0) += *value;
+                }
+            }
         }
-        if let Some(model) = model {
-            self.models_seen += 1;
-            self.model = model;
-        }
-        self.latest_timestamp = later_rfc3339(&self.latest_timestamp, timestamp);
     }
 
-    fn meta_event(&self) -> Option<Event> {
+    fn meta_events(&self) -> Vec<Event> {
         if self.generations == 0 {
-            return None;
+            return Vec::new();
         }
-        // Units (review 3e3a2198 F8): `planner_response_summed` counts
-        // GENERATIONS — one folded completion turn each, so a multi-turn
-        // session reports N, not 1; `multi_model_last_wins` counts model-id
-        // SIGHTINGS across those generations (and the model id itself is
-        // last-wins). Neither counter is a session count.
+        // Units (review 3e3a2198 F8, re-scoped rm-825): the basis counter
+        // counts GENERATIONS — one folded completion turn each, so a
+        // multi-turn session reports N, not 1. rm-825 replaces the
+        // `multi_model_last_wins` sighting counter (which fired on
+        // multiple SIGHTINGS of one model and flagged a cost that is now
+        // simply RIGHT) with `multi_model_priced_per_model` — a true
+        // statement of what the fold now does — plus per-model generation
+        // counts. Per-model keys route through the one capped+sanitized
+        // mint helper (rm-594): a journal-derived model id must not
+        // launder an over-long or ANSI-laden string into the counter map.
+        let mut events = Vec::new();
+        for (model, totals) in &self.per_model {
+            events.push(Event {
+                role: "meta".to_string(),
+                timestamp: totals.latest_timestamp.clone(),
+                usage: totals.usage.clone(),
+                model_used: model.clone(),
+                source_tool: "antigravity_cli".to_string(),
+                ..Event::default()
+            });
+        }
+        if self.unattributed_generations > 0 {
+            // Empty model id and empty timestamp: usage folds (lib.rs's
+            // meta arm sums it and prices it at the session default), but
+            // the session model cannot move and no usage_models entry is
+            // minted.
+            events.push(Event {
+                role: "meta".to_string(),
+                usage: self.unattributed.clone(),
+                source_tool: "antigravity_cli".to_string(),
+                ..Event::default()
+            });
+        }
+        // rm-721 pattern: one bare disclosure carrier — no usage, empty
+        // timestamp — so nothing else in the metrics can move.
         let mut counters = BTreeMap::new();
         counters.insert(
             "antigravity_usage_basis:planner_response_summed".to_string(),
             self.generations as i64,
         );
-        if self.models_seen > 1 {
+        for (model, totals) in &self.per_model {
             counters.insert(
-                "antigravity_model:multi_model_last_wins".to_string(),
-                self.models_seen as i64,
+                disclosure_key("antigravity_model_generations", model),
+                totals.generations as i64,
             );
         }
-        Some(Event {
+        if self.per_model.len() > 1 {
+            counters.insert(
+                "antigravity_model:multi_model_priced_per_model".to_string(),
+                self.per_model.len() as i64,
+            );
+        }
+        if self.unattributed_generations > 0 {
+            counters.insert(
+                "antigravity_usage_basis:generation_model_unattributed".to_string(),
+                self.unattributed_generations as i64,
+            );
+        }
+        events.push(Event {
             role: "meta".to_string(),
-            timestamp: self.latest_timestamp.clone(),
-            usage: self.usage.clone(),
-            model_used: self.model.clone(),
             disclosure_counters: counters,
             source_tool: "antigravity_cli".to_string(),
             ..Event::default()
-        })
+        });
+        events
     }
 }
 
@@ -1022,9 +1103,11 @@ fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
             _ => {}
         }
     }
-    // rm-720: one meta event carries the folded usage totals and the
-    // model id, so pricing resolves or discloses — never silently $0.
-    if let Some(meta) = usage_fold.meta_event() {
+    // rm-720/rm-825: one meta event PER MODEL carries that model's
+    // folded usage totals (plus a bare disclosure carrier), so pricing
+    // resolves each model at its own rates — or discloses — never
+    // silently $0 or last-wins.
+    for meta in usage_fold.meta_events() {
         events.insert(0, meta);
     }
     non_empty(events)
@@ -1092,9 +1175,11 @@ fn parse_antigravity_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             }),
         }
     }
-    // rm-720: same fold as the trajectory sidecar — one meta event
-    // carries the summed generation totals and the model id.
-    if let Some(meta) = usage_fold.meta_event() {
+    // rm-720/rm-825: same fold as the trajectory sidecar — one meta
+    // event per model carries that model's summed generation totals
+    // (plus a bare disclosure carrier), so each model prices at its own
+    // rates.
+    for meta in usage_fold.meta_events() {
         events.insert(0, meta);
     }
     non_empty(events)
@@ -3223,9 +3308,11 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     continue;
                 };
                 if string(payload.get("type")) == Some("token_count") {
-                    if let Some(usage) =
-                        codex_token_count_usage(payload.get("info"), &mut codex_totals)
-                    {
+                    if let Some(usage) = codex_token_count_usage(
+                        payload.get("info"),
+                        &mut codex_totals,
+                        &mut counters,
+                    ) {
                         events.push(Event {
                             role: "meta".to_string(),
                             timestamp: ts,
@@ -3680,6 +3767,7 @@ fn json_container_depth(bytes: &[u8], pos: usize) -> usize {
 fn codex_token_count_usage(
     raw_info: Option<&Value>,
     totals: &mut CodexTotals,
+    counters: &mut BTreeMap<String, usize>,
 ) -> Option<TokenUsage> {
     let info = raw_info?.as_object()?;
     let total = token_usage_map(info.get("total_token_usage"));
@@ -3699,7 +3787,18 @@ fn codex_token_count_usage(
         if totals.seen.len() >= MAX_CODEX_SEEN_TOTALS {
             // rm-711 (assess SL3): bounded-recent distincts — roll the
             // ledger over instead of growing one set entry per call.
+            // rm-711 residual (assess 21b66103 N2, 2026-10-08): the
+            // rollover used to be completely silent — a pre-rollover
+            // total replayed after it double-counts with no runtime
+            // trace, unlike every sibling heuristic (workbuddy input
+            // basis, antigravity multi-model, copilot uncounted
+            // entries). Disclose on the codex counters channel
+            // (line_skips), where the other token-accounting heuristics
+            // (compaction duplicates, unpaired records) already do.
             totals.seen.clear();
+            *counters
+                .entry("codex_seen_totals_ledger_rollover".to_string())
+                .or_insert(0) += 1;
         }
         if !totals.seen.insert(total.clone()) {
             // rm-554/rm-711: this exact total was already counted in the
@@ -6623,7 +6722,8 @@ mod tests {
             }
         });
         let mut totals = CodexTotals::default();
-        let usage = codex_token_count_usage(Some(&info), &mut totals).expect("usage event");
+        let usage = codex_token_count_usage(Some(&info), &mut totals, &mut BTreeMap::new())
+            .expect("usage event");
         assert_eq!(usage["input_tokens"], 10);
         assert_eq!(usage["output_tokens"], i64::MAX);
         assert_eq!(usage["reasoning_tokens"], i64::MAX);
@@ -6645,20 +6745,85 @@ mod tests {
             })
         };
         let mut totals = CodexTotals::default();
-        let first = codex_token_count_usage(Some(&step(2500)), &mut totals).expect("first event");
+        let first = codex_token_count_usage(Some(&step(2500)), &mut totals, &mut BTreeMap::new())
+            .expect("first event");
         assert_eq!(first["input_tokens"], 2500);
         // Rewind to 1000 fabricates no usage (negative delta -> no event).
-        let rewound = codex_token_count_usage(Some(&step(1000)), &mut totals);
+        let rewound = codex_token_count_usage(Some(&step(1000)), &mut totals, &mut BTreeMap::new());
         assert!(rewound.is_none());
         // Rebound to 3000 counts the full 2000-token growth from the reset
         // baseline — the old pin (500, climb past the old mark only) was
         // the undercount this defect removes.
-        let rebound =
-            codex_token_count_usage(Some(&step(3000)), &mut totals).expect("rebound event");
+        let rebound = codex_token_count_usage(Some(&step(3000)), &mut totals, &mut BTreeMap::new())
+            .expect("rebound event");
         assert_eq!(rebound["input_tokens"], 2000);
         // A re-emitted total (rate-limit-only update) counts nothing.
-        let repeated = codex_token_count_usage(Some(&step(3000)), &mut totals);
+        let repeated =
+            codex_token_count_usage(Some(&step(3000)), &mut totals, &mut BTreeMap::new());
         assert!(repeated.is_none());
+    }
+
+    #[test]
+    fn codex_seen_totals_ledger_rollover_is_disclosed() {
+        // rm-711 residual (assess 21b66103 N2): the seen-totals ledger
+        // rolls over at MAX_CODEX_SEEN_TOTALS (1024) distinct totals so
+        // it stays bounded — but the rollover was completely SILENT:
+        // totals replayed after it double-count with no runtime trace,
+        // unlike every sibling heuristic (workbuddy input basis,
+        // antigravity multi-model, copilot uncounted entries). The
+        // rollover must disclose on the codex counters channel
+        // (metrics.line_skips, where compaction duplicates and unpaired
+        // records already disclose), once per rollover, and the
+        // triggering call itself must still count — it inserts into
+        // the fresh ledger.
+        let step_line = |input: i64| {
+            serde_json::json!({
+                "timestamp": "2026-10-06T12:00:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"input_tokens": input}}
+                }
+            })
+            .to_string()
+        };
+        let mut lines = Vec::new();
+        for step in 1..=1024i64 {
+            lines.push(step_line(step * 10));
+        }
+        let journal = lines.join("\n");
+        let session = parse_raw_session("codex", "rollout-rollover.jsonl", &journal)
+            .expect("codex journal parses");
+        assert_eq!(
+            session.metrics.tokens_input, 10_240,
+            "1024 distinct totals, each a 10-token step, all count"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_seen_totals_ledger_rollover"),
+            None,
+            "no rollover before the 1024-distinct cap is reached"
+        );
+        // The 1025th DISTINCT total: the ledger is full — it rolls over,
+        // the rollover is disclosed, and the triggering call still
+        // counts (its own total inserts into the fresh ledger).
+        let journal = format!("{journal}\n{}", step_line(10_260));
+        let session = parse_raw_session("codex", "rollout-rollover.jsonl", &journal)
+            .expect("journal with rollover parses");
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_seen_totals_ledger_rollover"),
+            Some(&1),
+            "the ledger rollover must be disclosed, not silent"
+        );
+        assert_eq!(
+            session.metrics.tokens_input, 10_260,
+            "the rollover-triggering call still counts (10 more tokens)"
+        );
     }
 
     #[test]

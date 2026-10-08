@@ -72,8 +72,8 @@ pub use runtime_config::{
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
     cached_session, clear_session_cache, load_cached_sessions, load_cached_sessions_from_cache,
-    load_session_cache, save_session_cache, session_cache_path, store_session, SessionCache,
-    SESSION_CACHE_SCHEMA_VERSION,
+    load_session_cache, save_session_cache, session_cache_path, store_session, unique_temp_path,
+    write_private, write_private_exclusive, SessionCache, SESSION_CACHE_SCHEMA_VERSION,
 };
 pub use sqlite_sessions::{
     load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported, skip_sqlite_backed_file_dir,

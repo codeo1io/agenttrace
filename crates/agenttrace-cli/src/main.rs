@@ -10,8 +10,14 @@ use agenttrace_core::{
     report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
     report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
     session_capability, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
-    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
+    write_private_exclusive, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
+    TimeRange, VERSION,
 };
+// rm-693 dedupe: the symlink-refusal tests plant through the SAME
+// canonical helper the writer stages through (the core export above);
+// test-only, so it lives outside the production import list.
+#[cfg(test)]
+use agenttrace_core::unique_temp_path;
 use anyhow::{bail, Context};
 use chrono::Utc;
 use clap::Parser;
@@ -1528,89 +1534,6 @@ fn is_cline_task_dir(path: &std::path::Path) -> bool {
         || path.join("task_metadata.json").is_file()
 }
 
-fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
-    // rm-525: sibling of agenttrace-core's session_cache::write_private
-    // (the rm-208 family). -o artifacts are session-derived — --search
-    // hits quote user prompts verbatim — so PRIVACY.md's blanket
-    // owner-only sentence must hold at this choke point too. The mode
-    // is set on the TEMP file because rm-250's rename gives the
-    // destination a fresh inode on every write: a plain `fs::write`
-    // there let the umask (0664 under the common 0002) survive the
-    // rename, and a rewrite over an older artifact resurrected
-    // group/other read. Non-Unix keeps the plain write, mirroring the
-    // rm-208 helper's fallback.
-    //
-    // rm-693: creation is EXCLUSIVE (O_EXCL) — callers stage through a
-    // fresh `unique_temp_sibling`, so a pre-existing path at the
-    // staging name (a planted symlink) is refused with `AlreadyExists`
-    // instead of opened and truncated through; pair with
-    // `write_private_exclusive` for the sequence-bump retry and rename.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(content.as_bytes())
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, content)
-    }
-}
-
-/// How many consecutive temp names `write_private_exclusive` tries
-/// before refusing (rm-693) — mirrors the agenttrace-core staging
-/// helper's bound. A genuine collision (a stale same-name temp)
-/// clears on the first bump; a symlink-poisoned directory fails
-/// honestly after this many tries instead of ever truncating through
-/// an occupied path.
-const EXCLUSIVE_STAGING_ATTEMPTS: u32 = 16;
-
-/// rm-693: stage `content` into a fresh owner-only temp sibling of
-/// `path` (O_EXCL) and rename it into place. An `AlreadyExists` at the
-/// predictable `{name}.tmp.{pid}.{seq}` name — a planted symlink, or a
-/// stale temp — bumps the sequence instead of truncating through the
-/// existing path; a fully poisoned window is refused loudly. The
-/// rename still hands the destination a fresh inode atomically, so a
-/// crash mid-write can never tear it. Mirrors
-/// `agenttrace_core::session_cache::write_private_exclusive` (kept
-/// local because the core helper is `pub(crate)`).
-fn write_private_exclusive(path: &Path, content: &str) -> std::io::Result<()> {
-    for _ in 0..EXCLUSIVE_STAGING_ATTEMPTS {
-        let temp = unique_temp_sibling(path);
-        match write_private(&temp, content) {
-            Ok(()) => match fs::rename(&temp, path) {
-                Ok(()) => return Ok(()),
-                Err(err) => {
-                    // rm-250's no-residue invariant: a failed rename
-                    // (e.g. the destination is a directory) must not
-                    // leave the staged temp behind.
-                    let _ = fs::remove_file(&temp);
-                    return Err(err);
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                let _ = fs::remove_file(&temp);
-                return Err(err);
-            }
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!(
-            "refusing to stage {}: {} consecutive temp names were already occupied \
-             (planted symlinks or stale temps); nothing was written or truncated",
-            path.display(),
-            EXCLUSIVE_STAGING_ATTEMPTS
-        ),
-    ))
-}
-
 fn write_output(path: &Option<PathBuf>, content: &str) -> anyhow::Result<()> {
     if let Some(path) = path {
         // rm-250 residual (cycle 1): resolve the destination honestly
@@ -1723,15 +1646,20 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
     // truncated report at the destination (same pattern as the
     // session-cache and history persistence writers). rm-525 (rebased
     // at integration onto this resolved-target lane): the stage goes
-    // through `write_private`, not a plain `fs::write`, so the temp is
-    // 0600 before the rename — the rename hands the destination a
-    // fresh inode every time, which is what re-tightens a rewrite over
-    // an artifact aged to 0664 (PRIVACY.md's report-artifact sentence).
-    // rm-693: the stage is O_EXCL with a sequence bump — a symlink
-    // planted at the predictable temp name is skipped past (or, in a
-    // fully poisoned window, refused loudly), never truncated through,
-    // and the victim behind it is never touched.
-    write_private_exclusive(target, content)
+    // through the CORE `write_private` inside the staging helper, not a
+    // plain `fs::write`, so the temp is 0600 before the rename — the
+    // rename hands the destination a fresh inode every time, which is
+    // what re-tightens a rewrite over an artifact aged to 0664
+    // (PRIVACY.md's report-artifact sentence). rm-693: the stage is
+    // O_EXCL with a sequence bump — a symlink planted at the
+    // predictable temp name is skipped past (or, in a fully poisoned
+    // window, refused loudly), never truncated through, and the victim
+    // behind it is never touched. rm-693 residual (assess 21b66103 N4,
+    // 2026-10-08): the CLI mirrored the core staging helper byte for
+    // byte "because the core helper is pub(crate)" — the mirror is
+    // DELETED; this is now the ONE canonical export, so the
+    // exclusivity contract cannot drift between the crates.
+    write_private_exclusive(target, content.as_bytes())
         .map_err(|error| anyhow::anyhow!("writing report output file: {error}"))?;
     eprintln!("Saved: {}", target.display());
     Ok(())
@@ -1782,20 +1710,13 @@ fn render_model_pricing_list_json() -> anyhow::Result<String> {
 }
 
 /// Unique per-process, per-call temp sibling of `path` for atomic `-o`
-/// writes (rm-250). Mirrors `session_cache::unique_temp_path` (pass-6
-/// P6-3); that helper is `pub(crate)`, and the core crate is owned by a
-/// sibling lane, so the pattern is duplicated here instead of widened.
-fn unique_temp_sibling(path: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("agenttrace-report");
-    path.with_file_name(format!("{name}.tmp.{}.{}", std::process::id(), sequence))
-}
-
+/// writes (rm-250) — DELETED at rm-693's dedupe (assess 21b66103 N4):
+/// the ONE canonical helper is agenttrace-core's
+/// `session_cache::unique_temp_path` (now exported through the crate
+/// facade), and the tests plant their symlinks through that same
+/// helper so a planted name and the staging name can never diverge
+/// (two independent sequence counters was a mirror-induced hazard, not
+/// a guarantee).
 fn prepare_cli_view(mut sessions: Vec<Session>, args: &Args) -> anyhow::Result<Vec<Session>> {
     validate_view_filters(args)?;
     sessions.retain(|session| {
@@ -3190,9 +3111,11 @@ mod tests {
         fs::write(&victim, "secret bytes\n").expect("write victim");
 
         // One planted link at the next temp name: the write bumps the
-        // sequence and succeeds, leaving the victim intact.
+        // sequence and succeeds, leaving the victim intact. rm-693's
+        // dedupe: the plant goes through the SAME canonical helper the
+        // writer stages through, so the two names cannot diverge.
         let target = dir.join("report.json");
-        let planted = unique_temp_sibling(&target);
+        let planted = unique_temp_path(&target);
         std::os::unix::fs::symlink(&victim, &planted).expect("plant symlink");
         write_output(&Some(target.clone()), "body\n").expect("write past one planted link");
         assert_eq!(fs::read_to_string(&target).unwrap(), "body\n");
@@ -3218,7 +3141,7 @@ mod tests {
         };
         let mut last_seq = 0u64;
         for _ in 0..64 {
-            let name = unique_temp_sibling(&poisoned);
+            let name = unique_temp_path(&poisoned);
             last_seq = seq_of(&name);
             std::os::unix::fs::symlink(&victim, &name).expect("plant probe symlink");
         }

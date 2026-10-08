@@ -659,3 +659,99 @@ fn unknown_usage_key_disclosure_is_bounded_and_sanitized() {
     );
     assert!(key.contains("…#"), "digest form present: {key:?}");
 }
+
+#[test]
+fn antigravity_multi_model_session_prices_each_model_at_its_own_rates() {
+    // rm-825 (assess 21b66103 N1): the antigravity fold summed every
+    // generation's usage into ONE meta event stamped with the LAST
+    // generation's model id, so lib.rs's per-block pricing arm never
+    // engaged — the assess PoC (1M in / 100k out on gemini-2.5-pro plus
+    // the same on gemini-2.5-flash) billed all 2.2M tokens at flash
+    // rates ($1.10) where the truthful per-model sum is $2.80
+    // ($2.25 pro + $0.55 flash). The fold now emits one meta event PER
+    // MODEL so each model's block bills at that model's rates, and the
+    // retired last-wins sighting counter is replaced by a
+    // priced-per-model disclosure plus per-model generation counts.
+    let raw = serde_json::json!({
+        "trajectoryId": "99999999-8888-7777-6666-555555555555",
+        "steps": [
+            {
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": "COMPLETED",
+                "metadata": {"createdAt": "2026-10-08T09:00:01Z"},
+                "plannerResponse": {
+                    "response": "Pro generation.",
+                    "usageStats": {
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 100_000
+                    },
+                    "modelConfigId": "gemini-2.5-pro"
+                }
+            },
+            {
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": "COMPLETED",
+                "metadata": {"createdAt": "2026-10-08T09:00:05Z"},
+                "plannerResponse": {
+                    "response": "Flash generation.",
+                    "usageStats": {
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 100_000
+                    },
+                    "modelConfigId": "gemini-2.5-flash"
+                }
+            }
+        ]
+    })
+    .to_string();
+    let session = parse_raw_session("poc", "multi-model.trajectory.json", &raw)
+        .expect("two-model trajectory parses");
+    assert_eq!(session.metrics.tokens_input, 2_000_000, "both models sum");
+    assert_eq!(session.metrics.tokens_output, 200_000);
+    assert_eq!(
+        session.metrics.model_used, "multiple",
+        "a two-model session must not report the last generation's model as the session model"
+    );
+    assert_eq!(
+        session.metrics.cost_estimated, 2.8,
+        "each model bills at its own rates: pro 1M*$1.25/M + 100k*$10/M = $2.25, \
+         flash 1M*$0.30/M + 100k*$2.50/M = $0.55"
+    );
+    assert_eq!(
+        session.metrics.provenance.cost, "calculated_per_message_tokens",
+        "the per-block decomposition decided the figure"
+    );
+    assert!(
+        session
+            .metrics
+            .provenance
+            .pricing_source
+            .contains("priced per usage block"),
+        "pricing must name the per-block decomposition, got {}",
+        session.metrics.provenance.pricing_source
+    );
+    let counters = &session.metrics.disclosure_counters;
+    assert_eq!(
+        counters.get("antigravity_usage_basis:planner_response_summed"),
+        Some(&2),
+        "the basis counter keeps counting generations"
+    );
+    assert_eq!(
+        counters.get("antigravity_model:multi_model_priced_per_model"),
+        Some(&2),
+        "the multi-model disclosure states what now happens — priced per model"
+    );
+    assert_eq!(
+        counters.get("antigravity_model_generations:gemini-2.5-pro"),
+        Some(&1),
+        "per-model generation counts name each observed model"
+    );
+    assert_eq!(
+        counters.get("antigravity_model_generations:gemini-2.5-flash"),
+        Some(&1)
+    );
+    assert!(
+        !counters.contains_key("antigravity_model:multi_model_last_wins"),
+        "the retired last-wins counter must be gone — the cost is right now, not merely flagged wrong"
+    );
+}

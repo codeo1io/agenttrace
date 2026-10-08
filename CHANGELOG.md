@@ -8,6 +8,32 @@
 
 ### Fixed
 
+- Antigravity multi-model sessions bill each model at its own rates (rm-825, run
+  66fc09b893f6 cycle 4): the usage fold no longer stamps every generation's summed tokens
+  with the LAST generation's model id — it emits one usage meta event per observed model
+  (plus one for unattributed blocks, priced at the session default and disclosed as
+  `antigravity_usage_basis:generation_model_unattributed`), so the per-block pricing arm
+  actually engages: the assess PoC (1M in / 100k out on gemini-2.5-pro plus the same on
+  gemini-2.5-flash) now reports $2.80 ($2.25 pro + $0.55 flash) instead of $1.10 all at
+  flash rates, with `model_used: "multiple"`, `pricing_source` naming the per-block
+  decomposition, and new `antigravity_model_generations:<model>` /
+  `antigravity_model:multi_model_priced_per_model` disclosure counters replacing the
+  retired last-wins flag (the cost is right now, not merely marked wrong). Single-model
+  journals are unchanged in behavior. Same batch: the Codex seen-totals ledger rollover
+  (1024 distinct totals) is no longer silent — `codex_seen_totals_ledger_rollover` joins
+  the line_skips disclosure channel while the triggering call still counts (rm-711
+  residual); corrupt-history quarantine generations are claimed EXCLUSIVELY before the
+  rename (create_new/O_EXCL + claim withdrawal on a lost race), so two concurrent
+  agenttrace processes can never land on the same `.corrupt.N` generation and clobber a
+  forensic copy, and a lost race leaves no empty placeholder file (rm-703 residual); and
+  the CLI's `-o` staging mirror of the core exclusive-write helper is deleted —
+  `write_private`/`write_private_exclusive`/`unique_temp_path` are exported once from
+  agenttrace-core, the retry bound is 16 in exactly one place, and the symlink-refusal
+  tests plant through the same canonical helper the writer stages through so the two
+  names can never diverge (rm-693 residual). SESSION_CACHE_SCHEMA_VERSION bumps 35 → 36
+  with the four literal-bearing surfaces swept in the same change (const rung, TUI planted
+  fixture + ladder, governance sentence, occurrence-contract oracle) — warm v35 entries
+  would keep serving the last-wins totals for unchanged journals (rm-230 convention).
 - Antigravity sessions report real usage and price the standalone model (rm-720, run
   3ec6cec08fb9 cycle 2): both antigravity lanes (trajectory + jsonl) now fold per-message
   usage blocks (input/output tokens, cache reads) and resolve the model id, priced via

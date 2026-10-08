@@ -5,7 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 35;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 36;
+// Bumped 35 -> 36 (run 66fc09b893f6 cycle 4 stewardship implement,
+// rm-825 'antigravity multi-model per-call pricing' + rm-711's
+// ledger-rollover disclosure rider): the fold rework changes what
+// UNCHANGED antigravity journals report — a multi-model session's
+// cost_estimated, model_used (last-wins id -> "multiple"), and
+// disclosure counters all move (the assess PoC: $1.10 all at flash
+// rates -> $2.80 priced per model), and codex journals past 1024
+// distinct totals gain a line_skips disclosure — so a warm v35 cache
+// keeps serving the last-wins totals with matching fingerprints and
+// never re-parses (rm-230 convention). Direct wall implement, no
+// re-base. Entries regenerate once on next scan.
 // Bumped 34 -> 35 (integration of run 3ec6cec08fb9, rm-720 'Agent-
 // lane usage truthfulness' + rm-721 copilot agent-host audit; review
 // fix 8a3231c6 over implement b127341f): the batch corrects
@@ -677,8 +688,10 @@ fn store_sqlite_snapshot_at(
 /// on the same temp file, failing or tearing the save. The suffix is unique
 /// per process and per write within the process; the atomic rename is
 /// unchanged. Shared by the pricing-catalog and derived-history writes
-/// (pass-7 P7-5).
-pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
+/// (pass-7 P7-5), and — since rm-693's dedupe — by the CLI's `-o` staging
+/// and its symlink-refusal tests (the ONE canonical naming helper across
+/// crates; the CLI's local mirror is gone).
+pub fn unique_temp_path(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -706,7 +719,7 @@ pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
 /// path at the staging name (a planted symlink) is refused with
 /// `AlreadyExists` instead of opened and truncated through; pair with
 /// [`write_private_exclusive`] for the sequence-bump retry and rename.
-pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -739,8 +752,11 @@ const EXCLUSIVE_STAGING_ATTEMPTS: u32 = 16;
 /// `{name}.tmp.{pid}.{seq}` name (a planted symlink, or a stale temp)
 /// bumps the sequence instead of truncating through the existing
 /// path. The rename still hands the destination a fresh inode
-/// atomically, so a crash mid-write can never tear it.
-pub(crate) fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// atomically, so a crash mid-write can never tear it. The ONE
+/// canonical staging helper: since rm-693's dedupe (assess 21b66103
+/// N4) the CLI's `-o` lane calls this export instead of mirroring it,
+/// so the exclusivity contract cannot drift between crates.
+pub fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     for _ in 0..EXCLUSIVE_STAGING_ATTEMPTS {
         let temp = unique_temp_path(path);
         match write_private(&temp, bytes) {
