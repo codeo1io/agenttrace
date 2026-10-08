@@ -40,6 +40,61 @@ pub struct StatuslineRateLimitState {
     pub resets_at: Option<i64>,
 }
 
+/// Token counts from the session's last API call
+/// (`context_window.current_usage`, docs 2026-10-07). The object is
+/// `null` before the first API call and again immediately after
+/// `/compact` until the next call repopulates it; individual fields
+/// stay optional so future growth is tolerated, not rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct StatuslineContextUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+/// The `context_window` object (docs 2026-10-07, v2.1.251+):
+/// pre-calculated utilization plus the last-API token counts — the
+/// authoritative context pressure a transcript lane can only estimate.
+/// `used_percentage` is input-only
+/// (`input + cache_creation + cache_read`), `current_usage` is `null`
+/// before the first API call and right after `/compact`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct StatuslineContextWindow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percentage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percentage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<StatuslineContextUsage>,
+}
+
+/// The gateway `rate_limits.spend_limit` window (docs 2026-10-07,
+/// v2.1.251+; behind a Claude apps gateway with spend limits).
+/// `used_percentage`/`resets_at` come with every response once the
+/// object exists; `used_usd`/`limit_usd`/`period` arrive on a separate
+/// ~5-minute schedule (v2.1.284+) and stay absent under
+/// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` — every field optional
+/// even when the object is present. `used_usd` is a gateway estimate,
+/// not a billed amount.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct StatuslineSpendLimit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percentage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct StatuslineMissCause {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -95,8 +150,25 @@ impl CapturedStatusline {
         serde_json::from_value(self.payload.get("rate_limits")?.get(window)?.clone()).ok()
     }
 
+    fn spend_limit(&self) -> Option<StatuslineSpendLimit> {
+        serde_json::from_value(self.payload.get("rate_limits")?.get("spend_limit")?.clone()).ok()
+    }
+
+    fn context_window(&self) -> Option<StatuslineContextWindow> {
+        serde_json::from_value(self.payload.get("context_window")?.clone()).ok()
+    }
+
     fn prompt_cache(&self) -> Option<StatuslinePromptCache> {
         serde_json::from_value(self.payload.get("prompt_cache")?.clone()).ok()
+    }
+
+    /// rm-708: the prompt correlation key — a UUID that matches the
+    /// `prompt.id` attribute on OpenTelemetry events (docs 2026-10-07).
+    /// Absent until the session's first user input, so absence is a
+    /// normal pre-first-input state, not an error. A non-string value
+    /// is not a usable key and reports as absent.
+    pub fn prompt_id(&self) -> Option<&str> {
+        self.payload.get("prompt_id").and_then(Value::as_str)
     }
 }
 
@@ -377,6 +449,26 @@ pub struct StatuslineSessionCache {
     pub last_miss_causes: Vec<String>,
 }
 
+/// Latest `context_window` state for one session, newest session first
+/// (rm-037): utilization is a per-session quantity, so the arm joins
+/// `session_caches` in reporting the newest capture per session.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StatuslineSessionContextWindow {
+    pub session_id: String,
+    pub used_percentage: Option<f64>,
+    pub remaining_percentage: Option<f64>,
+    pub current_usage: Option<StatuslineContextUsage>,
+}
+
+/// Latest observed `prompt_id` for one session, newest session first
+/// (rm-708). The value is the correlation key matching OTel `prompt.id`
+/// attributes; only captures that actually carry one appear here.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StatuslineSessionPrompt {
+    pub session_id: String,
+    pub prompt_id: String,
+}
+
 /// Aggregated view of the journal for reports and the TUI.
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
 pub struct StatuslineInsights {
@@ -396,6 +488,20 @@ pub struct StatuslineInsights {
     pub session_caches: Vec<StatuslineSessionCache>,
     /// Total miss-cause counts across sessions.
     pub miss_causes: BTreeMap<String, u64>,
+    /// Latest `context_window` per session, newest session first
+    /// (rm-037; sessions without a `context_window` arm stay absent).
+    pub context_windows: Vec<StatuslineSessionContextWindow>,
+    /// Peak `context_window.used_percentage` across all captures
+    /// (rm-037). None when no capture carried a non-null percentage.
+    pub context_peak_used_percentage: Option<f64>,
+    /// Latest gateway spend-limit window (rm-037): None when no
+    /// capture has run behind a Claude apps gateway with limits.
+    pub spend_limit: Option<StatuslineSpendLimit>,
+    /// Peak spend-limit usage across all captures (rm-037).
+    pub spend_limit_peak_used_percentage: Option<f64>,
+    /// Latest observed `prompt_id` per session, newest session first
+    /// (rm-708; pre-first-input captures carry none and stay absent).
+    pub prompt_ids: Vec<StatuslineSessionPrompt>,
 }
 
 /// Deduplicates and aggregates captures. Captures are keyed by
@@ -428,6 +534,12 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
     }
     let five_hour = latest[0].and_then(|capture| capture.rate_limit("five_hour"));
     let seven_day = latest[1].and_then(|capture| capture.rate_limit("seven_day"));
+    // rm-037: the spend-limit window reports on the same schedule as
+    // the subscription windows, so the latest observed capture wins.
+    let spend_limit = deduped
+        .iter()
+        .filter_map(|capture| capture.spend_limit())
+        .next_back();
 
     let peak = |window: &str| {
         deduped
@@ -443,7 +555,11 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
     };
 
     let mut crossings: Vec<StatuslineLimitCrossing> = Vec::new();
-    for window in ["five_hour", "seven_day"] {
+    // rm-037: the gateway spend window resets on the same mechanism as
+    // the two subscription windows (epoch `resets_at` + falling usage),
+    // so it joins the crossing scan. Windows never observed simply
+    // contribute nothing.
+    for window in ["five_hour", "seven_day", "spend_limit"] {
         let mut distinct: Vec<i64> = deduped
             .iter()
             .filter_map(|capture| capture.rate_limit(window))
@@ -510,6 +626,55 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
         });
     }
 
+    // rm-037: peak context utilization across every capture that
+    // carried a non-null percentage (the docs allow null before the
+    // first API call and right after /compact).
+    let context_peak_used_percentage = deduped
+        .iter()
+        .filter_map(|capture| capture.context_window())
+        .filter_map(|window| window.used_percentage)
+        .fold(None::<f64>, |acc, used| {
+            Some(match acc {
+                Some(max) if max >= used => max,
+                _ => used,
+            })
+        });
+    let mut context_windows: Vec<StatuslineSessionContextWindow> = Vec::new();
+    let mut context_seen: HashSet<String> = HashSet::new();
+    for capture in deduped.iter().rev() {
+        let Some(window) = capture.context_window() else {
+            continue;
+        };
+        let session_id = capture.session_id().unwrap_or("(unknown)").to_string();
+        if !context_seen.insert(session_id.clone()) {
+            continue;
+        }
+        context_windows.push(StatuslineSessionContextWindow {
+            session_id,
+            used_percentage: window.used_percentage,
+            remaining_percentage: window.remaining_percentage,
+            current_usage: window.current_usage,
+        });
+    }
+
+    // rm-708: latest prompt correlation key per session, newest
+    // session first, mirroring `session_caches`.
+    let mut prompt_ids: Vec<StatuslineSessionPrompt> = Vec::new();
+    let mut prompt_seen: HashSet<String> = HashSet::new();
+    for capture in deduped.iter().rev() {
+        let Some(prompt_id) = capture.prompt_id() else {
+            continue;
+        };
+        let session_id = capture.session_id().unwrap_or("(unknown)").to_string();
+        if !prompt_seen.insert(session_id.clone()) {
+            continue;
+        }
+        prompt_ids.push(StatuslineSessionPrompt {
+            session_id,
+            prompt_id: prompt_id.to_string(),
+        });
+    }
+
     StatuslineInsights {
         captures: deduped.len(),
         sessions: sessions.len(),
@@ -520,6 +685,11 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
         limit_crossings: crossings,
         session_caches,
         miss_causes,
+        context_windows,
+        context_peak_used_percentage,
+        spend_limit,
+        spend_limit_peak_used_percentage: peak("spend_limit"),
+        prompt_ids,
     }
 }
 
@@ -534,6 +704,59 @@ pub fn load_statusline_insights() -> Option<StatuslineInsights> {
     Some(statusline_insights(&captures))
 }
 
+/// rm-708: prompt ids shared between the statusline journal and an
+/// OTLP-JSON export carrying `prompt.id` span attributes — the
+/// capture-side half of the statusline↔OTel correlation the docs
+/// define as "Matches the `prompt.id` attribute on OpenTelemetry
+/// events, when they exist". The emitter side of that attribute lands
+/// with the OTel arm; this join is pure so both lanes can exercise it
+/// the moment a doc is available. Unknown shapes (missing
+/// `resourceSpans`, spans without attributes, non-string values)
+/// correlate nothing — never an error, mirroring the journal's
+/// malformed-line tolerance.
+pub fn correlated_prompt_ids(captures: &[CapturedStatusline], otel_doc: &Value) -> Vec<String> {
+    let captured: HashSet<String> = captures
+        .iter()
+        .filter_map(|capture| capture.prompt_id())
+        .map(str::to_string)
+        .collect();
+    if captured.is_empty() {
+        return Vec::new();
+    }
+    let mut otel: HashSet<String> = HashSet::new();
+    let resource_spans = otel_doc
+        .get("resourceSpans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for scope_spans in
+        resource_spans.filter_map(|rs| rs.get("scopeSpans").and_then(Value::as_array))
+    {
+        let spans = scope_spans
+            .iter()
+            .filter_map(|ss| ss.get("spans").and_then(Value::as_array))
+            .flatten();
+        for attribute in spans
+            .filter_map(|span| span.get("attributes").and_then(Value::as_array))
+            .flatten()
+        {
+            let key = attribute.get("key").and_then(Value::as_str);
+            let value = attribute
+                .get("value")
+                .and_then(|value| value.get("stringValue"))
+                .and_then(Value::as_str);
+            if key == Some("prompt.id") {
+                if let Some(id) = value {
+                    otel.insert(id.to_string());
+                }
+            }
+        }
+    }
+    let mut both: Vec<String> = captured.intersection(&otel).cloned().collect();
+    both.sort_unstable();
+    both
+}
+
 /// Journal bookkeeping for `--doctor` and the report header.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct StatuslineJournalStats {
@@ -544,24 +767,59 @@ pub struct StatuslineJournalStats {
     /// The retention bound: newest whole lines are kept until the
     /// journal fits half of this once it crosses it.
     pub retained_max_bytes: u64,
+    /// rm-708 diagnostics: lines classified by prompt-correlation key
+    /// presence. `prompt_id` is absent until the session's first user
+    /// input (docs 2026-10-07), so an object payload without it is a
+    /// pre-first-input capture — deliberately distinct from an
+    /// unclassifiable payload (not a JSON object, or a non-string
+    /// `prompt_id`). Torn tail lines that fail JSON parsing count in
+    /// `lines` only, keeping them out of both buckets.
+    pub captures_with_prompt_id: usize,
+    pub captures_pre_first_input: usize,
+    pub captures_unknown_payload: usize,
 }
 
 pub fn statusline_journal_stats(path: &Path) -> StatuslineJournalStats {
     let exists = path.exists();
     let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-    let lines = if exists {
-        fs::read_to_string(path)
-            .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
-            .unwrap_or(0)
+    let raw = if exists {
+        fs::read_to_string(path).unwrap_or_default()
     } else {
-        0
+        String::new()
     };
+    let lines = raw.lines().filter(|line| !line.trim().is_empty()).count();
+    // rm-708: classify parseable lines by `prompt_id` presence inside
+    // the captured payload. A torn tail line fails parsing and counts
+    // only in `lines` (the append-only journal already tolerates it),
+    // so it lands in neither bucket.
+    let mut captures_with_prompt_id = 0;
+    let mut captures_pre_first_input = 0;
+    let mut captures_unknown_payload = 0;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(capture) = serde_json::from_str::<CapturedStatusline>(line) else {
+            continue;
+        };
+        if !capture.payload.is_object() {
+            captures_unknown_payload += 1;
+        } else if capture.prompt_id().is_some() {
+            captures_with_prompt_id += 1;
+        } else if capture.payload.get("prompt_id").is_some() {
+            // Present but not a string: not a usable correlation key.
+            captures_unknown_payload += 1;
+        } else {
+            // The documented pre-first-input state.
+            captures_pre_first_input += 1;
+        }
+    }
     StatuslineJournalStats {
         path: path.to_string_lossy().to_string(),
         exists,
         lines,
         bytes,
         retained_max_bytes: STATUSLINE_CAPTURE_MAX_BYTES,
+        captures_with_prompt_id,
+        captures_pre_first_input,
+        captures_unknown_payload,
     }
 }
 
@@ -628,13 +886,32 @@ fn render_statusline_report_text(
         "  {} captures ({} after dedup), {} distinct sessions, {} bytes, retention keeps newest lines under {} bytes\n",
         stats.lines, insights.captures, insights.sessions, stats.bytes, stats.retained_max_bytes / 2
     ));
+    // rm-708: prompt-key diagnostics. Absence until the first user
+    // input is a documented state, so it is disclosed distinctly from
+    // unclassifiable payloads instead of being lumped into an error.
     out.push_str(&format!(
-        "Limits: 5h {} (peak {}) · 7d {} (peak {})\n",
+        "  Prompt correlation: {} captures with prompt_id, {} pre-first-input, {} unknown payload\n",
+        stats.captures_with_prompt_id, stats.captures_pre_first_input, stats.captures_unknown_payload
+    ));
+    // rm-037: the gateway spend window renders alongside the two
+    // subscription windows, but only when one is actually running —
+    // subscribers see no phantom arm.
+    let mut limits = format!(
+        "Limits: 5h {} (peak {}) · 7d {} (peak {})",
         format_percent(insights.five_hour.as_ref().and_then(|s| s.used_percentage)),
         format_percent(insights.five_hour_peak_used_percentage),
         format_percent(insights.seven_day.as_ref().and_then(|s| s.used_percentage)),
         format_percent(insights.seven_day_peak_used_percentage),
-    ));
+    );
+    if let Some(spend) = &insights.spend_limit {
+        limits.push_str(&format!(
+            " · spend {} (peak {})",
+            format_percent(spend.used_percentage),
+            format_percent(insights.spend_limit_peak_used_percentage)
+        ));
+    }
+    limits.push('\n');
+    out.push_str(&limits);
     for crossing in &insights.limit_crossings {
         out.push_str(&format!(
             "  {} window reset at {}: {} -> {}\n",
@@ -643,6 +920,39 @@ fn render_statusline_report_text(
             format_percent(crossing.used_percentage_before),
             format_percent(crossing.used_percentage_after),
         ));
+    }
+    // rm-037: the USD/period trio rides a slower ~5-minute schedule
+    // and can be absent while the percentage is present, so each
+    // field renders only when the gateway actually sent it.
+    if let Some(spend) = &insights.spend_limit {
+        let mut parts: Vec<String> = Vec::new();
+        let mut usd = match (spend.used_usd, spend.limit_usd) {
+            (Some(used), Some(limit)) => Some(format!("${used:.2} of ${limit:.2}")),
+            (Some(used), None) => Some(format!("${used:.2} spent")),
+            (None, _) => None,
+        };
+        if let Some(period) = &spend.period {
+            // rm-034 rule (review fix, run 415d77e1 537105b1 F1): the
+            // period is a journal payload string, so both render arms
+            // pass it through the control-character sanitization.
+            let period = sanitize_line_segment(period);
+            match &mut usd {
+                Some(part) => {
+                    part.push(' ');
+                    part.push_str(&period);
+                }
+                None => usd = Some(period),
+            }
+        }
+        if let Some(part) = usd {
+            parts.push(part);
+        }
+        if let Some(resets_at) = spend.resets_at {
+            parts.push(format!("resets {}", format_epoch(resets_at)));
+        }
+        if !parts.is_empty() {
+            out.push_str(&format!("Spend limit: {}\n", parts.join(", ")));
+        }
     }
     // rm-385: the weekly budget line rides the already-parsed capture
     // journal; budget unset keeps the report byte-compatible.
@@ -657,6 +967,47 @@ fn render_statusline_report_text(
             "Budget: 7d spend ${:.2} of ${budget:.2} — {state}\n",
             series.total
         ));
+    }
+    // rm-037: context pressure per session — the payload's
+    // pre-calculated utilization plus the last-API token counts
+    // (input-only in `used_percentage` per the docs formula). Sessions
+    // without a context arm stay absent; a null `current_usage`
+    // (pre-first-API-call / post-compact) renders without the token
+    // tail rather than as zeros.
+    if !insights.context_windows.is_empty() {
+        out.push_str(&format!(
+            "Context window (peak used {}):\n",
+            format_percent(insights.context_peak_used_percentage)
+        ));
+        for window in &insights.context_windows {
+            // rm-034: session ids are journal payload strings.
+            let mut line = format!(
+                "  {}: used {}, remaining {}",
+                sanitize_line_segment(&window.session_id),
+                format_percent(window.used_percentage),
+                format_percent(window.remaining_percentage)
+            );
+            if let Some(usage) = &window.current_usage {
+                let mut counts: Vec<String> = Vec::new();
+                if let Some(tokens) = usage.input_tokens {
+                    counts.push(format!("{tokens} in"));
+                }
+                if let Some(tokens) = usage.output_tokens {
+                    counts.push(format!("{tokens} out"));
+                }
+                if let Some(tokens) = usage.cache_creation_input_tokens {
+                    counts.push(format!("{tokens} cache-write"));
+                }
+                if let Some(tokens) = usage.cache_read_input_tokens {
+                    counts.push(format!("{tokens} cache-read"));
+                }
+                if !counts.is_empty() {
+                    line.push_str(&format!(" · last API {}", counts.join(", ")));
+                }
+            }
+            line.push('\n');
+            out.push_str(&line);
+        }
     }
     if !insights.session_caches.is_empty() {
         out.push_str("Prompt cache per session:\n");
@@ -697,6 +1048,19 @@ fn render_statusline_report_text(
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!("Miss causes: {causes}\n"));
+    }
+    // rm-708: the correlation key itself, latest per session. The id
+    // is a journal payload string and prints sanitized; the JSON arm
+    // keeps the verbatim value.
+    if !insights.prompt_ids.is_empty() {
+        out.push_str("Latest prompt_id per session:\n");
+        for entry in &insights.prompt_ids {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                sanitize_line_segment(&entry.session_id),
+                sanitize_line_segment(&entry.prompt_id)
+            ));
+        }
     }
     out
 }
@@ -987,6 +1351,9 @@ mod tests {
                 lines: 2,
                 bytes: 100,
                 retained_max_bytes: 1024,
+                captures_with_prompt_id: 0,
+                captures_pre_first_input: 0,
+                captures_unknown_payload: 0,
             },
             &statusline_insights(&captures),
             budget,
@@ -1001,12 +1368,561 @@ mod tests {
                 lines: 2,
                 bytes: 100,
                 retained_max_bytes: 1024,
+                captures_with_prompt_id: 0,
+                captures_pre_first_input: 2,
+                captures_unknown_payload: 0,
             },
             &statusline_insights(&captures),
             None,
             &series,
         );
         assert!(!unbudgeted.contains("Budget:"), "{unbudgeted}");
+    }
+
+    #[test]
+    fn statusline_report_gains_context_spend_prompt_arms_json() {
+        // rm-037/rm-708 (cycle 2): the 2026-10-07 payload docs add
+        // context_window.{used_percentage,remaining_percentage,
+        // current_usage}, the gateway rate_limits.spend_limit window
+        // (with the USD/period trio) and the prompt_id correlation key.
+        // The report surface must carry all three arms; a payload with
+        // unknown future fields must still parse (tolerance).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-arms-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        append_statusline_capture(&serde_json::json!({
+            "session_id": "probe-ctx-1",
+            "version": "2.1.292",
+            "context_window": {
+                "used_percentage": 41.2,
+                "remaining_percentage": 58.8,
+                "current_usage": {
+                    "input_tokens": 8500,
+                    "output_tokens": 1200,
+                    "cache_creation_input_tokens": 5000,
+                    "cache_read_input_tokens": 2000
+                }
+            },
+            "rate_limits": {
+                "five_hour": {"used_percentage": 84.0, "resets_at": 1790000000},
+                "seven_day": {"used_percentage": 46.0, "resets_at": 1790080000},
+                "spend_limit": {
+                    "used_percentage": 62.8,
+                    "resets_at": 1790100000,
+                    "used_usd": 314.12,
+                    "limit_usd": 500.0,
+                    "period": "monthly"
+                }
+            },
+            "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+            "future_field_a": {"nested": [1, 2, 3]}
+        }))
+        .expect("append fixture");
+        let json = render_statusline_report("json", None).expect("json report");
+        let value: Value = serde_json::from_str(&json).expect("json parses");
+        assert_eq!(
+            value["insights"]["spend_limit"]["used_usd"], 314.12,
+            "spend_limit USD arm extracts: {json}"
+        );
+        assert_eq!(
+            value["insights"]["context_windows"][0]["used_percentage"], 41.2,
+            "context window arm extracts: {json}"
+        );
+        assert_eq!(
+            value["insights"]["prompt_ids"][0]["prompt_id"], "550e8400-e29b-41d4-a716-446655440000",
+            "prompt_id arm extracts: {json}"
+        );
+        assert_eq!(
+            value["journal"]["captures_with_prompt_id"], 1,
+            "journal diagnostics carry the prompt-key counters: {json}"
+        );
+        assert_eq!(
+            value["insights"]["five_hour"]["used_percentage"], 84.0,
+            "subscription windows still extract alongside the new arms: {json}"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn statusline_report_gains_context_spend_prompt_arms_text() {
+        // rm-037/rm-708 text arm: spend renders alongside the two
+        // subscription windows, context utilization renders per
+        // session with the last-API token counts, and the prompt
+        // correlation key renders — sanitized (rm-034 convention:
+        // journal-derived strings never print raw control bytes).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-arms-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        append_statusline_capture(&serde_json::json!({
+            "session_id": "probe-ctx-1",
+            "context_window": {
+                "used_percentage": 41.2,
+                "remaining_percentage": 58.8,
+                "current_usage": {
+                    "input_tokens": 8500,
+                    "output_tokens": 1200,
+                    "cache_creation_input_tokens": 5000,
+                    "cache_read_input_tokens": 2000
+                }
+            },
+            "rate_limits": {
+                "spend_limit": {
+                    "used_percentage": 62.8,
+                    "resets_at": 1790100000,
+                    "used_usd": 314.12,
+                    "limit_usd": 500.0,
+                    "period": "monthly"
+                }
+            },
+            "prompt_id": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .expect("append fixture");
+        let text = render_statusline_report("text", None).expect("text report");
+        assert!(
+            text.contains("· spend 63% (peak 63%)"),
+            "spend on the Limits line: {text}"
+        );
+        assert!(
+            text.contains("Spend limit: $314.12 of $500.00 monthly"),
+            "spend USD detail line: {text}"
+        );
+        assert!(
+            text.contains("Context window (peak used 41%)"),
+            "context block: {text}"
+        );
+        assert!(
+            text.contains("used 41%, remaining 59% · last API 8500 in, 1200 out, 5000 cache-write, 2000 cache-read"),
+            "context per-session line: {text}"
+        );
+        assert!(
+            text.contains("Latest prompt_id per session:"),
+            "prompt_id block: {text}"
+        );
+        assert!(
+            text.contains("550e8400-e29b-41d4-a716-446655440000"),
+            "prompt_id value renders: {text}"
+        );
+        assert!(
+            text.contains("1 captures with prompt_id, 0 pre-first-input, 0 unknown payload"),
+            "prompt diagnostics line: {text}"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn statusline_insights_extracts_context_spend_prompt_arms() {
+        // rm-037/rm-708 unit: latest-per-session context windows, peak
+        // context utilization, the spend-limit window (latest + peak),
+        // and latest prompt_id per session — with unknown future
+        // fields riding along in the payload without breaking the
+        // extraction.
+        let captures = vec![
+            CapturedStatusline {
+                captured_at: 1_000,
+                payload: serde_json::json!({
+                    "session_id": "sess-a",
+                    "context_window": {
+                        "used_percentage": 41.2,
+                        "remaining_percentage": 58.8,
+                        "current_usage": {
+                            "input_tokens": 8500,
+                            "output_tokens": 1200,
+                            "cache_creation_input_tokens": 5000,
+                            "cache_read_input_tokens": 2000
+                        }
+                    },
+                    "rate_limits": {
+                        "five_hour": {"used_percentage": 84.0, "resets_at": 1_790_000_000},
+                        "spend_limit": {
+                            "used_percentage": 62.8,
+                            "resets_at": 1_790_100_000,
+                            "used_usd": 314.12,
+                            "limit_usd": 500.0,
+                            "period": "monthly"
+                        }
+                    },
+                    "prompt_id": "pid-a-1",
+                    "future_field": {"anything": [1]}
+                }),
+            },
+            CapturedStatusline {
+                captured_at: 2_000,
+                payload: serde_json::json!({
+                    "session_id": "sess-a",
+                    "context_window": {"used_percentage": 90.0, "remaining_percentage": 10.0},
+                    "prompt_id": "pid-a-2"
+                }),
+            },
+            CapturedStatusline {
+                captured_at: 3_000,
+                payload: serde_json::json!({
+                    "session_id": "sess-b",
+                    "context_window": {
+                        "used_percentage": null,
+                        "remaining_percentage": null,
+                        "current_usage": null
+                    },
+                    "rate_limits": {
+                        "spend_limit": {"used_percentage": 10.0, "resets_at": 1_790_200_000}
+                    }
+                }),
+            },
+        ];
+        let insights = statusline_insights(&captures);
+        // Latest context window per session, newest session first;
+        // sess-b is in the documented null state (pre-first-API-call
+        // or post-compact) and still reports as a session.
+        assert_eq!(insights.context_windows.len(), 2);
+        assert_eq!(insights.context_windows[0].session_id, "sess-b");
+        assert_eq!(insights.context_windows[0].used_percentage, None);
+        assert_eq!(insights.context_windows[0].current_usage, None);
+        assert_eq!(insights.context_windows[1].session_id, "sess-a");
+        assert_eq!(insights.context_windows[1].used_percentage, Some(90.0));
+        assert_eq!(insights.context_windows[1].remaining_percentage, Some(10.0));
+        assert!(insights.context_windows[1].current_usage.is_none());
+        // Peak across every capture that carried a percentage.
+        assert_eq!(insights.context_peak_used_percentage, Some(90.0));
+        // Spend window: latest capture wins, peak is the all-time max.
+        let spend = insights.spend_limit.expect("spend_limit extracts");
+        assert_eq!(spend.used_percentage, Some(10.0));
+        assert_eq!(spend.used_usd, None);
+        assert_eq!(insights.spend_limit_peak_used_percentage, Some(62.8));
+        // Prompt ids: latest per session; sess-b has none (documented
+        // pre-first-input state, not an error).
+        assert_eq!(insights.prompt_ids.len(), 1);
+        assert_eq!(insights.prompt_ids[0].session_id, "sess-a");
+        assert_eq!(insights.prompt_ids[0].prompt_id, "pid-a-2");
+        // Subscription windows unaffected.
+        assert_eq!(
+            insights.five_hour.as_ref().and_then(|s| s.used_percentage),
+            Some(84.0)
+        );
+    }
+
+    #[test]
+    fn spend_limit_window_joins_crossings_peaks_and_latest() {
+        // rm-037: the gateway spend window resets on the same epoch
+        // mechanism as the subscription windows, so it joins the
+        // crossing scan — before-side usage, falling usage after the
+        // boundary.
+        let captures = vec![
+            CapturedStatusline {
+                captured_at: 100,
+                payload: serde_json::json!({
+                    "session_id": "sess-a",
+                    "rate_limits": {
+                        "spend_limit": {"used_percentage": 62.8, "resets_at": 200}
+                    }
+                }),
+            },
+            CapturedStatusline {
+                captured_at: 300,
+                payload: serde_json::json!({
+                    "session_id": "sess-a",
+                    "rate_limits": {
+                        "spend_limit": {"used_percentage": 10.0, "resets_at": 500}
+                    }
+                }),
+            },
+        ];
+        let insights = statusline_insights(&captures);
+        let spend_crossings: Vec<_> = insights
+            .limit_crossings
+            .iter()
+            .filter(|crossing| crossing.window == "spend_limit")
+            .collect();
+        assert_eq!(spend_crossings.len(), 1, "{:?}", insights.limit_crossings);
+        assert_eq!(spend_crossings[0].resets_at, 200);
+        assert_eq!(spend_crossings[0].used_percentage_before, Some(62.8));
+        assert_eq!(spend_crossings[0].used_percentage_after, Some(10.0));
+    }
+
+    #[test]
+    fn statusline_insights_tolerates_legacy_and_unknown_payloads() {
+        // rm-037 acceptance: a legacy pre-2.1.251 payload (no
+        // rate_limits / prompt_cache / context_window / prompt_id at
+        // all) extracts without error and renders with no phantom
+        // arms; unknown future fields and documented null states are
+        // tolerated.
+        let legacy = vec![CapturedStatusline {
+            captured_at: 1_000,
+            payload: serde_json::json!({
+                "hook_event_name": "Status",
+                "session_id": "legacy-1",
+                "transcript_path": "/tmp/legacy.jsonl",
+                "cwd": "/work",
+                "version": "2.0.9",
+                "model": {"id": "claude-sonnet-4-5"},
+                "cost": {"total_cost_usd": 0.42}
+            }),
+        }];
+        let insights = statusline_insights(&legacy);
+        assert_eq!(insights.spend_limit, None);
+        assert!(insights.context_windows.is_empty());
+        assert_eq!(insights.context_peak_used_percentage, None);
+        assert!(insights.prompt_ids.is_empty());
+        assert_eq!(insights.five_hour, None);
+        let text = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 1,
+                bytes: 200,
+                retained_max_bytes: 1024,
+                captures_with_prompt_id: 0,
+                captures_pre_first_input: 1,
+                captures_unknown_payload: 0,
+            },
+            &insights,
+            None,
+            &statusline_budget_series(&legacy, 7),
+        );
+        assert!(!text.contains("spend"), "no phantom spend arm: {text}");
+        assert!(
+            !text.contains("Context window"),
+            "no phantom context arm: {text}"
+        );
+        assert!(
+            !text.contains("Latest prompt_id"),
+            "no phantom prompt arm: {text}"
+        );
+
+        // Documented null states (pre-first-API-call / post-compact)
+        // and unknown future fields parse to absent arms, not errors.
+        let nulled = vec![CapturedStatusline {
+            captured_at: 2_000,
+            payload: serde_json::json!({
+                "session_id": "null-1",
+                "context_window": {
+                    "used_percentage": null,
+                    "remaining_percentage": null,
+                    "current_usage": null
+                },
+                "rate_limits": {"spend_limit": {"used_percentage": null}},
+                "prompt_id": null,
+                "future_field": "unknown"
+            }),
+        }];
+        let insights = statusline_insights(&nulled);
+        assert_eq!(insights.context_windows.len(), 1);
+        assert_eq!(insights.context_windows[0].used_percentage, None);
+        assert_eq!(insights.context_windows[0].current_usage, None);
+        assert_eq!(insights.context_peak_used_percentage, None);
+        assert_eq!(insights.spend_limit, Some(StatuslineSpendLimit::default()));
+        assert!(insights.prompt_ids.is_empty());
+    }
+
+    #[test]
+    fn statusline_journal_stats_classifies_prompt_key_presence() {
+        // rm-708 diagnostics: captures-without-prompt_id (the
+        // documented pre-first-input state) are disclosed distinctly
+        // from unclassifiable payloads; torn tail lines count only as
+        // lines.
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-stats-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("statusline.jsonl");
+        let capture = |payload: Value| {
+            serde_json::to_string(&CapturedStatusline {
+                captured_at: 1,
+                payload,
+            })
+            .unwrap()
+        };
+        let lines = [
+            capture(serde_json::json!({"session_id": "a", "prompt_id": "pid-1"})),
+            capture(serde_json::json!({"session_id": "b"})),
+            capture(serde_json::json!("not an object")),
+            capture(serde_json::json!({"session_id": "c", "prompt_id": 42})),
+            // A torn tail line from a crashed append.
+            "{\"captured_at\": 2, \"payl".to_string(),
+        ];
+        fs::write(&path, lines.join("\n") + "\n").expect("write journal");
+        let stats = statusline_journal_stats(&path);
+        assert_eq!(stats.lines, 5);
+        assert_eq!(stats.captures_with_prompt_id, 1);
+        assert_eq!(stats.captures_pre_first_input, 1);
+        assert_eq!(stats.captures_unknown_payload, 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn correlated_prompt_ids_joins_and_tolerates_unknown_shapes() {
+        // rm-708: the capture-side half of the statusline<->OTel
+        // prompt correlation. Only ids present in both lanes join;
+        // unknown OTLP shapes correlate nothing instead of erroring.
+        let capture = |prompt_id: Option<&str>| CapturedStatusline {
+            captured_at: 1,
+            payload: match prompt_id {
+                Some(id) => serde_json::json!({"session_id": "a", "prompt_id": id}),
+                None => serde_json::json!({"session_id": "b"}),
+            },
+        };
+        let captures = vec![
+            capture(Some("pid-1")),
+            capture(Some("pid-2")),
+            capture(None),
+        ];
+        let otel_doc = serde_json::json!({
+            "resourceSpans": [
+                {
+                    "scopeSpans": [
+                        {
+                            "spans": [
+                                {
+                                    "attributes": [
+                                        {"key": "prompt.id", "value": {"stringValue": "pid-1"}},
+                                        {"key": "other", "value": {"stringValue": "pid-2"}}
+                                    ]
+                                },
+                                {"name": "no-attributes"}
+                            ]
+                        }
+                    ]
+                },
+                {"resourceSpans sibling without scopeSpans": true}
+            ]
+        });
+        assert_eq!(
+            correlated_prompt_ids(&captures, &otel_doc),
+            vec!["pid-1".to_string()]
+        );
+        // Distinct ids on the otel side alone never join.
+        let disjoint = serde_json::json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [{
+                        "attributes": [
+                            {"key": "prompt.id", "value": {"stringValue": "pid-3"}}
+                        ]
+                    }]
+                }]
+            }]
+        });
+        assert!(correlated_prompt_ids(&captures, &disjoint).is_empty());
+        // Unknown shapes: empty doc, missing arrays, non-string values.
+        assert!(correlated_prompt_ids(&captures, &serde_json::json!({})).is_empty());
+        assert!(
+            correlated_prompt_ids(&captures, &serde_json::json!({"resourceSpans": "oops"}))
+                .is_empty()
+        );
+        let non_string = serde_json::json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "spans": [{
+                        "attributes": [
+                            {"key": "prompt.id", "value": {"intValue": 7}}
+                        ]
+                    }]
+                }]
+            }]
+        });
+        assert!(correlated_prompt_ids(&captures, &non_string).is_empty());
+        // No prompts captured at all: nothing to join.
+        let bare = vec![capture(None)];
+        assert!(correlated_prompt_ids(&bare, &otel_doc).is_empty());
+    }
+
+    #[test]
+    fn statusline_report_sanitizes_prompt_id_render() {
+        // rm-034 convention extended to the new arms: the prompt id is
+        // a journal payload string, so the text lane prints it
+        // sanitized while the journal keeps what it saw.
+        let hostile = vec![CapturedStatusline {
+            captured_at: 1_000,
+            payload: serde_json::json!({
+                "session_id": "sess\u{1b}[2Jhostile",
+                "prompt_id": "pid\u{1b}[31mevil",
+                "context_window": {"used_percentage": 50.0},
+                "rate_limits": {"spend_limit": {
+                    "used_usd": 62.8,
+                    "limit_usd": 500.0,
+                    "period": "monthly\u{1b}]52;evil"
+                }}
+            }),
+        }];
+        let insights = statusline_insights(&hostile);
+        let text = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 1,
+                bytes: 100,
+                retained_max_bytes: 1024,
+                captures_with_prompt_id: 1,
+                captures_pre_first_input: 0,
+                captures_unknown_payload: 0,
+            },
+            &insights,
+            None,
+            &statusline_budget_series(&hostile, 7),
+        );
+        assert!(!text.contains('\u{1b}'), "no raw control bytes: {text}");
+        assert!(text.contains("Latest prompt_id per session:"), "{text}");
+        assert!(text.contains("sess\u{FFFD}[2Jhostile"), "{text}");
+        assert!(text.contains("pid\u{FFFD}[31mevil"), "{text}");
+        // rm-034 rule (review fix, 537105b1 F1): the spend-limit
+        // period is a journal payload string too — the append arm
+        // (beside the USD pair) renders it sanitized …
+        assert!(text.contains("monthly\u{FFFD}]52;evil"), "{text}");
+
+        // … and so does the period-alone arm when the gateway sent no
+        // USD fields at all.
+        let period_only = vec![CapturedStatusline {
+            captured_at: 1_000,
+            payload: serde_json::json!({
+                "session_id": "sess",
+                "rate_limits": {"spend_limit": {"period": "weekly\u{1b}[31mevil"}}
+            }),
+        }];
+        let period_text = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 1,
+                bytes: 100,
+                retained_max_bytes: 1024,
+                captures_with_prompt_id: 0,
+                captures_pre_first_input: 1,
+                captures_unknown_payload: 0,
+            },
+            &statusline_insights(&period_only),
+            None,
+            &statusline_budget_series(&period_only, 7),
+        );
+        assert!(
+            !period_text.contains('\u{1b}'),
+            "no raw control bytes: {period_text}"
+        );
+        assert!(
+            period_text.contains("weekly\u{FFFD}[31mevil"),
+            "{period_text}"
+        );
     }
 
     /// Fixture built field-for-field from the documented statusline input

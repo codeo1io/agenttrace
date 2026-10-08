@@ -76,10 +76,12 @@ pub use session_cache::{
 };
 pub use sqlite_sessions::{load_sqlite_backed_sessions, skip_sqlite_backed_file_dir};
 pub use statusline::{
-    load_statusline_insights, render_budget_view, render_statusline_report, run_statusline_host,
-    sanitize_line_segment, statusline_budget_series, statusline_capture_path, statusline_insights,
-    statusline_journal_stats, CapturedStatusline, StatuslineBudgetSeries, StatuslineInsights,
-    StatuslineJournalStats, StatuslineRateLimitState,
+    correlated_prompt_ids, load_statusline_insights, render_budget_view, render_statusline_report,
+    run_statusline_host, sanitize_line_segment, statusline_budget_series, statusline_capture_path,
+    statusline_insights, statusline_journal_stats, CapturedStatusline, StatuslineBudgetSeries,
+    StatuslineContextUsage, StatuslineContextWindow, StatuslineInsights, StatuslineJournalStats,
+    StatuslinePromptCache, StatuslineRateLimitState, StatuslineSessionContextWindow,
+    StatuslineSessionPrompt, StatuslineSpendLimit,
 };
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language,
