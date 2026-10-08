@@ -2,6 +2,7 @@ mod demo;
 mod diagnostics;
 mod discovery;
 mod doctor;
+mod filters;
 mod governance;
 mod history;
 mod insights;
@@ -29,6 +30,10 @@ pub use diagnostics::{
     ContextUtilization, CostAlert, Diagnostics, FindingEvidence, FixSuggestion, InspectFirst,
     LargeParam, LoopCost, LoopFingerprint, SessionFinding, StuckPattern, ToolLatency, TraceStep,
     UnusedTool,
+};
+pub use filters::{
+    matches_numeric_filter, parse_finite_f64, parse_numeric_filter, parse_numeric_filter_i32,
+    NumericFilterOp,
 };
 
 pub use discovery::{
@@ -1729,17 +1734,32 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
     overview
 }
 
+/// Parse-instant comparison for `session_start` strings (rm-785).
+///
+/// Orders by the parsed instant ([`parse_ts`]), not the raw string, so any
+/// two RFC 3339 spellings of the same timeline — `…Z` and `…+09:00` — order
+/// correctly. A session with a missing or unparseable `session_start` counts
+/// as the OLDEST (it sorts last in newest-first views); two such sessions
+/// compare `Equal` so caller tie-breaks (name, path, mtime) decide. This is
+/// the one recency basis shared by `canonical_sessions`, the CLI
+/// `--sort recent` arm and `--latest` selection, and the TUI
+/// `SortKey::Recent` comparator.
+pub fn session_start_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (parse_ts(a), parse_ts(b)) {
+        (Some(a_ts), Some(b_ts)) => a_ts.cmp(&b_ts),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 pub fn canonical_sessions(sessions: &[Session]) -> Vec<Session> {
     let mut out = sessions.to_vec();
     out.sort_by(|a, b| {
-        let a_ts = parse_ts(&a.metrics.session_start);
-        let b_ts = parse_ts(&b.metrics.session_start);
-        match (a_ts, b_ts) {
-            (Some(a_ts), Some(b_ts)) if a_ts != b_ts => b_ts.cmp(&a_ts),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)),
-        }
+        session_start_cmp(&a.metrics.session_start, &b.metrics.session_start)
+            .reverse()
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
     });
     out
 }
@@ -2266,6 +2286,80 @@ pub(crate) mod test_env {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recency_session(name: &str, session_start: &str) -> Session {
+        Session {
+            name: name.to_string(),
+            path: format!("/{name}.jsonl"),
+            cwd: String::new(),
+            metrics: Metrics {
+                session_start: session_start.to_string(),
+                ..Default::default()
+            },
+            anomalies: vec![],
+            health: 0,
+            tool_warnings: vec![],
+            diagnostics: Diagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn session_start_cmp_orders_parsed_instants_across_offset_spellings() {
+        // rm-785: "2026-01-02T01:30:00Z" and "2026-01-02T10:30:00+09:00"
+        // are the same instant in two spellings and must compare Equal; both
+        // must order against other instants identically. The raw-string
+        // comparators this replaces ordered by byte value, so any
+        // non-normalizing producer mis-sorted the whole corpus.
+        assert_eq!(session_start_cmp("", ""), std::cmp::Ordering::Equal);
+        assert_eq!(
+            session_start_cmp("2026-01-02T01:30:00Z", "2026-01-02T10:30:00+09:00"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            session_start_cmp("2026-01-02T10:30:00+09:00", "2026-01-02T01:29:59Z"),
+            std::cmp::Ordering::Greater
+        );
+        // Naive timestamps parse as UTC on the same basis.
+        assert_eq!(
+            session_start_cmp("2026-01-02T01:30:00", "2026-01-02T01:30:01Z"),
+            std::cmp::Ordering::Less
+        );
+        // Missing or unparseable timestamps count as the OLDEST instant, so
+        // newest-first views keep them last and --latest never picks them
+        // over a dated session.
+        assert_eq!(
+            session_start_cmp("", "2000-01-01T00:00:00Z"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            session_start_cmp("bogus", "2000-01-01T00:00:00Z"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(session_start_cmp("bogus", ""), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn canonical_sessions_orders_mixed_offset_corpus_by_instant() {
+        // rm-785 regression fixture: a mixed-offset corpus (+09:00 vs Z vs
+        // naive vs absent) orders by parsed instant, newest first, absent
+        // last — any future non-normalizing producer fails this pin loudly.
+        let sessions = vec![
+            recency_session("absent", ""),
+            recency_session("z-morning", "2026-01-02T01:30:00Z"),
+            recency_session("plus-nine", "2026-01-02T10:30:00+09:00"),
+            recency_session("z-later", "2026-01-02T05:00:00Z"),
+            recency_session("naive-utc", "2026-01-02T00:00:00"),
+        ];
+        let ordered = canonical_sessions(&sessions);
+        let names: Vec<&str> = ordered.iter().map(|s| s.name.as_str()).collect();
+        // z-later (05:00Z) newest; z-morning and plus-nine are the same
+        // instant and fall to the name tie-break; naive-utc (00:00Z) is the
+        // oldest present session; absent last.
+        assert_eq!(
+            names,
+            vec!["z-later", "plus-nine", "z-morning", "naive-utc", "absent"]
+        );
+    }
 
     #[test]
     fn all_three_installers_verify_sha256_sidecars() {

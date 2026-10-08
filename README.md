@@ -290,7 +290,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--diagnostics` |  | Render per-session diagnostics: findings, evidence, fix suggestions, and next actions |
 | `--inspect <INSPECT>` |  | Inspect a single session by its `--sessions` list index (1-based) instead of the whole corpus |
 | `-m <MODEL>` | `default` | Reference model for `--compare` framing (cost-rate attribution in the comparison narrative; not a session filter — see `--model-filter`) |
-| `-o <OUTPUT>` |  | Write the report to this path instead of stdout (the report is also kept on stdout — a tee, not a redirect). Regular paths stage atomically through a temp sibling (rm-250); terminal sinks like /dev/null and /dev/stdout write through directly, while fifo/socket/block-device targets are refused with a disclosed reason instead of being replaced (rm-489) |
+| `-o <OUTPUT>` |  | Write the report to this path instead of stdout (the report is also kept on stdout – a tee, not a redirect). Regular paths stage atomically through a temp sibling (rm-250); terminal sinks like /dev/null and /dev/stdout write through directly, while fifo/socket/block-device targets are refused with a disclosed reason instead of being replaced (rm-489). Missing parent directories are created recursively (mkdir -p semantics); when a parent cannot be created, the error names the directory and the requested target (rm-784) |
 | `--latest` |  | Restrict the view to the single most recent session (works with `--waste` and report actions) |
 | `--waste` |  | Render the token-waste report: redundant context, loop cost, and unused tool output, with a per-reason breakdown |
 | `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes |
@@ -322,8 +322,8 @@ fails when the README table drifts from the binary's actual flag count
 | `--source <SOURCE>` | `""` | Filter sessions by source tool substring (e.g. claude-code, codex, pi) |
 | `--model-filter <MODEL_FILTER>` | `""` | Filter sessions by model name substring |
 | `--query <QUERY>` | `""` | Filter sessions by a free-text query over identity fields |
-| `--health <HEALTH>` | `""` | Filter sessions by health tier (healthy/warning/critical) or a numeric comparison |
-| `--cost <COST>` | `""` | Filter sessions by a cost comparison (e.g. `>1.5`) |
+| `--health <HEALTH>` | `""` | Filter sessions by health tier (healthy/warning/critical) or a numeric comparison in the shared CLI/TUI dialect: an optional `>=`, `<=`, `>`, `<`, or `=` operator followed by a finite number; a bare number means `>=` (e.g. `warn`, `>=80`, `80`) |
+| `--cost <COST>` | `""` | Filter sessions by a cost comparison in the shared CLI/TUI dialect: an optional `>=`, `<=`, `>`, `<`, or `=` operator followed by a finite number; a bare number means `>=` (e.g. `>1.5`, `1.5`) |
 | `--anomaly <ANOMALY>` | `""` | Filter sessions by anomaly kind |
 | `--sort <SORT>` | `recent` | Sort key for list views: recent (default), health, cost, turns, failures, source, or name |
 | `--order <ORDER>` | `desc` | Sort direction for list views: desc (default) or asc |

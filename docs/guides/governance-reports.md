@@ -20,6 +20,13 @@ that way yet: on the interactive view they are accepted and ignored.
 
 Supported controls include `--range today|7d|30d|all`, `--project`, `--source`, `--model-filter`, `--query`, `--health`, `--cost`, `--anomaly`, `--sort`, `--order`, and `--limit`.
 
+`--health` and `--cost` share ONE dialect with the TUI (rm-389 remaining
+scope, landed run 24ec00eb cycle 1): an optional `>=`, `<=`, `>`, `<`, or
+`=` operator followed by a finite number, where a bare number means `>=`
+(e.g. `warn`, `>=80`, `80`, `>1.5`, `1.5`). Non-finite thresholds
+(`>=NaN`, `<=inf`, `1e400`) are rejected loudly with a message documenting
+the dialect instead of silently matching nothing or everything.
+
 By default every governance report audits **every** session in scope, and the
 report discloses its coverage: `audited_sessions` / `total_sessions` /
 `excluded_reason` in JSON, and a leading `(auditing N of M sessions)` line in
