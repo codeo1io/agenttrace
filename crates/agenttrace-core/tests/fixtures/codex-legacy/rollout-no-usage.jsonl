@@ -1,0 +1,6 @@
+{"timestamp":"2026-05-14T10:00:00.000Z","type":"session_meta","payload":{"id":"8f3a71c2-legacy-rollout","timestamp":"2026-05-14T10:00:00.000Z","cwd":"/home/user/proj","originator":"codex_cli_rs","cli_version":"0.20.0","instructions":null}}
+{"timestamp":"2026-05-14T10:00:01.000Z","type":"task_started","payload":{"id":"task_8f3a71c2"}}
+{"timestamp":"2026-05-14T10:00:02.000Z","type":"turn_context","payload":{"cwd":"/home/user/proj","model":"gpt-5-codex","effort":"medium","summary":"auto"}}
+{"timestamp":"2026-05-14T10:00:05.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"summarize the failing test"}]}}
+{"timestamp":"2026-05-14T10:00:09.000Z","type":"event_msg","payload":{"type":"item_completed"}}
+{"timestamp":"2026-05-14T10:00:12.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"the regression is in the cache layer"}]}}

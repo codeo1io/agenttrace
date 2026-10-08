@@ -158,6 +158,15 @@ pub struct Event {
         deserialize_with = "deserialize_usage_map"
     )]
     pub usage: BTreeMap<String, i64>,
+    // rm-718: the sibling scalar fields accept both spellings; the
+    // generic fallback lane is the only lane that deserializes foreign
+    // JSON into `Event` (the dedicated parsers construct events by
+    // hand), so accepting the lowercase spelling here is exactly the
+    // case-normalization that lane was missing — journals carrying
+    // `model_used` attributed to "default" and priced as unknown.
+    // (The alias itself also landed via rm-616's generic-lane batch on
+    // this branch — the two rows share the intake; rm-718 adds the
+    // cache-spelling normalization in `lenient_usage_map` below.)
     #[serde(
         default,
         rename = "ModelUsed",
@@ -259,6 +268,11 @@ where
 
 fn lenient_usage_map(value: &Value) -> BTreeMap<String, i64> {
     let mut usage = BTreeMap::new();
+    // rm-718 F4 sweep: cross-provider spellings of the cache-read count
+    // normalize onto the canonical key below — the canonical spelling
+    // wins if both appear, deterministically in either key order and
+    // never summed.
+    let mut aliased_cache_read: Option<i64> = None;
     let Some(object) = value.as_object() else {
         return usage;
     };
@@ -274,11 +288,27 @@ fn lenient_usage_map(value: &Value) -> BTreeMap<String, i64> {
                 }
             }
             other => {
-                if let Some(number) = parser::number_as_i64(other) {
-                    usage.insert(key.clone(), number);
+                let Some(number) = parser::number_as_i64(other) else {
+                    continue;
+                };
+                match key.as_str() {
+                    // Gemini wire (`cachedContentTokenCount`, the spelling
+                    // the dedicated gemini lane already maps) and the
+                    // OpenAI-compatible camelCase spelling.
+                    "cachedContentTokenCount" | "cacheReadInputTokens" => {
+                        aliased_cache_read = Some(number);
+                    }
+                    _ => {
+                        usage.insert(key.clone(), number);
+                    }
                 }
             }
         }
+    }
+    if let Some(number) = aliased_cache_read {
+        usage
+            .entry("cache_read_input_tokens".to_string())
+            .or_insert(number);
     }
     usage
 }
@@ -610,6 +640,22 @@ pub struct SearchResult {
 /// leaves to `{key}_{leaf}` first (mirroring `lenient_usage_map`), so a
 /// nested `"input": {"tokens": 7}` on a meta line is consumed, not
 /// disclosed.
+///
+/// rm-718 (integration of run 5417681937ae): the Event intake's
+/// `lenient_usage_map` normalizes the two cross-provider spellings of
+/// the cache-read count (`cachedContentTokenCount`, the Gemini wire
+/// spelling, and `cacheReadInputTokens`, the OpenAI-compatible one)
+/// onto the canonical `cache_read_input_tokens` key. At the location
+/// the accounting reads (top-level `usage` of a meta line) those
+/// spellings are therefore CONSUMED and stay silent like canonical
+/// keys — disclosing them as unmapped there would be the exact
+/// dishonesty this helper exists to prevent (a counted token labeled
+/// as dropped, degrading `data_health.confidence`). At every other
+/// location the accounting still never reads them, so they keep the
+/// truthful `usage_alias_unmapped` tier below. When a block carries
+/// both spellings the canonical value wins and the alias value is
+/// discarded (never summed) — pinned by `disclosure_plane_honesty`'s
+/// canonical-wins pair; the discarded alias stays silent there too.
 fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();
@@ -670,8 +716,22 @@ fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
                     )
                 }
             };
-            let prefix = if canonical && consumed_location {
-                continue; // actually accounted: canonical at the read place
+            // rm-718: the intake normalization (see the helper's doc
+            // above) consumes the two cache-read alias spellings at
+            // the read location — `cachedContentTokenCount` /
+            // `cacheReadInputTokens` on a meta line's top-level
+            // `usage` fold onto the canonical key, so they are
+            // accounted there and must stay silent like a canonical
+            // key. Everywhere else they fall through to the alias
+            // tier unchanged.
+            let normalized_cache_read_spelling = matches!(
+                wire_key.as_str(),
+                "cachedContentTokenCount" | "cacheReadInputTokens",
+            );
+            let prefix = if consumed_location && (canonical || normalized_cache_read_spelling) {
+                continue; // actually accounted: canonical at the read
+                          // place, or an rm-718-normalized spelling
+                          // folded onto it
             } else if canonical {
                 "usage_unconsumed_location"
             } else if recognized {

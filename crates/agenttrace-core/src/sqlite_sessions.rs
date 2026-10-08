@@ -1465,8 +1465,13 @@ mod tests {
         // load stores nothing; (b) even a pre-existing empty snapshot
         // (written by a pre-fix binary) is distrusted and re-verified.
         // The cache location is env-derived, so the test isolates it
-        // (and restores on exit).
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // (and restores on exit). It takes the SHARED test_env lock,
+        // not a private static: per-module locks let any other
+        // env-mutating test re-point AGENTTRACE_SESSION_CACHE_DIR
+        // mid-flight, which would write this test's hand-poisoned
+        // snapshot into the other test's cache root and fail the
+        // "poisoned snapshot is in place" pin non-deterministically —
+        // the exact re-pointing class `test_env` documents and closes.
         struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for EnvRestore {
             fn drop(&mut self) {
@@ -1478,9 +1483,9 @@ mod tests {
                 }
             }
         }
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Declared before EnvRestore so the env is restored (Drop)
+        // while the lock is still held.
+        let _guard = crate::test_env::lock_env();
         let _restore = EnvRestore(
             [
                 (

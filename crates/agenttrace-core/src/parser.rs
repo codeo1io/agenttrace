@@ -203,13 +203,18 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
         // kimi_cli parses outside the probe array — last, exactly where it
         // used to sit — because it carries its own disclosure channel for
-        // alias-matched usage fields (rm-400).
+        // alias-matched usage fields (rm-400). rm-719 moved that channel
+        // from `line_skips` to `disclosure_counters`: an alias match is
+        // informational (the vendor's real wire keys were matched, the
+        // usage counted exactly), so it renders under "Disclosed facts"
+        // like the workbuddy basis family above instead of degrading
+        // data_health.confidence as parse loss.
         if let Some((events, usage_alias_counts)) = parse_kimi_wire_jsonl(&objs) {
             let mut session = finish(events)?;
             for (key, count) in usage_alias_counts {
                 *session
                     .metrics
-                    .line_skips
+                    .disclosure_counters
                     .entry(format!("kimi_usage_alias:{key}"))
                     .or_insert(0) += count;
             }
@@ -3146,6 +3151,13 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     // call that did not complete marks its (later) output as an error,
     // the way other parsers surface tool failures.
     let mut failed_custom_calls: BTreeSet<String> = BTreeSet::new();
+    // rm-716 (tokscale #1405): rollouts the pre-Sept-2026 codex CLI
+    // wrote carry no `token_count` events and no `token_usage_record`
+    // rows — every usage source this lane reads — and used to parse
+    // green with zero usage and no distinct verdict. Track whether ANY
+    // usage row was seen so the verdict below fires only on true
+    // absence.
+    let mut saw_token_count_row = false;
     // A plain for-loop, not a filter-closure iterator chain: rm-542's
     // in-loop disclosure counters share `counters` with the ignorable-line
     // count, and a closure holding the mutable borrow across the whole
@@ -3223,6 +3235,7 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     continue;
                 };
                 if string(payload.get("type")) == Some("token_count") {
+                    saw_token_count_row = true;
                     if let Some(usage) =
                         codex_token_count_usage(payload.get("info"), &mut codex_totals)
                     {
@@ -3569,6 +3582,28 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
         *counters
             .entry("codex_compaction_usage_record".to_string())
             .or_insert(0) += 1;
+    }
+    // rm-716 (tokscale #1405): a rollout with zero usage rows on every
+    // source this lane reads is the pre-Sept-2026 codex CLI's journal
+    // shape, not a free session. Ship the absence as a distinct verdict
+    // on the non-loss disclosure channel (rm-538/rm-719 convention) —
+    // it renders under "Disclosed facts" and never degrades
+    // data_health.confidence, because it is an informational fact about
+    // the journal's era, not a parse failure. Nothing is fabricated:
+    // with no usage rows the token totals stay exactly what the text
+    // estimator derived (provenance stays estimated_from_text).
+    if saw_codex && !saw_token_count_row && usage_records.is_empty() {
+        events.push(Event {
+            role: "meta".to_string(),
+            timestamp: events
+                .last()
+                .map(|event| event.timestamp.clone())
+                .unwrap_or_default(),
+            model_used: model.clone(),
+            source_tool: "codex_cli".to_string(),
+            disclosure_counters: BTreeMap::from([("codex_rollout_no_usage_rows".to_string(), 1)]),
+            ..Event::default()
+        });
     }
     if saw_codex {
         non_empty(events).map(|events| (events, counters))
@@ -7681,8 +7716,11 @@ mod tests {
     fn kimi_usage_alias_matches_are_disclosed_in_parse_diagnostics() {
         // The alias table is a standing guess about another tool's wire
         // format; every alias-matched field is counted per session so a
-        // future key change surfaces in parse diagnostics instead of as
-        // silently-zero usage again.
+        // future key change surfaces in the reports instead of as
+        // silently-zero usage again. rm-719: the counters ride the
+        // non-loss disclosure channel ("Disclosed facts", never
+        // degrading data_health.confidence) — a wire-key match is an
+        // informational fact about the vendor's journal, not parse loss.
         let raw = [
             serde_json::json!({
                 "timestamp": 1,
@@ -7705,28 +7743,36 @@ mod tests {
         assert_eq!(
             session
                 .metrics
-                .line_skips
+                .disclosure_counters
                 .get("kimi_usage_alias:input_other"),
-            Some(&1)
-        );
-        assert_eq!(
-            session.metrics.line_skips.get("kimi_usage_alias:output"),
             Some(&1)
         );
         assert_eq!(
             session
                 .metrics
-                .line_skips
+                .disclosure_counters
+                .get("kimi_usage_alias:output"),
+            Some(&1)
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
                 .get("kimi_usage_alias:input_cache_read"),
             Some(&1)
         );
         assert_eq!(
             session
                 .metrics
-                .line_skips
+                .disclosure_counters
                 .get("kimi_usage_alias:input_cache_creation"),
             Some(&1),
             "a zero-valued matched field is still a wire-shape signal"
+        );
+        assert!(
+            session.metrics.line_skips.is_empty(),
+            "alias matches are not parse loss: line_skips {:#?}",
+            session.metrics.line_skips
         );
     }
 

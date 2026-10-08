@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 37 and the SQLite snapshot is schema 8; the
+The session cache is schema 38 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -143,7 +143,20 @@ with a disclosed synthetic fallback and a serialized `cost_basis`
 field on `LoopCost` — instead of pricing-independent constants
 (rm-754 of run bbde21568cd4, landed at its base 1c5edd1 as 32 → 33,
 re-based at integration onto the advanced ceiling as 36 → 37) — so
-cached sessions regenerate with priced loop costs; the SQLite snapshot to 7
+cached sessions regenerate with priced loop costs, and to 38 when the
+disclosure-plane honesty batch moved the kimi usage-alias counters
+onto the non-loss disclosure channel
+(`kimi_usage_alias:<key>` renders under "Disclosed facts" instead of
+degrading `data_health.confidence` as parse loss, rm-719), widened the
+generic lane's `Event` intake (`model_used` lowercase alias; the
+`cachedContentTokenCount` / `cacheReadInputTokens` spellings of the
+cache-read count normalize onto the canonical key, canonical-wins,
+rm-718), and added the `codex_rollout_no_usage_rows` absence verdict
+for pre-Sept-2026 rollouts that carry no usage rows at all (rm-716 —
+all three of run 5417681937ae cycle 3, landed at its base 1c5edd1 as
+32 → 33, re-based at integration onto the advanced ceiling as 37 → 38)
+— so cached sessions regenerate under the corrected confidence,
+disclosure census, attribution and cache-read totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, and to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548). Older versions are discarded and

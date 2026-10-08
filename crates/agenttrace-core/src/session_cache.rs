@@ -5,7 +5,30 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 37;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 38;
+// Bumped 37 -> 38 (integration of run 5417681937ae, cycle-3
+// "disclosure-plane honesty" batch, rm-718 + rm-719 + rm-716; conflict
+// case 3c573958563e417b94eeab5c307279df): kimi usage-alias counters
+// moved from `Metrics.line_skips` to `Metrics.disclosure_counters` —
+// the non-loss disclosure channel — so a healthy kimi corpus stops
+// reporting LOW confidence and a "Dropped lines" row for matching the
+// vendor's real wire keys; rm-718 widened the generic lane's `Event`
+// intake (lowercase `model_used` alias — also landed independently by
+// the rm-616 generic-lane batch — plus `cachedContentTokenCount` /
+// `cacheReadInputTokens` normalizing onto `cache_read_input_tokens`),
+// and rm-716 added the `codex_rollout_no_usage_rows` absence verdict.
+// All three change what a re-parse reports for an UNCHANGED source
+// file (confidence, disclosed-facts census, model attribution,
+// cache-read totals), so a warm v37 cache keeps serving the pre-batch
+// values with matching fingerprints and never re-parses (the rm-230
+// convention: parser-semantics changes bump the schema so cached
+// sessions regenerate under corrected accounting). The batch landed
+// against its base 1c5edd1 at schema 32 and bumped it to 33 there;
+// integration re-bases the bump onto the already-advanced ceiling
+// (33 was the run-91833f02 rm-616 batch, 34 the run-73fe8e1e rm-710
+// batch, 35 the run-3ec6cec08fb9 rm-720/rm-721 batch, 36 the
+// run-6aaf51aa rm-502 batch, 37 the run-bbde21568cd4 rm-754 batch)
+// per the same convention. Entries regenerate once on next scan.
 // Bumped 36 -> 37 (integration of run bbde21568cd4, "honest numbers",
 // rm-754; conflict case 615546e27c2b4f2d86e02b511f23ddd1): loop
 // costs are now priced from the session's own model rates x the

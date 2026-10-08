@@ -1631,6 +1631,29 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 38 (integration of run 5417681937ae,
+                // cycle-3 "disclosure-plane honesty": the kimi
+                // usage-alias counters moved onto
+                // metrics.disclosure_counters (rm-719) so a healthy
+                // kimi corpus stops reporting LOW confidence, the
+                // generic-lane Event intake gained the lowercase
+                // model_used alias plus the
+                // cachedContentTokenCount/cacheReadInputTokens
+                // cache-read spellings (rm-718), and pre-Sept-2026
+                // codex rollouts gained the
+                // codex_rollout_no_usage_rows absence verdict
+                // (rm-716) — warm v37 entries keep the pre-batch
+                // confidence/attribution for unchanged files; landed
+                // at its base 1c5edd1 as the campaign's 32 -> 33
+                // bump, re-based here onto the advanced ceiling, 37
+                // being the rm-754 priced-loop-cost rung below);
+                // Schema 37 (integration of run bbde21568cd4, rm-754
+                // priced loop-cost dollars + the rm-753 SQLite ingest
+                // disclosures — warm v36 entries kept the
+                // pricing-independent loop-cost constants for
+                // unchanged files; landed at its base 1c5edd1 as the
+                // campaign's 32 -> 33 bump, re-based here onto the
+                // advanced ceiling, 36 being the rm-502 rung below);
                 // Schema 36 (integration of run 6aaf51aa, rm-502 —
                 // every strict timestamp consumer routes through the
                 // shared lenient parse_ts, so naive-ISO corpora
@@ -1676,7 +1699,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // codex reasoning/post-compaction counting, copilot
                 // later-record-wins + the shutdown timestamp tail;
                 // re-based off the campaign's 26 -> 27 bump);
-                // Schema 31 (integration of run 254b2417, rm-551 copilot
+                // schema 31 (integration of run 254b2417, rm-551 copilot
                 // per-model reconciliation — warm v30 entries carried
                 // snapshot-level totals; re-based off the campaign's
                 // 26 -> 27 bump); schema 30 (integration of run
@@ -1702,7 +1725,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":37,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":38,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

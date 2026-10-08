@@ -1,0 +1,7 @@
+{"type":"user","timestamp":"2026-10-07T10:00:00Z","content":"hello"}
+{"type":"assistant","timestamp":"2026-10-07T10:00:05Z","content":"hi","usage":{"input_tokens":1000,"output_tokens":500}}
+---
+"standalone note"
+{"type":"tool_use","timestamp":"2026-10-07T10:00:06Z","tool_name":"Bash","id":"t1"}
+{"type":"tool_result","timestamp":"2026-10-07T10:00:10Z","tool_name":"Bash","id":"t1"}
+{"type":"assistant","timestamp":"2026-10-07T10:0
