@@ -1,4 +1,17 @@
-#![allow(dead_code)]
+//! Production TUI helpers (rm-014 unification, cycle 2).
+//!
+//! This module is the ONE implementation of the shared TUI helper set:
+//! the production renderer (`explorer.rs`) and the test renderer
+//! (`presentation.rs`) both consume these functions through `app`'s
+//! `use shared::*` binding. Before rm-014 the test renderer carried its
+//! own copies of all 21 helpers (12 of them drifted); tests exercised the
+//! copies, not production code. `tests::presentation_defines_no_duplicate_helpers`
+//! fails the suite if a copy is ever re-introduced, and
+//! `tests::helpers_resolve_to_the_production_module` pins function-pointer
+//! identity between the glob binding and `shared::`.
+//!
+//! Every helper here must have a production caller (directly or through
+//! another helper) — there is deliberately no `allow(dead_code)`.
 
 use super::*;
 
@@ -76,35 +89,87 @@ pub(super) fn render_loading_status(frame: &mut Frame<'_>, app: &App, area: Rect
     );
 }
 
+/// Honest loading disclosure (adopted from the pre-unification test
+/// renderer during rm-014): mode, progress bar, sources, parsed /
+/// confidence / skipped / fallback-pricing / latest-session lines. The
+/// pre-unification production copy rendered three lines and never
+/// disclosed sources or parse confidence.
 pub(super) fn loading_status_lines(app: &App) -> Vec<Line<'static>> {
     let state = &app.load_state;
+    let health = &app.derived.health;
+    let mode = if state.force {
+        app.t("force reload", "强制重载")
+    } else {
+        app.t("normal load", "正常加载")
+    };
     let processed = state.processed.min(state.discovered);
+    let progress_width = 32;
+    let filled = processed
+        .saturating_mul(progress_width)
+        .checked_div(state.discovered)
+        .unwrap_or(0);
     let percent = processed
         .saturating_mul(100)
         .checked_div(state.discovered)
         .unwrap_or(0);
+    let source_text = if state.sources.is_empty() {
+        format!("{}={}", app.t("sources", "来源"), app.t("none", "无"))
+    } else {
+        format!(
+            "{}={}",
+            app.t("sources", "来源"),
+            state
+                .sources
+                .iter()
+                .take(4)
+                .map(|(source, count)| format!("{}:{count}", short(source, 18)))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
     vec![
         Line::from(format!(
-            "{} · {}",
+            "{} - {} {} {}",
             load_phase_label(state.phase, app.language),
-            display_source_label(&state.source)
+            mode,
+            app.t("from", "来自"),
+            short(&display_source_label(&state.source), 36)
         )),
         Line::from(format!(
-            "{} {}/{} · {} {} · {}%",
-            app.t("processed", "已处理"),
+            "{} {}/{} {}, {} {}, {}",
+            app.t("loaded", "已加载"),
             format_count(processed as i64),
             format_count(state.discovered as i64),
+            app.t("files processed", "个文件已处理"),
             format_count(state.cache_hits as i64),
             app.t("cache hits", "缓存命中"),
-            percent
+            cache_state_for_language(&state.cache_state, app.language)
         )),
+        Line::from(vec![
+            Span::raw("["),
+            Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
+            Span::styled(
+                "░".repeat(progress_width - filled),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(format!("] {percent}%")),
+        ]),
+        Line::from(source_text),
         Line::from(format!(
-            "{} · {}",
-            state.cache_state,
-            if state.showing_cached {
-                app.t("showing cached sessions", "正在显示缓存会话")
+            "{}={}  {}={}  {}={}  {}={}  {}={}",
+            app.t("sessions parsed", "已解析会话"),
+            format_count(state.parsed as i64),
+            app.t("confidence", "可信度"),
+            localized_level(&health.confidence, app.language),
+            app.t("skipped", "跳过"),
+            format_count(state.skipped as i64),
+            app.t("pricing fallback", "价格回退"),
+            format_count(health.fallback_pricing as i64),
+            app.t("latest", "最新"),
+            if health.latest_session_at.is_empty() {
+                app.t("unknown", "未知").to_string()
             } else {
-                app.t("waiting for sessions", "正在等待会话")
+                short(&health.latest_session_at, 20)
             }
         )),
     ]
@@ -122,25 +187,51 @@ pub(super) fn load_summary_line(app: &App) -> String {
             app.load_state.discovered
         );
     }
-    match app.load_state.phase {
-        LoadPhase::Discovering | LoadPhase::Parsing => format!(
-            "{} {}/{}",
-            load_phase_label(app.load_state.phase, app.language),
-            format_count(app.load_state.processed as i64),
-            format_count(app.load_state.discovered as i64)
+    let state = &app.load_state;
+    match state.phase {
+        LoadPhase::Idle => app.t("idle", "空闲").to_string(),
+        LoadPhase::Discovering => format!(
+            "{} {} {}",
+            app.t("discovering", "发现中"),
+            format_count(state.discovered as i64),
+            app.t("files", "个文件")
         ),
+        LoadPhase::Parsing => format!(
+            "{} {} {}, {} {}",
+            app.t("loading", "加载中"),
+            format_count(state.discovered as i64),
+            app.t("files", "个文件"),
+            format_count(state.cache_hits as i64),
+            app.t("cache hits", "缓存命中")
+        ),
+        LoadPhase::Ready => {
+            let source = state
+                .sources
+                .first()
+                .map(|(source, count)| {
+                    format!(
+                        "{}:{}",
+                        display_source_label(source),
+                        format_count(*count as i64)
+                    )
+                })
+                .unwrap_or_else(|| app.t("none", "无").to_string());
+            format!(
+                "{} {} {}, {} {}, {source}",
+                app.t("loaded", "已加载"),
+                format_count(state.parsed as i64),
+                app.t("sessions", "个会话"),
+                format_count(state.cache_hits as i64),
+                app.t("cache hits", "缓存命中")
+            )
+        }
         LoadPhase::Failed => app.t("load failed", "加载失败").to_string(),
-        _ => format!(
-            "{} {}",
-            app.t("loaded", "已加载"),
-            format_count(app.sessions.len() as i64)
-        ),
     }
 }
 
 pub(super) fn load_phase_label(phase: LoadPhase, language: Language) -> &'static str {
     match phase {
-        LoadPhase::Idle => text(language, "Ready", "就绪"),
+        LoadPhase::Idle => text(language, "Idle", "空闲"),
         LoadPhase::Discovering => text(language, "Finding sessions", "正在查找会话"),
         LoadPhase::Parsing => text(language, "Reading sessions", "正在读取会话"),
         LoadPhase::Ready => text(language, "Ready", "就绪"),
@@ -168,11 +259,20 @@ pub(super) fn top_driver<T: Borrow<Session>>(
     groups.into_values().max_by(compare_driver_items)
 }
 
+/// Counts DISTINCT sessions per anomaly kind (adopted from the
+/// pre-unification test renderer during rm-014): `DriverItem::sessions`
+/// names sessions, not anomaly occurrences — a session carrying the same
+/// kind three times must count once. The pre-unification production copy
+/// counted occurrences, overstating the driver.
 pub(super) fn top_anomaly_driver<T: Borrow<Session>>(sessions: &[T]) -> Option<DriverItem> {
     let mut groups: BTreeMap<String, DriverItem> = BTreeMap::new();
     for session in sessions {
         let session = session.borrow();
+        let mut seen_kinds = std::collections::BTreeSet::new();
         for anomaly in &session.anomalies {
+            if !seen_kinds.insert(anomaly.kind.clone()) {
+                continue;
+            }
             let entry = groups
                 .entry(anomaly.kind.clone())
                 .or_insert_with(|| DriverItem {
@@ -232,25 +332,47 @@ pub(super) fn display_session_source(session: &Session) -> String {
     driver_source(session)
 }
 
+/// Recognizes BOTH slug ids and on-disk source paths (adopted from the
+/// pre-unification test renderer during rm-014). The pre-unification
+/// production copy mapped a path like `/home/u/.claude/projects` to its
+/// last segment ("projects"), mislabeling the source column.
 pub(super) fn display_source_label(source: &str) -> String {
     let source = source.trim();
-    match source {
-        "" | "auto-discovery" => "auto discovery".to_string(),
-        "pi" => "Pi sessions".to_string(),
-        "oh_my_pi" => "Oh My Pi sessions".to_string(),
-        "pi_senpi" => "Pi (senpi) sessions".to_string(),
-        "pi_omo" => "Pi (omo) sessions".to_string(),
-        "claude_code" => "Claude Code".to_string(),
-        "codex_cli" => "Codex".to_string(),
-        "hermes_db" => "Hermes DB".to_string(),
-        "opencode_db" => "OpenCode DB".to_string(),
-        _ if source.contains('/') => source
+    if source.is_empty() || source == "auto-discovery" {
+        return "auto discovery".to_string();
+    }
+    if source == "pi" || source.ends_with("/.pi/agent/sessions") {
+        return "Pi sessions".to_string();
+    }
+    if source == "oh_my_pi" || source.ends_with("/.omp/agent/sessions") {
+        return "Oh My Pi sessions".to_string();
+    }
+    if source == "pi_senpi" {
+        return "Pi (senpi) sessions".to_string();
+    }
+    if source == "pi_omo" {
+        return "Pi (omo) sessions".to_string();
+    }
+    if source == "claude_code" || source.ends_with("/.claude/projects") {
+        return "Claude Code".to_string();
+    }
+    if source == "codex_cli" || source.contains("/.codex/") {
+        return "Codex".to_string();
+    }
+    if source == "hermes_db" || source.ends_with("/.hermes/state.db") {
+        return "Hermes DB".to_string();
+    }
+    if source == "opencode_db" || source.ends_with("/opencode.db") {
+        return "OpenCode DB".to_string();
+    }
+    if source.contains('/') {
+        return source
             .rsplit('/')
             .find(|part| !part.is_empty())
             .unwrap_or(source)
-            .to_string(),
-        _ => source.to_string(),
+            .to_string();
     }
+    source.to_string()
 }
 
 pub(super) fn driver_model(session: &Session) -> String {
@@ -307,6 +429,9 @@ pub(super) fn format_count(value: i64) -> String {
     format_tokens(value)
 }
 
+/// Durations of a year or more render in years (adopted from the
+/// pre-unification test renderer during rm-014); the production copy
+/// showed "1095.0d"-style output for multi-year durations.
 pub(super) fn format_duration(seconds: f64) -> String {
     if !seconds.is_finite() || seconds <= 0.0 {
         "0s".to_string()
@@ -316,9 +441,28 @@ pub(super) fn format_duration(seconds: f64) -> String {
         format!("{:.1}m", seconds / 60.0)
     } else if seconds < 86_400.0 {
         format!("{:.1}h", seconds / 3600.0)
-    } else {
+    } else if seconds < 365.0 * 86_400.0 {
         format!("{:.1}d", seconds / 86_400.0)
+    } else {
+        format!("{:.1}y", seconds / (365.0 * 86_400.0))
     }
+}
+
+pub(super) fn localized_level(value: &str, language: Language) -> String {
+    if language == Language::En {
+        return value.to_string();
+    }
+    match value {
+        "critical" => "严重",
+        "warning" => "警告",
+        "high" => "高",
+        "medium" => "中",
+        "good" => "良好",
+        "low" => "低",
+        "info" => "提示",
+        _ => value,
+    }
+    .to_string()
 }
 
 #[cfg(test)]
@@ -349,23 +493,117 @@ mod tests {
     }
 
     #[test]
-    fn production_helpers_render_their_own_loading_summary() {
+    fn loading_status_lines_disclose_sources_and_confidence() {
+        // Adopted semantics (rm-014): the loading panel is the honest
+        // 5-line disclosure — phase+mode, files/cache/cache-state, a
+        // progress bar, the source breakdown, and parse-confidence line.
         let app = App::new(Vec::new(), "test", None);
         let lines = loading_status_lines(&app);
-        assert_eq!(lines.len(), 3);
-        assert!(format!("{:?}", lines[0]).contains("Ready"));
+        assert_eq!(lines.len(), 5);
+        assert!(format!("{:?}", lines[0]).contains("Idle"));
+        assert!(format!("{:?}", lines[0]).contains("normal load"));
+        assert!(format!("{:?}", lines[1]).contains("cache hits"));
+        assert!(format!("{:?}", lines[3]).contains("sources=none"));
+    }
+
+    #[test]
+    fn display_source_label_maps_slugs_and_paths() {
+        // Slug ids keep their pre-unification labels.
         assert_eq!(display_source_label("codex_cli"), "Codex");
         // rm-084 review follow-up: fork ids must render as labels, never
-        // leak as raw slugs — here and in the presentation.rs twin.
+        // leak as raw slugs.
         assert_eq!(display_source_label("pi_senpi"), "Pi (senpi) sessions");
         assert_eq!(display_source_label("pi_omo"), "Pi (omo) sessions");
+        // Adopted semantics (rm-014): known on-disk source paths label
+        // their tool instead of leaking a trailing path segment.
         assert_eq!(
-            crate::app::presentation::display_source_label("pi_senpi"),
-            "Pi (senpi) sessions"
+            display_source_label("/home/u/.claude/projects"),
+            "Claude Code"
+        );
+        assert_eq!(display_source_label("/u/.pi/agent/sessions"), "Pi sessions");
+        assert_eq!(
+            display_source_label("/u/.omp/agent/sessions"),
+            "Oh My Pi sessions"
+        );
+        assert_eq!(display_source_label("/u/.codex/sessions.jsonl"), "Codex");
+        assert_eq!(display_source_label("/u/.hermes/state.db"), "Hermes DB");
+        assert_eq!(display_source_label("/u/opencode.db"), "OpenCode DB");
+        // Unknown paths still degrade to their last non-empty segment.
+        assert_eq!(display_source_label("/tmp/custom"), "custom");
+    }
+
+    #[test]
+    fn top_anomaly_driver_counts_distinct_sessions() {
+        // Adopted semantics (rm-014): `sessions` counts sessions, not
+        // anomaly occurrences — one session with three latency anomalies
+        // counts once; a second session with the same kind makes two.
+        use agenttrace_core::{Anomaly, Metrics, Session};
+        let session = |anomalies: Vec<Anomaly>| Session {
+            name: "s".to_string(),
+            path: "/tmp/s.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                tokens_input: 10,
+                tokens_output: 5,
+                ..Metrics::default()
+            },
+            anomalies,
+            health: 50,
+            tool_warnings: Vec::new(),
+            diagnostics: Default::default(),
+        };
+        let anomaly = |kind: &str| Anomaly {
+            kind: kind.to_string(),
+            severity: "medium".to_string(),
+            detail: String::new(),
+        };
+        let sessions = vec![
+            session(vec![
+                anomaly("latency"),
+                anomaly("latency"),
+                anomaly("latency"),
+            ]),
+            session(vec![anomaly("latency")]),
+            session(vec![anomaly("loop"), anomaly("loop")]),
+        ];
+        let top = top_anomaly_driver(&sessions).expect("a driver");
+        assert_eq!(top.label, "latency");
+        assert_eq!(top.sessions, 2);
+        let loop_driver = {
+            let only = &sessions[2..];
+            top_anomaly_driver(only)
+        };
+        assert_eq!(loop_driver.expect("loop driver").sessions, 1);
+    }
+
+    #[test]
+    fn format_duration_renders_years_above_a_year() {
+        // Adopted semantics (rm-014): >= 365 days renders in years.
+        assert_eq!(format_duration(364.0 * 86_400.0), "364.0d");
+        assert_eq!(format_duration(365.0 * 86_400.0), "1.0y");
+        assert_eq!(format_duration(3.0 * 365.0 * 86_400.0), "3.0y");
+        assert_eq!(format_duration(125.0), "2.1m");
+        assert_eq!(format_duration(0.0), "0s");
+    }
+
+    #[test]
+    fn load_phase_labels_distinguish_idle_from_ready() {
+        // Adopted semantics (rm-014): Idle no longer masquerades as
+        // "Ready" — the Idle phase has its own label.
+        assert_eq!(load_phase_label(LoadPhase::Idle, Language::En), "Idle");
+        assert_eq!(load_phase_label(LoadPhase::Idle, Language::Zh), "空闲");
+        assert_eq!(load_phase_label(LoadPhase::Ready, Language::En), "Ready");
+        assert_eq!(
+            load_phase_label(LoadPhase::Discovering, Language::En),
+            "Finding sessions"
         );
         assert_eq!(
-            crate::app::presentation::display_source_label("pi_omo"),
-            "Pi (omo) sessions"
+            load_phase_label(LoadPhase::Parsing, Language::En),
+            "Reading sessions"
+        );
+        assert_eq!(
+            load_phase_label(LoadPhase::Failed, Language::En),
+            "Load failed"
         );
     }
 }

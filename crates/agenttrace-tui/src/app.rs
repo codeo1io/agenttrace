@@ -4,13 +4,12 @@ use std::io::IsTerminal;
 
 use agenttrace_core::{
     attention_priority, attention_rank, average_health, canonical_sessions, clear_session_cache,
-    compute_overview, compute_overview_iter, context_trends, cost_audit, data_health,
-    delivery_evidence_with_git, format_cost, format_tokens, inspect_first, inspect_reason,
-    load_cached_sessions_from_cache, load_session_cache, load_sessions_with_progress,
-    load_sessions_with_progress_from_cache_mode, mcp_governance, needs_attention, project_name,
-    recommendations, resolve_project, session_capability, session_cost_audit,
-    session_matches_time_range, total_tokens, ContextTrend, CostAudit, DataHealth,
-    DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
+    context_trends, cost_audit, data_health, delivery_evidence_with_git, format_cost,
+    format_tokens, inspect_first, inspect_reason, load_cached_sessions_from_cache,
+    load_session_cache, load_sessions_with_progress, load_sessions_with_progress_from_cache_mode,
+    mcp_governance, needs_attention, project_name, recommendations, resolve_project,
+    session_capability, session_cost_audit, session_matches_time_range, total_tokens, ContextTrend,
+    CostAudit, DataHealth, DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance,
     Recommendation, ReportLanguage, Session, SessionCache, TimeRange,
 };
 #[cfg(test)]
@@ -260,7 +259,6 @@ enum ExplorerOverlay {
 
 struct App {
     sessions: Vec<Session>,
-    overview: Overview,
     source_label: String,
     reload_dir: Option<String>,
     view: View,
@@ -381,10 +379,8 @@ enum LoadPhase {
 impl App {
     fn new(sessions: Vec<Session>, source_label: &str, reload_dir: Option<String>) -> Self {
         let sessions = canonical_sessions(&sessions);
-        let overview = compute_overview(&sessions);
         let mut app = Self {
             sessions,
-            overview,
             source_label: source_label.to_string(),
             reload_dir,
             view: View::List,
@@ -1381,11 +1377,10 @@ impl App {
         self.explorer_selected = self
             .explorer_selected
             .min(self.filtered.len().saturating_sub(1));
-        self.overview = compute_overview_iter(
-            self.filtered
-                .iter()
-                .filter_map(|index| self.sessions.get(*index)),
-        );
+        // rm-015: no overview recompute here. The pre-unification TUI
+        // recomputed a full Overview per keystroke into a field that had
+        // no production reader (only the test renderer read it); the
+        // test renderer now computes it on demand via `overview(app)`.
         self.governance_dirty = true;
         let visible = self.visible_sessions();
         let tool_failure_sessions = visible
@@ -1812,7 +1807,6 @@ use filters::*;
 use i18n::UiText;
 #[cfg(test)]
 use presentation::*;
-#[cfg(not(test))]
 use shared::*;
 
 #[cfg(test)]
