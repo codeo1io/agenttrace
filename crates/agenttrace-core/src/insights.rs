@@ -143,6 +143,10 @@ pub struct DataHealth {
     pub unknown_sources: usize,
     pub unknown_models: usize,
     pub fallback_pricing: usize,
+    /// Last ACTIVITY across parsed sessions — max(session_start,
+    /// session_end) per session, the same basis as the report scope
+    /// window end (rm-694): the health block can never report a
+    /// "latest" older than the window the same report draws.
     pub latest_session_at: String,
     pub confidence: String,
     pub with_tokens: usize,
@@ -713,11 +717,37 @@ pub fn filter_sessions(
 pub fn session_matches_time_range(session: &Session, range: TimeRange, now: DateTime<Utc>) -> bool {
     range.since(now).is_none_or(|since| {
         // Unknown start times stay visible (N7 unknown-time bucket);
-        // only sessions with a known start before the cutoff drop out.
-        parse_ts(&session.metrics.session_start)
+        // only sessions with no known activity at or after the cutoff
+        // drop out.
+        //
+        // rm-694: admission is by OVERLAP, not by session START. A
+        // session that started before the window but was still running
+        // inside it (overnight session, long-lived agent) used to be
+        // invisible to `--range today` — silently dropping its whole
+        // cost from the day it was most active in. Its last known
+        // activity now admits it; only sessions whose activity ended
+        // before the window start still drop out.
+        session_last_activity(session)
             .map(|time| time >= since)
             .unwrap_or(true)
     })
+}
+
+/// rm-694: the session's last known activity — `session_end` when the
+/// parser saw one, else the session start. Because re-emitted stream
+/// snapshots now advance `session_end` to their final emission
+/// (rm-834), this is the real "was this session alive then" bound.
+/// `None` only when neither timestamp parses (the N7 unknown-time
+/// bucket, which stays visible everywhere).
+pub(crate) fn session_last_activity(session: &Session) -> Option<DateTime<Utc>> {
+    let start = parse_ts(&session.metrics.session_start);
+    let end = parse_ts(&session.metrics.session_end);
+    match (start, end) {
+        (Some(start), Some(end)) => Some(start.max(end)),
+        (Some(start), None) => Some(start),
+        (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
 }
 
 pub fn report_scope(
@@ -729,8 +759,16 @@ pub fn report_scope(
     let mut earliest = None;
     let mut latest = None;
     for session in sessions {
+        // rm-694: `latest_session_at` reports last ACTIVITY (session_end
+        // where known), not the latest session START — the window line
+        // used to end before the very activity it was reporting on
+        // (dossier PoC C: "to 11:00:00Z" while the session ran to
+        // 11:00:07Z). Earliest stays start-based: it answers "when did
+        // the first session begin".
         if let Some(time) = parse_ts(&session.metrics.session_start) {
             earliest = Some(earliest.map_or(time, |current: DateTime<Utc>| current.min(time)));
+        }
+        if let Some(time) = session_last_activity(session) {
             latest = Some(latest.map_or(time, |current: DateTime<Utc>| current.max(time)));
         }
         let entry = sources
@@ -880,9 +918,13 @@ fn data_health_from_parts(
         unknown_sources,
         unknown_models,
         fallback_pricing,
+        // rm-694 review fix (0772a0ca, HIGH finding): same activity
+        // basis as `report_scope` — a start-basis value let the
+        // data_health block report a "latest" older than the window
+        // the same report drew (overnight corpus: 23:30Z vs 01:00Z).
         latest_session_at: sessions
             .iter()
-            .filter_map(|s| parse_ts(&s.metrics.session_start))
+            .filter_map(session_last_activity)
             .max()
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_default(),

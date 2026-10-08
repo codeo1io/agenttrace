@@ -1532,7 +1532,43 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                 }
             }
         }
+        // rm-835: discovery used to swallow parse failures at `.ok()`, so
+        // an all-corrupt directory bailed here as "no sessions match the
+        // requested filters" — hiding both the failure and the parser's
+        // own remediation hint (e.g. the zstd-compressed rollout hint the
+        // explicit-file lane already prints). Differentiate the two
+        // stories the user can act on: everything failed to parse, or
+        // some parsed and the filters dropped them (failures still
+        // disclosed so the blind spot never comes back).
+        if let Some(first) = report
+            .first_parse_failure
+            .as_deref()
+            .filter(|_| report.parse_failures > 0)
+        {
+            if report.parse_failures == report.discovered {
+                bail!(
+                    "No sessions parsed: all {} discovered session files failed to parse (first: {})",
+                    report.discovered,
+                    first
+                );
+            }
+            bail!(
+                "No sessions match the requested filters ({} of {} discovered files failed to parse; first: {})",
+                report.parse_failures,
+                report.discovered,
+                first
+            );
+        }
         bail!("No sessions match the requested filters");
+    }
+    // rm-835 residual arm: when sessions DID load but some discovered
+    // files failed to parse, the failure must not vanish entirely —
+    // downstream empty-set bails (post --project/--source/--model
+    // filters) and every report would otherwise look complete while the
+    // corpus is partially unreadable. One stderr advisory keeps stdout
+    // contracts byte-identical while the blind spot stays closed.
+    if let Some(advisory) = parse_failure_advisory(&report) {
+        eprintln!("agenttrace: warning: {advisory}");
     }
     Ok((sessions, Some(report)))
 }
@@ -1556,6 +1592,22 @@ fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
             db.sample
         );
     }
+}
+
+/// rm-835 residual arm: the stderr advisory text for a load that
+/// produced sessions while some discovered files failed to parse
+/// (None when every discovered file parsed). Kept as a pure function so
+/// the exact wording ships with a pinned test.
+fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
+    if report.parse_failures == 0 {
+        return None;
+    }
+    report.first_parse_failure.as_deref().map(|first| {
+        format!(
+            "{} of {} discovered session files failed to parse; first: {first}",
+            report.parse_failures, report.discovered
+        )
+    })
 }
 
 fn parse_range(args: &Args) -> anyhow::Result<TimeRange> {
@@ -2181,6 +2233,18 @@ fn single_session_report_requested(args: &Args) -> bool {
 }
 
 fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
+    // rm-836: --demo sessions are synthetic samples pinned to a fixed
+    // epoch; --preserve-history would bank them into the user's durable
+    // history.json and permanently inflate every later --include-history
+    // report (dossier PoC F3: $0.8106 of fiction after one demo run, and
+    // it survives forever — demo reports are supposed to be ephemeral
+    // like their cache behavior). Refuse the pair loudly instead of
+    // writing fiction, mirroring the --baseline/--compare rule above.
+    if args.demo && args.preserve_history {
+        bail!(
+            "--demo cannot be combined with --preserve-history: demo sessions are ephemeral samples and never enter durable history"
+        );
+    }
     // --fetch only means something for the upstream command; staying
     // silent about it elsewhere would let a typo'd invocation report
     // stale data while looking refreshed.
@@ -3455,9 +3519,124 @@ mod tests {
         args.compare = false;
         args.overview = true;
         let err = load_sessions(&args).expect_err("empty parseable sessions should fail");
-        assert!(err.to_string().contains("No sessions match"));
+        // rm-835 flipped this message: the all-corrupt directory used to
+        // bail as "No sessions match the requested filters" — the filters
+        // were not the problem, every parse was failing silently — so the
+        // exhaustion arm now says what actually happened.
+        assert!(
+            err.to_string().contains("No sessions parsed"),
+            "exhaustion arm: {err}"
+        );
+        assert!(
+            err.to_string().contains("failed to parse"),
+            "failure disclosure: {err}"
+        );
+        assert!(
+            err.to_string().contains("storage.json"),
+            "first failure must name the offending file: {err}"
+        );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_session_bail_discloses_zstd_parse_failure_hint() {
+        // rm-835: the parser's zstd-compressed rollout hint used to die
+        // with the parse error at discovery's `.ok()`; the directory
+        // overview then claimed "no sessions match the requested
+        // filters" while the same file, passed explicitly, printed the
+        // remediation hint. The bail must carry the hint through.
+        let root = std::env::temp_dir().join(format!("agenttrace-zst-bail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create zst bail dir");
+        // zstd magic (28 b5 2f fd) followed by frame zeros: not JSONL.
+        let mut bytes = vec![0x28, 0xb5, 0x2f, 0xfd];
+        bytes.extend(std::iter::repeat_n(0u8, 100));
+        fs::write(root.join("rollout-2026-10-06.jsonl"), bytes).expect("write zst fixture");
+
+        let mut args = compare_args(Some(root.to_string_lossy().to_string()));
+        args.compare = false;
+        args.overview = true;
+        let err = load_sessions(&args).expect_err("all-corrupt dir must fail, not filter-match");
+        assert!(
+            err.to_string().contains("zstd"),
+            "the zstd remediation hint must surface: {err}"
+        );
+        assert!(
+            err.to_string().contains("rollout-2026-10-06.jsonl"),
+            "the offending file must be named: {err}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_failure_advisory_names_the_corrupt_file() {
+        // rm-835 residual arm: a partially-unreadable corpus must carry a
+        // load-time advisory even when enough sessions parse for reports
+        // to render — otherwise the post-filter empty bails and every
+        // report look complete over a corpus that is partially garbage.
+        let report = agenttrace_core::LoadReport {
+            discovered: 3,
+            parse_failures: 1,
+            first_parse_failure: Some(
+                "read session file /x/rollout.jsonl: zstd-compressed".to_string(),
+            ),
+            ..Default::default()
+        };
+        let advisory = parse_failure_advisory(&report).expect("advisory for partial failure");
+        assert!(
+            advisory.starts_with("1 of 3 discovered session files failed to parse"),
+            "{advisory}"
+        );
+        assert!(advisory.contains("rollout.jsonl"), "{advisory}");
+        assert!(advisory.contains("zstd-compressed"), "{advisory}");
+
+        // clean loads and countless failures must stay silent
+        let report = agenttrace_core::LoadReport {
+            discovered: 2,
+            ..Default::default()
+        };
+        assert!(parse_failure_advisory(&report).is_none());
+        let report = agenttrace_core::LoadReport {
+            discovered: 2,
+            parse_failures: 2, // counted, but no message retained
+            ..Default::default()
+        };
+        assert!(
+            parse_failure_advisory(&report).is_none(),
+            "no message means nothing to print"
+        );
+    }
+
+    #[test]
+    fn demo_preserve_history_conflicts_loudly() {
+        // rm-836: --demo --preserve-history used to write the synthetic
+        // demo sessions into the user's durable history.json (dossier
+        // PoC F3), permanently inflating every later --include-history
+        // report. The pair must be refused before any load happens.
+        let mut args = compare_args(None);
+        args.demo = true;
+        validate_primary_action(&args).expect("--demo alone is fine");
+
+        let mut args = compare_args(None);
+        args.preserve_history = true;
+        validate_primary_action(&args).expect("--preserve-history alone is fine");
+
+        let mut args = compare_args(None);
+        args.demo = true;
+        args.preserve_history = true;
+        let error = validate_primary_action(&args)
+            .expect_err("demo must never enter durable history")
+            .to_string();
+        assert!(
+            error.contains("--demo cannot be combined with --preserve-history"),
+            "{error}"
+        );
+        assert!(
+            error.contains("ephemeral"),
+            "the error must say why: {error}"
+        );
     }
 
     fn temp_session_file(prefix: &str, content: &str) -> String {

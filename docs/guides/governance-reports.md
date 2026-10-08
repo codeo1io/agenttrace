@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 38 and the SQLite snapshot is schema 8; the
+The session cache is schema 39 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -156,7 +156,15 @@ for pre-Sept-2026 rollouts that carry no usage rows at all (rm-716 —
 all three of run 5417681937ae cycle 3, landed at its base 1c5edd1 as
 32 → 33, re-based at integration onto the advanced ceiling as 37 → 38)
 — so cached sessions regenerate under the corrected confidence,
-disclosure census, attribution and cache-read totals; the SQLite snapshot to 7
+disclosure census, attribution and cache-read totals, and to 39 when the
+report-truthfulness batch made streaming re-emissions count the message
+once — Claude stream snapshots fold per message id into their final
+form, so turns, tool calls, tool results, `session_end` and duration
+describe the message at its last emission instead of once per streamed
+block (rm-834 of run f7f81aeaf57b, minted campaign-locally as rm-693;
+schema landed as 32 → 33 at the run's base, re-based at integration
+onto the advanced ceiling as 38 → 39) — so cached sessions regenerate
+under the corrected totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, and to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548). Older versions are discarded and

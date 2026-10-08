@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-09-01T10:00:00Z","message":{"role":"user","content":"hi"}}
+{"type":"assistant","timestamp":"2026-10-03T09:00:00Z","message":{"id":"msg_a","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":100,"output_tokens":10}}}

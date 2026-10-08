@@ -191,7 +191,14 @@ agenttrace --audit --range 30d -f json
 # agenttrace --audit --sample 500 -f json
 
 # --range today bounds the report to your local calendar day (sessions
-# since your local midnight); 7d/30d are rolling windows, unaffected.
+# with activity since your local midnight — a session that started
+# before midnight but ran into today counts); 7d/30d are rolling
+# windows on the same activity basis, unaffected.
+
+# --demo renders the built-in synthetic sample corpus and is
+# side-effect-free: nothing is written to history.json or the session
+# cache, and combining it with --preserve-history is refused rather
+# than silently banking sample sessions into durable history.
 
 # Optional local model aliases and per-million-token price overrides.
 AGENTTRACE_PRICING_FILE=pricing-overrides.json agenttrace --audit -f json

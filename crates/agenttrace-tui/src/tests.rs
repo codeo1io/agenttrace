@@ -1631,6 +1631,19 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 39 (integration of run f7f81aeaf57b, cycle-1
+                // "report truthfulness & honest surfacing" — rm-834
+                // (minted campaign-locally as rm-693, rebound at
+                // integration): claude stream snapshots now fold per
+                // message id into their final form, so turns, tool
+                // calls, tool results, session_end and duration
+                // describe the message at its last emission instead of
+                // once per streamed block; warm v38 entries kept the
+                // undercounted totals for unchanged files; landed at
+                // its base 518170a7 as the campaign's 32 -> 33 bump,
+                // re-based here onto the advanced ceiling, 38 being
+                // the rm-718/rm-719/rm-716 disclosure-plane rung
+                // below);
                 // Schema 38 (integration of run 5417681937ae,
                 // cycle-3 "disclosure-plane honesty": the kimi
                 // usage-alias counters moved onto
@@ -1693,6 +1706,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // the pre-fix values verbatim; landed at its base as the
                 // campaign's 27 -> 28 bump, re-based here onto the
                 // advanced ceiling);
+
                 // Schema 32 (integration of run 7f9c6d24, the usage-
                 // accounting-truthfulness batch — claude streaming
                 // per-message-id fold, qwen alias/cache-inclusive basis,
@@ -1725,7 +1739,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":38,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":39,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
