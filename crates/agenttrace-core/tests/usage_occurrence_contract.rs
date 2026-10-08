@@ -107,10 +107,10 @@ fn qwen_multi_result_usage_accumulates_per_turn() {
 /// skips at confidence "high", and of v32 totals undercounted by the
 /// pre-rm-711 parsers.
 #[test]
-fn warm_cache_replays_cold_disclosure_and_schema_40_invalidates_v32() {
+fn warm_cache_replays_cold_disclosure_and_schema_41_invalidates_v32() {
     assert_eq!(
-        SESSION_CACHE_SCHEMA_VERSION, 40,
-        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834 report-truthfulness stream-fold integration, and to 40 at the rm-585/rm-730 honest-attribution integration, so this assert pins the live constant)"
+        SESSION_CACHE_SCHEMA_VERSION, 41,
+        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834 report-truthfulness stream-fold integration, to 40 at the rm-585/rm-730 honest-attribution integration, and to 41 at the rm-520/rm-521 recorded-cost-basis integration (run ac14e52c, conflict case c1c77f5e), so this assert pins the live constant)"
     );
     let root = std::env::temp_dir().join(format!(
         "agenttrace-contract-warmcold-{}",
@@ -156,7 +156,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_40_invalidates_v32() {
     );
 
     // Stale-schema leg: degrade the persisted file to schema 32 (what a
-    // pre-bump cache looks like) — it must not be served at 37.
+    // pre-bump cache looks like) — it must not be served at 41.
     let cache_file = session_cache_path();
     let raw = fs::read_to_string(&cache_file).expect("cache file exists");
     let mut degraded: Value = serde_json::from_str(&raw).expect("cache file is JSON");
@@ -165,7 +165,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_40_invalidates_v32() {
     let mut stale_cache: SessionCache = load_session_cache();
     assert!(
         cached_session(&journal, &mut stale_cache).is_none(),
-        "rm-710: a schema-32 entry must not be served at the live schema ceiling (37 at this tree)"
+        "rm-710: a schema-32 entry must not be served at the live schema ceiling (41 at this tree)"
     );
 
     std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");

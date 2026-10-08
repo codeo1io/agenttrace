@@ -76,7 +76,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 40 and the SQLite snapshot is schema 9; the
+The session cache is schema 41 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -186,7 +186,16 @@ clause above, so a warm v39 entry stops serving a "Dropped lines" row
 and degraded confidence for unchanged files (rm-585 + rm-730 of run
 4c3ca863, landed 32 → 33 at the run's base e9e8fd9, re-based at
 integration onto the advanced ceiling as 39 → 40) — so cached sessions
-regenerate under the corrected attribution; the SQLite snapshot to 7
+regenerate under the corrected attribution, and to 41 when Metrics began
+persisting which token classes carry upstream-recorded cost
+(`upstream_priced_*` — the rm-436 basis split) — the basis the governance
+audit's recorded-cost recompute reads, so a warm v40 entry can no longer
+hand the audit a recorded-cost session whose priced classes deserialize
+as zero and false-trip the drift note on exactly the sessions whose
+stored estimate is upstream truth (rm-520 of run ac14e52c, landed 24 → 25
+at the run's base 1511547, re-based at integration onto the advanced
+ceiling as 40 → 41) — so cached sessions regenerate under the corrected
+audit basis; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

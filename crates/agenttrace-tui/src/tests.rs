@@ -1631,6 +1631,20 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 41 (integration of run ac14e52c, rm-520 +
+                // rm-521 "audit cost truthfulness" — Metrics persist
+                // the upstream_priced_* recorded-cost token-class
+                // split the governance audit's cost recompute reads,
+                // so warm entries must regenerate carrying the basis
+                // instead of false-tripping the drift note; landed at
+                // its base 1511547 as the campaign's 24 -> 25 bump,
+                // re-based here onto the advanced ceiling, 40 being
+                // the rm-585/rm-730 rung below). From this rung on
+                // the fixture interpolates
+                // SESSION_CACHE_SCHEMA_VERSION instead of hand-pinning
+                // the version, so it cannot rot on a future bump (the
+                // last hand-pinned rung was 40, run 4c3ca863's
+                // honest-attribution batch).
                 // Schema 40 (integration of run 4c3ca863, the
                 // "honest attribution" batch — rm-585 spend-by-branch
                 // first cut: Session/GoSession carry the new `branch`
@@ -1752,10 +1766,11 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":40,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":{3},"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
-                metadata.len()
+                metadata.len(),
+                agenttrace_core::SESSION_CACHE_SCHEMA_VERSION
             ),
         )
         .expect("write cache");

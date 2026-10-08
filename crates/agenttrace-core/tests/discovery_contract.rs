@@ -1018,6 +1018,15 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
+        // v41 (integration of run ac14e52c, rm-520 'audit cost
+        // truthfulness — recorded-cost basis recompute + per-block
+        // multiple note' — Metrics now persist the upstream_priced_*
+        // token-class split the governance audit's cost recompute
+        // reads, so warm entries regenerate carrying the recorded-
+        // cost basis instead of false-tripping the drift note;
+        // re-based off the campaign's 24 -> 25 bump onto the advanced
+        // ceiling, 40 being the rm-585/rm-730 rung and 39 the
+        // rm-834/rm-694 re-emission rung in session_cache.rs);
         // v36 (integration of run 6aaf51aa, rm-502 'Naive-ISO
         // timestamps parse for --overview but vanish from --sessions
         // and --diagnostics' — every strict timestamp consumer routes
@@ -1058,7 +1067,9 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         // 24 the rm-436/437/438 pi journal accounting, 23 rm-408,
         // 22 was run 2c2db6f5 rm-400/401):
         // parser-semantics fixes bump the schema so warm entries
-        // regenerate under corrected accounting.
+        // regenerate under corrected accounting. Asserting the
+        // exported constant keeps this contract honest across future
+        // bumps.
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(SESSION_CACHE_SCHEMA_VERSION)
@@ -1226,13 +1237,14 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v36 — see the rm-502, rm-720/rm-721,
+        // version (v41 — see the rm-520, rm-585/rm-730, rm-834/
+        // rm-694, rm-718/719/716, rm-754, rm-502, rm-720/rm-721,
         // rm-710, rm-616, usage-accounting-truthfulness,
         // rm-551, rm-538, rm-600, rm-529, rm-542,
         // rm-485, rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes
-        // in session_cache.rs; the rm-502 timestamp unification is
-        // what carried 35 -> 36 at this integration, re-based off the
-        // campaign's own 22 -> 23 bump).
+        // in session_cache.rs; the rm-520 recorded-cost basis is
+        // what carried 40 -> 41 at this integration, re-based off the
+        // campaign's own 24 -> 25 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(SESSION_CACHE_SCHEMA_VERSION)

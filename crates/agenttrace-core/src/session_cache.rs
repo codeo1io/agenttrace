@@ -5,7 +5,34 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 40;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 41;
+// Bumped 40 -> 41 (integration of run ac14e52c, cycle-1 "governance
+// audit truthfulness" batch, rm-520 LEAD + rm-521 rider; conflict case
+// c1c77f5e076549f1aadd7f3e4e12c32c): Metrics now persist which token
+// classes carry upstream-recorded cost (`upstream_priced_*`), the
+// basis the audit's cost recompute needs. Warm v40 entries lack the
+// split — a warm cache would hand the audit a recorded-cost session
+// with `upstream_cost_usd > 0` and all-zero priced classes,
+// resurrecting the false drift note this batch fixes (catalog × all
+// tokens + recorded vs the stored catalog × unpriced + recorded).
+// Dropping the cache once re-parses journals and repopulates the
+// basis; no migration can reconstruct it (rm-230 convention:
+// parser-semantics changes that alter the served report bump the
+// schema so cached sessions regenerate). The batch landed against
+// its base 1511547 at schema 24 and bumped it to 25 there;
+// integration re-bases the bump onto the already-advanced ceiling
+// (25 was the run-66a7d797 rm-450 batch, 26 the run-32192d92 rm-485
+// batch, 27 the run-b1ff12f8 rm-542 batch, 28 the run-66e75e39
+// rm-529 batch, 29 the run-99d1c79c rm-600 batch, 30 the
+// run-cb38b958 rm-538 batch, 31 the run-254b2417 rm-551 batch, 32
+// the run-7f9c6d24 usage-accounting batch, 33 the run-91833f02
+// rm-616 batch, 34 the run-73fe8e1e rm-710 batch, 35 the
+// run-3ec6cec08fb9 rm-720/rm-721 batch, 36 the run-6aaf51aa rm-502
+// batch, 37 the run-bbde21568cd4 rm-754 batch, 38 the
+// run-5417681937ae rm-718/rm-719/rm-716 disclosure-plane batch, 39
+// the run-f7f81aeaf re-emission accounting batch, 40 the
+// run-4c3ca863 rm-585/rm-730 honest-attribution batch) per the same
+// convention. Entries regenerate once on next scan.
 // Bumped 39 -> 40 (integration of run 4c3ca863, cycle-3 "honest
 // attribution" batch, rm-585 'Spend by branch' LEAD + rm-730 rider
 // 'codex structural skips are assumption disclosures'; conflict case
@@ -673,6 +700,19 @@ struct GoMetrics {
     /// instead of reverting to the catalog estimate on cache hit.
     #[serde(default, rename = "UpstreamCostUSD")]
     upstream_cost_usd: f64,
+    /// rm-520: token classes already carrying that upstream-recorded
+    /// cost (excluded from the catalog formula in Metrics). Round-
+    /// tripped so the audit's rm-436-basis recompute survives a cache
+    /// hit; v24 caches lacking them are dropped by the schema bump
+    /// above rather than silently priced wrong.
+    #[serde(default, rename = "UpstreamPricedInput")]
+    upstream_priced_input: i64,
+    #[serde(default, rename = "UpstreamPricedOutput")]
+    upstream_priced_output: i64,
+    #[serde(default, rename = "UpstreamPricedCacheW")]
+    upstream_priced_cache_w: i64,
+    #[serde(default, rename = "UpstreamPricedCacheR")]
+    upstream_priced_cache_r: i64,
     /// rm-436/rm-437: parse-time disclosure counters (pi journals),
     /// round-tripped so cache hits keep disclosing.
     #[serde(
@@ -1944,6 +1984,10 @@ impl GoMetrics {
             line_skips: metrics.line_skips.clone(),
             zero_usage_events: metrics.zero_usage_events,
             upstream_cost_usd: metrics.upstream_cost_usd,
+            upstream_priced_input: metrics.upstream_priced_input,
+            upstream_priced_output: metrics.upstream_priced_output,
+            upstream_priced_cache_w: metrics.upstream_priced_cache_w,
+            upstream_priced_cache_r: metrics.upstream_priced_cache_r,
             disclosure_counters: metrics.disclosure_counters.clone(),
             provenance: metrics.provenance.clone(),
             session_key: metrics.session_key.clone(),
@@ -1988,6 +2032,10 @@ impl GoMetrics {
             line_skips: self.line_skips.clone(),
             zero_usage_events: self.zero_usage_events,
             upstream_cost_usd: self.upstream_cost_usd,
+            upstream_priced_input: self.upstream_priced_input,
+            upstream_priced_output: self.upstream_priced_output,
+            upstream_priced_cache_w: self.upstream_priced_cache_w,
+            upstream_priced_cache_r: self.upstream_priced_cache_r,
             disclosure_counters: self.disclosure_counters,
             provenance: self.provenance,
             // rm-790/rm-791: the source row key and the raw parent row id

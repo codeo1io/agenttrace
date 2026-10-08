@@ -1,6 +1,6 @@
 use crate::{
     parse_ts, pricing, project_name, resolve_project, round4, session_capability, total_tokens,
-    Session,
+    Session, PER_BLOCK_PRICING_MARKER,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -84,9 +84,38 @@ pub struct SessionCostAudit {
     pub pricing_note: String,
 }
 
+/// rm-520: the recorded-cost half of an rm-436 stored estimate — the
+/// token classes the source journal already priced (excluded from the
+/// catalog formula so they are charged exactly once, at face value)
+/// and the recorded USD total. The audit's "current" recompute must
+/// add this basis back; a catalog-only total compared against a
+/// recorded-cost-inclusive stored number false-trips the drift note
+/// on every recorded-cost session.
+#[derive(Debug, Clone, Default)]
+struct RecordedCostBasis {
+    input: i64,
+    output: i64,
+    cache_write: i64,
+    cache_read: i64,
+    usd: f64,
+}
+
+impl RecordedCostBasis {
+    fn of(metrics: &crate::Metrics) -> Self {
+        Self {
+            input: metrics.upstream_priced_input,
+            output: metrics.upstream_priced_output,
+            cache_write: metrics.upstream_priced_cache_w,
+            cache_read: metrics.upstream_priced_cache_r,
+            usd: metrics.upstream_cost_usd,
+        }
+    }
+}
+
 fn current_cost_estimate(
     model: &str,
     tokens: &TokenBreakdown,
+    recorded: &RecordedCostBasis,
 ) -> Option<(String, PriceBreakdown, PriceBreakdown)> {
     if model == "multiple" {
         return None;
@@ -100,16 +129,46 @@ fn current_cost_estimate(
         total: 0.0,
     };
     let mut components = PriceBreakdown {
-        input: round4(tokens.input as f64 / 1e6 * rate.input),
-        output: round4(tokens.output as f64 / 1e6 * rate.output),
-        cache_write: round4(tokens.cache_write as f64 / 1e6 * rate.cw),
-        cache_read: round4(tokens.cache_read as f64 / 1e6 * rate.cr),
+        input: round4(tokens.input.saturating_sub(recorded.input) as f64 / 1e6 * rate.input),
+        output: round4(tokens.output.saturating_sub(recorded.output) as f64 / 1e6 * rate.output),
+        cache_write: round4(
+            tokens.cache_write.saturating_sub(recorded.cache_write) as f64 / 1e6 * rate.cw,
+        ),
+        cache_read: round4(
+            tokens.cache_read.saturating_sub(recorded.cache_read) as f64 / 1e6 * rate.cr,
+        ),
         total: 0.0,
     };
+    // The recorded USD rides in the total at face value: by the time
+    // an audit sees the session it has no token-class attribution,
+    // but it is part of the rm-436 basis the stored estimate was
+    // computed on, so any comparison against that stored number must
+    // include it.
     components.total = round4(
-        components.input + components.output + components.cache_write + components.cache_read,
+        components.input
+            + components.output
+            + components.cache_write
+            + components.cache_read
+            + recorded.usd,
     );
     Some((pricing::pricing_source_for(model), rates, components))
+}
+
+/// rm-521: `model_used == "multiple"` has two producers with opposite
+/// exactness. Per-block pricing (rm-438, pi-family journals) prices
+/// every usage block at the model that produced it — the stored total
+/// is exact. SQLite aggregates (sqlite_sessions.rs) merge sessions
+/// across models with no per-model split — "no single-model exact
+/// price applies" is true only there. The audit note must claim the
+/// mechanism that actually produced the stored number. The marker this
+/// matches on is the shared PER_BLOCK_PRICING_MARKER const (lib.rs),
+/// the same symbol `analyze` mints the provenance with.
+fn is_per_block_multiple(session: &Session) -> bool {
+    session
+        .metrics
+        .provenance
+        .pricing_source
+        .contains(PER_BLOCK_PRICING_MARKER)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -233,6 +292,8 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         specific: usize,
         fallback: usize,
         unknown: usize,
+        recorded: RecordedCostBasis,
+        per_block_multiple: usize,
     }
     let mut rows: BTreeMap<(String, String), Aggregate> = BTreeMap::new();
     let mut coverage = PricingCoverage::default();
@@ -263,6 +324,29 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .saturating_add(session.metrics.tokens_cache_r);
         row.tokens.total = row.tokens.total.saturating_add(total_tokens(session));
         row.cost += session.metrics.cost_estimated;
+        // rm-520: carry each session's rm-436 recorded-cost basis into
+        // the row so the drift comparison prices recorded classes
+        // exactly once instead of re-estimating them at catalog rates.
+        row.recorded.input = row
+            .recorded
+            .input
+            .saturating_add(session.metrics.upstream_priced_input);
+        row.recorded.output = row
+            .recorded
+            .output
+            .saturating_add(session.metrics.upstream_priced_output);
+        row.recorded.cache_write = row
+            .recorded
+            .cache_write
+            .saturating_add(session.metrics.upstream_priced_cache_w);
+        row.recorded.cache_read = row
+            .recorded
+            .cache_read
+            .saturating_add(session.metrics.upstream_priced_cache_r);
+        row.recorded.usd += session.metrics.upstream_cost_usd;
+        if model == "multiple" && is_per_block_multiple(session) {
+            row.per_block_multiple += 1;
+        }
         if matches!(model.as_str(), "default" | "unknown" | "multiple") {
             row.unknown += 1;
             coverage.unpriced_or_unknown_sessions += 1;
@@ -301,16 +385,27 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
     let mut by_provider_model = rows
         .into_iter()
         .map(|((provider, model), row)| {
-            let current = current_cost_estimate(&model, &row.tokens);
+            let current = current_cost_estimate(&model, &row.tokens, &row.recorded);
             let pricing_source = current
                 .as_ref()
                 .map(|(source, _, _)| source.clone())
                 .unwrap_or_else(|| "unavailable: multiple models".to_string());
             let (pricing_status, pricing_note) = if model == "multiple" {
-                (
-                    "aggregate_estimate",
-                    "SQLite aggregated multiple model IDs; no single-model exact price applies",
-                )
+                if row.per_block_multiple == row.sessions {
+                    // rm-521: every session in this row was priced per
+                    // usage block (rm-438) — the stored total is exact.
+                    // Only genuinely aggregated rows keep the
+                    // no-exact-price claim below.
+                    (
+                        "aggregate_estimate",
+                        "multiple models, priced per usage block; per-model totals exact",
+                    )
+                } else {
+                    (
+                        "aggregate_estimate",
+                        "SQLite aggregated multiple model IDs; no single-model exact price applies",
+                    )
+                }
             } else if row.unknown > 0 {
                 ("unpriced_or_unknown", "model name is missing or generic")
             } else if row.fallback > 0 {
@@ -407,12 +502,22 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         cache_read: session.metrics.tokens_cache_r,
         total: total_tokens(session),
     };
-    let current = current_cost_estimate(&model, &tokens);
+    let current = current_cost_estimate(&model, &tokens, &RecordedCostBasis::of(&session.metrics));
     let (pricing_status, pricing_note) = if model == "multiple" {
-        (
-            "aggregate_estimate",
-            "SQLite aggregated multiple model IDs; no single-model exact price applies",
-        )
+        if is_per_block_multiple(session) {
+            // rm-521: per-block pricing (rm-438) priced every usage
+            // block at its own model — the stored total is exact, and
+            // the note must not claim SQLite aggregation.
+            (
+                "aggregate_estimate",
+                "multiple models, priced per usage block; per-model totals exact",
+            )
+        } else {
+            (
+                "aggregate_estimate",
+                "SQLite aggregated multiple model IDs; no single-model exact price applies",
+            )
+        }
     } else if matches!(model.as_str(), "default" | "unknown") {
         (
             "unpriced_or_unknown",
@@ -1184,6 +1289,125 @@ mod tests {
         assert!(aggregate.current_estimated_cost_usd.is_none());
         assert!(aggregate.by_provider_model[0].estimated_cost_usd.is_none());
         assert!(aggregate.by_provider_model[0].component_cost_usd.is_none());
+    }
+
+    #[test]
+    fn audit_recomputes_recorded_cost_sessions_on_the_rm436_basis() {
+        // rm-520: a recorded-cost session's stored estimate is
+        // catalog × unpriced tokens + recorded USD (rm-436). The
+        // audit's "current" recompute must use the same basis — the
+        // pre-fix catalog-only total reported $1.25 against a recorded
+        // $5.00 and false-tripped the drift note (assess PoC F1:
+        // /tmp/at-ac14/corpus2/usage-entry.jsonl, 1M gpt-5 input
+        // tokens at $1.25/M catalog, $5.00 recorded).
+        let rate = pricing::lookup_price("gpt-5");
+        assert!((rate.input - 1.25).abs() < 1e-9, "golden premise");
+        let mut recorded = session("recorded");
+        recorded.metrics.model_used = "gpt-5".to_string();
+        recorded.metrics.tokens_input = 1_000_000;
+        recorded.metrics.tokens_output = 0;
+        recorded.metrics.upstream_priced_input = 1_000_000;
+        recorded.metrics.upstream_cost_usd = 5.0;
+        recorded.metrics.cost_estimated = 5.0;
+        let audit = session_cost_audit(&recorded);
+        assert_eq!(audit.stored_estimated_cost_usd, 5.0);
+        let current = audit.estimated_cost_usd.expect("current computed");
+        assert!((current - 5.0).abs() < 0.0001, "rm-436 basis: {current}");
+        assert!(
+            !audit
+                .pricing_note
+                .contains("current rates recalculate a different total"),
+            "recorded-cost session must not false-trip: {}",
+            audit.pricing_note
+        );
+
+        // A genuinely stale stored estimate (no recorded cost) still
+        // trips — the drift mechanism survives the fix.
+        let mut stale = session("stale");
+        stale.metrics.model_used = "gpt-5".to_string();
+        stale.metrics.tokens_input = 1_000_000;
+        stale.metrics.tokens_output = 0;
+        stale.metrics.cost_estimated = 5.0;
+        let audit = session_cost_audit(&stale);
+        let current = audit.estimated_cost_usd.expect("current computed");
+        assert!((current - 1.25).abs() < 0.0001, "catalog-only: {current}");
+        assert!(
+            audit
+                .pricing_note
+                .contains("current rates recalculate a different total"),
+            "stale catalog comparison must keep tripping: {}",
+            audit.pricing_note
+        );
+
+        // Corpus rows inherit the corrected basis: two clean
+        // recorded-cost sessions in one row produce no trip...
+        let clean = cost_audit(&[recorded.clone(), recorded.clone()]);
+        assert_eq!(clean.by_provider_model.len(), 1);
+        let row = &clean.by_provider_model[0];
+        assert_eq!(row.sessions, 2);
+        let current = row.estimated_cost_usd.expect("row current computed");
+        assert!((current - 10.0).abs() < 0.0001, "2 × recorded: {current}");
+        assert!(!row.pricing_note.contains("current rates recalculate"));
+
+        // ...while a row holding one genuinely stale session still
+        // reports the difference — the trip here is truthful.
+        let mixed = cost_audit(&[recorded, stale]);
+        let row = &mixed.by_provider_model[0];
+        let current = row.estimated_cost_usd.expect("row current computed");
+        assert!(
+            (current - 6.25).abs() < 0.0001,
+            "1.25 catalog + 5.0 recorded: {current}"
+        );
+        assert!(row.pricing_note.contains("current rates recalculate"));
+    }
+
+    #[test]
+    fn audit_labels_per_block_multi_model_rows_by_their_real_mechanism() {
+        // rm-521: "multiple" has two producers — per-block pricing
+        // (rm-438, exact) and SQLite aggregation (no per-model split).
+        // The note must claim the mechanism that produced the number.
+        let mut per_block = session("per-block");
+        per_block.metrics.model_used = "multiple".to_string();
+        per_block.metrics.source_tool = "pi".to_string();
+        per_block.metrics.provenance.pricing_source =
+            "multiple models (priced per usage block) + recorded cost".to_string();
+        let audit = session_cost_audit(&per_block);
+        assert_eq!(
+            audit.pricing_note,
+            "multiple models, priced per usage block; per-model totals exact"
+        );
+        assert_eq!(audit.pricing_status, "aggregate_estimate");
+        assert!(audit.rates_per_million_usd.is_none());
+
+        // The SQLite boundary is unchanged (rm-521 keeps the legacy
+        // note where aggregation is genuinely what happened).
+        let mut sqlite = session("aggregate");
+        sqlite.metrics.model_used = "multiple".to_string();
+        sqlite.metrics.source_tool = "opencode_db".to_string();
+        sqlite.metrics.provenance.pricing_source = "SQLite aggregate: multiple models".to_string();
+        let audit = session_cost_audit(&sqlite);
+        assert_eq!(
+            audit.pricing_note,
+            "SQLite aggregated multiple model IDs; no single-model exact price applies"
+        );
+
+        // Corpus arm: a row whose every session is per-block-priced
+        // gets the exact label; a mixed row stays conservative.
+        let rows = cost_audit(&[per_block.clone(), per_block.clone()]);
+        assert_eq!(rows.by_provider_model.len(), 1);
+        assert_eq!(
+            rows.by_provider_model[0].pricing_note,
+            "multiple models, priced per usage block; per-model totals exact"
+        );
+        let mut mixed = per_block.clone();
+        mixed.name = "mixed".to_string();
+        mixed.metrics.provenance.pricing_source = "SQLite aggregate: multiple models".to_string();
+        let rows = cost_audit(&[per_block, mixed]);
+        assert_eq!(rows.by_provider_model.len(), 1);
+        assert_eq!(
+            rows.by_provider_model[0].pricing_note,
+            "SQLite aggregated multiple model IDs; no single-model exact price applies"
+        );
     }
 
     #[test]

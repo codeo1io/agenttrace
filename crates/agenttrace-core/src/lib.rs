@@ -490,6 +490,22 @@ pub struct Metrics {
     /// rate.
     #[serde(skip_serializing_if = "zero_usd")]
     pub upstream_cost_usd: f64,
+    /// Token classes already carrying an upstream-recorded cost
+    /// (counted in the class totals above for visibility, excluded
+    /// from the catalog formula — rm-436). Persisted so downstream
+    /// audits can recompute a stored estimate under rm-436 semantics
+    /// (catalog × unpriced tokens + recorded USD) instead of comparing
+    /// a catalog-only total against a recorded-cost-inclusive one and
+    /// false-tripping a drift note on every recorded-cost session
+    /// (rm-520).
+    #[serde(skip_serializing_if = "zero_i64")]
+    pub upstream_priced_input: i64,
+    #[serde(skip_serializing_if = "zero_i64")]
+    pub upstream_priced_output: i64,
+    #[serde(skip_serializing_if = "zero_i64")]
+    pub upstream_priced_cache_w: i64,
+    #[serde(skip_serializing_if = "zero_i64")]
+    pub upstream_priced_cache_r: i64,
     /// Parse-time disclosure counters: journal facts the accounting
     /// keeps visible without treating them as loss (pi-family,
     /// rm-436/rm-437): `pi_usage_entry:<kind>` per usage-entry kind,
@@ -543,6 +559,10 @@ fn usize_is_zero(value: &usize) -> bool {
 
 fn zero_usd(value: &f64) -> bool {
     *value == 0.0
+}
+
+fn zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 /// rm-408: a present usage block whose recognized values are all zero.
@@ -1091,6 +1111,12 @@ fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
+/// Marker substring embedded in `provenance.pricing_source` whenever a
+/// session's usage blocks were priced exactly per usage block (rm-438).
+/// The mint in `analyze` and `governance::is_per_block_multiple` both go
+/// through this const so the marker cannot be reworded on one side only.
+pub(crate) const PER_BLOCK_PRICING_MARKER: &str = "priced per usage block";
+
 pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let price = pricing::lookup_price(model);
     let mut metrics = Metrics {
@@ -1428,6 +1454,16 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 / 1e6
                 * price.cr,
     );
+    // rm-520: persist which token classes the journal priced upstream
+    // so audits can reproduce the stored estimate on the same basis
+    // (the classes above are already excluded from the catalog
+    // formula; the audit needs the split to avoid re-estimating those
+    // tokens at the session model's rate against a stored number that
+    // already includes their recorded cost).
+    metrics.upstream_priced_input = upstream_priced_input;
+    metrics.upstream_priced_output = upstream_priced_output;
+    metrics.upstream_priced_cache_w = upstream_priced_cache_w;
+    metrics.upstream_priced_cache_r = upstream_priced_cache_r;
     // rm-438: when the usage blocks themselves disagree about which
     // model produced them (pi model_change journals), pricing the whole
     // session at the first model's rate silently misprices every
@@ -1549,11 +1585,10 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // mixed-model row keeps the recorded-cost hint the single-model
         // row gets (review fix F3).
         metrics.provenance.pricing_source = if metrics.upstream_cost_usd > 0.0 {
-            "multiple models (priced per usage block) + recorded cost"
+            format!("multiple models ({PER_BLOCK_PRICING_MARKER}) + recorded cost")
         } else {
-            "multiple models (priced per usage block)"
-        }
-        .to_string();
+            format!("multiple models ({PER_BLOCK_PRICING_MARKER})")
+        };
     } else if metrics.upstream_cost_usd > 0.0 {
         metrics.provenance.pricing_source =
             format!("{} + recorded cost", metrics.provenance.pricing_source);
