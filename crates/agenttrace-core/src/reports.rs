@@ -53,13 +53,24 @@ fn counts_cell(counts: &BTreeMap<String, usize>) -> String {
     if counts.is_empty() {
         return String::new();
     }
-    let rendered = counts
+    // rm-594 residual (run 9ab0afad assess F4): bound how many entries
+    // a single-line render carries — the first 40 (BTreeMap order is
+    // deterministic) plus an explicit count of what is held back;
+    // corpora under the cap render byte-identical.
+    let mut parts: Vec<String> = counts
         .iter()
+        .take(crate::parser::DISCLOSURE_RENDER_ENTRY_CAP)
         .map(|(reason, count)| {
             format!("{}={count}", crate::parser::capped_disclosure_value(reason))
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+    if counts.len() > crate::parser::DISCLOSURE_RENDER_ENTRY_CAP {
+        parts.push(format!(
+            "+{} more distinct keys",
+            counts.len() - crate::parser::DISCLOSURE_RENDER_ENTRY_CAP
+        ));
+    }
+    let rendered = parts.join(", ");
     // rm-450 provenance: the workbuddy input-basis counters only carry
     // their meaning alongside the assumption that produced them; clean
     // corpora keep byte-identical report output.
