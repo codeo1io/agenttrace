@@ -69,10 +69,15 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 32 and the SQLite snapshot is schema 7; the
+The session cache is schema 33 and the SQLite snapshot is schema 7; the
 versions move whenever the persisted session model changes (the session
-cache to 21 when tool call/result pairing and retry-loop keying were
-corrected, then to 22 when per-format usage accounting was corrected —
+cache to 33 again when usage-truth disclosure reached every claiming
+lane — single-document journals stopped being re-accounted by the gemini
+lane and capital-spelled usage containers became visible to the
+disclosure classifier — to 32 when derived token totals were corrected
+across claude/qwen/codex/copilot journals, to 21 when tool call/result
+pairing and retry-loop keying were corrected, then to 22 when
+per-format usage accounting was corrected —
 kimi_cli wire aliases and Codex compaction usage records — to 23 when
 present-but-zero usage blocks began counting as disclosed measured zeros
 (rm-408), to 24 when pi-journal disclosure counters, upstream

@@ -174,6 +174,17 @@ pub(super) fn provenance_label(value: &str, language: Language) -> &'static str 
     // of degrading to "source unknown" exactly when it is flagged
     // (integration review decfa879).
     let base = value.split('+').next().unwrap_or("");
+    // rm-449 F3 / rm-760: `+usage_unusable:<N>` rides provenance.tokens
+    // when the estimate was made while a usage block existed but was
+    // not a container the accounting could read — a different fact
+    // from plain "no usage recorded", said on the surface people read.
+    if base == "estimated_from_text" && value.contains("+usage_unusable") {
+        return pick(
+            language,
+            "estimated from text (usage unusable)",
+            "根据文本估算（用量不可用）",
+        );
+    }
     match base {
         "reported_by_agent" => pick(language, "recorded by the agent", "Agent 直接记录"),
         "estimated_from_text" => pick(language, "estimated from text", "根据文本估算"),

@@ -447,13 +447,21 @@ fn zero_usd(value: &f64) -> bool {
     *value == 0.0
 }
 
-/// rm-408: a present usage block whose recognized values are all zero.
-/// Every parser attaches zeros through `usage_from_value_with_keys`
-/// (which inserts explicit `0` values), so a non-empty all-zero map is
-/// exactly the client-reported-zero population — the one stated rule
-/// across formats instead of per-format accidents.
+/// rm-408 + rm-760: a present usage block counts as zero-reported
+/// when every consumed class in it is zero. `usage_from_value_with_keys`
+/// attaches zeros through explicit canonical names, so a non-empty
+/// all-zero canonical map is exactly the client-reported-zero
+/// population — the one stated rule across formats instead of
+/// per-format accidents. rm-760 extends it to maps whose keys never
+/// map at all (aliases, unknown names — the `usage:{bogus_metric:9999}`
+/// shape): they carry no token truth either way, and without this they
+/// upgraded to clean `reported_by_agent` with no rider.
 pub fn usage_is_all_zero(usage: &BTreeMap<String, i64>) -> bool {
-    !usage.is_empty() && usage.values().all(|value| *value == 0)
+    !usage.is_empty()
+        && usage
+            .iter()
+            .filter(|(key, _)| parser::usage_key_is_consumed(key))
+            .all(|(_, value)| *value == 0)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -573,16 +581,40 @@ pub struct SearchResult {
 /// leaves to `{key}_{leaf}` first (mirroring `lenient_usage_map`), so a
 /// nested `"input": {"tokens": 7}` on a meta line is consumed, not
 /// disclosed.
+/// rm-449 F3 / rm-760: token truth that came from the text estimator
+/// while a usage block existed but was not a container the accounting
+/// could read (`usage_non_object:*` disclosures minted alongside) rides
+/// a `+usage_unusable:<N>` suffix beside rm-408's
+/// `+zero_usage_reported` suffixes, so the human renderers can tell
+/// "no usage recorded" from "usage present, unusable".
+pub(crate) fn flag_estimated_from_unusable_usage(
+    metrics: &mut Metrics,
+    skips: &BTreeMap<String, usize>,
+) {
+    let count: usize = skips
+        .iter()
+        .filter(|(key, _)| key.starts_with("usage_non_object"))
+        .map(|(_, count)| count)
+        .sum();
+    if count == 0 {
+        return;
+    }
+    if metrics.provenance.tokens.split('+').next() != Some("estimated_from_text") {
+        return;
+    }
+    metrics.provenance.tokens = format!("{}+usage_unusable:{}", metrics.provenance.tokens, count);
+}
+
 fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();
     };
     let message_usage = object
         .get("message")
-        .and_then(|message| message.get("usage"));
+        .and_then(|message| message.get("usage").or_else(|| message.get("Usage")));
     let provider_usage = object
         .get("providerData")
-        .and_then(|data| data.get("usage"));
+        .and_then(|data| data.get("usage").or_else(|| data.get("Usage")));
     // The accounting reads usage only on `session_meta`/`meta` events
     // (`session_from_events` below): a top-level `usage` on any other
     // role's line is exactly as unread as `message.usage`, so it gets
@@ -596,54 +628,30 @@ fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let meta_line = matches!(role, "session_meta" | "meta");
+    // rm-760: `Event` deserializes both `usage` (alias) and `Usage`
+    // (rename) spellings wherever it reads the container, so the
+    // classifier probes the same two spellings at all three containers
+    // — what the event machinery can see, the disclosure machinery can
+    // see (arm 3: the caps-assistant/caps-meta-bogus/msgcaps shapes).
+    let consumed: &[&str] = if meta_line {
+        parser::USAGE_KEYS_CONSUMED
+    } else {
+        &[]
+    };
     let mut keys = Vec::new();
-    // (usage value, is this the place the lane's accounting reads?)
-    for (usage, consumed_location) in [
-        (object.get("usage"), meta_line),
-        (message_usage, false),
-        (provider_usage, false),
+    // (usage value, wire keys this lane's accounting consumes here)
+    for (usage, consumed) in [
+        (
+            object.get("usage").or_else(|| object.get("Usage")),
+            consumed,
+        ),
+        (message_usage, &[][..]),
+        (provider_usage, &[][..]),
     ]
     .into_iter()
-    .filter_map(|(usage, consumed_location)| usage.map(|usage| (usage, consumed_location)))
+    .filter_map(|(usage, consumed)| usage.map(|usage| (usage, consumed)))
     {
-        let Some(map) = usage.as_object() else {
-            continue;
-        };
-        for (wire_key, wire_value) in map {
-            // Does this entry flatten to a canonical / recognized name
-            // with a numeric value the accounting could take?
-            let (canonical, recognized) = match wire_value {
-                serde_json::Value::Object(nested) => {
-                    let mut canonical = false;
-                    let mut recognized = false;
-                    for (leaf, leaf_value) in nested {
-                        if parser::number_as_i64(leaf_value).is_some() {
-                            let flat = format!("{wire_key}_{leaf}");
-                            canonical |= parser::usage_key_is_consumed(&flat);
-                            recognized |= parser::usage_wire_key_is_recognized(&flat);
-                        }
-                    }
-                    (canonical, recognized)
-                }
-                other => {
-                    let numeric = parser::number_as_i64(other).is_some();
-                    (
-                        numeric && parser::usage_key_is_consumed(wire_key),
-                        numeric && parser::usage_wire_key_is_recognized(wire_key),
-                    )
-                }
-            };
-            let prefix = if canonical && consumed_location {
-                continue; // actually accounted: canonical at the read place
-            } else if canonical {
-                "usage_unconsumed_location"
-            } else if recognized {
-                "usage_alias_unmapped"
-            } else {
-                "usage_unknown_key"
-            };
-            keys.push(parser::disclosure_key(prefix, wire_key));
-        }
+        parser::usage_container_truth_disclosures(usage, consumed, &mut keys);
     }
     keys
 }
@@ -708,6 +716,7 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
     }
     let mut session = session_from_events(name, path, events)?;
     if !line_skips.is_empty() {
+        flag_estimated_from_unusable_usage(&mut session.metrics, &line_skips);
         session.metrics.line_skips = line_skips;
     }
     Ok(session)

@@ -307,13 +307,22 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         format_tokens(total_tokens)
     ));
     out.push_str(&format!(
-        "  {}: {:>12}  ({}: {})\n\n",
+        "  {}: {:>12}  ({}: {}{})\n\n",
         language.t("Estimated cost", "估算成本"),
         format_cost(metrics.cost_estimated),
         language.t("model", "模型"),
         // rm-383: model strings are transcript-derived; sanitize for the
         // terminal like every other text-renderer field.
-        sanitize_line_segment(&metrics.model_used)
+        sanitize_line_segment(&metrics.model_used),
+        // rm-449 F3 / rm-760: an estimate made while a usage block was
+        // present but unusable (`+usage_unusable` provenance suffix) is
+        // marked — "no usage recorded" and "usage present, unusable"
+        // are different facts on the human surface too.
+        if metrics.provenance.tokens.contains("+usage_unusable") {
+            language.t(" — usage present but unusable", " — 用量存在但不可用")
+        } else {
+            ""
+        }
     ));
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));

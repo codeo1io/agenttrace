@@ -5,7 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 32;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+// Bumped 32 -> 33 (run ec762a618372, repository-maintenance fad1cbf4
+// cycle 3, rm-760 'usage-truth disclosure on every claiming lane' +
+// rm-449 F3/F4 fold arms): the batch changes what parsing REPORTS for
+// UNCHANGED source files — single-object hermes event documents stop
+// being claimed and re-accounted by the gemini lane (same map,
+// different line count used to flip source_tool and token totals),
+// the disclosure classifier case-matches the `Usage` spelling
+// `Event` itself deserializes and runs on the whole-JSON hermes and
+// gemini document lanes' success paths, all-noncanonical usage maps
+// now ride the rm-408 zero_usage_reported rider, and new counter keys
+// (`usage_non_object:<kind>`, `usage_key_non_numeric:<name>`, the
+// case-matched and document-lane tiers of the rm-449 vocabulary)
+// mint where the old parse was silent — so a warm v32 cache keeps
+// serving the swallowed or fabricated totals with matching
+// fingerprints and never re-parses (rm-230 convention: parser-
+// semantics changes that alter the served report for unchanged files
+// bump the schema so cached sessions regenerate once under corrected
+// accounting). The batch lands against base 92149bd at schema 32;
+// if the sibling run-32f3b7a1 session-cache delta lands first,
+// integration re-bases this bump onto the advanced ceiling per the
+// same convention.
 // Bumped 31 -> 32 (integration of run 7f9c6d24, "usage-accounting
 // truthfulness", rm-551..rm-556 renumbered rm-601..rm-603 with rm-554/
 // rm-556 keeping their numerals and rm-555 folding into landed rm-551):

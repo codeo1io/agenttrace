@@ -1,0 +1,2 @@
+{"type":"message","role":"session_meta","timestamp":"2026-10-07T01:00:00Z"}
+{"type":"message","role":"assistant","timestamp":"2026-10-07T01:00:01Z","message":{"role":"assistant","Usage":{"input_tokens":100}}}

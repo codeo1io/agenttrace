@@ -1631,6 +1631,15 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 33 (run ec762a618372, rm-760 + rm-449
+                // F3/F4: usage-truth disclosure on every claiming lane —
+                // single-object hermes event documents no longer gemini-
+                // claimed, the classifier case-matches `Usage`, the
+                // whole-JSON hermes/gemini document lanes disclose their
+                // usage containers, and the new counter keys
+                // (`usage_non_object:*`, `usage_key_non_numeric:*`) mint
+                // where the old parse was silent — re-based off the
+                // landed 31 -> 32 bump);
                 // Schema 32 (integration of run 7f9c6d24, the usage-
                 // accounting-truthfulness batch — claude streaming
                 // per-message-id fold, qwen alias/cache-inclusive basis,
@@ -1663,7 +1672,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":32,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":33,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
@@ -2082,5 +2091,27 @@ fn provenance_label_translates_the_taxonomy_base_behind_disclosure_suffixes() {
     assert_eq!(
         i18n::provenance_label("mystery+zero_usage_reported:1", Language::En),
         i18n::provenance_label("mystery", Language::En)
+    );
+}
+
+#[test]
+fn provenance_label_marks_usage_unusable_estimates() {
+    // rm-449 F3 / rm-760: an estimate made while a usage block existed
+    // but could not be read (`usage_non_object:*` disclosures, the
+    // `+usage_unusable:<N>` provenance suffix) is a different fact
+    // from plain "no usage recorded" — the label must say so instead
+    // of silently reading as the ordinary estimate.
+    assert_eq!(
+        i18n::provenance_label("estimated_from_text+usage_unusable:2", Language::En),
+        "estimated from text (usage unusable)"
+    );
+    assert_eq!(
+        i18n::provenance_label("estimated_from_text+usage_unusable:2", Language::Zh),
+        "根据文本估算（用量不可用）"
+    );
+    // Plain estimates and other suffixes are unaffected.
+    assert_eq!(
+        i18n::provenance_label("estimated_from_text+zero_usage_reported:1", Language::En),
+        i18n::provenance_label("estimated_from_text", Language::En)
     );
 }

@@ -1,0 +1,1 @@
+{"platform":"pi","session_id":"s2","model":"gpt-test","session_start":"2026-10-07T01:00:00Z","last_updated":"2026-10-07T01:05:00Z","usage":{"prompt_tokens":100,"thoughtsTokenCount":5},"messages":[{"role":"user","content":"hello world how are you today fine thanks","timestamp":"2026-10-07T01:00:30Z"}]}
