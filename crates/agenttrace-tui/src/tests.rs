@@ -1702,7 +1702,12 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":37,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                //
+                // The schema literal tracks the live constant: 37
+                // was the rm-754 priced-loop-cost rung, 38 the
+                // run-d932c0c2afee rm-842/rm-843 rung (loop-cost
+                // dollars change for unchanged files).
+                r#"{{"schema_version":38,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
@@ -2395,4 +2400,58 @@ fn explorer_timeline_renders_naive_iso_step_times_as_local_times() {
             "{label} timeline must not fall back to the raw step stamp"
         );
     }
+}
+
+#[test]
+fn loop_analysis_line_names_its_cost_basis() {
+    // rm-847: the loop-analysis line carries basis=priced | synthetic
+    // -- the same values the serialized cost_basis field and the
+    // governance advice use -- and a synthetic-basis dollar figure
+    // gets the explicit (estimate) marker instead of a plain $ label.
+    let session = |cost_basis: agenttrace_core::LoopCostBasis| {
+        let mut diagnostics = agenttrace_core::Diagnostics::default();
+        diagnostics.loop_cost.retry_cost = 0.03;
+        diagnostics.loop_cost.total_loop_cost = 0.03;
+        diagnostics.loop_cost.retry_events = 4;
+        diagnostics.loop_cost.loop_groups = 1;
+        diagnostics.loop_cost.turns = 6;
+        diagnostics.loop_cost.cost_basis = cost_basis;
+        agenttrace_core::Session {
+            name: "loopy".to_string(),
+            path: "/tmp/loopy.jsonl".to_string(),
+            cwd: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 91,
+            tool_warnings: Vec::new(),
+            diagnostics,
+        }
+    };
+
+    let priced = presentation::diagnostics_native_text(
+        &session(agenttrace_core::LoopCostBasis::Priced),
+        Language::En,
+    );
+    assert!(priced.contains("Loop analysis"), "{priced}");
+    assert!(
+        priced.contains("basis=priced"),
+        "the line must name the priced basis: {priced}"
+    );
+    assert!(
+        !priced.contains("(estimate)"),
+        "a priced figure carries no estimate marker: {priced}"
+    );
+
+    let synthetic = presentation::diagnostics_native_text(
+        &session(agenttrace_core::LoopCostBasis::Synthetic),
+        Language::En,
+    );
+    assert!(
+        synthetic.contains("basis=synthetic"),
+        "the line must name the synthetic basis: {synthetic}"
+    );
+    assert!(
+        synthetic.contains("(estimate)"),
+        "a synthetic figure must wear the estimate marker: {synthetic}"
+    );
 }

@@ -2449,17 +2449,32 @@ pub(super) fn diagnostics_native_text(session: &Session, language: Language) -> 
     lines.extend(step_lines(session, language, 12));
     let diagnostics = &session.diagnostics;
     if diagnostics.loop_cost.total_loop_cost > 0.0 {
+        // rm-847: name the cost basis on screen -- the same priced |
+        // synthetic distinction the governance advice and the JSON
+        // `cost_basis` field carry, so a constant-derived dollar
+        // figure never wears a plain $ label on the TUI either. A
+        // synthetic figure gets the explicit estimate marker.
+        let cost_label = if diagnostics.loop_cost.cost_basis.is_synthetic() {
+            format!(
+                "{} {}",
+                format_compact_cost(diagnostics.loop_cost.total_loop_cost),
+                text(language, "(estimate)", "（估算）")
+            )
+        } else {
+            format_compact_cost(diagnostics.loop_cost.total_loop_cost)
+        };
         lines.push(format!(
-            "{}: {}={} {}={} {}={} type={} turns={}",
+            "{}: {}={} {}={} {}={} type={} turns={} basis={}",
             text(language, "Loop analysis", "循环分析"),
             text(language, "cost", "成本"),
-            format_compact_cost(diagnostics.loop_cost.total_loop_cost),
+            cost_label,
             text(language, "retries", "重试"),
             diagnostics.loop_cost.retry_events,
             text(language, "groups", "组数"),
             diagnostics.loop_cost.loop_groups,
             diagnostics.loop_cost.loop_type,
-            diagnostics.loop_cost.turns
+            diagnostics.loop_cost.turns,
+            diagnostics.loop_cost.cost_basis.marker()
         ));
     }
     for warning in &session.tool_warnings {

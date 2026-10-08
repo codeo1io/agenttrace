@@ -53,6 +53,23 @@ impl LoopCostBasis {
             }
         }
     }
+
+    /// rm-847: the compact basis marker the TUI loop-analysis line
+    /// renders -- same values the serialized `cost_basis` field
+    /// carries, so the screen and the JSON document agree.
+    pub fn marker(&self) -> &'static str {
+        match self {
+            LoopCostBasis::Priced => "priced",
+            LoopCostBasis::Synthetic => "synthetic",
+        }
+    }
+
+    /// rm-847: does this dollar figure need the on-screen estimate
+    /// qualifier? (The TUI cannot name this type -- it is not
+    /// re-exported -- so the predicate travels with the enum.)
+    pub fn is_synthetic(&self) -> bool {
+        matches!(self, LoopCostBasis::Synthetic)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -724,6 +741,21 @@ fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost
     // constant estimate and the figures carry an explicit `synthetic`
     // cost basis so a constant-derived number never wears a plain `$`
     // label again.
+    //
+    // rm-842: "usable usage block" means every token class the
+    // per-block oracle prices -- input, output, cache_creation x cw
+    // and cache_read x cr. A cache-only event is real priced money,
+    // not a None.
+    //
+    // rm-843: the composition measures BASELINE-ADJUSTED waste: every
+    // qualifying run contributes the priced cost of its calls BEYOND
+    // the first two (calls 3..=N of ALL runs). The rm-754 composition
+    // ALSO priced the whole longest run in a separate tool arm, so
+    // raw_total counted the longest run's calls 3..=N twice while a
+    // non-max run contributed nothing for its first two calls. The
+    // whole-run tool arm is dropped: a two-call retry is baseline
+    // behavior, not waste, and total_loop_cost is the sum over all
+    // runs' retry calls, capped at the session cost as before.
     let mut last: Option<(&str, String)> = None;
     let mut consecutive = 0;
     let mut max_consecutive = 0;
@@ -731,8 +763,6 @@ fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost
     let mut retries = 0;
     let mut groups = 0;
     // rm-754 priced bookkeeping.
-    let mut run_cost = 0.0f64; // priced cost of the run being scanned
-    let mut max_run_cost = 0.0f64; // priced cost of the longest run
     let mut retry_cost_priced = 0.0f64;
     let mut unpriced_calls = 0usize;
     for event in events.iter() {
@@ -750,7 +780,6 @@ fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost
             };
             if same_call {
                 consecutive += 1;
-                run_cost += counted_cost;
                 if consecutive >= 3 {
                     retries += 1;
                     retry_cost_priced += counted_cost;
@@ -759,13 +788,11 @@ fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost
                 if consecutive > max_consecutive {
                     max_consecutive = consecutive;
                     max_tool = last.map(|(name, _)| name).unwrap_or("");
-                    max_run_cost = run_cost;
                 }
                 if consecutive >= 3 {
                     groups += 1;
                 }
                 consecutive = 1;
-                run_cost = counted_cost;
                 last = Some((call.name.as_str(), call_args));
             }
         }
@@ -773,39 +800,25 @@ fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost
     if consecutive > max_consecutive {
         max_consecutive = consecutive;
         max_tool = last.map(|(name, _)| name).unwrap_or("");
-        max_run_cost = run_cost;
     }
     if consecutive >= 3 {
         groups += 1;
     }
-    let (tool, retry, cost_basis) = if unpriced_calls > 0 {
+    // rm-843: the whole-max-run tool arm is dropped; `retries` and
+    // `retry_cost_priced` already accumulate exactly the calls 3..=N
+    // of EVERY qualifying run, which is the whole waste measure.
+    let (retry, cost_basis) = if unpriced_calls > 0 {
         // rm-754 synthetic fallback: at least one counted call carried
         // no token mass, so no honest rate-derived total exists. Keep
-        // the historical constant estimate and disclose the basis.
-        (
-            if max_consecutive >= 3 {
-                max_consecutive as f64 * 0.015
-            } else {
-                0.0
-            },
-            retries as f64 * 0.0075,
-            LoopCostBasis::Synthetic,
-        )
+        // the historical per-retry constant and disclose the basis.
+        (retries as f64 * 0.0075, LoopCostBasis::Synthetic)
     } else {
         // rm-754 priced arm: every counted call had a usable usage
         // block, so these dollars are the session's own rates applied
         // to the loop's token mass.
-        (
-            if max_consecutive >= 3 {
-                max_run_cost
-            } else {
-                0.0
-            },
-            retry_cost_priced,
-            LoopCostBasis::Priced,
-        )
+        (retry_cost_priced, LoopCostBasis::Priced)
     };
-    let raw_total = tool + retry;
+    let raw_total = retry;
     let total = if total_cost.is_finite() && total_cost > 0.0 {
         raw_total.min(total_cost)
     } else {
@@ -818,7 +831,9 @@ fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost
     };
     LoopCost {
         retry_cost: retry * scale,
-        tool_loop_cost: tool * scale,
+        // rm-843: the whole-run arm was dropped; the field stays
+        // serialized (machine contract) and now always reads 0.
+        tool_loop_cost: 0.0,
         total_loop_cost: total,
         retry_events: retries,
         loop_groups: groups,
@@ -836,9 +851,15 @@ fn loop_cost(events: &[Event], total_cost: f64, session_model: &str) -> LoopCost
 /// lib.rs's per-block pricing (per-million rates from the bundled
 /// snapshot, session-model fallback for events that record no model)
 /// and splits the event's cost evenly across its tool calls so a
-/// multi-call event is not priced once per call. Returns None when the
-/// event carries no usable usage block -- the caller then falls back
-/// to the disclosed synthetic estimate.
+/// multi-call event is not priced once per call. Returns None when
+/// the event carries no usable usage block -- the caller then falls
+/// back to the disclosed synthetic estimate.
+/// rm-842: "usable" prices EVERY class the per-block oracle prices:
+/// input x input rate, output x output rate, cache_creation x cw and
+/// cache_read x cr (lib.rs:1380-1393). The None gate fires only when
+/// ALL FOUR classes are zero, so a cache-only event is priced --
+/// before rm-842 it returned None and flipped the whole session's
+/// cost basis to the synthetic constants.
 fn priced_event_cost(event: &Event, session_model: &str) -> Option<f64> {
     let input = event.usage.get("input_tokens").copied().unwrap_or(0).max(0);
     let output = event
@@ -847,7 +868,19 @@ fn priced_event_cost(event: &Event, session_model: &str) -> Option<f64> {
         .copied()
         .unwrap_or(0)
         .max(0);
-    if input == 0 && output == 0 {
+    let cache_creation = event
+        .usage
+        .get("cache_creation_input_tokens")
+        .copied()
+        .unwrap_or(0)
+        .max(0);
+    let cache_read = event
+        .usage
+        .get("cache_read_input_tokens")
+        .copied()
+        .unwrap_or(0)
+        .max(0);
+    if input == 0 && output == 0 && cache_creation == 0 && cache_read == 0 {
         return None;
     }
     let price = if event.model_used.is_empty() || event.model_used == "unknown" {
@@ -857,7 +890,10 @@ fn priced_event_cost(event: &Event, session_model: &str) -> Option<f64> {
     };
     let calls = event.tool_calls.len().max(1) as f64;
     Some(
-        (input as f64 / 1_000_000.0 * price.input + output as f64 / 1_000_000.0 * price.output)
+        (input as f64 / 1_000_000.0 * price.input
+            + output as f64 / 1_000_000.0 * price.output
+            + cache_creation as f64 / 1_000_000.0 * price.cw
+            + cache_read as f64 / 1_000_000.0 * price.cr)
             / calls,
     )
 }
@@ -1756,8 +1792,9 @@ mod tests {
             let price = crate::pricing::lookup_price(model);
             200_000.0 / 1_000_000.0 * price.input + 50_000.0 / 1_000_000.0 * price.output
         };
-        // Six same-call events: the whole run prices the max-run arm,
-        // calls 3..=6 (four of them) price the retry arm.
+        // Six same-call events: rm-843 measures baseline-adjusted
+        // waste, so calls 3..=6 (four of them) price the retry arm and
+        // the whole-run tool arm is gone.
         let haiku = loop_cost(
             &loop_cost_six_call_run("claude-haiku-4-5", true),
             1_000_000.0,
@@ -1776,8 +1813,8 @@ mod tests {
         ] {
             let call_cost = per_call(model);
             assert!(
-                (lc.tool_loop_cost - 6.0 * call_cost).abs() < 1e-9,
-                "{label} tool_loop_cost {} != 6 x {call_cost}",
+                (lc.tool_loop_cost - 0.0).abs() < 1e-9,
+                "{label} whole-run arm must be dropped (rm-843): {}",
                 lc.tool_loop_cost
             );
             assert!(
@@ -1804,7 +1841,10 @@ mod tests {
         // plain $ label again.
         let lc = loop_cost(&loop_cost_six_call_run("", false), 1_000_000.0, "");
         assert_eq!(lc.cost_basis, LoopCostBasis::Synthetic);
-        assert!((lc.tool_loop_cost - 0.09).abs() < 1e-9); // 6 x 0.015
+        // rm-843: the synthetic estimate mirrors the priced composition,
+        // so only the beyond-baseline calls price (4 x 0.0075); the
+        // whole-run constant arm (6 x 0.015 = 0.09) is gone.
+        assert!((lc.tool_loop_cost - 0.0).abs() < 1e-9);
         assert!((lc.retry_cost - 0.03).abs() < 1e-9); // 4 x 0.0075
         assert_eq!(lc.retry_events, 4);
         assert_eq!(lc.loop_groups, 1);
@@ -1850,6 +1890,78 @@ mod tests {
         let price = crate::pricing::lookup_price("claude-haiku-4-5");
         let call_cost =
             200_000.0 / 1_000_000.0 * price.input + 50_000.0 / 1_000_000.0 * price.output;
-        assert!((lc.tool_loop_cost - 6.0 * call_cost).abs() < 1e-9);
+        assert!((lc.retry_cost - 4.0 * call_cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn loop_cost_prices_cache_only_events_on_the_priced_arm() {
+        // rm-842: an event whose only token mass is cache classes is
+        // real priced money. It used to return None from
+        // priced_event_cost, bump unpriced_calls and flip the WHOLE
+        // session's cost basis to the synthetic constants; it now
+        // prices at cw/cr exactly like the per-block oracle (lib.rs)
+        // and the session stays Priced.
+        let mut events = loop_cost_six_call_run("claude-haiku-4-5", false);
+        for event in events.iter_mut() {
+            event
+                .usage
+                .insert("cache_creation_input_tokens".to_string(), 100_000);
+            event
+                .usage
+                .insert("cache_read_input_tokens".to_string(), 400_000);
+        }
+        let lc = loop_cost(&events, 1_000_000.0, "claude-haiku-4-5");
+        assert_eq!(lc.cost_basis, LoopCostBasis::Priced);
+        let price = crate::pricing::lookup_price("claude-haiku-4-5");
+        let call_cost = 100_000.0 / 1_000_000.0 * price.cw + 400_000.0 / 1_000_000.0 * price.cr;
+        assert!(
+            (lc.total_loop_cost - 4.0 * call_cost).abs() < 1e-9,
+            "cache-only dollars must price at cw/cr: {} vs {}",
+            lc.total_loop_cost,
+            4.0 * call_cost
+        );
+    }
+
+    #[test]
+    fn loop_cost_baseline_adjusted_waste_counts_only_calls_beyond_two() {
+        // rm-843: a two-call retry run is baseline behavior, not
+        // waste -- it contributes $0. The old composition counted the
+        // whole run twice over once it reached three calls.
+        let two_calls = (0..2)
+            .map(|_| loop_cost_event("claude-haiku-4-5", true))
+            .collect::<Vec<_>>();
+        let lc = loop_cost(&two_calls, 1_000_000.0, "");
+        assert_eq!(lc.cost_basis, LoopCostBasis::Priced);
+        assert_eq!(lc.retry_cost, 0.0);
+        assert_eq!(lc.tool_loop_cost, 0.0);
+        assert_eq!(lc.total_loop_cost, 0.0);
+        assert_eq!(lc.loop_groups, 0);
+    }
+
+    #[test]
+    fn loop_cost_baseline_adjusted_waste_sums_all_runs() {
+        // rm-843: EVERY qualifying run contributes its calls 3..=N,
+        // not just the longest. Two three-call runs price their third
+        // calls (2 x one call); no whole-run arm is added on top.
+        let model = "claude-haiku-4-5";
+        let mut events: Vec<Event> = (0..3).map(|_| loop_cost_event(model, true)).collect();
+        for _ in 0..3 {
+            let mut ev = loop_cost_event(model, true);
+            ev.tool_calls[0].name = "other-tool".to_string();
+            events.push(ev);
+        }
+        let lc = loop_cost(&events, 1_000_000.0, "");
+        let price = crate::pricing::lookup_price(model);
+        let call_cost =
+            200_000.0 / 1_000_000.0 * price.input + 50_000.0 / 1_000_000.0 * price.output;
+        assert_eq!(lc.loop_groups, 2, "two separate three-call runs");
+        assert_eq!(lc.retry_events, 2);
+        assert!(
+            (lc.total_loop_cost - 2.0 * call_cost).abs() < 1e-9,
+            "waste = third calls of both runs: {} vs {}",
+            lc.total_loop_cost,
+            2.0 * call_cost
+        );
+        assert_eq!(lc.tool_loop_cost, 0.0);
     }
 }
