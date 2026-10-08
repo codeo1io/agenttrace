@@ -544,9 +544,12 @@ fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Ses
 /// time-ranged view (N7); only sessions with a known start before the
 /// cutoff are filtered out.
 fn session_within_since(session: &Session, since: Option<DateTime<Utc>>) -> bool {
+    // rm-502: the shared lenient arm (lib.rs parse_ts) keeps this
+    // filter in agreement with ingest — naive-ISO starts fall in
+    // time like RFC 3339 ones, unparseable ones stay visible.
     since.is_none_or(|since| {
-        DateTime::parse_from_rfc3339(&session.metrics.session_start)
-            .map(|time| time.with_timezone(&Utc) >= since)
+        crate::parse_ts(&session.metrics.session_start)
+            .map(|time| time >= since)
             .unwrap_or(true)
     })
 }

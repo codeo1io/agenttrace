@@ -28,7 +28,6 @@
 //! guess which basis the numbers are on.
 
 use crate::Session;
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -197,9 +196,13 @@ fn infer_gen_ai_system(path: &str) -> &'static str {
 }
 
 fn rfc3339_to_unix_nanos(stamp: &str) -> Option<u64> {
-    DateTime::parse_from_rfc3339(stamp)
-        .ok()?
-        .with_timezone(&Utc)
+    // rm-502 (integration of run 6aaf51aa): session bounds parse
+    // through the shared lenient arm (lib.rs `parse_ts` — the single
+    // source of timestamp truth) exactly like every other consumer of
+    // `metrics.session_start`/`session_end`, so a naive-ISO stamp keeps
+    // its real nanos here instead of silently dropping to the
+    // `timestamps.first()` fallback the strict copy forced.
+    crate::parse_ts(stamp)?
         .timestamp_nanos_opt()
         .and_then(|n| u64::try_from(n).ok())
 }

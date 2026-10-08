@@ -1631,6 +1631,14 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 36 (integration of run 6aaf51aa, rm-502 —
+                // every strict timestamp consumer routes through the
+                // shared lenient parse_ts, so naive-ISO corpora
+                // regenerate with populated diagnostics and the
+                // naive-stamp count; landed at its base ea5c41e as the
+                // campaign's 22 -> 23 bump, re-based here onto the
+                // advanced ceiling, 35 being the rm-720/rm-721 rung and
+                // 34 the rm-710 rung below);
                 // Schema 35 (integration of run 3ec6cec08fb9,
                 // rm-720/rm-721 agent-lane truth — Antigravity
                 // per-generation usage fold + Copilot agent-host
@@ -1694,7 +1702,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":35,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":36,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()
@@ -2326,4 +2334,65 @@ fn delivery_evidence_confidence_localizes_bare_words_and_states_note_once() {
         !zh.contains("medium:"),
         "legacy composite shape must not leak"
     );
+}
+
+#[test]
+fn explorer_timeline_renders_naive_iso_step_times_as_local_times() {
+    // rm-502: step timestamps that reach the TUI raw (diagnostics trace
+    // steps) used to hit a strict RFC 3339 copy and fall back to the raw
+    // string for naive-ISO stamps; they now route through the shared
+    // lenient parser (lib.rs parse_ts) and render as local times exactly
+    // like Z-stamped ones.
+    let step = |started_at: &str| agenttrace_core::TraceStep {
+        kind: "tool".to_string(),
+        name: "read_file".to_string(),
+        started_at: started_at.to_string(),
+        ended_at: String::new(),
+        duration_sec: 1.0,
+        status: "ok".to_string(),
+        tokens: 0,
+        call_id: String::new(),
+        parent_id: String::new(),
+    };
+    let mut naive = session("naive", "claude_code", "gpt-5", 60, 0.1, "read_file");
+    // A hanging gap makes the session attention-worthy so it is
+    // reachable from the explorer list (explorer_session()).
+    naive.metrics.gaps_sec = vec![180.0];
+    naive.diagnostics.steps.push(step("2026-10-05T03:00:00"));
+    let mut aware = session("aware", "claude_code", "gpt-5", 60, 0.1, "read_file");
+    aware.metrics.gaps_sec = vec![180.0];
+    aware.diagnostics.steps.push(step("2026-10-05T03:00:00Z"));
+    let expected =
+        chrono::NaiveDateTime::parse_from_str("2026-10-05T03:00:00", "%Y-%m-%dT%H:%M:%S")
+            .unwrap()
+            .and_utc()
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M:%S")
+            .to_string();
+
+    for (label, session, raw) in [
+        ("naive", naive, "2026-10-05T03:00:00"),
+        ("aware", aware, "2026-10-05T03:00:00Z"),
+    ] {
+        let mut app = App::new(vec![session], "test", None);
+        app.handle_explorer_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("open detail");
+        app.explorer_detail = Some(DetailSection::Timeline);
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).expect("terminal");
+        terminal
+            .draw(|frame| render_explorer(frame, &mut app))
+            .expect("render timeline detail");
+        let text = format!("{:?}", terminal.backend().buffer());
+        assert!(
+            text.contains(&expected),
+            "{label} timeline must render the local-time step stamp ({expected})"
+        );
+        assert!(
+            !text.contains(raw),
+            "{label} timeline must not fall back to the raw step stamp"
+        );
+    }
 }

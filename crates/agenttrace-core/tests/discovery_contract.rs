@@ -1018,6 +1018,14 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
+        // v36 (integration of run 6aaf51aa, rm-502 'Naive-ISO
+        // timestamps parse for --overview but vanish from --sessions
+        // and --diagnostics' — every strict timestamp consumer routes
+        // through the shared lenient parse_ts, so cached sessions
+        // regenerate with populated diagnostics and the naive-stamp
+        // count; re-based off the campaign's 22 -> 23 bump onto the
+        // advanced ceiling, 35 being the rm-720/rm-721 rung and 34 the
+        // rm-710 rung in session_cache.rs);
         // v33 (integration of run 91833f02, rm-616 generic-lane
         // model/usage truth — the Event.model_used alias + the
         // generic counted-lane fold change what unchanged generic
@@ -1218,12 +1226,13 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v33 — see the rm-616, usage-accounting-truthfulness,
+        // version (v36 — see the rm-502, rm-720/rm-721,
+        // rm-710, rm-616, usage-accounting-truthfulness,
         // rm-551, rm-538, rm-600, rm-529, rm-542,
         // rm-485, rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes
-        // in session_cache.rs; the generic-lane model/usage truth is
-        // what carried 32 -> 33 at this integration, re-based off the
-        // campaign's own 27 -> 28 bump).
+        // in session_cache.rs; the rm-502 timestamp unification is
+        // what carried 35 -> 36 at this integration, re-based off the
+        // campaign's own 22 -> 23 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(SESSION_CACHE_SCHEMA_VERSION)
@@ -3583,4 +3592,116 @@ fn opencode_db_fork_rows_excluded_and_disclosed_across_warm_snapshots() {
     });
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn naive_iso_twin_fixtures_parse_identically_at_every_consumer() {
+    // rm-502: the lenient ingest arm (lib.rs `parse_ts`) accepts naive
+    // ISO timestamps (no `Z`/offset) and reinterprets them as UTC — the
+    // Go-parity contract pinned by `naive_iso_timestamps_match_go_utc_gap_rules`
+    // — while the downstream consumers (diagnostics latencies/trace
+    // steps, report ordering, since-filters, governance windows, TUI
+    // step times) parsed RFC 3339 strictly. The same corpus therefore
+    // produced full `--overview` totals but empty `--diagnostics`
+    // tool_latencies and 0-second trace steps. The committed twin
+    // fixtures differ ONLY by the trailing `Z`; every consumer must
+    // treat them identically.
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/naive-iso");
+    let naive_text = fs::read_to_string(fixtures.join("naive.jsonl")).expect("naive fixture");
+    let aware_text = fs::read_to_string(fixtures.join("aware.jsonl")).expect("aware fixture");
+    assert_eq!(
+        naive_text.trim_end().replace('Z', ""),
+        aware_text.trim_end().replace('Z', ""),
+        "twin fixtures must differ only by the Z suffix"
+    );
+
+    let home = std::env::temp_dir().join(format!("at-rm502-twins-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    for (corpus, text) in [("naive", &naive_text), ("aware", &aware_text)] {
+        let sessions_dir = home.join(corpus).join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::write(sessions_dir.join("s1.jsonl"), text).expect("write session");
+    }
+
+    let mut naive = Vec::new();
+    let mut aware = Vec::new();
+    with_home_and_cache(&home.join("home"), &home.join("cache"), || {
+        naive = load_sessions_from_dir(Some(&home.join("naive").join("sessions")));
+        aware = load_sessions_from_dir(Some(&home.join("aware").join("sessions")));
+    });
+
+    assert_eq!(
+        naive.len(),
+        1,
+        "naive corpus must stay listed (lenient ingest arm)"
+    );
+    assert_eq!(aware.len(), 1, "aware control must stay listed");
+    let naive = &naive[0];
+    let aware = &aware[0];
+
+    // Ingest normalizes session_start to `...Z` for both arms.
+    assert_eq!(naive.metrics.session_start, "2026-10-05T03:00:00Z");
+    assert_eq!(aware.metrics.session_start, naive.metrics.session_start);
+
+    // The reproducible split-brain arm: diagnostics derive tool
+    // latencies and step durations from RAW event stamps, which the
+    // strict parser rejected for the naive twin.
+    assert!(
+        !aware.diagnostics.tool_latencies.is_empty(),
+        "aware control must derive tool latencies"
+    );
+    assert_eq!(
+        serde_json::to_value(&naive.diagnostics.tool_latencies).unwrap(),
+        serde_json::to_value(&aware.diagnostics.tool_latencies).unwrap(),
+        "tool latencies must be identical between the naive and aware twins"
+    );
+    assert_eq!(naive.diagnostics.steps.len(), aware.diagnostics.steps.len());
+    let step_durations = |session: &agenttrace_core::Session| -> Vec<f64> {
+        session
+            .diagnostics
+            .steps
+            .iter()
+            .map(|step| step.duration_sec)
+            .collect()
+    };
+    let aware_durations = step_durations(aware);
+    assert!(
+        aware_durations.iter().any(|duration| *duration > 0.0),
+        "aware control must derive nonzero step durations"
+    );
+    assert_eq!(
+        step_durations(naive),
+        aware_durations,
+        "step durations must be identical between the naive and aware twins"
+    );
+    assert_eq!(
+        naive.diagnostics.stuck_patterns.len(),
+        aware.diagnostics.stuck_patterns.len()
+    );
+
+    // rm-502 disclosure: naive stamps count into data_health so the UTC
+    // reinterpretation is visible instead of hiding behind `confidence`.
+    let naive_health = data_health(std::slice::from_ref(naive), 1, 0);
+    let aware_health = data_health(std::slice::from_ref(aware), 1, 0);
+    assert_eq!(naive_health.naive_utc_sessions, 1);
+    assert_eq!(aware_health.naive_utc_sessions, 0);
+    assert_eq!(naive.metrics.naive_utc_stamps, 3);
+    assert_eq!(aware.metrics.naive_utc_stamps, 0);
+
+    // The counter persists in the session cache (GoMetrics carries it;
+    // schema — the campaign's 22 → 23 bump, re-based onto the advanced
+    // ceiling as 35 → 36 at integration) — the second load below hits
+    // the warm cache.
+    let mut reloaded = Vec::new();
+    with_home_and_cache(&home.join("home"), &home.join("cache"), || {
+        reloaded = load_sessions_from_dir(Some(&home.join("naive").join("sessions")));
+    });
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(
+        reloaded[0].metrics.naive_utc_stamps, 3,
+        "naive stamp count must survive the warm cache round-trip"
+    );
+
+    let _ = fs::remove_dir_all(&home);
 }

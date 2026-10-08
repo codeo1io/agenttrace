@@ -107,10 +107,10 @@ fn qwen_multi_result_usage_accumulates_per_turn() {
 /// skips at confidence "high", and of v32 totals undercounted by the
 /// pre-rm-711 parsers.
 #[test]
-fn warm_cache_replays_cold_disclosure_and_schema_35_invalidates_v32() {
+fn warm_cache_replays_cold_disclosure_and_schema_36_invalidates_v32() {
     assert_eq!(
-        SESSION_CACHE_SCHEMA_VERSION, 35,
-        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, so this assert pins the live constant)"
+        SESSION_CACHE_SCHEMA_VERSION, 36,
+        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration and to 36 at the rm-502 timestamp-unification integration, so this assert pins the live constant)"
     );
     let root = std::env::temp_dir().join(format!(
         "agenttrace-contract-warmcold-{}",
@@ -165,7 +165,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_35_invalidates_v32() {
     let mut stale_cache: SessionCache = load_session_cache();
     assert!(
         cached_session(&journal, &mut stale_cache).is_none(),
-        "rm-710: a schema-32 entry must not be served at schema 35"
+        "rm-710: a schema-32 entry must not be served at the live schema ceiling (36 at this tree)"
     );
 
     std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");

@@ -1,5 +1,4 @@
-use crate::{Event, Metrics, Session};
-use chrono::{DateTime, Utc};
+use crate::{parse_ts, Event, Metrics, Session};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -341,8 +340,8 @@ fn trace_steps(events: &[Event], _model: &str) -> Vec<TraceStep> {
         .flat_map(|event| event.tool_calls.iter().map(move |call| (event, call)))
         .map(|(event, call)| {
             let result = results.get(call.id.as_str());
-            let duration_sec = parse_time(&event.timestamp)
-                .zip(result.and_then(|event| parse_time(&event.timestamp)))
+            let duration_sec = parse_ts(&event.timestamp)
+                .zip(result.and_then(|event| parse_ts(&event.timestamp)))
                 .map(|(start, end)| (end - start).num_milliseconds() as f64 / 1000.0)
                 // rm-004 residual arm: this used to clamp at 3600s,
                 // collapsing a 2h call to 0.0 while tool_latencies
@@ -796,13 +795,13 @@ fn tool_latencies(events: &[Event]) -> Vec<ToolLatency> {
     let results = events
         .iter()
         .filter_map(|event| {
-            parse_time(&event.timestamp).map(|time| (event.tool_call_id.as_str(), time))
+            parse_ts(&event.timestamp).map(|time| (event.tool_call_id.as_str(), time))
         })
         .filter(|(id, _)| !id.is_empty())
         .collect::<HashMap<_, _>>();
     let mut values: BTreeMap<String, (Vec<f64>, usize)> = BTreeMap::new();
     for event in events {
-        let Some(start) = parse_time(&event.timestamp) else {
+        let Some(start) = parse_ts(&event.timestamp) else {
             continue;
         };
         for call in &event.tool_calls {
@@ -1018,11 +1017,11 @@ fn stuck_patterns(events: &[Event], metrics: &Metrics) -> Vec<StuckPattern> {
     out
 }
 
-fn parse_time(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|time| time.with_timezone(&Utc))
-}
+// NOTE (rm-502): the strict `parse_time` copy that used to live here
+// was removed — every timestamp parse in this module routes through
+// lib.rs `parse_ts` (the single source of timestamp truth), so naive
+// ISO stamps derive latencies and step durations exactly like
+// RFC 3339 ones instead of vanishing.
 
 fn hash(value: &str) -> u32 {
     value.bytes().take(200).fold(5381_u32, |hash, byte| {

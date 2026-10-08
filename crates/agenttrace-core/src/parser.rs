@@ -4886,16 +4886,13 @@ fn opencode_parse_time(raw: Option<&Value>) -> Option<chrono::DateTime<chrono::U
     match raw? {
         Value::Number(number) => number.as_f64().and_then(opencode_unix_time),
         Value::String(text) => {
-            let normalized = text.replace('Z', "+00:00");
-            chrono::DateTime::parse_from_rfc3339(&normalized)
-                .map(|ts| ts.with_timezone(&chrono::Utc))
-                .ok()
-                .or_else(|| {
-                    chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S")
-                        .ok()
-                        .map(|ts| ts.and_utc())
-                })
-                .or_else(|| text.parse::<f64>().ok().and_then(opencode_unix_time))
+            // rm-502: the string arms fold onto lib.rs `parse_ts`, the
+            // single source of timestamp truth — this lane used to carry
+            // an independent naive copy that dropped fractional seconds.
+            // The fold additively widens the accepted space to naive
+            // stamps WITH fractions; the unix-float fallback below stays
+            // lane-specific (parse_ts is string-ISO only).
+            crate::parse_ts(text).or_else(|| text.parse::<f64>().ok().and_then(opencode_unix_time))
         }
         _ => None,
     }
@@ -5318,17 +5315,20 @@ fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
     Some(usage)
 }
 
-/// Compare two RFC3339 timestamp strings and return the later one; ties
-/// keep the candidate. Falls back to lexicographic order when either side
-/// fails to parse (rm-556: shutdown/checkpoint records both end sessions,
-/// and the latest activity — not the freshest parse — must win).
+/// Compare two timestamp strings and return the later one; ties
+/// keep the candidate. Falls back to lexicographic order only when
+/// neither stamp parses (rm-556: shutdown/checkpoint records both end
+/// sessions, and the latest activity — not the freshest parse — must
+/// win). rm-502 (integration of run 6aaf51aa): "parses" is decided by
+/// the shared lenient arm (lib.rs `parse_ts`), so naive-ISO record
+/// stamps compare chronologically instead of falling to the string
+/// arm — the accepted-stamp space stays identical to ingest's.
 fn later_rfc3339(current: &str, candidate: &str) -> String {
-    let parse = chrono::DateTime::parse_from_rfc3339;
-    let candidate_wins = match (parse(current), parse(candidate)) {
-        (Ok(a), Ok(b)) => b >= a,
-        (Err(_), Ok(_)) => true,
-        (Ok(_), Err(_)) => false,
-        (Err(_), Err(_)) => candidate >= current,
+    let candidate_wins = match (crate::parse_ts(current), crate::parse_ts(candidate)) {
+        (Some(a), Some(b)) => b >= a,
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (None, None) => candidate >= current,
     };
     if candidate_wins {
         candidate.to_string()
@@ -7913,5 +7913,45 @@ mod tests {
                 .get("codex_compaction_usage_record"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn opencode_parse_time_agrees_with_the_single_source_of_timestamp_truth() {
+        // rm-502: the lane's private naive copy folded onto lib.rs
+        // `parse_ts`. Fractional naive stamps now parse (the old copy
+        // dropped the fraction), every ISO string the shared parser
+        // accepts yields the same instant on this lane, and the
+        // unix-float fallback stays lane-specific.
+        let shared = |value: &str| crate::parse_ts(value);
+        let lane = |value: Option<&Value>| opencode_parse_time(value);
+        for text in [
+            "2026-10-05T03:00:00Z",
+            "2026-10-05T03:00:00+02:00",
+            "2026-10-05T03:00:00",
+            "2026-10-05T03:00:00.500",
+            "2026-10-05T03:00:00.500000",
+        ] {
+            assert_eq!(
+                lane(Some(&Value::String(text.to_string()))),
+                shared(text),
+                "opencode lane must agree with parse_ts on {text}"
+            );
+        }
+        // Additive widening pinned: fractional naive stamps used to fall
+        // through to the unix-float arm (None for a non-numeric string).
+        assert!(shared("2026-10-05T03:00:00.500").is_some());
+        // Lane-specific fallback preserved: raw unix floats.
+        assert_eq!(
+            lane(Some(&Value::Number(serde_json::Number::from(
+                1735689600u64
+            )))),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1735689600, 0)
+        );
+        assert_eq!(
+            lane(Some(&Value::String("1735689600".to_string()))),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1735689600, 0)
+        );
+        assert_eq!(lane(None), None);
+        assert_eq!(lane(Some(&Value::Bool(true))), None);
     }
 }

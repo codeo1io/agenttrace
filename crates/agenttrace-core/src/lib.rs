@@ -397,6 +397,10 @@ pub struct Metrics {
     pub source_tool: String,
     pub session_start: String,
     pub session_end: String,
+    /// Event timestamps accepted by the lenient naive-ISO arm and
+    /// reinterpreted as UTC (no offset in the source log; rm-502).
+    /// Zero unless the session's log carried naive stamps.
+    pub naive_utc_stamps: usize,
     pub duration_sec: f64,
     pub cost_estimated: f64,
     /// rm-485: session-wide cost-only credit total (USD), folded from meta
@@ -1039,8 +1043,11 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             metrics.source_tool = event.source_tool.clone();
         }
 
-        if let Some(ts) = parse_ts(&event.timestamp) {
+        if let Some((ts, form)) = parse_ts_form(&event.timestamp) {
             metrics.timestamps.push(ts);
+            if matches!(form, TimestampForm::NaiveUtc) {
+                metrics.naive_utc_stamps += 1;
+            }
         }
 
         // Usage values arrive from untrusted session logs; clamp negatives
@@ -2019,18 +2026,43 @@ pub fn sorted_set(set: BTreeSet<String>) -> Vec<String> {
     set.into_iter().collect()
 }
 
-fn parse_ts(value: &str) -> Option<DateTime<Utc>> {
+/// How [`parse_ts`] accepted a timestamp string (rm-502).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimestampForm {
+    /// RFC 3339 with an explicit UTC offset (`Z`, `+00:00`, `-0700`, …).
+    Rfc3339,
+    /// Naive ISO `YYYY-MM-DDTHH:MM:SS[.f]` with no offset — reinterpreted
+    /// as UTC by the lenient arm, the Go-parity contract pinned by
+    /// `naive_iso_timestamps_match_go_utc_gap_rules`.
+    NaiveUtc,
+}
+
+/// The single source of timestamp truth (rm-502).
+///
+/// Every consumer that needs a `DateTime<Utc>` from a session-log
+/// timestamp string parses through here — ingest (`analyze`), session
+/// ordering, report trend windows, the discovery and SQLite
+/// since-filters, governance commit windows, diagnostics latencies and
+/// trace steps, and the TUI step timeline. Strict RFC-3339-only copies
+/// previously rejected the naive-ISO stamps this arm accepts, so one
+/// corpus produced full `--overview` totals while `--diagnostics`
+/// reported empty tool latencies and zero-second trace steps.
+pub fn parse_ts(value: &str) -> Option<DateTime<Utc>> {
+    parse_ts_form(value).map(|(ts, _)| ts)
+}
+
+fn parse_ts_form(value: &str) -> Option<(DateTime<Utc>, TimestampForm)> {
     if value.is_empty() {
         return None;
     }
     let normalized = value.replace('Z', "+00:00");
     if let Ok(ts) = DateTime::parse_from_rfc3339(&normalized) {
-        return Some(ts.with_timezone(&Utc));
+        return Some((ts.with_timezone(&Utc), TimestampForm::Rfc3339));
     }
     NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S"))
         .ok()
-        .map(|ts| ts.and_utc())
+        .map(|ts| (ts.and_utc(), TimestampForm::NaiveUtc))
 }
 
 pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -2738,6 +2770,27 @@ mod tests {
         assert_eq!(metrics.session_end, "2026-06-21T01:06:01Z");
         assert_eq!(metrics.gaps_sec, vec![361.0]);
         assert_eq!(detect_anomalies(&metrics)[0].kind, "hanging");
+    }
+
+    #[test]
+    fn parse_ts_reports_which_arm_accepted_each_form() {
+        // rm-502 acceptance (c): the shared parser is the single source
+        // of timestamp truth, and it reports which arm accepted a value
+        // so ingest can count naive-UTC reinterpretations.
+        let form = |value: &str| parse_ts_form(value).map(|(_, form)| form);
+        assert_eq!(form("2026-10-05T03:00:00Z"), Some(TimestampForm::Rfc3339));
+        assert_eq!(
+            form("2026-10-05T03:00:00+02:00"),
+            Some(TimestampForm::Rfc3339)
+        );
+        assert_eq!(
+            form("2026-10-05T03:00:00.500000"),
+            Some(TimestampForm::NaiveUtc)
+        );
+        assert_eq!(form("2026-10-05T03:00:00"), Some(TimestampForm::NaiveUtc));
+        assert_eq!(form(""), None);
+        assert_eq!(form("not a timestamp"), None);
+        assert_eq!(form("1735689600"), None);
     }
 
     #[test]
