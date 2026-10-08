@@ -95,29 +95,30 @@ pub(super) fn matches_issue_filter(session: &Session, filter: &str) -> bool {
 }
 
 pub(super) fn parse_numeric_i32_filter(filter: &str) -> Option<(CostOp, i32)> {
-    let (op, value) = parse_operator_value(filter)?;
-    value.parse::<i32>().ok().map(|value| (op, value))
+    // rm-389 remaining scope / rm-786: shared core dialect, i32 surface —
+    // bare number means >=; fractional and non-finite thresholds invalid.
+    agenttrace_core::parse_numeric_filter_i32(filter).map(|(op, value)| (cost_op(op), value))
 }
 
 pub(super) fn parse_cost_filter(filter: &str) -> Option<(CostOp, f64)> {
-    let (op, value) = parse_operator_value(filter.trim())?;
-    value.parse::<f64>().ok().map(|value| (op, value))
+    // rm-389 remaining scope / rm-786: both parse helpers delegate to the
+    // ONE core dialect (agenttrace_core::filters) shared with the CLI —
+    // operator-prefixed or bare (>=) FINITE thresholds only. The old local
+    // parser accepted `>=nan` / `<=inf`, which then silently matched
+    // nothing or everything through the partial comparisons below.
+    agenttrace_core::parse_numeric_filter(filter).map(|(op, value)| (cost_op(op), value))
 }
 
-pub(super) fn parse_operator_value(filter: &str) -> Option<(CostOp, &str)> {
-    let filter = filter.trim();
-    for (prefix, op) in [
-        (">=", CostOp::Gte),
-        ("<=", CostOp::Lte),
-        (">", CostOp::Gt),
-        ("<", CostOp::Lt),
-        ("=", CostOp::Eq),
-    ] {
-        if let Some(value) = filter.strip_prefix(prefix) {
-            return Some((op, value.trim()));
-        }
+/// Map the shared core operator onto the TUI's CostOp spelling so
+/// `cost_op_label` and the app state keep their existing shape.
+fn cost_op(op: agenttrace_core::NumericFilterOp) -> CostOp {
+    match op {
+        agenttrace_core::NumericFilterOp::Gte => CostOp::Gte,
+        agenttrace_core::NumericFilterOp::Lte => CostOp::Lte,
+        agenttrace_core::NumericFilterOp::Gt => CostOp::Gt,
+        agenttrace_core::NumericFilterOp::Lt => CostOp::Lt,
+        agenttrace_core::NumericFilterOp::Eq => CostOp::Eq,
     }
-    filter.parse::<f64>().ok().map(|_| (CostOp::Gte, filter))
 }
 
 pub(super) fn compare_i32(left: i32, op: CostOp, right: i32) -> bool {
@@ -136,7 +137,10 @@ pub(super) fn compare_f64(left: f64, op: CostOp, right: f64) -> bool {
         CostOp::Gte => left >= right,
         CostOp::Lt => left < right,
         CostOp::Lte => left <= right,
-        CostOp::Eq => (left - right).abs() < f64::EPSILON,
+        // rm-786: the shared dialect documents `=` as exact equality
+        // (total_cmp basis); the old EPSILON window matched only
+        // representationally-equal floats anyway.
+        CostOp::Eq => left == right,
     }
 }
 
@@ -318,11 +322,10 @@ pub(super) fn cost_op_label(op: CostOp) -> &'static str {
 
 pub(super) fn compare_sessions(a: &Session, b: &Session, key: SortKey, desc: bool) -> Ordering {
     let ord = match key {
-        SortKey::Recent => a
-            .metrics
-            .session_start
-            .cmp(&b.metrics.session_start)
-            .then_with(|| a.name.cmp(&b.name)),
+        SortKey::Recent => {
+            agenttrace_core::session_start_cmp(&a.metrics.session_start, &b.metrics.session_start)
+                .then_with(|| a.name.cmp(&b.name))
+        }
         SortKey::Health => a.health.cmp(&b.health).then_with(|| a.name.cmp(&b.name)),
         SortKey::Cost => cmp_f64(a.metrics.cost_estimated, b.metrics.cost_estimated)
             .then_with(|| a.name.cmp(&b.name)),

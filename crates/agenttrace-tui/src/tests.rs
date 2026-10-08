@@ -2448,3 +2448,82 @@ fn explorer_timeline_renders_naive_iso_step_times_as_local_times() {
         );
     }
 }
+
+#[test]
+fn numeric_filters_share_the_finite_core_dialect() {
+    // rm-389 remaining scope / rm-786: `:cost` / `:health` / `:context`
+    // parsing routes through the shared core validator — non-finite
+    // thresholds are rejected instead of silently matching nothing
+    // (`>=NaN`) or everything (`<=inf`), and a bare number means `>=`.
+    for bad in [">=NaN", "<=inf", ">=inf", ">=1e400", ">=abc", ""] {
+        assert!(
+            filters::parse_cost_filter(bad).is_none(),
+            "{bad:?} must be invalid"
+        );
+    }
+    assert_eq!(
+        filters::parse_cost_filter("0.10"),
+        Some((CostOp::Gte, 0.10))
+    );
+    assert_eq!(
+        filters::parse_cost_filter(">=0.10"),
+        Some((CostOp::Gte, 0.10))
+    );
+    assert_eq!(
+        filters::parse_cost_filter(">= 0.10"),
+        Some((CostOp::Gte, 0.10))
+    );
+
+    for bad in [">=79.5", "5.5", ">=nan", "<=inf", ">=1e400", "abc", ""] {
+        assert!(
+            filters::parse_numeric_i32_filter(bad).is_none(),
+            "{bad:?} must be invalid"
+        );
+    }
+    assert_eq!(
+        filters::parse_numeric_i32_filter("80"),
+        Some((CostOp::Gte, 80))
+    );
+    assert_eq!(
+        filters::parse_numeric_i32_filter("<80"),
+        Some((CostOp::Lt, 80))
+    );
+
+    assert_eq!(filters::parse_health_filter("good"), Some(()));
+    assert!(filters::parse_health_filter(">=NaN").is_none());
+}
+
+#[test]
+fn sort_key_recent_orders_parsed_instants_across_offset_spellings() {
+    // rm-785: SortKey::Recent compares on the parsed instant (the shared
+    // session_start_cmp basis), so "2026-01-02T10:30:00+09:00" — the same
+    // instant as "2026-01-02T01:30:00Z" but a byte-wise LARGER string —
+    // no longer sorts above a genuinely later session, and an undated
+    // session stays last in the default newest-first view.
+    let mut z_morning = session("z-morning", "claude_code", "gpt-5", 90, 0.2, "bash");
+    z_morning.metrics.session_start = "2026-01-02T01:30:00Z".to_string();
+    let mut plus_nine = session("plus-nine", "claude_code", "gpt-5", 90, 0.2, "bash");
+    plus_nine.metrics.session_start = "2026-01-02T10:30:00+09:00".to_string();
+    let mut z_later = session("z-later", "claude_code", "gpt-5", 90, 0.2, "bash");
+    z_later.metrics.session_start = "2026-01-02T05:00:00Z".to_string();
+    let mut absent = session("absent", "claude_code", "gpt-5", 90, 0.2, "bash");
+    absent.metrics.session_start = String::new();
+
+    let mut sessions = [
+        absent.clone(),
+        plus_nine.clone(),
+        z_later.clone(),
+        z_morning.clone(),
+    ];
+    sessions.sort_by(|a, b| filters::compare_sessions(a, b, SortKey::Recent, true));
+    let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+    // Descending reverses the whole comparator (house shape), so the
+    // same-instant tie breaks by name DESCENDING; absent last.
+    assert_eq!(names, vec!["z-later", "z-morning", "plus-nine", "absent"]);
+
+    // Ascending flips to oldest-first with the undated session first and
+    // the same-instant tie breaking by name ascending.
+    sessions.sort_by(|a, b| filters::compare_sessions(a, b, SortKey::Recent, false));
+    let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["absent", "plus-nine", "z-morning", "z-later"]);
+}

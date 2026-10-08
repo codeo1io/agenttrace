@@ -2,14 +2,15 @@ use agenttrace_core::{
     add_baseline_comparison, average_health, compute_overview, compute_waste_report,
     context_trends, cost_audit, data_health, data_health_scoped, delivery_evidence_with_git,
     demo_sessions, evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
-    list_pricing, load_sessions_with_options, lookup_price, mcp_governance, parse_file,
-    parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
-    render_doctor_report, render_model_pricing_list, render_test_match,
-    render_waste_report_with_language, report_compare_json, report_json_with_language,
-    report_overview_html_with_context, report_overview_json_with_context,
-    report_overview_markdown_with_context, report_overview_text_with_context, report_search_json,
-    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
-    session_capability, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
+    list_pricing, load_sessions_with_options, lookup_price, matches_numeric_filter, mcp_governance,
+    parse_file, parse_numeric_filter, parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path,
+    pricing_source, recommendations, render_doctor_report, render_model_pricing_list,
+    render_test_match, render_waste_report_with_language, report_compare_json,
+    report_json_with_language, report_overview_html_with_context,
+    report_overview_json_with_context, report_overview_markdown_with_context,
+    report_overview_text_with_context, report_search_json, report_search_text,
+    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
+    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
     BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
@@ -100,7 +101,10 @@ struct Args {
     /// stage atomically through a temp sibling (rm-250); terminal
     /// sinks like /dev/null and /dev/stdout write through directly,
     /// while fifo/socket/block-device targets are refused with a
-    /// disclosed reason instead of being replaced (rm-489).
+    /// disclosed reason instead of being replaced (rm-489). Missing
+    /// parent directories are created automatically (mkdir -p
+    /// semantics); when a parent cannot be created the error names
+    /// the directory and the requested target (rm-784).
     #[arg(short = 'o')]
     output: Option<PathBuf>,
     /// Restrict the view to the single most recent session (works with
@@ -228,10 +232,15 @@ struct Args {
     #[arg(long, default_value = "")]
     query: String,
     /// Filter sessions by health tier (healthy/warning/critical) or a
-    /// numeric comparison.
+    /// numeric comparison in the shared CLI/TUI dialect: an optional
+    /// `>=`, `<=`, `>`, `<`, or `=` operator followed by a finite number,
+    /// where a bare number means `>=` (e.g. `warn`, `>=80`, `80`).
     #[arg(long, default_value = "")]
     health: String,
-    /// Filter sessions by a cost comparison (e.g. `>1.5`).
+    /// Filter sessions by a cost comparison in the shared CLI/TUI
+    /// dialect: an optional `>=`, `<=`, `>`, `<`, or `=` operator followed
+    /// by a finite number, where a bare number means `>=`
+    /// (e.g. `>1.5`, `1.5`).
     #[arg(long, default_value = "")]
     cost: String,
     /// Filter sessions by anomaly kind.
@@ -1325,19 +1334,30 @@ fn newer_session_order<'a>(
     b: &'a Session,
     mod_times: &mut std::collections::HashMap<&'a Path, SystemTime>,
 ) -> std::cmp::Ordering {
-    let a_has_session_time = !a.metrics.session_start.is_empty();
-    let b_has_session_time = !b.metrics.session_start.is_empty();
-    a_has_session_time
-        .cmp(&b_has_session_time)
+    // rm-785: recency is judged on the PARSED instant — the shared
+    // session_start_cmp basis also used by `--sort recent` and the TUI
+    // SortKey::Recent comparator — so offset-bearing spellings
+    // (`…+09:00` vs `…Z`) order correctly instead of by raw byte value.
+    // A session without a usable timestamp loses to any dated one (that
+    // presence split is inside session_start_cmp, replacing the old
+    // has-session_start pre-compare); two undated sessions fall back to
+    // file mod time, then the path tie-break.
+    //
+    // rm-688 (composed at integration): the mtime fallback below is the
+    // stat-storm site — both stats go through the ONE memo threaded by
+    // the caller (`latest_session`), so each fallback file is stat'ed at
+    // most once per selection pass, and missing files still resolve to
+    // the epoch fallback (their "stat" is cached like any other).
+    session_start_cmp(&a.metrics.session_start, &b.metrics.session_start)
         .then_with(|| {
-            if a_has_session_time && b_has_session_time {
-                a.metrics.session_start.cmp(&b.metrics.session_start)
-            } else {
+            if a.metrics.session_start.is_empty() && b.metrics.session_start.is_empty() {
                 // Sequential binds: the map is borrowed mutably per stat,
                 // and both stats share the one memo.
                 let a_mod_time = session_mod_time(a, mod_times);
                 let b_mod_time = session_mod_time(b, mod_times);
                 a_mod_time.cmp(&b_mod_time)
+            } else {
+                std::cmp::Ordering::Equal
             }
         })
         .then_with(|| a.path.cmp(&b.path))
@@ -1831,12 +1851,20 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
         }
     }
     if let Some(parent) = target.parent() {
-        // rm-704: name the phase and the -o target — a raw
-        // "Permission denied (os error 13)" for an uncreatable parent
-        // gave the user nothing to act on while every adjacent -o
-        // failure (opening, writing) already carried its context.
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent directory for -o {}", requested.display()))?;
+        // rm-784 (landing composed with the landed rm-704 wording — the
+        // second lander names more, not less): mkdir -p semantics for -o
+        // parents are KEPT (documented in --help and README; do not break
+        // mkdir -p users) — but the error names the directory that could
+        // not be created for the requested target instead of surfacing a
+        // bare OS errno ("Permission denied" from mkdir at /) with no
+        // path attached, riding the rm-610 full-cause-chain handler.
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating parent directory {} for -o {}",
+                parent.display(),
+                target.display()
+            )
+        })?;
     }
     // rm-250: stage through a unique temp sibling and rename into
     // place, so a crash or Ctrl-C mid-write never leaves a
@@ -1942,7 +1970,11 @@ fn prepare_cli_view(mut sessions: Vec<Session>, args: &Args) -> anyhow::Result<V
     };
     sessions.sort_by(|left, right| {
         let ordering = match args.sort.as_str() {
-            "recent" | "time" => left.metrics.session_start.cmp(&right.metrics.session_start),
+            "recent" | "time" => {
+                // rm-785: parsed-instant basis (shared session_start_cmp),
+                // not raw string order — mixed-offset corpora sort honestly.
+                session_start_cmp(&left.metrics.session_start, &right.metrics.session_start)
+            }
             "health" => left.health.cmp(&right.health),
             "cost" => left
                 .metrics
@@ -2027,44 +2059,32 @@ fn validate_view_filters(args: &Args) -> anyhow::Result<()> {
         )
         && !valid_number_filter(&args.health)
     {
-        bail!("invalid --health filter: {}", args.health);
+        bail!(
+            "invalid --health filter: {} (expected a health tier, or an optional >=, <=, >, <, or = operator followed by a finite number; a bare number means >=)",
+            args.health
+        );
     }
     if !args.cost.is_empty() && !valid_number_filter(&args.cost) {
-        bail!("invalid --cost filter: {}", args.cost);
+        bail!(
+            "invalid --cost filter: {} (expected an optional >=, <=, >, <, or = operator followed by a finite number; a bare number means >=)",
+            args.cost
+        );
     }
     Ok(())
 }
 
 fn valid_number_filter(filter: &str) -> bool {
-    [">=", "<=", ">", "<", "="]
-        .iter()
-        .find_map(|prefix| filter.strip_prefix(prefix))
-        .is_some_and(|value| value.parse::<f64>().is_ok())
+    // rm-389 remaining scope / rm-786: the CLI and TUI share the ONE core
+    // dialect (agenttrace_core::filters) — an optional comparison operator
+    // followed by a FINITE number, where a bare number means >=. The CLI
+    // gate previously required an operator prefix (rejecting `--cost 1.5`)
+    // while accepting non-finite thresholds like `>=nan` and `=1e400`, which
+    // then silently matched nothing (or everything) instead of erroring.
+    parse_numeric_filter(filter).is_some()
 }
 
 fn matches_number(value: f64, filter: &str) -> bool {
-    let filter = filter.trim();
-    if filter.is_empty() {
-        return true;
-    }
-    for (prefix, compare) in [
-        (
-            ">=",
-            std::cmp::Ordering::is_ge as fn(std::cmp::Ordering) -> bool,
-        ),
-        ("<=", std::cmp::Ordering::is_le),
-        (">", std::cmp::Ordering::is_gt),
-        ("<", std::cmp::Ordering::is_lt),
-        ("=", std::cmp::Ordering::is_eq),
-    ] {
-        if let Some(raw) = filter.strip_prefix(prefix) {
-            return raw
-                .parse::<f64>()
-                .ok()
-                .is_some_and(|target| compare(value.total_cmp(&target)));
-        }
-    }
-    false
+    matches_numeric_filter(value, filter)
 }
 
 fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
@@ -2889,6 +2909,81 @@ mod tests {
         for file in files {
             let _ = fs::remove_file(file);
         }
+    }
+
+    #[test]
+    fn latest_session_orders_mixed_offset_timestamps_by_instant() {
+        // rm-785: "2026-01-02T01:30:00Z" and "2026-01-02T10:30:00+09:00" are
+        // the same instant, and a strictly-later Z timestamp must win the
+        // --latest pick even though its raw STRING sorts before the +09:00
+        // spelling (the raw comparator used to pick the earlier session).
+        let later = session(
+            "later",
+            "/tmp/agenttrace-later-mixed",
+            "2026-01-02T05:00:00Z",
+        );
+        let offset = session(
+            "offset-spelling",
+            "/tmp/agenttrace-offset-mixed",
+            "2026-01-02T10:30:00+09:00",
+        );
+
+        assert_eq!(
+            latest_session(&[later.clone(), offset.clone()]).map(|session| session.name.as_str()),
+            Some("later")
+        );
+        assert_eq!(
+            latest_session(&[offset, later]).map(|session| session.name.as_str()),
+            Some("later")
+        );
+    }
+
+    #[test]
+    fn sort_recent_orders_mixed_offset_corpus_by_instant() {
+        // rm-785: --sort recent uses the parsed-instant basis (shared
+        // session_start_cmp), so the mixed-offset corpus orders newest-first
+        // exactly like canonical_sessions regardless of +09:00 spelling;
+        // equal instants keep stable input order, absent sorts last.
+        let mut args = compare_args(None);
+        args.sessions = true;
+        args.sort = "recent".to_string();
+        args.order = "desc".to_string();
+        let sessions = vec![
+            session("absent", "/tmp/agenttrace-absent", ""),
+            session("z-morning", "/tmp/agenttrace-zm", "2026-01-02T01:30:00Z"),
+            session(
+                "plus-nine",
+                "/tmp/agenttrace-pn",
+                "2026-01-02T10:30:00+09:00",
+            ),
+            session("z-later", "/tmp/agenttrace-zl", "2026-01-02T05:00:00Z"),
+        ];
+        let ordered = prepare_cli_view(sessions, &args).expect("sort");
+        let names: Vec<&str> = ordered.iter().map(|s| s.name.as_str()).collect();
+        // z-later newest; z-morning and plus-nine are the SAME instant, and
+        // the view's canonical pre-pass (name tie-break) orders the tie
+        // deterministically regardless of input order; absent last.
+        assert_eq!(names, vec!["z-later", "plus-nine", "z-morning", "absent"]);
+    }
+
+    #[test]
+    fn number_filter_gate_accepts_bare_and_rejects_nonfinite() {
+        // rm-389 remaining scope / rm-786: ONE finite-only dialect shared by
+        // the CLI and the TUI. The CLI gate previously required an operator
+        // prefix (rejecting `--cost 1.5`) while accepting `>=nan` / `=1e400`,
+        // which then silently matched nothing or everything.
+        assert!(valid_number_filter("1.5"));
+        assert!(valid_number_filter(">=1.5"));
+        assert!(valid_number_filter(">= 1.5"));
+        for bad in [
+            ">=nan", "<=inf", ">=inf", "=1e400", "1e400", "abc", "", ">=", "nan",
+        ] {
+            assert!(!valid_number_filter(bad), "{bad:?} must be rejected");
+        }
+        assert!(matches_number(1.5, "1.5"));
+        assert!(matches_number(2.0, ">1.5"));
+        assert!(!matches_number(2.0, ">=nan"));
+        assert!(!matches_number(2.0, "<=inf"));
     }
 
     #[test]
