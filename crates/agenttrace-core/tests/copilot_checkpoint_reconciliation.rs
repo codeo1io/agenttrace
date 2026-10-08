@@ -19,6 +19,12 @@
 use agenttrace_core::parse_file;
 use std::path::PathBuf;
 
+/// Serializes the env-var windows of the stale-schema cache pins in this
+/// binary (cargo runs `#[test]` fns on parallel threads; each pin points
+/// `AGENTTRACE_SESSION_CACHE_DIR` at its own isolated root and must not
+/// observe a sibling's).
+static STALE_CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/copilot-checkpoints")
@@ -254,6 +260,7 @@ fn stale_schema_32_cache_cannot_mask_the_agent_lane_rollup() {
     std::fs::write(root.join("sessions.json"), cache.to_string()).expect("write stale v32 cache");
 
     let key = "AGENTTRACE_SESSION_CACHE_DIR";
+    let _env_guard = STALE_CACHE_ENV_LOCK.lock().unwrap();
     let previous = std::env::var_os(key);
     std::env::set_var(key, &root);
     let sessions = agenttrace_core::load_sessions_from_dir(Some(&sessions_dir));
@@ -278,6 +285,114 @@ fn stale_schema_32_cache_cannot_mask_the_agent_lane_rollup() {
         (sessions[0].metrics.credit_usd - 0.0035).abs() < 1e-9,
         "re-parsed from source: summed per-model credit meters, got {}",
         sessions[0].metrics.credit_usd
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// Review bbe295b60d7c F1 (fix attempt 3238a517): the warm-cache half of
+// the cycle-2 hostile-value batch, in the stale_schema_NN family
+// (zero_usage_contract holds the schema-22 ancestor; the v32 pin above
+// the agent-lane rung). The rm-831/rm-721 batch (implement d8b72dad)
+// corrects derived values for UNCHANGED files — antigravity folds
+// saturate instead of wrapping, negative counts are refused at insert
+// with alias-rescue, and the copilot per-model credit sum drops +inf
+// totals with a NAMED copilot_credit_nonfinite counter — and cached
+// entries carry the full derived metrics (GoMetrics::from_metrics:
+// tokens, credit_usd, disclosure_counters), so a cache written by the
+// pre-batch build (schema 35) keeps serving the poisoned shapes —
+// serialized-null credits, no disclosure counter, wrapped-zero token
+// totals — with matching size/mtime fingerprints and never re-parses
+// (proven live by the review's warm-cache leg: ag-2gen tokens_input 0
+// warm vs i64::MAX cold). The 35 -> 36 bump retires those entries once
+// (rm-230 convention). This pins the masking PoC as a regression: on a
+// tree where the const is still 35 the hand-written v35 entry below IS
+// served and the assertions fail.
+#[test]
+fn stale_schema_35_cache_cannot_mask_the_hostile_value_folds() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "at-hostile-stale-v35-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let sessions_dir = root.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    let session_path = sessions_dir.join("agent-host-nonfinite.jsonl");
+    std::fs::copy(fixture("agent-host-nonfinite-credit.jsonl"), &session_path)
+        .expect("copy nonfinite fixture");
+
+    // Hand-write the pre-batch shape: schema 35, entry fingerprint FRESH
+    // against the file (matching mod_time/size), cached session carrying
+    // the pre-batch metrics for this exact journal — NO
+    // copilot_credit_nonfinite counter (it did not exist pre-batch) and
+    // the null credit the poisoned +inf sum serialized to.
+    let metadata = std::fs::metadata(&session_path).expect("stat fixture");
+    let mod_time = metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec();
+    let session_path_str = session_path.to_string_lossy().to_string();
+    let mut entries = serde_json::Map::new();
+    entries.insert(
+        session_path_str.clone(),
+        serde_json::json!({
+            "mod_time": mod_time,
+            "size": metadata.len() as i64,
+            "session": {
+                "Name": "stale",
+                "Path": session_path_str,
+                "Metrics": {
+                    "SourceTool": "copilot_cli",
+                    "ModelUsed": "cached-default",
+                    "SessionStart": "2026-10-05T14:00:00Z",
+                    "ToolArgUsage": {},
+                },
+                "Health": 91,
+                "ToolWarnings": [],
+                "Diagnostics": {},
+            },
+        }),
+    );
+    let cache = serde_json::json!({
+        "schema_version": 35,
+        "entries": serde_json::Value::Object(entries),
+    });
+    std::fs::write(root.join("sessions.json"), cache.to_string()).expect("write stale v35 cache");
+
+    let key = "AGENTTRACE_SESSION_CACHE_DIR";
+    let _env_guard = STALE_CACHE_ENV_LOCK.lock().unwrap();
+    let previous = std::env::var_os(key);
+    std::env::set_var(key, &root);
+    let sessions = agenttrace_core::load_sessions_from_dir(Some(&sessions_dir));
+    match previous {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+
+    assert_eq!(sessions.len(), 1, "one session discovered");
+    assert_ne!(
+        sessions[0].name, "stale",
+        "the fresh-fingerprint v35 entry must NOT be served: its absent \
+         disclosure counter and null credit are exactly the pre-batch \
+         poisoned shape the schema bump exists to retire"
+    );
+    assert_eq!(
+        sessions[0]
+            .metrics
+            .disclosure_counters
+            .get("copilot_credit_nonfinite"),
+        Some(&2),
+        "re-parsed from source: the refused meters are NAMED, got {:?}",
+        sessions[0].metrics.disclosure_counters
+    );
+    assert!(
+        sessions[0].metrics.credit_usd.is_finite(),
+        "re-parsed from source: the poisoned sum never reaches the report \
+         as non-finite, got {}",
+        sessions[0].metrics.credit_usd
+    );
+    assert_eq!(
+        sessions[0].metrics.tokens_input, 150,
+        "re-parsed from source: the meters' usage blocks still count"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -334,4 +449,41 @@ fn agent_host_hostile_entry_types_mint_capped_sanitized_keys() {
          {key:?}"
     );
     let _ = std::fs::remove_file(&path);
+}
+
+/// rm-721 rider (assess 36f5 F4): two per-model `totalNanoAiu` meters at
+/// 1.5e308 are EACH finite — they pass the parser's is_finite INSERT
+/// guard — but the per-model SUM overflows to +inf, and IEEE makes
+/// `inf > 0.0` true, so the poisoned credit used to ride the meta event
+/// and only die at serialization (`credit_usd: null` in the report, cost
+/// silently falling back to token pricing, rc 0). The sum is now dropped
+/// BEFORE the event insert and the refused meters are NAMED on the
+/// disclosure channel. Fixture is the assess PoC corpus, byte for byte
+/// (two 1.5e308 meters + real usage blocks + the full un-counted
+/// vocabulary).
+#[test]
+fn nonfinite_credit_sum_is_dropped_and_disclosed_not_nulled() {
+    let session = parse_file(&fixture("agent-host-nonfinite-credit.jsonl")).unwrap();
+    let m = &session.metrics;
+    assert!(
+        m.credit_usd.is_finite(),
+        "the poisoned sum must never reach the report as non-finite \
+         (pre-fix: serialized credit_usd null), got {}",
+        m.credit_usd
+    );
+    assert_eq!(
+        m.credit_usd, 0.0,
+        "no top-level meter exists to fall back to"
+    );
+    assert_eq!(
+        m.disclosure_counters.get("copilot_credit_nonfinite"),
+        Some(&2),
+        "the refused meters are NAMED, not silently vanished: {:?}",
+        m.disclosure_counters
+    );
+    // The usage blocks on those same meters are real and still count
+    // (120+30 in / 45+15 out) — the credit guard must not cost tokens.
+    assert_eq!(m.tokens_input, 150);
+    assert_eq!(m.tokens_output, 60);
+    assert_eq!(m.source_tool, "copilot_cli");
 }

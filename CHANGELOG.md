@@ -8,6 +8,49 @@
 
 ### Fixed
 
+- Session-cache schema bumped 35 → 36 at the cycle-2 review fix (run
+  fabd9fb8cf73 cycle 2, the rm-831/rm-721 hostile-value batch; review
+  bbe295b60d7c F1): the batch corrects derived totals for UNCHANGED source
+  files — antigravity folds saturate instead of wrapping, negative counts
+  are refused at insert with alias-rescue, and the copilot per-model credit
+  sum drops +inf totals with a named `copilot_credit_nonfinite` counter —
+  but the cache fingerprint is size+mtime of the source file, so a warm
+  v35 entry written by a pre-batch binary kept serving the wrapped-zero
+  totals, serialized-null credits and the absent disclosure forever
+  (proven live by the review: same binary, cold cache i64::MAX vs warm
+  cache 0 on the fold-wrap PoC). Pre-batch caches now retire once on
+  first scan and regenerate under the corrected accounting, pinned
+  red-first by stale_schema_35_cache_cannot_mask_the_hostile_value_folds
+  (stale_schema_NN family). The same-unit set moved together: the const +
+  ladder rung, the TUI planted warm-cache fixture literal, the
+  governance-guide schema sentence `scripts/ci/check-docs-commands.sh`
+  verifies against the live constant, and the rm-710 occurrence-contract
+  schema-literal oracle (fn name + assert + message).
+- Antigravity usage folds are hostile-value safe (rm-831, run
+  fabd9fb8cf73 cycle 2): the antigravity fold's per-key accumulators now
+  saturate per the rm-046 contract instead of wrapping — a journal folding
+  i64::MAX inputTokens twice reports i64::MAX (9223372036854775807),
+  never a wrapped-to-zero `tokens_input 0`, and debug builds no longer
+  panic on the fold — and the shared usage extractor refuses NEGATIVE
+  token counts at insert (a negative value is corrupt journal data, never
+  a measurement) so a poisoned count can neither ride the fold only to be
+  silently dropped by the read-side >0 consumers nor shadow a later alias
+  carrying real data ({"inputTokens": -4000, "promptTokenCount": 700} now
+  reports 700, previously 0). Zeros stay inserted (rm-408's
+  client-reported-zero population). WorkBuddy's stricter rm-600 clamp
+  contract is preserved: a negative semconv input_tokens still clamps to a
+  MEASURED ZERO with the clamp flag raised, not an absent class.
+- Copilot per-model credit sums refuse non-finite totals with a named
+  disclosure (rm-721 rider, run fabd9fb8cf73 cycle 2): each
+  totalNanoAiu meter is finite at insert, but the per-model SUM could
+  overflow to +inf — and IEEE makes `inf > 0.0` true, so the poisoned sum
+  passed the credit gate and only died at serialization (the report
+  showed `"credit_usd": null` and the session's bill silently vanished;
+  PoC: two 1.5e308 meters, rc 0). The sum is now dropped BEFORE the event
+  insert and the refused meters are NAMED via a
+  `copilot_credit_nonfinite` disclosure counter; the usage blocks on those
+  same meters still count.
+
 - Antigravity sessions report real usage and price the standalone model (rm-720, run
   3ec6cec08fb9 cycle 2): both antigravity lanes (trajectory + jsonl) now fold per-message
   usage blocks (input/output tokens, cache reads) and resolve the model id, priced via

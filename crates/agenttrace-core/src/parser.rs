@@ -594,7 +594,24 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // same bill, so the greater of the two is exact on either shape and
     // never double-counts; a global max across per-model meters silently
     // under-reports a 2-model rollup with no disclosure.
-    let per_model_credit_sum: f64 = per_model_credit_nano.values().sum();
+    // rm-721 rider (assess 36f5 F4): every per-model meter is finite at
+    // insert (the is_finite gates above), but the SUM can still overflow
+    // to +inf on hostile journals — and IEEE makes inf > 0.0 true, so
+    // the poisoned sum sails through the credit gate below and only
+    // dies at serialization (the report nulls the non-finite credit,
+    // silently vanishing the session's bill). Sum with an overflow
+    // guard: drop the poisoned total BEFORE the event insert and name
+    // the refused meters on the disclosure channel instead.
+    let mut per_model_credit_sum = 0.0f64;
+    let mut credit_nonfinite_meters = 0usize;
+    for nano in per_model_credit_nano.values() {
+        per_model_credit_sum += nano;
+        if !per_model_credit_sum.is_finite() {
+            credit_nonfinite_meters = per_model_credit_nano.len();
+            per_model_credit_sum = 0.0;
+            break;
+        }
+    }
     let credit_nano = max_credit_nano.max(per_model_credit_sum);
     if credit_nano > 0.0 {
         events.insert(
@@ -622,6 +639,27 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 role: "meta".to_string(),
                 timestamp: latest_shutdown_timestamp,
                 source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            },
+        );
+    }
+    if credit_nonfinite_meters > 0 {
+        // rm-721 rider carrier: the refused credit class is NAMED, not
+        // silently vanished — same shape as the un-counted entry-type
+        // carrier above (a bare meta marker with no usage moves nothing
+        // else in the metrics; lib.rs's meta arm aggregates the counter
+        // into Metrics.disclosure_counters).
+        let mut counters = BTreeMap::new();
+        counters.insert(
+            "copilot_credit_nonfinite".to_string(),
+            credit_nonfinite_meters as i64,
+        );
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                source_tool: "copilot_cli".to_string(),
+                disclosure_counters: counters,
                 ..Event::default()
             },
         );
@@ -829,7 +867,17 @@ impl AntigravityUsageFold {
     fn fold(&mut self, usage: &BTreeMap<String, i64>, model: Option<String>, timestamp: &str) {
         self.generations += 1;
         for (key, value) in usage {
-            *self.usage.entry(key.clone()).or_insert(0) += *value;
+            // rm-831: the rm-046 clamp-plus-saturate contract
+            // (add_usage / add_usage_value) — hostile journals repeat
+            // i64::MAX-sized counts, where plain `+=` panics in debug
+            // and wraps negative in release, and the read-side >0
+            // consumers then silently zero the whole class (assess 36f5
+            // F1: two i64::MAX inputTokens generations folded to
+            // tokens_input 0 — the more-hostile journal reporting less
+            // usage). Saturating keeps the fold truthful at the i64
+            // ceiling.
+            let slot = self.usage.entry(key.clone()).or_insert(0);
+            *slot = (*slot).saturating_add(*value);
         }
         if let Some(model) = model {
             self.models_seen += 1;
@@ -1458,11 +1506,39 @@ fn subtract_cached_input(usage: &mut TokenUsage, cache_keys: &[&str]) -> bool {
 }
 
 fn workbuddy_usage(entry: &Map<String, Value>) -> Option<(TokenUsage, bool)> {
-    let mut usage = entry
+    let raw_usage = entry
         .get("message")
         .and_then(|message| message.get("usage"))
-        .or_else(|| entry.get("providerData").and_then(|data| data.get("usage")))
-        .and_then(usage_from_value)?;
+        .or_else(|| entry.get("providerData").and_then(|data| data.get("usage")));
+    let mut usage = raw_usage.and_then(usage_from_value)?;
+    // rm-831 interaction: the shared extractor now refuses NEGATIVE
+    // counts at insert (corrupt journal data never rides the fold), but
+    // this lane's rm-600 clamp contract is deliberately MORE truthful
+    // than the refusal — a negative input becomes a MEASURED ZERO with
+    // the clamp flag raised, never an absent class. When the gate
+    // refused the semconv input_tokens and no alias rescued the class,
+    // re-seed the zero the clamp below is contracted to produce
+    // (upstream #316 shape; pinned by
+    // workbuddy_usage_survives_negative_input_with_cache_read).
+    // KNOWN EDGE (review bbe295b60d7c F4, documented here as the
+    // accepted disposition): the `?` above means a usage block whose
+    // ONLY class is a negative count (no other class, no alias) yields
+    // NO usage at all — usage_from_value returns None for it — while
+    // negative-input-plus-other-classes re-seeds a measured zero. The
+    // asymmetry is deliberate: a block carrying nothing but a negative
+    // count is corrupt in its entirety, so "never a measurement" is
+    // the honest verdict; consolidating it into the user-facing
+    // documented-limits surface is rider work on rm-833.
+    if !usage.contains_key("input_tokens") {
+        let refused_negative_input = raw_usage
+            .and_then(Value::as_object)
+            .and_then(|obj| obj.get("input_tokens"))
+            .and_then(number_as_i64)
+            .is_some_and(|value| value < 0);
+        if refused_negative_input {
+            usage.insert("input_tokens".to_string(), 0);
+        }
+    }
     // WorkBuddy only reports cache reads, so the single-key form of the
     // shared clamp (rm-529's parameterized port); the Copilot arms pass
     // both cache keys.
@@ -5804,11 +5880,21 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
         // matching the legacy parser's per-format precedence (canonical
         // keys first, aliases behind); remember which wire key won so
         // alias matches can be disclosed per session (rm-400).
+        //
+        // rm-831 sign gate: a NEGATIVE token count is corrupt journal
+        // data, never a real measurement — the add_usage_value
+        // discipline (:4964) refuses it here, so the poisoned value
+        // cannot ride the fold only to be silently dropped by the
+        // read-side >0 consumers, and cannot shadow a later alias
+        // carrying real data. Zeros are KEPT: rm-408's
+        // client-reported-zero population attaches through explicit
+        // zero inserts (usage_is_all_zero).
         if let Some((key, value)) = keys
             .iter()
             .filter_map(|key| {
                 obj.get(*key)
                     .and_then(number_as_i64)
+                    .filter(|value| *value >= 0)
                     .map(|value| (*key, value))
             })
             .next()

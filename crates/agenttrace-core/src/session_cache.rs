@@ -5,7 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 35;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 36;
+// Bumped 35 -> 36 (integration of run fabd9fb8cf73, rm-831 'hostile-
+// value truthfulness in parser usage folds' + the rm-721 non-finite
+// credit rider; review fix 3238a517 over implement d8b72dad, after
+// review bbe295b60d7c F1): the batch corrects derived totals for
+// UNCHANGED source files — antigravity folds saturate instead of
+// wrapping (a journal folding i64::MAX inputTokens twice reported a
+// wrapped-to-zero total), the shared usage extractor refuses NEGATIVE
+// counts at insert with alias-rescue semantics (a poisoned count could
+// neither ride the fold nor shadow a later alias carrying real data),
+// and the copilot per-model credit sum drops poisoned +inf totals
+// BEFORE the event insert with a named copilot_credit_nonfinite
+// disclosure counter — so a warm v35 cache written by the pre-batch
+// build keeps serving the wrapped-zero totals, serialized-null
+// credits and the absent disclosure with matching size/mtime
+// fingerprints and never re-parses (proven live on the assess corpus
+// by the review: ag-2gen tokens_input 0 warm vs i64::MAX cold). The
+// stewardship's fence on this file (unlanded spool rm-803's serde
+// read-path claim) does not extend to the version ladder — the bump is
+// orthogonal to rm-803 and does not collide with it. Pinned red-first
+// by stale_schema_35_cache_cannot_mask_the_hostile_value_folds (the
+// stale_schema_NN family). Entries regenerate once on next scan.
 // Bumped 34 -> 35 (integration of run 3ec6cec08fb9, rm-720 'Agent-
 // lane usage truthfulness' + rm-721 copilot agent-host audit; review
 // fix 8a3231c6 over implement b127341f): the batch corrects
