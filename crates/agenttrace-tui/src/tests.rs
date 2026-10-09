@@ -2580,3 +2580,52 @@ fn sort_key_recent_orders_parsed_instants_across_offset_spellings() {
     let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["absent", "plus-nine", "z-morning", "z-later"]);
 }
+
+#[test]
+fn load_summary_discloses_unlinked_subagents_zero_count_clean() {
+    // rm-904 TUI arm: apply_loaded_sessions used to DROP
+    // report.unlinked_subagents — the CLI disclosed orphaned subagents
+    // on every report path (main.rs disclose_unlinked_subagents) while
+    // the TUI's load summary stayed silent. The count now lands in
+    // load_state and the Ready summary line surfaces it when non-zero
+    // (0-count-clean: zero orphans must not add the clause).
+    let solo = session("solo", "pi", "m", 90, 0.1, "rg");
+    let mut app = App::new(vec![solo], "test", None);
+    app.apply_loaded_sessions(
+        LoadReport {
+            sessions: app.sessions.clone(),
+            discovered: 1,
+            parsed: 1,
+            unlinked_subagents: 2,
+            ..LoadReport::default()
+        },
+        false,
+    );
+    assert_eq!(app.load_state.phase, LoadPhase::Ready);
+    assert_eq!(
+        app.load_state.unlinked_subagents, 2,
+        "count must not be dropped"
+    );
+    assert!(
+        load_summary_line(&app).contains("2 unlinked subagents"),
+        "Ready summary line must disclose the orphans: {}",
+        load_summary_line(&app)
+    );
+
+    // 0-count-clean: a reload without orphans carries no clause.
+    app.apply_loaded_sessions(
+        LoadReport {
+            sessions: app.sessions.clone(),
+            discovered: 1,
+            parsed: 1,
+            ..LoadReport::default()
+        },
+        false,
+    );
+    assert_eq!(app.load_state.unlinked_subagents, 0);
+    assert!(
+        !load_summary_line(&app).contains("unlinked"),
+        "clean corpus must not carry the clause: {}",
+        load_summary_line(&app)
+    );
+}

@@ -374,6 +374,12 @@ struct LoadState {
     parsed: usize,
     skipped: usize,
     cache_hits: usize,
+    /// rm-904: subagent transcripts whose parent transcript is not
+    /// part of the loaded corpus (orphaned children) — the same grain
+    /// the CLI discloses on every report path. Carried in load state
+    /// so the summary line can disclose it; 0-count-clean (the
+    /// clause renders only when non-zero).
+    unlinked_subagents: usize,
     cache_state: String,
     sources: Vec<(String, usize)>,
     showing_cached: bool,
@@ -970,6 +976,9 @@ impl App {
             parsed: 0,
             skipped: 0,
             cache_hits: 0,
+            // rm-904: reset per load — the disclosure clause belongs to
+            // the report that lands, not the previous one.
+            unlinked_subagents: 0,
             cache_state,
             sources: Vec::new(),
             showing_cached: !force && !self.sessions.is_empty(),
@@ -1087,6 +1096,11 @@ impl App {
         self.load_state.processed = report.discovered;
         self.load_state.skipped = report.skipped;
         self.load_state.cache_hits = report.cache_hits;
+        // rm-904: apply_loaded_sessions used to DROP this field — the
+        // CLI disclosed orphaned subagents on every report path while
+        // the TUI's load summary stayed silent. The count lands in
+        // load state; the summary line discloses it when non-zero.
+        self.load_state.unlinked_subagents = report.unlinked_subagents;
         self.sessions = report.sessions;
         self.sessions
             .sort_by(|left, right| compare_sessions(left, right, SortKey::Recent, true));

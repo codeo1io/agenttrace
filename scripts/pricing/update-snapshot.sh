@@ -6,6 +6,9 @@
 # manual-drop note for it. A refresh whose result would lose a priced key
 # REFUSES to write and exits non-zero (shrink-check), so an upstream removal
 # or rename can never silently vanish a price the bundle once carried.
+# Wildcard glob keys (rm-903) — `bedrock/*/1-month-commitment/…` — are
+# skipped on the live side: the lookup is exact-key, so a glob row can never
+# match; concrete-region commitment keys stay (exact-matchable, priced).
 #
 # Run from the repository root, then commit the result, update
 # PRICING_SNAPSHOT_DATE in crates/agenttrace-core/src/pricing.rs to match
@@ -34,6 +37,8 @@ usage() {
     cat <<'USAGE'
 Regenerates crates/agenttrace-core/src/pricing_snapshot.json (the vendored
 offline pricing catalog) through the rm-588 never-drop union contract.
+Live-source keys containing '*' (glob rows) are skipped (rm-903): the
+offline lookup is exact-key and can never match them.
 
 Usage:
     scripts/pricing/update-snapshot.sh          run the refresh (no arguments)
@@ -105,6 +110,28 @@ def trim(data):
         if not isinstance(value, dict):
             continue
         if value.get("mode") != "chat":
+            continue
+        # rm-903: LiteLLM publishes glob keys (bedrock/*/1-month-commitment/
+        # …, 4 of them in the 2026-10-08 refresh). Our lookup is exact-key,
+        # so such a row can never match — skip it at refresh time instead of
+        # vendoring unmatchable dead weight. Concrete-region commitment-tier
+        # keys (bedrock/us-east-1/1-month-commitment/…) deliberately stay:
+        # they are exact-matchable strings and priced rows in their own
+        # right. Under the rm-588 union the filter sits on the live side
+        # only: the committed bundle carries zero wildcard keys (pinned by
+        # tests/pricing_snapshot_hygiene.rs
+        # vendored_pricing_bundle_carries_no_wildcard_keys), so the union
+        # can never re-admit one. A hypothetical wildcard key already in
+        # a prior bundle would be union-RETAINED (the shrink-check only
+        # fires on lost keys), so the fail-closed signal is that same
+        # hygiene pin: the refresh stays writable but the bundle fails
+        # the zero-wildcard test until the key leaves through a dated
+        # drop note in snapshot-drops.txt (fail-closed, never fail-open).
+        # The drift gate mirrors this filter (drift-check.sh kept(),
+        # rm-903): live glob rows count on NEITHER side, or the gate
+        # would report permanent phantom new_costed drift that this
+        # refresh can never clear.
+        if "*" in key:
             continue
         inp = value.get("input_cost_per_token") or 0
         outp = value.get("output_cost_per_token") or 0

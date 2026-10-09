@@ -9,8 +9,9 @@
 #   (offline-first determinism; runtime refresh already exists as the opt-in --update-pricing cache).
 #
 # Basis rule (the false-alarm trap this script exists to avoid): drift is computed ONLY on the
-# builder keep-filter basis — mode == "chat" AND (input_cost_per_token > 0 OR output_cost_per_token > 0) —
-# mirroring scripts/pricing/update-snapshot.sh verbatim. Raw total-model comparisons against LiteLLM
+# builder keep-filter basis — mode == "chat" AND (input_cost_per_token > 0 OR output_cost_per_token > 0)
+# AND no '*' in the key (rm-903: glob rows are unmatchable under the exact-key lookup, so the builder
+# never vendors them) — mirroring scripts/pricing/update-snapshot.sh verbatim. Raw total-model comparisons against LiteLLM
 # main mix in non-chat/uncosted entries and misread the bundle as drifted when it is not
 # (verified 2026-10-05: raw total 4,473 vs chat-with-cost 3,099 on BOTH sides = parity).
 #
@@ -38,7 +39,7 @@
 #   ... --bundle F.json --pricing-rs F.rs          # overrides for red-arm testing
 #   ... --json                                     # emit the machine report on stdout (summary goes to stderr
 #                                                  #   then — stdout is PURE JSON; review-2 fix F2)
-#   scripts/pricing/drift-check.sh --selftest      # seven embedded offline arms, rc 0 iff all pass
+#   scripts/pricing/drift-check.sh --selftest      # eight embedded offline arms, rc 0 iff all pass
 
 set -euo pipefail
 
@@ -91,6 +92,19 @@ def kept(catalog):
         if name == "_snapshot" or not isinstance(row, dict):
             continue
         if row.get("mode") != "chat":
+            continue
+        # rm-903: skip glob keys on BOTH sides, mirroring the builder's
+        # trim() verbatim — the offline lookup is exact-key
+        # (pricing.rs matching_catalog_key -> contains_key), so a
+        # `bedrock/*/1-month-commitment/…` row can never match a model
+        # name and can never enter the bundle (pinned by
+        # tests/pricing_snapshot_hygiene.rs). Counting live glob rows
+        # here produced PERMANENT phantom new_costed drift that no
+        # refresh could clear (the regenerated bundle excludes them by
+        # design), wedging the scheduled gate's post-regeneration rc-0
+        # verification — the exact false-alarm class this basis rule
+        # exists to prevent.
+        if "*" in name:
             continue
         inp = float(row.get("input_cost_per_token") or 0.0)
         outp = float(row.get("output_cost_per_token") or 0.0)
@@ -150,7 +164,7 @@ def sample(names):
 # parseable); without --json the summary stays on stdout (the workflow's regen-verify grep for
 # 'costed-chat models' reads a no---json run).
 out = sys.stderr if emit_json else sys.stdout
-print(f"pricing drift check (keep-filter basis: mode==chat AND input-or-output per-token cost>0)", file=out)
+print(f"pricing drift check (keep-filter basis: mode==chat AND input-or-output per-token cost>0 AND no '*' glob key)", file=out)
 print(f"  bundled: {len(bundle_kept)} costed-chat models, _snapshot.date={bundle_date or '<none>'}, PRICING_SNAPSHOT_DATE={const_date or '<none>'}", file=out)
 print(f"  live   : {len(live_kept)} costed-chat models", file=out)
 print(f"  new-costed: {len(new_costed)}{' — ' + sample(new_costed) if new_costed else ''}", file=out)
@@ -163,7 +177,7 @@ if desync:
     print(f"  DESYNC (assess A1): pricing.rs const {const_date} != bundle _snapshot.date {bundle_date} — update-snapshot.sh's manual const bump was skipped", file=out)
 if emit_json:
     report = {
-        "basis": "mode==chat AND (input_cost_per_token>0 OR output_cost_per_token>0)",
+        "basis": "mode==chat AND (input_cost_per_token>0 OR output_cost_per_token>0) AND no '*' in key (rm-903)",
         "bundle": {"date": bundle_date, "costed_chat_models": len(bundle_kept)},
         "live": {"costed_chat_models": len(live_kept)},
         "pricing_snapshot_date_const": const_date,
@@ -217,7 +231,7 @@ run_check() { # resolves inputs, fetches live if needed, dispatches analyze; ret
   return "$rc"
 }
 
-self_test() { # seven embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
+self_test() { # eight embedded offline arms; rc 0 iff all pass (fixtures never touch the repo)
   local t rc ok=0
   t="$(mktemp -d -t drift-selftest.XXXXXX)"
   trap 'rm -rf "$t"' RETURN
@@ -331,6 +345,33 @@ PY
     echo "  arm 7 malformed shapes ... PASS (list-typed cost -> rc 2; _snapshot string -> rc 2; stdout empty)"
   else echo "  arm 7 malformed shapes ... FAIL (badtype sub-arm c=$c, badmeta sub-arm d=$d)"; sed -n '1,6p' "$t/out7a.txt"; sed -n '1,6p' "$t/out7a.err"; ok=1; fi
 
+  # Arm 8 — rm-903 wildcard basis parity: live glob keys (`bedrock/*/1-month-commitment/…`, costed
+  # chat rows) are EXCLUDED from the keep-filter basis on both sides, so they are never phantom
+  # new_costed drift the gate's own regeneration can never clear (pre-fix: the refreshed bundle
+  # excludes them by design, so the post-regeneration rc-0 verification failed permanently).
+  # Sub-arm (a): a live wildcard row reads as PARITY (rc 0, new_costed 0). Sub-arm (b): a
+  # concrete-region commitment key stays a real, reportable new-costed signal (rc 1) while the
+  # wildcard row still never appears in the report.
+  python3 - "$t" <<'PY'
+import json, sys
+t = sys.argv[1]
+live = json.load(open(f"{t}/live-parity.json"))
+live["bedrock/*/1-month-commitment/anthropic"] = {"mode": "chat", "input_cost_per_token": 2e-06, "output_cost_per_token": 8e-06}
+json.dump(live, open(f"{t}/live-wildcard.json", "w"))
+live["bedrock/us-east-1/1-month-commitment/anthropic"] = {"mode": "chat", "input_cost_per_token": 1e-06, "output_cost_per_token": 4e-06}
+json.dump(live, open(f"{t}/live-commitment.json", "w"))
+PY
+  local e=0 f=0
+  rc=0; "$0" --live "$t/live-wildcard.json" --bundle "$t/base.json" --pricing-rs "$t/pricing.rs" --json > "$t/out8a.txt" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] && grep -q '"new_costed": 0' "$t/out8a.txt" && e=1
+  rc=0; "$0" --live "$t/live-commitment.json" --bundle "$t/base.json" --pricing-rs "$t/pricing.rs" --json > "$t/out8b.txt" 2>&1 || rc=$?
+  if [ "$rc" -eq 1 ] && grep -q '"new_costed": 1' "$t/out8b.txt" \
+     && grep -q 'bedrock/us-east-1/1-month-commitment/anthropic' "$t/out8b.txt" \
+     && ! grep -q 'bedrock/\*/' "$t/out8b.txt"; then f=1; fi
+  if [ "$e" -eq 1 ] && [ "$f" -eq 1 ]; then
+    echo "  arm 8 rm-903 wildcard ..... PASS (glob row = parity rc 0; concrete commitment key still new-costed rc 1)"
+  else echo "  arm 8 rm-903 wildcard ..... FAIL (parity sub-arm e=$e, commitment sub-arm f=$f)"; sed -n '1,8p' "$t/out8a.txt"; sed -n '1,12p' "$t/out8b.txt"; ok=1; fi
+
   # Control — the keep-filter basis itself: non-chat and uncosted rows never count either side.
   if grep -q 'costed-chat models' "$t/out1.txt"; then
     echo "  control keep-filter ...... PASS (basis line present)"
@@ -340,7 +381,7 @@ PY
 }
 
 if [ "$selftest" -eq 1 ]; then
-  echo "drift-check --selftest (seven offline arms, no network)"
+  echo "drift-check --selftest (eight offline arms, no network)"
   self_test
   rc=$?
   [ "$rc" -eq 0 ] && echo "selftest: ALL ARMS PASS" || echo "selftest: FAILURES PRESENT"

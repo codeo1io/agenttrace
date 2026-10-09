@@ -63,7 +63,7 @@ jobs:
           if [ "$rc" -eq 0 ]; then
             {
               echo "## pricing drift gate: clean"
-              echo "No actionable drift on the keep-filter basis (mode==chat AND input-or-output per-token cost>0)."
+              echo "No actionable drift on the keep-filter basis (mode==chat AND input-or-output per-token cost>0 AND no '*' glob key, rm-903)."
               cat drift-report.txt
             } >> "$GITHUB_STEP_SUMMARY"
             echo "mode=clean" >> "$GITHUB_OUTPUT"

@@ -3343,8 +3343,21 @@ pub(super) fn load_summary_line(app: &App) -> String {
                     )
                 })
                 .unwrap_or_else(|| app.t("none", "无").to_string());
+            // rm-904: orphaned subagent transcripts disclose in the
+            // Ready summary — the TUI's counterpart to the CLI's
+            // disclose_unlinked_subagents on every report path.
+            // 0-count-clean: the clause renders only when non-zero.
+            let unlinked = if state.unlinked_subagents > 0 {
+                format!(
+                    ", {} {}",
+                    format_count(state.unlinked_subagents as i64),
+                    app.t("unlinked subagents", "未关联子代理")
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{} {} {}, {} {}, {source}",
+                "{} {} {}, {} {}, {source}{unlinked}",
                 app.t("loaded", "已加载"),
                 format_count(state.parsed as i64),
                 app.t("sessions", "个会话"),
