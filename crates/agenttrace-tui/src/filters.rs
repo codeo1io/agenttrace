@@ -414,9 +414,17 @@ pub(super) fn pad_display_width(value: &str, width: usize) -> String {
 }
 
 pub(super) fn terminal_safe_report(text: &str) -> String {
-    text.chars()
+    // rm-819: control bytes (ESC/BEL/C1) are killed by the ONE shared
+    // sanitizer first — this helper previously folded box characters
+    // to ASCII but passed every escape sequence through verbatim,
+    // making it a second, partial sanitizer that looked like the real
+    // boundary. The box-character folding is presentation, not
+    // sanitization, so it stays local and composes after the core
+    // pass (U+FFFD is printable; both passes are idempotent).
+    let sanitized = crate::sanitize_output_document(text);
+    sanitized
+        .chars()
         .map(|ch| match ch {
-            '\n' | '\t' => ch,
             '━' | '─' | '═' | '—' | '–' => '-',
             '│' | '┃' => '|',
             '┌' | '┐' | '└' | '┘' | '┬' | '┴' | '├' | '┤' | '┼' => '+',

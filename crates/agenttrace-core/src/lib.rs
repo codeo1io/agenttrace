@@ -82,8 +82,9 @@ pub use sqlite_sessions::{
 pub use statusline::{
     load_statusline_insights, render_budget_view, render_statusline_report, run_statusline_host,
     sanitize_line_segment, sanitize_output_document, statusline_budget_series,
-    statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
-    StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
+    statusline_capture_path, statusline_insights, statusline_journal_stats, statusline_torn_tail,
+    CapturedStatusline, StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats,
+    StatuslineRateLimitState, StatuslineTornTail,
 };
 pub use subagents::attribute_subagents;
 pub use waste::{
@@ -2410,6 +2411,110 @@ mod tests {
             js.contains(".sha256") && js.contains("createHash"),
             "npm installer sidecar verification must stay in place"
         );
+    }
+
+    #[test]
+    fn env_serialization_is_the_one_shared_lock_not_per_test_statics() {
+        // rm-818: exactly one env-serialization lock may exist in the
+        // library-test surface — crate::test_env::ENV_LOCK. A private
+        // static in any test module re-opens the race this run's
+        // assess caught: the defector serialized against nothing while
+        // every other env-consuming test held the shared lock, so the
+        // two lanes raced the process environment (pre-fix red loop:
+        // 34 of 40 iterations). The pin is textual because the defect
+        // is textual — same style as the installer-parity pins above.
+        // Integration-test binaries (tests/) and the TUI crate are
+        // separate processes from this binary and cannot share this
+        // lock; each serializes internally, which is the whole
+        // requirement there.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut entries: Vec<_> = std::fs::read_dir(&src)
+            .expect("src readable")
+            .map(|entry| entry.expect("dir entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "rs")
+                    && path.file_name().is_some_and(|name| name != "lib.rs")
+            })
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !content.contains("ENV_LOCK"),
+                "{name} must not declare a private ENV_LOCK — route env \
+                 mutation through crate::test_env::lock_env()"
+            );
+            assert!(
+                !static_env_mutex(&content),
+                "{name} must not declare a private env-serialization \
+                 static Mutex — the one shared lock lives in \
+                 crate::test_env (rm-818)"
+            );
+        }
+        let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs readable");
+        // Count declarations (line-initial `static ENV_LOCK`), not
+        // this pin's own mention of the name.
+        let declared = lib
+            .lines()
+            .filter(|line| line.trim_start().starts_with("static ENV_LOCK"))
+            .count();
+        assert_eq!(
+            declared, 1,
+            "exactly one shared env lock may exist (crate::test_env)"
+        );
+    }
+
+    /// Detects `static NAME: ...Mutex<()>` (the direct shape and the
+    /// `OnceLock<Mutex<()>>` helper shape both qualify — either was
+    /// enough to serialize a defector against nothing). Kept
+    /// dependency-free: a scan over source lines, same discipline as
+    /// the installer pins.
+    fn static_env_mutex(content: &str) -> bool {
+        content.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("static ") && trimmed.contains(':') && trimmed.contains("Mutex<()>")
+        })
+    }
+
+    #[test]
+    fn shared_env_lock_serializes_concurrent_mutators_and_readers() {
+        // rm-818 interleaved pin: under the ONE shared lock, a reader
+        // never observes another lane's in-flight env mutation. This
+        // is the shape the defector broke (two locks over one
+        // environment — see the pre-fix red loop for this batch) and
+        // the pin that keeps lock_env honest if anyone turns it into a
+        // no-op or a per-call static.
+        const LANES: usize = 4;
+        const ROUNDS: usize = 200;
+        std::thread::scope(|scope| {
+            for lane in 0..LANES {
+                scope.spawn(move || {
+                    for round in 0..ROUNDS {
+                        let _guard = crate::test_env::lock_env();
+                        let key = "AGENTTRACE_ENV_LOCK_STRESS";
+                        let prior = std::env::var_os(key);
+                        let value = format!("lane-{lane}-round-{round}");
+                        std::env::set_var(key, &value);
+                        // Same-lock readback must see this lane's own
+                        // write — any interleaving is a second lock.
+                        let seen = std::env::var_os(key)
+                            .map(|v| v.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        match prior {
+                            Some(prior) => std::env::set_var(key, prior),
+                            None => std::env::remove_var(key),
+                        }
+                        assert_eq!(
+                            seen, value,
+                            "env read under the shared lock observed a \
+                             foreign value — a second serialization lane \
+                             is mutating env"
+                        );
+                    }
+                });
+            }
+        });
     }
 
     #[test]

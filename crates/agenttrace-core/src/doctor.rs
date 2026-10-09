@@ -63,6 +63,16 @@ pub struct DoctorStatuslineReport {
     pub captures: usize,
     pub sessions: usize,
     pub bytes: u64,
+    /// rm-821 (review fix F3): bytes beyond the journal read cap
+    /// that were NOT read while counting the fields above. Zero on
+    /// every healthy journal. Skipped at zero so demo JSON stays
+    /// byte-compatible with the pinned contract.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub capped_away_bytes: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -531,17 +541,23 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
             captures: 0,
             sessions: 0,
             bytes: 0,
+            capped_away_bytes: 0,
         };
     }
     let stats = crate::statusline::statusline_journal_stats(&path);
     let captures = crate::statusline::read_statusline_captures(&path);
     let sessions = crate::statusline::statusline_insights(&captures).sessions;
+    // rm-821 (review fix F3): this lane consumed the capped prefix
+    // with no cap disclosure — the counts below presented as the whole
+    // journal even when bytes beyond the read cap were never read.
+    let capped_away_bytes = crate::statusline::statusline_torn_tail(&path).capped_away_bytes;
     DoctorStatuslineReport {
         path: stats.path,
         exists: stats.exists,
         captures: stats.lines,
         sessions,
         bytes: stats.bytes,
+        capped_away_bytes,
     }
 }
 
@@ -893,10 +909,21 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.cache_size_bytes, report.cache_limits
     ));
     let statusline_state = if report.statusline.exists {
-        format!(
+        let base = format!(
             "{} captures, {} distinct sessions, {} bytes",
             report.statusline.captures, report.statusline.sessions, report.statusline.bytes
-        )
+        );
+        // rm-821 (review fix F3): doctor's only cap lane — `bytes` is
+        // the FILE's size, but the counts cover only the capped
+        // prefix when the journal exceeds the read cap.
+        if report.statusline.capped_away_bytes > 0 {
+            format!(
+                "{base} — ⚠ journal exceeds the read cap; {} byte(s) NOT read, counts cover only the capped prefix",
+                report.statusline.capped_away_bytes
+            )
+        } else {
+            base
+        }
     } else {
         "no captures (configure statusLine to `agenttrace statusline`)".to_string()
     };

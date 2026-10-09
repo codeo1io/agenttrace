@@ -34,6 +34,44 @@ pub const STATUSLINE_CAPTURE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// few KiB; anything larger is a misconfigured host and is not captured.
 const STATUSLINE_INPUT_MAX_BYTES: u64 = 1024 * 1024;
 
+/// rm-821: read bound for journal consumers, aligned with the
+/// retention cap ([`STATUSLINE_CAPTURE_MAX_BYTES`]) — the same whole
+/// the compaction lane keeps. Reads beyond this size stop at the cap
+/// and DISCLOSE (see [`StatuslineTornTail::capped_away_bytes`]);
+/// they never truncate silently.
+const STATUSLINE_READ_MAX_BYTES: u64 = STATUSLINE_CAPTURE_MAX_BYTES;
+
+/// rm-821: bounded journal read. Returns the (up to) cap-sized prefix
+/// as UTF-8 plus `Some((bytes_read, file_bytes))` when the file was
+/// larger than the cap — the disclosed marker's raw material.
+fn read_journal_capped(path: &Path) -> (String, Option<(u64, u64)>) {
+    let Ok(file) = fs::File::open(path) else {
+        return (String::new(), None);
+    };
+    let file_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let take = file_bytes.min(STATUSLINE_READ_MAX_BYTES);
+    let mut raw = Vec::with_capacity(take as usize);
+    let mut limited = (&file).take(take);
+    // rm-821 (review fix F3): read BYTES, then decode lossily. The
+    // old `read_to_string` returned Err the moment the cap boundary
+    // split a multibyte char (or stray junk landed mid-file) and this
+    // arm answered `(empty, None)` — a VALID journal silently read
+    // as missing: the report printed "no captures yet" while
+    // `stats.bytes` still showed the true >10 MiB size. Lossy decode
+    // keeps every parseable line: a straddled or poisoned byte
+    // becomes U+FFFD inside its own line, which the per-line JSON
+    // parse below already tolerates and the torn-tail walk discloses
+    // as an unparsed line — never a silent whole-journal drop.
+    if std::io::Read::read_to_end(&mut limited, &mut raw).is_err() {
+        // A real I/O error (not an encoding artifact) reads the same
+        // as a missing journal.
+        return (String::new(), None);
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let capped = (file_bytes > take).then_some((take, file_bytes));
+    (text, capped)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct StatuslineRateLimitState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,13 +488,73 @@ fn compact_statusline_capture_locked(path: &Path, keep_under: u64) -> io::Result
 /// Reads the journal, skipping malformed lines (a torn tail line from a
 /// crashed append is tolerated, matching append-only semantics).
 pub fn read_statusline_captures(path: &Path) -> Vec<CapturedStatusline> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
+    // rm-821: the read is bounded by the module's retention cap — an
+    // unbounded journal (a runaway host appending forever) must not
+    // balloon an inspection command's memory. The bound is disclosed
+    // by [`statusline_torn_tail`], never silently truncating.
+    let (raw, _capped) = read_journal_capped(path);
     raw.lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+/// rm-821: what [`read_statusline_captures`] had to drop. The
+/// append-only journal tolerates a torn tail (a crashed append leaves
+/// a final line without its newline, which is not valid JSON), and
+/// the report used to skip those bytes SILENTLY — the "N captures"
+/// line just understated the journal the reader was looking at.
+/// `last_intact_captured_at` anchors the hole: the epoch of the last
+/// line that DID parse, i.e. the moment before the capture gap.
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+pub struct StatuslineTornTail {
+    /// Non-empty lines that failed to parse as JSON.
+    pub unparsed_lines: usize,
+    /// Bytes those lines occupy in the journal (newline included).
+    pub unparsed_bytes: u64,
+    /// The journal ends without a newline — the classic crashed-append
+    /// shape. Malformed lines mid-file (a full, poisoned line) do not
+    /// set this, and are disclosed separately by the counts above.
+    pub torn_final_line: bool,
+    /// Epoch of the last line that parsed, if any.
+    pub last_intact_captured_at: Option<i64>,
+    /// rm-821: bytes beyond the read cap that were NOT read (file
+    /// larger than [`STATUSLINE_READ_MAX_BYTES`]). Zero on every
+    /// healthy journal; nonzero is always disclosed.
+    pub capped_away_bytes: u64,
+}
+
+impl StatuslineTornTail {
+    fn is_quiet(&self) -> bool {
+        self.unparsed_lines == 0 && !self.torn_final_line && self.capped_away_bytes == 0
+    }
+}
+
+/// Measures the journal's unparseable tail region. Reads the same
+/// bytes [`read_statusline_captures`] does, with the same per-line
+/// tolerance — this never fails, it only reports.
+pub fn statusline_torn_tail(path: &Path) -> StatuslineTornTail {
+    let mut tail = StatuslineTornTail::default();
+    let (raw, capped) = read_journal_capped(path);
+    if let Some((_read, file_bytes)) = capped {
+        tail.capped_away_bytes = file_bytes - STATUSLINE_READ_MAX_BYTES;
+    }
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        tail.torn_final_line = true;
+    }
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CapturedStatusline>(line) {
+            Ok(capture) => tail.last_intact_captured_at = Some(capture.captured_at),
+            Err(_) => {
+                tail.unparsed_lines += 1;
+                tail.unparsed_bytes += line.len() as u64 + 1;
+            }
+        }
+    }
+    tail
 }
 
 /// One observed limit window: the usage seen just before `resets_at`
@@ -500,6 +598,18 @@ pub struct StatuslineInsights {
     pub session_caches: Vec<StatuslineSessionCache>,
     /// Total miss-cause counts across sessions.
     pub miss_causes: BTreeMap<String, u64>,
+    /// rm-821 (review fix F3): bytes beyond the read cap that were
+    /// NOT read when these insights were aggregated. Zero on every
+    /// healthy journal; nonzero means every count above describes
+    /// only the capped prefix — this lane used to have no cap
+    /// disclosure at all. Skipped at zero so healthy-journal JSON
+    /// stays byte-compatible.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub journal_capped_away_bytes: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Deduplicates and aggregates captures. Captures are keyed by
@@ -624,6 +734,7 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
         limit_crossings: crossings,
         session_caches,
         miss_causes,
+        journal_capped_away_bytes: 0,
     }
 }
 
@@ -631,11 +742,19 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
 /// when nothing is captured yet so reports stay unchanged until the
 /// statusline mode is actually used.
 pub fn load_statusline_insights() -> Option<StatuslineInsights> {
-    let captures = read_statusline_captures(&statusline_capture_path());
+    let path = statusline_capture_path();
+    let captures = read_statusline_captures(&path);
     if captures.is_empty() {
         return None;
     }
-    Some(statusline_insights(&captures))
+    let mut insights = statusline_insights(&captures);
+    // rm-821 (review fix F3): the TUI efficiency panel consumed the
+    // capped journal prefix with no cap lane of its own — prefix-only
+    // limit counts presented as the whole journal. Same marker the
+    // report arm prints, surfaced on the struct the panel already
+    // renders.
+    insights.journal_capped_away_bytes = statusline_torn_tail(&path).capped_away_bytes;
+    Some(insights)
 }
 
 /// Journal bookkeeping for `--doctor` and the report header.
@@ -653,13 +772,14 @@ pub struct StatuslineJournalStats {
 pub fn statusline_journal_stats(path: &Path) -> StatuslineJournalStats {
     let exists = path.exists();
     let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-    let lines = if exists {
-        fs::read_to_string(path)
-            .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    // rm-821: counted from the capped read (the prefix the report
+    // actually aggregates); `bytes` above stays the TRUE file size so
+    // the header is honest about what the cap left unread.
+    let lines = read_journal_capped(path)
+        .0
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     StatuslineJournalStats {
         path: path.to_string_lossy().to_string(),
         exists,
@@ -679,10 +799,18 @@ pub fn render_statusline_report(
     let path = statusline_capture_path();
     let stats = statusline_journal_stats(&path);
     let captures = read_statusline_captures(&path);
+    let torn = statusline_torn_tail(&path);
     let insights = statusline_insights(&captures);
     let series = statusline_budget_series(&captures, 7);
     if format == "json" {
         let mut value = serde_json::json!({ "journal": stats, "insights": insights });
+        // rm-821: the JSON view discloses what the tolerant reader
+        // dropped, so an operator diffing `journal.lines` against the
+        // insight counts can see the gap is unparseable tail bytes,
+        // not sessions that never existed.
+        if !torn.is_quiet() {
+            value["torn_tail"] = serde_json::to_value(&torn)?;
+        }
         if let Some(budget) = weekly_budget {
             value["budget"] = serde_json::json!({
                 "weekly_budget_usd": budget,
@@ -697,6 +825,7 @@ pub fn render_statusline_report(
         &insights,
         weekly_budget,
         &series,
+        &torn,
     ))
 }
 
@@ -717,6 +846,7 @@ fn render_statusline_report_text(
     insights: &StatuslineInsights,
     weekly_budget: Option<f64>,
     series: &StatuslineBudgetSeries,
+    torn: &StatuslineTornTail,
 ) -> String {
     let mut out = String::new();
     out.push_str("AGENTTRACE statusline capture\n");
@@ -732,6 +862,35 @@ fn render_statusline_report_text(
         "  {} captures ({} after dedup), {} distinct sessions, {} bytes, retention keeps newest lines under {} bytes\n",
         stats.lines, insights.captures, insights.sessions, stats.bytes, stats.retained_max_bytes / 2
     ));
+    // rm-821: a tolerant reader that skips unparseable tail bytes owes
+    // the operator the size of what it skipped — the "N captures"
+    // line above counts raw lines including the bytes that never
+    // parsed, so the gap was invisible arithmetic until now.
+    if !torn.is_quiet() {
+        let anchored = torn
+            .last_intact_captured_at
+            .map(|epoch| format!(", last intact capture {}", format_epoch(epoch)))
+            .unwrap_or_default();
+        let shape = if torn.torn_final_line {
+            "a torn tail (crashed append, no trailing newline)"
+        } else {
+            "malformed line(s)"
+        };
+        out.push_str(&format!(
+            "  ⚠ {} byte(s) across {} line(s) failed to parse as JSON — {shape}{anchored}; \
+             they are excluded from every count above\n",
+            torn.unparsed_bytes, torn.unparsed_lines
+        ));
+    }
+    // rm-821: the read bound's own marker — separate from the parse
+    // gap above because a capped journal can parse perfectly clean.
+    if torn.capped_away_bytes > 0 {
+        out.push_str(&format!(
+            "  ⚠ journal exceeds the {} byte read cap; {} byte(s) beyond it were NOT read \
+             and every count above covers only the capped prefix\n",
+            STATUSLINE_READ_MAX_BYTES, torn.capped_away_bytes
+        ));
+    }
     out.push_str(&format!(
         "Limits: 5h {} (peak {}) · 7d {} (peak {})\n",
         format_percent(insights.five_hour.as_ref().and_then(|s| s.used_percentage)),
@@ -902,6 +1061,7 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
     let path = statusline_capture_path();
     let stats = statusline_journal_stats(&path);
     let captures = read_statusline_captures(&path);
+    let torn = statusline_torn_tail(&path);
     let series = statusline_budget_series(&captures, 7);
     if format == "json" {
         let mut value = serde_json::json!({
@@ -916,6 +1076,10 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
                 .collect::<Vec<_>>(),
             "spend_7d_usd": series.total,
         });
+        // rm-821: same disclosure contract as the report view.
+        if !torn.is_quiet() {
+            value["torn_tail"] = serde_json::to_value(&torn)?;
+        }
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
             value["remaining_usd"] = serde_json::json!(budget - series.total);
@@ -937,6 +1101,50 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
     }
     if series.daily.is_empty() {
         out.push_str("  (no cost samples in the window)\n");
+    }
+    // rm-821 (review fix F2): branch on the two components exactly
+    // like the report arm — a cap-only journal (capped_away_bytes > 0,
+    // nothing unparsed) or a torn final line that still parses must
+    // never mint a false "0 bytes across 0 lines failed to parse"
+    // sentence, and the read cap gets its own marker in this lane
+    // (it had none). `statusline_torn_tail` sets `torn_final_line`
+    // whenever the taken prefix lacks a trailing newline — including
+    // when the CAP itself made the cut, hence the 3-shape matrix.
+    if torn.unparsed_lines > 0 {
+        let anchored = torn
+            .last_intact_captured_at
+            .map(|epoch| format!(", last intact capture {}", format_epoch(epoch)))
+            .unwrap_or_default();
+        let shape = if torn.torn_final_line && torn.capped_away_bytes > 0 {
+            "the read cap cut mid-line"
+        } else if torn.torn_final_line {
+            "a torn tail (crashed append, no trailing newline)"
+        } else {
+            "malformed line(s)"
+        };
+        out.push_str(&format!(
+            "  ⚠ {} byte(s) across {} line(s) failed to parse as JSON — {shape}{anchored}; \
+             they are excluded from the spend above\n",
+            torn.unparsed_bytes, torn.unparsed_lines
+        ));
+    } else if torn.torn_final_line && torn.capped_away_bytes == 0 {
+        // Torn-but-parses (crashed append whose final line is a
+        // complete capture sans newline): nothing failed to parse
+        // and nothing was excluded — say exactly that.
+        out.push_str(
+            "  ⚠ journal ends without a trailing newline (crashed append shape); \
+             the final line still parsed — nothing was excluded from the spend above\n",
+        );
+    }
+    if torn.capped_away_bytes > 0 {
+        // Cap-only or cap-cut-mid-line with a clean prefix: this
+        // sentence is the whole truth — bytes beyond the cap were
+        // never read, the parseable prefix is fully counted.
+        out.push_str(&format!(
+            "  ⚠ journal exceeds the {} byte read cap; {} byte(s) beyond it were NOT read \
+             — the spend above covers only the capped prefix\n",
+            STATUSLINE_READ_MAX_BYTES, torn.capped_away_bytes
+        ));
     }
     out.push_str(&format!("  7d total ${:.2}\n", series.total));
     match weekly_budget {
@@ -1084,6 +1292,7 @@ mod tests {
         ];
         let series = statusline_budget_series(&captures, 7);
         let budget = Some(10.0);
+        let quiet_tail = StatuslineTornTail::default();
         let text = render_statusline_report_text(
             &StatuslineJournalStats {
                 path: "journal".to_string(),
@@ -1095,6 +1304,7 @@ mod tests {
             &statusline_insights(&captures),
             budget,
             &series,
+            &quiet_tail,
         );
         assert!(text.contains("Budget: 7d spend $3.00 of $10.00"), "{text}");
         assert!(text.contains("$7.00 remaining"), "{text}");
@@ -1109,6 +1319,7 @@ mod tests {
             &statusline_insights(&captures),
             None,
             &series,
+            &quiet_tail,
         );
         assert!(!unbudgeted.contains("Budget:"), "{unbudgeted}");
     }
@@ -1269,6 +1480,392 @@ mod tests {
         assert!(stats.exists);
         assert_eq!(stats.retained_max_bytes, STATUSLINE_CAPTURE_MAX_BYTES);
         assert!(stats.lines >= 2);
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn torn_tail_is_measured_and_disclosed_not_skipped_silently() {
+        // rm-821 acceptance: build a journal with an intact line, a
+        // malformed FULL line, and a torn final line (no newline), then
+        // require the measurement to report both drops, the torn shape,
+        // and the epoch of the last intact capture — and both render
+        // arms to carry the same disclosure (JSON field + text line).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-torn-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let intact: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let capture = CapturedStatusline {
+            captured_at: 1_700_000_000,
+            payload: intact.clone(),
+        };
+        let poisoned = "{\"not\": \"a capture\"}";
+        let torn_tail_text = "{\"captured_at\":2,\"payload\":{\"tor";
+        let mut raw = String::new();
+        raw.push_str(&serde_json::to_string(&capture).expect("serialize"));
+        raw.push('\n');
+        raw.push_str(poisoned);
+        raw.push('\n');
+        raw.push_str(torn_tail_text);
+        fs::write(&journal, &raw).expect("write journal");
+
+        let torn = statusline_torn_tail(&journal);
+        assert_eq!(torn.unparsed_lines, 2, "poisoned + torn both counted");
+        assert_eq!(
+            torn.unparsed_bytes,
+            (poisoned.len() + 1 + torn_tail_text.len() + 1) as u64,
+            "bytes include each line's newline"
+        );
+        assert!(torn.torn_final_line, "no trailing newline = torn tail");
+        assert_eq!(
+            torn.last_intact_captured_at,
+            Some(1_700_000_000),
+            "the intact line anchors the hole"
+        );
+
+        // Both render arms disclose the same facts (env pin keeps the
+        // render on the crafted journal).
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let report = render_statusline_report("text", None).expect("render report");
+        assert!(
+            report.contains("failed to parse as JSON"),
+            "text report must disclose: {report}"
+        );
+        assert!(report.contains("torn tail"), "shape named: {report}");
+        assert!(
+            report.contains("last intact capture"),
+            "epoch anchor named: {report}"
+        );
+        let json = render_statusline_report("json", None).expect("render json");
+        assert!(json.contains("\"torn_tail\""), "json arm carries the field");
+        assert!(
+            json.contains("\"unparsed_bytes\""),
+            "json field shape: {json}"
+        );
+        let budget = render_budget_view("json", None).expect("render budget");
+        assert!(budget.contains("\"torn_tail\""), "budget view too");
+
+        // An intact journal stays byte-quiet: no disclosure noise.
+        fs::write(
+            &journal,
+            format!("{}\n", serde_json::to_string(&capture).expect("serialize")),
+        )
+        .expect("rewrite journal intact");
+        let quiet = statusline_torn_tail(&journal);
+        assert!(quiet.is_quiet());
+        let report = render_statusline_report("text", None).expect("render quiet");
+        assert!(
+            !report.contains("failed to parse as JSON"),
+            "intact journal prints no warning: {report}"
+        );
+
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_journal_is_capped_with_a_disclosed_marker_not_silent_truncation() {
+        // rm-821 read bound: a journal larger than the 10 MiB cap is
+        // read only to the cap, and every consumer says so — the
+        // marker must appear even when the capped prefix parses 100%
+        // clean (that is what separates a disclosed cap from the
+        // parse-gap disclosure).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-cap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let intact: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let capture = CapturedStatusline {
+            captured_at: 1_700_000_000,
+            payload: intact,
+        };
+        // One valid capture padded past the cap with trailing spaces
+        // (serde tolerates them; the line still parses).
+        let line = serde_json::to_string(&capture).expect("serialize");
+        let padding = (STATUSLINE_READ_MAX_BYTES as usize + 4096).saturating_sub(line.len() + 1);
+        let mut raw = format!("{line}{}\n", " ".repeat(padding));
+        // A SECOND capture strictly beyond the cap boundary: if the
+        // read ignored the cap it would show up in the captures.
+        let beyond = CapturedStatusline {
+            captured_at: 1_700_000_001,
+            payload: serde_json::from_str(FIXTURE).expect("fixture parses"),
+        };
+        raw.push_str(&serde_json::to_string(&beyond).expect("serialize"));
+        raw.push('\n');
+        fs::write(&journal, &raw).expect("write oversized journal");
+
+        let captures = read_statusline_captures(&journal);
+        assert_eq!(captures.len(), 1, "the beyond-cap capture is not read");
+        let torn = statusline_torn_tail(&journal);
+        assert_eq!(
+            torn.capped_away_bytes,
+            (raw.len() as u64).saturating_sub(STATUSLINE_READ_MAX_BYTES),
+            "the marker carries exactly the unread byte count"
+        );
+        assert!(!torn.is_quiet(), "a capped journal is never quiet");
+        assert_eq!(torn.unparsed_lines, 0, "the capped prefix parses clean");
+
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let report = render_statusline_report("text", None).expect("render report");
+        assert!(
+            report.contains("read cap"),
+            "text report names the cap: {report}"
+        );
+        let json = render_statusline_report("json", None).expect("render json");
+        assert!(
+            json.contains("\"capped_away_bytes\""),
+            "json arm carries the field: {json}"
+        );
+        let budget = render_budget_view("json", None).expect("render budget");
+        assert!(budget.contains("\"capped_away_bytes\""), "budget view too");
+        // rm-821 (review fix F2): the capped prefix parses 100% clean,
+        // so the TEXT arm must name the cap and never mint a false
+        // parse-gap sentence.
+        let budget_text = render_budget_view("text", None).expect("render budget text");
+        assert!(
+            budget_text.contains("read cap"),
+            "budget text names the cap: {budget_text}"
+        );
+        assert!(
+            !budget_text.contains("failed to parse"),
+            "capped-and-clean must not claim a parse gap: {budget_text}"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cap_boundary_utf8_straddle_cannot_empty_the_journal() {
+        // rm-821 (review fix F3): the cap boundary can land INSIDE a
+        // multibyte UTF-8 character. read_to_string answered Err and
+        // this arm returned (empty, None) — a VALID journal silently
+        // read as missing: the report said "no captures yet" while
+        // stats.bytes still showed the true >10 MiB size. The byte
+        // read with lossy decode keeps every parseable line and
+        // discloses the straddled tail as an unparsed line instead.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-straddle-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let intact: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let capture = CapturedStatusline {
+            captured_at: 1_700_000_000,
+            payload: intact,
+        };
+        let line = serde_json::to_string(&capture).expect("serialize");
+        // Pad with spaces so a 4-byte emoji STARTS exactly two bytes
+        // before the cap: bytes [cap-2, cap) are the first half of the
+        // character and the read cut lands mid-character.
+        let emoji = "\u{1F600}"; // 4 bytes
+        let padding = (STATUSLINE_READ_MAX_BYTES as usize - 2).saturating_sub(line.len() + 1);
+        let raw = format!("{line}{}\n{emoji}", " ".repeat(padding));
+        fs::write(&journal, &raw).expect("write straddled journal");
+
+        let (text, capped) = read_journal_capped(&journal);
+        assert!(
+            !text.is_empty(),
+            "a straddled journal no longer silently reads as missing"
+        );
+        assert!(capped.is_some(), "the cap marker still fires");
+        let captures = read_statusline_captures(&journal);
+        assert_eq!(captures.len(), 1, "the intact prefix line still reads");
+        let torn = statusline_torn_tail(&journal);
+        assert_eq!(
+            torn.capped_away_bytes,
+            (raw.len() as u64) - STATUSLINE_READ_MAX_BYTES,
+            "exactly the unread byte count is carried"
+        );
+        assert_eq!(torn.unparsed_lines, 1, "the straddled line is disclosed");
+        assert!(torn.torn_final_line, "the capped read cuts mid-line");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn budget_text_names_a_torn_tail_without_a_false_parse_gap() {
+        // rm-821 (review fix F2): a journal whose final line is a
+        // COMPLETE JSON object without a trailing newline (a crashed
+        // append that still parses) used to print "0 byte(s) across 0
+        // line(s) failed to parse" — a false claim. The text arm now
+        // branches on the two components like the report arm: the
+        // torn-tail shape is named, and no cap sentence appears for a
+        // journal that never hit the cap.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-tornparses-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let intact: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let first = serde_json::to_string(&CapturedStatusline {
+            captured_at: 1_700_000_000,
+            payload: intact.clone(),
+        })
+        .expect("serialize");
+        let second = serde_json::to_string(&CapturedStatusline {
+            captured_at: 1_700_000_100,
+            payload: intact,
+        })
+        .expect("serialize");
+        // No trailing newline on the final line: torn-but-parses.
+        fs::write(&journal, format!("{first}\n{second}")).expect("write torn journal");
+
+        let torn = statusline_torn_tail(&journal);
+        assert!(torn.torn_final_line, "fixture is torn as designed");
+        assert_eq!(torn.unparsed_lines, 0, "both lines parse");
+
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let text = render_budget_view("text", None).expect("render budget text");
+        assert!(
+            text.contains("ends without a trailing newline (crashed append shape)"),
+            "the shape is named: {text}"
+        );
+        assert!(
+            !text.contains("failed to parse"),
+            "nothing failed to parse — no false claim: {text}"
+        );
+        assert!(
+            !text.contains("malformed line(s)"),
+            "no false malformed claim: {text}"
+        );
+        assert!(
+            !text.contains("read cap"),
+            "no cap claim without a cap: {text}"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_appends_render_without_panic_and_mark_torn_tails() {
+        // rm-821 e2e: a writer appends captures while the reader
+        // renders. Every render must succeed; whenever the snapshot
+        // the reader saw ended without a newline (the torn shape), the
+        // report must SAY so — a torn tail may never surface as a
+        // silent zero/partial-usage line.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let intact: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        let capture = serde_json::to_string(&CapturedStatusline {
+            captured_at: 1_700_000_000,
+            payload: intact,
+        })
+        .expect("serialize");
+
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // Phase 1 — deterministic: the writer holds a body without its
+        // newline; the render between the two writes must (a) not
+        // panic and (b) mark the torn tail. The reader-side file
+        // check is only for OUR bookkeeping; the marker assertion is
+        // one-sided by construction here because nothing else writes.
+        {
+            use std::io::Write;
+            let mut held = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&journal)
+                .expect("open journal");
+            write!(held, "{capture}   ").expect("write torn body");
+            let report = render_statusline_report("text", None).expect("render torn");
+            assert!(
+                report.contains("torn tail"),
+                "a snapshot ending mid-line is marked, never silent: {report}"
+            );
+            writeln!(held).expect("complete the line");
+            let report = render_statusline_report("text", None).expect("render intact");
+            assert!(
+                !report.contains("failed to parse as JSON"),
+                "completing the line leaves no residue: {report}"
+            );
+        }
+
+        // Phase 2 — stress: 2_000 interleaved body/newline writes race
+        // the render loop. Every render must succeed without panic.
+        // (Torn-MARKING cannot be asserted here: the render reads the
+        // journal at its own moment, which is neither my before-read
+        // nor after-read — a torn snapshot before the render can be
+        // complete by the render's read and vice versa. Phase 1 pins
+        // the marker deterministically against a held-open torn
+        // state; this phase pins panic-freedom under real
+        // interleaving, and the final settled render pins no-residue.)
+        let writer = std::thread::spawn({
+            let journal = journal.clone();
+            let line = capture.clone();
+            move || {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&journal)
+                    .expect("open journal");
+                for i in 0..2_000u32 {
+                    // The body keeps trailing-space padding only
+                    // (serde tolerates it), so a COMPLETED line always
+                    // parses — the torn shape is the only defect the
+                    // reader is allowed to see.
+                    let padding = " ".repeat((i % 7) as usize + 1);
+                    write!(file, "{line}{padding}").expect("write body");
+                    std::thread::yield_now();
+                    writeln!(file).expect("write newline");
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let mut renders = 0usize;
+        while !writer.is_finished() {
+            let report = render_statusline_report("text", None).expect("render never panics");
+            let _ = report;
+            renders += 1;
+        }
+        writer.join().expect("writer never panics");
+        assert!(renders > 0, "the reader actually raced the writer");
+        // The final state is intact: full lines, quiet tail, and all
+        // 2_000 captures are counted.
+        let final_report = render_statusline_report("text", None).expect("final render");
+        assert!(
+            !final_report.contains("failed to parse as JSON"),
+            "settled journal has no residue: {final_report}"
+        );
         match prior {
             Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
             None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),

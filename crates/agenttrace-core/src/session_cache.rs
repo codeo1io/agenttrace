@@ -763,6 +763,46 @@ pub(crate) fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Res
 /// for append only after inspection — a planted symlink (or any
 /// non-regular file) at the journal path is refused loudly, never
 /// followed.
+/// `O_NOFOLLOW` for the final append open, so a symlink swapped in
+/// between the stable-symlink refusal and the open cannot redirect the
+/// append. `ELOOP` is the errno that refusal surfaces as. The crate
+/// deliberately carries no libc dependency, so both constants are
+/// cfg'd per kernel for the release matrix (linux, macOS); other
+/// unixes get 0/`None` — the refusal below still runs there, leaving
+/// the pre-rm-820 check-then-open window open and documented.
+#[cfg(unix)]
+mod append_nofollow {
+    #[cfg(target_os = "linux")]
+    pub(super) const FLAG: i32 = 0o400000;
+    #[cfg(target_os = "linux")]
+    const ELOOP_ERRNO: i32 = 40;
+    #[cfg(target_os = "macos")]
+    pub(super) const FLAG: i32 = 0x0100;
+    #[cfg(target_os = "macos")]
+    const ELOOP_ERRNO: i32 = 62;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) const FLAG: i32 = 0;
+
+    /// The errno an O_NOFOLLOW refusal surfaces as on this platform
+    /// (`None` where the platform is outside the release matrix and
+    /// the flag is 0, so the raced-link mapping simply never fires).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) const ELOOP: Option<i32> = Some(ELOOP_ERRNO);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) const ELOOP: Option<i32> = None;
+}
+
+/// Opens (creating on first use) the append-only journal at `path`,
+/// owner-only. rm-208: create/append via OpenOptions, never O_TRUNC.
+/// A planted symlink (or any non-regular file) at the journal path is
+/// refused loudly, never followed. rm-820: the final append open now
+/// carries `O_NOFOLLOW` — the pre-fix shape stat'd the path, refused
+/// the symlink, and then REOPENED the same path, so a link swapped
+/// between check and open redirected the append through it
+/// (check-then-reopen TOCTOU; assess F3). The stat refusal stays as
+/// the friendly stable-symlink error path and the special-file guard
+/// (a FIFO would block the open); `O_NOFOLLOW` is the kernel-side
+/// guarantee that the raced window fails closed with `ELOOP`.
 pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
@@ -771,6 +811,7 @@ pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
             .append(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(append_nofollow::FLAG)
             .open(path)
         {
             Ok(file) => Ok(file),
@@ -786,13 +827,54 @@ pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
                         ),
                     ));
                 }
-                fs::OpenOptions::new().append(true).open(path)
+                fs::OpenOptions::new()
+                    .append(true)
+                    .custom_flags(append_nofollow::FLAG)
+                    .open(path)
+                    .map_err(|err| {
+                        // A link swapped in after the stat surfaces as
+                        // ELOOP; report it in the same disclosed
+                        // fail-closed voice as the refusal above.
+                        let raced_link = append_nofollow::ELOOP
+                            .is_some_and(|eloop| err.raw_os_error() == Some(eloop));
+                        if raced_link {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "refusing to append through {}: the path became a \
+                                     symlink while opening (O_NOFOLLOW)",
+                                    path.display()
+                                ),
+                            )
+                        } else {
+                            err
+                        }
+                    })
             }
             Err(err) => Err(err),
         }
     }
     #[cfg(not(unix))]
     {
+        // Windows, named explicitly (rm-820): std has no O_NOFOLLOW
+        // here, so the contract is the same refusal via a reparse-
+        // point check — `symlink_metadata` sees symlinks and junctions
+        // before the open — plus the named residual window: creating
+        // either requires SeCreateSymbolicLinkPrivilege, outside the
+        // cache-dir attacker model, so check-then-open is the
+        // documented equivalent on this platform.
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if !meta.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to append through {}: the journal path is a reparse \
+                         point (symlink/junction), not a regular journal",
+                        path.display()
+                    ),
+                ));
+            }
+        }
         fs::OpenOptions::new().create(true).append(true).open(path)
     }
 }
@@ -2230,6 +2312,88 @@ mod tests {
             fs::read_to_string(&journal).unwrap(),
             "first\nsecond\n",
             "appends must land in place, not replace the journal"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn journal_append_never_follows_a_link_swapped_mid_open() {
+        // rm-820 race harness (assess F3, red-first this run): the
+        // pre-fix shape stat'd the journal path, refused the symlink,
+        // then REOPENED the same path — so a link swapped in that
+        // window redirected the append through it. The swapper below
+        // hammers rename(symlink -> journal) / rename(regular ->
+        // journal) while the opener loops open_private_append; with
+        // O_NOFOLLOW on the final open the kernel fails the raced
+        // window closed (ELOOP) and the victim behind the link never
+        // gains a byte. Pre-fix, this same harness grew the victim
+        // (implement-phase red loop); post-fix it cannot, by kernel
+        // guarantee rather than by winning the race.
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-journal-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let victim = root.join("victim.log");
+        fs::write(&victim, "sentinel\n").expect("write victim sentinel");
+        fs::write(&journal, "journal\n").expect("write journal seed");
+        let link = root.join("swap-link");
+        let regular = root.join("swap-regular");
+        fs::write(&regular, "swapped regular\n").expect("write swap regular");
+        let stop = AtomicBool::new(false);
+        let mut opens_ok = 0u32;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::os::unix::fs::symlink(&victim, &link);
+                    let _ = fs::rename(&link, &journal);
+                    let _ = fs::copy(&regular, root.join("swap-copy.tmp"));
+                    let _ = fs::rename(root.join("swap-copy.tmp"), &journal);
+                }
+            });
+            for round in 0..20_000u32 {
+                match open_private_append(&journal) {
+                    Ok(mut file) => {
+                        opens_ok += 1;
+                        // Landing in the journal (or a renamed-away old
+                        // inode) is fine; landing in the victim is the
+                        // bug. A failed write is a loud failure, never
+                        // a silent break: appends must work under the
+                        // race (0o400000 is O_NOFOLLOW — an earlier
+                        // draft fat-fingered O_DIRECT=0o40000, whose
+                        // EINVALs made this loop pass vacuously).
+                        writeln!(file, "round {round}")
+                            .unwrap_or_else(|err| panic!("append under race failed: {err}"));
+                    }
+                    Err(err) => {
+                        let message = err.to_string();
+                        assert!(
+                            message.contains("refusing to append"),
+                            "raced opens must fail closed with the disclosed \
+                             refusal, got: {message}"
+                        );
+                    }
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        // rm-820 (review fix F6): the panics above fire only on a
+        // FAILED append — a pathological run where every open
+        // failed-closed would still pass without ever proving a
+        // single append succeeded under the flag. Assert the
+        // prevention doc's minimum-success rule explicitly.
+        assert!(
+            opens_ok > 0,
+            "harness proved nothing: every open failed closed"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"sentinel\n",
+            "a swap racing the open must never append through the link"
         );
         let _ = fs::remove_dir_all(root);
     }

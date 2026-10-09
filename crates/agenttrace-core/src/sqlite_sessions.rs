@@ -1462,7 +1462,18 @@ mod tests {
         // (written by a pre-fix binary) is distrusted and re-verified.
         // The cache location is env-derived, so the test isolates it
         // (and restores on exit).
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        //
+        // rm-818: the isolation runs under the ONE shared env lock
+        // (crate::test_env). The private static this test used to hold
+        // serialized it against nothing: every other env-consuming
+        // test in this binary takes the shared lock, so the two lanes
+        // raced over the same process environment — observed as the
+        // assess-battery flake and reproduced by this run's pre-fix
+        // red loop (34 of 40 iterations failed
+        // pricing_catalog_refresh_invalidates_cached_costs_once, a
+        // test that was legally holding the shared lock the whole
+        // time). The defector is gone; the pin test in lib.rs keeps it
+        // gone.
         struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for EnvRestore {
             fn drop(&mut self) {
@@ -1474,9 +1485,7 @@ mod tests {
                 }
             }
         }
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::test_env::lock_env();
         let _restore = EnvRestore(
             [
                 (

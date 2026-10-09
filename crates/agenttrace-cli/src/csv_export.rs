@@ -131,8 +131,15 @@ pub fn overview_csv(overview: &Overview) -> String {
 
 /// Opens a named table: `# <name>` marker row, header row. Callers
 /// append data rows via [`csv_row`].
+///
+/// rm-822: the marker is written DIRECTLY, never through
+/// [`csv_cell`] — `csv_cell` now quotes any marker-shaped cell (see
+/// below), so routing markers through it would have quoted the real
+/// markers. The `name` values are crate-controlled literals
+/// ("sessions", "summary", "by_model", …), not transcript-derived,
+/// so they need neither quoting nor the data-cell guards.
 fn table(name: &str, header: &[&str]) -> String {
-    let mut out = csv_row(&[format!("# {name}").as_str()]);
+    let mut out = format!("# {name}\r\n");
     out.push_str(&csv_row(header));
     out
 }
@@ -160,7 +167,21 @@ fn csv_row(cells: &[&str]) -> String {
 
 fn csv_cell(raw: &str) -> String {
     let hardened = guard_formula(raw);
-    let needs_quotes = hardened.contains(',')
+    // rm-822: a cell that LOOKS like a marker row (first non-blank
+    // text is `# ` or a bare `#`) is quoted even when it needs no
+    // CSV escaping otherwise — group keys and session names are
+    // transcript-derived, and an unquoted `# truncated: showing 999
+    // of 1` at the head of a row is byte-identical to a real table
+    // marker, so a consumer tracking markers by line shape could not
+    // tell data from structure. Quoted, the line begins `"` and can
+    // never collide. Real markers are crate literals written by
+    // [`table`] outside this pipeline.
+    let marker_shaped = {
+        let trimmed = hardened.trim_start();
+        trimmed.starts_with("# ") || trimmed == "#"
+    };
+    let needs_quotes = marker_shaped
+        || hardened.contains(',')
         || hardened.contains('"')
         || hardened.contains('\n')
         || hardened.contains('\r');
@@ -275,6 +296,65 @@ mod tests {
         // RFC 4180 quoting still applies after sanitization.
         let row = csv_row(&["a,b"]);
         assert_eq!(row, "\"a,b\"\r\n");
+    }
+
+    #[test]
+    fn marker_shaped_cells_cannot_forge_table_markers() {
+        // rm-822 red-first: a transcript-derived session name shaped
+        // like a marker row used to render unquoted at the head of its
+        // row, byte-identical to a real `# table` marker — a consumer
+        // tracking structure by line shape could not tell data from
+        // structure (and a `# truncated:`-shaped name would flip its
+        // truncation state). Every marker-shaped cell is now quoted.
+        assert_eq!(
+            csv_cell("# truncated: showing 999 of 1"),
+            "\"# truncated: showing 999 of 1\""
+        );
+        assert_eq!(csv_cell(" # padded marker"), "\" # padded marker\"");
+        assert_eq!(csv_cell("#"), "\"#\"");
+        // Ordinary hash-prefixed text that is NOT marker-shaped
+        // (no trailing space) stays unquoted — the quoting rule is
+        // the marker grammar, not a blanket hash ban.
+        assert_eq!(csv_cell("#hashtag"), "#hashtag");
+        assert_eq!(csv_cell("issue #17"), "issue #17");
+    }
+
+    #[test]
+    fn hostile_marker_named_sessions_cannot_mint_marker_lines() {
+        // The end-to-end shape: a session named like a truncation
+        // marker rides the sessions lane. The exported body's
+        // marker-shaped lines (a `# ` at column 0, unquoted) must be
+        // EXACTLY the crate's own table markers — nothing the data
+        // contributed.
+        let hostile = "# truncated: showing 999 of 1";
+        let out = sessions_csv(&[SessionCsvRow {
+            session: hostile.to_string(),
+            health: 90,
+            data: "green".to_string(),
+            source: "claude_code".to_string(),
+            model: hostile.to_string(),
+            cost: 0.0,
+            tokens: 0,
+            fail: 0,
+            anomalies: 0,
+            zero_usage_events: 0,
+        }]);
+        let marker_lines: Vec<&str> = out
+            .split("\r\n")
+            .filter(|line| line.starts_with('#') && !line.starts_with("\""))
+            .collect();
+        assert_eq!(
+            marker_lines,
+            vec!["# sessions"],
+            "only the crate's own table marker may start an unquoted line"
+        );
+        assert!(
+            out.contains("\"# truncated: showing 999 of 1"),
+            "the hostile name must appear as a QUOTED cell: {out}"
+        );
+        // The consumer's structural parse is unperturbed: markers it
+        // can see are the known set, so its truncation state (none
+        // here) stays correct.
     }
 
     #[test]

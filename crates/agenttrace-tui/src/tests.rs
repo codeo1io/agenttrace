@@ -56,6 +56,178 @@ fn explorer_navigation_reaches_views_details_and_overlays() {
 }
 
 #[test]
+fn poisoned_journal_cannot_drive_the_terminal_past_the_frame() {
+    // rm-819 acceptance, honestly scoped. Two layers are pinned:
+    //
+    // (1) STRUCTURAL — the flagged render sites route transcript-derived
+    //     strings through the ONE shared sanitizer family re-exported
+    //     from agenttrace-core. Pre-fix, `grep sanitize
+    //     crates/agenttrace-tui/src` was ZERO hits (assess F2): the
+    //     boundary existed only by ratatui accident (the locked
+    //     ratatui skips zero-width symbols when writing spans, so
+    //     ESC/BEL/C1 — all width 0 — happened to drop out of the
+    //     buffer). A sanitizer-free TUI plus a partial local folder
+    //     (`terminal_safe_report`, which passed every escape through)
+    //     meant the safety was implicit and one ratatui upgrade away
+    //     from vanishing. The source pin below is the red-first
+    //     proof: it fails on exactly the pre-fix tree.
+    // (2) BEHAVIORAL — the buffer walk. Against the locked stack this
+    //     passes pre-fix too (the zero-width skip); it stays as the
+    //     regression net that catches the combination "sanitizer
+    //     routing reverted" × "zero-width skip removed".
+    let poison = "\u{1b}]2;pwned\u{7}\u{1b}[31mred\u{1b}[0mname";
+    let mut app = App::new(
+        vec![session(poison, poison, poison, 42, 0.1, poison)],
+        "test",
+        None,
+    );
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal
+        .draw(|frame| render_explorer(frame, &mut app))
+        .expect("render explorer list");
+    assert_no_control_symbols(&terminal, "explorer list");
+    app.explorer_detail = Some(DetailSection::Summary);
+    app.raw_report_expanded = true;
+    terminal
+        .draw(|frame| render_explorer(frame, &mut app))
+        .expect("render explorer detail");
+    assert_no_control_symbols(&terminal, "explorer detail");
+    let app2 = App::new(
+        vec![session(poison, poison, poison, 42, 0.1, poison)],
+        "test",
+        None,
+    );
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            render_overview(frame, &app2, area);
+        })
+        .expect("render overview");
+    assert_no_control_symbols(&terminal, "overview");
+    // The re-exported family IS the core family (no second
+    // sanitizer): the tui crate exposes exactly the functions the CLI
+    // dispatches stdout through, and they neutralize the same bytes.
+    assert_eq!(
+        crate::sanitize_line_segment(poison),
+        agenttrace_core::sanitize_line_segment(poison)
+    );
+    assert!(
+        !crate::sanitize_line_segment(poison)
+            .chars()
+            .any(|c| c.is_control()),
+        "line sanitizer leaves no control bytes"
+    );
+    assert!(
+        !crate::sanitize_output_document("a\u{1b}b\nc\td\r")
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r'),
+        "document sanitizer keeps layout bytes only"
+    );
+    // terminal_safe_report folds box chars AND kills escapes now.
+    assert!(
+        !terminal_safe_report("\u{2500}\u{1b}[2J")
+            .chars()
+            .any(|c| c.is_control()),
+        "report folding composes after sanitization"
+    );
+}
+
+#[test]
+fn tui_render_sources_route_the_shared_sanitizer() {
+    // rm-819 red-first source pin, upgraded after review F1: the
+    // original file-COUNT pin was blind to site gaps (5 sanitized
+    // sites can coexist with 10 raw ones). The statement scan below
+    // is site-aware: every render-bearing statement (Cell::from /
+    // Span::raw / Span::styled / Paragraph::new / Line::from /
+    // Line::styled) that interpolates a transcript-derived value
+    // (session.name / cwd / path, step.name / status / kind,
+    // s.name / s.project, model_used, display_session_source(session))
+    // must also carry `sanitize`. Pre-fix, the review's sites
+    // (explorer row/header/list/sidebar/preview lanes) all fail this
+    // scan; statements without a needle (literals, numerics) pass —
+    // the scan can never be satisfied by count alone.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let read = |name: &str| {
+        std::fs::read_to_string(format!("{manifest}/src/{name}"))
+            .unwrap_or_else(|err| panic!("{name} readable: {err}"))
+    };
+    let count = |name: &str, needle: &str| read(name).matches(needle).count();
+    assert!(
+        count("lib.rs", "pub use agenttrace_core::") >= 1,
+        "the crate re-exports the shared sanitizer family"
+    );
+    let ctors = [
+        "Cell::from(",
+        "Span::raw(",
+        "Span::styled(",
+        "Paragraph::new(",
+        "Line::from(",
+        "Line::styled(",
+    ];
+    let needles = [
+        "session.name",
+        "session.cwd",
+        "session.path",
+        "step.name",
+        "step.status",
+        "step.kind",
+        "s.name",
+        "s.project",
+        "model_used",
+        "display_session_source(session)",
+    ];
+    for name in ["explorer.rs", "presentation.rs"] {
+        let source = read(name);
+        for chunk in source.split([';', '}']) {
+            // Chunks routed through a pinned choke point count as
+            // covered: sidebar_field sanitizes every value it renders
+            // (pinned by the explicit count assert below).
+            if chunk.contains("sanitize") || chunk.contains("sidebar_field(") {
+                continue;
+            }
+            if ctors.iter().any(|ctor| chunk.contains(ctor))
+                && needles.iter().any(|needle| chunk.contains(needle))
+            {
+                panic!(
+                    "{name} renders a transcript-derived value through a \
+                     raw constructor (no shared-sanitizer call): {}",
+                    chunk.lines().last().unwrap_or("").trim()
+                );
+            }
+        }
+    }
+    // Choke points named by review F1 stay pinned explicitly:
+    // preview Paragraphs and the sidebar field helper.
+    assert!(
+        count("explorer.rs", "Paragraph::new(crate::sanitize_output_document") >= 2,
+        "context/storage/cost/tools previews + project preview leave through the document sanitizer"
+    );
+    assert!(
+        count("explorer.rs", "crate::sanitize_line_segment") >= 5,
+        "explorer row/header/list/step cells route the line sanitizer"
+    );
+    let presentation = count("presentation.rs", "crate::sanitize_line_segment")
+        + count("presentation.rs", "crate::sanitize_output_document");
+    assert!(
+        presentation >= 7,
+        "recent sessions, table rows and native text route the family ({presentation})"
+    );
+    assert!(
+        count("filters.rs", "crate::sanitize_output_document") >= 1,
+        "terminal_safe_report delegates control-byte policy to the shared family"
+    );
+}
+
+fn assert_no_control_symbols(terminal: &Terminal<TestBackend>, view: &str) {
+    for cell in terminal.backend().buffer().content() {
+        assert!(
+            !cell.symbol().chars().any(|c| c.is_control()),
+            "{view} buffer carries a control byte in a cell symbol"
+        );
+    }
+}
+
+#[test]
 fn explorer_footer_shows_language_shortcut_in_list_and_detail() {
     let mut app = App::new(
         vec![session("language", "codex_cli", "gpt-5", 90, 0.1, "rg")],

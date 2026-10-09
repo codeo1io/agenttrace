@@ -467,13 +467,13 @@ pub(super) fn render_recent_sessions(frame: &mut Frame<'_>, app: &App, area: Rec
                 format!("{:>3} ", session.health),
                 Style::default().fg(health_color(session.health)),
             ),
-            Span::raw(format!(
+            Span::raw(crate::sanitize_line_segment(&format!(
                 "{} {} {} {}",
-                pad_display_width(&session.name, name_width),
+                pad_display_width(&crate::sanitize_line_segment(&session.name), name_width),
                 pad_display_width(&format_compact_cost(session.metrics.cost_estimated), 8),
                 pad_display_width(&display_session_source(session), 14),
                 short(&triage_reason(session, app.language), 24),
-            )),
+            ))),
         ]));
     }
     if lines.is_empty() {
@@ -608,7 +608,7 @@ pub(super) fn render_session_table(
         let success_rate = tool_success_rate(session);
         if compact {
             Some(Row::new(vec![
-                Cell::from(short(&session.name, 18)),
+                Cell::from(short(&crate::sanitize_line_segment(&session.name), 18)),
                 Cell::from(session.health.to_string())
                     .style(Style::default().fg(health_color(session.health))),
                 Cell::from(format_compact_cost(metrics.cost_estimated)),
@@ -618,18 +618,30 @@ pub(super) fn render_session_table(
         } else {
             Some(
                 Row::new(vec![
-                    Cell::from(short(&session.name, name_width)),
+                    Cell::from(short(
+                        &crate::sanitize_line_segment(&session.name),
+                        name_width,
+                    )),
                     Cell::from(health_label(session.health, app.language))
                         .style(Style::default().fg(health_color(session.health))),
                     Cell::from(capability_label(session, app.language)),
-                    Cell::from(short(&display_session_source(session), 14)),
-                    Cell::from(short(&metrics.model_used, 14)),
+                    Cell::from(short(
+                        &crate::sanitize_line_segment(&display_session_source(session)),
+                        14,
+                    )),
+                    Cell::from(short(
+                        &crate::sanitize_line_segment(&metrics.model_used),
+                        14,
+                    )),
                     Cell::from(format_compact_cost(metrics.cost_estimated)),
                     Cell::from(format_tokens(total_tokens(session))),
                     Cell::from(format!("{success_rate:.0}%")),
                     Cell::from(format_count(metrics.tool_calls_fail as i64)),
                     Cell::from(format_count(session.anomalies.len() as i64)),
-                    Cell::from(short(&triage_reason(session, app.language), reason_width)),
+                    Cell::from(short(
+                        &crate::sanitize_line_segment(&triage_reason(session, app.language)),
+                        reason_width,
+                    )),
                 ])
                 .style(session_row_style(session)),
             )
@@ -855,7 +867,7 @@ pub(super) fn render_selected_summary(frame: &mut Frame<'_>, app: &App, area: Re
             Line::from(format!(
                 "{}: {}  {}={}  ok={:.0}%  {}={}  {}={}  {}={}  {}={}",
                 app.t("selected", "选中"),
-                short(&session.name, 24),
+                short(&crate::sanitize_line_segment(&session.name), 24),
                 app.t("reason", "原因"),
                 short(&triage_reason(session, app.language), 22),
                 tool_success_rate(session),
@@ -871,7 +883,10 @@ pub(super) fn render_selected_summary(frame: &mut Frame<'_>, app: &App, area: Re
             Line::from(format!(
                 "{}={}  {}={}  {}={}  {}={}  p95 {}={}",
                 app.t("source", "来源"),
-                short(&display_session_source(session), 18),
+                short(
+                    &crate::sanitize_line_segment(&display_session_source(session)),
+                    18
+                ),
                 app.t("model", "模型"),
                 short(&driver_model(session), 24),
                 app.t("tokens", "Token"),
@@ -1393,6 +1408,25 @@ fn efficiency_text(governance: &GovernanceSnapshot, language: Language) -> Strin
             lines.push(format!(
                 "  {}: {causes}",
                 text(language, "miss causes", "未命中原因")
+            ));
+        }
+        // rm-821 (review fix F3): this panel consumed the capped
+        // journal prefix with no cap lane of its own — prefix-only
+        // limit counts presented as the whole journal.
+        if statusline.journal_capped_away_bytes > 0 {
+            lines.push(format!(
+                "  ⚠ {} {} {}",
+                text(
+                    language,
+                    "journal over the read cap —",
+                    "日志超出读取上限——"
+                ),
+                statusline.journal_capped_away_bytes,
+                text(
+                    language,
+                    "bytes unread; the numbers above cover only the capped prefix",
+                    "字节未读取；以上数字只覆盖截断前缀"
+                )
             ));
         }
     }
@@ -2382,7 +2416,10 @@ pub(super) fn detail_native_text(session: &Session, language: Language) -> Strin
     lines.extend(signal_lines(session, language));
     lines.push(String::new());
     lines.extend(anomaly_lines(session, 4, language));
-    lines.join("\n")
+    // rm-819: the whole native document is transcript-derived text; it
+    // leaves through the same document sanitizer stdout uses (layout
+    // LF/TAB survive, ESC/BEL/C1 die).
+    crate::sanitize_output_document(&lines.join("\n"))
 }
 
 pub(super) fn diagnostics_native_text(session: &Session, language: Language) -> String {
@@ -3565,7 +3602,10 @@ pub(super) fn inspect_first_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                         Modifier::empty()
                     }),
             ),
-            Span::raw(format!("{} ", pad_display_width(&session.name, name_width))),
+            Span::raw(format!(
+                "{} ",
+                pad_display_width(&crate::sanitize_line_segment(&session.name), name_width)
+            )),
             Span::styled(
                 pad_display_width(inspect_open_label(item.label, app.language), 12),
                 Style::default().fg(inspect_label_color(item.label)),

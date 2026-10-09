@@ -968,12 +968,22 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             | ExplorerView::All
             | ExplorerView::Projects => unreachable!(),
         };
-        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+        // rm-819 (review F1): every preview document (context/
+        // storage/cost/tools, built from session.name/path/cwd raw)
+        // leaves through the shared document sanitizer before the
+        // Paragraph, same as detail_native_text.
+        frame.render_widget(
+            Paragraph::new(crate::sanitize_output_document(&text)).wrap(Wrap { trim: false }),
+            inner,
+        );
         return;
     }
     if app.explorer_view == ExplorerView::Projects {
         frame.render_widget(
-            Paragraph::new(project_preview(app, session)).wrap(Wrap { trim: false }),
+            Paragraph::new(crate::sanitize_output_document(&project_preview(
+                app, session,
+            )))
+            .wrap(Wrap { trim: false }),
             inner,
         );
         return;
@@ -986,7 +996,7 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Style::default().fg(Color::Cyan),
         ),
         Line::styled(
-            short(&session.name, 56),
+            short(&crate::sanitize_line_segment(&session.name), 56),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
@@ -1027,7 +1037,10 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             app.t("What's going on", "现在的问题"),
             Style::default().fg(Color::Cyan),
         ),
-        Line::raw(primary_finding(session, app.language)),
+        Line::raw(crate::sanitize_line_segment(&primary_finding(
+            session,
+            app.language,
+        ))),
         Line::raw(""),
         Line::styled(
             app.t("What we saw", "我们看到了什么"),
@@ -1035,14 +1048,22 @@ fn render_explorer_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
     ];
     for evidence in explorer_evidence(session, app.language).into_iter().take(5) {
-        lines.push(Line::raw(format!("• {evidence}")));
+        // rm-819 (review fix F1): evidence strings carry
+        // anomaly.detail, which embeds transcript-derived tool names —
+        // same sanitizer family as the row sites.
+        lines.push(Line::raw(format!(
+            "• {}",
+            crate::sanitize_line_segment(&evidence)
+        )));
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         app.t("What to do", "建议怎么做"),
         Style::default().fg(Color::Cyan),
     ));
-    lines.push(Line::raw(explorer_recommendation(session, app.language)));
+    lines.push(Line::raw(crate::sanitize_line_segment(
+        &explorer_recommendation(session, app.language),
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -1402,7 +1423,10 @@ fn render_explorer_detail(frame: &mut Frame<'_>, app: &App, section: DetailSecti
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                format!("←  {}", short(&session.name, name_width)),
+                format!(
+                    "←  {}",
+                    short(&crate::sanitize_line_segment(&session.name), name_width)
+                ),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Line::from(tabs),
@@ -1468,9 +1492,17 @@ fn render_detail_section(
     };
     let reason = inspect_reason(session);
     frame.render_widget(
-        Paragraph::new(styled_detail_text(&text, reason))
-            .scroll((app.scroll, 0))
-            .wrap(Wrap { trim: false }),
+        // rm-819 (review fix F1): the composed detail text embeds
+        // anomaly detail (tool names) and session-derived file paths,
+        // all of it transcript-derived, so the whole document routes
+        // through the shared document sanitizer before styling (static
+        // ASCII headings pass through untouched)
+        Paragraph::new(styled_detail_text(
+            &crate::sanitize_output_document(&text),
+            reason,
+        ))
+        .scroll((app.scroll, 0))
+        .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -1528,6 +1560,9 @@ fn styled_detail_text(text: &str, reason: &str) -> Vec<Line<'static>> {
 
 fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, area: Rect) {
     let audit = session_cost_audit(session);
+    // rm-819 (review F1): hoisted so both the workspace line and any
+    // later field can borrow the root without a dropped temporary.
+    let identity = app.project_identity(session);
     let text = vec![
         Line::styled(
             app.t("Session at a glance", "会话概况"),
@@ -1621,12 +1656,14 @@ fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, ar
             app.t("Workspace", "工作区"),
             Style::default().fg(Color::Cyan),
         ),
+        // rm-819 (review F1): cwd / project root is transcript-
+        // derived — sanitize before the Line, whichever arm wins.
         Line::styled(
-            if session.cwd.is_empty() {
-                app.project_identity(session).root
+            crate::sanitize_line_segment(if session.cwd.is_empty() {
+                identity.root.as_str()
             } else {
-                session.cwd.clone()
-            },
+                session.cwd.as_str()
+            }),
             Style::default().fg(Color::Gray),
         ),
         Line::raw(""),
@@ -1634,7 +1671,12 @@ fn render_detail_sidebar(frame: &mut Frame<'_>, app: &App, session: &Session, ar
             app.t("Session file", "会话文件"),
             Style::default().fg(Color::Cyan),
         ),
-        Line::styled(session.path.clone(), Style::default().fg(Color::Gray)),
+        Line::styled(
+            // rm-819 (review F1): the journal path itself is hostile-
+            // journal surface — sanitized like every other value line.
+            crate::sanitize_line_segment(&session.path),
+            Style::default().fg(Color::Gray),
+        ),
     ];
     frame.render_widget(
         Paragraph::new(text)
@@ -2108,9 +2150,15 @@ fn explorer_row_spans(
     };
     vec![
         Span::raw(format!("{marker} ")),
-        Span::raw(pad_display_width(&session.name, name_width)),
+        Span::raw(pad_display_width(
+            &crate::sanitize_line_segment(&session.name),
+            name_width,
+        )),
         Span::raw("  "),
-        Span::styled(pad_display_width(&value, ROW_VALUE_WIDTH), value_style),
+        Span::styled(
+            pad_display_width(&crate::sanitize_line_segment(&value), ROW_VALUE_WIDTH),
+            value_style,
+        ),
         Span::styled(
             format!("{:>4}", session.health),
             Style::default()
@@ -2156,22 +2204,28 @@ fn key_hint_line(text: &str, raw: bool) -> Line<'static> {
 }
 
 fn sidebar_field(label: &str, value: String, style: Style) -> Line<'static> {
+    // rm-819 (review F1): choke point for the whole insights sidebar —
+    // source/model/cwd/path values are transcript-derived; the line
+    // sanitizer runs here so every current and future field is covered.
     Line::from(vec![
         Span::styled(
             pad_display_width(label, 9),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(value, style),
+        Span::styled(crate::sanitize_line_segment(&value), style),
     ])
 }
 
 fn preview_field(label: &str, value: String) -> Line<'static> {
+    // rm-819: transcript-derived values pass the shared line
+    // sanitizer on their way into the buffer — a poisoned session
+    // name/model/project cannot carry ESC sequences past this point.
     Line::from(vec![
         Span::styled(
             pad_display_width(label, 9),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::raw(value),
+        Span::raw(crate::sanitize_line_segment(&value)),
     ])
 }
 
@@ -2319,11 +2373,15 @@ fn render_timeline_table(frame: &mut Frame<'_>, app: &App, session: &Session, ar
         .skip(start)
         .take(area.height.saturating_sub(4) as usize)
         .map(|step| {
-            let name = short(&step.name, name_width);
-            let status = Cell::from(step.status.clone()).style(step_status_style(&step.status));
+            // rm-819: step names/statuses/kinds come from journal
+            // tool-call data — sanitized before truncation so a hostile
+            // value cannot ride the width clamp into the buffer.
+            let name = short(&crate::sanitize_line_segment(&step.name), name_width);
+            let status = Cell::from(crate::sanitize_line_segment(&step.status))
+                .style(step_status_style(&step.status));
             if compact {
                 Row::new(vec![
-                    Cell::from(step.kind.clone()),
+                    Cell::from(crate::sanitize_line_segment(&step.kind)),
                     Cell::from(name),
                     Cell::from(format_duration(step.duration_sec)),
                     status,
@@ -2344,7 +2402,7 @@ fn render_timeline_table(frame: &mut Frame<'_>, app: &App, session: &Session, ar
                 };
                 Row::new(vec![
                     Cell::from(started),
-                    Cell::from(step.kind.clone()),
+                    Cell::from(crate::sanitize_line_segment(&step.kind)),
                     Cell::from(name),
                     Cell::from(format_duration(step.duration_sec)),
                     status,
