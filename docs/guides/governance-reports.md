@@ -84,7 +84,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 42 and the SQLite snapshot is schema 9; the
+The session cache is schema 52 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -359,7 +359,11 @@ The overview also carries attribution dimensions over the same scope:
   `planning` (everything else). Token totals ride with each bucket.
   This is correlation over tool-mix and failure evidence, not ground
   truth; the cascade is documented and deterministic so two identical
-  sessions always classify identically.
+  sessions always classify identically. On every surface — text,
+  markdown, html, and json — the family renders cost-descending with the
+  task-type name as the tie-break (rm-919: one ordering contract shared
+  with every other group family); alphabetical order is never a render
+  order for `by_task_type`.
 - `top_cost_drivers`: the ranked top sessions by estimated cost, each
   with its share of total spend and its strict possible-driver note
   when one exists. Shares are computed over the full in-scope corpus,

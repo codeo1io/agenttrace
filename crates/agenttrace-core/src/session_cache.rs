@@ -5,7 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 42;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 52;
+// Bumped 52 above the fleet's observed in-flight frontier (census
+// 2026-10-10, this run's review-fix 670753a6: landed under base 15a8da8
+// at 42; origin ea5c41e at 42; family sibling worktrees' uncommitted
+// consts at 43/44/45 — and, earlier in this run's review 543ac419
+// before those worktrees were swept, through 51 — so the mint is
+// conflict-free above every observed claim; a held uncommitted number
+// can still land later, the wall moves mid-run). Reason: run
+// 57c491338818 review 543ac419 F1 — the id-less fold-key namespace
+// (rm-300 U1) changes computed disclosure on journals the fingerprint
+// cannot see: a hostile '#N' wire tool_use_id can no longer alias an
+// id-less fold row (a silently dropped tool_result), fold ordinals are
+// one-per-block emission positions, and a genuine re-fold carries one
+// structural meta carrier (+1 events_total per session with re-folds;
+// this lane has no earlier meta carrier to attach to, review F4). A
+// warm v42 cache would keep serving the pre-fix fold on untouched
+// files forever — this const is the invalidation trigger.
 // Bumped 41 -> 42 (integration of run 14954d7a, "journal truth:
 // contain hostile input, surface hidden wire", rm-880 + rm-406's
 // dated 2026-10-07 arm): Metrics gained two persisted-only fields —

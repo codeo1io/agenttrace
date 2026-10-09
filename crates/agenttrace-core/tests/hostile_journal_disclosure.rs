@@ -659,3 +659,135 @@ fn unknown_usage_key_disclosure_is_bounded_and_sanitized() {
     );
     assert!(key.contains("…#"), "digest form present: {key:?}");
 }
+
+// rm-300 reserved-namespace arm (run 57c491338818 cycle-1 batch, assess F1):
+// the id-less tool_result fold synthesizes its dedup key from the
+// position within the emission; those synthesized keys must never alias a
+// journal-supplied tool_use_id, and any true re-fold must carry a
+// disclosure counter instead of silently dropping the row.
+
+fn claude_user_line(text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "timestamp": "2026-10-08T10:00:00Z",
+        "message": {"role": "user", "content": text}
+    })
+    .to_string()
+}
+
+fn claude_results_line(results: &[(&str, &str)]) -> String {
+    serde_json::json!({
+        "type": "assistant",
+        "timestamp": "2026-10-08T10:00:05Z",
+        "message": {
+            "id": "msg_alias",
+            "model": "claude-sonnet-4-20250514",
+            "content": results.iter().map(|(id, text)| serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": [{"type": "text", "text": text}]
+            })).collect::<Vec<_>>(),
+            "usage": {"input_tokens": 1000, "output_tokens": 50}
+        }
+    })
+    .to_string()
+}
+
+#[test]
+fn idless_fold_key_cannot_alias_wire_tool_use_id() {
+    // Pre-fix PoC (run 57c491338818 assess F1): the id-less row at
+    // position 2 synthesizes key "#2" in the same (message_id, key) set
+    // as the wire tool_use_id "#2" and is silently dropped (1 result /
+    // 3 events instead of 2 / 4, no disclosure).
+    let raw = format!(
+        "{}\n{}",
+        claude_user_line("run the checks"),
+        claude_results_line(&[("#2", "wire result"), ("", "id-less result at position 2")])
+    );
+    let session = parse_raw_session("claude", "hostile-alias.jsonl", &raw)
+        .expect("hostile alias journal parses");
+    assert_eq!(
+        session.metrics.tool_results, 2,
+        "wire '#2' and the id-less row at position 2 are distinct fold keys — both must be counted"
+    );
+    assert_eq!(
+        session.metrics.events_total, 4,
+        "user + assistant + 2 tool_results"
+    );
+    // and nothing folds on this input, so no refold disclosure fires
+    assert!(
+        !session
+            .metrics
+            .disclosure_counters
+            .keys()
+            .any(|k| k.starts_with("tool_result_refold:")),
+        "distinct-key input must not fabricate a refold disclosure"
+    );
+}
+
+#[test]
+fn refolded_tool_results_carry_disclosure_counters() {
+    // Genuine re-emission: the same (message_id, wire tool_use_id)
+    // arriving on a second assistant line folds away — the drop must be
+    // disclosed, never silent (every-drop-disclosed discipline).
+    let line = claude_results_line(&[("call_dup", "first emission")]);
+    let raw = format!("{}\n{}\n{}", claude_user_line("run the checks"), line, line);
+    let session =
+        parse_raw_session("claude", "refold.jsonl", &raw).expect("re-emitted journal parses");
+    assert_eq!(
+        session.metrics.tool_results, 1,
+        "a true duplicate (message_id, tool_use_id) still folds exactly once"
+    );
+    let refolds: usize = session
+        .metrics
+        .disclosure_counters
+        .iter()
+        .filter(|(k, v)| k.starts_with("tool_result_refold:") && **v > 0)
+        .map(|(_, v)| *v)
+        .sum();
+    assert_eq!(
+        refolds, 1,
+        "the folded duplicate must be disclosed via tool_result_refold:* counters, got {:?}",
+        session.metrics.disclosure_counters
+    );
+}
+
+#[test]
+fn idless_refold_labels_are_emission_positions() {
+    // F3 (review 543ac419): fold ordinals are one-per-block emission
+    // positions. A re-emitted three-id-less-block message folds all
+    // three duplicates and must disclose them as "#1"/"#2"/"#3" —
+    // the pre-fix double increment labeled all-id-less streams
+    // #1/#3/#5 (and a wire id between two id-less rows shifted the
+    // next label by 2), so this arm pins the corrected semantics.
+    let line = claude_results_line(&[
+        ("", "first id-less result"),
+        ("", "second id-less result"),
+        ("", "third id-less result"),
+    ]);
+    let raw = format!("{}\n{}\n{}", claude_user_line("run the checks"), line, line);
+    let session = parse_raw_session("claude", "idless-refold.jsonl", &raw)
+        .expect("re-emitted journal parses");
+    assert_eq!(
+        session.metrics.tool_results, 3,
+        "a re-emission that repeats id-less blocks in order folds away exactly"
+    );
+    let mut labels: Vec<&str> = session
+        .metrics
+        .disclosure_counters
+        .iter()
+        .filter(|(k, v)| k.starts_with("tool_result_refold:") && **v > 0)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    labels.sort_unstable();
+    assert_eq!(
+        labels,
+        vec![
+            "tool_result_refold:#1",
+            "tool_result_refold:#2",
+            "tool_result_refold:#3",
+        ],
+        "id-less refold labels are emission positions (one increment per block), got {:?}",
+        session.metrics.disclosure_counters
+    );
+}

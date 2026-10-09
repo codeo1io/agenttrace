@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed
+
+- Session cache bumped to schema 52 (from 42): id-less tool_result fold
+  keys no longer share a dedup namespace with wire tool_use_ids (a
+  hostile `"#N"` id could alias an id-less fold row and silently drop
+  its tool_result), fold ordinals are one-per-block emission positions,
+  and genuine re-folds emit one structural meta disclosure carrier
+  (+1 `events_total` per session with re-folds) — warm pre-bump caches
+  regenerate on next scan instead of serving the stale fold (review
+  543ac419 F1/F4 → fix 670753a6; `by_task_type` html band ordering
+  acceptance made loud — a missing/reordered band now fails instead of
+  passing vacuously, review F2).
+- `--overview` `By Task Type` now renders cost-descending on text,
+  markdown, and html like every sibling family and the json lane
+  (rm-919; alphabetical order was never a render order).
+- `--doctor <PATH>` honors the positional path as its scan scope
+  instead of silently walking the default corpus homes (rm-439 arm;
+  the 49,457-file default walk hung ~25s with zero output).
+
 ### Added
 
 - The session cache entry bound is configurable and disclosed (rm-298 residual capacity arm, run 3e6e5de0 cycle 1): `session_cache_entries` in the config file outranks `AGENTTRACE_SESSION_CACHE_ENTRIES` (parse-fail ignored, best-effort like every AGENTTRACE_*), both clamp to the 1..=1,000,000 band (default 20,000 unchanged; no schema bump rides this arm — the cache shape is untouched and SESSION_CACHE_SCHEMA_VERSION stays at its landed ceiling, 41 after this integration's rm-520 rebase), and `--doctor` reports the effective bound, where it came from (`default|config file|env`), and how many sessions the last scan re-parsed (release probe on the 25,889-file corpus: 20000/default/19414). The `--config` disclosure shows the same clamped effective value and annotates `clamped from <raw>` when the configured value was out of band.

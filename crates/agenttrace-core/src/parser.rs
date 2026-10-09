@@ -4201,7 +4201,19 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // final state — instead of once per streamed block.
     let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
     let mut assistant_by_message: BTreeMap<String, usize> = BTreeMap::new();
-    let mut tool_results_by_message: BTreeSet<(String, String)> = BTreeSet::new();
+    // rm-300 reserved-namespace arm (run 57c491338818): the fold keys for
+    // journal-supplied tool_use_ids and for synthesized id-less rows are
+    // structurally disjoint enum variants — a hostile wire id literally
+    // "#2" can never alias the id-less row at ordinal 2, and a true
+    // re-fold is disclosed via `tool_result_refold:*` counters instead of
+    // silently dropping the row.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum ToolResultFoldKey {
+        Wire(String),
+        Idless(usize),
+    }
+    let mut tool_results_by_message: BTreeSet<(String, ToolResultFoldKey)> = BTreeSet::new();
+    let mut tool_result_refolds: BTreeMap<String, i64> = BTreeMap::new();
     // rm-406 (dated 2026-10-07 arm): message ids whose usage.iterations[]
     // array was already mined — the streaming re-emission problem rm-601
     // solved for top-level usage applies to the iterations array verbatim
@@ -4351,15 +4363,25 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                                 string(block.get("tool_use_id")).unwrap_or("").to_string();
                             let message_id = string(message.get("id")).unwrap_or("");
                             tool_result_ordinal += 1;
-                            let dedup_key = if tool_use_id.is_empty() {
-                                format!("#{tool_result_ordinal}")
+                            let idless = tool_use_id.is_empty();
+                            let ordinal = tool_result_ordinal;
+                            let dedup_key = if idless {
+                                ToolResultFoldKey::Idless(ordinal)
                             } else {
-                                tool_use_id.clone()
+                                ToolResultFoldKey::Wire(tool_use_id.clone())
                             };
                             if !message_id.is_empty()
                                 && !tool_results_by_message
                                     .insert((message_id.to_string(), dedup_key))
                             {
+                                let label = if idless {
+                                    format!("#{ordinal}")
+                                } else {
+                                    tool_use_id.clone()
+                                };
+                                *tool_result_refolds
+                                    .entry(disclosure_key("tool_result_refold", &label))
+                                    .or_insert(0) += 1;
                                 continue;
                             }
                             events.push(Event {
@@ -4436,6 +4458,25 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             }
             _ => {}
         }
+    }
+    // One-carrier note (review 543ac419 F4): this Claude lane mints no
+    // earlier meta carrier in this parser — the insert below is the
+    // lane's ONLY meta event, and it carries every refold counter on
+    // that single event (the one-carrier shape of the discipline used
+    // for header disclosures). The events_total consequence is
+    // structural and disclosed: +1 event for a session with genuine
+    // re-folds, +0 otherwise, once regardless of how many rows
+    // re-fold — named in the SESSION_CACHE_SCHEMA_VERSION ladder entry
+    // for 52 alongside the rm-300 U1 arm.
+    if !tool_result_refolds.is_empty() {
+        events.insert(
+            0,
+            Event {
+                role: "meta".to_string(),
+                disclosure_counters: std::mem::take(&mut tool_result_refolds),
+                ..Event::default()
+            },
+        );
     }
     if saw_claude {
         non_empty(events)
