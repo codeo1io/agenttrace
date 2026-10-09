@@ -107,10 +107,10 @@ fn qwen_multi_result_usage_accumulates_per_turn() {
 /// skips at confidence "high", and of v32 totals undercounted by the
 /// pre-rm-711 parsers.
 #[test]
-fn warm_cache_replays_cold_disclosure_and_schema_41_invalidates_v32() {
+fn warm_cache_replays_cold_disclosure_and_schema_45_invalidates_v32() {
     assert_eq!(
-        SESSION_CACHE_SCHEMA_VERSION, 41,
-        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834 report-truthfulness stream-fold integration, to 40 at the rm-585/rm-730 honest-attribution integration, and to 41 at the rm-520/rm-521 recorded-cost-basis integration (run ac14e52c, conflict case c1c77f5e), so this assert pins the live constant)"
+        SESSION_CACHE_SCHEMA_VERSION, 45,
+        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834 report-truthfulness stream-fold integration, to 40 at the rm-585/rm-730 honest-attribution integration, to 41 at the rm-520/rm-521 recorded-cost-basis integration (run ac14e52c, conflict case c1c77f5e), to 42 at the fleet master (integration 181630e, run 14954d7a — not in this tree's base), to 43 at the rm-617/rm-899 truthful-accounting integration (run 33b7b7b5), and to 44 at the origin-43 collision re-base (independent-review 9fb0a017 F1: origin landed 43 under fabd9fb8/rm-831 on 2026-10-09 16:55Z, descending from this base — re-based at review-fix ed90e5ec so this tree stays unique below the uncommitted sibling frontier 49/50), and to 45 at the second origin-collision re-base (independent-review-fix b5b9c6fc: origin/master landed 44 under fb1addd56503 — merge b917ff7, 2026-10-09 18:41:12Z, landing 03dc231, concurrent with the ed90e5ec mint and descending from this base — while siblings hold uncommitted 44/49/51 and no spool patch claims 45; 45 is the lowest rung unique above the landed ceiling), so this assert pins the live constant)"
     );
     let root = std::env::temp_dir().join(format!(
         "agenttrace-contract-warmcold-{}",
@@ -156,7 +156,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_41_invalidates_v32() {
     );
 
     // Stale-schema leg: degrade the persisted file to schema 32 (what a
-    // pre-bump cache looks like) — it must not be served at 41.
+    // pre-bump cache looks like) — it must not be served at 43.
     let cache_file = session_cache_path();
     let raw = fs::read_to_string(&cache_file).expect("cache file exists");
     let mut degraded: Value = serde_json::from_str(&raw).expect("cache file is JSON");
@@ -165,7 +165,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_41_invalidates_v32() {
     let mut stale_cache: SessionCache = load_session_cache();
     assert!(
         cached_session(&journal, &mut stale_cache).is_none(),
-        "rm-710: a schema-32 entry must not be served at the live schema ceiling (41 at this tree)"
+        "rm-710: a schema-32 entry must not be served at the live schema ceiling (45 at this tree, re-based twice at review-fix — ed90e5ec after origin landed fabd9fb8's 43, then b5b9c6fc after origin landed fb1addd56503's 44)"
     );
 
     std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");

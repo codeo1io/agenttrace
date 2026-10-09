@@ -177,3 +177,36 @@ fn copilot_later_checkpoint_still_ends_the_session() {
     assert_eq!(session.metrics.session_end, "2026-01-04T00:00:30Z");
     assert_eq!(session.metrics.duration_sec, 30.0);
 }
+
+/// rm-617: the rollout arm's compaction-paired `token_usage_record` fold
+/// saturated `output_tokens` by `reasoning_output_tokens` — the exact
+/// overstatement the landed rm-603 breakdown (this file, above) removed
+/// from the token_count lane. The landed lane's own comment names this
+/// port: "The OLD rollout parser also saturated output by
+/// reasoning_output_tokens — an overstatement we now know was wrong;
+/// rm-617 tracks the port of this breakdown to the rollout arm."
+/// Fixture: reasoning 120 rides ALONGSIDE output 300 on the paired
+/// record, so the old arm billed 420 output tokens.
+#[test]
+fn codex_rollout_record_reasoning_is_a_breakdown_not_an_addition() {
+    let session = fixture("codex-rollout-compaction-reasoning.jsonl");
+    assert_eq!(session.metrics.source_tool, "codex_cli");
+    assert_eq!(
+        session.metrics.tokens_output, 300,
+        "reasoning_output_tokens is a breakdown of output_tokens on Codex \
+         rollout records too, never an addition (old rollout arm: 300+120=420)"
+    );
+    assert_eq!(
+        session.metrics.tokens_reasoning, 120,
+        "the breakdown stays visible on its own reasoning_tokens line, \
+         same as the rm-603 token-count lane"
+    );
+    assert_eq!(
+        session.metrics.tokens_input, 300,
+        "500 input minus 200 cached"
+    );
+    assert_eq!(
+        session.metrics.tokens_cache_r, 200,
+        "cached input tokens arrive on the cache-read arm"
+    );
+}

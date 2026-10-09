@@ -28,8 +28,11 @@
 //! upstream #312): the post-compaction rewound snapshot now COUNTS once as
 //! its own distinct cumulative total (its last_token_usage is the fresh
 //! call's billed usage; the old rm-162/#286 high-water refusal was an
-//! undercount), and rm-603 keeps the record lane's reasoning fold while the
-//! token_count lane reports reasoning as its own breakdown line.
+//! undercount). Dated change 2026-10-09 (rm-617, upstream #312's
+//! +64%-output evidence): the record lane no longer folds reasoning into
+//! output — `reasoning_output_tokens` is a breakdown of `output_tokens`
+//! on rollout records, so it rides its own reasoning line (the token_count
+//! lane has done so since rm-603).
 
 use agenttrace_core::parse_raw_session;
 use std::fs;
@@ -84,27 +87,33 @@ fn remote_compaction_usage_is_counted_after_the_fix() {
     //
     //   pre-fix agenttrace report   in 1000 / cache   0 / out 200 / rea   0
     //   rm-304/rm-401 pin            in 1700 / cache 800 / out 620 / rea   0
-    //   rm-554 pin (this, 2026-10-06) in 2300 / cache 800 / out 720 / rea   0
+    //   rm-554 pin (2026-10-06)      in 2300 / cache 800 / out 720 / rea   0
+    //   rm-617 pin (this, 2026-10-09) in 2300 / cache 800 / out 600 / rea 120
     //
     // The compaction turn's record is counted once in the parser's codex
     // decomposition: net input 1500-800=700 beside turn 1's 1000, cache_read
-    // 800 tracked separately, output 300 with reasoning 120 folded in (420
-    // beside turn 1's 200). Dated pin change 2026-10-06 (rm-554, upstream
-    // #312): the post-compaction token_count snapshot is a DISTINCT
+    // 800 tracked separately, output 300 as billed (turn 1's 200 plus the
+    // post-compaction 100) with reasoning 120 on its own breakdown line.
+    // Dated pin change 2026-10-06 (rm-554, upstream #312): the
+    // post-compaction token_count snapshot is a DISTINCT
     // cumulative total whose `last_token_usage` (600 in / 100 out) is the
     // fresh call's billed usage — the compacted context is re-sent after
     // the reset — so the old rm-162/#286 high-water refusal of that whole
     // window was an undercount, not a guard. It now counts once; the
-    // turn-1 and record rows above are unchanged. Dropping back to either
-    // earlier row is exactly the regression this pin exists to catch.
+    // turn-1 and record rows above are unchanged. Dated pin change
+    // 2026-10-09 (rm-617, upstream #312): the record lane's reasoning fold
+    // is removed — output no longer carries the double-added 120 (the
+    // exact overstatement rm-617 exists to remove); dropping back to
+    // either earlier row is exactly the regression this pin exists to
+    // catch.
     let reported = parse_fixture("remote-compaction.jsonl");
     assert_eq!(
         reported,
         Usage {
             input: 2300,
             cache_r: 800,
-            output: 720,
-            reasoning: 0,
+            output: 600,
+            reasoning: 120,
         }
     );
     eprintln!(

@@ -3018,8 +3018,47 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 /// every report — including this markdown/html family. Entity escaping
 /// here stays as defense-in-depth; the two layers compose because the
 /// document sanitizer is idempotent.
+/// rm-897: neutralizes spreadsheet-formula introducers in a markdown table
+/// cell, mirroring the landed rm-540 CSV guard (agenttrace-cli
+/// `csv_export.rs::guard_formula`) arm for arm. The numeric exemption is
+/// judged FIRST on the whole trimmed cell (`-42.50`, `+1e3`, `" -1.5"` stay
+/// bare so numeric columns import as values); then a cell whose first
+/// NON-WHITESPACE character is an introducer — `=`, `+`, `@`, `-`, or their
+/// fullwidth forms U+FF1D/U+FF0B/U+FF20/U+FF0D, which spreadsheet apps
+/// normalize to the ASCII meaning — gets a leading `'`, the same paste-in
+/// marker the CSV lane emits. A transcript-derived key (gitBranch under
+/// rm-585, session name, model) can then never re-arm `=HYPERLINK`/`=cmd|'`
+/// payloads when the markdown report is pasted into a spreadsheet; the
+/// false-positive cost (a leading apostrophe on benign `-` bullets) is the
+/// same trade the CSV lane accepted — guarding is the safe direction.
+fn guard_formula_cell(value: &str) -> String {
+    if value.trim().parse::<f64>().is_ok() {
+        return value.to_string();
+    }
+    let starts_introducer = value
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|first| {
+            matches!(
+                first,
+                '=' | '+'
+                    | '@'
+                    | '-'
+                    | '\u{FF1D}' // FULLWIDTH EQUALS SIGN
+                    | '\u{FF0B}' // FULLWIDTH PLUS SIGN
+                    | '\u{FF20}' // FULLWIDTH COMMERCIAL AT
+                    | '\u{FF0D}' // FULLWIDTH HYPHEN-MINUS
+            )
+        });
+    if starts_introducer {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    }
+}
+
 fn markdown_cell(value: &str) -> String {
-    value
+    guard_formula_cell(value)
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

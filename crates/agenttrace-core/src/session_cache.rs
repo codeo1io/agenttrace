@@ -5,7 +5,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 41;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 45;
+// Bumped 41 -> 45 (run 33b7b7b5, cycle-1 "truthful accounting, honest
+// surfaces" batch, rm-617 LEAD 'codex rollout reasoning breakdown' +
+// rm-899 'aider DST-ambiguous starts'; the fleet master meanwhile took
+// 42 at integration 181630e (run 14954d7a), which is not in this
+// tree's base 9c3c599, so the batch first minted 43 directly above the
+// landed ceiling — then review 9fb0a017 F1 (2026-10-10) caught origin
+// landing 43 under fabd9fb8 (rm-831 hostile-value work, 2026-10-09
+// 16:55Z, descendant of this base), a real collision; re-based to 44
+// at review-fix ed90e5ec per the moving-wall census (origin 43 landed;
+// sibling uncommitted 49/50 held above; 44 unique below the frontier)
+// — then attempt b5b9c6fc's fresh moving-wall census (2026-10-10)
+// found origin/master had LANDED 44 under fb1addd56503 (merge b917ff7,
+// 2026-10-09 18:41:12Z, landing 03dc231 — concurrent with the
+// ed90e5ec mint, descending from this base), re-colliding the rung:
+// re-based to 45, the lowest rung unique above the landed ceiling
+// (live census: origin 44 landed; siblings uncommitted 44
+// (run-472afca2), 49, 51; no spool patch claims 45): (a) the codex
+// rollout record arm stopped folding
+// reasoning_output_tokens into billed output — a warm v41 entry keeps
+// serving the overstated tokens_output (and zero tokens_reasoning) for
+// every unchanged rollout journal, exactly the double-add rm-617
+// removes; (b) aider_time now resolves DST-ambiguous local starts with
+// earliest() instead of degrading them to an empty session_start — a
+// warm v41 entry pins the pre-fix empty start for unchanged aider
+// journals. Rendering-only fixes in the same batch (rm-897 markdown
+// formula cells, rm-898 bounded statusline reads) do not touch cached
+// Metrics and ride no rung. No migration can reconstruct either
+// correction from stale entries (rm-230 convention: parser-semantics
+// changes that alter the served report bump the schema so cached
+// sessions regenerate). Entries regenerate once on next scan.
 // Bumped 40 -> 41 (integration of run ac14e52c, cycle-1 "governance
 // audit truthfulness" batch, rm-520 LEAD + rm-521 rider; conflict case
 // c1c77f5e076549f1aadd7f3e4e12c32c): Metrics now persist which token

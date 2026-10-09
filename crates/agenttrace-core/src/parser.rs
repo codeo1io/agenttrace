@@ -1874,9 +1874,20 @@ fn flush_aider_event(
 }
 
 fn aider_time(value: &str) -> String {
+    // rm-899: `.single()` returned None for a fall-back-ambiguous local
+    // time (DST repeat hour), silently degrading the session start to an
+    // empty string on valid input. Policy: resolve the ambiguity with
+    // `LocalResult::earliest()` — deterministic, never empty for a
+    // parseable wall clock, and it never invents a time that did not
+    // exist (the spring-forward gap still yields None → empty, as
+    // before). Note the arm chrono 0.4.45 actually returns at a
+    // fall-back is the smaller-offset one (its tz_info backend orders
+    // the ambiguous pair by offset, not by instant); the contract
+    // pinned by the tests is deterministic-and-real, not which of the
+    // two repeat-hour instants wins.
     chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
         .ok()
-        .and_then(|ts| ts.and_local_timezone(chrono::Local).single())
+        .and_then(|ts| ts.and_local_timezone(chrono::Local).earliest())
         .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
         .unwrap_or_default()
 }
@@ -3574,24 +3585,35 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             .copied()
             .unwrap_or(0);
         let input = (record.usage.get("input_tokens").copied().unwrap_or(0) - cache_read).max(0);
-        let output = record
+        // rm-617 (2026-10-09): remove the reasoning fold from the rollout
+        // arm — on Codex `token_usage_record` rows `reasoning_output_tokens`
+        // is a BREAKDOWN of `output_tokens` (OpenAI Responses usage
+        // semantics; upstream #312's fix table cites 1166/1166 real rollout
+        // files with output over-counted by +64%), never an addition, so
+        // the old `saturating_add` overstated billed output. The landed
+        // rm-603 breakdown left THIS arm folding on purpose (its comment
+        // below says so verbatim); this row supersedes that choice. Keep
+        // reasoning on its own `reasoning_tokens` line so it stays visible
+        // (CU-20 output-rate convention, same as the token_count arm) and
+        // do NOT fold it into output — contrast the qwen lane above, whose
+        // thinking tokens are genuinely reported separately and stay
+        // folded. No arithmetic remains in this arm, so the rm-162
+        // saturating discipline now applies to the callers' sums only.
+        let output = record.usage.get("output_tokens").copied().unwrap_or(0);
+        let reasoning = record
             .usage
-            .get("output_tokens")
+            .get("reasoning_output_tokens")
             .copied()
-            .unwrap_or(0)
-            .saturating_add(
-                record
-                    .usage
-                    .get("reasoning_output_tokens")
-                    .copied()
-                    .unwrap_or(0),
-            );
-        let usage = BTreeMap::from([
+            .unwrap_or(0);
+        let mut usage = BTreeMap::from([
             ("input_tokens".to_string(), input),
             ("output_tokens".to_string(), output),
             ("cache_creation_input_tokens".to_string(), cache_write),
             ("cache_read_input_tokens".to_string(), cache_read),
         ]);
+        if reasoning > 0 {
+            usage.insert("reasoning_tokens".to_string(), reasoning);
+        }
         events.push(Event {
             role: "meta".to_string(),
             timestamp: record.timestamp.clone(),
@@ -3794,6 +3816,10 @@ fn codex_token_count_usage(
     // on its own reasoning_tokens line (billed at the output rate by CU-20
     // convention, visible in the metrics breakdown); the rm-401
     // token_usage_record lane below keeps its deliberate fold.
+    // (Superseded 2026-10-09, rm-617: the rollout token_usage_record arm
+    // no longer folds — it breaks reasoning out exactly like this lane;
+    // the "deliberate fold" clause above is rm-603-era history, kept for
+    // the record.)
     let output = counts.get("output_tokens").copied().unwrap_or(0);
     let reasoning = counts.get("reasoning_output_tokens").copied().unwrap_or(0);
 
@@ -7995,7 +8021,13 @@ mod tests {
         // 1000 from the snapshot + 700 net from the record, exactly once.
         assert_eq!(session.metrics.tokens_input, 1_700);
         assert_eq!(session.metrics.tokens_cache_r, 800);
-        assert_eq!(session.metrics.tokens_output, 620);
+        // rm-617: the record's output_tokens (300) already CONTAINS its
+        // reasoning_output_tokens (120) on the OpenAI wire — the old
+        // rollout fold billed 300+120=420 (200+420=620 total), the exact
+        // overstatement this row removes; reasoning now rides its own
+        // line instead of inflating output.
+        assert_eq!(session.metrics.tokens_output, 500);
+        assert_eq!(session.metrics.tokens_reasoning, 120);
         assert_eq!(
             session
                 .metrics
@@ -8139,5 +8171,66 @@ mod tests {
         );
         assert_eq!(lane(None), None);
         assert_eq!(lane(Some(&Value::Bool(true))), None);
+    }
+
+    #[test]
+    fn aider_time_resolves_dst_ambiguity_deterministically() {
+        // rm-899: aider chat histories carry LOCAL wall-clock starts
+        // ("# aider chat started at 2026-11-01 01:30:00"). During a
+        // fall-back repeat hour that wall clock maps to TWO instants;
+        // the old `.single()` returned None for the ambiguity and the
+        // session start silently degraded to an empty string on valid
+        // input. Policy (pinned here): resolve ambiguity to the EARLIEST
+        // arm — deterministic, never empty for a parseable wall clock,
+        // and it never invents an instant that did not exist (the
+        // spring-forward gap still yields the empty string, as before).
+        // chrono caches the local zone and only re-reads TZ once its
+        // cache is older than a second, so the sleeps below force the
+        // swap to be observed; the shared env lock keeps the process-
+        // wide mutation serialized (aider_time is the only
+        // chrono::Local user in this crate, so nothing else can poison
+        // the cache first).
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("TZ");
+        std::env::set_var("TZ", "America/New_York");
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        // Fall-back repeat hour (2026-11-01 01:30 happens twice: EDT
+        // -04:00 at 05:30Z, then EST -05:00 at 06:30Z). chrono 0.4.45's
+        // tz_info backend orders MappedLocalTime::Ambiguous by OFFSET
+        // (smaller first), so `earliest()` picks the EST arm — the pin
+        // below records that observed behavior on purpose: what rm-899
+        // guarantees is a DETERMINISTIC, REAL instant (never empty on
+        // valid input), and a chrono upgrade that flips the chosen arm
+        // must surface HERE for review, not drift silently.
+        assert_eq!(
+            aider_time("2026-11-01 01:30:00"),
+            "2026-11-01T01:30:00-05:00",
+            "ambiguous fall-back wall clock resolves deterministically to a \
+             real instant, never an empty start"
+        );
+        // Unambiguous control: regular EDT instant keeps rendering the
+        // same way it always did.
+        assert_eq!(
+            aider_time("2026-06-15 12:00:00"),
+            "2026-06-15T12:00:00-04:00"
+        );
+        // Spring-forward gap (2026-03-08 02:30 never happened in
+        // America/New_York) — no invented instant, empty string stands.
+        assert_eq!(
+            aider_time("2026-03-08 02:30:00"),
+            "",
+            "a nonexistent wall clock still yields no invented instant \
+             (the CHANGELOG's 'a spring-forward gap still yields no invented \
+             instant' sentence pins HERE — review 9fb0a017 F4 verified this \
+             arm present and tightened the message to make it discoverable)"
+        );
+        // Unparseable input stays empty (pre-existing behavior).
+        assert_eq!(aider_time("not a timestamp"), "");
+        match prior {
+            Some(value) => std::env::set_var("TZ", value),
+            None => std::env::remove_var("TZ"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        drop(_env);
     }
 }
