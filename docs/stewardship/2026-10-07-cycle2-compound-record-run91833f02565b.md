@@ -77,3 +77,35 @@ Tooling note recorded for the fleet: one edit-tool "success" on `agenttrace-tui/
 - CHANGELOG entries land with the merge per lineage convention (fd5532f/1e1eb66 precedent), not minted at compound. The Unreleased/Fixed entry should name both the alias/fold and the schema-28 invalidation (review fix F1).
 - Session-cache schema: **bumped 27→28 at review fix 9e2227b4** — the compound-time claim that no bump was owed was WRONG (review f6b98bc3 F1 PoC: a cache warmed by the pre-fix binary served `default`/1/1 verbatim under matching size/mtime fingerprints — no re-parse, no self-heal). A later sibling bump (e.g. the unlanded 7f9c6d24 band's 26→27) re-bases onto 28 per the rm-230 convention — one invalidation either way, the higher number wins at merge.
 - Integration will likely have to rebase this wall band (rm-616..619) numerals past the contested space — renumber by TITLE, keep this record's campaign numerals as dated provenance.
+
+---
+
+## Correction (appended 2026-10-09, run feb16bba cycle 2)
+
+This record's "Retest (targeted, this turn): core 329/0" is faithful
+to the lane it was written in, not to the merged tree: at the recorded
+integration (86c4eb4, the rm-616 landing) the FULL workspace battery
+was RED — `hostile_journal_disclosure::relocated_usage_keys_disclose_instead_of_silent_zero`
+failed its len()==2 pin because the landed rm-616 review fix F3 fires
+`usage_present_not_counted` beside meta usage (the cycle-2 adversarial
+assess measured 605 passed / 1 failed on the merged tree). The tree
+stayed red until integration re-pinned that test (e249a10,
+2026-10-07 21:47:03Z) to
+len()==3 with the beside-meta counter asserted (conflict case
+15bdfe5f, `e249a10` on the landed wall). Recorded here as a dated
+append rather than an edit of the gate lines above: they say what that
+turn saw, and this says what the merged tree actually was.
+
+Cycle 2 (run feb16bba, rm-856 'journal-truth composition repair')
+adopts that re-pin at its base (96b528e) so the battery this record
+speaks for is green there again, and closes the adjacent gap that
+battery could not see: a generic-lane session that also carries usage
+on a meta-role line previously folded BOTH lanes into its totals (the
+assess PoC: meta 100/50 + assistant 7/3 → total_tokens 160, no
+disclosure). With meta usage present the meta arm is now the counted
+lane — the native-family precedent
+`stray_conversation_usage_disclosed_beside_meta_usage` — the generic
+fold stands down, and the stood-down lines disclose via
+`usage_present_not_counted`. Session-cache schema 33 → 34 (rm-230
+convention) so warm caches regenerate under the corrected totals; the
+governance guide's schema sentence moved with it.

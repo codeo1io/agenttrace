@@ -21,6 +21,13 @@
 //! Red-first fixtures c2.json / c-generic.json are the PoC corpus from
 //! the adversarial assessment (pre-fix: model 'default', tokens 1/1
 //! and 2/2 against journal truth gpt-5 {7,3}) preserved verbatim.
+//! rm-856 fixtures rm-856-composition/double{,-reversed}.json are the
+//! cycle-2 assessment's double-count PoC shape, reconstructed from the
+//! recorded assessment (the /tmp original was swept; stewardship record
+//! L4) — meta 100/50 +
+//! assistant 7/3 folded to total_tokens 160 with NO disclosure) plus
+//! the same shape with the meta line last, pinning the composition
+//! policy and its order-independence.
 
 use agenttrace_core::parse_file;
 use std::fs;
@@ -28,6 +35,11 @@ use std::path::PathBuf;
 
 const C2: &str = include_str!("fixtures/rm-616-generic/c2.json");
 const C_GENERIC: &str = include_str!("fixtures/rm-616-generic/c-generic.json");
+const DOUBLE: &str = include_str!("fixtures/rm-856-composition/double.json");
+const DOUBLE_REVERSED: &str = include_str!("fixtures/rm-856-composition/double-reversed.json");
+const META_SWITCH: &str = include_str!("fixtures/rm-856-composition/meta-switch.json");
+const META_SWITCH_NO_USAGE: &str =
+    include_str!("fixtures/rm-856-composition/meta-switch-nousage.json");
 
 fn write(tag: &str, raw: &str) -> PathBuf {
     // Review fix F4: pid-qualify and let the caller remove, so two
@@ -195,6 +207,98 @@ fn stray_conversation_usage_disclosed_beside_meta_usage() {
     assert_eq!(
         session.metrics.line_skips.get("usage_present_not_counted"),
         Some(&1)
+    );
+}
+
+#[test]
+fn meta_usage_makes_the_meta_arm_the_counted_lane_not_a_double_count() {
+    // rm-856 composition pin (red-first): a generic-lane session that
+    // ALSO carries usage on a meta-role line previously folded BOTH
+    // lanes into the same totals — the cycle-2 assess PoC (meta 100/50
+    // + assistant 7/3 -> total_tokens 160) with no disclosure, because
+    // the rm-616 generic fold and the meta arm saturating_add side by
+    // side. The native-lane precedent
+    // (`stray_conversation_usage_disclosed_beside_meta_usage`) is the
+    // policy: when meta usage is present it IS the session's counted
+    // lane — the meta block already aggregates the conversation — so
+    // the generic fold stands down and the conversation line's usage
+    // discloses beside it instead of double-counting.
+    let session = session("double", DOUBLE);
+    assert_eq!(session.metrics.source_tool, "generic");
+    assert_eq!(session.metrics.model_used, "gpt-5");
+    assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+    assert_eq!(
+        session.metrics.tokens_input, 100,
+        "meta-only totals: the conversation line's 7 must not add on top"
+    );
+    assert_eq!(
+        session.metrics.tokens_output, 50,
+        "meta-only totals: the conversation line's 3 must not add on top"
+    );
+    assert_eq!(
+        session.metrics.line_skips.get("usage_present_not_counted"),
+        Some(&1),
+        "the stood-down line discloses beside the meta aggregate: {:?}",
+        session.metrics.line_skips
+    );
+    assert_eq!(
+        session.metrics.line_skips.len(),
+        1,
+        "exactly the composition disclosure, nothing else: {:?}",
+        session.metrics.line_skips
+    );
+}
+
+#[test]
+fn meta_usage_composition_is_order_independent() {
+    // Same composition with the meta-role line LAST: the counted-lane
+    // decision is a whole-slice pre-scan (`has_meta_usage`), so it
+    // cannot depend on where the meta line sits — a per-event gate
+    // would fold the earlier conversation line before ever seeing the
+    // meta usage and still double-count.
+    let session = session("double-reversed", DOUBLE_REVERSED);
+    assert_eq!(session.metrics.source_tool, "generic");
+    assert_eq!(session.metrics.model_used, "gpt-5");
+    assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_output, 50);
+    assert_eq!(
+        session.metrics.line_skips.get("usage_present_not_counted"),
+        Some(&1)
+    );
+    assert_eq!(session.metrics.line_skips.len(), 1);
+}
+
+#[test]
+fn per_block_pricing_stands_down_generic_lines_under_meta_usage() {
+    // Review-fix pin (independent review F3, red-first): when a meta-role
+    // line carries model attribution different from the session's, the
+    // multi-model per-block pricing arm fires — and it used to price the
+    // STOOD-DOWN generic conversation block on top of the meta block:
+    // tokens disclosed-not-counted but cost counted, the exact class
+    // rm-856 closes. Catalog-independent reference: the same journal
+    // with NO usage on the conversation line prices the meta block alone,
+    // so the composition session's cost must equal it to the cent —
+    // pre-fix it is reference + price(gpt-4o, 7, 3).
+    let sess = session("meta-switch", META_SWITCH);
+    let reference = session("meta-switch-nousage", META_SWITCH_NO_USAGE);
+    assert_eq!(sess.metrics.source_tool, "generic");
+    assert_eq!(sess.metrics.tokens_input, 100);
+    assert_eq!(sess.metrics.tokens_output, 50);
+    assert_eq!(
+        sess.metrics.line_skips.get("usage_present_not_counted"),
+        Some(&1),
+        "the stood-down conversation line still discloses: {:?}",
+        sess.metrics.line_skips
+    );
+    assert_eq!(
+        sess.metrics.provenance.cost, "calculated_per_message_tokens",
+        "post-fix this shape takes the CATALOG arm: usage_models joins only counted lanes, so the stood-down gpt-4o attribution leaves the inventory and the journal prices as the single meta model (pre-fix the multi-model arm fired and priced BOTH blocks — the 0.00087075 red)"
+    );
+    assert_eq!(
+        sess.metrics.cost_estimated, reference.metrics.cost_estimated,
+        "the stood-down block must contribute NOTHING to cost: got {:?} vs reference {:?}",
+        sess.metrics.cost_estimated, reference.metrics.cost_estimated
     );
 }
 
