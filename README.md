@@ -336,7 +336,15 @@ the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
 variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
 discloses the bound actually in force, which layer supplied it, and how
 many session files the last scan re-parsed from source instead of the
-cache. Cache files are written owner-only (`0600` on Unix) and
+cache. Session journal ingestion is bounded and disclosed too: any
+single session file larger than the admission cap (default 256 MiB,
+overridable via `AGENTTRACE_MAX_SESSION_FILE_BYTES`) is skipped before it
+is read — bounded memory on huge journals — and the skip is never silent:
+the load report counts it (`data_health.oversize_session_files_skipped`,
+separate from parse failures), report runs print a one-line advisory naming
+the first skipped file and the deliberate raise escape hatch, and a corpus
+where every file is over the cap fails with that reason instead of an
+empty overview (rm-700). Cache files are written owner-only (`0600` on Unix) and
 compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
 load reclaims if a crash leaves one behind (see PRIVACY.md). The command
 never fails the host — bad or empty input still

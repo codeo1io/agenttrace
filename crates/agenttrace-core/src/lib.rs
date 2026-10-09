@@ -58,7 +58,10 @@ pub use insights::{
     SessionComparison, SourceScope, TimeRange,
 };
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
-pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
+pub use parser::{
+    parse_file, parse_file_capped, parse_raw_session, parse_stdin_bytes,
+    DEFAULT_MAX_SESSION_FILE_BYTES, OVERSIZE_SESSION_PREFIX,
+};
 pub use pricing::{
     list_pricing, lookup_price, pricing_cache_path, pricing_source, pricing_source_for,
     render_model_pricing_list, render_test_match, update_pricing,
@@ -1273,6 +1276,16 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         tool_authority: BTreeMap::new(),
         ..Metrics::default()
     };
+    // rm-845: plan-scope catalog entries (subscription-included coding
+    // plans such as `zai-coding-plan/glm-5.3`) price at plan rates —
+    // 0/0 for included tiers — by design. Disclose the scope so a
+    // zero-cost session reads as exactly priced under a plan, never as
+    // a fallback-priced model (data_health.disclosures lane).
+    if pricing::plan_tier_note(model).is_some() {
+        metrics
+            .disclosure_counters
+            .insert("plan_tier_pricing".to_string(), 1);
+    }
     let has_meta_usage = events.iter().any(|event| {
         matches!(event.role.as_str(), "session_meta" | "meta") && !event.usage.is_empty()
     });

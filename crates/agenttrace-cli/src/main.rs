@@ -827,6 +827,7 @@ fn run() -> anyhow::Result<()> {
                 report.cache_hits,
                 report.opencode_fork_excluded,
                 report.sqlite.unreadable.clone(),
+                report.oversize_skipped,
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
@@ -1632,12 +1633,30 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         if let Some(first) = report
             .first_parse_failure
             .as_deref()
-            .filter(|_| report.parse_failures > 0)
+            .filter(|_| report.parse_failures > 0 || report.oversize_skipped > 0)
         {
+            if report.parse_failures == 0 {
+                // rm-700: every discovered file was skipped by the
+                // ingestion cap — bounded by design, but never silent.
+                bail!(
+                    "No sessions parsed: all {} discovered session files exceeded the ingestion cap (first: {})",
+                    report.discovered,
+                    first
+                );
+            }
             if report.parse_failures == report.discovered {
                 bail!(
                     "No sessions parsed: all {} discovered session files failed to parse (first: {})",
                     report.discovered,
+                    first
+                );
+            }
+            if report.oversize_skipped > 0 {
+                bail!(
+                    "No sessions match the requested filters ({} of {} discovered files failed to parse, {} skipped over the ingestion cap; first: {})",
+                    report.parse_failures,
+                    report.discovered,
+                    report.oversize_skipped,
                     first
                 );
             }
@@ -1646,6 +1665,13 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                 report.parse_failures,
                 report.discovered,
                 first
+            );
+        }
+        if report.oversize_skipped > 0 {
+            // Same story with no retained message: counted, never silent.
+            bail!(
+                "No sessions parsed: all {} discovered session files exceeded the ingestion cap",
+                report.discovered
             );
         }
         bail!("No sessions match the requested filters");
@@ -1699,15 +1725,27 @@ fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
 /// (None when every discovered file parsed). Kept as a pure function so
 /// the exact wording ships with a pinned test.
 fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
-    if report.parse_failures == 0 {
+    if report.parse_failures == 0 && report.oversize_skipped == 0 {
         return None;
     }
-    report.first_parse_failure.as_deref().map(|first| {
-        format!(
-            "{} of {} discovered session files failed to parse; first: {first}",
-            report.parse_failures, report.discovered
-        )
-    })
+    let first = report.first_parse_failure.as_deref()?;
+    if report.parse_failures == 0 {
+        // rm-700: pure oversize-skip loads — disclosed, not silent.
+        return Some(format!(
+            "{} of {} discovered session files skipped over the ingestion cap; first: {first}",
+            report.oversize_skipped, report.discovered
+        ));
+    }
+    if report.oversize_skipped > 0 {
+        return Some(format!(
+            "{} of {} discovered session files failed to parse, {} skipped over the ingestion cap; first: {first}",
+            report.parse_failures, report.discovered, report.oversize_skipped
+        ));
+    }
+    Some(format!(
+        "{} of {} discovered session files failed to parse; first: {first}",
+        report.parse_failures, report.discovered
+    ))
 }
 
 /// rm-534: `--output` must never be an input journal. write_output
@@ -3917,6 +3955,48 @@ mod tests {
         let report = agenttrace_core::LoadReport {
             discovered: 2,
             parse_failures: 2, // counted, but no message retained
+            ..Default::default()
+        };
+        assert!(
+            parse_failure_advisory(&report).is_none(),
+            "no message means nothing to print"
+        );
+
+        // rm-700: pure oversize skips get their own truthful wording
+        let report = agenttrace_core::LoadReport {
+            discovered: 4,
+            oversize_skipped: 2,
+            first_parse_failure: Some(
+                "session file exceeds ingestion cap (600 MiB > 256 MiB bytes): /x/huge.jsonl skipped — raise AGENTTRACE_MAX_SESSION_FILE_BYTES to ingest it deliberately".to_string(),
+            ),
+            ..Default::default()
+        };
+        let advisory = parse_failure_advisory(&report).expect("oversize skips are disclosed");
+        assert!(
+            advisory.starts_with("2 of 4 discovered session files skipped over the ingestion cap"),
+            "{advisory}"
+        );
+        assert!(advisory.contains("huge.jsonl"), "{advisory}");
+        // mixed parse failures + oversize skips name both lanes
+        let report = agenttrace_core::LoadReport {
+            discovered: 4,
+            parse_failures: 1,
+            oversize_skipped: 1,
+            first_parse_failure: Some("read session file /x/a.jsonl: zstd-compressed".to_string()),
+            ..Default::default()
+        };
+        let advisory = parse_failure_advisory(&report).expect("mixed lane advisory");
+        assert!(
+            advisory.starts_with(
+                "1 of 4 discovered session files failed to parse, 1 skipped over the ingestion cap"
+            ),
+            "{advisory}"
+        );
+        // counted oversize with no retained message stays silent, like
+        // the countless-failure arm above
+        let report = agenttrace_core::LoadReport {
+            discovered: 2,
+            oversize_skipped: 2,
             ..Default::default()
         };
         assert!(

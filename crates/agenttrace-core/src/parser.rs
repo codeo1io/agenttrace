@@ -13,7 +13,39 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 /// values have already been summed.
 type ParseCounters = Vec<(String, i64)>;
 
+/// Default admission cap for a single session file: 256 MiB (rm-700).
+/// Calibration: the largest real journal observed on the fleet host is
+/// ~1.9 MiB across 427 files, so the default carries ~130x headroom while
+/// still bounding the 16-worker largest-first parallel read path
+/// (discovery.rs) before `fs::read` allocates.
+pub const DEFAULT_MAX_SESSION_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Failure-message prefix emitted when a session file exceeds the
+/// ingestion cap (rm-700). This is the STABLE classification token:
+/// discovery counts a skip as `oversize_skipped` (not a parse failure)
+/// exactly when the parser's error message starts with this prefix, so
+/// the wording here and the bail in `parse_file_capped` must move
+/// together.
+pub const OVERSIZE_SESSION_PREFIX: &str = "session file exceeds ingestion cap";
+
+/// Environment override for [`DEFAULT_MAX_SESSION_FILE_BYTES`] (raw
+/// bytes, decimal). Invalid values fall back to the default — the cap is
+/// a guardrail, not a configuration surface.
+pub fn max_session_file_bytes() -> u64 {
+    std::env::var("AGENTTRACE_MAX_SESSION_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_SESSION_FILE_BYTES)
+}
+
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
+    parse_file_capped(path, max_session_file_bytes())
+}
+
+/// `parse_file` with an explicit cap so tests can exercise the admission
+/// boundary without materializing multi-hundred-MiB fixtures (rm-700).
+pub fn parse_file_capped(path: &Path, cap: u64) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
     }
@@ -23,6 +55,17 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
                 return Ok(session);
             }
         }
+    }
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("stat session file {}", path.display()))?;
+    if metadata.len() > cap {
+        anyhow::bail!(
+            "{OVERSIZE_SESSION_PREFIX} ({} bytes > {} bytes): {} skipped — \
+             raise AGENTTRACE_MAX_SESSION_FILE_BYTES to ingest it deliberately",
+            metadata.len(),
+            cap,
+            path.display()
+        );
     }
     let raw =
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
