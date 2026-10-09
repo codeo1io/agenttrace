@@ -26,6 +26,14 @@ scope, landed run 24ec00eb cycle 1): an optional `>=`, `<=`, `>`, `<`, or
 (e.g. `warn`, `>=80`, `80`, `>1.5`, `1.5`). Non-finite thresholds
 (`>=NaN`, `<=inf`, `1e400`) are rejected loudly with a message documenting
 the dialect instead of silently matching nothing or everything.
+`--project` matches by case-insensitive SUBSTRING against any of the
+resolved project identity, display name, and filesystem root (rm-779):
+`--project storefront` keeps `/work/storefront` and `storefront-api`
+alike, and an encoded Claude session directory matches its
+`-work-projects-storefront` spelling. Resolution mirrors the by_project
+rollup: git-root grouping when a `.git` is discoverable from the session
+cwd, else the normalized cwd itself, else the encoded/unattributed
+fallbacks.
 
 By default every governance report audits **every** session in scope, and the
 report discloses its coverage: `audited_sessions` / `total_sessions` /
@@ -76,7 +84,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 41 and the SQLite snapshot is schema 9; the
+The session cache is schema 42 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -195,7 +203,19 @@ as zero and false-trip the drift note on exactly the sessions whose
 stored estimate is upstream truth (rm-520 of run ac14e52c, landed 24 → 25
 at the run's base 1511547, re-based at integration onto the advanced
 ceiling as 40 → 41) — so cached sessions regenerate under the corrected
-audit basis; the SQLite snapshot to 7
+audit basis, and to 42 when the journal-truth batch joined
+`Metrics.wire_metadata` (codex 0.160.1 identity/lineage/quota wire,
+rm-880 — minted campaign-locally as rm-776 and rebound at the commit
+gate; landed at its base aa5544a as 32 → 33, re-based at the commit
+gate onto the ceiling since advanced to 39 as 33 → 40 and at
+integration onto the advanced ceiling as 41 → 42) and
+`Metrics.model_attribution` (per-model token/cost attribution for
+multi-model sessions, rm-406) beside rm-778's parse-time cwd cap and
+its `cwd_truncation_disclosure` counter to the persisted metrics — a
+warm cache that predates the fields would keep serving sessions whose
+hidden wire and advisor split silently vanished on the cache hit — so
+cached sessions regenerate under the surfaced wire and advisor
+attribution; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

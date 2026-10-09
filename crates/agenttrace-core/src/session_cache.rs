@@ -5,7 +5,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 41;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 42;
+// Bumped 41 -> 42 (integration of run 14954d7a, "journal truth:
+// contain hostile input, surface hidden wire", rm-880 + rm-406's
+// dated 2026-10-07 arm): Metrics gained two persisted-only fields —
+// `wire_metadata` (codex 0.160.1 session identity/lineage/quota wire
+// the fork of record read and dropped) and `model_attribution`
+// (per-model token/cost attribution for multi-model sessions, Claude
+// Code advisor turns) — round-tripped through the Go mirror above so
+// a cache hit keeps disclosing them, beside rm-778's parse-time cwd
+// cap and its `cwd_truncation_disclosure` counter. Same keys, same
+// fingerprints: a warm v41 cache would keep serving sessions whose
+// hidden wire and advisor split silently vanished on the cache hit
+// (rm-230 convention: persisted-shape changes bump the schema so
+// cached sessions regenerate). The batch landed against its base
+// aa5544a at schema 32 and bumped it to 33 there; its commit gate
+// re-based the bump onto origin's ceiling 39 as 40 (landing 33 would
+// have downgraded the cache format); this integration re-bases it
+// again onto the already-advanced ceiling (41 was the run-ac14e52c
+// rm-520/rm-521 governance-audit batch) per the same convention.
+// Entries regenerate once on next scan.
 // Bumped 40 -> 41 (integration of run ac14e52c, cycle-1 "governance
 // audit truthfulness" batch, rm-520 LEAD + rm-521 rider; conflict case
 // c1c77f5e076549f1aadd7f3e4e12c32c): Metrics now persist which token
@@ -726,6 +745,26 @@ struct GoMetrics {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     disclosure_counters: BTreeMap<String, usize>,
+    /// rm-880: journal wire facts the accounting reads but does not
+    /// consume (codex 0.160.1 identity/lineage/quota wire),
+    /// round-tripped so a cache hit keeps disclosing the hidden wire
+    /// instead of silently dropping it — the rm-230 case class that
+    /// forced schema v40.
+    #[serde(
+        default,
+        rename = "WireMetadata",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    wire_metadata: BTreeMap<String, String>,
+    /// rm-406 (dated 2026-10-07 arm): per-model attribution for
+    /// multi-model sessions (Claude Code advisor turns), round-tripped
+    /// so cache hits keep the by_model split.
+    #[serde(
+        default,
+        rename = "ModelAttribution",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    model_attribution: BTreeMap<String, crate::ModelAttribution>,
     #[serde(default, rename = "Provenance")]
     provenance: crate::MetricProvenance,
     /// rm-790: source row identity for sqlite-backed sessions; empty
@@ -1994,6 +2033,8 @@ impl GoMetrics {
             upstream_priced_cache_w: metrics.upstream_priced_cache_w,
             upstream_priced_cache_r: metrics.upstream_priced_cache_r,
             disclosure_counters: metrics.disclosure_counters.clone(),
+            wire_metadata: metrics.wire_metadata.clone(),
+            model_attribution: metrics.model_attribution.clone(),
             provenance: metrics.provenance.clone(),
             session_key: metrics.session_key.clone(),
             parent_session: metrics.parent_session.clone(),
@@ -2042,6 +2083,8 @@ impl GoMetrics {
             upstream_priced_cache_w: self.upstream_priced_cache_w,
             upstream_priced_cache_r: self.upstream_priced_cache_r,
             disclosure_counters: self.disclosure_counters,
+            wire_metadata: self.wire_metadata,
+            model_attribution: self.model_attribution,
             provenance: self.provenance,
             // rm-790/rm-791: the source row key and the raw parent row id
             // round-trip — they are source data the attribution consumes
@@ -2879,6 +2922,11 @@ mod tests {
         // CU-22: the entry-count bound alone cannot stop unbounded growth;
         // once the serialized estimate exceeds the ceiling the oldest
         // source files drop first, in the same order as the count bound.
+        // Hold the env lock: `save_session_cache` enforces the EFFECTIVE
+        // entry bound, and the knob tests set
+        // `AGENTTRACE_SESSION_CACHE_ENTRIES` in this process — without
+        // the lock this fixture races them and evicts to their knob.
+        let _env = crate::test_env::lock_env();
         let root = std::env::temp_dir().join(format!(
             "agenttrace-byte-bound-{}-{:?}",
             std::process::id(),
@@ -2959,6 +3007,10 @@ mod tests {
         // slots were the same path), and the byte bound summed both
         // copies and over-evicted near the ceiling. Both bounds now
         // walk the deduplicated union.
+        // Hold the env lock: the count bound honors the effective
+        // `AGENTTRACE_SESSION_CACHE_ENTRIES` knob, which sibling knob
+        // tests mutate in this process mid-test otherwise.
+        let _env = crate::test_env::lock_env();
         let root = std::env::temp_dir().join(format!(
             "agenttrace-union-bound-{}-{:?}",
             std::process::id(),
@@ -3115,6 +3167,10 @@ mod tests {
         // on the estimator's model of it: with a ceiling the old
         // values-only estimate called in-bounds, the written document
         // must still fit under it, and eviction must be oldest-first.
+        // Hold the env lock: the save path enforces the effective
+        // `AGENTTRACE_SESSION_CACHE_ENTRIES` knob, which the sibling
+        // knob tests mutate in this process otherwise.
+        let _env = crate::test_env::lock_env();
         let root = std::env::temp_dir().join(format!(
             "agenttrace-byte-true-{}-{:?}",
             std::process::id(),
@@ -3188,7 +3244,12 @@ mod tests {
         // that needs JSON escaping, a path living in both maps (the
         // decoded copy overwrites the raw copy at save time), and a
         // non-empty dirs map — so any drift between the model and the
-        // writer fails here first.
+        // writer fails here first. Hold the env lock: the save path
+        // enforces the effective `AGENTTRACE_SESSION_CACHE_ENTRIES`
+        // knob, which the sibling knob tests mutate in this process —
+        // without it the written file can evict to their knob and the
+        // byte-for-byte pin breaks (observed racing the "2" knob).
+        let _env = crate::test_env::lock_env();
         let root = std::env::temp_dir().join(format!(
             "agenttrace-doc-size-{}-{:?}",
             std::process::id(),

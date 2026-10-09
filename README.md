@@ -364,6 +364,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--context-trends` |  | Render context-utilization trends over the session corpus (window pressure, cache reuse, growth by turn) |
 | `--delivery-evidence` |  | Render the delivery-evidence report: verifiable outcome signals per session rather than effort metrics |
 | `--overview` |  | Render the corpus overview report: totals, health mix, and model/provider/project breakdowns |
+| `--card-theme <CARD_THEME>` | `auto` | rm-576: color scheme of the SVG usage card (`-f svg`). `auto` ships the light palette plus a `prefers-color-scheme` override so the static file adapts to the viewer; bytes stay deterministic |
 | `--sessions` |  | List sessions as rows (TSV text by default; `--format` json/csv for machine use). The TSV ends with the subagent rollup columns SUBAGENTS and SUBAGENT_COST — attributed spawned work, kept separate from the session's own COST/TOKENS cells; rollups are corpus-scope (every child in the loaded corpus, not just rows surviving the view filters), `--limit` truncation is disclosed in-band for json/csv and on stderr, and csv carries the subagents/subagent_cost/parent_session parity columns |
 | `--diagnostics` |  | Render per-session diagnostics: findings, evidence, fix suggestions, and next actions |
 | `--inspect <INSPECT>` |  | Inspect a single session by its `--sessions` list index (1-based) instead of the whole corpus |

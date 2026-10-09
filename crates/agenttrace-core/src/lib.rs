@@ -233,6 +233,19 @@ pub struct Event {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub disclosure_counters: BTreeMap<String, i64>,
+    /// rm-880: session-level wire facts the accounting reads but does
+    /// not consume (codex 0.160.1 identity/lineage/quota wire:
+    /// creator ids, fork/parent lineage, thread_name, service_tier,
+    /// plan_type, …). Set programmatically by parsers only; never
+    /// deserialized from foreign journals. Aggregated onto session
+    /// metrics (last observation wins) so reports and the session
+    /// cache disclose the hidden wire instead of dropping it unread.
+    #[serde(
+        skip_deserializing,
+        rename = "WireMetadata",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub wire_metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -523,6 +536,30 @@ pub struct Metrics {
     /// Empty for journals without disclosures.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosure_counters: BTreeMap<String, usize>,
+    /// rm-880: wire facts read off the journal that the accounting
+    /// does not consume — codex 0.160.1 session_meta identity/lineage
+    /// (creator_user_id/creator_account_id, forked_from_id/
+    /// forked_from_ordinal_exclusive, parent_thread_id, history_base,
+    /// agent persona), session_configured (thread_name,
+    /// model_provider_id, service_tier), and the rate_limits quota
+    /// snapshot (plan_type, limit id/name). Values are sanitized and
+    /// capped through the rm-594 treatment; last observation wins.
+    /// Empty for journals without wire metadata.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub wire_metadata: BTreeMap<String, String>,
+    /// rm-406 (dated 2026-10-07 arm): per-model token/cost attribution
+    /// for sessions whose usage blocks name more than one model
+    /// (Claude Code advisor turns ride message.usage.iterations[] with
+    /// their own model; pi model_change journals switch mid-session).
+    /// Populated only when the multi-model pricing arm runs —
+    /// single-model sessions keep their exact pre-existing serialized
+    /// shape — and consumed by the overview's by_model rollup so a
+    /// session's advisor spend lands on the advisor's model instead of
+    /// vanishing under the "multiple" label. `sessions` in a
+    /// by_model bucket counts sessions that USED the model, so a
+    /// multi-model session appears in more than one bucket.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_attribution: BTreeMap<String, ModelAttribution>,
     pub provenance: MetricProvenance,
     /// rm-545: subagent transcripts attributed to this session. Kept
     /// SEPARATE from the totals above so fleet rollups still count each
@@ -552,6 +589,18 @@ pub struct Metrics {
 
 fn i64_is_zero(value: &i64) -> bool {
     *value == 0
+}
+
+/// rm-406: one model's slice of a multi-model session's usage, priced
+/// at that model's own catalog rate by the same per-block arithmetic
+/// that prices the session total.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelAttribution {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_w: i64,
+    pub cache_r: i64,
+    pub cost_usd: f64,
 }
 
 fn usize_is_zero(value: &usize) -> bool {
@@ -995,7 +1044,32 @@ fn jsonl_source_tool(objects: &[serde_json::Map<String, Value>]) -> &'static str
     "generic"
 }
 
-pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow::Result<Session> {
+pub fn session_from_events(
+    name: &str,
+    path: &str,
+    mut events: Vec<Event>,
+) -> anyhow::Result<Session> {
+    // rm-778: last-line containment at the ONE choke point every
+    // format passes through — including the generic Vec<Event> lane
+    // and deserialized journals, which never touch the five capped
+    // read sites. Parser lanes cap at read time, so their events are
+    // already within [`parser::SESSION_CWD_BYTE_CAP`] bytes and pass
+    // through untouched; anything longer is capped HERE with the same
+    // `cwd_truncated:<lane>` disclosure the read sites mint.
+    for event in &mut events {
+        let (capped, truncated) = crate::parser::cap_session_cwd(&event.cwd);
+        if truncated {
+            let lane = if event.source_tool.is_empty() {
+                "generic"
+            } else {
+                event.source_tool.as_str()
+            };
+            event.cwd = capped;
+            for (key, value) in crate::parser::cwd_truncation_disclosure(lane, true) {
+                *event.disclosure_counters.entry(key).or_insert(0) += value;
+            }
+        }
+    }
     let mut model = "default".to_string();
     let mut cwd = String::new();
     let mut branch = String::new();
@@ -1323,6 +1397,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 .or_insert(0) += 1;
         }
 
+        // rm-880: wire metadata rides the same fold — last observation
+        // wins so a re-configured session reports its latest wire
+        // (session_configured can follow session_meta, and rate-limit
+        // snapshots refresh on every token_count line).
+        for (key, value) in &event.wire_metadata {
+            metrics.wire_metadata.insert(key.clone(), value.clone());
+        }
+
         match event.role.as_str() {
             "session_meta" | "meta" => {
                 if !event.usage.is_empty() {
@@ -1554,6 +1636,15 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         || (!usage_models.is_empty()
             && session_model_is_real
             && !usage_models.iter().any(|usage_model| usage_model == model));
+    // rm-406 (dated 2026-10-07 arm): per-model attribution for the
+    // multi-model session — each usage block's tokens and per-block
+    // cost land on the model that produced them (the advisor-model
+    // case: claude-fable advisor turns ride message.usage.iterations[]
+    // with their own model while the session's headline model hides
+    // them). Single-model sessions never populate this map, so their
+    // serialized metrics shape is byte-identical to the pre-rm-406
+    // form.
+    let mut model_attribution: BTreeMap<String, ModelAttribution> = BTreeMap::new();
     let token_priced = if usage_blocks_multi_model {
         // Recorded costs were accumulated into upstream_cost_usd above;
         // start from them and add per-block catalog pricing for the rest.
@@ -1570,10 +1661,47 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             })
             .filter(|event| !event.usage.is_empty())
         {
+            let block_model = if event.model_used.is_empty() || event.model_used == "unknown" {
+                model.to_string()
+            } else {
+                event.model_used.clone()
+            };
+            let entry = model_attribution.entry(block_model).or_default();
+            entry.input_tokens = entry
+                .input_tokens
+                .saturating_add(event.usage.get("input_tokens").copied().unwrap_or(0).max(0));
+            entry.output_tokens = entry.output_tokens.saturating_add(
+                event
+                    .usage
+                    .get("output_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0),
+            );
+            entry.cache_w = entry.cache_w.saturating_add(
+                event
+                    .usage
+                    .get("cache_creation_input_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0),
+            );
+            entry.cache_r = entry.cache_r.saturating_add(
+                event
+                    .usage
+                    .get("cache_read_input_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0),
+            );
             if event
                 .recorded_cost_usd
                 .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
             {
+                // Upstream-recorded cost already sits in the seed; credit
+                // the block's model with it so attribution sums to the
+                // session total.
+                entry.cost_usd = round4(entry.cost_usd + event.recorded_cost_usd.unwrap_or(0.0));
                 continue;
             }
             let block_price = if event.model_used.is_empty() || event.model_used == "unknown" {
@@ -1581,7 +1709,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             } else {
                 pricing::lookup_price(&event.model_used)
             };
-            per_block_cost += event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
+            let block_cost = event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
                 / 1e6
                 * block_price.input
                 + event
@@ -1608,6 +1736,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .max(0) as f64
                     / 1e6
                     * block_price.cr;
+            per_block_cost += block_cost;
+            entry.cost_usd = round4(entry.cost_usd + block_cost);
         }
         round4(per_block_cost)
     } else {
@@ -1652,6 +1782,10 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     .to_string();
     if usage_blocks_multi_model {
         metrics.model_used = "multiple".to_string();
+        // rm-406: keep the split that produced the per-block total on
+        // the metrics — by_model reads it so the advisor/model-switch
+        // spend lands on each producing model's bucket.
+        metrics.model_attribution = model_attribution;
         // Per-block cost seeds from the upstream-recorded total, so the
         // mixed-model row keeps the recorded-cost hint the single-model
         // row gets (review fix F3).
@@ -2000,7 +2134,37 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         };
         let model_entry = overview.by_model.entry(model).or_default();
         model_entry.sessions += 1;
-        model_entry.cost += session.metrics.cost_estimated;
+        // Review fix F1 (run 14954d7a independent_review, blocking):
+        // when the session carries a per-model attribution split, its
+        // full spend is distributed among the attributed buckets below,
+        // so the headline bucket (multi-model sessions collapse under
+        // "multiple") keeps the session count but contributes no cost —
+        // sum(by_model[].cost) stays exactly the true total, which the
+        // pre-batch rollup guaranteed and agenttrace.overview.v1 machine
+        // consumers sum against. Unattributed sessions (single- or
+        // multi-model) keep the one-bucket full-cost behavior.
+        if session.metrics.model_attribution.is_empty() {
+            model_entry.cost += session.metrics.cost_estimated;
+        }
+
+        // rm-406 (dated 2026-10-07 arm): the session-level by_model
+        // bucket above is the headline split (multi-model sessions
+        // collapse under "multiple"); additionally credit each
+        // producing model with its own session's spend so an advisor
+        // turn (or a mid-session model switch) lands on the model that
+        // actually burned the tokens instead of vanishing. `sessions`
+        // in an attribution bucket counts sessions that USED the
+        // model — a multi-model session therefore appears in more than
+        // one bucket (by_task_type, by contrast, assigns each session
+        // exactly one bucket and never overlaps).
+        for (attributed_model, attribution) in &session.metrics.model_attribution {
+            let entry = overview
+                .by_model
+                .entry(attributed_model.clone())
+                .or_default();
+            entry.sessions += 1;
+            entry.cost += attribution.cost_usd;
+        }
 
         // rm-245: attribution dimensions. The provider comes from the
         // same catalog row that prices the model, so vendor claims and

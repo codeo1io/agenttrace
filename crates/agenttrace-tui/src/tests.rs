@@ -1631,6 +1631,20 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 42 (integration of run 14954d7a, cycle-1
+                // "journal truth: contain hostile input, surface hidden
+                // wire" — Metrics persist `wire_metadata` (codex
+                // 0.160.1 identity/lineage/quota wire the fork of
+                // record read and dropped) and `model_attribution`
+                // (per-model token/cost attribution for multi-model
+                // sessions, Claude Code advisor turns), both
+                // round-tripped through the Go mirror so a cache hit
+                // keeps disclosing them, beside rm-778's parse-time
+                // cwd cap; landed at its base aa5544a as the
+                // campaign's 32 -> 33 bump, the commit gate re-based
+                // to 40, and this integration re-based again onto the
+                // advanced ceiling as 41 -> 42, 41 being the ac14e52c
+                // rm-520/rm-521 rung below).
                 // Schema 41 (integration of run ac14e52c, rm-520 +
                 // rm-521 "audit cost truthfulness" — Metrics persist
                 // the upstream_priced_* recorded-cost token-class
@@ -1753,7 +1767,20 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // — re-based off the campaign's 25 -> 26 bump; 28 was the
                 // rm-529 #316 clamp port — re-based off the campaign's 24 -> 26
                 // bump, 25 being already taken on the landed ceiling by
-                // rm-450; 27 was the rm-542 Codex custom-tools parse
+                // rm-450; 42 the journal-truth `wire_metadata` +
+                // `model_attribution` persisted shape (run 14954d7a,
+                // rm-880 + rm-406 dated arm — Metrics carry the codex
+                // identity/lineage/quota wire and the per-model
+                // attribution split through the Go mirror, so warm
+                // entries regenerate instead of serving sessions whose
+                // hidden wire and advisor split silently vanished on
+                // the cache hit; landed at its base aa5544a as the
+                // campaign's 32 -> 33 bump, the commit gate re-based
+                // to 40, and THIS integration re-based again onto the
+                // advanced ceiling as 41 -> 42, 41 being the
+                // ac14e52c rm-520/rm-521 rung and 40 the 4c3ca863
+                // rm-585/rm-730 rung below);
+                // 27 was the rm-542 Codex custom-tools parse
                 // coverage re-based off the campaign's 22 -> 23 bump,
                 // 26 the rm-485 copilot session-wide credit accounting,
                 // 25 the rm-450 workbuddy input-basis disclosure, 24
