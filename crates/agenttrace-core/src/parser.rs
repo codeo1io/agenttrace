@@ -2507,10 +2507,18 @@ fn oh_my_pi_content(raw: Option<&Value>) -> (String, String, bool, Vec<ToolCall>
 fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let obj = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
-    let input = sum_numbers(obj, &["input", "input_tokens"]);
-    let output = sum_numbers(obj, &["output", "output_tokens"]);
-    let cache_read = sum_numbers(obj, &["cacheRead", "cache_read_input_tokens"]);
-    let cache_write = sum_numbers(obj, &["cacheWrite", "cache_creation_input_tokens"]);
+    // rm-618: count ONE source per token class, never the sum of the alias
+    // pairs — the wire spellings describe the SAME class twice (`input`
+    // beside `input_tokens`, `output` beside `output_tokens`, `cacheRead`
+    // beside `cache_read_input_tokens`, `cacheWrite` beside
+    // `cache_creation_input_tokens`), so the old alias sum double-counted
+    // every journal that carried both spellings. First present alias wins,
+    // the single-source rule upstream #312 ships and the qwen lane already
+    // pinned (rm-602).
+    let input = first_number(obj, &["input", "input_tokens"]);
+    let output = first_number(obj, &["output", "output_tokens"]);
+    let cache_read = first_number(obj, &["cacheRead", "cache_read_input_tokens"]);
+    let cache_write = first_number(obj, &["cacheWrite", "cache_creation_input_tokens"]);
     if input > 0 {
         usage.insert("input_tokens".to_string(), input);
     }
@@ -3896,6 +3904,36 @@ fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage 
     .collect()
 }
 
+/// rm-905: decide whether a REPEATED claude message id is still a genuine
+/// streaming re-emission (fold per rm-601/rm-834) or a distinct response a
+/// relay/gateway answered under a reused id (count per emission). The fold
+/// keys on the id alone — so a relay that answers every response with ONE
+/// foreign id (ccusage #1635: `ocgo`, no request id) had its whole session
+/// max-folded down to a single response's numbers. Genuine streaming keeps
+/// two invariants the relay shape breaks: the id carries Anthropic's real
+/// `msg_*` shape, and every reported token class is non-decreasing against
+/// the folded snapshot (re-emissions are running totals of one message). A
+/// repeat that fails either invariant is a new response.
+fn claude_reemission(
+    id: &str,
+    folded: &BTreeMap<String, i64>,
+    incoming: &BTreeMap<String, i64>,
+) -> bool {
+    let real_shape = match id.strip_prefix("msg_") {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        }
+        None => false,
+    };
+    real_shape
+        && incoming
+            .iter()
+            .all(|(key, value)| folded.get(key).is_none_or(|prev| value >= prev))
+}
+
 fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -3916,6 +3954,12 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
     let mut assistant_by_message: BTreeMap<String, usize> = BTreeMap::new();
     let mut tool_results_by_message: BTreeSet<(String, String)> = BTreeSet::new();
+    // rm-905: message ids the usage guard has already deemed relay reuse
+    // (foreign id shape, or non-monotone totals under a repeated id) —
+    // every later fold for that id counts per emission instead of replacing
+    // in place, so a relay answering N responses under ONE id still parses
+    // as N responses.
+    let mut reused_message_ids: BTreeSet<String> = BTreeSet::new();
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
@@ -3967,7 +4011,12 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
                     let message_id = string(message.get("id")).unwrap_or("");
                     match usage_by_message.get(message_id).copied() {
-                        Some(index) => {
+                        // rm-601/rm-834 re-emission arm: the guard in
+                        // `claude_reemission` (rm-905) has already confirmed
+                        // this repeat still looks like genuine streaming.
+                        Some(index)
+                            if claude_reemission(message_id, &events[index].usage, &usage) =>
+                        {
                             for (key, value) in usage {
                                 let slot = events[index].usage.entry(key).or_insert(0);
                                 *slot = (*slot).max(value);
@@ -3980,6 +4029,34 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             if !ts.is_empty() {
                                 events[index].timestamp = ts.clone();
                             }
+                        }
+                        Some(_) => {
+                            // rm-905: a repeated id that is NOT a genuine
+                            // re-emission — a foreign id shape (a relay
+                            // answering every response with ONE id, ccusage
+                            // #1635: `ocgo`, no request id) or non-monotone
+                            // totals under a real shape — is a NEW response:
+                            // count it per emission instead of max-folding it
+                            // into invisibility, and disclose the reuse so
+                            // the session stays inspectable. Id-less rows
+                            // never reach this arm (they never enter the
+                            // map — pinned count-every-emission legacy).
+                            if !message_id.is_empty() {
+                                reused_message_ids.insert(message_id.to_string());
+                                usage_by_message.insert(message_id.to_string(), events.len());
+                            }
+                            events.push(Event {
+                                role: "meta".to_string(),
+                                timestamp: ts.clone(),
+                                usage,
+                                model_used: model.clone(),
+                                source_tool: "claude_code".to_string(),
+                                disclosure_counters: BTreeMap::from([(
+                                    "relay_reused_message_id".to_string(),
+                                    1,
+                                )]),
+                                ..Event::default()
+                            });
                         }
                         None => {
                             if !message_id.is_empty() {
@@ -4036,6 +4113,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                                 string(block.get("tool_use_id")).unwrap_or("").to_string();
                             let message_id = string(message.get("id")).unwrap_or("");
                             if !message_id.is_empty()
+                                && !reused_message_ids.contains(message_id)
                                 && !tool_results_by_message
                                     .insert((message_id.to_string(), tool_use_id.clone()))
                             {
@@ -4081,8 +4159,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         events.push(assistant_event);
                     } else {
                         match assistant_by_message.get_mut(message_id) {
-                            Some(index) => events[*index] = assistant_event,
-                            None => {
+                            // rm-905: an id the usage guard already flagged as
+                            // relay reuse counts EVERY emission — no in-place
+                            // snapshot replace, so N relay responses under one
+                            // id stay N assistant turns.
+                            Some(index) if !reused_message_ids.contains(message_id) => {
+                                events[*index] = assistant_event
+                            }
+                            _ => {
                                 assistant_by_message.insert(message_id.to_string(), events.len());
                                 events.push(assistant_event);
                             }
@@ -4755,6 +4839,9 @@ fn parse_opencode_storage_session(
 
     let mut model = opencode_session_model(session);
     let mut usage = BTreeMap::new();
+    // rm-619: parse-time disclosure counters (reasoning dropped beside
+    // present totals) — attached to the session meta event below.
+    let mut counters = BTreeMap::new();
     let mut body = Vec::new();
     for msg in messages {
         if model == "unknown" {
@@ -4763,9 +4850,15 @@ fn parse_opencode_storage_session(
                 model = msg_model;
             }
         }
-        let message_had_usage = add_opencode_tokens(&mut usage, msg.doc.get("tokens"));
-        let (events, part_usage) =
-            parse_opencode_message(&storage_root, &msg.doc, &model, message_had_usage);
+        let message_had_usage =
+            add_opencode_tokens(&mut usage, msg.doc.get("tokens"), &mut counters);
+        let (events, part_usage) = parse_opencode_message(
+            &storage_root,
+            &msg.doc,
+            &model,
+            message_had_usage,
+            &mut counters,
+        );
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
@@ -4784,6 +4877,7 @@ fn parse_opencode_storage_session(
             } else {
                 BTreeMap::new()
             },
+            disclosure_counters: counters,
             ..Event::default()
         });
     }
@@ -4837,6 +4931,7 @@ fn parse_opencode_message(
     msg: &Map<String, Value>,
     model: &str,
     message_had_usage: bool,
+    counters: &mut BTreeMap<String, i64>,
 ) -> (Vec<Event>, BTreeMap<String, i64>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
@@ -4878,7 +4973,7 @@ fn parse_opencode_message(
             }
             "tool" => events.extend(opencode_tool_events(part, &part_ts, model)),
             "step-finish" if !message_had_usage => {
-                add_opencode_tokens(&mut part_usage, part.get("tokens"));
+                add_opencode_tokens(&mut part_usage, part.get("tokens"), counters);
             }
             _ => {}
         }
@@ -5046,7 +5141,11 @@ fn opencode_message_model(msg: &Map<String, Value>) -> String {
         .to_string()
 }
 
-fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -> bool {
+fn add_opencode_tokens(
+    usage: &mut BTreeMap<String, i64>,
+    raw: Option<&Value>,
+    counters: &mut BTreeMap<String, i64>,
+) -> bool {
     let Some(tokens) = raw.and_then(Value::as_object) else {
         return false;
     };
@@ -5055,6 +5154,41 @@ fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -
     if let Some(cache) = tokens.get("cache").and_then(Value::as_object) {
         add_usage_value(usage, "cache_read_input_tokens", cache.get("read"));
         add_usage_value(usage, "cache_creation_input_tokens", cache.get("write"));
+    }
+    // rm-619: opencode emits `tokens.reasoning` as a SIBLING of the
+    // total-style counts (upstream #312 fix-table row for opencode), and
+    // the total block can be 0/absent while reasoning carries the whole
+    // spend — that reasoning previously landed nowhere. When the totals
+    // are 0/absent the reasoning block IS the message's entire output-class
+    // spend: fold it into output_tokens (billed at the output rate — the
+    // CU-20 gemini thinking-token precedent) and break it out on
+    // reasoning_tokens. When the totals are present the wire does not say
+    // whether output already includes the reasoning, so folding would risk
+    // a double count — the value stays out and the drop is disclosed
+    // instead of guessed at (rm-436 family: never silently vanish).
+    if let Some(reasoning) = tokens
+        .get("reasoning")
+        .and_then(number_as_i64)
+        .filter(|value| *value > 0)
+    {
+        let totals_present = ["input", "output"].iter().any(|key| {
+            tokens
+                .get(*key)
+                .and_then(number_as_i64)
+                .is_some_and(|value| value > 0)
+        });
+        if totals_present {
+            *counters
+                .entry(disclosure_key(
+                    "opencode_reasoning",
+                    "present_beside_totals",
+                ))
+                .or_insert(0) += 1;
+        } else {
+            let output = usage.entry("output_tokens".to_string()).or_insert(0);
+            *output = output.saturating_add(reasoning);
+            usage.insert("reasoning_tokens".to_string(), reasoning);
+        }
     }
     true
 }
@@ -5456,16 +5590,6 @@ fn first_number(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
         .find_map(|key| obj.get(*key))
         .and_then(number_as_i64)
         .unwrap_or(0)
-}
-
-fn sum_numbers(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
-    keys.iter()
-        .filter_map(|key| obj.get(*key))
-        .filter_map(number_as_i64)
-        // Saturating: alias keys can each carry a legal in-range value whose
-        // sum overflows (e.g. two i64::MAX entries for the same counter),
-        // which previously wrapped the usage negative.
-        .fold(0i64, i64::saturating_add)
 }
 
 pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
@@ -7324,16 +7448,67 @@ mod tests {
     }
 
     #[test]
-    fn sum_numbers_saturates_alias_pairs_instead_of_overflowing() {
-        // `input` and `input_tokens` are both legal in-range integers; the
-        // alias sum previously wrapped negative on i64::MAX pairs.
+    fn oh_my_pi_usage_picks_one_alias_per_class_never_the_sum() {
+        // rm-618: the wire writes the same token class under two spellings;
+        // the old alias SUM double-counted every journal carrying both
+        // (this shape reported 200/100/60/20 pre-fix).
         let value = serde_json::json!({
-            "input": 9_223_372_036_854_775_807i64,
-            "input_tokens": 9_223_372_036_854_775_807i64,
+            "input": 100,
+            "input_tokens": 100,
+            "output": 50,
+            "output_tokens": 50,
+            "cacheRead": 30,
+            "cache_read_input_tokens": 30,
+            "cacheWrite": 10,
+            "cache_creation_input_tokens": 10,
         });
-        let obj = value.as_object().expect("object");
-        assert_eq!(sum_numbers(obj, &["input", "input_tokens"]), i64::MAX);
-        assert_eq!(sum_numbers(obj, &["output", "output_tokens"]), 0);
+        let usage = oh_my_pi_usage(Some(&value)).expect("usage map");
+        assert_eq!(usage.get("input_tokens"), Some(&100));
+        assert_eq!(usage.get("output_tokens"), Some(&50));
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&30));
+        assert_eq!(usage.get("cache_creation_input_tokens"), Some(&10));
+    }
+
+    #[test]
+    fn claude_reemission_folds_real_shapes_and_counts_relays() {
+        // rm-905: genuine streaming keeps the msg_* id shape and
+        // non-decreasing totals; anything else under a repeated id is a
+        // distinct response.
+        let folded = BTreeMap::from([
+            ("input_tokens".to_string(), 1000),
+            ("output_tokens".to_string(), 200),
+        ]);
+        let reemit = BTreeMap::from([
+            ("input_tokens".to_string(), 1000),
+            ("output_tokens".to_string(), 400),
+        ]);
+        assert!(claude_reemission("msg_01XFDUDYJgAAC", &folded, &reemit));
+        // Duplicate emission of the same snapshot is still a re-emission.
+        assert!(claude_reemission("msg_01XFDUDYJgAAC", &folded, &folded));
+        // Foreign id shape: ccusage #1635's relay answers with one id.
+        let relay = BTreeMap::from([
+            ("input_tokens".to_string(), 100),
+            ("output_tokens".to_string(), 50),
+        ]);
+        assert!(!claude_reemission("ocgo", &folded, &relay));
+        // `msg_` alone is not a real id; `-`/`_` inside the suffix ARE legal
+        // in real ids, so they do not flip a genuine shape to reuse.
+        assert!(!claude_reemission("msg_", &BTreeMap::new(), &relay));
+        assert!(claude_reemission("msg_oc-go_x", &BTreeMap::new(), &relay));
+        // Real shape, but a class went DOWN: an independent response, not a
+        // running total.
+        let rewind = BTreeMap::from([
+            ("input_tokens".to_string(), 1000),
+            ("output_tokens".to_string(), 120),
+        ]);
+        assert!(!claude_reemission("msg_01XFDUDYJgAAC", &folded, &rewind));
+        // A class only the later emission reports folds in (or_insert(0)).
+        let growing = BTreeMap::from([
+            ("input_tokens".to_string(), 1000),
+            ("output_tokens".to_string(), 400),
+            ("cache_read_input_tokens".to_string(), 12),
+        ]);
+        assert!(claude_reemission("msg_01XFDUDYJgAAC", &folded, &growing));
     }
 
     #[test]

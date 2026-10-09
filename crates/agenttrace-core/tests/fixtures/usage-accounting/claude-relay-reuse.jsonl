@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"run the relay probe twice"}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:05Z","message":{"id":"ocgo","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"first response through the relay"}],"usage":{"input_tokens":80,"output_tokens":40}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:10Z","message":{"id":"ocgo","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"second response, same gateway message id"}],"usage":{"input_tokens":100,"output_tokens":50}}}

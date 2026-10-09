@@ -84,6 +84,13 @@ jobs:
           cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
           cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Rustdoc (-D warnings)
+        # rm-909: docs had NO lane at all — the otel.rs broken intra-doc
+        # link to a private item shipped at HEAD undetected. Warnings are
+        # errors, so a new broken link or missing example fails the PR
+        # lane instead of rotting until someone runs cargo doc by hand.
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+
       - name: Lockfile enforcement (cargo --locked)
         run: scripts/ci/check-locked-cargo.sh
 
@@ -138,6 +145,13 @@ jobs:
         run: |
           cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
           cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Rustdoc (-D warnings)
+        # rm-909: docs had NO lane at all — the otel.rs broken intra-doc
+        # link to a private item shipped at HEAD undetected. Warnings are
+        # errors, so a new broken link or missing example fails this lane
+        # instead of rotting until someone runs cargo doc by hand.
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
 
       - name: Rust tests
         run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace

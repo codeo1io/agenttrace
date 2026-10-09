@@ -1,0 +1,3 @@
+{"type":"user","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"non-monotone repeat under a real msg_ shape"}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:05Z","message":{"id":"msg_01XFDUDYJgAAC","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"first response"}],"usage":{"input_tokens":1000,"output_tokens":200}}}
+{"type":"assistant","timestamp":"2026-10-01T10:00:10Z","message":{"id":"msg_01XFDUDYJgAAC","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"second response, output went DOWN"}],"usage":{"input_tokens":1000,"output_tokens":120}}}

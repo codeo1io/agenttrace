@@ -1,0 +1,16 @@
+{
+  "id": "msg_rr_think",
+  "sessionID": "ses_reasoning",
+  "role": "assistant",
+  "modelID": "claude-sonnet-4",
+  "time": {
+    "created": 1764753601000,
+    "completed": 1764753601500
+  },
+  "content": "thinking-only response",
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "reasoning": 250
+  }
+}

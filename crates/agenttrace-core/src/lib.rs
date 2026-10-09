@@ -1193,14 +1193,22 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // same clamp-plus-saturate contract governs every downstream
         // consumer of these totals (by_model/by_task_type rollups
         // included, rm-541) — a new sum of untrusted counts must use
-        // saturating_add, never `+=`.
+        // saturating_add, never `+=`. rm-910: that rule includes the
+        // disclosure-counter fold at the end of this fn — it was found
+        // still summing through a bare i64→usize cast.
         let usage_tokens = |key: &str| -> i64 { event.usage.get(key).copied().unwrap_or(0).max(0) };
 
         // rm-436/rm-437: aggregate parse-time disclosure counters onto
         // the session (pi-family journals). Counters are facts about
         // the journal, never conversation content.
         for (key, value) in &event.disclosure_counters {
-            *metrics.disclosure_counters.entry(key.clone()).or_insert(0) += *value as usize;
+            // rm-910: `*value as usize` WRAPS a negative counter to
+            // ~usize::MAX, and the second such event overflowed this `+=`
+            // (debug panic; release: silent wrap to a wrong huge count).
+            // Counter values are untrusted journal facts — clamp at zero
+            // and saturate, exactly the rule pinned two comments up.
+            let slot = metrics.disclosure_counters.entry(key.clone()).or_insert(0);
+            *slot = slot.saturating_add((*value).max(0) as usize);
         }
 
         // rm-616: fold reported usage from generic-lane conversation
@@ -2603,6 +2611,47 @@ mod tests {
             tool_warnings: vec![],
             diagnostics: Diagnostics::default(),
         }
+    }
+
+    #[test]
+    fn disclosure_counter_fold_clamps_negatives_and_saturates() {
+        // rm-910: the old fold did `entry(..) += *value as usize` — a
+        // negative counter WRAPS to ~usize::MAX and the next event's `+=`
+        // overflowed (debug panic, release: silent wrap to a wrong huge
+        // count). Counters are untrusted journal facts: clamp at zero,
+        // saturate the sum.
+        let events = vec![
+            Event {
+                role: "meta".to_string(),
+                disclosure_counters: BTreeMap::from([(
+                    "relay_reused_message_id".to_string(),
+                    i64::MIN,
+                )]),
+                ..Event::default()
+            },
+            Event {
+                role: "meta".to_string(),
+                disclosure_counters: BTreeMap::from([
+                    ("relay_reused_message_id".to_string(), 2),
+                    (
+                        "opencode_reasoning:present_beside_totals".to_string(),
+                        i64::MAX,
+                    ),
+                ]),
+                ..Event::default()
+            },
+        ];
+        let metrics = analyze(&events, "claude-sonnet-4");
+        assert_eq!(
+            metrics.disclosure_counters.get("relay_reused_message_id"),
+            Some(&2)
+        );
+        assert_eq!(
+            metrics
+                .disclosure_counters
+                .get("opencode_reasoning:present_beside_totals"),
+            Some(&(i64::MAX as usize))
+        );
     }
 
     #[test]

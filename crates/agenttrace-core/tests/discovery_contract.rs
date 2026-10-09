@@ -1447,6 +1447,40 @@ fn rust_parses_opencode_storage_session() {
 }
 
 #[test]
+fn opencode_tokens_reasoning_folds_when_totals_zero_and_discloses_otherwise() {
+    // rm-619: opencode emits `tokens.reasoning` as a sibling of the
+    // total-style counts and the parser dropped it in BOTH arms. When the
+    // totals are 0/absent (msg_rr_think) the reasoning block IS the whole
+    // output-class spend: fold into output_tokens and break it out on
+    // reasoning_tokens (this message reported output 0 at 7798b00). When
+    // the totals are present (msg_rr_totals) the wire does not say whether
+    // output already includes the reasoning — drop disclosed by counter,
+    // no guessed fold.
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("repo root");
+    let session_path =
+        repo_root.join("testdata/opencode/storage/session/project_alpha/ses_reasoning.json");
+
+    let parsed = parse_file(&session_path).expect("parse OpenCode reasoning session");
+    assert_eq!(parsed.metrics.source_tool, "opencode");
+    // msg_rr_think folded: 0 input / 250 reasoning -> output 250.
+    // msg_rr_totals as-is: 60 in / 30 out. 20 reasoning beside totals is
+    // disclosed, not folded.
+    assert_eq!(parsed.metrics.tokens_input, 60);
+    assert_eq!(parsed.metrics.tokens_output, 280);
+    assert_eq!(parsed.metrics.tokens_reasoning, 250);
+    assert_eq!(
+        parsed
+            .metrics
+            .disclosure_counters
+            .get("opencode_reasoning:present_beside_totals"),
+        Some(&1)
+    );
+}
+
+#[test]
 fn rust_discovers_only_opencode_storage_session_files_like_go() {
     let root = temp_root("agenttrace-rust-opencode-discovery");
     let home = root.join("home");

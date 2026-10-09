@@ -27,6 +27,11 @@
 //! - rm-556 copilot timestamp: a metrics-less shutdown record ends the
 //!   session; its timestamp reaches the credit event (or a terminal
 //!   marker) so duration reflects it.
+//!
+//! 2026-10-09 additions (run 92cfd5d5 cycle 1): rm-905 relay reuse guard
+//! and rm-618 oh-my-pi alias-pair single-source rule — the new fixtures
+//! (claude-relay-reuse, claude-rewind-reuse, oh-my-pi-alias-pair) each
+//! measured RED on the pre-batch build at 7798b00.
 
 use agenttrace_core::parse_file;
 use std::path::PathBuf;
@@ -176,4 +181,59 @@ fn copilot_later_checkpoint_still_ends_the_session() {
     assert_eq!(session.metrics.tokens_output, 1);
     assert_eq!(session.metrics.session_end, "2026-01-04T00:00:30Z");
     assert_eq!(session.metrics.duration_sec, 30.0);
+}
+
+#[test]
+fn relay_reused_message_id_counts_every_response_not_the_max() {
+    // rm-905: a relay/gateway answering every response with ONE message
+    // id (ccusage #1635: "ocgo", no request id — pre-fix 750K vs 1.21B
+    // true tokens upstream) max-folded the whole session into a single
+    // response's numbers: this fixture reported 100/50 at 7798b00 where
+    // the session truly holds two responses (80/40 and 100/50).
+    let session = fixture("claude-relay-reuse.jsonl");
+    assert_eq!(session.metrics.source_tool, "claude_code");
+    assert_eq!(session.metrics.tokens_input, 180);
+    assert_eq!(session.metrics.tokens_output, 90);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("relay_reused_message_id"),
+        Some(&1)
+    );
+    // N responses stay N responses: two assistant turns, not one folded
+    // snapshot.
+    assert_eq!(session.metrics.assistant_turns, 2);
+}
+
+#[test]
+fn claude_non_monotone_repeat_under_real_shape_is_a_new_response() {
+    // rm-905 second arm: a REAL msg_* shape whose totals go DOWN is an
+    // independent response, not a running-total re-emission — the fold
+    // reported 1000/200 at 7798b00; the true session is 2000/320. Genuine
+    // streaming (claude-stream-growing) keeps folding — pinned above.
+    let session = fixture("claude-rewind-reuse.jsonl");
+    assert_eq!(session.metrics.tokens_input, 2000);
+    assert_eq!(session.metrics.tokens_output, 320);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("relay_reused_message_id"),
+        Some(&1)
+    );
+    assert_eq!(session.metrics.assistant_turns, 2);
+}
+
+#[test]
+fn oh_my_pi_alias_pair_counts_one_source_per_class() {
+    // rm-618: both spellings of every token class present — the alias SUM
+    // double-counted each class (200/100/60/20 at 7798b00); one source
+    // per class reports the true 100/50/30/10.
+    let session = fixture("oh-my-pi-alias-pair.jsonl");
+    assert_eq!(session.metrics.source_tool, "oh_my_pi");
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_output, 50);
+    assert_eq!(session.metrics.tokens_cache_r, 30);
+    assert_eq!(session.metrics.tokens_cache_w, 10);
 }

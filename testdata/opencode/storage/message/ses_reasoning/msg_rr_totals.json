@@ -1,0 +1,16 @@
+{
+  "id": "msg_rr_totals",
+  "sessionID": "ses_reasoning",
+  "role": "assistant",
+  "modelID": "claude-sonnet-4",
+  "time": {
+    "created": 1764753602000,
+    "completed": 1764753602500
+  },
+  "content": "response with totals beside reasoning",
+  "tokens": {
+    "input": 60,
+    "output": 30,
+    "reasoning": 20
+  }
+}

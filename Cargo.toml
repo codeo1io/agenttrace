@@ -26,6 +26,17 @@ readme = "README.md"
 keywords = ["agent", "observability", "tui", "cli", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
+[profile.release]
+# rm-908: this workspace had NO release profile — every build paid cargo's
+# defaults (no LTO, 16 codegen units, symbols shipped). Thin-LTO across the
+# crate graph, one codegen unit and stripped symbols are the standard Rust
+# release posture for a shipped CLI; the before/after binary size for this
+# change is recorded in the CHANGELOG entry. No `panic = "abort"` — the
+# CLI's failure contract is a typed anyhow error exit, not a signal.
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [workspace.dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = [
