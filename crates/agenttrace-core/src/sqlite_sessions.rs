@@ -77,6 +77,16 @@ pub struct SqliteIngestReport {
     /// double-counts usage. The count is carried here so the cached
     /// and fresh paths disclose identically.
     pub fork_excluded: usize,
+    /// rm-805: token magnitude of the excluded opencode db fork rows
+    /// (stored session totals), so the exclusion discloses what it
+    /// dropped, not just how many rows.
+    pub fork_excluded_tokens: i64,
+    /// rm-805: stored-cost magnitude of the excluded rows, micro-USD.
+    pub fork_excluded_cost_microusd: i64,
+    /// rm-805: orphaned fork rows (parent row absent from the db) —
+    /// counted fully instead of dropped, disclosed so the exception is
+    /// visible next to the exclusions.
+    pub fork_orphans: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -409,13 +419,22 @@ fn load_opencode_sqlite_sessions(
     if !sqlite_file_exists(path) {
         return Vec::new();
     }
-    if let Some((sessions, fork_excluded)) =
+    if let Some((sessions, fork_meta)) =
         crate::session_cache::load_sqlite_snapshot_with_meta(path, "opencode")
     {
-        // rm-548: the warm snapshot (schema 8) carries the stored
-        // exclusion count, so the disclosure cannot go silent on the
-        // cached path.
-        report.fork_excluded += fork_excluded;
+        // rm-548/rm-805: the warm snapshot (schema 9 since the review
+        // fix — pre-rm-805 v8 snapshots regenerate rather than serve
+        // stale orphan-excluded totals) carries the stored fork
+        // accounting, so the disclosure cannot go silent on the cached
+        // path.
+        report.fork_excluded += fork_meta.excluded_sessions;
+        report.fork_excluded_tokens = report
+            .fork_excluded_tokens
+            .saturating_add(fork_meta.excluded_tokens);
+        report.fork_excluded_cost_microusd = report
+            .fork_excluded_cost_microusd
+            .saturating_add(fork_meta.excluded_cost_microusd);
+        report.fork_orphans += fork_meta.orphans_counted;
         // rm-753: see load_hermes_sqlite_sessions — an empty snapshot
         // is re-verified, not trusted (pre-fix corrupt databases cached
         // one; the P14 probe left exactly such a file behind); the
@@ -425,16 +444,20 @@ fn load_opencode_sqlite_sessions(
             return filter_since(sessions, since);
         }
     }
-    let (sessions, failures, fork_excluded) = query_opencode_sqlite_sessions(path, None);
+    let (sessions, failures, fork_meta) = query_opencode_sqlite_sessions(path, None);
     let clean = failures.is_clean();
     report.absorb(path, "opencode", failures);
-    report.fork_excluded += fork_excluded;
+    report.fork_excluded += fork_meta.excluded_sessions;
+    report.fork_excluded_tokens = report
+        .fork_excluded_tokens
+        .saturating_add(fork_meta.excluded_tokens);
+    report.fork_excluded_cost_microusd = report
+        .fork_excluded_cost_microusd
+        .saturating_add(fork_meta.excluded_cost_microusd);
+    report.fork_orphans += fork_meta.orphans_counted;
     if clean {
         let _ = crate::session_cache::store_sqlite_snapshot_with_meta(
-            path,
-            "opencode",
-            &sessions,
-            fork_excluded,
+            path, "opencode", &sessions, fork_meta,
         );
     }
     filter_since(sessions, since)
@@ -443,19 +466,27 @@ fn load_opencode_sqlite_sessions(
 fn query_opencode_sqlite_sessions(
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> (Vec<Session>, SqliteFileFailures, usize) {
+) -> (
+    Vec<Session>,
+    SqliteFileFailures,
+    crate::session_cache::SqliteForkMeta,
+) {
     let mut failures = SqliteFileFailures::default();
     let db = match open_sqlite_read_only(path) {
         Ok(db) => db,
         Err(error) => {
             failures.unreadable = Some(error.to_string());
-            return (Vec::new(), failures, 0);
+            return (
+                Vec::new(),
+                failures,
+                crate::session_cache::SqliteForkMeta::default(),
+            );
         }
     };
-    let (mut aggs, row_failures, fork_excluded) = opencode_sqlite_session_rows(&db, path, since);
+    let (mut aggs, row_failures, fork_meta) = opencode_sqlite_session_rows(&db, path, since);
     failures.merge(row_failures);
     if aggs.is_empty() {
-        return (Vec::new(), failures, fork_excluded);
+        return (Vec::new(), failures, fork_meta);
     }
     add_opencode_sqlite_messages(&db, &mut aggs);
     add_opencode_sqlite_parts(&db, &mut aggs);
@@ -474,7 +505,7 @@ fn query_opencode_sqlite_sessions(
             session_from_sqlite_agg(agg)
         })
         .collect();
-    (sessions, failures, fork_excluded)
+    (sessions, failures, fork_meta)
 }
 
 /// Prefer the authoritative totals recorded on the session row over
@@ -555,7 +586,11 @@ fn opencode_sqlite_session_rows(
     db: &Connection,
     path: &Path,
     since: Option<DateTime<Utc>>,
-) -> (HashMap<String, SqliteSessionAgg>, SqliteFileFailures, usize) {
+) -> (
+    HashMap<String, SqliteSessionAgg>,
+    SqliteFileFailures,
+    crate::session_cache::SqliteForkMeta,
+) {
     let mut failures = SqliteFileFailures::default();
     let directory = if sqlite_has_column(db, "session", "directory") {
         "directory"
@@ -623,7 +658,11 @@ fn opencode_sqlite_session_rows(
             if !error.to_string().contains("no such table") {
                 failures.unreadable = Some(error.to_string());
             }
-            return (HashMap::new(), failures, 0);
+            return (
+                HashMap::new(),
+                failures,
+                crate::session_cache::SqliteForkMeta::default(),
+            );
         }
     };
     let since_millis = since.map(|value| value.timestamp_millis());
@@ -631,7 +670,6 @@ fn opencode_sqlite_session_rows(
     // session's messages are a replay of the parent's history, so
     // aggregating both double-counts usage. Excluded rows are counted
     // for the disclosure channel instead of dying silently.
-    let mut fork_excluded = 0usize;
     let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
         // Lenient read, same rule as every other dynamically-typed
@@ -675,7 +713,11 @@ fn opencode_sqlite_session_rows(
         Ok(rows) => rows,
         Err(error) => {
             failures.unreadable = Some(error.to_string());
-            return (HashMap::new(), failures, 0);
+            return (
+                HashMap::new(),
+                failures,
+                crate::session_cache::SqliteForkMeta::default(),
+            );
         }
     };
     // rm-753: decode failures are counted and sampled, not
@@ -683,21 +725,151 @@ fn opencode_sqlite_session_rows(
     // session silently (P11: 4 of 5 sessions "reported"). rm-548: a
     // row whose fork marker (`parent_id`) names a parent session is a
     // fork copy replaying that parent's history — it is excluded from
-    // aggregation and counted for disclosure instead.
-    let mut aggs = HashMap::new();
+    // aggregation and counted for disclosure instead. rm-805 refined
+    // the drop with the row-level facts: an orphaned fork (parent row
+    // absent from this database — the fork is the only surviving
+    // record of that history) is counted fully and disclosed as
+    // `fork_orphans`, and every excluded live fork contributes its
+    // stored token/cost magnitude so the disclosure says what was
+    // dropped, not only how many rows. (The db's message rows carry
+    // no replay-boundary structure, so a live fork's post-boundary
+    // continuation cannot be split out of a stored row the way the
+    // JSON lane does; the row is dropped whole with its magnitude
+    // disclosed.)
+    let mut collected = Vec::new();
     for row in rows {
         match row {
-            Ok((id, fork_parent, agg)) => {
-                if fork_parent.is_some() {
-                    fork_excluded += 1;
-                    continue;
-                }
-                aggs.insert(id, agg);
-            }
+            Ok(triple) => collected.push(triple),
             Err(error) => failures.record_dropped(&error),
         }
     }
-    (aggs, failures, fork_excluded)
+    let known_ids: std::collections::HashSet<String> =
+        collected.iter().map(|(id, _, _)| id.clone()).collect();
+    let mut fork_meta = crate::session_cache::SqliteForkMeta::default();
+    let mut aggs = HashMap::new();
+    for (id, fork_parent, agg) in collected {
+        if let Some(parent) = fork_parent {
+            if known_ids.contains(&parent) {
+                fork_meta.excluded_sessions += 1;
+                // Magnitude of the drop — mirroring
+                // `apply_opencode_stored_totals`: stored totals when the
+                // upstream row carries them (output includes stored
+                // reasoning), else the derived message aggregation that
+                // `add_opencode_sqlite_messages` would have counted.
+                let has_stored = agg.stored_input.is_some()
+                    || agg.stored_output.is_some()
+                    || agg.stored_reasoning.is_some()
+                    || agg.stored_cache_read.is_some()
+                    || agg.stored_cache_write.is_some();
+                let mut prefix_cost = None;
+                let (input, output, cache_read, cache_write) = if has_stored {
+                    (
+                        agg.stored_input.unwrap_or(0).max(0),
+                        agg.stored_output
+                            .unwrap_or(0)
+                            .max(0)
+                            .saturating_add(agg.stored_reasoning.unwrap_or(0).max(0)),
+                        agg.stored_cache_read.unwrap_or(0).max(0),
+                        agg.stored_cache_write.unwrap_or(0).max(0),
+                    )
+                } else {
+                    // Review-fix F2 (cycle-3 rm-805): the derived `agg` token
+                    // fields are structurally zero at this point —
+                    // `add_opencode_sqlite_messages` folds messages only after
+                    // the session rows, and a dropped fork's rows then find no
+                    // agg — so the honest disclosure scans the fork's message
+                    // rows directly and aggregates what they would have
+                    // contributed.
+                    let (pin, pout, pcr, pcw, pcost) =
+                        opencode_sqlite_fork_prefix_magnitude(db, &id);
+                    prefix_cost = Some(pcost);
+                    (pin, pout, pcr, pcw)
+                };
+                let magnitude = [input, output, cache_read, cache_write]
+                    .iter()
+                    .fold(0i64, |acc, value| acc.saturating_add(*value));
+                fork_meta.excluded_tokens = fork_meta.excluded_tokens.saturating_add(magnitude);
+                let disclosed_cost = agg
+                    .stored_cost
+                    .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                    // Review-fix F2: message-derived prefix cost for rows
+                    // without stored usage columns (see the else-branch note).
+                    .or(prefix_cost.filter(|cost| cost.is_finite() && *cost >= 0.0));
+                if let Some(cost) = disclosed_cost {
+                    let microusd = (cost * 1e6).round();
+                    if microusd.is_finite() && microusd >= 0.0 {
+                        fork_meta.excluded_cost_microusd = fork_meta
+                            .excluded_cost_microusd
+                            .saturating_add(microusd as i64);
+                    }
+                }
+                continue;
+            }
+            fork_meta.orphans_counted += 1;
+        }
+        aggs.insert(id, agg);
+    }
+    (aggs, failures, fork_meta)
+}
+
+/// Review-fix F2 (cycle-3 rm-805 review): magnitude of what a dropped fork's
+/// message rows would have contributed. In the sqlite lane the fork session
+/// row is removed before `add_opencode_sqlite_messages` folds messages, so
+/// none of its rows are counted — the disclosure therefore aggregates them
+/// directly, mirroring `add_opencode_tokens_from_map` (`tokens.input`,
+/// `tokens.output + tokens.reasoning`, `tokens.cache.read/write`) and the
+/// adder's `token_cost_raw` model pricing.
+fn opencode_sqlite_fork_prefix_magnitude(
+    db: &Connection,
+    session_id: &str,
+) -> (i64, i64, i64, i64, f64) {
+    let mut input = 0i64;
+    let mut output = 0i64;
+    let mut cache_read = 0i64;
+    let mut cache_write = 0i64;
+    let mut cost = 0.0f64;
+    let Ok(mut stmt) = db.prepare("select data from message where session_id = ?1") else {
+        return (input, output, cache_read, cache_write, cost);
+    };
+    let Ok(mut rows) = stmt.query(rusqlite::params![session_id]) else {
+        return (input, output, cache_read, cache_write, cost);
+    };
+    while let Ok(Some(row)) = rows.next() {
+        let Ok(data) = row.get::<_, String>("data") else {
+            continue;
+        };
+        let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let Some(tokens) = doc.get("tokens").and_then(Value::as_object) else {
+            continue;
+        };
+        let cache = tokens.get("cache").and_then(Value::as_object);
+        let row_input = number_as_i64(tokens.get("input"));
+        let row_output = number_as_i64(tokens.get("output"))
+            .saturating_add(number_as_i64(tokens.get("reasoning")));
+        let row_cache_read = cache
+            .map(|cache| number_as_i64(cache.get("read")))
+            .unwrap_or_default();
+        let row_cache_write = cache
+            .map(|cache| number_as_i64(cache.get("write")))
+            .unwrap_or_default();
+        input = input.saturating_add(row_input);
+        output = output.saturating_add(row_output);
+        cache_read = cache_read.saturating_add(row_cache_read);
+        cache_write = cache_write.saturating_add(row_cache_write);
+        let model = opencode_sqlite_message_model(&doc);
+        if !model.is_empty() {
+            cost += token_cost_raw(
+                row_input,
+                row_output,
+                row_cache_write,
+                row_cache_read,
+                &model,
+            );
+        }
+    }
+    (input, output, cache_read, cache_write, cost)
 }
 
 fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {

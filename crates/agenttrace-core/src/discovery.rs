@@ -3,12 +3,11 @@ use crate::session_cache::{
     load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
 };
 use crate::{
-    merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
-    Session,
+    merge_preserved_history, preserve_derived_history, skip_sqlite_backed_file_dir, Session,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -45,6 +44,37 @@ pub struct LoadReport {
     /// `parent_id`). Counted here so the journal disclosure channel can
     /// report the exclusion instead of dropping sessions silently.
     pub opencode_fork_excluded: usize,
+    /// rm-805: boundary-aware detail behind the exclusion count —
+    /// orphaned forks counted, replayed-prefix magnitudes for both
+    /// dropped and retained fork copies (the JSON lane's scan; the
+    /// sqlite lane folds its row magnitudes in).
+    pub opencode_forks: OpencodeForkAccounting,
+}
+
+/// rm-805: opencode fork accounting — the aggregate view of what the
+/// boundary-aware exclusion (refining rm-548's whole-drop) removes
+/// from and keeps in aggregation, surfaced through the disclosure
+/// channel so no exclusion is only a silent count.
+#[derive(Debug, Clone, Default)]
+pub struct OpencodeForkAccounting {
+    /// Fork copies fully excluded (pure replays; includes the rm-548
+    /// fallback when a fork doc carries no usable `timeCreated`).
+    pub excluded_sessions: usize,
+    /// Token magnitude of the fully-excluded fork copies (their
+    /// replayed prefix — all of their tokens, since nothing else
+    /// counts a pure replay).
+    pub excluded_tokens: i64,
+    /// Catalog-estimated cost of `excluded_tokens`, micro-USD.
+    pub excluded_cost_microusd: i64,
+    /// Replayed-prefix magnitude inside retained continuation forks:
+    /// sessions kept (post-boundary work exists) whose replayed
+    /// prefix is excluded at parse time.
+    pub prefix_excluded_tokens: i64,
+    /// Catalog-estimated cost of `prefix_excluded_tokens`, micro-USD.
+    pub prefix_excluded_cost_microusd: i64,
+    /// Orphaned forks (parent info doc absent — the fork is now the
+    /// only record of that history) fully counted.
+    pub orphans_counted: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -292,7 +322,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (files, fork_accounting, fork_boundaries) = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -300,6 +330,16 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let mut slots: Vec<Option<(Option<Session>, bool)>> = Vec::with_capacity(files.len());
     let mut misses = Vec::new();
     for (index, path) in files.iter().enumerate() {
+        if fork_boundaries.contains_key(path) {
+            // rm-805: retained fork copies parse through the boundary
+            // filter every run — serving a cached full-fidelity copy
+            // would bypass the prefix exclusion, and storing the
+            // filtered view would poison the cache for explicit
+            // full-fidelity loads of the same path. Neither is cached.
+            slots.push(None);
+            misses.push(index);
+            continue;
+        }
         match cached_session(path, cache) {
             Some(session) => slots.push(Some((Some(session), true))),
             None => {
@@ -323,12 +363,21 @@ pub fn load_sessions_with_progress_from_cache_mode(
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
-            let (files, misses, next_miss) = (&files, &misses, &next_miss);
+            let (files, misses, next_miss, fork_boundaries) =
+                (&files, &misses, &next_miss, &fork_boundaries);
             scope.spawn(move || {
                 while let Some(&index) =
                     misses.get(next_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    if tx.send((index, parse_file(&files[index]).ok())).is_err() {
+                    let boundary = fork_boundaries.get(&files[index]).copied();
+                    if tx
+                        .send((
+                            index,
+                            crate::parser::parse_file_with_fork_boundary(&files[index], boundary)
+                                .ok(),
+                        ))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -342,9 +391,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
             while let Some((result, from_cache)) = slots.get_mut(next).and_then(Option::take) {
                 match (&result, from_cache) {
                     (Some(_), true) => cache_hits += 1,
-                    (Some(session), false) => {
+                    (Some(session), false) if !fork_boundaries.contains_key(&files[next]) => {
                         let _ = store_session(&files[next], session, cache);
                     }
+                    // rm-805: boundary-filtered fork parses stay out of
+                    // the cache (see the miss loop above).
+                    (Some(_), false) => {}
                     (None, _) => skipped += 1,
                 }
                 report_load_progress(
@@ -373,13 +425,24 @@ pub fn load_sessions_with_progress_from_cache_mode(
     let mut sqlite_ingest = crate::sqlite_sessions::SqliteIngestReport::default();
     // rm-548: the JSON storage lane's fork exclusions (counted during
     // file discovery) seed the total; the sqlite lane adds its own.
-    let mut opencode_fork_excluded = json_fork_excluded;
+    let mut opencode_fork_excluded = fork_accounting.excluded_sessions;
+    let mut opencode_forks = fork_accounting;
     if dir.is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
         sessions.extend(sqlite_sessions);
         sqlite_ingest = ingest;
         opencode_fork_excluded += sqlite_ingest.fork_excluded;
+        // rm-805: the sqlite lane's row-level fork magnitudes fold
+        // into the same disclosure counters.
+        opencode_forks.excluded_sessions += sqlite_ingest.fork_excluded;
+        opencode_forks.excluded_tokens = opencode_forks
+            .excluded_tokens
+            .saturating_add(sqlite_ingest.fork_excluded_tokens);
+        opencode_forks.excluded_cost_microusd = opencode_forks
+            .excluded_cost_microusd
+            .saturating_add(sqlite_ingest.fork_excluded_cost_microusd);
+        opencode_forks.orphans_counted += sqlite_ingest.fork_orphans;
     }
     if options.preserve_history {
         let _ = preserve_derived_history(&sessions);
@@ -421,6 +484,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         cache_hits,
         sqlite: sqlite_ingest,
         opencode_fork_excluded,
+        opencode_forks,
     }
 }
 
@@ -465,15 +529,31 @@ pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> (Vec<PathBuf>, usize) {
+) -> (
+    Vec<PathBuf>,
+    OpencodeForkAccounting,
+    // rm-805: retained continuation forks → fork point, keyed by info
+    // doc path. Discovery-internal plumbing (drives the parse-time
+    // prefix exclusion and the cache bypass); kept out of the public
+    // accounting struct so report-carrying enums stay small.
+    HashMap<PathBuf, DateTime<Utc>>,
+) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return (vec![dir.to_path_buf()], 0);
+            return (
+                vec![dir.to_path_buf()],
+                OpencodeForkAccounting::default(),
+                HashMap::new(),
+            );
         }
         // rm-548: an explicitly requested directory keeps every file —
         // a forked copy loaded by explicit path still renders (the
         // exclusion is an aggregation rule, not a parse block).
-        return (collect_session_files_cached(dir, cache), 0);
+        return (
+            collect_session_files_cached(dir, cache),
+            OpencodeForkAccounting::default(),
+            HashMap::new(),
+        );
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -498,22 +578,148 @@ pub(crate) fn find_session_files_cached(
     }
     // rm-548: opencode fork copies (session info docs whose `parentID`
     // is set) re-emit their parent's history, so aggregating them
-    // double-counts usage. Drop them before enumeration and return the
-    // count so the disclosure channel reports it — never silently.
-    // Independent-review fix: the per-file probe is memoized on the
-    // cached dir listing (fingerprint-keyed, see
+    // double-counts usage. rm-805 made the drop boundary-aware, one
+    // fork at a time:
+    //   • parent info doc gone (an orphaned fork) — nothing else
+    //     carries this history, so count the fork fully and disclose
+    //     the exception (`orphans_counted`);
+    //   • the fork's own `timeCreated` splits replay from
+    //     continuation — keep the session and record the fork point
+    //     when messages strictly newer than the boundary exist (the
+    //     loader then parses it with the replayed prefix excluded);
+    //   • otherwise (pure replay, or no usable timestamp) the rm-548
+    //     whole-drop stands.
+    // Every dropped magnitude is measured by re-deriving the same
+    // per-message usage the parser counts (message `tokens`, else the
+    // step-finish part fallback) and priced at the catalog rate, so
+    // the disclosure equals what aggregation would have counted —
+    // never silently.
+    // Independent-review fix (rm-548): the per-file probe is memoized
+    // on the cached dir listing (fingerprint-keyed, see
     // `opencode_session_fork_parent_cached`) so warm runs stop
     // re-reading every storage session info doc on discovery.
-    let mut opencode_fork_excluded = 0usize;
-    all.retain(|path| {
-        if opencode_session_fork_parent_cached(path, cache).is_some() {
-            opencode_fork_excluded += 1;
-            false
-        } else {
-            true
+    let mut accounting = OpencodeForkAccounting::default();
+    let mut boundaries: HashMap<PathBuf, DateTime<Utc>> = HashMap::new();
+    let mut kept = Vec::with_capacity(all.len());
+    for path in all {
+        let Some(parent_id) = opencode_session_fork_parent_cached(&path, cache) else {
+            kept.push(path);
+            continue;
+        };
+        let info_dir = path.parent().map(Path::to_path_buf);
+        let parent_doc = info_dir
+            .as_deref()
+            .map(|dir| dir.join(format!("{parent_id}.json")));
+        if !parent_doc.as_deref().is_some_and(|doc| doc.is_file()) {
+            accounting.orphans_counted += 1;
+            kept.push(path);
+            continue;
         }
-    });
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+        let storage_root = info_dir
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let boundary = crate::parser::opencode_fork_boundary(&path);
+        let session_dir = path
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|stem| {
+                storage_root
+                    .as_deref()
+                    .map(|root| root.join("message").join(stem))
+            });
+        // rm-805 review-fix F6: the per-fork message-dir scan is memoized
+        // on the cached dir listing (info-doc fingerprint + message-dir
+        // mtime keyed; see `cached_fork_boundary_probe`), so warm loads
+        // stop re-reading every non-orphan fork's message dir — the same
+        // memo bar rm-548 set for the parent probe. A grown or rewritten
+        // message dir re-probes; the boundary itself stays a live read of
+        // the (tiny) info doc.
+        let probe =
+            crate::session_cache::cached_fork_boundary_probe(&path, session_dir.as_deref(), cache)
+                .unwrap_or_else(|| {
+                    let mut prefix_tokens: i64 = 0;
+                    let mut prefix_cost: i64 = 0;
+                    let mut has_continuation = false;
+                    if let (Some(root), Some(boundary), Some(session_dir)) = (
+                        storage_root.as_deref(),
+                        boundary.as_ref(),
+                        session_dir.as_deref(),
+                    ) {
+                        if let Ok(records) = fs::read_dir(session_dir) {
+                            for entry in records.flatten() {
+                                let Ok(raw) = fs::read_to_string(entry.path()) else {
+                                    continue;
+                                };
+                                let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+                                else {
+                                    continue;
+                                };
+                                let Some(doc) = value.as_object() else {
+                                    continue;
+                                };
+                                // Same classification the parser's boundary filter
+                                // applies: at-or-before the boundary, or unprovable
+                                // (no timestamp), counts as replayed prefix.
+                                let is_replay = crate::parser::opencode_record_time(doc)
+                                    .is_none_or(|time| time <= *boundary);
+                                if is_replay {
+                                    let (usage, microusd) =
+                                        crate::parser::opencode_message_usage_and_cost(root, doc);
+                                    let message_tokens = usage
+                                        .values()
+                                        .fold(0i64, |acc, value| acc.saturating_add(*value));
+                                    prefix_tokens = prefix_tokens.saturating_add(message_tokens);
+                                    prefix_cost = prefix_cost.saturating_add(microusd);
+                                } else {
+                                    has_continuation = true;
+                                }
+                            }
+                        }
+                    }
+                    let outcome = crate::session_cache::ForkBoundaryProbeOutcome {
+                        prefix_tokens,
+                        prefix_cost_microusd: prefix_cost,
+                        has_continuation,
+                    };
+                    crate::session_cache::store_fork_boundary_probe(
+                        &path,
+                        session_dir.as_deref(),
+                        outcome.clone(),
+                        cache,
+                    );
+                    outcome
+                });
+        let prefix_tokens = probe.prefix_tokens;
+        let prefix_cost = probe.prefix_cost_microusd;
+        let has_continuation = probe.has_continuation;
+        if has_continuation {
+            // Retained: the fork has work of its own. Parse-time prefix
+            // exclusion (see the loader) keeps its usage honest; the
+            // disclosure carries the excluded magnitude.
+            kept.push(path.clone());
+            accounting.prefix_excluded_tokens = accounting
+                .prefix_excluded_tokens
+                .saturating_add(prefix_tokens);
+            accounting.prefix_excluded_cost_microusd = accounting
+                .prefix_excluded_cost_microusd
+                .saturating_add(prefix_cost);
+            boundaries.insert(
+                path,
+                // Continuation is only detected with a boundary in
+                // scope, so this cannot miss here.
+                boundary.expect("continuation requires a boundary in scope"),
+            );
+        } else {
+            accounting.excluded_sessions += 1;
+            accounting.excluded_tokens = accounting.excluded_tokens.saturating_add(prefix_tokens);
+            accounting.excluded_cost_microusd = accounting
+                .excluded_cost_microusd
+                .saturating_add(prefix_cost);
+        }
+    }
+    (sort_paths_by_cache(kept, cache), accounting, boundaries)
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/

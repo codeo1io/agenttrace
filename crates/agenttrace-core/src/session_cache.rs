@@ -5,7 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 34;
+// Bumped 33 -> 34 (cycle-3 rm-805 'opencode fork boundary-aware accounting'
+// + review fix 97f7e26c): orphaned opencode forks are now fully counted with
+// disclosure instead of dropped, and post-fork continuation counts toward
+// the fork's own session — v33 dir-cache snapshots carry stale
+// orphan-excluded totals and regenerate once on next scan.
 // Bumped 32 -> 33 (integration of run 91833f02, rm-616 'Generic-lane
 // model/usage truth', review fix 0be11bb1 after review f6b98bc3 F1):
 // the Event.model_used snake_case alias plus the generic-lane counted
@@ -192,7 +197,12 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 33;
 // tool_calls_ok/fail are now derived from the messages table instead of
 // fabricating ok == sessions.tool_call_count, so v6 snapshots carry stale
 // tool outcome splits and must regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 8;
+// Bumped 8 -> 9 (cycle-3 rm-805 + review fix 97f7e26c F1/F2): orphaned
+// fork rows are now kept and counted with magnitude disclosure, and
+// fork rows without stored usage columns disclose the derived
+// message-row magnitude — v8 snapshots carry orphan-excluded stale
+// totals on an unchanged opencode.db and regenerate once.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 9;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -300,6 +310,32 @@ struct SqliteSnapshot {
     /// retires snapshots written before the exclusion existed.
     #[serde(default)]
     fork_excluded: usize,
+    /// rm-805: row-level fork detail (magnitude of what the exclusion
+    /// dropped, and orphaned forks counted instead of dropped) so warm
+    /// snapshots keep disclosing it. The fields ride `serde(default)` —
+    /// the same forward-compat pattern `pricing_catalog_id` used — and
+    /// the review fix then bumped the schema 8 → 9 so snapshots written
+    /// before the fields existed regenerate once instead of serving
+    /// stale orphan-excluded totals.
+    #[serde(default)]
+    fork_excluded_tokens: i64,
+    #[serde(default)]
+    fork_excluded_cost_microusd: i64,
+    #[serde(default)]
+    fork_orphans: usize,
+}
+
+/// rm-805: sqlite-lane opencode fork accounting — the row-level detail
+/// behind the rm-548 exclusion count. `excluded_sessions` is the number
+/// the snapshot's legacy `fork_excluded` field carries; the magnitude
+/// fields and the orphan count ride along so warm snapshots disclose
+/// the same shape a fresh ingest does.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SqliteForkMeta {
+    pub excluded_sessions: usize,
+    pub excluded_tokens: i64,
+    pub excluded_cost_microusd: i64,
+    pub orphans_counted: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +354,33 @@ struct DirCacheEntry {
     /// serialize byte-identically.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fork_parents: BTreeMap<String, (FileFingerprint, Option<String>)>,
+    /// rm-805 review-fix F6: memoized per-fork boundary-probe outcomes
+    /// (replayed-prefix tokens/cost + continuation presence), keyed by the
+    /// session info doc path. Served only while the info doc's fingerprint
+    /// AND the fork's message dir mtime still match probe-time values — a
+    /// rewritten doc or a grown message dir re-probes, so the memo can
+    /// never mask new continuation work. Kept per-directory so it retires
+    /// with the listing, and skipped when empty so untouched journals
+    /// serialize byte-identically.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    fork_boundary_probes: BTreeMap<String, ForkBoundaryProbeMemo>,
+}
+
+/// rm-805 review-fix F6: what the discovery-side per-fork message-dir
+/// scan produced (mirrors the classification the parser's boundary
+/// filter applies).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ForkBoundaryProbeOutcome {
+    pub(crate) prefix_tokens: i64,
+    pub(crate) prefix_cost_microusd: i64,
+    pub(crate) has_continuation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ForkBoundaryProbeMemo {
+    info: FileFingerprint,
+    message_dir_mod_time: i64,
+    outcome: ForkBoundaryProbeOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -554,14 +617,14 @@ pub(crate) fn load_sqlite_snapshot(database: &Path, name: &str) -> Option<Vec<Se
 pub(crate) fn load_sqlite_snapshot_with_meta(
     database: &Path,
     name: &str,
-) -> Option<(Vec<Session>, usize)> {
+) -> Option<(Vec<Session>, SqliteForkMeta)> {
     load_sqlite_snapshot_from(database, &sqlite_snapshot_path(name))
 }
 
 fn load_sqlite_snapshot_from(
     database: &Path,
     snapshot_path: &Path,
-) -> Option<(Vec<Session>, usize)> {
+) -> Option<(Vec<Session>, SqliteForkMeta)> {
     let raw = fs::read(snapshot_path).ok()?;
     let snapshot = serde_json::from_slice::<SqliteSnapshot>(&raw).ok()?;
     if snapshot.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION
@@ -575,14 +638,19 @@ fn load_sqlite_snapshot_from(
     {
         return None;
     }
-    let fork_excluded = snapshot.fork_excluded;
+    let fork_meta = SqliteForkMeta {
+        excluded_sessions: snapshot.fork_excluded,
+        excluded_tokens: snapshot.fork_excluded_tokens,
+        excluded_cost_microusd: snapshot.fork_excluded_cost_microusd,
+        orphans_counted: snapshot.fork_orphans,
+    };
     Some((
         snapshot
             .sessions
             .into_iter()
             .map(|session| session.into_session(&database.to_string_lossy()))
             .collect(),
-        fork_excluded,
+        fork_meta,
     ))
 }
 
@@ -591,30 +659,26 @@ pub(crate) fn store_sqlite_snapshot(
     name: &str,
     sessions: &[Session],
 ) -> anyhow::Result<()> {
-    store_sqlite_snapshot_with_meta(database, name, sessions, 0)
+    store_sqlite_snapshot_with_meta(database, name, sessions, SqliteForkMeta::default())
 }
 
-/// rm-548: opencode snapshots record their fork-exclusion count so the
-/// disclosure survives warm caches.
+/// rm-548/rm-805: opencode snapshots record their fork accounting
+/// (exclusion count since rm-548, magnitudes and orphans since rm-805)
+/// so the disclosure survives warm caches.
 pub(crate) fn store_sqlite_snapshot_with_meta(
     database: &Path,
     name: &str,
     sessions: &[Session],
-    fork_excluded: usize,
+    fork_meta: SqliteForkMeta,
 ) -> anyhow::Result<()> {
-    store_sqlite_snapshot_at(
-        database,
-        &sqlite_snapshot_path(name),
-        sessions,
-        fork_excluded,
-    )
+    store_sqlite_snapshot_at(database, &sqlite_snapshot_path(name), sessions, fork_meta)
 }
 
 fn store_sqlite_snapshot_at(
     database: &Path,
     path: &Path,
     sessions: &[Session],
-    fork_excluded: usize,
+    fork_meta: SqliteForkMeta,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -626,7 +690,10 @@ fn store_sqlite_snapshot_at(
         shm: file_fingerprint(&sqlite_shm_path(database)),
         sessions: sessions.iter().map(GoSession::from_session).collect(),
         pricing_catalog_id: Some(crate::pricing::catalog_identity().to_string()),
-        fork_excluded,
+        fork_excluded: fork_meta.excluded_sessions,
+        fork_excluded_tokens: fork_meta.excluded_tokens,
+        fork_excluded_cost_microusd: fork_meta.excluded_cost_microusd,
+        fork_orphans: fork_meta.orphans_counted,
     };
     let tmp = unique_temp_path(path);
     write_private(&tmp, &serde_json::to_vec(&snapshot)?)?;
@@ -960,6 +1027,7 @@ pub(crate) fn store_dir_listing(
             files: files.iter().map(|path| cache_key(path)).collect(),
             dirs: dirs.iter().map(|path| cache_key(path)).collect(),
             fork_parents: BTreeMap::new(),
+            fork_boundary_probes: BTreeMap::new(),
         },
     );
     cache.dirty = true;
@@ -1015,6 +1083,77 @@ pub(crate) fn store_fork_parent_probe(
             },
             parent,
         ),
+    );
+    cache.dirty = true;
+}
+
+/// rm-805 review-fix F6: memoized per-fork boundary probe (the message-dir
+/// scan that classifies replayed prefix vs continuation), served from the
+/// info doc's parent directory listing. `None` = no usable memo (probe
+/// never run, no listing, the info doc's fingerprint moved, or the fork's
+/// message dir changed) — callers then scan once and persist with
+/// [`store_fork_boundary_probe`]. Warm loads therefore stop re-reading
+/// every non-orphan fork's message dir.
+pub(crate) fn cached_fork_boundary_probe(
+    info_path: &Path,
+    message_dir: Option<&Path>,
+    cache: &SessionCache,
+) -> Option<ForkBoundaryProbeOutcome> {
+    let entry = cache.dirs.get(&cache_key(info_path.parent()?))?;
+    let memo = entry.fork_boundary_probes.get(&cache_key(info_path))?;
+    let metadata = fs::metadata(info_path).ok()?;
+    if memo.info.mod_time != file_mod_time_nanos(&metadata)
+        || memo.info.size != metadata.len() as i64
+    {
+        return None;
+    }
+    // The probe classified this fork's message dir: a dir whose mtime
+    // moved (new message files — the exact state change that turns a
+    // pure-replay fork into a continuation fork) invalidates the memo
+    // even when the info doc is untouched.
+    let dir_mtime = message_dir
+        .and_then(|dir| fs::metadata(dir).ok())
+        .map(|meta| file_mod_time_nanos(&meta));
+    if dir_mtime != Some(memo.message_dir_mod_time) {
+        return None;
+    }
+    Some(memo.outcome.clone())
+}
+
+/// rm-805 review-fix F6: persist one per-fork boundary probe result onto
+/// the info doc's parent directory listing (see
+/// [`cached_fork_boundary_probe`]). When the directory has no cached
+/// listing the result is simply not persisted — the probe answer stays
+/// correct for this run.
+pub(crate) fn store_fork_boundary_probe(
+    info_path: &Path,
+    message_dir: Option<&Path>,
+    outcome: ForkBoundaryProbeOutcome,
+    cache: &mut SessionCache,
+) {
+    let Some(dir) = info_path.parent() else {
+        return;
+    };
+    let Ok(metadata) = fs::metadata(info_path) else {
+        return;
+    };
+    let message_dir_mod_time = message_dir
+        .and_then(|dir| fs::metadata(dir).ok())
+        .map(|meta| file_mod_time_nanos(&meta))
+        .unwrap_or(0);
+    let Some(entry) = cache.dirs.get_mut(&cache_key(dir)) else {
+        return;
+    };
+    entry.fork_boundary_probes.insert(
+        cache_key(info_path),
+        ForkBoundaryProbeMemo {
+            info: FileFingerprint {
+                mod_time: file_mod_time_nanos(&metadata),
+                size: metadata.len() as i64,
+            },
+            message_dir_mod_time,
+            outcome,
+        },
     );
     cache.dirty = true;
 }
@@ -1763,7 +1902,15 @@ mod tests {
                     let database = database.clone();
                     let snapshot = snapshot.clone();
                     let session = session.clone();
-                    move || store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).map(|_| i)
+                    move || {
+                        store_sqlite_snapshot_at(
+                            &database,
+                            &snapshot,
+                            &[session],
+                            SqliteForkMeta::default(),
+                        )
+                        .map(|_| i)
+                    }
                 })
             })
             .collect();
@@ -1814,7 +1961,8 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
 
-        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], SqliteForkMeta::default())
+            .expect("store snapshot");
         assert_eq!(
             load_sqlite_snapshot_from(&database, &snapshot)
                 .expect("cache hit")
@@ -1839,7 +1987,7 @@ mod tests {
                 tool_warnings: Vec::new(),
                 diagnostics: Diagnostics::default(),
             }],
-            0,
+            SqliteForkMeta::default(),
         )
         .expect("store snapshot with wal");
         fs::write(sqlite_shm_path(&database), b"shm").expect("write shm");
@@ -1878,7 +2026,8 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], SqliteForkMeta::default())
+            .expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         // Version seven (cycle-1 rm-198): hermes tool outcome semantics
@@ -1888,7 +2037,7 @@ mod tests {
         // (rm-548): snapshots now carry their opencode fork-exclusion
         // count, so v7 snapshots would disclose a silently-missing
         // count and must regenerate too.
-        assert_eq!(doc["schema_version"], 8);
+        assert_eq!(doc["schema_version"], 9);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -1981,6 +2130,7 @@ mod tests {
             files: Vec::new(),
             dirs: Vec::new(),
             fork_parents: BTreeMap::new(),
+            fork_boundary_probes: BTreeMap::new(),
         };
         cache
             .dirs
@@ -2362,6 +2512,7 @@ mod tests {
                     files: vec!["f".repeat(120); 6],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    fork_boundary_probes: BTreeMap::new(),
                 },
             );
         }
@@ -2451,6 +2602,7 @@ mod tests {
                 files: vec!["f".repeat(120); 6],
                 dirs: Vec::new(),
                 fork_parents: BTreeMap::new(),
+                fork_boundary_probes: BTreeMap::new(),
             },
         );
         let projected = serialized_doc_size(&cache);
@@ -2545,6 +2697,7 @@ mod tests {
                     files: vec![format!("file-{i}-{}.jsonl", "f".repeat(60)); 4],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
+                    fork_boundary_probes: BTreeMap::new(),
                 },
             );
         }
@@ -2974,7 +3127,8 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, &[session], SqliteForkMeta::default())
+            .expect("store snapshot");
         let mode = fs::metadata(&snapshot)
             .expect("snapshot exists")
             .permissions()
@@ -3000,6 +3154,128 @@ mod tests {
             "sessions.json must be owner-only, got {:o}",
             mode & 0o777
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn serde_json_parses_shortest_roundtrip_floats_exactly() {
+        // rm-803: serde_json's default float parser takes a fast path
+        // that is up to 1 ULP off on some shortest-round-trip literals
+        // (upstream serde-rs/json#1336 — intentional best-effort, the
+        // sanctioned exactness switch is the `float_roundtrip`
+        // feature). These three literals are the pinned corruptible
+        // shapes from the corpus audit; each must parse to the exact
+        // IEEE-754 bits a correctly-rounded parser (and Rust's own
+        // `str::parse::<f64>`) produces.
+        let cases: &[(&str, u64)] = &[
+            ("11.005401611328125", 0x4026_02c4_0000_0000),
+            ("1.5777777777770001", 0x3ff9_3e93_e93e_863b),
+            ("9007199254740993.0", 0x4340_0000_0000_0000),
+        ];
+        for (text, bits) in cases {
+            let expected: f64 = text.parse().expect("rust parse is correctly rounded");
+            assert_eq!(
+                expected.to_bits(),
+                *bits,
+                "pinned bit pattern for {text} drifted"
+            );
+            let doc = serde_json::from_str::<serde_json::Value>(&format!("{{\"x\":{text}}}"))
+                .expect("document parses");
+            let parsed = doc["x"].as_f64().expect("x is a number");
+            assert_eq!(
+                parsed.to_bits(),
+                *bits,
+                "serde_json parse of {text} is not exact: got {parsed:e} ({:#018x}), want {:#018x}",
+                parsed.to_bits(),
+                bits
+            );
+        }
+    }
+
+    #[test]
+    fn warm_cache_float_fields_roundtrip_bit_exact() {
+        // rm-803: the session cache is serialized as JSON and the warm
+        // read (:769 `from_str::<Value>` + field extraction) used to
+        // re-parse those f64 literals through the inexact fast path,
+        // so warm reads corrupted cached costs/durations by 1 ULP
+        // while cold parses kept the exact bits — warm != cold on
+        // metrics that must never drift. Store a session carrying the
+        // pinned corruptible literals in every cache-serialized f64
+        // field, persist, then warm-load and require identical bits.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-float-warm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("session.jsonl");
+        fs::write(&journal, b"{}\n").expect("write journal");
+        let pinned: f64 = "11.005401611328125".parse().unwrap();
+        let second: f64 = "1.5777777777770001".parse().unwrap();
+        let big: f64 = "9007199254740993.0".parse().unwrap();
+        let session = Session {
+            name: "float-pin".to_string(),
+            path: journal.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: Metrics {
+                duration_sec: pinned,
+                cost_estimated: second,
+                credit_usd: big,
+                upstream_cost_usd: second,
+                gaps_sec: vec![pinned, big],
+                source_tool: "hermes".to_string(),
+                ..Default::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let mut cache = load_session_cache();
+        store_session(&journal, &session, &mut cache).expect("store session");
+        save_session_cache(&mut cache).expect("save cache");
+        // The persisted journal really carries the shortest-round-trip
+        // literals — otherwise the read-back below would be vacuous.
+        let persisted = fs::read_to_string(root.join("sessions.json")).expect("read journal");
+        assert!(
+            persisted.contains("11.005401611328125"),
+            "persisted cache must carry the pinned literal"
+        );
+        let mut warm = load_session_cache();
+        let restored = cached_session(&journal, &mut warm).expect("warm read restores session");
+        assert_eq!(
+            restored.metrics.duration_sec.to_bits(),
+            pinned.to_bits(),
+            "duration_sec corrupted on warm read"
+        );
+        assert_eq!(
+            restored.metrics.cost_estimated.to_bits(),
+            second.to_bits(),
+            "cost_estimated corrupted on warm read"
+        );
+        assert_eq!(
+            restored.metrics.credit_usd.to_bits(),
+            big.to_bits(),
+            "credit_usd corrupted on warm read"
+        );
+        assert_eq!(
+            restored.metrics.upstream_cost_usd.to_bits(),
+            second.to_bits(),
+            "upstream_cost_usd corrupted on warm read"
+        );
+        assert_eq!(
+            restored.metrics.gaps_sec,
+            vec![pinned, big],
+            "gaps_sec corrupted on warm read"
+        );
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
         let _ = fs::remove_dir_all(root);
     }
 }

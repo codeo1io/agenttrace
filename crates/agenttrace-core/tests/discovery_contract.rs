@@ -2614,14 +2614,14 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             all.discovered,
             all.skipped,
             all.cache_hits,
-            all.opencode_fork_excluded,
+            &all.opencode_forks,
         );
         let health_day = data_health_scoped(
             &day.sessions,
             day.discovered,
             day.skipped,
             day.cache_hits,
-            day.opencode_fork_excluded,
+            &day.opencode_forks,
         );
         assert_eq!(health_all.parsed, 2);
         assert_eq!(
@@ -2704,7 +2704,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
-            report.opencode_fork_excluded,
+            &report.opencode_forks,
         );
         assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
         assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
@@ -2713,7 +2713,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.discovered,
             report.skipped,
             report.cache_hits,
-            report.opencode_fork_excluded,
+            &report.opencode_forks,
         );
         assert_eq!(clean.non_finite_costs, 0);
     });
@@ -3448,7 +3448,7 @@ fn opencode_json_fork_copies_excluded_from_aggregation_and_disclosed() {
             report.discovered,
             report.skipped,
             report.cache_hits,
-            report.opencode_fork_excluded,
+            &report.opencode_forks,
         );
         assert_eq!(
             health.disclosures.get("opencode_fork_excluded_sessions"),

@@ -14,6 +14,22 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 type ParseCounters = Vec<(String, i64)>;
 
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
+    parse_file_with_fork_boundary(path, None)
+}
+
+/// rm-805: parse one session file with an opencode fork boundary in
+/// force. Discovery passes the fork point (the session doc's
+/// `timeCreated`) for fork copies that continue past the fork: their
+/// replayed prefix (messages at or before the boundary) re-emits the
+/// parent's already-counted history, so aggregation double-counts it.
+/// `None` everywhere else — the default `parse_file` — keeps full
+/// fidelity for every other caller (explicit `-d` loads still render a
+/// forked copy whole; the boundary is an aggregation-lane rule, the
+/// same stance rm-548 took for the whole-drop).
+pub fn parse_file_with_fork_boundary(
+    path: &Path,
+    fork_boundary: Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
     }
@@ -28,14 +44,19 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
-    parse_session_bytes(raw, &path_text, &name)
+    parse_session_bytes(raw, &path_text, &name, fork_boundary)
 }
 
 /// Decode + parse one session stream (rm-503): the shared tail of
 /// `parse_file` past the byte read. Encoding guards keep the exact
 /// wording the file path produced, with `label` standing in for the
 /// path so stdin failures read `session file <stdin> is …`.
-fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<Session> {
+fn parse_session_bytes(
+    raw: Vec<u8>,
+    label: &str,
+    name: &str,
+    fork_boundary: Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<Session> {
     // Windows tooling (notably PowerShell 5.1's `>` redirection) writes
     // UTF-16 with a BOM by default; name the encoding instead of failing
     // with a generic read error (pass-7 P7-2).
@@ -57,7 +78,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
     }
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
-    parse_raw_session(name, label, &raw)
+    parse_raw_session_with_fork_boundary(name, label, &raw, fork_boundary)
 }
 
 /// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):
@@ -66,7 +87,7 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
 /// touched for it — and stdin sessions are ephemeral, so callers keep
 /// them out of the session cache.
 pub fn parse_stdin_bytes(raw: Vec<u8>) -> anyhow::Result<Session> {
-    parse_session_bytes(raw, "<stdin>", "stdin")
+    parse_session_bytes(raw, "<stdin>", "stdin", None)
 }
 
 fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
@@ -105,6 +126,15 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
 }
 
 pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Session> {
+    parse_raw_session_with_fork_boundary(name, path, raw, None)
+}
+
+fn parse_raw_session_with_fork_boundary(
+    name: &str,
+    path: &str,
+    raw: &str,
+    fork_boundary: Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<Session> {
     // Strip one UTF-8 BOM at offset 0 and nowhere else (pass-7 P7-2):
     // every parse path funnels through this entry, so a single strip
     // covers every format, and a U+FEFF embedded later in the content
@@ -240,7 +270,7 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if let Some(value) = parsed_value {
-        if let Some(events) = parse_opencode_storage_value(path, &value) {
+        if let Some(events) = parse_opencode_storage_value(path, &value, fork_boundary) {
             return session_from_events(name, path, events);
         }
         if let Some(events) = parse_cursor_export(&value) {
@@ -4295,12 +4325,16 @@ struct OpenCodeRecord {
     doc: Map<String, Value>,
 }
 
-fn parse_opencode_storage_value(path: &str, value: &Value) -> Option<Vec<Event>> {
+fn parse_opencode_storage_value(
+    path: &str,
+    value: &Value,
+    fork_boundary: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<Vec<Event>> {
     let doc = value.as_object()?;
     if !is_opencode_storage_session_doc(path, doc) {
         return None;
     }
-    parse_opencode_storage_session(path, doc).ok()
+    parse_opencode_storage_session(path, doc, fork_boundary).ok()
 }
 
 fn is_opencode_storage_session_doc(path: &str, doc: &Map<String, Value>) -> bool {
@@ -4353,6 +4387,7 @@ fn rel_from_root(root: &Path, path: &Path) -> Option<String> {
 fn parse_opencode_storage_session(
     path: &str,
     session: &Map<String, Value>,
+    fork_boundary: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<Vec<Event>> {
     let session_id = string(session.get("id")).unwrap_or("");
     if session_id.is_empty() {
@@ -4370,6 +4405,20 @@ fn parse_opencode_storage_session(
     let mut usage = BTreeMap::new();
     let mut body = Vec::new();
     for msg in messages {
+        // rm-805: inside a retained fork copy (discovery found
+        // post-boundary continuation and kept the session), the
+        // replayed prefix — messages at or before the fork point, and
+        // messages without a timestamp (path-order fallback cannot
+        // prove they are newer) — re-emits the parent's already-counted
+        // history. Skip them entirely so the fork's own session counts
+        // only the work that happened after the fork. The magnitude of
+        // what this drops is disclosed by the discovery scan
+        // (`opencode_fork_prefix_excluded_*`), never lost silently.
+        if let Some(boundary) = fork_boundary {
+            if opencode_record_time(&msg.doc).is_none_or(|time| time <= boundary) {
+                continue;
+            }
+        }
         if model == "unknown" {
             let msg_model = opencode_message_model(&msg.doc);
             if !msg_model.is_empty() {
@@ -4583,7 +4632,9 @@ fn opencode_part_timestamp(part: &Map<String, Value>, fallback: &str) -> String 
     fallback.to_string()
 }
 
-fn opencode_record_time(doc: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn opencode_record_time(
+    doc: &Map<String, Value>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     opencode_time_value(doc.get("time"), &["start", "created"]).or_else(|| {
         doc.get("state")
             .and_then(Value::as_object)
@@ -4660,6 +4711,56 @@ fn opencode_message_model(msg: &Map<String, Value>) -> String {
         .or_else(|| string(msg.get("model")))
         .unwrap_or("")
         .to_string()
+}
+
+/// rm-805: the fork point of an opencode storage session info doc —
+/// its `timeCreated` timestamp (epoch milliseconds or RFC 3339).
+/// `None` when the doc is unreadable or carries no usable timestamp;
+/// discovery then keeps the rm-548 whole-drop for that fork.
+pub(crate) fn opencode_fork_boundary(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let doc = read_json_value(path)?;
+    opencode_parse_time(doc.as_object()?.get("timeCreated"))
+}
+
+/// rm-805: fork-scan support — the usage one opencode message record
+/// contributes, mirroring `parse_opencode_storage_session` exactly
+/// (message-level `tokens`, else the step-finish part fallback), plus
+/// the catalog-estimated cost of that usage in micro-USD (the journal
+/// disclosure channel counts integers, so the estimate is scaled by
+/// 1e6 and its key says so). The discovery fork scan uses this so the
+/// exclusion-magnitude disclosure equals what aggregation would have
+/// counted, not a parallel accounting that drifts from the parser.
+pub(crate) fn opencode_message_usage_and_cost(
+    storage_root: &Path,
+    doc: &Map<String, Value>,
+) -> (BTreeMap<String, i64>, i64) {
+    let mut usage = BTreeMap::new();
+    let message_had_usage = add_opencode_tokens(&mut usage, doc.get("tokens"));
+    if !message_had_usage {
+        if let Some(message_id) = string(doc.get("id")).filter(|id| !id.is_empty()) {
+            let part_dir = storage_root.join("part").join(message_id);
+            for part in read_opencode_records(&part_dir) {
+                if string(part.doc.get("type")) == Some("step-finish") {
+                    add_opencode_tokens(&mut usage, part.doc.get("tokens"));
+                }
+            }
+        }
+    }
+    let model = opencode_message_model(doc);
+    let model = if model.is_empty() { "unknown" } else { &model };
+    let price = crate::pricing::lookup_price(model);
+    let class = |key: &str| usage.get(key).copied().unwrap_or(0).max(0) as f64;
+    let usd = class("input_tokens") / 1e6 * price.input
+        + class("output_tokens") / 1e6 * price.output
+        + class("cache_creation_input_tokens") / 1e6 * price.cw
+        + class("cache_read_input_tokens") / 1e6 * price.cr;
+    let microusd = (usd * 1e6).round();
+    let microusd = if microusd.is_finite() && microusd >= 0.0 {
+        microusd as i64
+    } else {
+        i64::MAX
+    };
+    (usage, microusd)
 }
 
 fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -> bool {

@@ -37,6 +37,14 @@ crossterm = "0.28"
 ratatui = "0.30"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order"] }
+# rm-803: `float_roundtrip` makes serde_json parse floats through a
+# correctly-rounded path instead of the up-to-1-ULP-off fast default
+# (upstream serde-rs/json#1336 marks the default best-effort by
+# design). The session cache persists f64 metrics (costs, durations,
+# credits) as JSON and the warm read used to re-parse those literals
+# inexactly, so warm and cold loads disagreed on the last bit of
+# cached money. All three crates inherit this declaration via
+# `serde_json.workspace = true`, so one flip covers the workspace.
+serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 thiserror = "2.0"
 ureq = "2.12"

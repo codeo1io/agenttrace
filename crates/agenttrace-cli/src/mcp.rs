@@ -294,13 +294,13 @@ fn usage_overview(range: TimeRange) -> Result<Value, (i64, String)> {
     let overview = compute_overview(&report.sessions);
     // Truthful coverage accounting straight from the loader's census
     // (pass-8 F8-2), identical to the CLI overview arm — including the
-    // rm-548 fork-exclusion count so MCP and CLI disclosures agree.
+    // rm-548/rm-805 fork accounting so MCP and CLI disclosures agree.
     let health = data_health_scoped(
         &report.sessions,
         report.discovered,
         report.skipped,
         report.cache_hits,
-        report.opencode_fork_excluded,
+        &report.opencode_forks,
     );
     let text = report_overview_json_with_context(
         &overview,

@@ -124,6 +124,9 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    /// rm-805: JSON-lane fork accounting (magnitudes, orphan count) —
+    /// the detail behind `opencode_fork_excluded`.
+    opencode_forks: crate::discovery::OpencodeForkAccounting,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -150,16 +153,21 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            opencode_forks: crate::discovery::OpencodeForkAccounting::default(),
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
+    let (files, opencode_fork_excluded, opencode_forks) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        (find_session_files(dir), 0)
+        (
+            find_session_files(dir),
+            0,
+            crate::discovery::OpencodeForkAccounting::default(),
+        )
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -183,6 +191,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        opencode_forks,
     }
 }
 
@@ -194,6 +203,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        opencode_forks,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     let mode = if demo {
@@ -228,6 +238,45 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             "opencode_fork_excluded_sessions".to_string(),
             opencode_fork_excluded_total,
         );
+    }
+    // rm-805: the magnitude detail behind the exclusion count —
+    // dropped fork copies and replayed prefixes (JSON lane scan plus
+    // sqlite stored rows), and orphaned forks counted instead of
+    // dropped. Same keys as the loader's data-health disclosure so
+    // the two reports stay comparable.
+    let fork_tokens = opencode_forks
+        .excluded_tokens
+        .saturating_add(sqlite_ingest.fork_excluded_tokens);
+    if fork_tokens > 0 {
+        disclosures.insert(
+            "opencode_fork_excluded_tokens".to_string(),
+            fork_tokens as usize,
+        );
+        let fork_cost = opencode_forks
+            .excluded_cost_microusd
+            .saturating_add(sqlite_ingest.fork_excluded_cost_microusd);
+        if fork_cost > 0 {
+            disclosures.insert(
+                "opencode_fork_excluded_cost_estimated_microusd".to_string(),
+                fork_cost as usize,
+            );
+        }
+    }
+    if opencode_forks.prefix_excluded_tokens > 0 {
+        disclosures.insert(
+            "opencode_fork_prefix_excluded_tokens".to_string(),
+            opencode_forks.prefix_excluded_tokens as usize,
+        );
+        if opencode_forks.prefix_excluded_cost_microusd > 0 {
+            disclosures.insert(
+                "opencode_fork_prefix_excluded_cost_estimated_microusd".to_string(),
+                opencode_forks.prefix_excluded_cost_microusd as usize,
+            );
+        }
+    }
+    let fork_orphans = opencode_forks.orphans_counted + sqlite_ingest.fork_orphans;
+    if fork_orphans > 0 {
+        disclosures.insert("opencode_fork_orphans_counted".to_string(), fork_orphans);
     }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
@@ -545,9 +594,19 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+fn find_reportable_session_files(
+    dir: Option<&Path>,
+) -> (
+    Vec<PathBuf>,
+    usize,
+    crate::discovery::OpencodeForkAccounting,
+) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        return (
+            find_session_files(dir),
+            0,
+            crate::discovery::OpencodeForkAccounting::default(),
+        );
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -563,12 +622,13 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
+    let (files, opencode_forks, _fork_boundaries) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
+    let opencode_fork_excluded = opencode_forks.excluded_sessions;
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, opencode_forks)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite

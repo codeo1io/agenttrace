@@ -741,7 +741,7 @@ fn run() -> anyhow::Result<()> {
                 report.discovered,
                 report.skipped,
                 report.cache_hits,
-                report.opencode_fork_excluded,
+                &report.opencode_forks,
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
@@ -2365,6 +2365,87 @@ mod tests {
     use super::*;
     use agenttrace_core::Metrics;
     use std::io::Write;
+
+    #[test]
+    fn every_dispatch_write_arm_routes_through_dispatch_sanitize() {
+        // rm-807: arm-completeness source pin (rm-573 precedent). The
+        // rm-525/rm-625 terminal-injection fix routes rendered report
+        // text through `dispatch_sanitize` at the single choke point;
+        // the behavior matrix (tests/output_safety_matrix.rs) pins the
+        // sanitization of today's arms but nothing pins that a NEW
+        // arm added tomorrow keeps the wrap. This test fails the suite
+        // the moment a dispatch write arm appears without it.
+        //
+        // Rule enforced, line-wise over the dispatch flow (the source
+        // up to `#[cfg(test)]`): every `write_stdout(`/`write_output(`
+        // call site must either (a) inline `dispatch_sanitize`, or
+        // (b) write a binding whose nearest preceding `let <binding> =`
+        // assignment is a `dispatch_sanitize` call, or (c) be one of
+        // the two audited static-text exceptions — the `--version`
+        // banner (a literal plus the VERSION const) and the keyword
+        // help text (`keyword_help_text`, static operator text).
+        let source = include_str!("main.rs");
+        let dispatch_flow: String = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs must carry a cfg(test) section")
+            .to_string();
+        let static_exceptions = [
+            // (a) --version banner: literal + VERSION const, no report
+            // content.
+            "write_stdout(&format!(\"agenttrace v{}\\n\", VERSION))?",
+            // (b) keyword help: operator-facing static text.
+            "write_stdout(&keyword_help_text(&keyword))?",
+        ];
+        let mut unwrapped: Vec<String> = Vec::new();
+        for (index, line) in dispatch_flow.lines().enumerate() {
+            if !line.contains("write_stdout(") && !line.contains("write_output(") {
+                continue;
+            }
+            if line.contains("fn write_stdout") || line.contains("fn write_output") {
+                continue;
+            }
+            if line.contains("dispatch_sanitize(") {
+                continue;
+            }
+            if static_exceptions
+                .iter()
+                .any(|exception| line.trim().trim_end_matches(';') == *exception)
+            {
+                continue;
+            }
+            // Dynamic write: find the binding being written and demand
+            // its most recent assignment is the sanitize wrap.
+            let binding = if line.contains("out") {
+                "out"
+            } else {
+                unwrapped.push(format!(
+                    "line {}: writes an inline expression, not a sanitized binding: {line}",
+                    index + 1
+                ));
+                continue;
+            };
+            let assignment = format!("let {binding} = ");
+            let preceding: Vec<&str> = dispatch_flow.lines().take(index).collect();
+            let sanitized = preceding
+                .iter()
+                .rev()
+                .find(|candidate| candidate.contains(&assignment))
+                .map(|candidate| candidate.contains("dispatch_sanitize("))
+                .unwrap_or(false);
+            if !sanitized {
+                unwrapped.push(format!(
+                    "line {}: `let {binding} = ...` is not a dispatch_sanitize wrap: {line}",
+                    index + 1
+                ));
+            }
+        }
+        assert!(
+            unwrapped.is_empty(),
+            "rm-807: dispatch write arms missing the dispatch_sanitize wrap:\n{}",
+            unwrapped.join("\n")
+        );
+    }
 
     #[test]
     fn pricing_download_announcement_goes_to_stderr() {

@@ -768,7 +768,7 @@ pub fn data_health_scoped(
     discovered: usize,
     parse_failures: usize,
     cache_hits: usize,
-    opencode_fork_excluded: usize,
+    opencode_forks: &crate::discovery::OpencodeForkAccounting,
 ) -> DataHealth {
     let parsed = sessions.len();
     let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
@@ -781,16 +781,48 @@ pub fn data_health_scoped(
     );
     // rm-548: fork copies excluded from aggregation are disclosed in
     // the same channel as parse-time journal disclosures — a count the
-    // user can see instead of sessions that vanish silently.
-    if opencode_fork_excluded > 0 {
-        health
-            .disclosures
-            .entry("opencode_fork_excluded_sessions".to_string())
-            .or_insert(0);
-        *health
-            .disclosures
-            .get_mut("opencode_fork_excluded_sessions")
-            .expect("just inserted") += opencode_fork_excluded;
+    // user can see instead of sessions that vanish silently. rm-805
+    // widened the count into an accounting: what the exclusions
+    // dropped (tokens, catalog-estimated micro-USD), the replayed
+    // prefix magnitude inside retained continuation forks, and the
+    // orphaned forks counted instead of dropped. Keys stay
+    // present-but-zero absent in the no-fork case (nothing to
+    // disclose then).
+    let mut bump = |key: &str, value: usize| {
+        health.disclosures.entry(key.to_string()).or_insert(0);
+        *health.disclosures.get_mut(key).expect("just inserted") += value;
+    };
+    if opencode_forks.excluded_sessions > 0 {
+        bump(
+            "opencode_fork_excluded_sessions",
+            opencode_forks.excluded_sessions,
+        );
+    }
+    if opencode_forks.excluded_tokens > 0 {
+        bump(
+            "opencode_fork_excluded_tokens",
+            opencode_forks.excluded_tokens as usize,
+        );
+        bump(
+            "opencode_fork_excluded_cost_estimated_microusd",
+            opencode_forks.excluded_cost_microusd as usize,
+        );
+    }
+    if opencode_forks.prefix_excluded_tokens > 0 {
+        bump(
+            "opencode_fork_prefix_excluded_tokens",
+            opencode_forks.prefix_excluded_tokens as usize,
+        );
+        bump(
+            "opencode_fork_prefix_excluded_cost_estimated_microusd",
+            opencode_forks.prefix_excluded_cost_microusd as usize,
+        );
+    }
+    if opencode_forks.orphans_counted > 0 {
+        bump(
+            "opencode_fork_orphans_counted",
+            opencode_forks.orphans_counted,
+        );
     }
     health
 }
