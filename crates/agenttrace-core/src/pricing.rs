@@ -12,9 +12,12 @@ const PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 /// Trimmed LiteLLM chat-model pricing snapshot, vendored so agenttrace is
 /// fully offline by default. Regenerate with `scripts/pricing/update-snapshot.sh`
-/// and keep `PRICING_SNAPSHOT_DATE` in sync with the date it prints.
+/// (the rm-588 never-drop union: every key the committed bundle priced stays
+/// priced unless `scripts/pricing/snapshot-drops.txt` carries a dated manual
+/// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
+/// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-04";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -2032,6 +2035,65 @@ mod tests {
              update the const together with the snapshot (see \
              scripts/pricing/update-snapshot.sh)"
         );
+    }
+
+    #[test]
+    fn bundled_snapshot_prices_claude_haiku_5_5_exactly() {
+        // rm-006 cycle-1 refresh: claude-haiku-5-5 was missing from the
+        // 2026-10-04 bundle, so a 1000-in/500-out haiku-5-5 session fell
+        // back to default pricing — $0.0105 instead of the true $0.00035,
+        // the 30x disclosed overestimate proven live (research 61b8a2ed,
+        // /tmp/at-research-61b8/haiku/h5.jsonl). Pin the exact rates so a
+        // future refresh that loses or corrupts the entry goes red here
+        // instead of silently re-enabling the fallback.
+        assert!(has_specific_price("claude-haiku-5-5"));
+        let price = lookup_price("claude-haiku-5-5");
+        // Price is per million tokens; live rates are 1e-7 in / 5e-7 out
+        // / 1.25e-7 cache-write / 1e-8 cache-read per token.
+        let eps = 1e-12;
+        assert!((price.input - 0.1).abs() < eps, "input {}", price.input);
+        assert!((price.output - 0.5).abs() < eps, "output {}", price.output);
+        assert!((price.cw - 0.125).abs() < eps, "cw {}", price.cw);
+        assert!((price.cr - 0.01).abs() < eps, "cr {}", price.cr);
+        // 1000 input + 500 output tokens: $0.00035 in exact arithmetic,
+        // disclosed as $0.0004 by token_cost's 4-decimal rounding.
+        assert_eq!(token_cost(1000, 500, 0, 0, "claude-haiku-5-5"), 0.0004);
+        // The fallback this replaces charged 30x more on this workload.
+        assert_eq!(token_cost(1000, 500, 0, 0, "nonexistent-model-xyz"), 0.0105);
+    }
+
+    #[test]
+    fn bundled_snapshot_union_header_stays_honest() {
+        // rm-588 never-drop contract, artifact side: the refresh writes
+        // the keys that survived only through the union (upstream no
+        // longer prices them; the committed bundle did) into
+        // _snapshot.retained_from_previous. Keep the header honest: the
+        // models count must equal the entry count and every retained key
+        // must still be priced, so a hand-edit or a regressed refresh
+        // cannot quietly drop prices while the header still claims them.
+        let snapshot: serde_json::Value =
+            serde_json::from_str(PRICING_SNAPSHOT_JSON).expect("bundled snapshot parses");
+        let map = snapshot.as_object().expect("snapshot is an object");
+        let entries = map.keys().filter(|k| k.as_str() != "_snapshot").count();
+        let header = &snapshot["_snapshot"];
+        assert_eq!(
+            header["models"].as_u64(),
+            Some(entries as u64),
+            "_snapshot.models drifted from the bundled entry count"
+        );
+        let retained: Vec<&str> = header["retained_from_previous"]
+            .as_array()
+            .expect("retained_from_previous is a list")
+            .iter()
+            .map(|v| v.as_str().expect("retained key is a string"))
+            .collect();
+        for key in &retained {
+            assert!(
+                map.contains_key(*key),
+                "union-retained key {key} vanished from the bundle — \
+                 rm-588 never-drop contract broken"
+            );
+        }
     }
 
     #[test]

@@ -90,8 +90,11 @@ jobs:
           git checkout -b "$branch"
 
           # Regenerate the bundle from the SAME single fetch the gate ran on
-          # (update-snapshot.sh takes the pre-fetched catalog as its argument).
-          scripts/pricing/update-snapshot.sh pricing-live.json
+          # (update-snapshot.sh takes no arguments — the pre-fetched catalog
+          # rides its LITELLM_SNAPSHOT_SRC env override, the rm-588 refresh
+          # path's offline arm; review fix F4's no-second-fetch, no-TOCTOU
+          # contract holds unchanged through that interface).
+          LITELLM_SNAPSHOT_SRC=pricing-live.json scripts/pricing/update-snapshot.sh
 
           # Bump the const to the stamped date, then prove the pair is back in sync
           # (same manual step update-snapshot.sh documents, done by the automation instead).
