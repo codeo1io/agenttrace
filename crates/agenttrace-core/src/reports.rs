@@ -1663,7 +1663,13 @@ pub fn report_compare_with_language(
         } else {
             "N/A".to_string()
         };
-        let name = truncate_runes(&session.name, 27);
+        // rm-239 rider (d80f6a25): session names are transcript/filename-
+        // derived; the compare text row is the last default text lane
+        // that printed them raw (assess PoC: `--compare` over a hostile
+        // journal emitted one OSC-52 clipboard-write sequence). Route
+        // through the shared sanitizer before layout so the 27-rune
+        // budget applies to sanitized text.
+        let name = truncate_runes(&sanitize_line_segment(&session.name), 27);
         out.push_str(&format!(
             "  {:<28} {:>4} {:>5} {:>5} {:>5} {:>9} {} {}/100\n",
             name,

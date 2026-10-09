@@ -11,6 +11,40 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_agenttrace")
 }
 
+/// rm-534 / rm-533 test fixture: a minimal but real claude-format
+/// journal (the zero_usage_contract line shapes) so the lanes under
+/// test load a genuine session instead of failing for an unrelated
+/// parse reason.
+fn claude_journal_lines() -> String {
+    let user = r#"{"type":"user","timestamp":"2026-10-04T01:00:00Z","cwd":"/tmp/guard","message":{"role":"user","content":"check the billing please"}}"#;
+    let assistant = r#"{"type":"assistant","timestamp":"2026-10-04T01:00:05Z","message":{"id":"msg_5","model":"claude-sonnet-4-5-20250929","role":"assistant","content":[{"type":"text","text":"on it"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}"#;
+    format!("{user}\n{assistant}\n")
+}
+
+/// Runs the built binary with every host-derived store pointed at a
+/// scratch root so boundary assertions can also pin “nothing else
+/// wrote host state”.
+fn run_isolated(args: &[&str], scratch: &std::path::Path) -> (i32, String, String) {
+    let history_dir = scratch.join("history");
+    let cache_dir = scratch.join("cache");
+    std::fs::create_dir_all(&history_dir).expect("mkdir history scratch");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir cache scratch");
+    let output = Command::new(bin())
+        .args(args)
+        .env("AGENTTRACE_HISTORY_DIR", &history_dir)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn agenttrace");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
 fn run_with_pipes(args: &[&str]) -> (i32, String, String) {
     let output = Command::new(bin())
         .args(args)
@@ -237,4 +271,127 @@ fn demo_source_guard_leaves_legal_demo_invocations_alone() {
         "explicit --range all is the default and must stay legal; stderr: {stderr}"
     );
     assert!(stdout.contains("sessions"), "expected a rendered overview");
+}
+
+#[test]
+fn demo_preserve_history_exits_with_a_flag_naming_error() {
+    // rm-533: `--demo --preserve-history` used to fabricate 4 rows
+    // ($0.8950) into the REAL history.json and every later
+    // history-consuming report repeated them (assess b6c398bf PoC).
+    // The demo lane must stay hermetic: the pair is rejected loudly,
+    // with both flags named, before anything is loaded or rendered.
+    let (code, stdout, stderr) = run_with_pipes(&["--demo", "--preserve-history", "--overview"]);
+    assert_ne!(code, 0, "the pair must not succeed; stdout: {stdout}");
+    assert!(
+        stderr.contains("--demo") && stderr.contains("--preserve-history"),
+        "expected a flag-naming error, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Saved:"),
+        "no output may be written before the hermeticity guard fires, got: {stdout}"
+    );
+}
+
+#[test]
+fn demo_preserve_history_leaves_host_state_untouched() {
+    // rm-533 host-state pin: with a pre-existing history.json under a
+    // scratch AGENTTRACE_HISTORY_DIR and an empty scratch session cache,
+    // the rejected invocation must leave both byte-identical/empty —
+    // demo state never reaches host stores by any path.
+    let scratch = std::env::temp_dir().join(format!("at-rm533-host-state-{}", std::process::id()));
+    let history_dir = scratch.join("history");
+    let cache_dir = scratch.join("cache");
+    std::fs::create_dir_all(&history_dir).expect("mkdir history scratch");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir cache scratch");
+    let history_path = history_dir.join("history.json");
+    let sentinel: &[u8] = b"{\"sentinel\":\"pre-existing host history must survive a --demo run\"}";
+    std::fs::write(&history_path, sentinel).expect("seed scratch history");
+
+    let (code, _stdout, stderr) =
+        run_isolated(&["--demo", "--preserve-history", "--overview"], &scratch);
+    assert_ne!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("--demo") && stderr.contains("--preserve-history"),
+        "the hermeticity guard must be the failure, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&history_path).expect("history survives"),
+        sentinel,
+        "real history.json must be byte-identical after the rejected --demo run"
+    );
+    assert_eq!(
+        std::fs::read_dir(&cache_dir)
+            .expect("cache dir survives")
+            .count(),
+        0,
+        "the session cache must stay empty"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn output_colliding_with_input_journal_is_rejected_without_touching_it() {
+    // rm-534 positional arm, the assess PoC verbatim:
+    // `--overview -o X.jsonl X.jsonl` used to exit 0 with a "Saved:"
+    // banner while write_output's temp+rename atomically replaced the
+    // just-loaded transcript with the rendered report. It must exit
+    // non-zero naming --output, with the journal byte-identical.
+    let scratch = std::env::temp_dir().join(format!("at-rm534-positional-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+    let journal = scratch.join("X.jsonl");
+    std::fs::write(&journal, claude_journal_lines()).expect("write journal");
+    let before = std::fs::read(&journal).expect("read journal before");
+    let journal_arg = journal.to_str().expect("utf-8 scratch path").to_string();
+
+    let (code, stdout, stderr) =
+        run_isolated(&["--overview", "-o", &journal_arg, &journal_arg], &scratch);
+    assert_ne!(code, 0, "the collision must not succeed; stdout: {stdout}");
+    assert!(
+        stderr.contains("--output") && stderr.contains("input session journal"),
+        "expected a --output membership error, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&journal).expect("read journal after"),
+        before,
+        "the input journal must be byte-identical (no staging, no rename)"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn output_colliding_with_walked_journal_is_rejected_without_touching_it() {
+    // rm-534 -d-walk arm: `-o <name>.jsonl` colliding with a journal a
+    // discovery walk admitted must be rejected identically — the
+    // membership check covers every loaded source, not just positional
+    // files.
+    let scratch = std::env::temp_dir().join(format!("at-rm534-walk-{}", std::process::id()));
+    let sessions_dir = scratch.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions scratch");
+    let journal = sessions_dir.join("victim.jsonl");
+    std::fs::write(&journal, claude_journal_lines()).expect("write journal");
+    let before = std::fs::read(&journal).expect("read journal before");
+    let dir_arg = sessions_dir
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+    let journal_arg = journal.to_str().expect("utf-8 scratch path").to_string();
+
+    let (code, stdout, stderr) = run_isolated(
+        &["--overview", "-d", &dir_arg, "-o", &journal_arg],
+        &scratch,
+    );
+    assert_ne!(
+        code, 0,
+        "the walk-arm collision must not succeed; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("--output") && stderr.contains("input session journal"),
+        "expected a --output membership error, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&journal).expect("read journal after"),
+        before,
+        "the walked journal must be byte-identical"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
 }
