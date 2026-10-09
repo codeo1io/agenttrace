@@ -792,10 +792,20 @@ fn walk_session_files_cached(
     if let Some(listing) = cached_dir_listing(dir, cache) {
         // rm-597: replayed listings are raw (pre-dedup), so the same
         // same-file admission applies on warm replay as on a cold walk.
+        // rm-732: the cold walk's file-kind gate re-validates here too —
+        // the stored listing is trusted for directory shape, not for
+        // file kind. A listing written by a pre-rm-212 walker (retired
+        // by the v4 walk-version bump) or an entry whose on-disk kind
+        // changed since the walk (a fifo created at a listed path) must
+        // not re-admit a non-regular file by name: the parser's open on
+        // a fifo wedges with no message and no timeout. Cline task dirs
+        // stay admissible — the cold walk admits them as session roots
+        // ahead of the regular-file gate (see :862/:947 arms).
         items.extend(
             listing
                 .files
                 .into_iter()
+                .filter(|path| is_cline_task_dir(path) || path.is_file())
                 .filter(|path| file_targets.admit(path)),
         );
         for child in listing.dirs {

@@ -2404,41 +2404,14 @@ fn governance_inspect_flag(args: &Args) -> &'static str {
 /// truthful admission error.
 ///
 /// Admit a positional session path, or fail with the path's true class.
-/// Review fix (2026-10-07, round 2 MF1): the unix-only class detector must be
-/// paired with a cfg(not(unix)) stub below, or non-unix builds fail at the
-/// unconditional call site in load_sessions_report.
-#[cfg(unix)]
-fn admit_session_path(path: &std::path::Path) -> anyhow::Result<()> {
-    if path.as_os_str() == "-" {
-        bail!("invalid session path '-': read from stdin is not supported");
-    }
-    if path.is_file() || path.is_dir() {
-        return Ok(());
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(path) {
-            Ok(target) if target.is_file() || target.is_dir() => Ok(()),
-            Ok(target) => bail!(
-                "session path is not a regular file or directory: {} (symbolic link to {})",
-                path.display(),
-                special_file_kind(&target)
-            ),
-            Err(_) => bail!("session path is a dangling symlink: {}", path.display()),
-        },
-        Ok(meta) => bail!(
-            "session path is not a regular file or directory: {} ({})",
-            path.display(),
-            special_file_kind(&meta)
-        ),
-        Err(_) => bail!("session path does not exist: {}", path.display()),
-    }
-}
-
-/// rm-212 non-unix arm (review fix 2026-10-07, round 2 MF1): stat-class
-/// detection is unix-only (FileTypeExt), so this stub keeps the same
-/// admission contract with the generic class name — a non-regular path
-/// still fails truthfully instead of "does not exist".
-#[cfg(not(unix))]
+/// Written once, platform-generic (rm-733): the round-2 review fix
+/// initially split this into a cfg(unix)/cfg(not(unix)) pair, but the
+/// two bodies converged byte-identical — the only unix-specific piece
+/// is the `special_file_kind` classifier just below, which keeps its own
+/// cfg pair (it imports FileTypeExt) — so the duplicate arms, a drift
+/// factory that broke non-unix builds in that very round, are collapsed
+/// back into one body. Zero behavioral change; the unix bin-suite pins
+/// behavior.
 fn admit_session_path(path: &std::path::Path) -> anyhow::Result<()> {
     if path.as_os_str() == "-" {
         bail!("invalid session path '-': read from stdin is not supported");
@@ -3499,6 +3472,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_output_honors_symlinks_instead_of_replacing_them() {
         // rm-250 residual (cycle 1): -o through a symlink must update
@@ -3547,8 +3521,8 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
     #[cfg(unix)]
+    #[test]
     fn write_output_refuses_preplanted_symlinks_at_the_staged_temp() {
         // rm-693: the -o lane staged through create+truncate on a
         // predictable `{name}.tmp.{pid}.{seq}` sibling — a symlink

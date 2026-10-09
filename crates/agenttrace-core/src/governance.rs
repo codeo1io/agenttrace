@@ -966,18 +966,31 @@ fn git_commits(root: &str) -> Option<Vec<GitCommit>> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take();
-    let drain = std::thread::spawn(move || {
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // The handle is deliberately not joined: the reader exits once its
+    // pipe EOFs (or with the process), and the bounded recv below is the
+    // only wait this probe performs on it.
+    std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(stream) = stdout.as_mut() {
             let _ = stream.read_to_end(&mut bytes);
         }
-        bytes
+        let _ = drain_tx.send(bytes);
     });
+    let started = std::time::Instant::now();
     let status = wait_child_bounded(&mut child, GIT_PROBE_TIMEOUT)?;
     if !status.success() {
         return None;
     }
-    let stdout = drain.join().ok()?;
+    // rm-731: `wait_child_bounded` returns the moment the child exits,
+    // but a forked helper (git-remote-https, a credential helper, an
+    // exec'd hook) can inherit the stdout write-end and keep
+    // `read_to_end` from ever seeing EOF — the old unbounded join wedged
+    // the whole report for the helper's lifetime. The drain gets only
+    // what remains of the probe's ten-second budget and degrades to the
+    // documented heuristic instead of hanging.
+    let remaining = GIT_PROBE_TIMEOUT.saturating_sub(started.elapsed());
+    let stdout = drain_rx.recv_timeout(remaining).ok()?;
     Some(
         String::from_utf8_lossy(&stdout)
             .lines()
@@ -1689,6 +1702,56 @@ mod tests {
             .expect("spawn true");
         let status = wait_child_bounded(&mut child, std::time::Duration::from_secs(5));
         assert!(status.expect("fast child finishes").success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_commits_probe_survives_a_helper_holding_the_pipe_past_exit() {
+        let _env_lock = crate::test_env::lock_env();
+        // rm-731: `wait_child_bounded` returns the moment the child
+        // exits, but a forked helper inheriting the stdout write-end used
+        // to wedge the probe's unbounded drain for the helper's whole
+        // lifetime (the upstream.rs fast-exit arm's sibling — same
+        // assess PoC family). The drain now gets only the remainder of
+        // the ten-second probe budget and the report degrades to its
+        // documented heuristic instead of hanging. The shim delegates
+        // every other invocation to the real git so concurrent probes
+        // in this test binary are unaffected.
+        use std::os::unix::fs::PermissionsExt;
+        let marker = "agenttrace-gov-fast-exit-holder";
+        let root = std::env::temp_dir().join(marker);
+        let shim_dir = root.join("shim");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        std::fs::write(
+            shim_dir.join("git"),
+            format!(
+                "#!/bin/sh\ncase \"$2\" in\n  *{marker}*) sleep 60 &\n    exec true ;;\n  *) exec /usr/bin/git \"$@\" ;;\nesac\n"
+            ),
+        )
+        .expect("write git shim");
+        std::fs::set_permissions(shim_dir.join("git"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod git shim");
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
+        );
+        let started = std::time::Instant::now();
+        let commits = git_commits(root.to_str().expect("utf-8 root"));
+        if let Some(path) = previous_path {
+            std::env::set_var("PATH", path);
+        }
+        assert!(
+            commits.is_none(),
+            "the shim prints nothing and the drained bytes are unrecoverable in budget: the probe must degrade to the heuristic, got {} commits",
+            commits.map(|drained| drained.len()).unwrap_or(0)
+        );
+        assert!(
+            started.elapsed() < GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+            "the probe must stay inside its bound even when a helper holds the pipe (took {:?})",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

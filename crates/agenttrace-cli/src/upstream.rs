@@ -49,8 +49,11 @@ const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// counts as a missing prerequisite.
 #[derive(Debug)]
 enum GitRunError {
-    /// The deadline passed and the child was killed. `op` is the
-    /// human-named operation (e.g. `git fetch upstream --quiet`).
+    /// The bound elapsed and the call gave up. Either the child was
+    /// still alive at the deadline (it was killed), or it had already
+    /// exited but a forked helper kept a pipe write-end open past the
+    /// bound (its drains were abandoned, bytes unrecoverable). `op` is
+    /// the human-named operation (e.g. `git fetch upstream --quiet`).
     Timeout { op: String, bound: Duration },
     /// The child ran to completion and exited non-zero.
     Failed { op: String, message: String },
@@ -64,7 +67,7 @@ impl std::fmt::Display for GitRunError {
             GitRunError::Timeout { op, bound } => {
                 write!(
                     f,
-                    "{op} timed out after {}s and was killed",
+                    "{op} timed out after {}s and its output was not recovered",
                     bound.as_secs()
                 )
             }
@@ -75,13 +78,21 @@ impl std::fmt::Display for GitRunError {
 }
 
 /// Runs a subprocess under a wall-clock deadline and returns
-/// `(status, stdout, stderr)`. Both pipes are drained on helper threads
-/// because `read_to_end` blocks: draining on the polling thread could
-/// deadlock against a child whose pipe buffer fills, turning a fast
-/// child into a spurious timeout (the governance.rs
-/// `wait_child_bounded` comment states the same contract). On deadline
-/// the child is killed and the drains are joined so no thread
-/// outlives the call.
+/// `(status, stdout, stderr)`, honoring the deadline on every path.
+/// Both pipes are drained on helper threads because `read_to_end`
+/// blocks: draining on the polling thread could deadlock against a
+/// child whose pipe buffer fills, turning a fast child into a spurious
+/// timeout (the governance.rs `wait_child_bounded` comment states the
+/// same contract). A child still alive at the deadline is killed and
+/// reported as [`GitRunError::Timeout`] (the rm-583 arm). A child that
+/// has already exited gets only the remainder of the deadline for its
+/// drains: a forked helper (git-remote-https, a credential helper, an
+/// exec'd hook) that inherits a pipe write-end cannot wedge the call —
+/// if its bytes cannot be recovered in time the same named timeout
+/// surfaces (the rm-731 fast-exit arm; the 2026-10-07 assess PoC
+/// measured 25,106 ms on a 10 s bound here). Drain threads that cannot
+/// finish are abandoned — each dies when its pipe finally EOFs or with
+/// the process — never waited on unboundedly.
 fn run_bounded(
     program: &str,
     args: &[&str],
@@ -121,8 +132,25 @@ fn run_bounded(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    let stdout = drained_text(stdout);
-    let stderr = drained_text(stderr);
+    // rm-731: the child is gone, but a forked helper may still hold a
+    // pipe write-end, so the drains get only the remainder of the bound
+    // — the old unbounded joins blocked here for as long as the helper
+    // kept the pipe open (25,106 ms on a 10 s bound in the assess PoC).
+    let stdout = recv_drain_bounded(stdout, deadline);
+    let stderr = recv_drain_bounded(stderr, deadline);
+    let (stdout, stderr) = match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        _ => {
+            // The helper's bytes are unrecoverable within the bound: the
+            // drains are abandoned (each dies when its pipe finally EOFs
+            // or with the process) — the rm-583 timeout-arm precedent,
+            // extended to the happy path — and the named timeout keeps
+            // the deadline promise honest.
+            return Err(GitRunError::Timeout { op, bound });
+        }
+    };
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&stderr).to_string();
     if !status.success() {
         return Err(GitRunError::Failed {
             op,
@@ -132,18 +160,34 @@ fn run_bounded(
     Ok((status, stdout, stderr))
 }
 
-fn spawn_drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+fn spawn_drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut stream) = pipe {
             let _ = stream.read_to_end(&mut bytes);
         }
-        bytes
-    })
+        // On an abandoned drain the receiver is gone — the send errors
+        // and this thread exits as soon as its pipe finally EOFs.
+        let _ = tx.send(bytes);
+    });
+    rx
 }
 
-fn drained_text(handle: std::thread::JoinHandle<Vec<u8>>) -> String {
-    String::from_utf8_lossy(&handle.join().unwrap_or_default()).to_string()
+/// Bounded drain join (rm-731): the reader's bytes if they arrive before
+/// the run's deadline, `Err` otherwise — the reader thread is abandoned
+/// on `Err`, mirroring the rm-583 timeout arm's dropped joins.
+fn recv_drain_bounded(
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    deadline: Instant,
+) -> Result<Vec<u8>, std::sync::mpsc::RecvTimeoutError> {
+    let now = Instant::now();
+    let wait = if deadline > now {
+        deadline - now
+    } else {
+        Duration::ZERO
+    };
+    rx.recv_timeout(wait)
 }
 
 const DEFAULT_REMOTE: &str = "upstream";
@@ -329,8 +373,9 @@ fn fetch_remote(remote: &str) -> anyhow::Result<()> {
     match run_bounded("git", &["fetch", remote, "--quiet"], UPSTREAM_FETCH_TIMEOUT) {
         Ok(_) => Ok(()),
         Err(GitRunError::Timeout { op, bound }) => bail!(
-            "{op} timed out after {}s (UPSTREAM_FETCH_TIMEOUT): the fetch was killed; \
-             retry when the remote is reachable — no drift numbers are reported from a partial fetch",
+            "{op} timed out after {}s (UPSTREAM_FETCH_TIMEOUT): the fetch's output \
+             was not recovered within the bound — it may even have completed; \
+             retry when the remote is responsive — no drift numbers are reported from a partial fetch",
             bound.as_secs()
         ),
         Err(other) => bail!("{other}"),
@@ -350,8 +395,9 @@ fn git_bounded(args: &[&str]) -> Result<String, GitRunError> {
 fn git(args: &[&str]) -> anyhow::Result<String> {
     git_bounded(args).map_err(|err| match err {
         GitRunError::Timeout { op, bound } => anyhow::anyhow!(
-            "{op} timed out after {}s (UPSTREAM_GIT_TIMEOUT): the probe was killed — \
-             the upstream report is aborted, never rendered from a partial repository",
+            "{op} timed out after {}s (UPSTREAM_GIT_TIMEOUT): the probe's output was \
+             not recovered within the bound — the upstream report is aborted, never \
+             rendered from a partial repository",
             bound.as_secs()
         ),
         other => anyhow::anyhow!("{other}"),
@@ -658,6 +704,36 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "grandchild-held pipes must not block past the bound, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_bounded_fast_exit_survives_a_grandchild_holding_the_pipes() {
+        // rm-731 regression: the assess PoC's PATH-shim git — a helper
+        // holding both pipe write-ends past the child's rc-0 exit — made
+        // the fast-exit arm's unbounded drain joins block for the
+        // helper's lifetime (25,106 ms on a 10 s bound) with no error.
+        // Reduced to its essence here, without the PATH mutation: the
+        // shape is `sleep 60 & exec true`, a holder outliving the exited
+        // child. The drains must be bounded — the named timeout surfaces
+        // at the bound and the call returns, never a hang.
+        let started = std::time::Instant::now();
+        let result = run_bounded(
+            "sh",
+            &["-c", "echo probe-ok; sleep 60 & exec true"],
+            Duration::from_secs(1),
+        );
+        match result {
+            Err(GitRunError::Timeout { op, bound }) => {
+                assert!(op.contains("probe"), "op names the command: {op}");
+                assert_eq!(bound, Duration::from_secs(1));
+            }
+            other => panic!("expected the bounded timeout, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the fast-exit arm must not wait on the holder past the bound (took {:?})",
             started.elapsed()
         );
     }
