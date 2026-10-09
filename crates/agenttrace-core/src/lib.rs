@@ -15,6 +15,7 @@ mod search;
 mod session_cache;
 mod sqlite_sessions;
 mod statusline;
+mod storage;
 mod subagents;
 mod waste;
 
@@ -93,6 +94,7 @@ pub use statusline::{
     statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
     StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
 };
+pub use storage::{storage_report, storage_report_with_roots, StorageReport};
 pub use subagents::attribute_subagents;
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language,

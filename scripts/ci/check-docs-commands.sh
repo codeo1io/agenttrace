@@ -26,6 +26,13 @@ mkdir -p "$out_dir/docs"
 # corpus is scoped, mirroring the --demo legs below.
 "$bin" --doctor -d "$repo_root/crates/agenttrace-core/tests/fixtures/pi-oh-my-pi" \
   -f json >"$out_dir/docs/doctor.json"
+# rm-692: keep the documented storage-footprint command exercised
+# (read-only; json so the doc-examples JSON validity check below covers it).
+"$bin" --storage -f json >"$out_dir/docs/storage.json"
+# rm-088: keep the documented completions lane exercised.
+"$bin" --completions >"$out_dir/docs/completions.txt"
+grep -q 'complete -F _agenttrace_complete agenttrace' "$out_dir/docs/completions.txt" \
+  || fail "documented completions command must emit the bash completion hook"
 "$bin" --demo --latest -f json >"$out_dir/docs/latest.json"
 "$bin" --demo --latest --lang zh -f json >"$out_dir/docs/latest-zh.json"
 "$bin" --demo --overview -f json >"$out_dir/docs/overview.json"

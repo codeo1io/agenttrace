@@ -179,6 +179,17 @@ struct Args {
     /// validation.
     #[arg(long)]
     version: bool,
+    /// Print shell completion snippets for this CLI to stdout and exit
+    /// (rm-088: sources under scripts/completions/; nothing is written to
+    /// disk and no session data is loaded).
+    #[arg(long)]
+    completions: bool,
+    /// Print the read-only storage-footprint report (rm-692): per-provider
+    /// file counts and logical bytes, ten largest source files, session-cache
+    /// size, and available space per filesystem. Walks are read-only —
+    /// SQLite sidecars are counted by name, never opened.
+    #[arg(long)]
+    storage: bool,
     /// Use the built-in demo corpus instead of discovered agent homes
     /// (stable epoch-anchored sessions).
     #[arg(long)]
@@ -334,6 +345,12 @@ fn run() -> anyhow::Result<()> {
     // early return ran (pass-6 P6-2).
     if args.version {
         write_stdout(&format!("agenttrace v{}\n", VERSION))?;
+        return Ok(());
+    }
+    if args.completions {
+        // rm-088: pure stdout emission, before any discovery/validation,
+        // so `agenttrace --completions` stays fast and side-effect free.
+        write_stdout(&completion_snippets())?;
         return Ok(());
     }
     // `agenttrace statusline` is a Claude Code statusLine host command
@@ -501,6 +518,111 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if args.storage {
+        // rm-692: pure read-only footprint over the discovered provider
+        // roots and the session-cache dir. Emits before any corpus load.
+        let cache_dir = agenttrace_core::session_cache_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::temp_dir().join("agenttrace-cache-missing"));
+        let report = agenttrace_core::storage_report(&cache_dir);
+        match args.format.as_str() {
+            "json" => write_stdout(&serde_json::to_string_pretty(&report)?)?,
+            _ => {
+                let mut text = String::new();
+                use std::fmt::Write as _;
+                writeln!(
+                    text,
+                    "Storage footprint (read-only; sessions not parsed, databases not opened)"
+                )
+                .ok();
+                writeln!(text).ok();
+                writeln!(text, "  Providers:").ok();
+                if report.providers.is_empty() {
+                    writeln!(text, "    (none found)").ok();
+                }
+                for provider in &report.providers {
+                    writeln!(
+                        text,
+                        "    {:<10} {:>8} files {:>12}  {}",
+                        provider.name,
+                        provider.files,
+                        human_bytes(provider.logical_bytes),
+                        provider.resolved_root.display()
+                    )
+                    .ok();
+                    if provider.sqlite_sidecars > 0 {
+                        writeln!(
+                            text,
+                            "      sqlite sidecars (counted, never opened): {} ({})",
+                            provider.sqlite_sidecars,
+                            human_bytes(provider.sqlite_sidecar_bytes)
+                        )
+                        .ok();
+                    }
+                }
+                writeln!(text).ok();
+                writeln!(text, "  Session cache:").ok();
+                if report.cache.exists {
+                    writeln!(
+                        text,
+                        "    {} files, {} — {}",
+                        report.cache.files,
+                        human_bytes(report.cache.bytes),
+                        report.cache.dir.display()
+                    )
+                    .ok();
+                } else {
+                    writeln!(
+                        text,
+                        "    (no cache directory at {})",
+                        report.cache.dir.display()
+                    )
+                    .ok();
+                }
+                writeln!(text).ok();
+                writeln!(text, "  Ten largest source files:").ok();
+                if report.ten_largest.is_empty() {
+                    writeln!(text, "    (none)").ok();
+                }
+                for large in &report.ten_largest {
+                    writeln!(
+                        text,
+                        "    {:>12}  {}",
+                        human_bytes(large.bytes),
+                        large.path.display()
+                    )
+                    .ok();
+                }
+                writeln!(text).ok();
+                writeln!(text, "  Available space per filesystem:").ok();
+                for fs in &report.filesystems {
+                    match fs.available_bytes {
+                        Some(bytes) => writeln!(
+                            text,
+                            "    {:>12} free  {}",
+                            human_bytes(bytes),
+                            fs.root.display()
+                        )
+                        .ok(),
+                        None => {
+                            writeln!(text, "    {:>12} free  {}", "n/a", fs.root.display()).ok()
+                        }
+                    };
+                }
+                writeln!(text).ok();
+                writeln!(text, "  Coverage: {}", report.coverage).ok();
+                for note in &report.notes {
+                    writeln!(text, "  Note: {note}").ok();
+                }
+                for skip in &report.skipped {
+                    writeln!(text, "  Skipped: {} ({})", skip.path.display(), skip.reason).ok();
+                }
+                write_stdout(&text)?;
+            }
+        }
+        return Ok(());
+    }
     if args.doctor {
         let doctor_dir = args.dir.as_deref().map(PathBuf::from);
         // rm-384: disclose the configuration layers and the winning
@@ -1020,6 +1142,21 @@ fn write_stderr(value: &str) -> anyhow::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result.map_err(Into::into),
     }
+}
+
+/// rm-088: shell completion snippets for `agenttrace --completions`.
+///
+/// Sources the checked-in snippets under `scripts/completions/` — the
+/// bash word list is generated from `agenttrace --help`. Emission is
+/// read-only (stdout) and runs before any discovery, so the flag stays
+/// fast and side-effect free.
+fn completion_snippets() -> String {
+    let mut out = String::new();
+    out.push_str("# agenttrace shell completions (bash + zsh)\n");
+    out.push_str(include_str!("../../../scripts/completions/agenttrace.bash"));
+    out.push('\n');
+    out.push_str(include_str!("../../../scripts/completions/agenttrace.zsh"));
+    out
 }
 
 fn write_stdout(value: &str) -> anyhow::Result<()> {
@@ -2636,6 +2773,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
     Args {
         path: None,
         format: "json".to_string(),
+        storage: false,
         // rm-576: every test args literal carries the SVG card theme
         // default (the flag's clap default); the helper is the single
         // construction site since the test_args refactor.
@@ -2666,6 +2804,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         update_pricing: false,
         test_match: false,
         version: false,
+        completions: false,
         demo: false,
         doctor: false,
         search: None,
@@ -2694,6 +2833,22 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         clear_cache: false,
         preserve_history: false,
         include_history: false,
+    }
+}
+
+// rm-692: compact human-readable byte size for the storage report lanes.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
