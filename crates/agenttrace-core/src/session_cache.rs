@@ -5,7 +5,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 38;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 50;
+// Bumped 38 -> 50 (run 5eb82325ebea, cycle-1 "intake -> attribution ->
+// disclosure truthfulness" batch, rm-863 reasoning-fold producer
+// semantics LEAD + rm-860 duplicate-spelling canonical-winner + rm-861
+// model-label authority + rm-862 doctor loss-tier vocabulary rider;
+// conflict case b20465be8b3f4b00aceab32c1a3b70eb; review fix
+// 53c6d3ac12ec444f93a19adf494311b2 over review b0446d6c finding F1;
+// review-fix rebase 7166bfbb1d9f49ea89043d33001627dc over the moved
+// in-flight wall).
+// Minted at base 5ed9ebc as the 38 -> 39 increment, re-based to 41 at
+// implement over the then-live ceiling 40, re-based to 43 at the
+// cycle-1 review fix and to 50 at the review-fix rebase per the
+// rm-230 rule (landing a lower number downgrades the cache format):
+// while the batch was in review the wall advanced to 41 at the
+// ac14e52c integration and to 42 at the rm-880/rm-406 journal-truth
+// integration (run 14954d7a, 181630e), and the in-flight wall then
+// passed this batch's 43 (sibling run 33b7b7b5's batch minted 43
+// too; run 2a5cdb9e held 49), so a warm entry from ANY other format
+// (v49 or lower) must NOT be served after this batch: (a) rm-863 changes the output total for any doc
+// carrying a flat reasoning/thinking alias (completion 400 +
+// reasoning 150 now reports out 400, not 550) — a warm entry would
+// keep double-billing the span; (b) rm-860 un-drops both-spelling
+// lines (`ModelUsed` + `model_used`), so their usage and turns join
+// totals that a warm entry recorded as event_schema skips — the
+// served report changes for UNCHANGED files; (c) rm-861 re-labels
+// sessions whose model label came from a non-assistant row, moving
+// spend between by_model buckets.
 // Bumped 37 -> 38 (integration of run 5417681937ae, cycle-3
 // "disclosure-plane honesty" batch, rm-718 + rm-719 + rm-716; conflict
 // case 3c573958563e417b94eeab5c307279df): kimi usage-alias counters

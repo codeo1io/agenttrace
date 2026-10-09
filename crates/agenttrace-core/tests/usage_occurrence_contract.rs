@@ -109,8 +109,8 @@ fn qwen_multi_result_usage_accumulates_per_turn() {
 #[test]
 fn warm_cache_replays_cold_disclosure_and_schema_38_invalidates_v32() {
     assert_eq!(
-        SESSION_CACHE_SCHEMA_VERSION, 38,
-        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, and to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, so this assert pins the live constant)"
+        SESSION_CACHE_SCHEMA_VERSION, 50,
+        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834/rm-694/rm-835/rm-836 re-emission-truthfulness integration, to 40 at the rm-585/rm-730 honest-attribution integration, to 41 at the ac14e52c integration, to 42 at the rm-880/rm-406 journal-truth integration (run 14954d7a), and to 43 at the rm-863/rm-860/rm-861/rm-862 intake-attribution-disclosure-truthfulness integration — minted 38 → 39 at its base, re-based to 41 over the then-live ceiling 40, and re-based to 43 by the cycle-1 review fix (review b0446d6c F1: 41 collided with the ac14e52c format, and 42 was taken meanwhile by run 14954d7a), then to 50 by the review-fix rebase (attempt 7166bfbb: the landed ceiling stood at 42 at eafbb592, 43 was claimed in flight by sibling run 33b7b7b5's batch, and 49 by run 2a5cdb9e) per the rm-230 rule — so this assert pins the live constant)"
     );
     let root = std::env::temp_dir().join(format!(
         "agenttrace-contract-warmcold-{}",

@@ -118,10 +118,11 @@ fn otel_export_shape_and_genai_attributes() {
     );
     assert_eq!(
         attr(claude_span, "gen_ai.usage.output_tokens")["intValue"],
-        // reasoning_tokens folds into output_tokens (pass-9 CU-20):
-        // 50 recorded + 12 reasoning = 62 on the wire, with the 12
-        // ALSO reported separately below.
-        62
+        // rm-863: the flat `reasoning_tokens` spelling is a SUBSET
+        // alias — the documented breakdown INSIDE output_tokens — so
+        // the fold records the 12 separately WITHOUT adding (pass-9
+        // CU-20 added it blindly and billed 62 on the wire).
+        50
     );
 
     // rm-599: the Recommended cache/reasoning subset counters of the

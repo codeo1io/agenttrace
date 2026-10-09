@@ -324,6 +324,58 @@ where
     })
 }
 
+/// The canonical/alias spelling pairs on `Event` (serde `rename` +
+/// `alias`). A foreign doc carrying BOTH spellings of a pair trips
+/// serde's duplicate-field error, so the whole line drops as
+/// `event_schema` — these are the pairs `Event`'s strict parse needs
+/// pre-normalized (rm-860).
+const EVENT_FIELD_SPELLING_PAIRS: &[(&str, &str)] = &[
+    ("role", "Role"),
+    ("content", "Content"),
+    ("timestamp", "Timestamp"),
+    ("reasoning", "Reasoning"),
+    ("redacted", "Redacted"),
+    ("cwd", "CWD"),
+    ("tool_calls", "ToolCalls"),
+    ("tool_call_id", "ToolCallID"),
+    ("is_error", "IsError"),
+    ("Usage", "usage"),
+    ("ModelUsed", "model_used"),
+];
+
+/// rm-860: collapse duplicate case-variant spellings of `Event`
+/// fields before the strict deserialize, so a doc carrying BOTH
+/// `ModelUsed` and `model_used` (any [`EVENT_FIELD_SPELLING_PAIRS`]
+/// pair) parses instead of dropping its content + usage as an
+/// `event_schema` skip. Canonical-winner rule, disclosed as
+/// `duplicate_spelling_normalized` on the informational channel:
+/// the canonical (serde `rename`) spelling wins when it carries a
+/// value; a null canonical yields to the alias. Returns how many
+/// pairs were normalized. Docs carrying a single spelling are
+/// untouched (byte-identical parse).
+pub(crate) fn normalize_duplicate_field_spellings(value: &mut serde_json::Value) -> usize {
+    let Some(object) = value.as_object_mut() else {
+        return 0;
+    };
+    let mut normalized = 0;
+    for (canonical, alias) in EVENT_FIELD_SPELLING_PAIRS {
+        if object.contains_key(*canonical) && object.contains_key(*alias) {
+            if object
+                .get(*canonical)
+                .is_some_and(serde_json::Value::is_null)
+            {
+                // A null canonical contributes nothing to the strict
+                // parse; keep whichever spelling carries a value.
+                object.remove(*canonical);
+            } else {
+                object.remove(*alias);
+            }
+            normalized += 1;
+        }
+    }
+    normalized
+}
+
 fn deserialize_tool_calls<'de, D>(deserializer: D) -> Result<Vec<ToolCall>, D::Error>
 where
     D: Deserializer<'de>,
@@ -754,6 +806,10 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
     // Lines now go through the same lenient machinery the format
     // detectors use, and every loss is counted with a reason.
     let mut line_skips: BTreeMap<String, usize> = BTreeMap::new();
+    // rm-860: informational counter for duplicate-spelling
+    // normalizations, merged into metrics.disclosure_counters (never
+    // into line_skips — normalizing is not a loss).
+    let mut normalized_spellings = 0usize;
     let count_skip = |reason: &str, skips: &mut BTreeMap<String, usize>| {
         *skips.entry(reason.to_string()).or_insert(0) += 1;
     };
@@ -762,7 +818,7 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         if line.is_empty() {
             continue;
         }
-        let Some(value) = parser::parse_jsonl_value_lenient(line) else {
+        let Some(mut value) = parser::parse_jsonl_value_lenient(line) else {
             count_skip("unparseable_line", &mut line_skips);
             // rm-616: a rejected line that itself carries model identity
             // or a usage block is not just a lost message — it is lost
@@ -804,6 +860,14 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
                 || object.contains_key("usage")
                 || object.contains_key("Usage")
         });
+        // rm-860: collapse duplicate case-variant spellings before the
+        // strict Event parse — a doc carrying BOTH `ModelUsed` and
+        // `model_used` (any rename+alias pair) used to trip serde's
+        // duplicate-field error and vanish from every surface as an
+        // `event_schema` drop. Canonical spelling wins; the
+        // normalization is disclosed on the informational channel,
+        // never counted as a drop.
+        normalized_spellings += normalize_duplicate_field_spellings(&mut value);
         let Ok(mut event) = serde_json::from_value::<Event>(value) else {
             count_skip("event_schema", &mut line_skips);
             if carries_model_or_usage {
@@ -838,6 +902,13 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
     for (reason, count) in line_skips {
         *session.metrics.line_skips.entry(reason).or_insert(0) += count;
     }
+    if normalized_spellings > 0 {
+        *session
+            .metrics
+            .disclosure_counters
+            .entry("duplicate_spelling_normalized".to_string())
+            .or_insert(0) += normalized_spellings;
+    }
     Ok(session)
 }
 
@@ -863,9 +934,29 @@ fn jsonl_source_tool(objects: &[serde_json::Map<String, Value>]) -> &'static str
 pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow::Result<Session> {
     let mut model = "default".to_string();
     let mut cwd = String::new();
+    // rm-861: the session model label is only writable by rows that
+    // speak for the session's model — assistant turns,
+    // session/meta identity rows, and usage-bearing rows (a row that
+    // carries usage declares which model the counted tokens belong
+    // to). The scan used to be last-wins over EVERY role, so a
+    // terminal user row naming a different model relabeled the whole
+    // session (the label feeds by_model and pricing for sessions
+    // whose usage is unconsumed). A non-authoritative row may still
+    // SEED the label off "default" — lanes that stamp the model only
+    // on tool rows keep their attribution — but once named, its
+    // differing label is ignored and disclosed as
+    // `model_label_non_assistant_ignored`.
+    let mut non_assistant_model_ignored = 0usize;
     for event in &events {
         if !event.model_used.is_empty() && event.model_used != "unknown" {
-            model = event.model_used.clone();
+            let authoritative =
+                matches!(event.role.as_str(), "assistant" | "session_meta" | "meta")
+                    || !event.usage.is_empty();
+            if authoritative || model == "default" {
+                model = event.model_used.clone();
+            } else if event.model_used != model {
+                non_assistant_model_ignored += 1;
+            }
         }
         if cwd.is_empty() && !event.cwd.is_empty() {
             cwd = event.cwd.clone();
@@ -875,6 +966,16 @@ pub fn session_from_events(name: &str, path: &str, events: Vec<Event>) -> anyhow
         }
     }
     let mut metrics = analyze(&events, &model);
+    if non_assistant_model_ignored > 0 {
+        // rm-861 disclosure: ignored relabeling attempts stay visible
+        // on the informational channel (a healthy corpus never fires
+        // it — clean journals carry the model on authoritative rows
+        // or not at all).
+        *metrics
+            .disclosure_counters
+            .entry("model_label_non_assistant_ignored".to_string())
+            .or_insert(0) += non_assistant_model_ignored;
+    }
     // rm-408 disclosure (arm a): count present-but-zero usage blocks at
     // the one choke point every format passes through, and flag them in
     // the provenance string so no surface reports clean zeros silently.

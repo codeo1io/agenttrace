@@ -1631,7 +1631,21 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
-                // Schema 38 (integration of run 5417681937ae,
+                // rm-863/rm-860/rm-861/rm-862 (run 5eb82325eb, intake ->
+        // attribution -> disclosure truthfulness): reasoning folds
+        // follow per-key producer semantics, both-spelling lines parse
+        // under the canonical-winner rule, and model labels are only
+        // writable by authoritative rows — a warm v40 entry would
+        // serve stale output totals, dropped-line masks and model
+        // labels for UNCHANGED files (minted 38 -> 39 at base,
+        // re-based above the advanced ceiling as 40 -> 41, then to 43
+        // by the cycle-1 review fix and to 50 by the review-fix rebase
+        // — 41 landed meanwhile for the ac14e52c format, 42 for
+        // rm-880/rm-406 (run 14954d7a), and 43/49 were claimed in
+        // flight by sibling runs (33b7b7b5 / 2a5cdb9e), so warm
+        // entries from any other format must not serve).
+        //
+        // Schema 38 (integration of run 5417681937ae,
                 // cycle-3 "disclosure-plane honesty": the kimi
                 // usage-alias counters moved onto
                 // metrics.disclosure_counters (rm-719) so a healthy
@@ -1725,7 +1739,7 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
                 // (`pricing_catalog_id`), and an unstamped journal is
                 // accepted as-is, so the hand-planted entry needs no
                 // pricing stamp to be a warm hit.
-                r#"{{"schema_version":38,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
+                r#"{{"schema_version":50,"entries":{{{0}:{{"mod_time":{1},"size":{2},"session":{{"Name":"cached","Path":{0},"Metrics":{{"SourceTool":"hermes_jsonl","ModelUsed":"cached-model","SessionStart":"2026-05-02T09:00:00Z","ToolArgUsage":{{}}}},"Health":91,"ToolWarnings":[],"Diagnostics":{{}}}}}}}}}}"#,
                 session_path_json,
                 file_mod_time_nanos_for_test(&metadata),
                 metadata.len()

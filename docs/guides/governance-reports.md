@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 38 and the SQLite snapshot is schema 8; the
+The session cache is schema 50 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -156,7 +156,37 @@ for pre-Sept-2026 rollouts that carry no usage rows at all (rm-716 —
 all three of run 5417681937ae cycle 3, landed at its base 1c5edd1 as
 32 → 33, re-based at integration onto the advanced ceiling as 37 → 38)
 — so cached sessions regenerate under the corrected confidence,
-disclosure census, attribution and cache-read totals; the SQLite snapshot to 7
+disclosure census, attribution and cache-read totals, and to 39 when the
+re-emission-truthfulness batch re-counted Claude streaming re-emissions
+(rm-834/rm-694/rm-835/rm-836 of run f7f81aea), to 40 when the
+honest-attribution batch added branch roll-ups and moved the Codex
+structural counters onto the informational channel (rm-585/rm-730 of
+run 4c3ca863), and to 50 when the intake → attribution → disclosure
+truthfulness batch split the reasoning-token folds by producer
+semantics (the flat OpenAI-compatible spellings `reasoning_tokens` /
+`thinking_tokens` are a breakdown INSIDE the reported completion and no
+longer add to output — `thoughtsTokenCount` and its camelCase family,
+plus antigravity `reasoningTokens`, still add, rm-863), let
+duplicate-spelling docs parse under the disclosed canonical-winner
+rule (`ModelUsed` + `model_used` on one line used to drop the whole
+line as `event_schema`; the canonical rename spelling wins unless it
+is null, rm-860), restricted the session model label to authoritative
+rows (assistant turns, session/meta identity rows, and usage-bearing
+rows; a relabeling attempt from any other row is ignored and disclosed
+as `model_label_non_assistant_ignored` — though a non-authoritative row
+may still SEED the label while it reads `default`, so lanes that stamp
+the model only on tool rows keep their attribution — rm-861), and split the
+doctor
+report's fold into a loss tier and an informational tier (rm-862) —
+minted at its base 5ed9ebc as 38 → 39, re-based at integration onto
+the live ceiling to 41 at implement, to 43 by the cycle-1 review
+fix, and to 50 by the review-fix rebase — 41 (the ac14e52c
+integration) and 42 (the rm-880/rm-406 journal-truth integration,
+run 14954d7a) were taken while the batch was in review, and 43/49
+were claimed in flight by sibling runs (33b7b7b5 / 2a5cdb9e)) — so
+cached sessions regenerate
+under the corrected reasoning totals, intake and attribution;
+the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, and to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548). Older versions are discarded and
@@ -260,6 +290,23 @@ the human text view and `--diagnostics` stay ungated by design.
 ```bash
 agenttrace --overview --range 30d -f html -o agenttrace-overview.html
 ```
+
+The overview's data-health plane distinguishes REAL parse loss from
+healthy disclosure (rm-862 vocabulary map): `Dropped lines` (parse
+loss) counts `metrics.line_skips` — unparseable or schema-rejected
+lines whose content never reached the totals — and degrades
+`data_health.confidence`. `Disclosed facts` (informational) counts
+`metrics.disclosure_counters` — journal facts the accounting
+deliberately does not count: `kimi_usage_alias:<key>`,
+`codex_rollout_no_usage_rows`, `duplicate_spelling_normalized` (a doc
+carrying BOTH `ModelUsed` and `model_used` parsed under the
+canonical-winner rule, rm-860), and
+`model_label_non_assistant_ignored` (a relabeling attempt from a row
+that does not speak for the session's model, rm-861). `--doctor`
+mirrors the same two tiers as `Dropped lines (parse loss)` and
+`Disclosed facts (informational)` rows (rm-862; before it, doctor
+folded both channels under one "Disclosed facts" line, so a torn
+tail was indistinguishable from a healthy disclosure).
 
 The overview also carries attribution dimensions over the same scope:
 

@@ -1,0 +1,26 @@
+{
+ "session_id": "camelcase-thoughts-sibling",
+ "model": "deepseek-reasoner",
+ "platform": {
+  "name": "sglang-gateway"
+ },
+ "session_start": "2026-10-08T10:00:00Z",
+ "last_updated": "2026-10-08T10:01:00Z",
+ "messages": [
+  {
+   "role": "user",
+   "content": "hello",
+   "timestamp": "2026-10-08T10:00:00Z"
+  },
+  {
+   "role": "assistant",
+   "content": "ok",
+   "timestamp": "2026-10-08T10:00:30Z"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 1000,
+  "completion_tokens": 400,
+  "thoughtsTokenCount": 150
+ }
+}
