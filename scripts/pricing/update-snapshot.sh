@@ -25,6 +25,16 @@ for key, value in data.items():
         continue
     if value.get("mode") != "chat":
         continue
+    # rm-903: LiteLLM publishes glob keys (bedrock/*/1-month-commitment/
+    # …, 4 of them in the 2026-10-08 refresh). Our lookup is exact-key,
+    # so such a row can never match — skip it at refresh time instead of
+    # vendoring unmatchable dead weight. Concrete-region commitment-tier
+    # keys (bedrock/us-east-1/1-month-commitment/…) deliberately stay:
+    # they are exact-matchable strings and priced rows in their own
+    # right. Pinned by tests/pricing_snapshot_hygiene.rs
+    # (vendored_pricing_bundle_carries_no_wildcard_keys).
+    if "*" in key:
+        continue
     inp = value.get("input_cost_per_token") or 0
     outp = value.get("output_cost_per_token") or 0
     if inp == 0 and outp == 0:

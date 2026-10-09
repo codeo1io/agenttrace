@@ -1,6 +1,7 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions_reported, parse_file, Session, SqliteIngestReport, VERSION,
+    load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
+    SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -639,50 +640,67 @@ fn doctor_directories(
                 *disclosures.entry(key.clone()).or_insert(0) += count;
             }
         }
+        // rm-904: the bundled corpus runs through the same subagent
+        // linkage pass as a real scan, so a demo report discloses an
+        // orphaned subagent identically instead of silently dropping
+        // the grain the CLI lane discloses (0 → no key, clean).
+        disclose_unlinked_subagent_count(&mut sessions.to_vec(), disclosures);
         return Vec::new();
     }
     let mut cache = load_session_cache();
+    let mut scanned_sessions: Vec<Session> = Vec::new();
+    let mut dirs: Vec<DoctorDirReport> = Vec::new();
     if let Some(dir) = dir {
         let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        return vec![doctor_dir_report(
+        dirs.push(doctor_dir_report(
             "custom",
             &abs,
             files,
             &mut cache,
-            project_decode,
-            zero_usage,
-            disclosures,
-        )];
-    }
-
-    let mut count_by_root = BTreeMap::new();
-    for candidate in known_session_dirs() {
-        count_by_root.insert(candidate.path, 0usize);
-    }
-    for file in files {
-        for (root, count) in &mut count_by_root {
-            if is_under(file, root) {
-                *count += 1;
-            }
-        }
-    }
-
-    let mut dirs = Vec::new();
-    for candidate in known_session_dirs() {
-        let matching = files
-            .iter()
-            .filter(|file| is_under(file, &candidate.path))
-            .cloned()
-            .collect::<Vec<_>>();
-        dirs.push(doctor_dir_report(
-            &candidate.name,
-            &candidate.path,
-            &matching,
-            &mut cache,
+            &mut scanned_sessions,
             project_decode,
             zero_usage,
             disclosures,
         ));
+    } else {
+        let mut count_by_root = BTreeMap::new();
+        for candidate in known_session_dirs() {
+            count_by_root.insert(candidate.path, 0usize);
+        }
+        for file in files {
+            for (root, count) in &mut count_by_root {
+                if is_under(file, root) {
+                    *count += 1;
+                }
+            }
+        }
+
+        for candidate in known_session_dirs() {
+            let matching = files
+                .iter()
+                .filter(|file| is_under(file, &candidate.path))
+                .cloned()
+                .collect::<Vec<_>>();
+            dirs.push(doctor_dir_report(
+                &candidate.name,
+                &candidate.path,
+                &matching,
+                &mut cache,
+                &mut scanned_sessions,
+                project_decode,
+                zero_usage,
+                disclosures,
+            ));
+        }
+    }
+    // rm-367 stage (a): persist fresh parses so an immediate --doctor
+    // rerun on the same corpus reuses them (the loader lane's
+    // discovery.rs save pattern) — before this the doctor READ the
+    // cache but never wrote it, so every rerun re-parsed every
+    // session from source. Stages b-d (finder-level reuse of the
+    // walk itself) stay open on the row.
+    if cache.is_dirty() {
+        let _ = save_session_cache(&mut cache);
     }
     dirs.extend(doctor_sqlite_directories(sessions, sqlite_ingest));
     // SQLite-backed sessions (and, under `--demo`, the bundled corpus)
@@ -705,14 +723,39 @@ fn doctor_directories(
             *disclosures.entry(key.clone()).or_insert(0) += count;
         }
     }
+    // rm-904: both lanes join the same subagent linkage pass the
+    // loader runs (subagents::attribute_subagents, discovery.rs's
+    // lane), so orphaned subagent transcripts disclose through
+    // --doctor exactly as they do on every CLI report path
+    // (main.rs disclose_unlinked_subagents) — 0-count-clean.
+    scanned_sessions.extend(sessions.iter().cloned());
+    disclose_unlinked_subagent_count(&mut scanned_sessions, disclosures);
     dirs
 }
 
+/// rm-904: counts subagent transcripts whose parent transcript is not
+/// part of the scanned corpus (orphaned children) and discloses them
+/// through the doctor's disclosures map — mirroring the rm-548
+/// `opencode_fork_excluded_sessions` insert: the key appears only when
+/// there is something to disclose (0-count-clean), so healthy corpora
+/// read identically to before.
+fn disclose_unlinked_subagent_count(
+    sessions: &mut [Session],
+    disclosures: &mut BTreeMap<String, usize>,
+) {
+    let unlinked = crate::subagents::attribute_subagents(sessions);
+    if unlinked > 0 {
+        disclosures.insert("unlinked_subagents".to_string(), unlinked);
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // rm-367 stage (a) adds the scanned-session accumulator
 fn doctor_dir_report(
     name: &str,
     path: &Path,
     files: &[PathBuf],
     cache: &mut crate::SessionCache,
+    scanned_sessions: &mut Vec<Session>,
     project_decode: &mut DoctorProjectDecodeReport,
     zero_usage: &mut DoctorZeroUsageReport,
     disclosures: &mut BTreeMap<String, usize>,
@@ -729,6 +772,11 @@ fn doctor_dir_report(
             Some(session)
         } else if let Ok(session) = parse_file(file) {
             parsed += 1;
+            // rm-367 stage (a): persist the fresh parse so an
+            // immediate --doctor rerun reuses it — the loader lane's
+            // discovery.rs:382 pattern. The reuse shows up on the
+            // NEXT run (cache_hits / cached_valid), not this one.
+            let _ = store_session(file, &session, cache);
             Some(session)
         } else {
             if failure_samples.len() < 3 {
@@ -737,6 +785,9 @@ fn doctor_dir_report(
             None
         };
         if let Some(session) = session {
+            // rm-904: the session is retained (post-folds) for the
+            // subagent linkage pass at the end of doctor_directories.
+            scanned_sessions.push(session.clone());
             collect_project_decode(project_decode, &session);
             collect_zero_usage(zero_usage, &session);
             // rm-436/rm-437: cache-hit and freshly parsed sessions
