@@ -23,7 +23,19 @@ require_json() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir"
 
-"$bin" --doctor -f json >"$out_dir/doctor.json"
+# rm-444 residual (2026-10-09, assess F5, run 9ae1358ba55a cycle 2): the
+# --doctor leg persists session-cache state (rm-367 stage a), so it must run
+# under a scratch HOME + pinned AGENTTRACE_SESSION_CACHE_DIR — the same
+# sandbox scripts/ci/check-docs-commands.sh (:27) already got from rm-444.
+# Unsandboxed it wrote the real operator cache and the leg was killed >240s.
+scratch_home="$(mktemp -d)"
+mkdir -p "$scratch_home/.agenttrace/sessions"
+sandbox() {
+  env HOME="$scratch_home" XDG_CONFIG_HOME="$scratch_home/.config" \
+    XDG_CACHE_HOME="$scratch_home/.cache" \
+    AGENTTRACE_SESSION_CACHE_DIR="$scratch_home/.agenttrace/sessions" "$@"
+}
+sandbox "$bin" --doctor -f json >"$out_dir/doctor.json"
 require_file "$out_dir/doctor.json"
 require_json "$out_dir/doctor.json"
 

@@ -52,8 +52,12 @@ struct Args {
     /// rm-576: color scheme of the SVG usage card (`-f svg`). `auto`
     /// ships the light palette plus a `prefers-color-scheme` override so
     /// the static file adapts to the viewer; bytes stay deterministic.
-    #[arg(long = "card-theme", default_value = "auto")]
-    card_theme: SvgCardTheme,
+    /// rm-576 residual (2026-10-09, assess F6): the theme is consumed by
+    /// `-f svg` only; an explicitly set non-`auto` theme on any other
+    /// format earns a one-line stderr note instead of a silent discard.
+    /// The default stays `auto` (restored at the consumption site).
+    #[arg(long = "card-theme")]
+    card_theme: Option<SvgCardTheme>,
     /// Session directory to scan instead of auto-discovered agent homes
     #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
@@ -333,7 +337,11 @@ fn run() -> anyhow::Result<()> {
     // rm-573: an explicit --statusline-report wins over keyword host dispatch —
     // otherwise `agenttrace --statusline-report statusline` runs the host and
     // appends a bogus capture to the real journal before the report renders.
-    if args.path.as_deref() == Some("statusline") && !args.statusline_report {
+    // rm-573 residual (assess F3, 2026-10-09, run 9ae1358ba55a cycle 2):
+    // EVERY armed report action outranks the keyword interpretation —
+    // `--demo --waste statusline` used to render this host's report
+    // instead of the waste report, rc 0.
+    if args.path.as_deref() == Some("statusline") && !explicit_report_action_armed(&args) {
         return agenttrace_core::run_statusline_host();
     }
     // `agenttrace upstream` is a repository status host command (rm-024,
@@ -342,7 +350,10 @@ fn run() -> anyhow::Result<()> {
     // this is an explicit user action that may fail loudly. It is fully
     // offline unless --fetch explicitly opts into the network.
     // rm-573: --statusline-report also wins over the upstream keyword lane.
-    if args.path.as_deref() == Some("upstream") && !args.statusline_report {
+    // rm-573 residual (assess F3, 2026-10-09): every armed report action
+    // outranks the keyword interpretation — `--demo --waste upstream`
+    // used to render this drift report instead of the waste report, rc 0.
+    if args.path.as_deref() == Some("upstream") && !explicit_report_action_armed(&args) {
         let report = upstream::status_report(&args.format, args.fetch)?;
         // rm-625: the drift report rides the same dispatch choke point
         // as every other report lane (control bytes sanitized outside
@@ -369,7 +380,9 @@ fn run() -> anyhow::Result<()> {
     // swaps the requested report for a stdin-blocked server (the report
     // never renders; the same keyword-shadowing class rm-573 closed for
     // statusline/upstream, caught for `mcp` at integration of rm-455).
-    if args.path.as_deref() == Some("mcp") && !args.statusline_report {
+    // rm-573 residual (assess F3, 2026-10-09): same rule, every armed
+    // report action — kept consistent with the lanes above.
+    if args.path.as_deref() == Some("mcp") && !explicit_report_action_armed(&args) {
         return mcp::serve();
     }
     validate_primary_action(&args)?;
@@ -826,6 +839,13 @@ fn run() -> anyhow::Result<()> {
                 sessions.len()
             );
         }
+        // rm-576 residual (assess F6, 2026-10-09): an explicitly set
+        // theme cannot apply outside `-f svg`; say so instead of
+        // discarding it silently (`auto` and the unset default stay
+        // silent — there is nothing the operator got wrong).
+        if let Some(note) = card_theme_discard_note(&args.format, args.card_theme) {
+            eprintln!("{note}");
+        }
         let range = parse_range(&args)?;
         let mut out = match args.format.as_str() {
             "csv" => csv_export::overview_csv(&overview),
@@ -865,7 +885,7 @@ fn run() -> anyhow::Result<()> {
                 &health,
                 range,
                 args.include_history,
-                args.card_theme,
+                args.card_theme.unwrap_or(SvgCardTheme::Auto),
             ),
             _ => report_overview_text_with_context(
                 &overview,
@@ -1216,6 +1236,38 @@ where
     // stay tolerated: they are not flags, and the Go-style contract
     // only ever documented flag handling.
     let dropped: Vec<OsString> = args.collect();
+    // rm-247 residual (assess F7, 2026-10-09, run 9ae1358ba55a cycle 2):
+    // an unknown flag that looks value-taking lands its VALUE in the
+    // positional slot, and the dropped-tail error below then mislabels
+    // the real problem — `-d DIR --model foo --overview` failed naming
+    // `--overview` as "follows the positional session path" while the
+    // actual defect (`--model` is not an agenttrace flag; the operator
+    // meant `--model-filter`) stayed invisible. When the token
+    // immediately before the first positional is an unknown flag, name
+    // THAT flag — with the closest declared long flag when its stem
+    // matches uniquely (`--model` -> `--model-filter`).
+    if out.len() >= 2 {
+        let penultimate = out[out.len() - 2].to_string_lossy();
+        let penultimate_os = OsString::from(penultimate.as_ref());
+        let first_positional = &out[out.len() - 1];
+        if penultimate != "--"
+            && is_dash_flag(&penultimate)
+            && !flag_takes_value(&penultimate_os)
+            && !is_known_flag_token(&penultimate)
+            && is_go_flag_positional(first_positional)
+        {
+            bail!(
+                "unknown flag `{penultimate}` before the positional session path `{}`: \
+                 `{penultimate}` is not an agenttrace flag, so `{}` was parsed as the \
+                 positional session path{}; agenttrace's flags are listed by --help",
+                first_positional.to_string_lossy(),
+                first_positional.to_string_lossy(),
+                unknown_flag_suggestion(&penultimate)
+                    .map(|known| format!(" (did you mean `--{known}`?)"))
+                    .unwrap_or_default()
+            );
+        }
+    }
     if let Some(flag) = dropped.iter().find(|arg| !is_go_flag_positional(arg)) {
         let tail = dropped
             .iter()
@@ -1367,6 +1419,64 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--pricing-file"
             | "--weekly-budget"
     )
+}
+
+/// rm-247 residual (assess F7, 2026-10-09, run 9ae1358ba55a cycle 2):
+/// `--` starts a flag token; the shim only deals in Go-style flags.
+fn is_dash_flag(token: &str) -> bool {
+    token.starts_with('-')
+}
+
+/// rm-247 residual (assess F7): does clap know this exact token as a
+/// flag? Long-shaped tokens (`--model`) match only by their long name
+/// and short-shaped tokens (`-m`) only by the short character — mixing
+/// the two made `--model` "known" via the `-m` comparison flag and hid
+/// the real unknown-flag diagnosis. Derived from the live `Args`
+/// command so this cannot drift from the real argument grammar (the
+/// same `clap::CommandFactory` source the canary test in `mod tests`
+/// pins).
+fn is_known_flag_token(token: &str) -> bool {
+    use clap::CommandFactory;
+    let cmd = Args::command();
+    if let Some(name) = token.strip_prefix("--") {
+        if name.is_empty() {
+            return false;
+        }
+        let known = cmd.get_arguments().any(|arg| arg.get_long() == Some(name));
+        return known;
+    }
+    let stripped = token.strip_prefix('-').unwrap_or(token);
+    match stripped.chars().next() {
+        Some(short) => cmd
+            .get_arguments()
+            .any(|arg| arg.get_short() == Some(short)),
+        None => false,
+    }
+}
+
+/// rm-247 residual (assess F7): the uniquely matching declared long
+/// flag whose name starts with this unknown token's stem
+/// (`--model` -> `--model-filter`; a stem matching several flags stays
+/// ambiguous and suggests nothing).
+fn unknown_flag_suggestion(token: &str) -> Option<&'static str> {
+    let stem = token.trim_start_matches('-');
+    if stem.is_empty() {
+        return None;
+    }
+    let stem = stem.to_ascii_lowercase();
+    use clap::CommandFactory;
+    let cmd = Args::command();
+    let mut hits = cmd
+        .get_arguments()
+        .filter_map(|arg| arg.get_long().map(str::to_string))
+        .filter(|long| long.starts_with(stem.as_str()))
+        .collect::<Vec<_>>();
+    if hits.len() == 1 {
+        // Leak is fine: a handful of short strings once per process run.
+        Some(Box::leak(hits.remove(0).into_boxed_str()))
+    } else {
+        None
+    }
 }
 
 fn latest_session(sessions: &[Session]) -> Option<&Session> {
@@ -2354,6 +2464,59 @@ fn has_session_action(args: &Args) -> bool {
             .unwrap_or(false)
 }
 
+/// rm-573 residual (assess F3, 2026-10-09, run 9ae1358ba55a cycle 2):
+/// `true` when any explicit report action is armed. The keyword host
+/// lanes (`statusline` / `upstream` / `mcp` positionals) dispatch at the
+/// top of `run`, long before `validate_primary_action`, so guarding
+/// them with only `!args.statusline_report` let any OTHER armed report
+/// action be silently swapped for the keyword host's behavior —
+/// `--demo --waste upstream` rendered the upstream drift report
+/// instead of the waste report, rc 0. Any armed action outranks the
+/// keyword interpretation — the same rule `single_session_report`
+/// applies at the later report-choice point. Keep this table in sync
+/// with the actions array in `validate_primary_action` (that doc
+/// comment is the source of truth for what counts as one action).
+fn explicit_report_action_armed(args: &Args) -> bool {
+    args.overview
+        || args.sessions
+        || args.diagnostics
+        || args.inspect.is_some()
+        || args.waste
+        || args.budget
+        || args.doctor
+        || args.list_models
+        || args.test_match
+        || args.statusline_report
+        || args.version
+        || args.compare
+        || args.audit
+        || args.recommend
+        || args.mcp_governance
+        || args.context_trends
+        || args.delivery_evidence
+        || args
+            .search
+            .as_deref()
+            .map(|query| !query.trim().is_empty())
+            .unwrap_or(false)
+}
+
+/// One-line note for an explicitly set `--card-theme` that cannot
+/// apply to the requested output format (rm-576 residual, assess F6,
+/// 2026-10-09). `None` keeps the lane silent: `-f svg` consumes the
+/// theme, and the default (`auto`) was never a deliberate operator
+/// choice to warn about.
+fn card_theme_discard_note(format: &str, theme: Option<SvgCardTheme>) -> Option<String> {
+    let theme = theme?;
+    if format == "svg" || matches!(theme, SvgCardTheme::Auto) {
+        return None;
+    }
+    Some(format!(
+        "Note: --card-theme {} applies only to -f svg output; ignoring it for -f {format}.",
+        theme.as_str()
+    ))
+}
+
 /// rm-244: `--range` only filters session reports. Every action that
 /// consumes it is covered by `has_session_action`; on the interactive
 /// and utility paths (`--demo` TUI, plain TUI, `--clear-cache`,
@@ -2629,7 +2792,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         // rm-576: every test args literal carries the SVG card theme
         // default (the flag's clap default); the helper is the single
         // construction site since the test_args refactor.
-        card_theme: SvgCardTheme::Auto,
+        card_theme: Some(SvgCardTheme::Auto),
         config: None,
         history_dir: None,
         pricing_file: None,
@@ -4139,5 +4302,152 @@ mod tests {
         admit_session_path(&good).expect("symlink to a regular file is admitted");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // rm-247 residual (assess F7, 2026-10-09, run 9ae1358ba55a cycle 2):
+    // an unknown flag that looks value-taking lands its VALUE in the
+    // positional slot, so the dropped-tail error mislabeled the real
+    // problem — `-d DIR --model foo --overview` failed naming
+    // `--overview` as "follows the positional session path" while the
+    // actual defect (`--model` is not an agenttrace flag; the operator
+    // meant `--model-filter`) stayed invisible.
+    fn unknown_value_taking_flag_is_named_not_the_trailing_legal_flag() {
+        use std::ffi::OsString;
+
+        let argv: Vec<std::ffi::OsString> =
+            ["agenttrace", "-d", "/tmp/x", "--model", "foo", "--overview"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+        let err = go_flag_compatible_args(argv).expect_err("unknown flag must be named");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown flag `--model`"),
+            "must name the unknown flag, got: {msg}"
+        );
+        assert!(
+            msg.contains("--model-filter"),
+            "must suggest the closest declared flag, got: {msg}"
+        );
+        assert!(
+            !msg.contains("follows the positional session path"),
+            "must not mislabel as a flag-order violation, got: {msg}"
+        );
+
+        // Control: a legal boolean flag before the positional stays a
+        // passthrough — the unknown-flag check must not touch it.
+        let legal: Vec<std::ffi::OsString> = ["agenttrace", "--overview", "sessions.jsonl"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        go_flag_compatible_args(legal).expect("legal flag + positional passes through");
+
+        // No trailing legal flag: the shim itself names the unknown
+        // flag instead of deferring to clap's bare unexpected-argument.
+        let bare: Vec<std::ffi::OsString> = ["agenttrace", "--model", "foo"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let bare_err =
+            go_flag_compatible_args(bare).expect_err("unknown flag without a tail is still named");
+        assert!(
+            bare_err.to_string().contains("unknown flag `--model`"),
+            "got: {bare_err}"
+        );
+    }
+
+    #[test]
+    // rm-573 residual (assess F3, 2026-10-09, run 9ae1358ba55a cycle 2):
+    // the keyword host lanes (`statusline` / `upstream` / `mcp`
+    // positionals) dispatched before validate_primary_action with only
+    // `!args.statusline_report` guards, so every other armed report
+    // action was silently swapped for the keyword host's behavior —
+    // `--demo --waste upstream` rendered the upstream drift report, rc 0.
+    // Any armed action must outrank the keyword interpretation.
+    fn keyword_host_yields_to_every_armed_report_action() {
+        type Arm<'a> = (&'a str, fn(&mut Args));
+        let armed: Vec<Arm<'_>> = vec![
+            ("overview", |a: &mut Args| a.overview = true),
+            ("sessions", |a: &mut Args| a.sessions = true),
+            ("diagnostics", |a: &mut Args| a.diagnostics = true),
+            ("inspect", |a: &mut Args| a.inspect = Some(0)),
+            ("waste", |a: &mut Args| a.waste = true),
+            ("budget", |a: &mut Args| a.budget = true),
+            ("doctor", |a: &mut Args| a.doctor = true),
+            ("list_models", |a: &mut Args| a.list_models = true),
+            ("test_match", |a: &mut Args| a.test_match = true),
+            ("statusline_report", |a: &mut Args| {
+                a.statusline_report = true
+            }),
+            ("version", |a: &mut Args| a.version = true),
+            ("search", |a: &mut Args| a.search = Some("query".into())),
+            ("compare", |a: &mut Args| a.compare = true),
+            ("audit", |a: &mut Args| a.audit = true),
+            ("recommend", |a: &mut Args| a.recommend = true),
+            ("mcp_governance", |a: &mut Args| a.mcp_governance = true),
+            ("context_trends", |a: &mut Args| a.context_trends = true),
+            ("delivery_evidence", |a: &mut Args| {
+                a.delivery_evidence = true
+            }),
+        ];
+        for (name, arm) in &armed {
+            let mut args = test_args(None);
+            arm(&mut args);
+            args.path = Some("statusline".into());
+            assert!(
+                explicit_report_action_armed(&args),
+                "keyword host must yield when --{name} is armed"
+            );
+        }
+
+        // Non-action modifiers must NOT suppress the keyword lanes
+        // (test_args carries compare=true as its default reporting arm —
+        // zero it first for the modifier-only controls).
+        let mut plain = test_args(None);
+        plain.compare = false;
+        plain.path = Some("statusline".into());
+        assert!(
+            !explicit_report_action_armed(&plain),
+            "bare keyword stays live"
+        );
+        plain.demo = true;
+        assert!(!explicit_report_action_armed(&plain), "--demo stays live");
+        plain.demo = false;
+        plain.latest = true;
+        assert!(!explicit_report_action_armed(&plain), "--latest stays live");
+        plain.latest = false;
+        plain.search = Some("   ".into());
+        assert!(
+            !explicit_report_action_armed(&plain),
+            "whitespace-only --search is not an action"
+        );
+    }
+
+    #[test]
+    // rm-576 residual (assess F6, 2026-10-09, run 9ae1358ba55a cycle 2):
+    // `--card-theme dark --overview` (no -f svg) exited 0 with zero
+    // signal — an explicitly set theme that cannot apply must earn a
+    // one-line note; the default (`auto`, or unset) stays silent.
+    fn card_theme_note_only_when_theme_cannot_apply() {
+        assert_eq!(
+            card_theme_discard_note("svg", Some(SvgCardTheme::Dark)),
+            None
+        );
+        assert_eq!(card_theme_discard_note("text", None), None);
+        assert_eq!(
+            card_theme_discard_note("text", Some(SvgCardTheme::Auto)),
+            None
+        );
+        let note = card_theme_discard_note("text", Some(SvgCardTheme::Dark))
+            .expect("explicit theme on text format earns a note");
+        assert!(
+            note.contains("--card-theme dark"),
+            "names the theme, got: {note}"
+        );
+        assert!(note.contains("svg"), "names the owning format, got: {note}");
+        let note = card_theme_discard_note("json", Some(SvgCardTheme::Light))
+            .expect("explicit theme on json format earns a note");
+        assert!(note.contains("--card-theme light"), "got: {note}");
     }
 }
