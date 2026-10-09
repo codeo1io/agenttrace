@@ -135,6 +135,10 @@ pub fn overview_csv(overview: &Overview) -> String {
         &format!("{:.4}", overview.total_cost),
     ]));
     for (name, rows) in [
+        // rm-895 policy: the csv surface is a MACHINE surface — these
+        // sections render the FULL group set (no GROUP_TAKE cut, no
+        // marker); the human surfaces (text/html/markdown) cap at
+        // GROUP_TAKE with an explicit "+N more not shown" disclosure.
         ("by_model", &overview.by_model),
         ("by_provider", &overview.by_provider),
         // rm-585 (spend-by-branch, first cut): same GroupOverview
@@ -493,6 +497,41 @@ mod tests {
         assert!(
             out.contains("unknown,1,"),
             "the branchless session still lands under unknown: {out}"
+        );
+    }
+
+    #[test]
+    fn overview_csv_never_truncates_by_families() {
+        // rm-895 policy pin: csv is a MACHINE surface — it renders the
+        // FULL by_* group set (no GROUP_TAKE cut, no marker), whatever
+        // the human surfaces do. 15 branches > GROUP_TAKE(12) yet every
+        // row ships.
+        use agenttrace_core::{GroupOverview, Overview};
+        use std::collections::BTreeMap;
+        let mut by_branch = BTreeMap::new();
+        for i in 1..=15 {
+            by_branch.insert(
+                format!("feature/br{i:02}"),
+                GroupOverview {
+                    sessions: 1,
+                    cost: i as f64,
+                },
+            );
+        }
+        let overview = Overview {
+            by_branch,
+            ..Overview::default()
+        };
+        let out = overview_csv(&overview);
+        for i in 1..=15 {
+            assert!(
+                out.contains(&format!("feature/br{i:02},1,")),
+                "csv lost feature/br{i:02} — machine surfaces never truncate: {out}"
+            );
+        }
+        assert!(
+            !out.contains("more not shown"),
+            "csv must not claim a cut; it renders the full set"
         );
     }
 }
