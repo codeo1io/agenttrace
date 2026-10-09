@@ -182,6 +182,24 @@ surface, error-arm mapping, and a tool-call transcript:
 [docs/guides/mcp-server.md](docs/guides/mcp-server.md). (The keyword is
 unrelated to the `--mcp-governance` report flag.)
 
+### Shareable usage card (SVG)
+
+`--overview -f svg` renders a single static SVG file — headline cost, sessions,
+tool calls, tokens, top models/projects by cost, and a 14-day daily-spend
+sparkline, with the same honesty footer as the other overview formats
+(window, pricing source, data-confidence). The card is byte-deterministic for
+a fixed corpus + range + theme, carries no scripts and no network calls, and
+escapes session-derived strings so hostile model or project names render as
+text. `--card-theme auto|dark|light` selects the palette (`auto` adapts to the
+viewer via `prefers-color-scheme` while degrading gracefully to light).
+
+```shell
+agenttrace --overview --range 7d -f svg -o usage-week.svg
+agenttrace --overview -f svg --card-theme dark > usage.svg
+```
+
+Details and the determinism contract: [docs/guides/usage-card.md](docs/guides/usage-card.md).
+
 ### Governance reports
 
 ```bash

@@ -117,6 +117,35 @@ grep -q '^Saved: ' "$out_dir/agenttrace-demo.html.stderr" \
 ! grep -q '^Saved: ' "$out_dir/agenttrace-demo.html.stdout" \
   || fail "html stdout must not contain saved-file status"
 
+# rm-576: the usage card joins the output contract — same -o/stdout
+# split as the other file formats, byte-deterministic for a fixed
+# corpus+theme, and the default (auto) theme must embed the dark-mode
+# override block.
+"$bin" --demo --overview -f svg \
+  -o "$out_dir/agenttrace-demo.svg" \
+  >"$out_dir/agenttrace-demo.svg.stdout" \
+  2>"$out_dir/agenttrace-demo.svg.stderr"
+require_file "$out_dir/agenttrace-demo.svg"
+require_file "$out_dir/agenttrace-demo.svg.stdout"
+grep -q '^<?xml version' "$out_dir/agenttrace-demo.svg.stdout" \
+  || fail "svg stdout should contain the card markup"
+grep -q '^<?xml version' "$out_dir/agenttrace-demo.svg" \
+  || fail "saved svg should contain the card markup"
+grep -q '</svg>' "$out_dir/agenttrace-demo.svg" \
+  || fail "saved svg should close the document"
+grep -q '^Saved: ' "$out_dir/agenttrace-demo.svg.stderr" \
+  || fail "svg -o should write saved-file status to stderr"
+! grep -q '^Saved: ' "$out_dir/agenttrace-demo.svg.stdout" \
+  || fail "svg stdout must not contain saved-file status"
+grep -q 'prefers-color-scheme' "$out_dir/agenttrace-demo.svg" \
+  || fail "default (auto) card should embed the prefers-color-scheme override"
+"$bin" --demo --overview -f svg --card-theme dark \
+  -o "$out_dir/agenttrace-demo-dark.svg" >/dev/null 2>&1
+"$bin" --demo --overview -f svg --card-theme dark \
+  -o "$out_dir/agenttrace-demo-dark-2.svg" >/dev/null 2>&1
+cmp -s "$out_dir/agenttrace-demo-dark.svg" "$out_dir/agenttrace-demo-dark-2.svg" \
+  || fail "svg card must be byte-deterministic for a fixed corpus+theme"
+
 set +e
 "$bin" --demo --overview -f json \
   --fail-under-health 80 \

@@ -1648,22 +1648,53 @@ fn waste_report_format_matrix_pins_every_machine_surface() {
         "top_actions is a non-empty action list"
     );
 
-    // markdown cell: the guard rejects it loudly and names the owning
-    // actions — the same contract the overview surfaces live under.
-    let markdown = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
-        .args(["--demo", "--waste", "-f", "markdown"])
+    // markdown and svg cells: the guard rejects them loudly and names
+    // the owning actions — the same contract the overview surfaces live
+    // under. svg is pinned here beside markdown because it rides the
+    // same outside-composable-set rejection on the waste lane, with its
+    // own overview-only message (rm-576 review F1, integration review
+    // 2026-10-09: the card is an --overview renderer; svg must bail on
+    // every other lane instead of falling through to a silent text
+    // render).
+    for (format, message) in [
+        (
+            "markdown",
+            "markdown and html formats require --overview or a governance report action",
+        ),
+        ("svg", "svg format requires --overview"),
+    ] {
+        let rejected = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(["--demo", "--waste", "-f", format])
+            .output()
+            .expect("run agenttrace CLI");
+        assert_eq!(
+            rejected.status.code(),
+            Some(1),
+            "--waste -f {format} is rejected, not silently rendered as text"
+        );
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains(message),
+            "rejection names the format's owning actions: {stderr}"
+        );
+    }
+
+    // rm-576 review F1 pin: a governance action with -f svg must bail
+    // loudly too — before the fix `--demo --audit -f svg` exited 0 as
+    // plain text and (with -o) wrote text into a .svg file.
+    let governance_svg = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--demo", "--audit", "-f", "svg"])
         .output()
         .expect("run agenttrace CLI");
     assert_eq!(
-        markdown.status.code(),
+        governance_svg.status.code(),
         Some(1),
-        "--waste -f markdown is rejected, not silently rendered as text"
+        "--audit -f svg is rejected, never a silent text render"
     );
-    let stderr = String::from_utf8_lossy(&markdown.stderr);
+    let stderr = String::from_utf8_lossy(&governance_svg.stderr);
     assert!(
-        stderr
-            .contains("markdown and html formats require --overview or a governance report action"),
-        "rejection names the format's owning actions: {stderr}"
+        stderr.contains("svg format requires --overview"),
+        "svg rejection names its owning lane: {stderr}"
     );
 }
 

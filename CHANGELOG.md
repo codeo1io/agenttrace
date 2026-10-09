@@ -208,9 +208,34 @@
 
 ### Added
 
+- **rm-576: shareable usage card (`--overview -f svg`, `--card-theme
+  auto|dark|light`).** A deterministic, offline SVG renderer in the
+  `--overview` family: headline stats (cost, sessions, tool calls, tokens),
+  top models/projects by cost, a 14-day daily-spend sparkline anchored to
+  the corpus's own clock (never `Utc::now()` — this is what makes rerenders
+  byte-identical), and the same honesty footer as the other renderers
+  (covered window, pricing source, data-health confidence) so a shareable
+  artifact cannot hide an incomplete corpus. Auto theme ships the light
+  palette as presentation attributes plus a `prefers-color-scheme: dark`
+  override block — the card adapts where SVG media queries are honored and
+  degrades to a correct light card where they are not or a sanitizer strips
+  `<style>`. Session-derived strings pass `sanitize_line_segment` (raw
+  control bytes are illegal XML 1.0) and the family entity escaper, so a
+  model or project named like markup renders inert. `-f svg` requires
+  `--overview` (integration-review fix, rm-576 F1: the governance actions
+  have no svg arm, so svg outside the overview lane is a loud error rather
+  than the silent plain-text fallthrough the first cut admitted — the
+  rm-409 discipline). Contract pinned by `tests/svg_card_contract.rs` (golden bytes
+  for all three themes, rerender byte-equality, hostile-name inertness,
+  empty-corpus validity, corpus-clock anchoring) and
+  `scripts/ci/check-output-contract.sh` (saved-vs-stdout behavior,
+  cross-run `cmp` determinism). Docs: `docs/guides/usage-card.md`, README
+  section. Minted by the 7eae74ea cycle-1 roadmap (rm-576); codeburn #1640
+  parity research recorded in that run's ledger.
 - `-f otel` output format (rm-599 CLI half): OpenTelemetry GenAI OTLP-JSON export on the
   `--overview` lane (`--overview` required; `-o` supported); stdout text/json/csv output
   now ends with exactly one trailing newline, at parity with `-o` files.
+
 - `--doctor` and the pricing-source report line disclose vendor-deprecated models (rm-419): the snapshot ingestion now carries LiteLLM's `deprecation_date` when the source has one (463 of 3,099 entries in the 2026-10-04 refresh), the pricing provenance line discloses how many priced models are past their vendor deprecation date, and a session priced on a model the vendor has already retired says `model deprecated YYYY-MM-DD (rate unverified)` at its rate provenance instead of silently billing at catalog rates. The judgment anchors to the catalog's own vintage (the bundled snapshot's pinned date, or a cached catalog's fetch date) — never the wall clock — so report bytes stay stable for a given catalog.
 - pi-family journal format-contract suite (cycle 3, rm-423): the pi upstream (`@earendil-works/pi-coding-agent`) is a private repository that shipped 1.0.0→1.0.2 within four days, so journal-format drift has no release-notes early warning — a silent key change would degrade discovery, labeling, and usage attribution without failing a test. Golden fixtures (one derived-redacted from a real 1.0.2 v3 journal observed live, one per sniff arm: title-preamble/versionless header, `parentSession` header) pin the header key set, a known-journal-version gate (`1|2|3`) that names the `version` key on drift, both usage alias families (`input/cacheRead/cacheWrite/totalTokens` and `input_tokens/cache_creation_input_tokens/...`), message-level model attribution, and the `model_change` wire key (`modelId`) end to end. Known-divergence pins (the dead `model` handler, documented; system-entry routing — `branch_summary`/`compaction` surfacing as assistant turns — pinned by a fixture assertion added at review) are recorded in the suite so those fixes must update the contract deliberately, not by drift.
 - Statusline capture (research pass 9 candidate 53): `agenttrace statusline` is a host command for Claude Code's `statusLine` hook that renders the one-line status and tees the raw payload to a bounded local journal (`~/.cache/agenttrace/statusline.jsonl`, 10 MiB cap, newest-whole-lines compaction via temp-file rename, `AGENTTRACE_SESSION_CACHE_DIR` honored, torn lines skipped on read). It never fails the host — valid payload, malformed JSON, and empty stdin all exit 0 with exactly one stdout line, diagnostics to stderr only, stdin bounded at 1 MiB. `--statusline-report` (text and JSON) turns the journal into subscription limit-pressure windows (`5h`/`7d` usage, `resets_at` crossings evidenced by observations on both sides), deduplicated per-session prompt-cache analytics (`hit_ratio`, misses, `miss_causes` such as `tools_changed`), and peaks; `--doctor` reports the journal's health and the TUI Efficiency panel gains a "Subscription limits" block. Captures are deduplicated by exact payload with the count disclosed. Fixtures are schema-faithful to the documented payload contract, not recordings of a real host.

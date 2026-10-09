@@ -8,10 +8,11 @@ use agenttrace_core::{
     render_test_match, render_waste_report_with_language, report_compare_json,
     report_json_with_language, report_overview_html_with_context,
     report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
-    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
-    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, TimeRange, VERSION,
+    report_overview_svg_with_context, report_overview_text_with_context, report_search_json,
+    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
+    session_capability, session_start_cmp, tool_fail_rate, total_tokens, update_pricing,
+    waste_report_json, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
+    SvgCardTheme, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -37,16 +38,22 @@ struct Args {
     /// never touch the session cache)
     path: Option<String>,
     /// Output format for the requested view: text (default), json, csv,
-    /// markdown/md, html, or otel (the OTLP-JSON export of the whole
+    /// markdown/md, html, svg (the shareable usage card; requires
+    /// --overview), or otel (the OTLP-JSON export of the whole
     /// corpus; requires --overview). Unsupported combinations fail
     /// loudly instead of falling back to text.
     #[arg(
         short = 'f',
         long = "format",
         default_value = "text",
-        value_parser = ["text", "json", "csv", "markdown", "md", "html", "otel"]
+        value_parser = ["text", "json", "csv", "markdown", "md", "html", "otel", "svg"]
     )]
     format: String,
+    /// rm-576: color scheme of the SVG usage card (`-f svg`). `auto`
+    /// ships the light palette plus a `prefers-color-scheme` override so
+    /// the static file adapts to the viewer; bytes stay deterministic.
+    #[arg(long = "card-theme", default_value = "auto")]
+    card_theme: SvgCardTheme,
     /// Session directory to scan instead of auto-discovered agent homes
     #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
@@ -379,6 +386,17 @@ fn run() -> anyhow::Result<()> {
             || args.delivery_evidence)
     {
         bail!("markdown and html formats require --overview or a governance report action");
+    }
+    // rm-576 review F1 (integration review 2026-10-09): the SVG usage
+    // card is an --overview renderer only — it consumes the overview
+    // aggregation pass, and the governance actions have no svg arm, so
+    // admitting them in the guard above let render_governance_report's
+    // '_' fallback silently render plain text (rc=0; with -o, text was
+    // written into a .svg file) — the rm-409 silent-fallthrough class
+    // this guard family exists to prevent. Bail loudly instead,
+    // mirroring the otel lane's overview-only gate below.
+    if args.format == "svg" && !args.overview {
+        bail!("svg format requires --overview (the usage card renders the overview aggregation)");
     }
     // rm-409 (review fix): csv's composable set is exactly --overview and
     // --sessions (the README column contract); every other report shape
@@ -840,6 +858,14 @@ fn run() -> anyhow::Result<()> {
                 &health,
                 range,
                 args.include_history,
+            ),
+            "svg" => report_overview_svg_with_context(
+                &overview,
+                &sessions,
+                &health,
+                range,
+                args.include_history,
+                args.card_theme,
             ),
             _ => report_overview_text_with_context(
                 &overview,
@@ -1305,6 +1331,7 @@ fn flag_takes_value(arg: &OsString) -> bool {
     matches!(
         text.as_ref(),
         "-f" | "--format"
+            | "--card-theme"
             | "-d"
             | "--dir"
             | "-m"
@@ -2599,6 +2626,10 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
     Args {
         path: None,
         format: "json".to_string(),
+        // rm-576: every test args literal carries the SVG card theme
+        // default (the flag's clap default); the helper is the single
+        // construction site since the test_args refactor.
+        card_theme: SvgCardTheme::Auto,
         config: None,
         history_dir: None,
         pricing_file: None,

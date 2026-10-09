@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" role="img" aria-label="agenttrace usage card">
+<style>
+@media (prefers-color-scheme: dark) {
+.card-bg { fill: #0b1220; }
+.card-panel { fill: #111a2e; }
+.card-fg { fill: #e2e8f0; }
+.card-muted { fill: #8aa0b8; }
+.card-bar { fill: #38bdf8; }
+.card-bar-alt { fill: #22d3ee; }
+.card-spark { stroke: #38bdf8; }
+.card-sep { fill: #24344d; }
+}
+</style>
+<rect class="card-bg" x="0" y="0" width="920" height="560" rx="12" fill="#f8fafc"/>
+<rect class="card-panel" x="16" y="16" width="888" height="528" rx="10" fill="#ffffff" fill-opacity="0.6"/>
+<text class="card-fg" x="40" y="48" fill="#0f172a" font-size="22" font-weight="bold" font-family="ui-monospace, Menlo, monospace">agenttrace · usage card</text>
+<text class="card-muted" x="880" y="48" text-anchor="end" fill="#64748b" font-size="12" font-family="ui-monospace, Menlo, monospace">all</text>
+<text class="card-muted" x="40" y="70" fill="#64748b" font-size="12" font-family="ui-monospace, Menlo, monospace">3 sessions · 5 tool calls · 269,200 tokens (input+output)</text>
+<rect class="card-sep" x="40" y="86" width="840" height="1" fill="#e2e8f0"/>
+<text class="card-muted" x="40" y="118" fill="#64748b" font-size="11" letter-spacing="1" font-family="ui-monospace, Menlo, monospace">TOTAL COST</text>
+<text class="card-fg" x="40" y="148" fill="#0f172a" font-size="26" font-weight="bold" font-family="ui-monospace, Menlo, monospace">$0.8106</text>
+<text class="card-muted" x="300" y="118" fill="#64748b" font-size="11" letter-spacing="1" font-family="ui-monospace, Menlo, monospace">SESSIONS</text>
+<text class="card-fg" x="300" y="148" fill="#0f172a" font-size="26" font-weight="bold" font-family="ui-monospace, Menlo, monospace">3</text>
+<text class="card-muted" x="520" y="118" fill="#64748b" font-size="11" letter-spacing="1" font-family="ui-monospace, Menlo, monospace">TOOL CALLS</text>
+<text class="card-fg" x="520" y="148" fill="#0f172a" font-size="26" font-weight="bold" font-family="ui-monospace, Menlo, monospace">5</text>
+<text class="card-muted" x="720" y="118" fill="#64748b" font-size="11" letter-spacing="1" font-family="ui-monospace, Menlo, monospace">TOKENS IN+OUT</text>
+<text class="card-fg" x="720" y="148" fill="#0f172a" font-size="26" font-weight="bold" font-family="ui-monospace, Menlo, monospace">269,200</text>
+<text class="card-fg" x="40" y="180" fill="#0f172a" font-size="13" font-family="ui-monospace, Menlo, monospace" letter-spacing="0.5">Top models (cost)</text>
+<text class="card-muted" x="40" y="209" fill="#64748b" font-size="11" font-family="ui-monospace, Menlo, monospace">gpt-5.1</text>
+<rect class="card-bar" x="200" y="198" width="150" height="13" rx="3" fill="#2563eb"/>
+<text class="card-fg" x="356" y="209" fill="#0f172a" font-size="11" font-family="ui-monospace, Menlo, monospace">$0.7113</text>
+<text class="card-muted" x="40" y="235" fill="#64748b" font-size="11" font-family="ui-monospace, Menlo, monospace">gemini-2.5-pro</text>
+<rect class="card-bar-alt" x="200" y="224" width="12" height="13" rx="3" fill="#0ea5e9"/>
+<text class="card-fg" x="356" y="235" fill="#0f172a" font-size="11" font-family="ui-monospace, Menlo, monospace">$0.0570</text>
+<text class="card-muted" x="40" y="261" fill="#64748b" font-size="11" font-family="ui-monospace, Menlo, monospace">claude-sonnet-4-5</text>
+<rect class="card-bar" x="200" y="250" width="9" height="13" rx="3" fill="#2563eb"/>
+<text class="card-fg" x="356" y="261" fill="#0f172a" font-size="11" font-family="ui-monospace, Menlo, monospace">$0.0423</text>
+<text class="card-fg" x="480" y="180" fill="#0f172a" font-size="13" font-family="ui-monospace, Menlo, monospace" letter-spacing="0.5">Top projects (cost)</text>
+<text class="card-muted" x="480" y="209" fill="#64748b" font-size="11" font-family="ui-monospace, Menlo, monospace">unknown</text>
+<rect class="card-bar" x="640" y="198" width="150" height="13" rx="3" fill="#2563eb"/>
+<text class="card-fg" x="796" y="209" fill="#0f172a" font-size="11" font-family="ui-monospace, Menlo, monospace">$0.8106</text>
+<text class="card-fg" x="40" y="356" fill="#0f172a" font-size="13" font-family="ui-monospace, Menlo, monospace">Daily spend · last 14 days</text>
+<text class="card-muted" x="40" y="466" fill="#64748b" font-size="10" font-family="ui-monospace, Menlo, monospace">2026-04-19</text>
+<text class="card-muted" x="880" y="466" text-anchor="end" fill="#64748b" font-size="10" font-family="ui-monospace, Menlo, monospace">2026-05-02</text>
+<line class="card-sep" x1="40" y1="448.0" x2="880" y2="448.0" stroke="#e2e8f0" stroke-width="1"/>
+<polyline class="card-spark" points="40.0,448.0 104.6,448.0 169.2,448.0 233.8,448.0 298.5,448.0 363.1,448.0 427.7,448.0 492.3,448.0 556.9,448.0 621.5,448.0 686.2,448.0 750.8,448.0 815.4,448.0 880.0,392.0" fill="none" stroke="#2563eb" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<rect class="card-sep" x="40" y="488" width="840" height="1" fill="#e2e8f0"/>
+<text class="card-muted" x="40" y="512" fill="#64748b" font-size="11" font-family="ui-monospace, Menlo, monospace">window 2026-05-02T10:00:00Z → 2026-05-02T10:35:40Z · pricing LiteLLM snapshot 2026-10-04 (bundled); 55 of 1519 priced models past vendor deprecation · data confidence not assessed</text>
+<text class="card-muted" x="40" y="532" fill="#64748b" font-size="10" font-family="ui-monospace, Menlo, monospace">generated by agenttrace · static file · offline · byte-deterministic for a fixed corpus+range+theme</text>
+</svg>

@@ -303,6 +303,10 @@ fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
             &["--latest", "-f", "markdown"][..],
             "markdown and html formats require --overview",
         ),
+        (
+            &["--latest", "-f", "svg"][..],
+            "svg format requires --overview",
+        ),
     ] {
         // Same per-thread HOME/XDG sandbox as run_csv: no test in this
         // file may touch operator state, even on bail paths.
