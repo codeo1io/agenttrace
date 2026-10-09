@@ -23,7 +23,25 @@ require_json() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir"
 
-"$bin" --doctor -f json >"$out_dir/doctor.json"
+# rm-444 residual (2026-10-09, assess F5, run 9ae1358ba55a cycle 2):
+# the --doctor leg discovered agent homes under the REAL HOME and
+# persisted session-cache state (rm-367 stage a: without a pin the
+# cache lands in user_cache_dir()/agenttrace), so the leg ran unbounded
+# on the operator's corpus — assess saw it killed >240s. The leg now
+# runs under a scratch HOME with a pinned AGENTTRACE_SESSION_CACHE_DIR
+# (removed on exit), so neither the walk nor the persist can touch
+# operator state. The twin check-docs-commands.sh solved its leg's
+# wall-time by scoping the doctor corpus with -d (rm-444); that is a
+# separate lane this script does not co-edit.
+scratch_home="$(mktemp -d)"
+trap 'rm -rf "$scratch_home"' EXIT
+mkdir -p "$scratch_home/.agenttrace/sessions"
+sandbox() {
+  env HOME="$scratch_home" XDG_CONFIG_HOME="$scratch_home/.config" \
+    XDG_CACHE_HOME="$scratch_home/.cache" \
+    AGENTTRACE_SESSION_CACHE_DIR="$scratch_home/.agenttrace/sessions" "$@"
+}
+sandbox "$bin" --doctor -f json >"$out_dir/doctor.json"
 require_file "$out_dir/doctor.json"
 require_json "$out_dir/doctor.json"
 
