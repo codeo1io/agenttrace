@@ -1,0 +1,19 @@
+# rm-588 manual-drop gate — dated notes that let a previously priced model
+# leave the bundled pricing snapshot. The refresh union (update-snapshot.sh)
+# otherwise retains every key the committed bundle priced, forever, so an
+# upstream removal or rename can never silently vanish a price.
+#
+# Format: one note per line, exactly
+#   YYYY-MM-DD <exact-bundle-key> <human reason...>
+# '#' comment lines and blank lines are ignored. A note fires only when its
+# date is on or before the snapshot date being written; malformed lines
+# refuse the refresh outright (fail-closed). The key must match the bundle
+# key byte-for-byte (e.g. 'palm/chat-bison', not a normalized form).
+#
+# Keep this list SHORT and justified: each entry is a model users may still
+# be billed for. Prefer letting the union retain a stale rate over dropping
+# a price with no evidence the model is gone (a stale rate with a
+# deprecation_date still discloses; a missing entry silently falls back to
+# default pricing).
+#
+# Active drops: none.

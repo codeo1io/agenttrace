@@ -8,6 +8,30 @@
 
 ### Fixed
 
+- Pricing snapshot refreshes never drop a priced model, and the bundled
+  catalog is refreshed to 2026-10-08 (rm-588, rm-006, run fbc4581fd66b
+  cycle 1): `scripts/pricing/update-snapshot.sh` now union-merges the live
+  LiteLLM source into the committed bundle — every key the previous bundle
+  priced stays priced unless `scripts/pricing/snapshot-drops.txt` (new,
+  fail-closed: malformed lines refuse the refresh; a note fires only when
+  its date is on or before the snapshot date being written) carries a dated
+  manual-drop note; a shrink-check refuses any refresh that would fall
+  below the union floor; a vacuous or <50%-overlap live source is refused
+  instead of stamping a fresh date on stale content; the bundle write is
+  atomic (sibling `.new` + rename); the script takes no arguments
+  (`--help`/`-h` print usage, any other argument is refused non-zero) and
+  refreshes offline from a pinned capture via `LITELLM_SNAPSHOT_SRC`; every
+  run prints its added/removed/mutated census plus the standing reminder to
+  append the delta to the rm-176 roadmap row. The refresh executed through
+  the new path: 3,099 model keys @2026-10-04 → 3,130 @2026-10-08 (net +31;
+  39 rate-mutated keys = 78 field-level mutations; 2 upstream-removed keys
+  union-retained and disclosed via `_snapshot.retained_from_previous`:
+  palm/chat-bison, palm/chat-bison-001); claude-haiku-5-5 is now priced
+  exactly (0.1/0.5/0.125/0.01 per-M), closing the 30.0× disclosed-fallback
+  cost overestimate on the new default Haiku. Pinned by
+  `bundled_snapshot_prices_claude_haiku_5_5_exactly` and
+  `bundled_snapshot_union_header_stays_honest` (pricing suite 28/0).
+
 - Antigravity sessions report real usage and price the standalone model (rm-720, run
   3ec6cec08fb9 cycle 2): both antigravity lanes (trajectory + jsonl) now fold per-message
   usage blocks (input/output tokens, cache reads) and resolve the model id, priced via
