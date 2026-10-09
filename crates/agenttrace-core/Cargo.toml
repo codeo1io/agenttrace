@@ -15,6 +15,10 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+# rm-692: statfs(2) for the storage report's per-filesystem available-space
+# column. Linux-only target (host fleet); no API beyond statfs is used.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

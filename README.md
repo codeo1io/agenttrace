@@ -117,6 +117,19 @@ agenttrace
 # discloses which files were found and where each knob came from.
 agenttrace --doctor
 
+# Storage footprint, read-only (rm-692): per-provider file counts and
+# logical bytes, ten largest source files, session-cache size, and
+# available space per filesystem. Sessions are NOT parsed and SQLite
+# WAL/SHM sidecars are counted by name, never opened.
+agenttrace --storage
+agenttrace --storage -f json
+
+# Shell completions to stdout (rm-088); nothing is written to disk.
+agenttrace --completions
+
+# Binary identity (fleet-pinned format).
+agenttrace --version
+
 # ~/.config/agenttrace/config.toml — all keys optional:
 #   history_dir = "/data/agenttrace-history"   # where history.json lives
 #   pricing_file = "pricing-overrides.json"     # per-model price overrides
@@ -336,7 +349,18 @@ the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
 variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
 discloses the bound actually in force, which layer supplied it, and how
 many session files the last scan re-parsed from source instead of the
-cache. Cache files are written owner-only (`0600` on Unix) and
+cache. Every `-f json` report carries this coherence context in its
+`data_health` object: `cache_schema_version` is the session-cache schema
+the report was produced against (read-only disclosure of the writer
+const), and `parsed_with` is the exact binary identity the pinned
+`--version` lane prints — machine consumers can detect schema or version
+skew between two reports by comparing those fields. Read-only disk
+footprint without parsing sessions: `agenttrace --storage` (per-provider
+file counts and logical bytes, ten largest source files, session-cache
+size, available space per filesystem; SQLite WAL/SHM sidecars counted by
+name and never opened; `--storage -f json` for the machine form). Shell
+completions print to stdout with `agenttrace --completions`. Cache files
+are written owner-only (`0600` on Unix) and
 compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
 load reclaims if a crash leaves one behind (see PRIVACY.md). The command
 never fails the host — bad or empty input still
@@ -411,6 +435,8 @@ fails when the README table drifts from the binary's actual flag count
 | `--clear-cache` |  | Delete the session cache before running, forcing a full re-parse |
 | `--preserve-history` |  | Persist derived metrics to the history ledger so later `--include-history` runs can see them |
 | `--include-history` |  | Merge preserved-history sessions into the view (offline or retained-history analysis) |
+| `--storage` |  | Print a read-only storage-footprint report (per-provider file counts and logical bytes, ten largest source files, session-cache size, available space per filesystem; SQLite WAL/SHM sidecars counted by name, never opened) without parsing sessions or opening databases |
+| `--completions` |  | Print shell completion snippets (bash/zsh, sources under `scripts/completions/`) to stdout and exit; nothing is written to disk |
 | `-h, --help` |  | Print help |
 
 ## What you get

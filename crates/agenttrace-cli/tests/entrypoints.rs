@@ -2441,3 +2441,213 @@ fn waste_json_discloses_synthetic_loop_cost_basis() {
     );
     let _ = std::fs::remove_dir_all(&work);
 }
+
+#[test]
+fn json_lanes_disclose_cache_coherence_fields() {
+    // rm-504: -f json must disclose cache coherence in the data_health
+    // object: `cache_schema_version` (the session-cache schema the report
+    // was produced against — read-only const accessor, no schema bump) and
+    // `parsed_with` (the agenttrace binary version). Machine consumers
+    // need both to detect schema/version skew between reports.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--overview",
+            "--no-baseline-gate",
+            "-f",
+            "json",
+            generated_fixture("detailed-tool-steps.jsonl")
+                .to_str()
+                .expect("fixture path is valid UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        output.status.success(),
+        "overview json must succeed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("overview lane emits one json object");
+    let health = value
+        .get("data_health")
+        .expect("overview json carries a data_health object");
+    let schema_version = health
+        .get("cache_schema_version")
+        .and_then(|v| v.as_u64())
+        .expect("rm-504: data_health.cache_schema_version must be present and numeric");
+    assert!(
+        schema_version > 0,
+        "cache_schema_version must be a real schema number, got {schema_version}"
+    );
+    let parsed_with = health
+        .get("parsed_with")
+        .and_then(|v| v.as_str())
+        .expect("rm-504: data_health.parsed_with must be present and a string");
+    assert_eq!(
+        parsed_with,
+        concat!("agenttrace v", env!("CARGO_PKG_VERSION")),
+        "parsed_with must match the pinned --version identity exactly (skew detection)"
+    );
+}
+
+#[test]
+fn version_flag_prints_binary_identity() {
+    // rm-088: `agenttrace --version` prints `agenttrace {CARGO_PKG_VERSION}`
+    // to stdout and exits 0, without loading any session data.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--version")
+        .output()
+        .expect("run agenttrace CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--version must exit 0: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        concat!("agenttrace v", env!("CARGO_PKG_VERSION")),
+        "--version must print exactly the pinned binary identity (fleet 'v' format)"
+    );
+}
+
+#[test]
+fn completions_flag_prints_snippets_to_stdout() {
+    // rm-088: `agenttrace --completions` prints the shell completion
+    // snippets (checked-in under scripts/completions/) to stdout and
+    // exits 0 — the default lane stays untouched when the flag is
+    // absent. The emitted text must be non-empty and must name the
+    // binary so downstream installers can verify what they captured.
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--completions")
+        .output()
+        .expect("run agenttrace CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--completions must exit 0: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("agenttrace"),
+        "completions output must name the binary, got: {stdout}"
+    );
+    assert!(
+        stdout.len() > 200,
+        "completions output must carry real snippets, got {} bytes",
+        stdout.len()
+    );
+}
+
+#[test]
+fn completions_word_list_covers_every_documented_flag() {
+    // rm-088 no-drift pin: the snippets under scripts/completions/ are
+    // static, so nothing stops them from falling behind --help when a
+    // flag is added. Pin both directions mechanically: (a) every long
+    // flag clap defines on a --help DEFINITION line (a line whose first
+    // non-space character is `-` — backticked prose mentions never are)
+    // must appear in the bash word list, which is generated from --help;
+    // (b) every `--flag` token the completions emit must still be a real
+    // flag, so removed flags cannot linger in the snippets either.
+    let help = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--help")
+        .output()
+        .expect("run agenttrace --help");
+    assert!(help.status.success(), "--help must exit 0");
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    let defined: std::collections::BTreeSet<String> = help_text
+        .lines()
+        .map(|line| line.trim_start())
+        .filter(|line| line.starts_with('-'))
+        .flat_map(|line| line.split_whitespace())
+        .filter_map(|token| token.strip_prefix("--"))
+        .filter(|long| {
+            !long.is_empty()
+                && long
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !defined.is_empty(),
+        "--help must define long flags (found none — parser drift?)"
+    );
+
+    let completions = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--completions")
+        .output()
+        .expect("run agenttrace --completions");
+    assert!(completions.status.success(), "--completions must exit 0");
+    let out = String::from_utf8_lossy(&completions.stdout).to_string();
+
+    // (a) the bash word list (the `local opts="…"` line) carries every
+    // documented long flag — it is the mechanically generated list.
+    let opts_line = out
+        .lines()
+        .find(|line| line.trim_start().starts_with("local opts=\""))
+        .expect("bash snippet must carry its `local opts=\"…\"` word list");
+    let missing: Vec<&str> = defined
+        .iter()
+        .map(String::as_str)
+        .filter(|long| !opts_line.contains(&format!("--{long}")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "rm-088 drift: scripts/completions/agenttrace.bash word list is \
+         missing flags --help defines: {missing:?} — regenerate the word \
+         list from `agenttrace --help`"
+    );
+
+    // (b) no stale flags: every `--flag` token anywhere in the emitted
+    // snippets must still exist in --help.
+    let stale: Vec<String> = scan_long_flags(&out)
+        .into_iter()
+        .filter(|long| !defined.contains(long))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "rm-088 drift: completions emit flags --help no longer defines: \
+         {stale:?} — regenerate the snippets"
+    );
+}
+
+/// Collect maximal `--[a-z0-9-]+` tokens from `text` (the completions
+/// emit flags as space-separated words, `--flag:VALUE` zsh pairs, and
+/// comment mentions, so scan characters instead of splitting).
+fn scan_long_flags(text: &str) -> std::collections::BTreeSet<String> {
+    let mut flags = std::collections::BTreeSet::new();
+    let mut current = String::new();
+    let mut in_flag = false;
+    for ch in text.chars() {
+        if in_flag {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' {
+                current.push(ch);
+                continue;
+            }
+            if !current.is_empty() {
+                flags.insert(current.clone());
+            }
+            current.clear();
+            in_flag = false;
+        } else if ch == '-' {
+            // A candidate starts at the second consecutive dash.
+            if !current.is_empty() && current == "-" {
+                in_flag = true;
+                current.clear();
+            } else {
+                current.clear();
+                current.push(ch);
+            }
+        } else {
+            current.clear();
+        }
+    }
+    if in_flag && !current.is_empty() {
+        flags.insert(current);
+    }
+    flags
+}

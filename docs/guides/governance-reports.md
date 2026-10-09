@@ -84,6 +84,13 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
+Every `-f json` overview also carries its coherence context inside
+`data_health`: `cache_schema_version` (the session-cache schema the
+report's cache hits were written under) and `parsed_with` (the producing
+binary's name and version), so archived reports can be checked for
+schema/version skew before they are compared or replayed (rm-504 —
+these fields are disclosure only; they never gate a run).
+
 The session cache is schema 42 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were

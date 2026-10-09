@@ -139,6 +139,15 @@ pub struct DataHealth {
     /// `skipped` so "Parse coverage N/M" is true for every range
     /// (pass-8 F8-2).
     pub out_of_scope: usize,
+    /// rm-504: session-cache schema this report's coherence is measured
+    /// against (read-only disclosure of the writer const — see
+    /// `session_cache::session_cache_schema_version`).
+    pub cache_schema_version: u32,
+    /// rm-504: identity of the binary that parsed the corpus and produced
+    /// this report (`"agenttrace v{version}"` — same identity the pinned
+    /// `--version` lane prints), so machine consumers can detect version
+    /// skew between cached and fresh parses.
+    pub parsed_with: String,
     pub cache_hits: usize,
     pub unknown_sources: usize,
     pub unknown_models: usize,
@@ -941,6 +950,8 @@ fn data_health_from_parts(
         parsed,
         skipped,
         out_of_scope,
+        cache_schema_version: crate::session_cache::session_cache_schema_version(),
+        parsed_with: concat!("agenttrace v", env!("CARGO_PKG_VERSION")).to_string(),
         cache_hits,
         sqlite_read_failures,
         unknown_sources,

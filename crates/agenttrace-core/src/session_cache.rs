@@ -6,6 +6,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 42;
+
+/// Read-only disclosure of the session-cache schema the writer uses.
+///
+/// rm-504: consumed by the `-f json` cache-coherence fields
+/// (`data_health.cache_schema_version`) so machine consumers can detect
+/// schema skew. The const above stays the single source of truth and only
+/// moves via a fleet-censused bump (moving-wall rule); this accessor adds
+/// no state and no write-path change.
+pub fn session_cache_schema_version() -> u32 {
+    SESSION_CACHE_SCHEMA_VERSION as u32
+}
 // Bumped 41 -> 42 (integration of run 14954d7a, "journal truth:
 // contain hostile input, surface hidden wire", rm-880 + rm-406's
 // dated 2026-10-07 arm): Metrics gained two persisted-only fields —
