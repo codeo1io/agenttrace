@@ -177,3 +177,64 @@ fn copilot_later_checkpoint_still_ends_the_session() {
     assert_eq!(session.metrics.session_end, "2026-01-04T00:00:30Z");
     assert_eq!(session.metrics.duration_sec, 30.0);
 }
+
+/// rm-721 rider (assess 36f5 F4): the per-model credit SUM guard must
+/// refuse exactly the non-finite case — finite two-model rollups still
+/// SUM at emit (review 3e3a2198 F4: 250e6 + 100e6 nano = $0.0035, the
+/// global max must not come back), and only a sum that actually
+/// overflows to +inf drops with a `copilot_credit_nonfinite` disclosure.
+/// Each meter is finite at insert; only the SUM can go infinite —
+/// which is why the guard lives at sum time, not at the insert.
+#[test]
+fn copilot_credit_sum_refuses_only_the_nonfinite_sum() {
+    // Finite two-model rollup: the sum survives untouched.
+    let finite = [
+        r#"{"type":"session.start","timestamp":"2026-10-05T14:00:00Z","data":{"context":{"cwd":"/tmp/finite"}}}"#,
+        r#"{"type":"session.shutdown","timestamp":"2026-10-05T14:00:07Z","data":{"modelMetrics":{"gpt-5-mini":{"usage":{"inputTokens":100,"outputTokens":10},"totalNanoAiu":250000000},"claude-sonnet-4":{"usage":{"inputTokens":50,"outputTokens":5},"totalNanoAiu":100000000}}}}"#,
+    ]
+    .join("\n");
+    let session =
+        agenttrace_core::parse_raw_session("t", "session.jsonl", &finite).expect("finite parses");
+    assert_eq!(
+        session.metrics.credit_usd, 0.0035,
+        "finite per-model meters still SUM at emit — the guard must not \
+         regress the review 3e3a2198 F4 fix back to a global max"
+    );
+    assert!(
+        !session
+            .metrics
+            .disclosure_counters
+            .contains_key("copilot_credit_nonfinite"),
+        "a finite sum must not disclose: {:?}",
+        session.metrics.disclosure_counters
+    );
+
+    // Hostile meters: each finite, the sum +inf — refused and named.
+    let hostile = [
+        r#"{"type":"session.start","timestamp":"2026-10-05T14:00:00Z","data":{"context":{"cwd":"/tmp/hostile"}}}"#,
+        r#"{"type":"session.shutdown","timestamp":"2026-10-05T14:00:07Z","data":{"modelMetrics":{"gpt-5-mini":{"usage":{"inputTokens":100,"outputTokens":10},"totalNanoAiu":1.5e308},"claude-sonnet-4":{"usage":{"inputTokens":50,"outputTokens":5},"totalNanoAiu":1.5e308}}}}"#,
+    ]
+    .join("\n");
+    let session =
+        agenttrace_core::parse_raw_session("t", "session.jsonl", &hostile).expect("hostile parses");
+    assert_eq!(
+        session.metrics.credit_usd, 0.0,
+        "the poisoned sum is dropped BEFORE the insert — pre-fix the inf \
+         credit reached the report and serialized as null"
+    );
+    assert!(
+        session.metrics.credit_usd.is_finite(),
+        "never non-finite on the report"
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("copilot_credit_nonfinite"),
+        Some(&2),
+        "both refused meters are named: {:?}",
+        session.metrics.disclosure_counters
+    );
+    assert_eq!(session.metrics.tokens_input, 150, "usage still counts");
+    assert_eq!(session.metrics.tokens_output, 15);
+}

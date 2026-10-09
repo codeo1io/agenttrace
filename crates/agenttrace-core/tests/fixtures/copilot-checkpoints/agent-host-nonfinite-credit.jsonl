@@ -1,0 +1,13 @@
+{"type":"session.start","timestamp":"2026-10-05T14:00:00Z","data":{"context":{"cwd":"/tmp/agenthost"}}}
+{"type":"hook.start","timestamp":"2026-10-05T14:00:00.500Z","data":{"hookInvocationId":"h-1","hookType":"userPromptSubmitted","input":"run the audit"}}
+{"type":"hook.end","timestamp":"2026-10-05T14:00:00.600Z","data":{"hookInvocationId":"h-1","hookType":"userPromptSubmitted","success":true}}
+{"type":"user.message","timestamp":"2026-10-05T14:00:01Z","data":{"content":"run the audit"}}
+{"type":"assistant.turn_start","timestamp":"2026-10-05T14:00:02Z","data":{"turnId":"0","interactionId":"i-1"}}
+{"type":"assistant.message","timestamp":"2026-10-05T14:00:03Z","data":{"messageId":"m-1","model":"gpt-5-mini","content":"on it"}}
+{"type":"permission.requested","timestamp":"2026-10-05T14:00:03.500Z","data":{"requestId":"r-1","permissionRequest":"bash","agentMode":"default","permissionMode":"default"}}
+{"type":"permission.completed","timestamp":"2026-10-05T14:00:03.700Z","data":{"requestId":"r-1","toolCallId":"call_1","result":"granted"}}
+{"type":"tool.execution_start","timestamp":"2026-10-05T14:00:04Z","data":{"toolCallId":"call_1","toolName":"bash","arguments":"ls","turnId":"0","model":"gpt-5-mini"}}
+{"type":"tool.execution_complete","timestamp":"2026-10-05T14:00:05Z","data":{"toolCallId":"call_1","success":true,"result":"ok"}}
+{"type":"assistant.turn_end","timestamp":"2026-10-05T14:00:06Z","data":{"turnId":"0"}}
+{"type":"subagent.deselected","timestamp":"2026-10-05T14:00:06.500Z","data":{}}
+{"type":"session.shutdown","timestamp":"2026-10-05T14:00:07Z","data":{"shutdownType":"routine","totalPremiumRequests":1,"modelMetrics":{"gpt-5-mini":{"usage":{"inputTokens":120,"outputTokens":45},"totalNanoAiu":1.5e308},"claude-haiku-4.5":{"usage":{"inputTokens":30,"outputTokens":15},"totalNanoAiu":1.5e308}}}}

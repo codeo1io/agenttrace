@@ -84,7 +84,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 42 and the SQLite snapshot is schema 9; the
+The session cache is schema 43 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -215,7 +215,17 @@ its `cwd_truncation_disclosure` counter to the persisted metrics — a
 warm cache that predates the fields would keep serving sessions whose
 hidden wire and advisor split silently vanished on the cache hit — so
 cached sessions regenerate under the surfaced wire and advisor
-attribution; the SQLite snapshot to 7
+attribution, and to 43 when the hostile-value truthfulness batch made
+every parser usage fold hostile-value safe — Antigravity fold
+accumulators saturate instead of wrapping, negative token counts are
+refused at insert with alias-rescue, and a Copilot per-model credit sum
+that overflows to +inf is dropped before the report with a named
+copilot_credit_nonfinite disclosure counter instead of serializing a
+null credit (rm-831 + the rm-721 rider of run fabd9fb8cf73 cycle 2,
+landed with its review fix; landed at its base dc65644 as 35 → 36,
+re-based at integration onto the advanced ceiling as 42 → 43; the
+review proved a warm v35-era cache kept serving the wrapped-zero and
+null-credit shapes for unchanged files); the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

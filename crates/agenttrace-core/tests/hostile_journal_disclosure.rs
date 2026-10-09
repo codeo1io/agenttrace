@@ -659,3 +659,94 @@ fn unknown_usage_key_disclosure_is_bounded_and_sanitized() {
     );
     assert!(key.contains("…#"), "digest form present: {key:?}");
 }
+
+/// rm-831: hostile-value truthfulness in the antigravity usage fold
+/// (assess 36f5 F1 PoC shapes, red-first). A journal folding i64::MAX
+/// inputTokens TWICE used to WRAP to a negative total in release builds
+/// — which the read-side >0 consumers then silently zeroed, so the
+/// MORE-hostile journal reported LESS usage (ag-2gen tokens_input 0 vs
+/// ag-1gen i64::MAX). The fold now saturates per the rm-046 contract
+/// (add_usage / add_usage_value); debug builds never panic.
+#[test]
+fn antigravity_fold_saturates_instead_of_wrapping() {
+    // ag-1gen shape: ONE i64::MAX generation is already truthful and
+    // must stay so — saturation clamps the SUM, never a single value.
+    let one_gen = [
+        r#"{"step_index":0,"source":"HUMAN","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:33:40Z","content":"go"}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:33:41Z","usageStats":{"inputTokens":9223372036854775807,"outputTokens":5}}"#,
+    ]
+    .join("\n");
+    let session =
+        parse_raw_session("t", "session.jsonl", &one_gen).expect("one-generation journal parses");
+    assert_eq!(
+        session.metrics.tokens_input,
+        i64::MAX,
+        "single i64::MAX generation reports the ceiling (assess PoC baseline)"
+    );
+    assert_eq!(session.metrics.tokens_output, 5);
+
+    // ag-2gen shape: the SAME i64::MAX generation twice — plain `+=`
+    // wrapped to -2 and the >0 filter zeroed the class (tokens_input 0,
+    // the assess PoC's silent wrap). The rm-046 saturating fold keeps
+    // the ceiling.
+    let two_gen = [
+        &one_gen,
+        r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:33:42Z","usageStats":{"inputTokens":9223372036854775807,"outputTokens":5}}"#,
+    ]
+    .join("\n");
+    let session =
+        parse_raw_session("t", "session.jsonl", &two_gen).expect("two-generation journal parses");
+    assert_eq!(
+        session.metrics.tokens_input,
+        i64::MAX,
+        "two i64::MAX generations saturate at the ceiling — pre-fix this \
+         wrapped and reported tokens_input 0 (assess 36f5 F1 PoC)"
+    );
+    assert_eq!(
+        session.metrics.tokens_output, 10,
+        "the honest class still sums"
+    );
+}
+
+/// rm-831: NEGATIVE token counts are corrupt journal data, never real
+/// measurements — they used to ride the shared extractor insert
+/// unfiltered (usage_from_value_with_keys had no sign gate; the
+/// read-side >0 consumers then dropped the whole poisoned class). The
+/// insert now refuses negatives (the add_usage_value discipline),
+/// keeping zeros (rm-408's client-reported-zero population attaches
+/// through explicit zero inserts) and letting a LATER alias carrying
+/// real data win instead of being shadowed by the corrupt key.
+#[test]
+fn antigravity_negative_usage_never_poisons_a_class_total() {
+    // ag-neg PoC shape: inputTokens -4000 beside a real outputTokens 100.
+    let raw = [
+        r#"{"step_index":0,"source":"HUMAN","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:33:40Z","content":"go"}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:33:41Z","usageStats":{"inputTokens":-4000,"outputTokens":100}}"#,
+    ]
+    .join("\n");
+    let session = parse_raw_session("t", "session.jsonl", &raw).expect("negative journal parses");
+    assert_eq!(
+        session.metrics.tokens_input, 0,
+        "the negative class is refused BY CONSTRUCTION (absent), not \
+         folded-then-dropped"
+    );
+    assert_eq!(
+        session.metrics.tokens_output, 100,
+        "the honest class beside the corrupt one still counts"
+    );
+
+    // The truthfulness the sign gate buys: a corrupt negative on an
+    // EARLIER alias no longer shadows a later alias carrying real data
+    // (inputTokens precedes promptTokenCount in the input vocabulary;
+    // pre-fix this journal reported tokens_input 0).
+    let shadow = [
+        r#"{"step_index":0,"source":"HUMAN","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:33:40Z","content":"go"}"#,
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:33:41Z","usageStats":{"inputTokens":-4000,"promptTokenCount":700}}"#,
+    ]
+    .join("\n");
+    let session = parse_raw_session("t", "session.jsonl", &shadow).expect("shadow journal parses");
+    assert_eq!(
+        session.metrics.tokens_input, 700,
+        "a refused negative must not shadow a later alias with real data"
+    );
+}

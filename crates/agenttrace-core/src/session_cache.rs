@@ -5,7 +5,36 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 42;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 43;
+// Bumped 42 -> 43 (integration of run fabd9fb8cf73, rm-831 'hostile-
+// value truthfulness in parser usage folds' + the rm-721 non-finite
+// credit rider; review fix 3238a517 over implement d8b72dad, after
+// review bbe295b60d7c F1): the batch corrects derived totals for
+// UNCHANGED source files — antigravity folds saturate instead of
+// wrapping (a journal folding i64::MAX inputTokens twice reported a
+// wrapped-to-zero total), the shared usage extractor refuses NEGATIVE
+// counts at insert with alias-rescue semantics (a poisoned count could
+// neither ride the fold nor shadow a later alias carrying real data),
+// and the copilot per-model credit sum drops poisoned +inf totals
+// BEFORE the event insert with a named copilot_credit_nonfinite
+// disclosure counter — so a warm pre-batch cache keeps serving the
+// wrapped-zero totals, serialized-null credits and the absent
+// disclosure with matching size/mtime fingerprints and never re-parses
+// (proven live on the assess corpus by the review: ag-2gen
+// tokens_input 0 warm vs i64::MAX cold). The batch landed against its
+// base dc65644 at schema 35 and bumped it to 36 there; this
+// integration re-bases the bump onto the already-advanced ceiling (36
+// was the run-6aaf51aa rm-502 batch, 37 the run-bbde21568cd4 rm-754
+// batch, 38 the run-5417681937ae rm-718/rm-719/rm-716 disclosure-
+// plane batch, 39 the run-f7f81aeaf re-emission accounting batch, 40
+// the run-4c3ca863 rm-585/rm-730 honest-attribution batch, 41 the
+// run-ac14e52c rm-520/rm-521 batch, 42 the run-14954d7a rm-880/rm-406
+// journal-truth batch) per the same convention; the stewardship's
+// fence on this file (unlanded spool rm-803's serde read-path claim)
+// does not extend to the version ladder — the bump is orthogonal to
+// rm-803 and does not collide with it. Pinned red-first by
+// stale_schema_35_cache_cannot_mask_the_hostile_value_folds (the
+// stale_schema_NN family). Entries regenerate once on next scan.
 // Bumped 41 -> 42 (integration of run 14954d7a, "journal truth:
 // contain hostile input, surface hidden wire", rm-880 + rm-406's
 // dated 2026-10-07 arm): Metrics gained two persisted-only fields —
@@ -148,6 +177,7 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 42;
 // (33 was the run-91833f02 rm-616 batch, 34 was the run-73fe8e1e
 // rm-710 batch, 35 was the run-3ec6cec08fb9 rm-720/rm-721 batch)
 // per the same convention. Entries regenerate once on next scan.
+
 // Bumped 34 -> 35 (integration of run 3ec6cec08fb9, rm-720 'Agent-
 // lane usage truthfulness' + rm-721 copilot agent-host audit; review
 // fix 8a3231c6 over implement b127341f): the batch corrects

@@ -1631,6 +1631,17 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 43 (integration of run fabd9fb8cf73,
+                // rm-831/rm-721 hostile-value truthfulness —
+                // antigravity fold saturation + negative insert
+                // refusal, and the copilot credit sum's +inf guard
+                // with its named copilot_credit_nonfinite counter;
+                // warm v35-era entries kept serving wrapped-zero
+                // totals and serialized-null credits for unchanged
+                // files, review bbe295b60d7c F1, fix 3238a517;
+                // landed at its base dc65644 as the campaign's
+                // 35 -> 36 bump, re-based here onto the advanced
+                // ceiling, 42 being the journal-truth rung below);
                 // Schema 42 (integration of run 14954d7a, cycle-1
                 // "journal truth: contain hostile input, surface hidden
                 // wire" — Metrics persist `wire_metadata` (codex
