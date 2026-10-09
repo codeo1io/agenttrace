@@ -738,18 +738,23 @@ pub fn filter_sessions(
         .collect()
 }
 pub fn session_matches_time_range(session: &Session, range: TimeRange, now: DateTime<Utc>) -> bool {
-    range.since(now).is_none_or(|since| {
-        // Unknown start times stay visible (N7 unknown-time bucket);
-        // only sessions with no known activity at or after the cutoff
-        // drop out.
-        //
-        // rm-694: admission is by OVERLAP, not by session START. A
-        // session that started before the window but was still running
-        // inside it (overnight session, long-lived agent) used to be
-        // invisible to `--range today` — silently dropping its whole
-        // cost from the day it was most active in. Its last known
-        // activity now admits it; only sessions whose activity ended
-        // before the window start still drop out.
+    session_admitted_since(session, range.since(now))
+}
+
+/// rm-890: the ONE admission predicate for `--range`/`--since` on every
+/// lane — the sqlite lanes (hermes + opencode, sqlite_sessions.rs) and
+/// the file-lane retain (discovery.rs) all call this, so no lane can
+/// disagree about which sessions exist in a ranged view (the sqlite
+/// lanes used to filter by session START, silently dropping overnight
+/// sessions from every ranged report).
+///
+/// rm-694 basis: admission is by OVERLAP, not by session START. A
+/// session that started before the window but was still running inside
+/// it (overnight session, long-lived agent) counts; only sessions whose
+/// activity ended before the window start drop out. Unknown start times
+/// stay visible (N7 unknown-time bucket) — never a silent drop.
+pub fn session_admitted_since(session: &Session, since: Option<DateTime<Utc>>) -> bool {
+    since.is_none_or(|since| {
         session_last_activity(session)
             .map(|time| time >= since)
             .unwrap_or(true)

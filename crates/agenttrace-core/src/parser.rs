@@ -4305,6 +4305,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 let mut assistant_parts = Vec::new();
                 let mut reasoning_parts = Vec::new();
                 let mut tool_calls = Vec::new();
+                // rm-891: position of this tool_result within the current
+                // emission — the id-less dedup key below (resets per
+                // assistant message line).
+                let mut tool_result_ordinal = 0usize;
                 for block in message
                     .get("content")
                     .and_then(Value::as_array)
@@ -4337,13 +4341,24 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             // rm-834: within one message id a re-emission
                             // repeats the tool_result blocks it already
                             // carried — only the first copy is a distinct
-                            // result. Id-less rows keep legacy behavior.
+                            // result. rm-891: id-less rows used to collapse
+                            // every distinct result into the first — they
+                            // now key by position within the emission, so
+                            // distinct results stay distinct while a
+                            // re-emission that repeats them in order still
+                            // folds away.
                             let tool_use_id =
                                 string(block.get("tool_use_id")).unwrap_or("").to_string();
                             let message_id = string(message.get("id")).unwrap_or("");
+                            tool_result_ordinal += 1;
+                            let dedup_key = if tool_use_id.is_empty() {
+                                format!("#{tool_result_ordinal}")
+                            } else {
+                                tool_use_id.clone()
+                            };
                             if !message_id.is_empty()
                                 && !tool_results_by_message
-                                    .insert((message_id.to_string(), tool_use_id.clone()))
+                                    .insert((message_id.to_string(), dedup_key))
                             {
                                 continue;
                             }
@@ -4387,7 +4402,30 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         events.push(assistant_event);
                     } else {
                         match assistant_by_message.get_mut(message_id) {
-                            Some(index) => events[*index] = assistant_event,
+                            Some(index) => {
+                                // rm-891: the fold is keep-max for usage
+                                // but used to be last-wins for content — a
+                                // final re-emission that omits the thinking
+                                // block an earlier snapshot carried
+                                // silently deleted it (reasoning collapsed
+                                // to empty). Per-field union: an empty
+                                // field on the latest snapshot keeps the
+                                // previous non-empty one; a non-empty
+                                // field still replaces, so monotonic
+                                // growth stays byte-identical.
+                                let previous =
+                                    std::mem::replace(&mut events[*index], assistant_event);
+                                let merged = &mut events[*index];
+                                if merged.content.is_empty() {
+                                    merged.content = previous.content;
+                                }
+                                if merged.reasoning.is_empty() {
+                                    merged.reasoning = previous.reasoning;
+                                }
+                                if merged.tool_calls.is_empty() {
+                                    merged.tool_calls = previous.tool_calls;
+                                }
+                            }
                             None => {
                                 assistant_by_message.insert(message_id.to_string(), events.len());
                                 events.push(assistant_event);
