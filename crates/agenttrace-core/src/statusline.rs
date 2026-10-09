@@ -16,6 +16,7 @@
 //! stdin still prints a line, diagnostics go to stderr only, the tee is
 //! best-effort, and the process exits 0.
 
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -116,18 +117,38 @@ pub fn statusline_capture_path() -> PathBuf {
 }
 
 fn user_cache_dir() -> PathBuf {
+    resolve_user_cache_dir(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+    )
+}
+
+/// Pure resolution core for [`user_cache_dir`]: the same rules without
+/// touching process environment state, so the empty-env fallbacks are
+/// unit-testable without mutating (unsafe) globals (the
+/// `resolve_user_config_path` pattern from rm-683).
+///
+/// Review 95d74221 F2 (2026-10-07): a set-but-empty `HOME` is now
+/// treated as unset on BOTH arms — the same XDG-spec v0.8 rule the
+/// user-config guard applies. Without the guard, `HOME=` joined the
+/// RELATIVE `Library/Caches` / `.cache`, so the capture journal
+/// resolved against the CWD and a `.cache/agenttrace/statusline.jsonl`
+/// planted in the working directory was read into the budget view
+/// (live PoC: `$999.00 ... OVER by $989.00` from a planted journal).
+fn resolve_user_cache_dir(
+    home: Option<&std::ffi::OsStr>,
+    xdg_cache_home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
     if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
+        if let Some(home) = home.filter(|value| !value.is_empty()) {
+            return PathBuf::from(home).join("Library").join("Caches");
         }
     }
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() {
-            return cache;
-        }
+    if let Some(cache) = xdg_cache_home.filter(|value| !value.is_empty()) {
+        return PathBuf::from(cache);
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".cache");
+    if let Some(home) = home.filter(|value| !value.is_empty()) {
+        return PathBuf::from(home).join(".cache");
     }
     std::env::temp_dir()
 }
@@ -450,9 +471,21 @@ fn compact_statusline_capture_locked(path: &Path, keep_under: u64) -> io::Result
 /// Reads the journal, skipping malformed lines (a torn tail line from a
 /// crashed append is tolerated, matching append-only semantics).
 pub fn read_statusline_captures(path: &Path) -> Vec<CapturedStatusline> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
+    parse_statusline_captures(&read_statusline_capture_buffer(path))
+}
+
+/// The raw journal text: empty when the file is absent or unreadable,
+/// the same tolerance [`read_statusline_captures`] always had. rm-684:
+/// the budget view reads the journal exactly ONCE per invocation — the
+/// stats disclosure, the JSON arm, and the text arm all share this
+/// buffer instead of each re-reading the (up to 10 MiB) file.
+fn read_statusline_capture_buffer(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Parses already-read journal text (the torn-tail-tolerant half of
+/// [`read_statusline_captures`]).
+fn parse_statusline_captures(raw: &str) -> Vec<CapturedStatusline> {
     raw.lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
@@ -651,12 +684,27 @@ pub struct StatuslineJournalStats {
 }
 
 pub fn statusline_journal_stats(path: &Path) -> StatuslineJournalStats {
+    statusline_journal_stats_from_buffer(path, &read_statusline_capture_buffer(path))
+}
+
+/// Stats derived from an already-read journal buffer (rm-684: the
+/// budget view computes these from its single read instead of a
+/// second full read). `bytes`/`lines` describe the text that was
+/// actually read; `exists` still probes the path so an absent journal
+/// discloses itself. Review 95d74221 F7: a journal that is not valid
+/// UTF-8 decodes to an empty buffer, and reporting `bytes: 0` exactly
+/// when the journal is corrupt would hide its real footprint — an
+/// undecodable journal falls back to the on-disk metadata size so the
+/// stats keep disclosing it.
+fn statusline_journal_stats_from_buffer(path: &Path, raw: &str) -> StatuslineJournalStats {
     let exists = path.exists();
-    let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let bytes = if raw.is_empty() {
+        fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    } else {
+        raw.len() as u64
+    };
     let lines = if exists {
-        fs::read_to_string(path)
-            .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
-            .unwrap_or(0)
+        raw.lines().filter(|line| !line.trim().is_empty()).count()
     } else {
         0
     };
@@ -677,10 +725,15 @@ pub fn render_statusline_report(
     weekly_budget: Option<f64>,
 ) -> anyhow::Result<String> {
     let path = statusline_capture_path();
-    let stats = statusline_journal_stats(&path);
-    let captures = read_statusline_captures(&path);
+    // Review 95d74221 F6: ONE journal read — the same rm-684
+    // single-read pattern render_budget_view uses (stats and captures
+    // share the buffer; this used to read the journal twice
+    // back-to-back).
+    let raw = read_statusline_capture_buffer(&path);
+    let stats = statusline_journal_stats_from_buffer(&path, &raw);
+    let captures = parse_statusline_captures(&raw);
     let insights = statusline_insights(&captures);
-    let series = statusline_budget_series(&captures, 7);
+    let series = statusline_budget_series(&captures, 7, Utc::now());
     if format == "json" {
         let mut value = serde_json::json!({ "journal": stats, "insights": insights });
         if let Some(budget) = weekly_budget {
@@ -839,6 +892,7 @@ pub struct StatuslineBudgetSeries {
 pub fn statusline_budget_series(
     captures: &[CapturedStatusline],
     days: usize,
+    now: DateTime<Utc>,
 ) -> StatuslineBudgetSeries {
     use std::collections::BTreeMap;
 
@@ -874,11 +928,27 @@ pub fn statusline_budget_series(
             previous = *cumulative;
         }
     }
-    // Keep only the trailing `days` window.
-    let mut window: Vec<(String, f64)> = daily.into_iter().collect();
-    if window.len() > days {
-        window = window.split_off(window.len() - days);
-    }
+    // Keep only the trailing `days` calendar days anchored at `now`:
+    // the budget-window rider re-anchored the window on 2026-10-07.
+    // Before that, the window kept the first `days` *observed* days,
+    // so a journal with a week-old gap billed days outside the
+    // current week against the weekly budget (a corpus capturing
+    // $4/$5/$1 on the 21st/26th/6th rendered "7d total $10.00" with
+    // only $1 in the current week). Design follows upstream #306's
+    // calendar windows. ISO day strings compare lexicographically, so
+    // string bounds filter them; `days == 0` anchors the cutoff AT
+    // `now`, so today's entries are retained (a one-day window), not
+    // dropped. Review 95d74221 F8: the window is also bounded ABOVE by
+    // today — a future-dated capture (clock skew, a hostile journal)
+    // no longer bills into "the last 7 days".
+    let cutoff = (now.date_naive() - Duration::days(days.saturating_sub(1) as i64))
+        .format("%Y-%m-%d")
+        .to_string();
+    let today = now.date_naive().format("%Y-%m-%d").to_string();
+    let window: Vec<(String, f64)> = daily
+        .into_iter()
+        .filter(|(day, _)| day.as_str() >= cutoff.as_str() && day.as_str() <= today.as_str())
+        .collect();
     // Review 5b9a9470 F4: an empty window's f64 reduction is lowered
     // by LLVM to the additive identity -0.0 in optimized builds, which
     // rendered as "$-0.00" at both budget display sites (the fresh-
@@ -900,9 +970,15 @@ pub fn statusline_budget_series(
 /// `--statusline-report` budget keys.
 pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::Result<String> {
     let path = statusline_capture_path();
-    let stats = statusline_journal_stats(&path);
-    let captures = read_statusline_captures(&path);
-    let series = statusline_budget_series(&captures, 7);
+    // rm-684: ONE journal read per invocation — the stats disclosure,
+    // the JSON arm, and the text arm all share this buffer
+    // (previously the journal was read three times per invocation:
+    // once for stats, once for captures, and a second capture read in
+    // the text arm).
+    let raw = read_statusline_capture_buffer(&path);
+    let stats = statusline_journal_stats_from_buffer(&path, &raw);
+    let captures = parse_statusline_captures(&raw);
+    let series = statusline_budget_series(&captures, 7, Utc::now());
     if format == "json" {
         let mut value = serde_json::json!({
             "journal": stats,
@@ -929,8 +1005,6 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             path.display()
         ));
     }
-    let captures = read_statusline_captures(&path);
-    let series = statusline_budget_series(&captures, 7);
     let mut out = String::from("Weekly budget — last 7 days (statusline journal)\n");
     for (day, spend) in &series.daily {
         out.push_str(&format!("  {day}  ${spend:.2}\n"));
@@ -984,7 +1058,7 @@ mod tests {
         // "$-0.00" for every fresh install (no cost samples). The sum
         // site normalizes with `+ 0.0`; this pins the sign bit so no
         // future change reintroduces negative zero.
-        let series = statusline_budget_series(&[], 7);
+        let series = statusline_budget_series(&[], 7, Utc::now());
         assert_eq!(series.total.to_bits(), 0.0f64.to_bits(), "{series:?}");
         assert!(series.daily.is_empty());
     }
@@ -1032,32 +1106,93 @@ mod tests {
     }
 
     #[test]
-    fn budget_series_rises_per_day_and_windows_to_seven_days() {
-        // Day 1: session A burns 0 -> 2.00; day 2: A continues to 3.50
-        // while B starts fresh at 1.00 (epoch reset contributes only
-        // itself). Days 3..10: A restarts its counter and burns 0.25
-        // per day (cumulative 0.25, 0.50, ...) — a reset that never
-        // rises again burns nothing.
-        let day = |n: i64| n * 86_400;
+    fn budget_series_rises_per_day_and_windows_to_the_calendar_week() {
+        // Day -10: session A burns 0 -> 2.00; day -9: A continues to
+        // 3.50 while B starts fresh at 1.00 (epoch reset contributes
+        // only itself). Days -8..-1: A restarts its counter and burns
+        // 0.25 per day (cumulative 0.25, 0.50, ...) — a reset that
+        // never rises again burns nothing. The window is the seven
+        // CALENDAR days ending at `now`: with `now` pinned, days
+        // -6..-1 are inside and everything older falls OUT of the
+        // weekly budget instead of hiding inside an observed-days gap
+        // (the 2026-10-07 budget-window rider: the window used to keep
+        // the first seven *observed* days, so week-old spend still
+        // counted against the current weekly budget).
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
+        let base = now.timestamp();
+        let day = |n: i64| base + n * 86_400;
         let mut captures = vec![
-            budget_capture("A", day(1) + 100, 2.00),
-            budget_capture("A", day(2) + 100, 3.50),
-            budget_capture("B", day(2) + 200, 1.00),
+            budget_capture("A", day(-10) + 100, 2.00),
+            budget_capture("A", day(-9) + 100, 3.50),
+            budget_capture("B", day(-9) + 200, 1.00),
         ];
-        for n in 3..=10 {
-            captures.push(budget_capture("A", day(n), 0.25 * (n - 2) as f64));
+        for n in -8..=-1 {
+            captures.push(budget_capture("A", day(n), 0.25 * (n + 9) as f64));
         }
-        let series = statusline_budget_series(&captures, 7);
-        // Window keeps the trailing 7 days: day 3 (rise 0 after the
-        // reset) drops off, days 4..=10 burn 0.25 each.
-        assert_eq!(series.daily.len(), 7, "{:?}", series.daily);
-        assert!((series.total - 7.0 * 0.25).abs() < 1e-9, "{:?}", series);
-        // The full-journal variant still sums the early burn.
-        let full = statusline_budget_series(&captures, 30);
+        // Review 95d74221 F8: a future-dated capture (clock skew, a
+        // hostile journal) must not bill into a window — tomorrow's
+        // $99.00 stays outside both the 7-day and the full-journal
+        // sums under the today-bounded window.
+        captures.push(budget_capture("F", day(1) + 50, 99.00));
+        let series = statusline_budget_series(&captures, 7, now);
+        // Calendar week [now-6d .. now]: day -8 is a counter RESET
+        // (its 0.25 sample sits below day -9's 3.50 cumulative, so its
+        // rise is max(0, ·) = 0), and days -7..0 hold only the -7..-1
+        // tail — each burning 0.25. `now` itself has no samples, so
+        // six daily entries of 0.25.
+        assert_eq!(series.daily.len(), 6, "{:?}", series.daily);
+        assert!((series.total - 6.0 * 0.25).abs() < 1e-9, "{:?}", series);
+        // The full-journal variant still sums all the burn: day -8
+        // contributes 0 (the reset), so only the SEVEN tail days burn
+        // 0.25 — 2.00 + 1.50 + 1.00 + 7×0.25 = 6.25 (tomorrow's $99
+        // future capture excluded by the upper bound).
+        let full = statusline_budget_series(&captures, 30, now);
         assert!(
             (full.total - (2.00 + 1.50 + 1.00 + 7.0 * 0.25)).abs() < 1e-9,
             "{full:?}"
         );
+        let now_day = now.date_naive().format("%Y-%m-%d").to_string();
+        assert!(
+            series
+                .daily
+                .iter()
+                .chain(&full.daily)
+                .all(|(day, _)| day.as_str() <= now_day.as_str()),
+            "future-dated capture billed into a window: {:?}",
+            series.daily
+        );
+    }
+
+    #[test]
+    fn user_cache_dir_treats_empty_env_as_unset() {
+        // Review 95d74221 F2: `HOME=` or `XDG_CACHE_HOME=` must never
+        // yield a RELATIVE cache dir — an empty HOME used to join
+        // `.cache`/`Library/Caches` against the CWD, where a planted
+        // statusline journal loaded into the budget view (live PoC:
+        // `$999.00 ... OVER by $989.00`).
+        use std::ffi::OsStr;
+        let empty = Some(OsStr::new(""));
+        // Both empty: the temp-dir fallback — always absolute.
+        let both_empty = resolve_user_cache_dir(empty, empty);
+        assert!(both_empty.is_absolute(), "{both_empty:?}");
+        // Empty HOME with a set XDG override: the override wins.
+        assert_eq!(
+            resolve_user_cache_dir(empty, Some(OsStr::new("/xdg-cache"))),
+            PathBuf::from("/xdg-cache")
+        );
+        // Unset both: the same ladder end.
+        assert_eq!(resolve_user_cache_dir(None, None), std::env::temp_dir());
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Set HOME with an empty XDG value: the spec default
+            // `$HOME/.cache`, not the RELATIVE `.cache` the empty
+            // value used to produce.
+            assert_eq!(
+                resolve_user_cache_dir(Some(OsStr::new("/home/at-test")), empty),
+                PathBuf::from("/home/at-test").join(".cache")
+            );
+        }
     }
 
     #[test]
@@ -1071,18 +1206,21 @@ mod tests {
         // stripping it defensively anyway.
         let mut stripped = capture;
         stripped.payload.as_object_mut().map(|o| o.remove("cost"));
-        let series = statusline_budget_series(&[stripped], 7);
+        let series = statusline_budget_series(&[stripped], 7, Utc::now());
         assert_eq!(series.daily.len(), 0);
         assert_eq!(series.total, 0.0);
     }
 
     #[test]
     fn budget_view_renders_spend_budget_and_unconfigured_state() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
+        let base = now.timestamp();
         let captures = vec![
-            budget_capture("A", 1_000_000_000, 2.00),
-            budget_capture("A", 1_000_000_000 + 3_600, 3.00),
+            budget_capture("A", base, 2.00),
+            budget_capture("A", base + 3_600, 3.00),
         ];
-        let series = statusline_budget_series(&captures, 7);
+        let series = statusline_budget_series(&captures, 7, now);
         let budget = Some(10.0);
         let text = render_statusline_report_text(
             &StatuslineJournalStats {

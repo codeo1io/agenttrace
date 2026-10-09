@@ -73,6 +73,15 @@ mod tests {
         // env-steered history tests (history_file_is_owner_only and
         // run de96d4cc's legacy-fold test) are serialized against the
         // install instead of racing it for the life of the binary.
+        // INTEGRATION (2026-10-09, conflict case a075eb22, merge of run
+        // 7e00d9cbe20a): the candidate's rm-684 in-crate pin
+        // (set_is_write_once_and_rejected_writers_never_mutate_the_table)
+        // asserted the SAME order-agnostic contract and is superseded
+        // by this refinement (rm-800 provenance, env-locked); the run's
+        // fresh-process twin tests/runtime_config_first_writer.rs was
+        // dropped at this merge as superseded by
+        // tests/runtime_config_contract.rs, which stays the only `set`
+        // caller in its own target.
         let _env = crate::test_env::lock_env();
         let first = RuntimeConfigOverrides {
             history_dir: Some(PathBuf::from("/first-history")),
@@ -84,7 +93,7 @@ mod tests {
             pricing_file: None,
             session_cache_entries: Some(1),
         };
-        let _first_installed = set(first);
+        let first_installed = set(first);
         let before = get();
         let second_installed = set(second);
         let after = get();
@@ -96,5 +105,10 @@ mod tests {
             after, before,
             "a rejected writer must not alter what get() reports"
         );
+        // Provenance (case a075eb22): `first_installed` is unused
+        // beyond the write-once call above — this binary's process
+        // state decides it, and the deterministic first-writer pin
+        // lives in tests/runtime_config_contract.rs.
+        let _ = first_installed;
     }
 }

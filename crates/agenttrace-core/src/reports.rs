@@ -1576,15 +1576,26 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
 
     // rm-585 (spend-by-branch, first cut): branch values come only
     // from the claude-code gitBranch envelope; missing, detached-HEAD
-    // and other lanes share the explicit "unknown" bucket.
+    // and other lanes share the explicit "unknown" bucket. The family
+    // renders at width 40, not the by-model/by-provider 25: a branch
+    // label is a git ref the operator must be able to IDENTIFY — the
+    // rm-585 every-surface pin (by_branch_renders_on_every_surface)
+    // holds the full `feature/rm585-spend-by-branch` name against this
+    // lane, and cutting it at 25 (`feature/rm585-spend-by...`) was the
+    // one behavior rm-895's shared-family refactor never pinned (its
+    // contract is the GROUP_TAKE row cap + disclosed cut + shared
+    // comparator — width stays a per-family parameter, agent=30).
+    // text_cell still sanitizes (rm-239) and still truncates genuinely
+    // over-long refs at the 40-rune bound, so the lane stays bounded
+    // and control-byte-safe.
     out.push_str("  ── By Branch ──\n");
-    push_text_group_family(&mut out, &overview.by_branch, 25, |name| name.clone());
+    push_text_group_family(&mut out, &overview.by_branch, 40, |name| name.clone());
 
     out.push_str("  ── By Task Type ──\n");
     for (task_type, group) in &overview.by_task_type {
         out.push_str(&format!(
             "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
-            task_type,
+            text_cell(task_type, 15),
             format_count(group.sessions),
             format_cost(group.cost),
             format_tokens(group.tokens_input),
@@ -3258,6 +3269,17 @@ fn sorted_model_groups(groups: &BTreeMap<String, GroupOverview>) -> Vec<(String,
 
 /// rm-895: one row-shape for every by_* family on the text surface —
 /// shared sort, shared cap, explicit disclosure of the cut.
+/// rm-239 (2026-10-09, integration case a075eb22): the row label routes
+/// through `text_cell` at the family width — the composition point of
+/// run 7e00d9cbe20a review fix 95d74221 F1 (per-row
+/// `text_cell(&model, 25)` / `text_cell(&provider, 25)`) onto the shared
+/// family renderer that superseded those loops: the transcript-
+/// controlled model key, the catalog-derived provider (with its
+/// "unknown" fallback) and the git-branch bucket key all render
+/// sanitized (U+FFFD substitution, rm-034/rm-540 contract) and cut to
+/// the family width, and the tool-derived agent names ride the same
+/// path for defense-in-depth. The json/md/html/csv group lanes never
+/// pass through here and stay byte-identical.
 fn push_text_group_family(
     out: &mut String,
     groups: &BTreeMap<String, GroupOverview>,
@@ -3267,7 +3289,7 @@ fn push_text_group_family(
     for (name, group) in sorted_group_overview(groups).into_iter().take(GROUP_TAKE) {
         out.push_str(&format!(
             "    {:<width$} {:>4} Sessions  {:>8}\n",
-            display_name(name),
+            text_cell(&display_name(name), width),
             format_count(group.sessions),
             format_cost(group.cost),
             width = width
@@ -3400,6 +3422,19 @@ fn text_wrapped_key_values(label: &str, values: &[String], limit: usize) -> Vec<
 }
 
 fn text_cell(value: &str, limit: usize) -> String {
+    // rm-239 (2026-10-07): text report cells route through the same
+    // terminal-control sanitizer as the statement/statusline paths
+    // (`sanitize_line_segment`, rm-034) — an OSC-52 clipboard-write or
+    // CSI cursor payload carried by a session title, model name, or
+    // MCP server name must never reach the terminal as raw escape
+    // bytes. The sanitizer SUBSTITUTES every C0/C1 control byte with
+    // U+FFFD (the rm-034/rm-540 house contract — nothing is stripped
+    // or blanked), and the whitespace squash below then folds away
+    // nothing of it; rune truncation happens after sanitization, so
+    // the `...` tail of an over-long cell is clean too. The
+    // json/md/html/csv lanes never pass through here and stay
+    // byte-identical.
+    let value = sanitize_line_segment(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
@@ -3587,6 +3622,39 @@ fn possible_cost_driver_note_strict(session: &Session) -> Option<String> {
 mod tests {
     use super::*;
     use crate::Metrics;
+
+    #[test]
+    fn text_cell_sanitizes_terminal_control_bytes_from_every_payload_class() {
+        // rm-239 (2026-10-07) regression fixture: the payload classes
+        // that reach text report lanes are session titles, model
+        // names, and MCP server names. The pinned contract is the one
+        // every render boundary already shares (rm-034 statusline,
+        // rm-540 CSV): NO raw control byte survives — ESC from
+        // OSC-52/CSI, BEL, DEL, C1 — each replaced by a visible
+        // U+FFFD marker; the printable body around them stays
+        // readable, and the OSC body left behind is inert once its
+        // introducer byte is gone.
+        let osc_52 = "\u{1b}]52;c;aGVsbG8=\u{1b}\\Evil Title";
+        let csi = "\u{1b}[2J\u{1b}[Hgemini-2.5-pro";
+        let bel = "context7\u{7}";
+        for payload in [osc_52, csi, bel] {
+            let cell = text_cell(payload, 80);
+            assert!(
+                !cell.chars().any(|c| c.is_control()),
+                "raw control byte survived in {cell:?}"
+            );
+            assert!(
+                cell.contains('\u{FFFD}'),
+                "control bytes must be visibly replaced in {cell:?}"
+            );
+        }
+        assert!(text_cell(osc_52, 80).contains("Evil Title"));
+        assert!(text_cell(csi, 80).contains("gemini-2.5-pro"));
+        assert_eq!(text_cell("plain title", 80), "plain title");
+        // Truncation still applies after sanitization.
+        let long = "x".repeat(90);
+        assert_eq!(text_cell(&long, 40).chars().count(), 40);
+    }
 
     #[test]
     fn overview_summary_totals_saturate_across_sessions() {
