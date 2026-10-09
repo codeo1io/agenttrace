@@ -2656,6 +2656,7 @@ pub(super) fn localized_level(value: &str, language: Language) -> String {
     match value {
         "critical" => "严重",
         "warning" => "警告",
+        "caution" => "注意",
         "high" => "高",
         "medium" => "中",
         "good" => "良好",

@@ -5,7 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 38;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 49;
+// Bumped 38 -> 49 (run 2a5cdb9e cycle-3 "truthful-quantities" review
+// fix dc5540ae: usage-tokens utilization numerator, occupancy risk
+// ladder, and negative-usage disclosure counters all live in cached
+// session diagnostics, so pre-fix warm caches must drop; number
+// chosen above the fleet ceiling — origin/master 45 (1c8ee8e0) and
+// in-flight siblings 46/47/48.
 // Bumped 37 -> 38 (integration of run 5417681937ae, cycle-3
 // "disclosure-plane honesty" batch, rm-718 + rm-719 + rm-716; conflict
 // case 3c573958563e417b94eeab5c307279df): kimi usage-alias counters
@@ -3129,7 +3135,11 @@ mod tests {
         // files, so a warm cache written by the pre-fix build kept
         // serving cost 0.0 / credit null forever — the fingerprints
         // still match, so nothing re-parses and the cache never
-        // self-heals (proven live on a surgically degraded v22 cache).
+        // self-heals (proven live on a surgically degraded v22 cache;
+        // the cycle-3 truthful-quantities bump 38 -> 49 rides this same
+        // convention — a warm pre-numerator cache keeps serving
+        // utilization_pct 1.44 / risk "good" with matching
+        // fingerprints, proven live by review 834a5133 F1).
         // The rm-230 convention: parser-semantics changes bump
         // SESSION_CACHE_SCHEMA_VERSION, and a stale doc must drop its
         // entries at load, never serve them — however well-formed.

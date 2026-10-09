@@ -1118,6 +1118,26 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // included, rm-541) — a new sum of untrusted counts must use
         // saturating_add, never `+=`.
         let usage_tokens = |key: &str| -> i64 { event.usage.get(key).copied().unwrap_or(0).max(0) };
+        // rm-873: negative usage is corrupt or hostile data. Keep the
+        // historic zeroing (above) but DISCLOSE every clamp so a corrupt
+        // journal is never indistinguishable from a genuine zero.
+        // Negative-handling by lane, kept in ONE place so the lanes
+        // cannot drift silently:
+        //   * claude_code / generic fold (this site): negatives reach
+        //     `event.usage` and are zeroed HERE, disclosed as
+        //     `negative_usage_zeroed:<field>` in disclosure_counters.
+        //   * qwen (parser.rs): negative input/output dropped before a
+        //     usage-bearing event is built (`if input > 0` arms).
+        //   * copilot (parser.rs): per-field `.filter(> 0)` at ingest.
+        //   * workbuddy (parser.rs): negatives zeroed at ingest.
+        for (key, value) in &event.usage {
+            if *value < 0 {
+                *metrics
+                    .disclosure_counters
+                    .entry(format!("negative_usage_zeroed:{key}"))
+                    .or_insert(0) += 1;
+            }
+        }
 
         // rm-436/rm-437: aggregate parse-time disclosure counters onto
         // the session (pi-family journals). Counters are facts about
@@ -1512,6 +1532,29 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
 
 pub fn detect_anomalies(metrics: &Metrics) -> Vec<Anomaly> {
     let mut anomalies = Vec::new();
+    // rm-873: clamped negatives are a corruption/hostile-data signal —
+    // surface them so table/JSON consumers see the clamp without having
+    // to read disclosure_counters.
+    if metrics
+        .disclosure_counters
+        .keys()
+        .any(|key| key.starts_with("negative_usage_zeroed:"))
+    {
+        let fields = metrics
+            .disclosure_counters
+            .iter()
+            .filter_map(|(key, count)| {
+                key.strip_prefix("negative_usage_zeroed:")
+                    .map(|field| format!("{field}x{count}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        anomalies.push(Anomaly {
+            kind: "negative_usage_zeroed".to_string(),
+            severity: "medium".to_string(),
+            detail: format!("negative usage values were clamped to zero ({fields})"),
+        });
+    }
     if !metrics.gaps_sec.is_empty() {
         let mut gaps = metrics.gaps_sec.clone();
         gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -2041,11 +2084,22 @@ pub(crate) use pricing::token_cost;
 pub fn fmt_duration(seconds: f64) -> String {
     if seconds < 60.0 {
         format!("{:.0}s", seconds)
-    } else if seconds < 3600.0 {
+    } else if seconds < 3597.0 {
+        // rm-872: 3597.0s is the first value whose minutes/60 would round
+        // (`.1`) up to "60.0m"; below it the historic shape is kept.
         format!("{:.1}m", seconds / 60.0)
+    } else if seconds < 3599.5 {
+        // rm-872: the last minute before the hour carries into a
+        // minutes+seconds shape so the minutes field can never display 60.
+        let minutes = (seconds / 60.0).floor() as i64;
+        let remainder = seconds - minutes as f64 * 60.0;
+        format!("{minutes}m{remainder:.1}s")
     } else {
-        let hours = (seconds / 3600.0) as i64;
-        let minutes = ((seconds as i64) % 3600) / 60;
+        // rm-872: round to whole minutes first, then carry — 3599.5s and
+        // 3600.0s both render "1h 0m" instead of "0h 59m"/"60.0m".
+        let total_minutes = (seconds / 60.0).round() as i64;
+        let hours = total_minutes / 60;
+        let minutes = total_minutes % 60;
         format!("{hours}h {minutes}m")
     }
 }
@@ -2858,6 +2912,19 @@ mod tests {
         assert_eq!(fmt_duration(40.0), "40s");
         assert_eq!(fmt_duration(90.0), "1.5m");
         assert_eq!(fmt_duration(6180.0), "1h 43m");
+    }
+
+    #[test]
+    fn fmt_duration_minutes_never_reach_sixty() {
+        // rm-872: the minutes field must never display 60, and the hour
+        // branch must carry across the 3600s boundary.
+        assert_eq!(fmt_duration(3596.9), "59.9m"); // last value still inside .1 rounding
+        assert_eq!(fmt_duration(3597.0), "59m57.0s"); // first carry value (was "60.0m")
+        assert_eq!(fmt_duration(3599.4), "59m59.4s");
+        assert_eq!(fmt_duration(3599.5), "1h 0m"); // minute-rounding takes over
+        assert_eq!(fmt_duration(3600.0), "1h 0m");
+        assert_eq!(fmt_duration(3660.0), "1h 1m");
+        assert_eq!(fmt_duration(7260.0), "2h 1m"); // whole-minute carry, no hour regression
     }
 
     #[test]

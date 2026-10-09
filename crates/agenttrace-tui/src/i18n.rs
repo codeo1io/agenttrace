@@ -200,6 +200,7 @@ pub(super) fn risk_label(risk: &str, language: Language) -> &'static str {
     match risk {
         "critical" => pick(language, "critical", "严重"),
         "warning" => pick(language, "warning", "警告"),
+        "caution" => pick(language, "caution", "注意"),
         "ok" | "normal" | "" => pick(language, "ok", "正常"),
         _ => pick(language, "unknown risk", "风险未知"),
     }

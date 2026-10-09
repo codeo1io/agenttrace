@@ -1203,6 +1203,84 @@ mod tests {
     }
 
     #[test]
+    fn context_pressure_gate_and_trends_follow_the_usage_derived_numerator() {
+        // rm-871(d): governance reacts to the vendor-MEASURED numerator,
+        // not the bytes/2 heuristic. A session reporting 800k input
+        // tokens against the 1M catalog window is ~80% occupied and must
+        // trip the context-pressure recommendation and the warning
+        // aggregate; the 40.17% assess-probe shape stays `caution` —
+        // disclosed in the totals but firing no gate (display tier).
+        let event = |input: i64, output: i64| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "id": "msg",
+                    "model": "claude-sonnet-4-5",
+                    "usage": {
+                        "input_tokens": input,
+                        "output_tokens": output
+                    }
+                }
+            })
+            .to_string()
+                + "\n"
+        };
+        let probe_event = || {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {
+                    "id": "msg",
+                    "model": "claude-sonnet-4-5",
+                    "usage": {
+                        "input_tokens": 1_000,
+                        "cache_creation_input_tokens": 500,
+                        "cache_read_input_tokens": 400_000,
+                        "output_tokens": 191
+                    }
+                }
+            })
+            .to_string()
+                + "\n"
+        };
+        let dir = std::env::temp_dir().join(format!("at-rm871-gov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let heavy_path = dir.join("heavy.jsonl");
+        std::fs::write(&heavy_path, event(800_000, 1_000)).expect("write");
+        let probe_path = dir.join("probe.jsonl");
+        std::fs::write(&probe_path, probe_event()).expect("write");
+        let heavy = crate::parse_file(&heavy_path).expect("parse heavy");
+        let probe = crate::parse_file(&probe_path).expect("parse probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for session in [&heavy, &probe] {
+            assert_eq!(
+                session.diagnostics.context_utilization.numerator_source, "usage",
+                "both corpora must be measured, not estimated"
+            );
+        }
+        assert_eq!(heavy.diagnostics.context_utilization.risk_level, "warning");
+        assert_eq!(probe.diagnostics.context_utilization.risk_level, "caution");
+
+        let items = recommendations(std::slice::from_ref(&heavy));
+        assert!(
+            items.iter().any(|item| item.category == "context"),
+            "80% occupancy from vendor usage must produce a context rec"
+        );
+        let quiet = recommendations(std::slice::from_ref(&probe));
+        assert!(
+            !quiet.iter().any(|item| item.category == "context"),
+            "caution is display-only: the gate still fires from warning up"
+        );
+
+        let trends = context_trends(&[probe, heavy]);
+        assert_eq!(trends.totals.sessions, 2);
+        assert_eq!(trends.totals.context_warning_sessions, 1);
+        assert_eq!(trends.totals.context_critical_sessions, 0);
+    }
+
+    #[test]
     fn unmatched_tool_evidence_never_outranks_measured_slow_tool_latency() {
         // rm-528: severity used to follow `unmatched > 0`, so a torn
         // tail with p95=0.0s (no latency data at all) rated P1/high
