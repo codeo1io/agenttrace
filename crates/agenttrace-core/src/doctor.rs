@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
     pub version: String,
     pub mode: String,
@@ -79,7 +79,7 @@ pub struct DoctorReport {
     pub recommendations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorStatuslineReport {
     pub path: String,
     pub exists: bool,
@@ -88,7 +88,7 @@ pub struct DoctorStatuslineReport {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorDirReport {
     pub name: String,
     pub path: String,
@@ -850,6 +850,16 @@ fn doctor_sqlite_directories(
     dirs
 }
 
+/// rm-858: POSIX single-quote a path for interpolation into a shell command
+/// the operator is told to paste. `foo bar` -> `'foo bar'`; embedded quotes
+/// are escaped with the standard `'\''` sequence (close-quote, escaped
+/// quote, reopen-quote) so the pasted command runs verbatim for paths
+/// containing spaces, quotes, or shell metacharacters; non-UTF-8 path
+/// bytes render lossily (U+FFFD) and the quoting still holds.
+fn shell_quote(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
 fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool) -> Vec<String> {
     // rm-734: name every unreadable sqlite source with a repair path.
     // Computed BEFORE the empty-corpus early return on purpose — a
@@ -865,7 +875,7 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             failure.path.display(),
             failure.source,
             failure.reason,
-            failure.path.display()
+            shell_quote(&failure.path)
         ));
     }
     if report.sessions == 0 {
@@ -1529,6 +1539,50 @@ mod tests {
             disclosures.get("unparseable_line"),
             Some(&3),
             "line_skips fold (rm-526 channel): {disclosures:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shell_quote_tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_wraps_spaces_and_escapes_embedded_quotes() {
+        assert_eq!(
+            shell_quote(std::path::Path::new("/tmp/plain/usage.v3.db")),
+            "'/tmp/plain/usage.v3.db'"
+        );
+        assert_eq!(
+            shell_quote(std::path::Path::new("/tmp/my cache/usage.v3.db")),
+            "'/tmp/my cache/usage.v3.db'"
+        );
+        assert_eq!(
+            shell_quote(std::path::Path::new("/tmp/agent's data/usage.v3.db")),
+            "'/tmp/agent'\\''s data/usage.v3.db'"
+        );
+    }
+
+    #[test]
+    fn sqlite_repair_hint_quotes_the_interpolated_path() {
+        let mut report = DoctorReport::default();
+        report
+            .sqlite_read_failures
+            .push(crate::sqlite_sessions::SqliteUnreadableDb {
+                path: std::path::PathBuf::from("/tmp/my cache/agent's data/usage.v3.db"),
+                source: "sqlite",
+                reason: String::from("file is not a database"),
+            });
+        let lines = doctor_recommendations(&report, None, false);
+        let hint = lines
+            .iter()
+            .find(|line| line.contains("sqlite3 "))
+            .expect("sqlite repair hint present");
+        assert!(
+            hint.contains(
+                "sqlite3 '/tmp/my cache/agent'\\''s data/usage.v3.db' \"pragma integrity_check;\""
+            ),
+            "rm-858: pasted repair command must quote the interpolated path: {hint}"
         );
     }
 }

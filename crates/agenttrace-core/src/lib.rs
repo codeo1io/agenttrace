@@ -28,8 +28,8 @@ pub use diagnostics::{
     attention_priority, attention_rank, fix_suggestions, inspect_first, inspect_reason,
     loop_waste_percent, needs_attention, predict_cost_anomaly, session_findings,
     ContextUtilization, CostAlert, Diagnostics, FindingEvidence, FixSuggestion, InspectFirst,
-    LargeParam, LoopCost, LoopFingerprint, SessionFinding, StuckPattern, ToolLatency, TraceStep,
-    UnusedTool,
+    LargeParam, LoopCost, LoopCostBasis, LoopFingerprint, SessionFinding, StuckPattern,
+    ToolLatency, TraceStep, UnusedTool,
 };
 pub use filters::{
     matches_numeric_filter, parse_finite_f64, parse_numeric_filter, parse_numeric_filter_i32,

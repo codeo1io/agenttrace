@@ -278,7 +278,8 @@ The waste report scores the newest matching session for cache
 efficiency, tool-call bloat, retry-loop spend, and stuck patterns. In
 JSON it carries the same verdicts the text banner does, as data (schema
 `agenttrace.waste.v1`): `waste_score` (0–100), `waste_level`,
-`total_wasted_cost`, `loop_waste_percent`, `session_cost`, `cache`
+`total_wasted_cost`, `loop_waste_percent`, `loop_cost_basis`,
+`session_cost`, `cache`
 (`rating`, `hit_rate_percent`, `cache_read_tokens`,
 `total_input_tokens`, `wasted_cost`, `suggestion`), `tool_bloat`
 (`tools_per_turn`, `bloat_score`, `bloat_level`, `top_bloat[]`),
@@ -286,6 +287,14 @@ JSON it carries the same verdicts the text banner does, as data (schema
 
 Per-tool `allocated_cost` figures share the text report's caveat: they
 are a share of the session-level estimate, not measured per-tool spend.
+
+`loop_cost_basis` is the loop-dollar honesty key (rm-857): `priced`
+when the loop figure is derived from recorded token costs, `synthetic`
+when it is a constant-derived estimate — the same contract the
+diagnostics surface lands via `LoopCost.cost_basis`. When the basis is
+`synthetic`, `summary`, `top_actions[]`, and the text views mark the
+loop portion as a synthetic estimate so no constant-derived dollar ever
+reads as a measured one.
 
 The format matrix is consistent across report actions: `-f json` is
 honored everywhere the format guard admits it (the waste report
