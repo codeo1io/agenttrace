@@ -1,0 +1,141 @@
+name: pricing-drift
+
+# Provable pricing-catalog freshness (rm-176, cycle 1, run 84c45ccd, 2026-10-05).
+#
+# Posture — the fork keeps the OFFLINE-FIRST BUNDLED catalog (byte-deterministic reports, no
+# network in the hot path) and automates freshness with a SCHEDULED PR-BUMP gate:
+#   chosen  : weekly cadence; actionable drift opens a reviewable PR that carries the drift report
+#             and the snapshot-date/model-count deltas (regeneration + const bump happen in the PR
+#             branch, never on master);
+#   rejected: ccusage-style hourly auto-push to the default branch (no unreviewed mutation of the
+#             money table on a fork) and upstream-style runtime fetch (offline-first determinism;
+#             the opt-in --update-pricing cache already covers runtime refresh);
+#   guards  : a bundled model dropping out of the keep-filter basis (removal_guard) or a
+#             PRICING_SNAPSHOT_DATE/_snapshot.date desync (assess A1) FAILS this workflow loudly —
+#             no auto-PR, a human reconciles. Catalog growth stays additive: no silent price
+#             removals.
+# Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation).
+# The drift gate's own post-regeneration verification below is the review artifact; the PR body
+# says so explicitly.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pricing-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (same pin as ci.yml/release.yml; targeted_tests: was @v4 — repo convention pins full SHAs, rm-405 discipline)
+
+      - name: Run the drift gate (keep-filter basis)
+        id: gate
+        run: |
+          set -euo pipefail
+          # ONE fetch for the whole job (gate + regenerate + verify — review fix F4): the
+          # post-regeneration verification then compares the refreshed pair against EXACTLY
+          # the catalog it was built from, so LiteLLM main moving mid-job (its automation
+          # runs hourly) can no longer fail the refreshed bundle's own gate.
+          curl -fsSL --max-time 60 "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json" -o pricing-live.json
+          rc=0
+          scripts/pricing/drift-check.sh --live pricing-live.json --json | tee drift-report.txt || rc=${PIPESTATUS[0]}
+          if [ "$rc" -eq 2 ]; then
+            echo "drift gate infra error — failing loudly"; exit 2
+          fi
+          if grep -q '"removal_guard": true' drift-report.txt; then
+            echo "::error::removal_guard SET — bundled models would drop out of the keep-filter basis. No auto-PR (additive-growth guard, rm-176); reconcile manually. See drift-report.txt"
+            exit 1
+          fi
+          if grep -q '"desync": true' drift-report.txt; then
+            echo "::error::PRICING_SNAPSHOT_DATE/_snapshot.date desync (assess A1) — the bundle and the const disagree. No auto-PR; reconcile manually. See drift-report.txt"
+            exit 1
+          fi
+          if [ "$rc" -eq 0 ]; then
+            {
+              echo "## pricing drift gate: clean"
+              echo "No actionable drift on the keep-filter basis (mode==chat AND input-or-output per-token cost>0)."
+              cat drift-report.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "mode=clean" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "## pricing drift gate: actionable drift"
+              cat drift-report.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "mode=bump" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Regenerate bundle, bump const, open PR
+        if: steps.gate.outputs.mode == 'bump'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # run-id + attempt suffix (review fix F5): a same-UTC-day re-run (cron + manual
+          # dispatch, or a re-run after a partial failure) no longer collides with its own
+          # earlier branch push — the old date-only name failed non-fast-forward.
+          branch="chore/pricing-snapshot-$(date -u +%F)-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          git checkout -b "$branch"
+
+          # Regenerate the bundle from the SAME single fetch the gate ran on
+          # (update-snapshot.sh takes the pre-fetched catalog as its argument).
+          scripts/pricing/update-snapshot.sh pricing-live.json
+
+          # Bump the const to the stamped date, then prove the pair is back in sync
+          # (same manual step update-snapshot.sh documents, done by the automation instead).
+          new_date="$(python3 -c "import json; print(json.load(open('crates/agenttrace-core/src/pricing_snapshot.json'))['_snapshot']['date'])")"
+          sed -i "s/const PRICING_SNAPSHOT_DATE: &str = \"[0-9-]*\";/const PRICING_SNAPSHOT_DATE: \&str = \"$new_date\";/" crates/agenttrace-core/src/pricing.rs
+          grep -q "PRICING_SNAPSHOT_DATE: &str = \"$new_date\"" crates/agenttrace-core/src/pricing.rs
+
+          # Post-regeneration verification: the refreshed pair must pass the gate clean
+          # (rc 0 on the keep-filter basis, desync cleared, removal guard still clear),
+          # verified against the same single fetch the bundle was regenerated from
+          # (review fix F4 — no second fetch, no TOCTOU window).
+          rc=0
+          scripts/pricing/drift-check.sh --live pricing-live.json > refresh-check.txt 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::post-regeneration verification failed (rc=$rc) — the refreshed bundle did not pass its own gate"
+            cat refresh-check.txt
+            exit 1
+          fi
+
+          git add crates/agenttrace-core/src/pricing_snapshot.json crates/agenttrace-core/src/pricing.rs
+          git commit -m "chore(pricing): refresh bundled snapshot to $new_date (pricing-drift gate)"
+
+          counts="$(grep -E 'costed-chat models' refresh-check.txt | tr -s ' ' | tr '\n' ';')"
+          {
+            echo "Automated pricing-snapshot refresh opened by the pricing-drift gate (rm-176)."
+            echo
+            echo "### Drift that triggered this refresh"
+            echo '```'
+            cat drift-report.txt
+            echo '```'
+            echo "### After regeneration (gate re-run, must be rc 0)"
+            echo '```'
+            cat refresh-check.txt
+            echo '```'
+            echo "Snapshot date: **$new_date**. $counts"
+            echo
+            echo "Note: PRs authored by the default GITHUB_TOKEN do not trigger CI workflows (GitHub limitation); the post-regeneration gate run above is the validation artifact. Removal guard and desync paths never reach this step — they fail the workflow instead."
+          } > pr-body.md
+
+          git push origin "$branch"
+          # No label flag on gh pr create (review-2 fix F1): the repo carries no 'pricing'
+          # label (verified live 2026-10-06 — only GitHub's 11 defaults), gh resolves label
+          # names BEFORE creating the PR, so the flag failed PR creation deterministically on
+          # the first bump run. Labeling would need the label created on the repo first AND an
+          # issues:write permission grant.
+          gh pr create --title "chore(pricing): refresh bundled snapshot to $new_date" \
+            --body-file pr-body.md || echo "::warning::PR creation failed (permissions?) — the branch $branch is pushed with the refreshed bundle for manual PR"
