@@ -62,6 +62,13 @@ Every invocation appends one JSON line — `{"captured_at": <unix seconds>,
 Retention is bounded at 10 MiB: past that, oldest **whole** lines are dropped
 until the journal fits half the bound, through a temp-file rename so a crash
 mid-compaction cannot truncate it. Torn or malformed lines are skipped on read.
+Reads are bounded by the same 10 MiB cap taken from the tail (rm-898): if the
+journal is larger than that when read — a runaway writer that outpaced
+compaction, or a hostile one — only the newest whole lines under the cap are
+loaded, never the whole file; the text report says so (`head truncated, N of
+M bytes unread; counts cover the retained tail only`) and the JSON report
+carries `capped_away_bytes` on the journal stats, so an over-cap journal reads
+as what it is instead of silently undercounting.
 
 ## Schema (what agenttrace reads)
 

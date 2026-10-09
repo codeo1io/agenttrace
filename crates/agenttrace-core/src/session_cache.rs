@@ -5,7 +5,53 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 44;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 46;
+// Bumped 45 -> 46 (integration landing of run 33b7b7b5, conflict
+// case 58fbbd6c — the run's rung re-based a THIRD time, and the
+// first moved by a sibling claim rather than a landed ceiling: the
+// sibling integration of run ec762a618372 (conflict case c7c07e48,
+// integration item claimed 2026-10-08T11:55Z, resolving 2026-10-09 —
+// hours before this case 58fbbd6c opened at 22:37Z) minted its own
+// 45 directly above the SAME landed ceiling 44 for its rm-760
+// usage-truth disclosure parser corrections, so two independent
+// parser-semantics bumps claimed one rung while both trees were
+// uncommitted. The lowest-rung-unique-above-the-ceiling rule plus
+// one-invalidation-either-way yields to the OLDER claimant: the
+// sibling keeps 45 and this run lands 46. The invalidation
+// semantics are unchanged from the 44 -> 45 rung below — the
+// sibling's 45 does not carry this run's corrections, so a warm
+// v45 entry written by a post-sibling build still serves (a) the
+// overstated rollout tokens_output (and zero tokens_reasoning)
+// that rm-617 removes, and (b) the empty aider session_start that
+// rm-899 resolves to the earlier DST arm. No migration can
+// reconstruct either correction from stale entries (rm-230
+// convention: parser-semantics changes that alter the served
+// report bump the schema so cached sessions regenerate). Entries
+// regenerate once on next scan.
+// Bumped 44 -> 45 (integration of run 33b7b7b5, cycle-1 "truthful
+// accounting, honest surfaces" batch, rm-617 LEAD 'codex rollout
+// reasoning breakdown' + rm-899 'aider DST-ambiguous starts'; the
+// batch minted 43 directly above its base 9c3c599's ceiling 41, then
+// re-based twice at review-fix — 44 at ed90e5ec after origin landed
+// 43 under fabd9fb8/rm-831 (2026-10-09 16:55Z), 45 at b5b9c6fc after
+// origin landed 44 under fb1addd56503 (merge b917ff7, 2026-10-09
+// 18:41:12Z, landing 03dc231) — so this integration lands the run's
+// 45 straight onto the already-advanced ceiling 44 (the very rung
+// that review-fix b5b9c6fc's moving-wall census watched origin take)
+// per the same convention, one invalidation either way: (a) the codex
+// rollout record arm stopped folding reasoning_output_tokens into
+// billed output — a warm v44 entry keeps serving the overstated
+// tokens_output (and zero tokens_reasoning) for every unchanged
+// rollout journal, exactly the double-add rm-617 removes; (b)
+// aider_time now resolves DST-ambiguous local starts with earliest()
+// instead of degrading them to an empty session_start — a warm v44
+// entry pins the pre-fix empty start for unchanged aider journals.
+// Rendering-only fixes in the same batch (rm-897 markdown formula
+// cells, rm-898 bounded statusline reads) do not touch cached
+// Metrics and ride no rung. No migration can reconstruct either
+// correction from stale entries (rm-230 convention: parser-semantics
+// changes that alter the served report bump the schema so cached
+// sessions regenerate). Entries regenerate once on next scan.
 // Bumped 43 -> 44 (integration of run fb1addd56503 "truth and bounds",
 // conflict case e0a11c511c6344f4af8cf63ae9ed485d): the batch's one
 // surviving net-new parser change on the merged tree alters reported

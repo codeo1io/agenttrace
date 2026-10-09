@@ -84,7 +84,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 44 and the SQLite snapshot is schema 9; the
+The session cache is schema 46 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -235,7 +235,17 @@ base 8991144, re-based at integration onto the advanced ceiling as
 43 → 44; the batch's copilot MAX-fold half is retired onto the landed
 rm-551 per-model fold with identical numbers, and its empty-type
 disclosure half onto the landed codex_missing_type counter, so neither
-rides the bump); the SQLite snapshot to 7
+rides the bump), and to 45 when the truthful-accounting batch stopped
+the Codex rollout `token_usage_record` arm from folding
+`reasoning_output_tokens` into billed output (it is a breakdown of
+output on the Responses wire, so it now rides its own reasoning line
+— the port of the landed rm-603 breakdown to the rollout arm, rm-617)
+and made aider's DST-ambiguous local session starts resolve
+deterministically via `earliest()` instead of degrading to an empty
+session_start (rm-899; run 33b7b7b5 cycle 1 — minted 43 above its
+base's ceiling 41, re-based twice at review-fix as origin landed 43
+(fabd9fb8) and then 44 (fb1addd56503), landing here as 45, the lowest
+rung unique above the ceiling); the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane
