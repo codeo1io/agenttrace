@@ -1009,17 +1009,22 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         // rm-595: disclosure keys route through the control-byte
         // sanitizer at render — mirror of counts_cell in reports.rs; a
         // hostile key carries no ESC/OSC sequence into doctor text.
-        out.push_str(&format!(
-            "Disclosed facts: {}\n",
-            report
-                .disclosures
-                .iter()
-                .map(|(key, count)| {
-                    format!("{}={count}", crate::parser::capped_disclosure_value(key))
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        // rm-594 residual: the same single-line bound counts_cell
+        // applies — first 40 entries plus an explicit count of what is
+        // held back (the 4.6MB cardinality PoC rendered 2.15MB here).
+        let mut parts: Vec<String> = report
+            .disclosures
+            .iter()
+            .take(crate::parser::DISCLOSURE_RENDER_ENTRY_CAP)
+            .map(|(key, count)| format!("{}={count}", crate::parser::capped_disclosure_value(key)))
+            .collect();
+        if report.disclosures.len() > crate::parser::DISCLOSURE_RENDER_ENTRY_CAP {
+            parts.push(format!(
+                "+{} more distinct keys",
+                report.disclosures.len() - crate::parser::DISCLOSURE_RENDER_ENTRY_CAP
+            ));
+        }
+        out.push_str(&format!("Disclosed facts: {}\n", parts.join(", ")));
     }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {

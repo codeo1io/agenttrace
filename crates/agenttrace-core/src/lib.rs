@@ -720,16 +720,39 @@ pub struct SearchResult {
 /// both spellings the canonical value wins and the alias value is
 /// discarded (never summed) — pinned by `disclosure_plane_honesty`'s
 /// canonical-wins pair; the discarded alias stays silent there too.
-fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
+fn usage_field_case_folded<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(value) = object.get(key) {
+        return Some(value);
+    }
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    let mut folded = String::with_capacity(key.len());
+    folded.push(first.to_ascii_uppercase());
+    folded.push_str(chars.as_str());
+    object.get(&folded)
+}
+
+pub(crate) fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
     let Some(object) = value.as_object() else {
         return Vec::new();
     };
-    let message_usage = object
-        .get("message")
-        .and_then(|message| message.get("usage"));
-    let provider_usage = object
-        .get("providerData")
-        .and_then(|data| data.get("usage"));
+    // rm-756 (run 9ab0afad assess F1): `Event` deserializes the usage
+    // field from BOTH wire spellings (`rename = "Usage", alias =
+    // "usage"`), so the probes below fold key case the same way serde
+    // folds the field — the wire spelling first, then its
+    // first-letter-capitalized twin (the same two-spelling fold the
+    // `role`/`Role` probe applies). A line carrying BOTH spellings
+    // fails Event's duplicate-field check and lands on `event_schema`,
+    // so the lowercase probe is the only block a parsed line can owe.
+    let message_usage = usage_field_case_folded(object, "message")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|message| usage_field_case_folded(message, "usage"));
+    let provider_usage = usage_field_case_folded(object, "providerData")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|data| usage_field_case_folded(data, "usage"));
     // The accounting reads usage only on `session_meta`/`meta` events
     // (`session_from_events` below): a top-level `usage` on any other
     // role's line is exactly as unread as `message.usage`, so it gets
@@ -746,7 +769,7 @@ fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
     let mut keys = Vec::new();
     // (usage value, is this the place the lane's accounting reads?)
     for (usage, consumed_location) in [
-        (object.get("usage"), meta_line),
+        (usage_field_case_folded(object, "usage"), meta_line),
         (message_usage, false),
         (provider_usage, false),
     ]
@@ -809,6 +832,51 @@ fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
     keys
 }
 
+/// rm-594 residual (run 9ab0afad assess F4): the per-KEY sanitizer
+/// ([`parser::disclosure_key`]) bounds one hostile key's length, but
+/// nothing bounded how many DISTINCT keys the wire-controlled
+/// disclosure channel could mint — a 4.6MB journal of unique `zz_*`
+/// usage keys minted 50,000 `line_skips` entries, a 2.7MB diagnostics
+/// JSON and megabyte single-line renders. Distinct wire-controlled
+/// disclosure keys are now capped per session at
+/// [`USAGE_DISCLOSURE_DISTINCT_KEY_CAP`]; once the cap is reached new
+/// distinct keys stop entering the map and every suppressed occurrence
+/// counts into [`DISCLOSURE_KEYS_CAPPED`], so the suppression itself is
+/// disclosed instead of silent.
+const USAGE_DISCLOSURE_DISTINCT_KEY_CAP: usize = 1_000;
+const DISCLOSURE_KEYS_CAPPED: &str = "disclosure_keys_capped";
+
+fn counts_toward_disclosure_cap(key: &str) -> bool {
+    key.starts_with("usage_unknown_key:")
+        || key.starts_with("usage_alias_unmapped:")
+        || key.starts_with("usage_unconsumed_location:")
+        || key.starts_with("kimi_usage_alias:")
+}
+
+/// Mint one disclosure key (with its occurrence count) into a
+/// session's skip map under the rm-594 distinct-key cap. Non-disclosure
+/// skip reasons (parse loss, schema skips) never pass through here and
+/// stay uncapped.
+pub(crate) fn mint_disclosure(
+    skips: &mut BTreeMap<String, usize>,
+    key: String,
+    occurrences: usize,
+) {
+    if skips.contains_key(&key) {
+        *skips.get_mut(&key).expect("checked contains_key") += occurrences;
+        return;
+    }
+    let distinct = skips
+        .keys()
+        .filter(|key| counts_toward_disclosure_cap(key))
+        .count();
+    if distinct >= USAGE_DISCLOSURE_DISTINCT_KEY_CAP {
+        *skips.entry(DISCLOSURE_KEYS_CAPPED.to_string()).or_insert(0) += occurrences;
+        return;
+    }
+    skips.insert(key, occurrences);
+}
+
 pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Session> {
     let mut events = Vec::new();
     let mut line_objects = Vec::new();
@@ -856,9 +924,11 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         // cannot take (unknown name, known-but-unmapped alias, or a
         // recognized key at an ignored location) used to silently
         // produce zero tokens with no health signal (PoC p4-kimi; review
-        // bd6e4a50 F1 counterexamples f4-alias/f4-loc).
+        // bd6e4a50 F1 counterexamples f4-alias/f4-loc). rm-594 residual:
+        // the mint rides the distinct-key cap so wire-controlled
+        // cardinality cannot balloon the disclosure map.
         for disclosure in unrecognized_usage_keys(&value) {
-            count_skip(&disclosure, &mut line_skips);
+            mint_disclosure(&mut line_skips, disclosure, 1);
         }
         // rm-616: computed before `value` is consumed by the strict
         // Event parse — the same key census the drop markers use.

@@ -233,11 +233,24 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some((events, usage_alias_counts)) = parse_kimi_wire_jsonl(&objs) {
             let mut session = finish(events)?;
             for (key, count) in usage_alias_counts {
-                *session
-                    .metrics
-                    .disclosure_counters
-                    .entry(format!("kimi_usage_alias:{key}"))
-                    .or_insert(0) += count;
+                // rm-719 (landed at integration after this run's
+                // base): a wire-key match is informational — the
+                // vendor's real journal keys were matched and the
+                // usage counted exactly — so the counters ride the
+                // NON-LOSS disclosure channel (`disclosure_counters`,
+                // rendered under "Disclosed facts", never degrading
+                // `data_health.confidence` as parse loss would).
+                // rm-594 residual (this run): the alias-minted keys
+                // are wire-named — they ride the same distinct-key
+                // cap as the usage disclosures through the shared
+                // mint helper (the counting semantics are unchanged
+                // below the cap; a capped occurrence counts into
+                // `disclosure_keys_capped` on the same channel).
+                crate::mint_disclosure(
+                    &mut session.metrics.disclosure_counters,
+                    format!("kimi_usage_alias:{key}"),
+                    count,
+                );
             }
             return Ok(session);
         }
@@ -262,7 +275,24 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                     event.source_tool = "generic".to_string();
                 }
             }
-            return session_from_events(name, path, events);
+            // rm-757 (run 9ab0afad assess F2): this array lane used to
+            // hand the events straight to `session_from_events`, so a
+            // top-level JSON-array journal never entered the per-line
+            // disclosure mint in `parse_jsonl_session` — every usage
+            // disclosure it owed was silently zero (PoC arr-low.jsonl:
+            // tokens fell to the text estimator with no `usage_*`
+            // entry anywhere in the JSON). Route the array's elements
+            // through the SAME case-folded classifier (rm-756) and the
+            // SAME capped mint (rm-594 residual) before returning.
+            let mut session = session_from_events(name, path, events)?;
+            if let Some(serde_json::Value::Array(elements)) = &parsed_value {
+                for element in elements {
+                    for disclosure in crate::unrecognized_usage_keys(element) {
+                        crate::mint_disclosure(&mut session.metrics.line_skips, disclosure, 1);
+                    }
+                }
+            }
+            return Ok(session);
         }
     }
     if let Some(value) = parsed_value {
@@ -2335,6 +2365,14 @@ fn fnv1a_hex(value: &str) -> String {
     }
     format!("{:012x}", hash & 0xffff_ffff_ffff)
 }
+
+/// rm-594 residual (run 9ab0afad assess F4): how many entries a
+/// single-line "Disclosed facts" render (reports.rs `counts_cell`, the
+/// doctor disclosures block) may carry before the rest is held back
+/// behind an explicit "+N more distinct keys" marker. The 4.6MB
+/// cardinality PoC rendered 50,000 entries on one 2.15MB line; corpora
+/// under the cap render byte-identical.
+pub(crate) const DISCLOSURE_RENDER_ENTRY_CAP: usize = 40;
 
 /// rm-594: sanitize first (control bytes die), then cap by chars (no
 /// partial multi-byte truncation), keeping a prefix + digest when long.
