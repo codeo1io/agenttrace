@@ -3378,6 +3378,12 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     // usage row was seen so the verdict below fires only on true
     // absence.
     let mut saw_token_count_row = false;
+    // rm-584's ordering arm (run fb1addd5, campaign-local numeral
+    // rm-585): every custom_tool_call_output's event index is buffered so
+    // failure attribution can be re-applied after the loop — outputs can
+    // precede their call line (replayed/resumed journals, PoC pocE) and the
+    // in-loop contains() check alone is order-dependent.
+    let mut custom_output_events: Vec<(String, usize)> = Vec::new();
     // A plain for-loop, not a filter-closure iterator chain: rm-542's
     // in-loop disclosure counters share `counters` with the ignorable-line
     // count, and a closure holding the mutable borrow across the whole
@@ -3762,12 +3768,18 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     }
                     "custom_tool_call_output" => {
                         let call_id = string(payload.get("call_id")).unwrap_or("").to_string();
+                        // rm-584's ordering arm: index recorded before
+                        // the push; the
+                        // post-loop re-pair below stamps failures for
+                        // EVERY buffered output — in-loop contains() was
+                        // exactly the order dependence this removes.
+                        custom_output_events.push((call_id.clone(), events.len()));
                         events.push(Event {
                             role: "tool".to_string(),
                             timestamp: ts,
-                            tool_call_id: call_id.clone(),
+                            tool_call_id: call_id,
                             content: jsonish(payload.get("output")),
-                            is_error: failed_custom_calls.contains(&call_id),
+                            is_error: false,
                             source_tool: "codex_cli".to_string(),
                             ..Event::default()
                         });
@@ -3889,6 +3901,16 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     .entry(disclosure_key("codex_unmatched_type", unknown_top_level))
                     .or_insert(0) += 1;
             }
+        }
+    }
+    // rm-584's ordering arm: re-pair custom-tool failures after the
+    // loop — an output
+    // that preceded its failed call was stamped in-loop before the
+    // status was knowable (PoC pocE: the --max-tool-fail-rate gate
+    // flipped from rc2 to rc0 on line order alone).
+    for (call_id, index) in &custom_output_events {
+        if failed_custom_calls.contains(call_id) {
+            events[*index].is_error = true;
         }
     }
     // Pair buffered usage records against compaction markers (rm-401).
@@ -7220,6 +7242,98 @@ mod tests {
         assert_eq!(
             session.metrics.provenance.tool_results, "reported_by_agent",
             "an agent-reported failure status is reported, not inferred"
+        );
+    }
+
+    #[test]
+    fn codex_custom_tool_failure_survives_output_before_call_ordering() {
+        // rm-584's ordering arm (run fb1addd5, campaign-local numeral
+        // rm-585): replayed/resumed rollouts can carry a
+        // custom_tool_call_output BEFORE its call line, and the old
+        // in-loop contains() stamp was order-dependent — the identical
+        // events flipped the --max-tool-fail-rate 0 gate from rc2 to
+        // rc0 on line order alone (assess PoC pocE vs pocE3: same
+        // events, only ordering differed). Failure attribution is now
+        // re-applied after the loop for every buffered output, so both
+        // orderings stamp the same verdict.
+        let meta = serde_json::json!({
+            "timestamp": "2026-09-26T20:00:00Z",
+            "type": "session_meta",
+            "payload": {"cwd": "/tmp/probe", "model": "gpt-5.3-codex"}
+        })
+        .to_string();
+        let call = |status: &str, call_id: &str, ts: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "status": status,
+                    "call_id": call_id,
+                    "name": "exec",
+                    "input": "echo probe"
+                }
+            })
+            .to_string()
+        };
+        let output = |call_id: &str, ts: &str| {
+            serde_json::json!({
+                "timestamp": ts,
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": [{"type": "input_text", "text": "timed out"}]
+                }
+            })
+            .to_string()
+        };
+        // The good pair arrives call-first; the failed pair arrives
+        // output-first (the out-of-order shape). Both must count
+        // identically to the ordered fixture in the rm-542 test above
+        // — only line order differs (pocE vs pocE3), so only the
+        // verdict may not.
+        let raw = [
+            meta,
+            call("completed", "call_good", "2026-09-26T20:00:01Z"),
+            output("call_good", "2026-09-26T20:00:02Z"),
+            output("call_bad", "2026-09-26T20:00:03Z"),
+            call("failed", "call_bad", "2026-09-26T20:00:04Z"),
+        ]
+        .join("\n");
+        let session = parse_raw_session("codex", "rollout.jsonl", &raw).expect("rollout parses");
+        assert_eq!(session.metrics.tool_calls_total, 2);
+        assert_eq!(session.metrics.tool_results, 2);
+        assert_eq!(session.metrics.tool_calls_fail, 1);
+        assert_eq!(session.metrics.tool_calls_ok, 1);
+        assert_eq!(
+            session.metrics.provenance.tool_results, "reported_by_agent",
+            "ordering may not change what the failure verdict reports"
+        );
+    }
+
+    #[test]
+    fn codex_rollout_discloses_lines_with_an_empty_type() {
+        // The landed rm-584's empty/missing-type arm, pinned for run
+        // fb1addd5's shapes (the run's own campaign-local rm-585
+        // spelling is superseded; integration case e0a11c51): a journal
+        // line whose top-level `type` is missing or empty used to fall to the
+        // silent `_ => {}` drop with zero counter movement — the exact
+        // invisibility rm-542 closed for NAMED unknown types. The landed
+        // `""` arm discloses both shapes as `codex_missing_type`; the
+        // run's own `codex_unmatched_type:<empty>` spelling is
+        // superseded and does not land.
+        let raw = [
+            r#"{"type":"session_meta","payload":{"cwd":"/tmp/probe","model":"gpt-5.3-codex","timestamp":"2026-09-26T20:00:00Z"}}"#.to_string(),
+            r#"{"timestamp":"2026-09-26T20:00:05Z","payload":{"note":"type key missing"}}"#.to_string(),
+            r#"{"type":"","timestamp":"2026-09-26T20:00:06Z"}"#.to_string(),
+        ]
+        .join("\n");
+        let session = parse_raw_session("codex", "rollout.jsonl", &raw).expect("rollout parses");
+        assert_eq!(
+            session.metrics.line_skips.get("codex_missing_type"),
+            Some(&2),
+            "both the missing-type and the empty-type line must be disclosed"
         );
     }
 

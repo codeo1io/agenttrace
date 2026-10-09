@@ -5,7 +5,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 43;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 44;
+// Bumped 43 -> 44 (integration of run fb1addd56503 "truth and bounds",
+// conflict case e0a11c511c6344f4af8cf63ae9ed485d): the batch's one
+// surviving net-new parser change on the merged tree alters reported
+// tool-failure attribution for UNCHANGED codex journals —
+// custom_tool_call_output events are buffered by (call_id, index) and
+// failure attribution is re-applied after the parse loop, so replays
+// and resumed rollouts whose output lines precede their call lines
+// stamp the agent-reported failure verdict identically to ordered
+// pairs (assess PoC pocE vs pocE3: the --max-tool-fail-rate 0 gate
+// flipped rc2 -> rc0 on line order alone) — tool_calls_fail changes
+// for unchanged files, and warm v43 entries still carry the
+// order-dependent verdicts with matching size/mtime fingerprints, so
+// nothing regenerates them until the schema moves. The batch's other
+// halves are superseded at this merge and do NOT ride the bump: the
+// copilot per-model MAX fold is retired onto the landed rm-551
+// replace-preserving fold (identical numbers on every pinned shape,
+// so nothing changes for unchanged copilot files), and the
+// empty/missing-type disclosure already landed as the fleet rm-584's
+// codex_missing_type counter (schema 43 ceiling). The batch's own
+// 27 -> 28 bump at its base 8991144 re-bases onto the
+// already-advanced ceiling per the same convention (28 was the rm-529
+// rung; 43 the run-fabd9fb8cf73 rm-831 batch below) — one
+// invalidation either way (rm-230: parser-semantics changes bump the
+// schema so cached sessions regenerate under corrected accounting).
+// Entries regenerate once on next scan.
 // Bumped 42 -> 43 (integration of run fabd9fb8cf73, rm-831 'hostile-
 // value truthfulness in parser usage folds' + the rm-721 non-finite
 // credit rider; review fix 3238a517 over implement d8b72dad, after

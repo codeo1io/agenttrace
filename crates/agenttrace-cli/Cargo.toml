@@ -23,3 +23,10 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# rm-583: killpg for the upstream subprocess bound — no std API sends a
+# signal to a process group, and the deadline kill must reach the whole
+# tree (grandchildren hold the pipe write-ends). Already in the lockfile
+# via crossterm; no new version enters the graph.
+libc = "0.2"

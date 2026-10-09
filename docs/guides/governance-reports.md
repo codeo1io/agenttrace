@@ -84,7 +84,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 43 and the SQLite snapshot is schema 9; the
+The session cache is schema 44 and the SQLite snapshot is schema 9; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -225,7 +225,17 @@ null credit (rm-831 + the rm-721 rider of run fabd9fb8cf73 cycle 2,
 landed with its review fix; landed at its base dc65644 as 35 → 36,
 re-based at integration onto the advanced ceiling as 42 → 43; the
 review proved a warm v35-era cache kept serving the wrapped-zero and
-null-credit shapes for unchanged files); the SQLite snapshot to 7
+null-credit shapes for unchanged files), and to 44 when Codex
+custom-tool failure attribution became order-independent — outputs are
+buffered by (call_id, index) and failure stamps re-applied after the
+parse loop, so a warm entry can no longer serve the line-order-dependent
+tool-fail verdict (the landed rm-584's ordering arm — run fb1addd5's
+campaign-local rm-585; landed 27 → 28 at the run's
+base 8991144, re-based at integration onto the advanced ceiling as
+43 → 44; the batch's copilot MAX-fold half is retired onto the landed
+rm-551 per-model fold with identical numbers, and its empty-type
+disclosure half onto the landed codex_missing_type counter, so neither
+rides the bump); the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane
