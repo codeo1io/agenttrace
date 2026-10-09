@@ -8,7 +8,6 @@ use crate::{
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
@@ -1075,63 +1074,24 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     }
 
     out.push_str("  ── By Agent ──\n");
-    for (agent, group) in overview_text_agent_groups(&overview.by_agent) {
-        out.push_str(&format!(
-            "    {:<30} {:>4} Sessions  {:>8}\n",
-            tool_display_name(&agent),
-            format_count(group.sessions),
-            format_cost(group.cost)
-        ));
-    }
-    out.push('\n');
+    push_text_group_family(&mut out, &overview.by_agent, 30, |name| {
+        tool_display_name(name)
+    });
 
     out.push_str("  ── By Model ──\n");
-    for (model, group) in overview_text_model_groups(&overview.by_model)
-        .into_iter()
-        .take(8)
-    {
-        out.push_str(&format!(
-            "    {:<25} {:>4} Sessions  {:>8}\n",
-            model,
-            format_count(group.sessions),
-            format_cost(group.cost)
-        ));
-    }
-    out.push('\n');
+    push_text_group_family(&mut out, &overview.by_model, 25, |name| name.clone());
 
     // rm-245: vendor and task-type dimensions beside by-model. Providers
     // come from the pricing catalog row that prices each model;
     // unresolvable models land in the explicit "unknown" bucket.
     out.push_str("  ── By Provider ──\n");
-    for (provider, group) in overview_text_model_groups(&overview.by_provider)
-        .into_iter()
-        .take(8)
-    {
-        out.push_str(&format!(
-            "    {:<25} {:>4} Sessions  {:>8}\n",
-            provider,
-            format_count(group.sessions),
-            format_cost(group.cost)
-        ));
-    }
-    out.push('\n');
+    push_text_group_family(&mut out, &overview.by_provider, 25, |name| name.clone());
 
     // rm-585 (spend-by-branch, first cut): branch values come only
     // from the claude-code gitBranch envelope; missing, detached-HEAD
     // and other lanes share the explicit "unknown" bucket.
     out.push_str("  ── By Branch ──\n");
-    for (branch, group) in overview_text_model_groups(&overview.by_branch)
-        .into_iter()
-        .take(8)
-    {
-        out.push_str(&format!(
-            "    {:<25} {:>4} Sessions  {:>8}\n",
-            branch,
-            format_count(group.sessions),
-            format_cost(group.cost)
-        ));
-    }
-    out.push('\n');
+    push_text_group_family(&mut out, &overview.by_branch, 25, |name| name.clone());
 
     out.push_str("  ── By Task Type ──\n");
     for (task_type, group) in &overview.by_task_type {
@@ -1270,24 +1230,42 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
 
     out.push_str("## By agent\n\n");
     out.push_str("| Agent | Sessions | Cost |\n|---|---:|---:|\n");
-    for (agent, group) in sorted_agent_groups(&overview.by_agent) {
+    for (agent, group) in sorted_group_overview(&overview.by_agent)
+        .into_iter()
+        .take(GROUP_TAKE)
+    {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
-            markdown_cell(&tool_display_name(&agent)),
+            markdown_cell(&tool_display_name(agent)),
             format_count(group.sessions),
             format_cost(group.cost)
+        ));
+    }
+    if overview.by_agent.len() > GROUP_TAKE {
+        out.push_str(&format!(
+            "*… +{} more not shown*\n",
+            overview.by_agent.len() - GROUP_TAKE
         ));
     }
 
     // rm-245: vendor and task-type dimensions beside the by-agent view.
     out.push_str("\n## By provider\n\n");
     out.push_str("| Provider | Sessions | Cost |\n|---|---:|---:|\n");
-    for (provider, group) in sorted_model_groups(&overview.by_provider) {
+    for (provider, group) in sorted_group_overview(&overview.by_provider)
+        .into_iter()
+        .take(GROUP_TAKE)
+    {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
-            markdown_cell(&provider),
+            markdown_cell(provider),
             format_count(group.sessions),
             format_cost(group.cost)
+        ));
+    }
+    if overview.by_provider.len() > GROUP_TAKE {
+        out.push_str(&format!(
+            "*… +{} more not shown*\n",
+            overview.by_provider.len() - GROUP_TAKE
         ));
     }
 
@@ -1296,12 +1274,21 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     // detached-HEAD and lanes without a branch concept.
     out.push_str("\n## By branch\n\n");
     out.push_str("| Branch | Sessions | Cost |\n|---|---:|---:|\n");
-    for (branch, group) in sorted_model_groups(&overview.by_branch) {
+    for (branch, group) in sorted_group_overview(&overview.by_branch)
+        .into_iter()
+        .take(GROUP_TAKE)
+    {
         out.push_str(&format!(
             "| {} | {} | {} |\n",
-            markdown_cell(&branch),
+            markdown_cell(branch),
             format_count(group.sessions),
             format_cost(group.cost)
+        ));
+    }
+    if overview.by_branch.len() > GROUP_TAKE {
+        out.push_str(&format!(
+            "*… +{} more not shown*\n",
+            overview.by_branch.len() - GROUP_TAKE
         ));
     }
 
@@ -1373,10 +1360,10 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     let summary = overview_summary(overview, &ordered);
     let authority = overview_authority_summary(&ordered);
     let trend = analyze_health_trend(&ordered);
-    let agents = sorted_agent_groups(&overview.by_agent);
-    let models = sorted_model_groups(&overview.by_model);
-    let providers = sorted_model_groups(&overview.by_provider);
-    let branches = sorted_model_groups(&overview.by_branch);
+    let agents = sorted_group_overview(&overview.by_agent);
+    let models = sorted_group_overview(&overview.by_model);
+    let providers = sorted_group_overview(&overview.by_provider);
+    let branches = sorted_group_overview(&overview.by_branch);
 
     let mut out = String::new();
     let mut w = |line: String| {
@@ -1521,18 +1508,18 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     w("</tbody></table></section>".to_string());
 
     w("<section><h2>By agent</h2><table><thead><tr><th>Agent</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
-    for (agent, group) in agents {
+    for (agent, group) in agents.iter().take(GROUP_TAKE) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
-            html_escape(&tool_display_name(&agent)),
+            html_escape(&tool_display_name(agent)),
             format_count(group.sessions),
             format_cost(group.cost)
         ));
     }
-    w("</tbody></table></section>".to_string());
+    w(group_section_close(overview.by_agent.len()));
 
     w("<section><h2>By model</h2><table><thead><tr><th>Model</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
-    for (model, group) in models.iter().take(12) {
+    for (model, group) in models.iter().take(GROUP_TAKE) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(model),
@@ -1540,11 +1527,11 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
             format_cost(group.cost)
         ));
     }
-    w("</tbody></table></section>".to_string());
+    w(group_section_close(overview.by_model.len()));
 
     // rm-245: vendor and task-type dimensions beside by-model.
     w("<section><h2>By provider</h2><table><thead><tr><th>Provider</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
-    for (provider, group) in providers.iter().take(12) {
+    for (provider, group) in providers.iter().take(GROUP_TAKE) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(provider),
@@ -1552,11 +1539,11 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
             format_cost(group.cost)
         ));
     }
-    w("</tbody></table></section>".to_string());
+    w(group_section_close(overview.by_provider.len()));
 
     // rm-585 (spend-by-branch, first cut).
     w("<section><h2>By branch</h2><table><thead><tr><th>Branch</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
-    for (branch, group) in branches.iter().take(12) {
+    for (branch, group) in branches.iter().take(GROUP_TAKE) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(branch),
@@ -1564,7 +1551,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
             format_cost(group.cost)
         ));
     }
-    w("</tbody></table></section>".to_string());
+    w(group_section_close(overview.by_branch.len()));
 
     w("<section><h2>By task type</h2><table><thead><tr><th>Task type</th><th class=\"num\">Sessions</th><th class=\"num\">Tokens in</th><th class=\"num\">Tokens out</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (task_type, group) in &overview.by_task_type {
@@ -2737,55 +2724,72 @@ fn build_incident_timeline(session: &Session) -> IncidentTimelineSummary {
     }
 }
 
-fn sorted_agent_groups(groups: &BTreeMap<String, GroupOverview>) -> Vec<(String, GroupOverview)> {
-    let mut items: Vec<_> = groups
-        .iter()
-        .map(|(name, group)| (name.clone(), group.clone()))
-        .collect();
-    items.sort_by(|a, b| {
-        b.1.sessions
-            .cmp(&a.1.sessions)
-            .then_with(|| b.1.cost.partial_cmp(&a.1.cost).unwrap_or(Ordering::Equal))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    items
-}
+/// rm-895: the ONE truncation policy for the overview by_* spend
+/// families (agent / model / provider / branch). Human-facing
+/// surfaces (text, html, markdown) render at most `GROUP_TAKE` groups
+/// per family — sorted with [`sorted_group_overview`] — and disclose
+/// the cut with a `+N more not shown` marker. Machine surfaces
+/// (json, csv) never truncate and carry no marker: full data is their
+/// contract. A policy change is a one-line edit here, and the golden
+/// tests in `tests/by_group_truncation_contract.rs` pin the rendered
+/// counts so surfaces can only disagree by documented policy.
+pub const GROUP_TAKE: usize = 12;
 
-fn overview_text_agent_groups(
+/// rm-895: the shared comparator for the by_* spend families —
+/// cost desc, then sessions desc, then name — so the group set that
+/// survives a [`GROUP_TAKE`] cut is identical on every surface.
+fn sorted_group_overview(
     groups: &BTreeMap<String, GroupOverview>,
-) -> Vec<(String, GroupOverview)> {
-    let mut items: Vec<_> = groups
-        .iter()
-        .map(|(name, group)| (name.clone(), group.clone()))
-        .collect();
-    items.sort_by_key(|item| Reverse(item.1.sessions));
-    items
-}
-
-fn overview_text_model_groups(
-    groups: &BTreeMap<String, GroupOverview>,
-) -> Vec<(String, GroupOverview)> {
-    let mut items: Vec<_> = groups
-        .iter()
-        .map(|(name, group)| (name.clone(), group.clone()))
-        .collect();
-    items.sort_by(|a, b| b.1.cost.partial_cmp(&a.1.cost).unwrap_or(Ordering::Equal));
-    items
-}
-
-fn sorted_model_groups(groups: &BTreeMap<String, GroupOverview>) -> Vec<(String, GroupOverview)> {
-    let mut items: Vec<_> = groups
-        .iter()
-        .map(|(name, group)| (name.clone(), group.clone()))
-        .collect();
-    items.sort_by(|a, b| {
-        b.1.cost
-            .partial_cmp(&a.1.cost)
+) -> Vec<(&String, &GroupOverview)> {
+    let mut items: Vec<_> = groups.iter().collect();
+    items.sort_by(|(name_a, a), (name_b, b)| {
+        b.cost
+            .partial_cmp(&a.cost)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| b.1.sessions.cmp(&a.1.sessions))
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| b.sessions.cmp(&a.sessions))
+            .then_with(|| name_a.cmp(name_b))
     });
     items
+}
+
+/// rm-895: one row-shape for every by_* family on the text surface —
+/// shared sort, shared cap, explicit disclosure of the cut.
+fn push_text_group_family(
+    out: &mut String,
+    groups: &BTreeMap<String, GroupOverview>,
+    width: usize,
+    display_name: impl Fn(&String) -> String,
+) {
+    for (name, group) in sorted_group_overview(groups).into_iter().take(GROUP_TAKE) {
+        out.push_str(&format!(
+            "    {:<width$} {:>4} Sessions  {:>8}\n",
+            display_name(name),
+            format_count(group.sessions),
+            format_cost(group.cost),
+            width = width
+        ));
+    }
+    if groups.len() > GROUP_TAKE {
+        out.push_str(&format!(
+            "    (+{} more not shown)\n",
+            groups.len() - GROUP_TAKE
+        ));
+    }
+    out.push('\n');
+}
+
+/// rm-895: shared close for a by_* section on the html surface —
+/// table close, then the truncation marker when the family was cut.
+fn group_section_close(total: usize) -> String {
+    let mut close = String::from("</tbody></table>");
+    if total > GROUP_TAKE {
+        close.push_str(&format!(
+            "<p class=\"truncated\">+{} more not shown</p>",
+            total - GROUP_TAKE
+        ));
+    }
+    close.push_str("</section>");
+    close
 }
 
 fn health_class(health: i32) -> &'static str {
