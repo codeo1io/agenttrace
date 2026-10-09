@@ -108,7 +108,7 @@ fn default_discovery_covers_pi_forks_and_agent_dir_variants() {
     let expected = write_pi_family_fixture(&home);
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         let discovered: HashSet<String> = files
             .iter()
             .map(|path| path.to_string_lossy().to_string())

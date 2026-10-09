@@ -588,7 +588,7 @@ fn rust_discovers_and_loads_real_jsonl_files() {
 
     let mut loaded_health = None;
     with_session_cache(&root.join("cache"), || {
-        let files = find_session_files(Some(&root));
+        let (files, _unreadable) = find_session_files(Some(&root));
         assert_eq!(files, vec![session_path.clone()]);
 
         let sessions = load_sessions_from_dir(Some(&root));
@@ -1337,7 +1337,7 @@ fn rust_skips_claude_workflow_definitions() {
     )
     .expect("write workflow");
 
-    let files = find_session_files(Some(&root.join(".claude/projects")));
+    let (files, _unreadable) = find_session_files(Some(&root.join(".claude/projects")));
     assert_eq!(files, vec![project.join("session.jsonl")]);
 
     let _ = fs::remove_dir_all(root);
@@ -1609,7 +1609,7 @@ fn rust_discovers_only_opencode_storage_session_files_like_go() {
     fs::write(&part_path, raw).expect("write opencode part file");
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert!(
             files.contains(&session_path),
             "missing session file: {files:?}"
@@ -1619,7 +1619,7 @@ fn rust_discovers_only_opencode_storage_session_files_like_go() {
             "message/part files should be skipped: {files:?}"
         );
 
-        let files = find_session_files(Some(&storage));
+        let (files, _unreadable) = find_session_files(Some(&storage));
         assert!(
             files.contains(&session_path),
             "missing session file: {files:?}"
@@ -2032,7 +2032,7 @@ Added focused parser tests.
     )
     .expect("write aider history");
 
-    let files = find_session_files(Some(&root));
+    let (files, _unreadable) = find_session_files(Some(&root));
     assert_eq!(files, vec![session_path.clone()]);
 
     let parsed = parse_file(&session_path).expect("parse aider history");
@@ -2156,7 +2156,7 @@ fn rust_discovers_pi_session_files() {
     .expect("write pi session");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(files, vec![session_path.clone()]);
 
         let sessions = load_sessions_from_dir(None);
@@ -2291,7 +2291,7 @@ fn rust_discovers_qwen_project_chat_files() {
     .expect("write qwen chat file");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(files, vec![session_path.clone()]);
 
         let sessions = load_sessions_from_dir(None);
@@ -2341,7 +2341,7 @@ fn rust_discovers_gemini_cli_tmp_chats_and_checkpoints() {
     .expect("write gemini checkpoint");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert!(
             files.contains(&chat_path),
             "chats/*.json must be discovered: {files:?}"
@@ -2407,7 +2407,7 @@ fn rust_discovers_antigravity_conversation_sidecars_but_not_the_store() {
     fs::write(conversations.join("blob.pb"), b"protobuf bytes").expect("write pb blob");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert!(
             files.contains(&sidecar),
             "trajectory sidecars must be discovered: {files:?}"
@@ -2480,7 +2480,7 @@ fn default_discovery_uses_hermes_sqlite_when_present() {
     write_hermes_state_db(&home.join(".hermes").join("state.db"));
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(files, vec![legacy_dir.join("legacy.jsonl")]);
 
         let sessions = load_sessions_from_dir(None);
@@ -2529,7 +2529,7 @@ fn default_discovery_uses_opencode_sqlite_when_present() {
     );
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(files, vec![legacy_session]);
 
         let sessions = load_sessions_from_dir(None);
@@ -2940,7 +2940,7 @@ fn symlinked_child_directories_are_discovered_and_cycles_terminate() {
         .expect("symlink parent loop");
 
     with_home(&home, || {
-        let files = find_session_files(Some(&projects));
+        let (files, _unreadable) = find_session_files(Some(&projects));
         let names: Vec<String> = files
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
@@ -2984,7 +2984,7 @@ fn symlinked_session_file_aliases_are_collected_once() {
         .expect("symlink session file alias");
 
     with_home(&home, || {
-        let files = find_session_files(Some(&projects));
+        let (files, _unreadable) = find_session_files(Some(&projects));
         assert_eq!(
             files.len(),
             1,
@@ -3012,7 +3012,7 @@ fn symlinked_session_file_aliases_across_directories_are_collected_once() {
         .expect("symlink across directories");
 
     with_home(&home, || {
-        let files = find_session_files(Some(&projects));
+        let (files, _unreadable) = find_session_files(Some(&projects));
         assert_eq!(
             files.len(),
             1,
@@ -3036,7 +3036,7 @@ fn hardlinked_session_file_aliases_are_collected_once() {
     fs::hard_link(&real, projects.join("twin.jsonl")).expect("hardlink session file alias");
 
     with_home(&home, || {
-        let files = find_session_files(Some(&projects));
+        let (files, _unreadable) = find_session_files(Some(&projects));
         assert_eq!(
             files.len(),
             1,
@@ -3064,7 +3064,7 @@ fn symlink_only_session_file_still_counts() {
         .expect("symlink to outside file");
 
     with_home(&home, || {
-        let files = find_session_files(Some(&projects));
+        let (files, _unreadable) = find_session_files(Some(&projects));
         assert_eq!(
             files.len(),
             1,
@@ -3090,9 +3090,9 @@ fn symlinked_session_file_aliases_dedup_on_the_cached_walk() {
         .expect("symlink session file alias");
 
     with_home_and_cache(&home, &cache, || {
-        let cold = find_session_files(Some(&projects));
+        let (cold, _u1) = find_session_files(Some(&projects));
         assert_eq!(cold.len(), 1, "cold cached walk dedups the alias: {cold:?}");
-        let warm = find_session_files(Some(&projects));
+        let (warm, _u2) = find_session_files(Some(&projects));
         assert_eq!(
             warm.len(),
             1,
@@ -3114,7 +3114,7 @@ fn symlinked_session_file_aliases_dedup_on_the_uncached_walk() {
     std::os::unix::fs::symlink("real.jsonl", projects.join("link.jsonl"))
         .expect("symlink session file alias");
 
-    let files = collect_session_files(&projects);
+    let (files, _unreadable) = collect_session_files(&projects);
     assert_eq!(files.len(), 1, "uncached walk dedups the alias: {files:?}");
 
     let _ = fs::remove_dir_all(root);
@@ -3142,13 +3142,13 @@ fn symlinked_child_directories_are_resolved_through_the_cached_walk() {
         .expect("symlink project dir");
 
     with_home_and_cache(&home, &cache, || {
-        let cold = find_session_files(Some(&projects));
+        let (cold, _u1) = find_session_files(Some(&projects));
         assert_eq!(
             cold.len(),
             2,
             "cold cached walk follows the symlinked child: {cold:?}"
         );
-        let warm = find_session_files(Some(&projects));
+        let (warm, _u2) = find_session_files(Some(&projects));
         assert_eq!(
             warm.len(),
             2,
@@ -3234,7 +3234,7 @@ fn cross_root_symlink_alias_counts_each_session_once() {
     .expect("symlink omp sessions to pi sessions");
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(
             files.len(),
             1,
@@ -3273,7 +3273,7 @@ fn nested_overlap_alias_counts_each_session_once() {
     .expect("symlink senpi sessions into pi sessions subtree");
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(
             files.len(),
             1,
@@ -3300,7 +3300,7 @@ fn single_root_discovery_keeps_listed_paths() {
     let file = write_rm338_pi_session(&home);
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(
             files,
             vec![file],
@@ -3338,7 +3338,7 @@ fn custom_dir_walk_skips_npm_and_package_manifests() {
         .expect("write aider history");
 
     with_session_cache(&root.join("cache"), || {
-        let files = find_session_files(Some(&root));
+        let (files, _unreadable) = find_session_files(Some(&root));
         assert!(
             files.contains(&session_path),
             "the real session must be found: {files:?}"
@@ -3378,7 +3378,7 @@ fn manifest_blocklist_leaves_auto_discovery_admission_unchanged() {
     fs::write(&session_path, SAMPLE_JSONL).expect("write pi session");
 
     with_home(&home, || {
-        let files = find_session_files(None);
+        let (files, _unreadable) = find_session_files(None);
         assert_eq!(
             files,
             vec![session_path.clone()],
@@ -3419,7 +3419,7 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
         // the live schema version and real, manifest-free listings.
         let primed = load_sessions_from_dir(Some(&root));
         assert_eq!(primed.len(), 1, "one real session parsed: {primed:?}");
-        let primed_files = find_session_files(Some(&root));
+        let (primed_files, _unreadable) = find_session_files(Some(&root));
         assert!(
             !primed_files
                 .iter()
@@ -3464,7 +3464,7 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
         assert_eq!(
             replayed.discovered, 1,
             "a warm listing written by the pre-blocklist walker must not keep offering npm manifests as session candidates (discovered {}): {:?}",
-            replayed.discovered, find_session_files(Some(&root))
+            replayed.discovered, find_session_files(Some(&root)).0
         );
         assert_eq!(
             replayed.skipped, 0,
@@ -3497,7 +3497,7 @@ fn discovery_skips_non_regular_session_files() {
         .status()
         .expect("mkfifo available");
     assert!(status.success(), "mkfifo failed");
-    let files = find_session_files(Some(&root));
+    let (files, _unreadable) = find_session_files(Some(&root));
     assert_eq!(files.len(), 1, "expected only the regular file: {files:?}");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -4093,7 +4093,7 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
             current_started.elapsed()
         );
 
-        let files = find_session_files(Some(&root));
+        let (files, _unreadable) = find_session_files(Some(&root));
         assert_eq!(files.len(), 1, "cold path unaffected: {files:?}");
     });
     let _ = std::fs::remove_dir_all(&root);

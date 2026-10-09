@@ -365,6 +365,22 @@ The overview also carries attribution dimensions over the same scope:
   come from the pricing-catalog row that prices each model — never
   from the model name's prefix — and models the catalog cannot resolve
   bucket explicitly under `unknown` instead of being dropped.
+- `by_agent`: which agent lane the spend ran through. Each session is
+  attributed to the parser that owns its transcript (claude-code,
+  codex, qwen, copilot, opencode, ...); journals no lane claims stay
+  in an explicit bucket instead of being dropped.
+- `by_model`: which model the spend went to, keyed by the catalog's
+  normalized model name. **Session counts in these buckets deliberately
+  overlap**: a session that used more than one model is counted once in
+  *each* attributed model bucket and also once in the headline
+  `multiple-models` count, so `sum(by_model.sessions)` is intentionally
+  *not* `total_sessions` — do not additively combine them in CI checks.
+  Cost and token sums remain exact (each session's spend is attributed
+  to the models that actually produced it, with no double counting of
+  cost).
+- `by_project`: which project directory the spend ran under, from the
+  journal's recorded `cwd` lineage. Sessions without a resolvable
+  project land in an explicit `unknown` bucket.
 - `by_branch`: which branch the spend ran on. The branch comes from the
   claude-code lane's `gitBranch` envelope on the session-meta event —
   the only lane that records one today — so every codex, qwen, copilot

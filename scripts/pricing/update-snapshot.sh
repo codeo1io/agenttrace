@@ -33,6 +33,18 @@ drops="scripts/pricing/snapshot-drops.txt"
 date="${SNAPSHOT_DATE:-$(date -u +%F)}"
 src="${LITELLM_SNAPSHOT_SRC:-}"
 
+# rm-934: an override date must be a real calendar date in YYYY-MM-DD
+# form, otherwise a typo embeds an unparseable date the drift lane
+# then reports forever. The regex fixes the shape; the python3 check
+# (a hard dependency of the transform below) fixes the calendar —
+# 2026-13-99 and 2023-02-29 pass the shape but are not real dates,
+# and 2024-02-29 is.
+if [[ ! "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+    || ! python3 -c 'import datetime, sys; datetime.date.fromisoformat(sys.argv[1])' "$date" >/dev/null 2>&1; then
+    echo "error: SNAPSHOT_DATE must be a real YYYY-MM-DD calendar date (got: $date)" >&2
+    exit 2
+fi
+
 usage() {
     cat <<'USAGE'
 Regenerates crates/agenttrace-core/src/pricing_snapshot.json (the vendored
@@ -81,7 +93,7 @@ if [[ -n "$src" ]]; then
     cp -- "$src" "$tmp"
     echo "refresh source: captured file $src (offline refresh)"
 else
-    curl -fsSL "$url" -o "$tmp"
+    curl -fsSL --max-time 30 --connect-timeout 10 --max-filesize $((32 * 1024 * 1024)) "$url" -o "$tmp"
     echo "refresh source: $url (live fetch)"
 fi
 
