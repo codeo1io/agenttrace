@@ -973,8 +973,13 @@ fn rust_generic_jsonl_accepts_legacy_type_events_without_role() {
     let parsed = parse_file(&session_path).expect("parse legacy generic session");
     assert_eq!(parsed.metrics.source_tool, "generic");
     assert_eq!(parsed.metrics.events_total, 2);
-    assert_eq!(parsed.metrics.user_messages, 0);
-    assert_eq!(parsed.metrics.assistant_turns, 0);
+    // rm-882 supersedes the 2026-10-06 pin (user_messages == 0,
+    // assistant_turns == 0): type-keyed conversation lines now map onto
+    // roles instead of riding the has_event_type exemption into
+    // analyze()'s `_ => {}` arm — the tolerance contract (still parses,
+    // still generic lane, still 2 events) is unchanged.
+    assert_eq!(parsed.metrics.user_messages, 1);
+    assert_eq!(parsed.metrics.assistant_turns, 1);
 
     let _ = fs::remove_dir_all(root);
 }

@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-10-07T10:00:00Z","content":"hello"}
+{"type":"assistant","timestamp":"2026-10-07T10:00:05Z","content":"hi","usage":{"input_tokens":100,"output_tokens":50}}

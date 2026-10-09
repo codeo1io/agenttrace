@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-10-07T10:00:00Z","content":"q1"}
+{"type":"system","timestamp":"2026-10-07T10:00:05Z","content":"session note","usage":{"input_tokens":40,"output_tokens":20}}

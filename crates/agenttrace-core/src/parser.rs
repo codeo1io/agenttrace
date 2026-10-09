@@ -227,8 +227,16 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     if is_oh_my_pi_jsonl(&objs) {
         return finish(parse_oh_my_pi_jsonl(path, &objs)?);
     }
-    if let Some(events) = parse_claude_code_jsonl(&objs) {
-        return finish(events);
+    if let Some((events, idless_reemission_folds)) = parse_claude_code_jsonl(&objs) {
+        let mut session = finish(events)?;
+        if idless_reemission_folds > 0 {
+            *session
+                .metrics
+                .disclosure_counters
+                .entry("claude_idless_reemission_folded".to_string())
+                .or_insert(0) += idless_reemission_folds;
+        }
+        return Ok(session);
     }
     if let Some(events) = parse_copilot_jsonl(&objs) {
         return finish(events);
@@ -3875,7 +3883,7 @@ fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage 
     .collect()
 }
 
-fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
+fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, usize)> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_claude = false;
@@ -3884,9 +3892,22 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // totals on the SAME message id. Fold re-emissions into ONE meta
     // event per id, keeping the max per token class (never the sum: a
     // 5-block stream tripled the reported output). Exact duplicates
-    // collapse to the same values; id-less messages keep the legacy
-    // behavior of counting every emission (pinned by fixture).
+    // collapse to the same values; id-less messages are discriminated by
+    // rm-880 below (see the idless_* state) instead of blind-counted.
     let mut usage_by_message: BTreeMap<String, usize> = BTreeMap::new();
+    // rm-880: streaming can also re-emit an id-less assistant row with
+    // growing usage (the class ccusage #1837/#1838 fixed upstream as
+    // "counted 2-3x when requestId absent"). usage_by_message cannot pair
+    // those rows, so consecutive id-less emissions that look like ONE
+    // response — no user line intervened, same model, every token class
+    // non-decreasing, gap <= 2s — max-fold into the same meta event and
+    // increment idless_reemission_folds; everything else keeps the
+    // legacy sum. The fold is disclosed, never silent.
+    let mut last_idless_meta: Option<usize> = None;
+    let mut last_idless_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut last_idless_model = String::new();
+    let mut user_since_last_idless = true;
+    let mut idless_reemission_folds = 0usize;
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
@@ -3905,6 +3926,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         match typ {
             "user" => {
                 saw_claude = true;
+                user_since_last_idless = true;
                 let ts = string(obj.get("timestamp")).unwrap_or("").to_string();
                 let Some(message) = obj.get("message").and_then(Value::as_object) else {
                     continue;
@@ -3925,25 +3947,65 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 }
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
                     let message_id = string(message.get("id")).unwrap_or("");
-                    match usage_by_message.get(message_id).copied() {
-                        Some(index) => {
-                            for (key, value) in usage {
-                                let slot = events[index].usage.entry(key).or_insert(0);
-                                *slot = (*slot).max(value);
+                    if message_id.is_empty() {
+                        // rm-880: id-less rows cannot ride usage_by_message;
+                        // discriminate re-emissions instead of blind-summing.
+                        let fold_index = last_idless_meta.filter(|&index| {
+                            !user_since_last_idless
+                                && model == last_idless_model
+                                && last_idless_at.zip(crate::parse_ts(&ts)).is_some_and(
+                                    |(before, now)| (now - before).num_milliseconds() <= 2000,
+                                )
+                                && usage.iter().all(|(key, value)| {
+                                    events[index]
+                                        .usage
+                                        .get(key)
+                                        .is_some_and(|seen| *value >= *seen)
+                                })
+                        });
+                        match fold_index {
+                            Some(index) => {
+                                for (key, value) in usage {
+                                    let slot = events[index].usage.entry(key).or_insert(0);
+                                    *slot = (*slot).max(value);
+                                }
+                                idless_reemission_folds += 1;
+                                last_idless_at = crate::parse_ts(&ts);
+                            }
+                            None => {
+                                last_idless_meta = Some(events.len());
+                                last_idless_model = model.clone();
+                                last_idless_at = crate::parse_ts(&ts);
+                                events.push(Event {
+                                    role: "meta".to_string(),
+                                    timestamp: ts.clone(),
+                                    usage,
+                                    model_used: model.clone(),
+                                    source_tool: "claude_code".to_string(),
+                                    ..Event::default()
+                                });
                             }
                         }
-                        None => {
-                            if !message_id.is_empty() {
-                                usage_by_message.insert(message_id.to_string(), events.len());
+                        user_since_last_idless = false;
+                    } else {
+                        match usage_by_message.get(message_id).copied() {
+                            Some(index) => {
+                                for (key, value) in usage {
+                                    let slot = events[index].usage.entry(key).or_insert(0);
+                                    *slot = (*slot).max(value);
+                                }
                             }
-                            events.push(Event {
-                                role: "meta".to_string(),
-                                timestamp: ts.clone(),
-                                usage,
-                                model_used: model.clone(),
-                                source_tool: "claude_code".to_string(),
-                                ..Event::default()
-                            });
+                            None => {
+                                usage_by_message.insert(message_id.to_string(), events.len());
+                                events.push(Event {
+                                    role: "meta".to_string(),
+                                    timestamp: ts.clone(),
+                                    usage,
+                                    model_used: model.clone(),
+                                    source_tool: "claude_code".to_string(),
+                                    ..Event::default()
+                                });
+                            }
                         }
                     }
                 }
@@ -4015,7 +4077,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         }
     }
     if saw_claude {
-        non_empty(events)
+        non_empty(events).map(|events| (events, idless_reemission_folds))
     } else {
         None
     }

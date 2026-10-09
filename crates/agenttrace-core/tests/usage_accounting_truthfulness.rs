@@ -63,12 +63,25 @@ fn claude_identical_duplicate_usage_stays_deduped() {
 
 #[test]
 fn claude_idless_usage_still_counts_every_emission() {
-    // rm-601 pinned edge: messages with no id cannot be paired across
-    // rows, so every emission keeps counting (upstream #312 keeps the same
-    // fallback). Dated pin: legacy behavior retained 2026-10-06.
+    // rm-601 pinned edge, superseded by rm-880 on 2026-10-09: the two
+    // id-less emissions in this fixture are one response re-emitted
+    // (no user line between, same model, equal usage, 0.1s gap), so they
+    // now max-fold like their with-id siblings instead of blind-summing
+    // 200/20. Emissions the rm-880 gate rejects keep the legacy sum —
+    // idless_reemission_dedup.rs pins both directions and the disclosure
+    // counter.
     let session = fixture("claude-stream-idless.jsonl");
-    assert_eq!(session.metrics.tokens_input, 200);
-    assert_eq!(session.metrics.tokens_output, 20);
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_output, 10);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("claude_idless_reemission_folded")
+            .copied()
+            .unwrap_or(0),
+        1
+    );
 }
 
 #[test]

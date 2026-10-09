@@ -804,6 +804,32 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
                 || object.contains_key("usage")
                 || object.contains_key("Usage")
         });
+        // rm-882: type-keyed conversation lines used to ride the
+        // has_event_type exemption into analyze()'s `_ => {}` arm —
+        // usage folded (generic_reported_usage scans the raw lines)
+        // while user_messages/assistant_turns stayed zero with no census
+        // row: silent classification loss. Map the conversational type
+        // keys onto roles so analyze() counts them; type-bearing lines
+        // that map to no role disclose via role_unclassified.
+        let event_type_role = value.as_object().and_then(|object| {
+            let event_type = object
+                .get("type")
+                .or_else(|| object.get("Type"))
+                .or_else(|| object.get("event"))
+                .and_then(|value| value.as_str())?;
+            match event_type.to_ascii_lowercase().as_str() {
+                "user" => Some("user".to_string()),
+                "assistant" => Some("assistant".to_string()),
+                // Review fix F1 (cycle 2): tool-shaped type keys are tool
+                // activity, not unclassifiable lines — role "tool" routes
+                // them into analyze()'s tool arm (tool_results + ok/fail)
+                // instead of minting a role_unclassified census row.
+                "tool" | "tools" | "tooluse" | "tool_use" | "toolresult" | "tool_result" => {
+                    Some("tool".to_string())
+                }
+                _ => None,
+            }
+        });
         let Ok(mut event) = serde_json::from_value::<Event>(value) else {
             count_skip("event_schema", &mut line_skips);
             if carries_model_or_usage {
@@ -811,6 +837,13 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
             }
             continue;
         };
+        if event.role.is_empty() {
+            if let Some(role) = event_type_role.clone() {
+                event.role = role;
+            } else if has_event_type {
+                count_skip("role_unclassified", &mut line_skips);
+            }
+        }
         if event.role.is_empty() && !has_event_type {
             count_skip("non_event", &mut line_skips);
             if carries_model_or_usage {
@@ -2042,7 +2075,15 @@ pub fn fmt_duration(seconds: f64) -> String {
     if seconds < 60.0 {
         format!("{:.0}s", seconds)
     } else if seconds < 3600.0 {
-        format!("{:.1}m", seconds / 60.0)
+        let minutes = seconds / 60.0;
+        if (minutes * 10.0).round() >= 600.0 {
+            // rm-883: 59.95m..60m rounds to 60.0m at one decimal — the
+            // minutes arm cannot honestly print that, so carry into the
+            // hours arm (3599.8s used to render "60.0m").
+            let hours = (minutes / 60.0).round() as i64;
+            return format!("{hours}h 0m");
+        }
+        format!("{minutes:.1}m")
     } else {
         let hours = (seconds / 3600.0) as i64;
         let minutes = ((seconds as i64) % 3600) / 60;
