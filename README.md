@@ -369,7 +369,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--baseline-max-token-delta-pct <BASELINE_MAX_TOKEN_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session token drift, in percent |
 | `--no-baseline-gate` |  | Opt out of the baseline regression gate: keep the comparison in the report but do not fail the run (exit 2) on a threshold breach (pass-7 P7-3) |
 | `--lang <en|zh>` | `en` | Report language for text and TUI surfaces: en (default) or zh |
-| `--range <RANGE>` | `all` | Time range filter for session actions: today, 7d, 30d, or all (default all; ignored by corpus-wide reports) |
+| `--range <RANGE>` | `all` | Time range filter for every report: today, 7d, 30d, or all (default all). A session counts when it had activity in the window, even one that started before it |
 | `--project <PROJECT>` | `""` | Filter sessions by project slug substring |
 | `--source <SOURCE>` | `""` | Filter sessions by source tool substring (e.g. claude-code, codex, pi) |
 | `--model-filter <MODEL_FILTER>` | `""` | Filter sessions by model name substring |

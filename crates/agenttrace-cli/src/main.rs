@@ -210,8 +210,9 @@ struct Args {
     /// Report language for text and TUI surfaces: en (default) or zh.
     #[arg(long = "lang", default_value = "en", value_name = "en|zh")]
     lang: String,
-    /// Time range filter for session actions: today, 7d, 30d, or all
-    /// (default all; ignored by corpus-wide reports).
+    /// Time range filter for every report: today, 7d, 30d, or all
+    /// (default all). A session counts when it had activity in the
+    /// window, even one that started before it.
     #[arg(long, default_value = "all")]
     range: String,
     /// Filter sessions by project slug substring.

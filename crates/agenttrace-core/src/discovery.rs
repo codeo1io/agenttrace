@@ -441,16 +441,15 @@ pub fn load_sessions_with_progress_from_cache_mode(
         // rm-502: naive-ISO starts parse through the shared lenient
         // arm (lib.rs parse_ts) exactly like ingest does, so the
         // since-filter never disagrees with --overview about which
-        // sessions exist in time. rm-694: the filter admits by OVERLAP
-        // — last known activity (session_end where known, else the
-        // leniently-parsed start) at or after the cutoff — matching
-        // insights::session_matches_time_range, so an overnight session
-        // no longer vanishes from `--range today`.
-        options.since.is_none_or(|since| {
-            crate::insights::session_last_activity(session)
-                .map(|time| time >= since)
-                .unwrap_or(true)
-        }) && matches_project_filter(session, &options.project)
+        // sessions exist in time. rm-890: admission runs through the
+        // ONE shared predicate (insights::session_admitted_since) —
+        // last known activity (session_end where known, else the
+        // leniently-parsed start) at or after the cutoff, the same
+        // basis the sqlite lanes and session_matches_time_range use,
+        // so an overnight session no longer vanishes from `--range
+        // today` on any lane.
+        crate::insights::session_admitted_since(session, options.since)
+            && matches_project_filter(session, &options.project)
             && matches_filter(&session.metrics.source_tool, &options.source)
             && matches_filter(&session.metrics.model_used, &options.model)
     });

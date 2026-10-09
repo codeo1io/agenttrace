@@ -553,19 +553,15 @@ fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Ses
         .collect()
 }
 
-/// A session whose start time is unknown (empty or unparseable) stays in
-/// the unknown-time bucket instead of being silently dropped from every
-/// time-ranged view (N7); only sessions with a known start before the
-/// cutoff are filtered out.
+/// rm-890: admission delegates to the ONE shared predicate
+/// (insights::session_admitted_since, the rm-694 overlap basis) — a
+/// session counts when it had activity at or after the cutoff, so an
+/// overnight session (started before the window, last activity inside
+/// it) stays visible, matching the file lanes and the TUI. A session
+/// with unknown time (empty or unparseable) stays in the unknown-time
+/// bucket instead of being silently dropped (N7).
 fn session_within_since(session: &Session, since: Option<DateTime<Utc>>) -> bool {
-    // rm-502: the shared lenient arm (lib.rs parse_ts) keeps this
-    // filter in agreement with ingest — naive-ISO starts fall in
-    // time like RFC 3339 ones, unparseable ones stay visible.
-    since.is_none_or(|since| {
-        crate::parse_ts(&session.metrics.session_start)
-            .map(|time| time >= since)
-            .unwrap_or(true)
-    })
+    crate::insights::session_admitted_since(session, since)
 }
 
 fn opencode_sqlite_session_rows(
