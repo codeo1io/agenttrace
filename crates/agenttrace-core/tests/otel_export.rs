@@ -249,6 +249,49 @@ fn otel_export_shape_and_genai_attributes() {
 }
 
 #[test]
+fn span_ids_are_valid_nonzero_and_deterministic() {
+    // rm-605: `span_id_for(ordinal)` used to zero-pad the seed, so the
+    // FIRST span of every export carried spanId 0000000000000000 —
+    // reserved as invalid by OTLP/W3C trace-id/span-id semantics and
+    // dropped by collectors. Every span id must be non-zero, distinct
+    // within the doc, and stable across exports.
+    let a = write_session("claude-a.jsonl", CLAUDE_BODY);
+    let b = write_session("codex-b.jsonl", CODEX_BODY);
+    let sessions = vec![parse_file(&a).unwrap(), parse_file(&b).unwrap()];
+    let first: serde_json::Value = serde_json::from_str(&report_otel_export(&sessions)).unwrap();
+    let second: serde_json::Value = serde_json::from_str(&report_otel_export(&sessions)).unwrap();
+
+    let spans = first["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let mut seen = std::collections::HashSet::new();
+    for span in &spans {
+        let sid = span["spanId"].as_str().unwrap();
+        assert_eq!(sid.len(), 16);
+        assert!(sid.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            sid, "0000000000000000",
+            "reserved all-zero span id on an export span (rm-605)"
+        );
+        assert!(
+            seen.insert(sid.to_string()),
+            "span ids must be distinct: {sid}"
+        );
+        // rm-605 review rider: trace ids derive through the same hash
+        // and clamp the reserved all-zero value symmetrically.
+        let tid = span["traceId"].as_str().unwrap();
+        assert_eq!(tid.len(), 32);
+        assert!(tid.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            tid, "00000000000000000000000000000000",
+            "reserved all-zero trace id on an export span (rm-605 rider)"
+        );
+    }
+    assert_eq!(first, second, "export must be deterministic across calls");
+}
+
+#[test]
 fn otel_export_empty_input_is_valid_otlp() {
     let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&[])).unwrap();
     let spans = &doc["resourceSpans"][0]["scopeSpans"][0]["spans"];

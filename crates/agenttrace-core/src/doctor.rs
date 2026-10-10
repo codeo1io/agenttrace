@@ -60,6 +60,13 @@ pub struct DoctorReport {
     pub reparsed_this_scan: usize,
     pub sessions: usize,
     pub session_files: usize,
+    /// rm-607 disclosure: sibling sqlite databases (outside the
+    /// canonical ones) whose sessions were suppressed as cross-file
+    /// duplicates — backups and copies that used to double every
+    /// aggregate before the dedup landed. Empty when no sibling db
+    /// matched the discovery glob.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sqlite_duplicate_dbs: Vec<crate::sqlite_sessions::SqliteDuplicateDb>,
     pub directories: Vec<DoctorDirReport>,
     /// Statusline capture journal (candidate 53, cycle 7): present when
     /// `agenttrace statusline` has been configured as the statusLine
@@ -195,6 +202,10 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     // fork-exclusion count as well (the legacy count-dropping wrapper
     // was deleted at the campaign's review fix), so the doctor
     // inventory discloses the exclusion like every other lane.
+    // rm-607 rider: the same ingest report carries the sibling
+    // databases suppressed as cross-file duplicates, so doctor
+    // disclosures the dedup through one struct instead of a second
+    // load lane.
     let (sessions, sqlite_ingest) = if dir.is_none() {
         load_sqlite_backed_sessions_reported(None)
     } else {
@@ -277,6 +288,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         reparsed_this_scan,
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
+        sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
         project_decode,
         zero_usage,
         disclosures,
@@ -964,6 +976,30 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
             report.zero_usage.events
         ));
     }
+    // rm-607: sibling sqlite databases suppressed as duplicates are
+    // disclosed, not silently skipped — the numbers are honest but the
+    // user should learn their backups are inside the discovery glob.
+    // (Review 5968db61 F5, closed at conflict case 2b3bf2f0: build the
+    // path list once — the first cut collected it twice and took
+    // .len() of a map-collect.)
+    let duplicate_paths = report
+        .sqlite_duplicate_dbs
+        .iter()
+        .map(|db| db.path.as_str())
+        .collect::<Vec<_>>();
+    let duplicate_sessions: usize = report
+        .sqlite_duplicate_dbs
+        .iter()
+        .map(|db| db.duplicate_sessions)
+        .sum();
+    if duplicate_sessions > 0 {
+        recommendations.push(format!(
+            "{} session(s) across {} sibling sqlite database(s) ({}) were counted once because they repeat sessions already carried by the canonical database; archive backups outside the agent home to keep discovery unambiguous.",
+            duplicate_sessions,
+            duplicate_paths.len(),
+            duplicate_paths.join(", ")
+        ));
+    }
     if demo {
         recommendations.push(
             "Demo sessions are bundled in memory, so cache reuse does not apply in this mode."
@@ -1055,6 +1091,19 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     ));
     for sample in &report.zero_usage.samples {
         out.push_str(&format!("    {sample}\n"));
+    }
+    if !report.sqlite_duplicate_dbs.is_empty() {
+        out.push_str(&format!(
+            "Duplicate sqlite databases (rm-607): {}\n",
+            report
+                .sqlite_duplicate_dbs
+                .iter()
+                .map(|db| format!(
+                    "    {} — {} duplicate session(s) suppressed, canonical db kept\n",
+                    db.path, db.duplicate_sessions
+                ))
+                .collect::<String>()
+        ));
     }
     if !report.disclosures.is_empty() {
         // rm-595: disclosure keys route through the control-byte

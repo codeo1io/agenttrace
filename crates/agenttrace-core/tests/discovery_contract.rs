@@ -2554,6 +2554,83 @@ fn default_discovery_uses_opencode_sqlite_when_present() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn opencode_glob_duplicate_db_sessions_are_deduped_and_disclosed() {
+    // rm-607: the discovery glob loads every `opencode*.db` sibling. A
+    // byte-identical backup (opencode-backup.db) used to be counted
+    // alongside the canonical db, silently doubling every aggregate
+    // (live PoC on the real corpus: 309 -> 618 sessions). The union must
+    // dedup sessions by (source_tool, sqlite session id) — keeping the
+    // canonical db's copy — and `--doctor` must disclose the extra db.
+    let root = temp_root("agenttrace-opencode-dup-db");
+    let home = root.join("home");
+    let dir = home.join(".local").join("share").join("opencode");
+    fs::create_dir_all(&dir).expect("create opencode dir");
+    let db_path = dir.join("opencode.db");
+    let db = Connection::open(&db_path).expect("open canonical opencode db");
+    db.execute_batch(
+        r#"
+        create table session (
+            id text primary key,
+            title text,
+            time_created integer,
+            time_updated integer,
+            cost real,
+            tokens_input integer,
+            tokens_output integer,
+            tokens_reasoning integer,
+            tokens_cache_read integer,
+            tokens_cache_write integer
+        );
+        create table message (session_id text, data text);
+        create table part (session_id text, data text);
+        insert into session values
+            ('ses_dup_a', 'Alpha', 1764750000000, 1764750004000, 0.25, 1000, 200, 0, 30, 20),
+            ('ses_dup_b', 'Beta', 1764750100000, 1764750104000, 0.5, 500, 100, 0, 10, 5);
+        insert into message values
+            ('ses_dup_a', '{"id":"m1","role":"user","parts":[{"type":"text","text":"hello alpha"}]}'),
+            ('ses_dup_b', '{"id":"m2","role":"user","parts":[{"type":"text","text":"hello beta"}]}');
+        "#,
+    )
+    .expect("seed canonical opencode db");
+    drop(db);
+    // A byte-identical backup sibling: same sessions, same ids.
+    fs::copy(&db_path, dir.join("opencode-backup.db")).expect("copy backup db");
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "the backup db must not double the session count"
+        );
+        let input: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+        assert_eq!(input, 1500, "aggregates single-counted, not doubled");
+
+        // Doctor discloses the extra db instead of silently skipping it.
+        let report = build_doctor_report(None, false);
+        let dup = &report.sqlite_duplicate_dbs;
+        assert_eq!(dup.len(), 1, "exactly one duplicate db disclosed");
+        assert!(
+            dup[0].path.ends_with("opencode-backup.db"),
+            "disclosure names the sibling: {}",
+            dup[0].path
+        );
+        assert_eq!(
+            dup[0].duplicate_sessions, 2,
+            "both backup sessions were suppressed as duplicates"
+        );
+        let text =
+            agenttrace_core::render_doctor_report(None, false, "text").expect("render doctor text");
+        assert!(
+            text.contains("Duplicate sqlite databases"),
+            "doctor text discloses the sibling db"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn temp_root(prefix: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

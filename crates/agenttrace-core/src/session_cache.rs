@@ -532,6 +532,11 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
 // serving its snapshot forever on an unchanged (size, mtime)
 // fingerprint and hide the new drop counts. One regeneration retires
 // the stale entry (rm-230 convention).
+// rm-607 rider (integration, conflict case fc480c28): the cross-file
+// duplicate-dedup keys on `SessionKey`, which has survived the
+// snapshot since v9, and runs at union time after each database's
+// cache resolves — so the snapshot schema STAYS at 10; the
+// candidate's own 7 -> 8 bump is moot on this ceiling.
 const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 10;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
