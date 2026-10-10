@@ -95,16 +95,27 @@ RATE_FIELDS = (
 )
 
 
+MODES_KEPT = ("chat", "image_generation")
+
+
 def trim(data):
-    # Same trim as always: chat-mode entries with at least one nonzero
-    # per-token rate, keeping only the fields the offline catalog carries.
-    # Vendor context window and deprecation date ride along when the
-    # source carries them (rm-231 / rm-419).
+    # Same trim as always: text-pricable entries with at least one
+    # nonzero per-token rate, keeping only the fields the offline catalog
+    # carries. Vendor context window and deprecation date ride along when
+    # the source carries them (rm-231 / rm-419).
+    #
+    # rm-176 (2026-10-10): image_generation models that ALSO carry
+    # per-token rates (e.g. gpt-image-1.5, whose text-token lanes are
+    # priced like any chat model) are admitted with their truthful mode;
+    # resolution/steps-qualified image keys (1024-x-1024/50-steps/...) and
+    # per-image-only entries carry no per-token rates and stay out of the
+    # model-id space by this very filter.
     keep = {}
     for key, value in data.items():
         if not isinstance(value, dict):
             continue
-        if value.get("mode") != "chat":
+        mode = value.get("mode")
+        if mode not in MODES_KEPT:
             continue
         inp = value.get("input_cost_per_token") or 0
         outp = value.get("output_cost_per_token") or 0
@@ -115,7 +126,7 @@ def trim(data):
             "output_cost_per_token": outp,
             "cache_creation_input_token_cost": value.get("cache_creation_input_token_cost") or 0,
             "cache_read_input_token_cost": value.get("cache_read_input_token_cost") or 0,
-            "mode": "chat",
+            "mode": mode,
             "litellm_provider": value.get("litellm_provider") or "",
         }
         max_input = value.get("max_input_tokens")
@@ -160,7 +171,13 @@ def manual_drops(path, today):
 
 live = trim(json.load(open(src)))
 prior_doc = json.load(open(dst))
-prior = {k: v for k, v in prior_doc.items() if k != "_snapshot"}
+# rm-176 (2026-10-10): `_plan_scope` is a models.dev-sourced section, not
+# derivable from the LiteLLM source — it must never be union-merged as a
+# fake model row (which would corrupt the header count and the
+# retained_from_previous audit). Carry it across the refresh verbatim;
+# scripts/pricing/ingest-modelsdev.sh re-derives it on demand.
+meta_keys = {"_snapshot", "_plan_scope"}
+prior = {k: v for k, v in prior_doc.items() if k not in meta_keys}
 
 # Vacuous-refresh floor (review hardening on rm-588): a degenerate live
 # source — valid JSON that prices nothing, or an implausibly small share of
@@ -239,6 +256,8 @@ snapshot = {
         "retained_from_previous": retained,
     }
 }
+if "_plan_scope" in prior_doc:
+    snapshot["_plan_scope"] = prior_doc["_plan_scope"]
 snapshot.update(merged)
 # Atomic write (rm-693 discipline, review hardening): dump to a sibling
 # temp and os.replace into place, so a crash mid-dump can never leave the
@@ -257,7 +276,8 @@ except BaseException:
     raise
 
 print(
-    f"wrote {len(merged)} chat models to {dst} (snapshot date {date}): "
+    f"wrote {len(merged)} priced models ({sum(1 for v in merged.values() if v.get('mode') == 'image_generation')} image-generation) "
+    f"to {dst} (snapshot date {date}): "
     f"{len(prior)} pre-refresh | +{len(adds)} added | {len(rate_mutations)} rate-mutated | "
     f"{len(window_mutations)} window-only-changed | {len(retained)} retained-by-union | "
     f"{honored} manual drop(s)"

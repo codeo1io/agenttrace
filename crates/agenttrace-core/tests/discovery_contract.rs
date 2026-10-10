@@ -2637,6 +2637,7 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             all.cache_hits,
             all.opencode_fork_excluded,
             all.sqlite.unreadable.clone(),
+            all.oversize_skipped,
         );
         let health_day = data_health_scoped(
             &day.sessions,
@@ -2645,6 +2646,7 @@ fn data_health_discovered_is_range_independent_and_splits_out_of_scope() {
             day.cache_hits,
             day.opencode_fork_excluded,
             day.sqlite.unreadable.clone(),
+            day.oversize_skipped,
         );
         assert_eq!(health_all.parsed, 2);
         assert_eq!(
@@ -2729,6 +2731,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.sqlite.unreadable.clone(),
+            report.oversize_skipped,
         );
         assert_eq!(health.non_finite_costs, 1, "non-finite cost is counted");
         assert_eq!(health.confidence, "low", "corrupted costs lower confidence");
@@ -2739,6 +2742,7 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.sqlite.unreadable.clone(),
+            report.oversize_skipped,
         );
         assert_eq!(clean.non_finite_costs, 0);
     });
@@ -3479,6 +3483,7 @@ fn opencode_json_fork_copies_excluded_from_aggregation_and_disclosed() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.sqlite.unreadable.clone(),
+            report.oversize_skipped,
         );
         assert_eq!(
             health.disclosures.get("opencode_fork_excluded_sessions"),
@@ -3805,6 +3810,7 @@ fn corrupt_sqlite_lane_surfaces_in_load_report_data_health_and_doctor() {
             report.cache_hits,
             report.opencode_fork_excluded,
             report.sqlite.unreadable.clone(),
+            report.oversize_skipped,
         );
         assert_eq!(
             health.confidence, "low",
@@ -3823,6 +3829,7 @@ fn corrupt_sqlite_lane_surfaces_in_load_report_data_health_and_doctor() {
             report.cache_hits,
             0,
             Vec::new(),
+            0,
         );
         let clean_json = serde_json::to_string(&clean).expect("clean health json");
         assert!(

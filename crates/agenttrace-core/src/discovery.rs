@@ -60,6 +60,15 @@ pub struct LoadReport {
     /// rollout hint), so an all-corrupt directory can say what actually
     /// happened instead of "no sessions match the filters".
     pub first_parse_failure: Option<String>,
+    /// rm-700: discovered files skipped for exceeding the session
+    /// ingestion size cap (`parser::DEFAULT_MAX_SESSION_FILE_BYTES` /
+    /// `AGENTTRACE_MAX_SESSION_FILE_BYTES`). Counted separately from
+    /// `parse_failures` because the file is never read — the skip is a
+    /// bounded-ingestion decision, not a parse error, so callers can
+    /// disclose "N files over cap" without implying corruption. The
+    /// skip still rides the `first_parse_failure` message lane so an
+    /// all-oversize corpus says what happened.
+    pub oversize_skipped: usize,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -352,6 +361,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // LoadReport so the CLI can say what actually happened.
     let mut parse_failures = 0usize;
     let mut first_parse_failure: Option<String> = None;
+    let mut oversize_skipped = 0usize;
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -386,9 +396,20 @@ pub fn load_sessions_with_progress_from_cache_mode(
                         // rm-835: keep the first failure's parser message
                         // (discovery order) for the LoadReport.
                         if first_parse_failure.is_none() {
-                            first_parse_failure = failure;
+                            first_parse_failure = failure.clone();
                         }
-                        parse_failures += 1;
+                        // rm-700: cap skips are bounded-ingestion
+                        // decisions, not parse errors — classify by the
+                        // parser's stable prefix so callers can tell a
+                        // never-read oversize file from a corrupt one.
+                        let oversize = failure
+                            .as_deref()
+                            .is_some_and(|m| m.starts_with(crate::parser::OVERSIZE_SESSION_PREFIX));
+                        if oversize {
+                            oversize_skipped += 1;
+                        } else {
+                            parse_failures += 1;
+                        }
                     }
                 }
                 report_load_progress(
@@ -479,6 +500,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         opencode_fork_excluded,
         parse_failures,
         first_parse_failure,
+        oversize_skipped,
         unlinked_subagents,
     }
 }

@@ -851,6 +851,7 @@ pub fn data_health_scoped(
     cache_hits: usize,
     opencode_fork_excluded: usize,
     sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
+    oversize_skipped: usize,
 ) -> DataHealth {
     let parsed = sessions.len();
     let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
@@ -866,14 +867,19 @@ pub fn data_health_scoped(
     // the same channel as parse-time journal disclosures — a count the
     // user can see instead of sessions that vanish silently.
     if opencode_fork_excluded > 0 {
-        health
-            .disclosures
-            .entry("opencode_fork_excluded_sessions".to_string())
-            .or_insert(0);
         *health
             .disclosures
-            .get_mut("opencode_fork_excluded_sessions")
-            .expect("just inserted") += opencode_fork_excluded;
+            .entry("opencode_fork_excluded_sessions".to_string())
+            .or_insert(0) += opencode_fork_excluded;
+    }
+    // rm-700: files skipped by the ingestion cap (never read, bounded
+    // by design) are disclosed as a count instead of folding silently
+    // into out_of_scope.
+    if oversize_skipped > 0 {
+        *health
+            .disclosures
+            .entry("oversize_session_files_skipped".to_string())
+            .or_insert(0) += oversize_skipped;
     }
     health
 }

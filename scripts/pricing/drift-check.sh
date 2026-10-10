@@ -9,8 +9,9 @@
 #   (offline-first determinism; runtime refresh already exists as the opt-in --update-pricing cache).
 #
 # Basis rule (the false-alarm trap this script exists to avoid): drift is computed ONLY on the
-# builder keep-filter basis — mode == "chat" AND (input_cost_per_token > 0 OR output_cost_per_token > 0) —
-# mirroring scripts/pricing/update-snapshot.sh verbatim. Raw total-model comparisons against LiteLLM
+# builder keep-filter basis — mode in (chat, image_generation) AND (input_cost_per_token > 0 OR output_cost_per_token > 0) —
+# mirroring scripts/pricing/update-snapshot.sh verbatim (rm-176 2026-10-10 widened both from chat-only).
+# Raw total-model comparisons against LiteLLM
 # main mix in non-chat/uncosted entries and misread the bundle as drifted when it is not
 # (verified 2026-10-05: raw total 4,473 vs chat-with-cost 3,099 on BOTH sides = parity).
 #
@@ -84,13 +85,17 @@ if not isinstance(live, dict) or not isinstance(bundle, dict):
     print("drift-check: infra error: catalogs must be JSON objects", file=sys.stderr)
     sys.exit(2)
 
-# Keep-filter basis — must mirror scripts/pricing/update-snapshot.sh verbatim.
+# Keep-filter basis — must mirror scripts/pricing/update-snapshot.sh verbatim
+# (rm-176 2026-10-10: image_generation models with per-token rates are part of
+# the builder's keep set; step/resolution-qualified image keys stay out).
+MODES_KEPT = ("chat", "image_generation")
+
 def kept(catalog):
     out = {}
     for name, row in catalog.items():
-        if name == "_snapshot" or not isinstance(row, dict):
+        if name == "_snapshot" or name == "_plan_scope" or not isinstance(row, dict):
             continue
-        if row.get("mode") != "chat":
+        if row.get("mode") not in MODES_KEPT:
             continue
         inp = float(row.get("input_cost_per_token") or 0.0)
         outp = float(row.get("output_cost_per_token") or 0.0)
@@ -150,7 +155,7 @@ def sample(names):
 # parseable); without --json the summary stays on stdout (the workflow's regen-verify grep for
 # 'costed-chat models' reads a no---json run).
 out = sys.stderr if emit_json else sys.stdout
-print(f"pricing drift check (keep-filter basis: mode==chat AND input-or-output per-token cost>0)", file=out)
+print(f"pricing drift check (keep-filter basis: mode in (chat,image_generation) AND input-or-output per-token cost>0)", file=out)
 print(f"  bundled: {len(bundle_kept)} costed-chat models, _snapshot.date={bundle_date or '<none>'}, PRICING_SNAPSHOT_DATE={const_date or '<none>'}", file=out)
 print(f"  live   : {len(live_kept)} costed-chat models", file=out)
 print(f"  new-costed: {len(new_costed)}{' — ' + sample(new_costed) if new_costed else ''}", file=out)
@@ -163,7 +168,7 @@ if desync:
     print(f"  DESYNC (assess A1): pricing.rs const {const_date} != bundle _snapshot.date {bundle_date} — update-snapshot.sh's manual const bump was skipped", file=out)
 if emit_json:
     report = {
-        "basis": "mode==chat AND (input_cost_per_token>0 OR output_cost_per_token>0)",
+        "basis": "mode in (chat,image_generation) AND (input_cost_per_token>0 OR output_cost_per_token>0)",
         "bundle": {"date": bundle_date, "costed_chat_models": len(bundle_kept)},
         "live": {"costed_chat_models": len(live_kept)},
         "pricing_snapshot_date_const": const_date,

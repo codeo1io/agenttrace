@@ -333,6 +333,7 @@ fn usage_overview(range: TimeRange) -> Result<Value, (i64, String)> {
         report.cache_hits,
         report.opencode_fork_excluded,
         report.sqlite.unreadable.clone(),
+        report.oversize_skipped,
     );
     let text = report_overview_json_with_context(
         &overview,

@@ -17,7 +17,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-09";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -78,6 +78,12 @@ pub struct PricingCatalog {
     /// (rm-245). Read-only attribution data: provenance and freshness
     /// semantics stay with pricing_source_for and are untouched here.
     pub providers: BTreeMap<String, String>,
+    /// rm-845: catalog keys that price at plan-scope rates (subscription-
+    /// included coding-plan models, e.g. `zai-coding-plan/glm-5.3` at
+    /// 0/0) -> human explanation. A zero here is a plan scope, not a
+    /// missing rate: the note keeps the zero from reading as a fallback
+    /// in data_health disclosures.
+    pub plan_notes: BTreeMap<String, String>,
     /// The catalog's own vintage as YYYYMMDD (rm-419): the bundled
     /// snapshot's pinned date, a cached catalog's fetch date, or today
     /// for a just-refreshed remote fetch. Deprecation disclosure
@@ -110,6 +116,18 @@ pub fn lookup_price(model: &str) -> Price {
     let catalog = pricing_catalog();
     let model = resolve_alias(model, &catalog.aliases);
     lookup_price_in(&model, &catalog.entries)
+}
+
+/// rm-845: if `model` prices at a subscription-plan scope (catalog
+/// `plan_notes` entry, e.g. `zai-coding-plan/glm-5.3`), return the
+/// human explanation. Callers use this to disclose that a 0-cost (or
+/// plan-rate) result is exact pricing from a plan scope, not a
+/// fallback-priced model.
+pub fn plan_tier_note(model: &str) -> Option<&'static str> {
+    let catalog = pricing_catalog();
+    match_variants(model)
+        .into_iter()
+        .find_map(|variant| catalog.plan_notes.get(&variant).map(|note| note.as_str()))
 }
 
 pub fn has_specific_price(model: &str) -> bool {
@@ -456,6 +474,7 @@ pub fn update_pricing() -> anyhow::Result<usize> {
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
         providers: converted.providers,
+        plan_notes: converted.plan_notes,
         reference_date: today_ymd(),
     };
     let override_models = apply_pricing_overrides(&mut catalog);
@@ -578,6 +597,7 @@ fn fallback_catalog() -> PricingCatalog {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: None,
         };
     }
@@ -586,6 +606,7 @@ fn fallback_catalog() -> PricingCatalog {
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
         providers: converted.providers,
+        plan_notes: converted.plan_notes,
         reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
     }
 }
@@ -643,6 +664,7 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
         providers: converted.providers,
+        plan_notes: converted.plan_notes,
         // A cached catalog's vintage is its fetch date (rm-419); when
         // the provenance stamp is missing (pre-rm-167 cache) fall back
         // to the bundled snapshot date as a conservative anchor.
@@ -906,6 +928,7 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
 struct ConvertedCatalog {
     entries: BTreeMap<String, Price>,
     providers: BTreeMap<String, String>,
+    plan_notes: BTreeMap<String, String>,
 }
 
 fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
@@ -913,14 +936,24 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         return ConvertedCatalog {
             entries: BTreeMap::new(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
         };
     };
     let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    let plan_scope = source.get("_plan_scope").cloned();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
         };
-        if model.mode != "chat" || (model.input_cost == 0.0 && model.output_cost == 0.0) {
+        // rm-176: image-generation models that carry per-token text
+        // rates (e.g. gpt-image-1.5) are priced like chat models — the
+        // transcript usage blocks count text tokens. Per-image/-batch
+        // cost fields are never carried by the bundled projection, and
+        // resolution/steps-qualified image keys stay out of the model
+        // id space at refresh time.
+        if (model.mode != "chat" && model.mode != "image_generation")
+            || (model.input_cost == 0.0 && model.output_cost == 0.0)
+        {
             continue;
         }
         let normalized = normalize_model(&key);
@@ -969,7 +1002,48 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         providers.insert(name.clone(), provider);
         entries.insert(name, price);
     }
-    ConvertedCatalog { entries, providers }
+    // rm-845 plan-scope section (models.dev authority): entries that
+    // price at subscription-plan rates rather than LiteLLM per-token
+    // rates. They are inserted AFTER the model loop and never override
+    // an upstream LiteLLM entry, and they deliberately bypass the
+    // non-empty-rate filter above: a 0/0 plan-included entry is exact
+    // pricing, not a degenerate row.
+    let mut plan_notes = BTreeMap::new();
+    if let Some(Value::Object(plans)) = plan_scope {
+        for (key, plan) in plans {
+            let Some(input) = plan.get("input_per_mtok").and_then(Value::as_f64) else {
+                continue;
+            };
+            let Some(output) = plan.get("output_per_mtok").and_then(Value::as_f64) else {
+                continue;
+            };
+            if !(input.is_finite() && output.is_finite()) {
+                continue;
+            }
+            let note = plan
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or("subscription plan scope")
+                .to_string();
+            let normalized = normalize_model(&key);
+            if !entries.contains_key(&normalized) {
+                entries.insert(
+                    normalized.clone(),
+                    Price {
+                        input,
+                        output,
+                        ..Price::default()
+                    },
+                );
+                plan_notes.insert(normalized, note);
+            }
+        }
+    }
+    ConvertedCatalog {
+        entries,
+        providers,
+        plan_notes,
+    }
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -1995,6 +2069,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: source.to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2038,6 +2113,41 @@ mod tests {
     }
 
     #[test]
+    fn bundled_snapshot_prices_image_generation_models_with_text_rates() {
+        // rm-176: gpt-image-1.5 ships per-token text rates (5e-6 in /
+        // 1e-5 out / 1.25e-6 cache-read) alongside its per-image fields.
+        // The refresh admits image-generation models that carry per-token
+        // rates (transcript usage counts text tokens) while the
+        // resolution/steps-qualified image keys stay out of the model id
+        // space. Pin both sides so a refresh that drops the entry or
+        // leaks the step keys goes red here.
+        assert!(has_specific_price("gpt-image-1.5"));
+        let price = lookup_price("gpt-image-1.5");
+        let eps = 1e-12;
+        assert!((price.input - 5.0).abs() < eps, "input {}", price.input);
+        assert!((price.output - 10.0).abs() < eps, "output {}", price.output);
+        assert!((price.cr - 1.25).abs() < eps, "cr {}", price.cr);
+        // a steps/resolution-qualified transcript id normalizes onto the
+        // plain model and prices correctly — and no qualified id ships in
+        // the bundle itself
+        let qualified = lookup_price("1024-x-1024/50-steps/quality-low/gpt-image-1.5");
+        assert!(
+            (qualified.input - 5.0).abs() < eps,
+            "q input {}",
+            qualified.input
+        );
+        assert!(
+            (qualified.output - 10.0).abs() < eps,
+            "q output {}",
+            qualified.output
+        );
+        assert!(
+            !PRICING_SNAPSHOT_JSON.contains("steps/"),
+            "steps-qualified image ids must not ship in the bundle"
+        );
+    }
+
+    #[test]
     fn bundled_snapshot_prices_claude_haiku_5_5_exactly() {
         // rm-006 cycle-1 refresh: claude-haiku-5-5 was missing from the
         // 2026-10-04 bundle, so a 1000-in/500-out haiku-5-5 session fell
@@ -2074,7 +2184,9 @@ mod tests {
         let snapshot: serde_json::Value =
             serde_json::from_str(PRICING_SNAPSHOT_JSON).expect("bundled snapshot parses");
         let map = snapshot.as_object().expect("snapshot is an object");
-        let entries = map.keys().filter(|k| k.as_str() != "_snapshot").count();
+        // Structural sections ("_snapshot" header, "_plan_scope" plan
+        // tiers) are not models; the header counts model entries only.
+        let entries = map.keys().filter(|k| !k.as_str().starts_with('_')).count();
         let header = &snapshot["_snapshot"];
         assert_eq!(
             header["models"].as_u64(),
@@ -2106,6 +2218,7 @@ mod tests {
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: None,
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
@@ -2141,6 +2254,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "retired-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         // Plain catalog arm.
@@ -2168,6 +2282,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2179,6 +2294,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2226,6 +2342,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -2419,6 +2536,7 @@ mod tests {
             aliases: BTreeMap::from([("wide-alias".to_string(), "wide-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2466,6 +2584,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "snapshot".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         let overrides = BTreeSet::new();
@@ -2508,6 +2627,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2519,6 +2639,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2546,6 +2667,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: None,
         };
         let same_content = PricingCatalog {
@@ -2661,6 +2783,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            plan_notes: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -2712,5 +2835,77 @@ mod tests {
             catalog.entries["brand-new-model"].max_input_tokens, None,
             "an override for an unknown model has nothing to backfill from"
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_scope_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_plan_scope_entries_price_at_plan_rates() {
+        // Subscription-included coding-plan tier: 0/0 is exact pricing
+        // from the plan scope, not a fallback.
+        let price = lookup_price("zai-coding-plan/glm-5.3-highspeed");
+        assert_eq!((price.input, price.output), (0.0, 0.0));
+        // Direct-rate plan entry carries its per-token rate.
+        let direct = lookup_price("zai/glm-4.7-flashx");
+        assert_eq!((direct.input, direct.output), (0.07, 0.40));
+    }
+
+    #[test]
+    fn plan_tier_note_resolves_across_variant_arrivals() {
+        assert_eq!(
+            plan_tier_note("zai-coding-plan/glm-5.3-highspeed"),
+            Some("zai-coding-plan subscription: included (no per-token charge)")
+        );
+        // Case differences arrive from real transcripts.
+        assert!(plan_tier_note("Zai-Coding-Plan/GLM-5.3-HighSpeed").is_some());
+        // Non-plan models carry no note.
+        assert!(plan_tier_note("claude-sonnet-4").is_none());
+        assert!(plan_tier_note("totally-unknown-model-x").is_none());
+    }
+
+    #[test]
+    fn plan_scope_never_overrides_a_litellm_model_entry() {
+        // A plan key colliding with a real LiteLLM model id must keep
+        // the LiteLLM rates and gain no plan note.
+        let raw = br#"{
+            "real-model": {"mode": "chat", "input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002},
+            "_plan_scope": {
+                "real-model": {"input_per_mtok": 99.0, "output_per_mtok": 99.0, "note": "evil"},
+                "plan-only": {"input_per_mtok": 0.0, "output_per_mtok": 0.0, "note": "subscription plan"}
+            }
+        }"#;
+        let converted = convert_litellm(raw);
+        let price = converted
+            .entries
+            .get("real-model")
+            .expect("model entry kept");
+        assert_eq!((price.input, price.output), (1.0, 2.0));
+        assert!(!converted.plan_notes.contains_key("real-model"));
+        let plan = converted
+            .entries
+            .get("plan-only")
+            .expect("plan entry added");
+        assert_eq!((plan.input, plan.output), (0.0, 0.0));
+        assert_eq!(
+            converted.plan_notes.get("plan-only").map(String::as_str),
+            Some("subscription plan")
+        );
+    }
+
+    #[test]
+    fn plan_scope_entries_without_rates_are_skipped() {
+        // A "provenance" object (or malformed entry) must not panic or
+        // become a priced key.
+        let raw = br#"{
+            "_plan_scope": {
+                "provenance": {"source": "models.dev api.json", "fetched": "2026-10-10"}
+            }
+        }"#;
+        let converted = convert_litellm(raw);
+        assert!(converted.entries.is_empty());
+        assert!(converted.plan_notes.is_empty());
     }
 }
