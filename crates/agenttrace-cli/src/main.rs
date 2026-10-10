@@ -2371,11 +2371,11 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
         // transcript-derived), so no sanitization is owed here.
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
-            sanitize_line_segment(&session.name),
+            csv_export::guard_formula(&sanitize_line_segment(&session.name)),
             session.health,
             session_capability(session),
-            sanitize_line_segment(&session.metrics.source_tool),
-            sanitize_line_segment(&session.metrics.model_used),
+            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.source_tool)),
+            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.model_used)),
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,

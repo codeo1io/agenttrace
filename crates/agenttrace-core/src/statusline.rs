@@ -294,11 +294,50 @@ fn render_status_line(payload: &Value) -> String {
 /// because JSON escaping already encodes control bytes losslessly, and
 /// markdown/HTML renderers apply their own escaping before this class
 /// applies. Printable CSI/OSC tails may legitimately survive — only the
-/// control bytes themselves (ESC, BEL, …) are neutralized.
+/// control bytes (ESC, BEL, …) are neutralized.
+/// rm-933: bidirectional format controls - the invisible direction
+/// overrides (RLE/LRO/PDF/RLO and the isolate family LRI/RLI/FSI/PDI)
+/// plus the directional marks LRM/RLM/ALM. A single raw RLO flips the
+/// visual order of everything after it (CVE-2021-42574-class
+/// spoofing), so these are neutralized wherever transcript-derived
+/// text meets a terminal or a rendered document.
+pub fn is_bidi_format_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// rm-933: the remaining invisible-spoofing set - Unicode tag
+/// characters (U+E0000-U+E007F, hidden-payload smuggling past
+/// eyeballs) and the zero-width joiner family (ZWSP/ZWNJ/ZWJ, WJ and
+/// the BOM) that concatenates or hides tokens with no visible glyph.
+const fn is_tag_or_zero_width_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// rm-933: the composed spoofing predicate shared by every render
+/// sanitizer - invisible Cf-class characters that can rewrite what a
+/// human (or an agent reading a capture) perceives. Visible lookalikes
+/// (fullwidth letters/digits, emoji, CJK) are NOT members: they carry
+/// real glyphs and stay first-class text.
+pub fn is_spoofing_format_char(c: char) -> bool {
+    is_bidi_format_control(c) || is_tag_or_zero_width_char(c)
+}
+
 pub fn sanitize_line_segment(segment: &str) -> String {
     segment
         .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            if c.is_control() || is_spoofing_format_char(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -309,14 +348,18 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 /// bytes: LF, CR and TAB are layout and stay; every other control
 /// byte — ESC (the OSC/CSI introducer), BEL, DEL, and the C1 range —
 /// is neutralized to U+FFFD so terminal emulators never interpret
-/// transcript-derived sequences. Idempotent by construction: U+FFFD is
+/// transcript-derived sequences - and rm-933 extends the same treatment
+/// to the invisible spoofing set (bidi overrides, tag characters,
+/// zero-widths). Idempotent by construction: U+FFFD is
 /// printable, so already-sanitized documents (including cells that
 /// first went through the rm-383/rm-540 line sanitizer) pass through
 /// unchanged — the two layers compose instead of corrupting.
 pub fn sanitize_output_document(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+            if (c.is_control() && c != '\n' && c != '\r' && c != '\t')
+                || is_spoofing_format_char(c)
+            {
                 '\u{FFFD}'
             } else {
                 c
@@ -3015,5 +3058,40 @@ mod tests {
                 "no non-layout control survives either order: {rendered:?}"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_neutralizes_bidi_tags_and_zero_widths() {
+        // rm-933: the Cf spoofing set must not survive any render
+        // sanitizer - bidi overrides, isolate controls and directional
+        // marks; Unicode tag characters; zero-width joiners.
+        let hostile = "\u{202E}evil\u{2066}\u{061C}\u{200E}\u{200F}\u{E0001}en\u{E0041}\u{200B}\u{200C}\u{200D}\u{2060}\u{FEFF}";
+        let seg = sanitize_line_segment(hostile);
+        for c in seg.chars() {
+            assert!(
+                !is_spoofing_format_char(c),
+                "spoofing char {c:?} survived sanitize_line_segment"
+            );
+        }
+        assert!(seg.contains('\u{FFFD}'));
+        let doc = sanitize_output_document(&format!("hello {hostile} world"));
+        for c in doc.chars() {
+            assert!(
+                !is_spoofing_format_char(c),
+                "spoofing char {c:?} survived sanitize_output_document"
+            );
+        }
+        // layout characters stay intact in the document lane
+        assert_eq!(sanitize_output_document("a\nb\tc\r\nd"), "a\nb\tc\r\nd");
+    }
+
+    #[test]
+    fn sanitize_preserves_visible_fullwidth_and_cjk_text() {
+        // rm-933: visible lookalikes are first-class text - fullwidth
+        // letters, digits, punctuation, CJK and emoji pass untouched.
+        let visible = "=HYPERLINK \u{FF1D}\u{FF0B}\u{FF20}\u{FF0D} \u{FF21}\u{FF11} \u{4E2D}\u{6587}\u{6D4B}\u{8BD5} \u{1F980}";
+        assert_eq!(sanitize_line_segment(visible), visible);
+        assert_eq!(sanitize_output_document(visible), visible);
+        assert!(!is_spoofing_format_char('\u{FF1D}'));
     }
 }
