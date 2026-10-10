@@ -1,18 +1,19 @@
 use agenttrace_core::{
-    add_baseline_comparison, average_health, compute_overview, compute_waste_report,
-    context_trends, cost_audit, data_health, data_health_scoped, delivery_evidence_with_git,
-    demo_sessions, evaluate_overview_gate, filter_sessions, fix_suggestions, inspect_first,
-    list_pricing, load_sessions_with_options, lookup_price, matches_numeric_filter, mcp_governance,
-    parse_file, parse_numeric_filter, parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path,
-    pricing_source, recommendations, render_doctor_report, render_model_pricing_list,
-    render_test_match, render_waste_report_with_language, report_compare_json,
-    report_json_with_language, report_overview_html_with_context,
-    report_overview_json_with_context, report_overview_markdown_with_context,
-    report_overview_svg_with_context, report_overview_text_with_context, report_search_json,
-    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
-    session_capability, session_start_cmp, tool_fail_rate, total_tokens, update_pricing,
-    waste_report_json, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
-    SvgCardTheme, TimeRange, VERSION,
+    add_baseline_comparison, average_health, build_doctor_report, compute_overview,
+    compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
+    delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
+    fix_suggestions, inspect_first, list_pricing, load_sessions_with_options, lookup_price,
+    matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter, parse_stdin_bytes,
+    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
+    render_doctor_report, render_model_pricing_list, render_test_match,
+    render_waste_report_with_language, report_compare_json, report_json_with_language,
+    report_overview_html_with_context, report_overview_json_with_context,
+    report_overview_markdown_with_context, report_overview_svg_with_context,
+    report_overview_text_with_context, report_search_json, report_search_text,
+    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
+    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
+    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
+    VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -472,7 +473,12 @@ fn run() -> anyhow::Result<()> {
     if args.clear_cache {
         agenttrace_core::clear_session_cache()?;
         announce("Session cache cleared.\n")?;
-        if !has_session_action(&args) {
+        // rm-301 (cycle-3 extension, assess 7276 A1/A2): a requested
+        // action must never be silently dropped by the clear-and-exit —
+        // this guard and --update-pricing's below consult the ONE
+        // shared action-introspection helper, not a hand-maintained
+        // subset that drifts as arms are added.
+        if !has_followup_action(&args) {
             return Ok(());
         }
     }
@@ -489,7 +495,7 @@ fn run() -> anyhow::Result<()> {
             "Cache saved: {}\n",
             pricing_cache_path().display()
         ))?;
-        if !has_post_pricing_action(&args) {
+        if !has_followup_action(&args) {
             return Ok(());
         }
     }
@@ -519,22 +525,44 @@ fn run() -> anyhow::Result<()> {
         // source of every knob. JSON mode keeps stdout a single pure
         // object; the disclosure goes to stderr as its own document.
         if args.format == "json" {
-            eprintln!("{}", config::disclosure_json(&resolved));
-        } else {
-            let out = format!(
-                "{}{}",
-                config::disclosure_text(&resolved),
-                render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?
-            );
-            // rm-625: the text doctor lane renders transcript-derived
-            // samples, so it rides the same dispatch choke point as
-            // the fallthrough lane below.
-            let out = dispatch_sanitize(&args.format, out);
-            write_output(&args.output, &out)?;
+            let disclosure = config::disclosure_json(&resolved);
+            eprintln!("{disclosure}");
+            // rm-656: build the report once and embed the SAME
+            // disclosure payload into the `-o` artifact as a top-level
+            // `config_disclosure` object — archiving a doctor run must
+            // not lose the layer/knob provenance the terminal path
+            // prints. The stdout document stays byte-identical to
+            // render_doctor_report's json arm (the rm-384 terminal
+            // contract); the embedded payload equals the stderr doc.
+            let report = build_doctor_report(doctor_dir.as_deref(), args.demo);
+            let out = serde_json::to_string_pretty(&report)? + "\n";
+            let artifact = match &args.output {
+                Some(_) => {
+                    let mut doc = serde_json::to_value(&report)
+                        .context("serializing the doctor report for -o disclosure embedding")?;
+                    if let Some(object) = doc.as_object_mut() {
+                        object.insert(
+                            "config_disclosure".to_string(),
+                            serde_json::from_str(disclosure.trim_end())
+                                .context("parsing the config disclosure for -o embedding")?,
+                        );
+                    }
+                    serde_json::to_string_pretty(&doc)? + "\n"
+                }
+                None => out.clone(),
+            };
+            write_output(&args.output, &artifact)?;
             write_stdout(&out)?;
             return Ok(());
         }
-        let out = render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?;
+        // rm-625: the text doctor lane renders transcript-derived
+        // samples, so it rides the same dispatch choke point as
+        // every other text render.
+        let out = format!(
+            "{}{}",
+            config::disclosure_text(&resolved),
+            render_doctor_report(doctor_dir.as_deref(), args.demo, &args.format)?
+        );
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -2371,30 +2399,35 @@ fn render_diagnostics(
     Ok(out)
 }
 
-fn has_post_pricing_action(args: &Args) -> bool {
-    args.path.is_some()
+/// rm-301 (cycle-3 acceptance extension, assess 7276 A1/A2): do the
+/// side-effect early exits (`--clear-cache`, `--update-pricing`) owe
+/// the user a follow-up action? The two guards used to consult two
+/// hand-maintained predicates that each knew only part of the action
+/// surface — `has_session_action` omitted `--doctor`, `--list-models`,
+/// and `--test-match`, and neither knew `--statusline-report` or
+/// `--budget` — so `--clear-cache --doctor` (and four sibling combos)
+/// printed "Session cache cleared." and exited 0 without ever running
+/// the co-requested action. One shared helper now answers for BOTH
+/// guards: every action arm `run()` dispatches between the side-effect
+/// exits and the interactive fallback must appear here, and the unit
+/// matrix in `mod tests` pins the full flag set so a new action arm
+/// cannot be registered on one guard and not the other.
+fn has_followup_action(args: &Args) -> bool {
+    has_session_action(args)
         || args.list_models
         || args.test_match
         || args.doctor
-        || args.latest
-        || args.compare
-        || args.audit
-        || args.recommend
-        || args.mcp_governance
-        || args.context_trends
-        || args.delivery_evidence
-        || args.overview
-        || args.sessions
-        || args.diagnostics
-        || args.inspect.is_some()
-        || args.waste
-        || args
-            .search
-            .as_deref()
-            .map(|query| !query.trim().is_empty())
-            .unwrap_or(false)
+        || args.statusline_report
+        || args.budget
 }
 
+/// Session-report actions only — the interactive-TUI fallback and the
+/// `--range` applicability guard (rm-244). Deliberately NARROWER than
+/// `has_followup_action`: `--doctor`, `--list-models`, `--test-match`,
+/// `--statusline-report`, and `--budget` are utility arms that return
+/// before either consumer runs and that consume neither sessions nor
+/// `--range`. The side-effect early exits must NOT use this predicate
+/// (rm-301: that drift is what swallowed co-requested actions).
 fn has_session_action(args: &Args) -> bool {
     args.path.is_some()
         || args.latest
@@ -2755,6 +2788,155 @@ mod tests {
     use super::*;
     use agenttrace_core::Metrics;
     use std::io::Write;
+
+    #[test]
+    fn has_followup_action_covers_every_action_arm_for_both_side_effect_exits() {
+        // rm-301 (cycle-3 extension, assess 7276 A1/A2): `--clear-cache`
+        // and `--update-pricing` share this predicate as their
+        // clear-and-exit guard. The --update-pricing half of the e2e
+        // swallow matrix is network-bound (it downloads the LiteLLM
+        // table), so both halves are pinned here at the shared
+        // predicate: every action arm `run()` dispatches must register,
+        // and the side-effect flags themselves must not.
+        let base = || {
+            let mut args = test_args(None);
+            args.compare = false;
+            args
+        };
+        assert!(
+            !has_followup_action(&base()),
+            "no action flag: the side-effect exits keep their clear-and-exit contract"
+        );
+        let variants: Vec<(&str, Args)> = vec![
+            ("<path>", {
+                let mut a = base();
+                a.path = Some("session.jsonl".to_string());
+                a
+            }),
+            ("--latest", {
+                let mut a = base();
+                a.latest = true;
+                a
+            }),
+            ("--compare", {
+                let mut a = base();
+                a.compare = true;
+                a
+            }),
+            ("--audit", {
+                let mut a = base();
+                a.audit = true;
+                a
+            }),
+            ("--recommend", {
+                let mut a = base();
+                a.recommend = true;
+                a
+            }),
+            ("--mcp-governance", {
+                let mut a = base();
+                a.mcp_governance = true;
+                a
+            }),
+            ("--context-trends", {
+                let mut a = base();
+                a.context_trends = true;
+                a
+            }),
+            ("--delivery-evidence", {
+                let mut a = base();
+                a.delivery_evidence = true;
+                a
+            }),
+            ("--overview", {
+                let mut a = base();
+                a.overview = true;
+                a
+            }),
+            ("--sessions", {
+                let mut a = base();
+                a.sessions = true;
+                a
+            }),
+            ("--diagnostics", {
+                let mut a = base();
+                a.diagnostics = true;
+                a
+            }),
+            ("--inspect", {
+                let mut a = base();
+                a.inspect = Some(3);
+                a
+            }),
+            ("--waste", {
+                let mut a = base();
+                a.waste = true;
+                a
+            }),
+            ("--baseline", {
+                let mut a = base();
+                a.baseline = Some("base".to_string());
+                a
+            }),
+            ("--search QUERY", {
+                let mut a = base();
+                a.search = Some("query".to_string());
+                a
+            }),
+            ("--doctor", {
+                let mut a = base();
+                a.doctor = true;
+                a
+            }),
+            ("--list-models", {
+                let mut a = base();
+                a.list_models = true;
+                a
+            }),
+            ("--test-match", {
+                let mut a = base();
+                a.test_match = true;
+                a
+            }),
+            ("--statusline-report", {
+                let mut a = base();
+                a.statusline_report = true;
+                a
+            }),
+            ("--budget", {
+                let mut a = base();
+                a.budget = true;
+                a
+            }),
+        ];
+        for (flag, args) in &variants {
+            assert!(
+                has_followup_action(args),
+                "{flag} must count as a follow-up action for BOTH side-effect guards"
+            );
+        }
+        for (flag, args) in [
+            ("--clear-cache", {
+                let mut a = base();
+                a.clear_cache = true;
+                a
+            }),
+            ("--update-pricing", {
+                let mut a = base();
+                a.update_pricing = true;
+                a
+            }),
+        ] {
+            assert!(
+                !has_followup_action(&args),
+                "{flag} is a side effect, not a follow-up action"
+            );
+        }
+        // The search lane keeps the shared non-empty rule.
+        let mut whitespace = base();
+        whitespace.search = Some("   ".to_string());
+        assert!(!has_followup_action(&whitespace));
+    }
 
     #[test]
     fn pricing_download_announcement_goes_to_stderr() {
