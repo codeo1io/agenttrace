@@ -772,11 +772,12 @@ fn capture_opencode_user_text(
     // rm-753 perf rider: this used to `order by p.time_created`,
     // sorting the ENTIRE part table on every load to find each
     // session's earliest user text. One unordered pass keeping the
-    // per-session (time_created, rowid) minimum selects the same part
-    // without the database-side sort. Ordering matches SQLite's ASC
-    // semantics exactly: NULL time_created first, then value, ties by
-    // rowid; time_created reads through the lenient i64 converter so
-    // wrong-typed values degrade to None instead of dropping the row.
+    // per-session minimum selects the same part without the
+    // database-side sort. rm-954: ordering now honors SQLite's ASC
+    // storage-class semantics — NULL first, then numeric values, then
+    // wrong-typed TEXT/BLOB (sqlite_value_asc_rank) — where the lenient
+    // i64 converter used to degrade wrong-typed values into the NULL
+    // bucket; ties break by rowid.
     let Ok(mut stmt) = db.prepare(
         "select p.session_id, p.data, m.data, p.time_created, p.rowid from part p \
          join message m on p.message_id = m.id",
@@ -788,13 +789,13 @@ fn capture_opencode_user_text(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            sqlite_value_as_i64(row.get(3)?),
+            sqlite_value_asc_rank(row.get(3)?),
             row.get::<_, i64>(4)?,
         ))
     }) else {
         return;
     };
-    let mut earliest: HashMap<String, (Option<i64>, i64, String)> = HashMap::new();
+    let mut earliest: HashMap<String, ((i32, i64), i64, String)> = HashMap::new();
     for row in rows {
         let (session_id, part_raw, message_raw, time_created, rowid) = match row {
             Ok(quint) => quint,
@@ -1239,6 +1240,26 @@ fn sqlite_has_column(db: &Connection, table: &str, column: &str) -> bool {
 /// conversion — a failed `get::<Option<i64>>` previously dropped the
 /// entire session silently. Unparseable values become None so callers
 /// fall back (derived tokens, unknown time) rather than disappearing.
+/// rm-954: SQLite ASC orders NULL first, then numeric values by
+/// magnitude, then TEXT/BLOB. The lenient i64 reader folds wrong-typed
+/// values into the NULL bucket they never shared, so the earliest-part
+/// selection ranks them explicitly: NULL (0) < numeric (1) < wrong-typed
+/// (2), ties by rowid — matching what `order by time_created` would have
+/// picked instead of inverting it.
+fn sqlite_value_asc_rank(value: Option<rusqlite::types::Value>) -> (i32, i64) {
+    use rusqlite::types::Value as SqliteValue;
+    match value {
+        None => (0, 0),
+        Some(SqliteValue::Integer(number)) => (1, number),
+        Some(SqliteValue::Real(number)) => (1, number as i64),
+        Some(SqliteValue::Text(text)) => match text.parse::<i64>() {
+            Ok(number) => (1, number),
+            Err(_) => (2, 0),
+        },
+        Some(_) => (2, 0),
+    }
+}
+
 fn sqlite_value_as_i64(value: Option<rusqlite::types::Value>) -> Option<i64> {
     use rusqlite::types::Value as SqliteValue;
     match value {

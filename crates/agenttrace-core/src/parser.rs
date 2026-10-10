@@ -5555,9 +5555,15 @@ fn parse_opencode_storage_session(
                 model = msg_model;
             }
         }
-        let message_had_usage = add_opencode_tokens(&mut usage, msg.doc.get("tokens"));
+        // rm-619: the message-level fold is the authoritative lift of the
+        // step-finish part's `tokens`, so a fold that consumed BILLING
+        // classes suppresses the part rescue (the same usage would count
+        // twice). A reasoning-only or unknown-key message `tokens` object
+        // consumed no billing class, so the rescue still fires and the
+        // step's input/output survives.
+        let message_fold = add_opencode_tokens(&mut usage, msg.doc.get("tokens"), true);
         let (events, part_usage) =
-            parse_opencode_message(&storage_root, &msg.doc, &model, message_had_usage);
+            parse_opencode_message(&storage_root, &msg.doc, &model, message_fold);
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
@@ -5628,7 +5634,7 @@ fn parse_opencode_message(
     storage_root: &Path,
     msg: &Map<String, Value>,
     model: &str,
-    message_had_usage: bool,
+    message_fold: OpencodeTokensFold,
 ) -> (Vec<Event>, BTreeMap<String, i64>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
@@ -5669,8 +5675,13 @@ fn parse_opencode_message(
                 }
             }
             "tool" => events.extend(opencode_tool_events(part, &part_ts, model)),
-            "step-finish" if !message_had_usage => {
-                add_opencode_tokens(&mut part_usage, part.get("tokens"));
+            "step-finish" if !message_fold.billing => {
+                // rm-619 rescue: the message level reported no billing
+                // classes, so this part is the only place the step's usage
+                // exists. Reasoning folds here only when the message level
+                // did not already disclose it — each key class counts once
+                // under the mirror contract.
+                add_opencode_tokens(&mut part_usage, part.get("tokens"), !message_fold.reasoning);
             }
             _ => {}
         }
@@ -5838,17 +5849,42 @@ fn opencode_message_model(msg: &Map<String, Value>) -> String {
         .to_string()
 }
 
-fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -> bool {
+/// Which recognized key classes an opencode `tokens` fold actually
+/// consumed — drives the step-finish rescue guard (rm-619). The
+/// message-level `tokens` object is the authoritative lift of the
+/// step-finish part's copy, so BILLING classes (input/output/cache)
+/// count once at the message level and the part lane only rescues a
+/// step whose message reported no billing at all.
+#[derive(Clone, Copy, Default)]
+struct OpencodeTokensFold {
+    billing: bool,
+    reasoning: bool,
+}
+
+fn add_opencode_tokens(
+    usage: &mut BTreeMap<String, i64>,
+    raw: Option<&Value>,
+    fold_reasoning: bool,
+) -> OpencodeTokensFold {
     let Some(tokens) = raw.and_then(Value::as_object) else {
-        return false;
+        return OpencodeTokensFold::default();
     };
-    add_usage_value(usage, "input_tokens", tokens.get("input"));
-    add_usage_value(usage, "output_tokens", tokens.get("output"));
+    let mut folded = OpencodeTokensFold::default();
+    folded.billing |= add_usage_value(usage, "input_tokens", tokens.get("input"));
+    folded.billing |= add_usage_value(usage, "output_tokens", tokens.get("output"));
     if let Some(cache) = tokens.get("cache").and_then(Value::as_object) {
-        add_usage_value(usage, "cache_read_input_tokens", cache.get("read"));
-        add_usage_value(usage, "cache_creation_input_tokens", cache.get("write"));
+        folded.billing |= add_usage_value(usage, "cache_read_input_tokens", cache.get("read"));
+        folded.billing |= add_usage_value(usage, "cache_creation_input_tokens", cache.get("write"));
     }
-    true
+    if fold_reasoning {
+        // rm-619: `tokens.reasoning` folds per the codex discipline — a
+        // disclosed breakdown that rides within the output family
+        // (`tokens_reasoning` is billed at the output rate and never
+        // ADDED to `tokens_output`, pass-9 CU-20) — so folding it must
+        // not make `message_had_usage` true and suppress the rescue.
+        folded.reasoning |= add_usage_value(usage, "reasoning_tokens", tokens.get("reasoning"));
+    }
+    folded
 }
 
 fn add_usage(dst: &mut BTreeMap<String, i64>, src: &BTreeMap<String, i64>) {
@@ -5861,12 +5897,14 @@ fn add_usage(dst: &mut BTreeMap<String, i64>, src: &BTreeMap<String, i64>) {
     }
 }
 
-fn add_usage_value(usage: &mut BTreeMap<String, i64>, key: &str, raw: Option<&Value>) {
+fn add_usage_value(usage: &mut BTreeMap<String, i64>, key: &str, raw: Option<&Value>) -> bool {
     if let Some(value) = raw.and_then(number_as_i64).filter(|value| *value > 0) {
         let slot = usage.entry(key.to_string()).or_insert(0);
         // rm-046: see add_usage — clamp instead of panicking/wrapping.
         *slot = (*slot).saturating_add(value);
+        return true;
     }
+    false
 }
 
 fn usage_has_values(usage: &BTreeMap<String, i64>) -> bool {

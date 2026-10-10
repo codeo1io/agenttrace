@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 53;
 // Bumped 50 -> 51 (run 0a55a397 cycle-1 "accounting truth"
 // residual batch, attempt 5712b6f0: codex record-arm reasoning
 // breakdown rm-617 + pi alias first-present rm-618 + qwen per-reason
@@ -30,6 +30,21 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
 // never landed) so every warm entry written before rm-618/rm-619/
 // rm-251 corrected the served totals regenerates.
 // Entries regenerate once on next scan.
+// Bumped 51 -> 53 (run e944a060a640 cycle 1 "usage truthfulness &
+// honest ordering", attempt 2ba22694: rm-619 + rm-954 + rm-955).
+// The opencode fold reported `message_had_usage` for ANY `tokens`
+// object, so a message carrying only reasoning (or only unknown
+// keys) suppressed the step-finish part rescue and the session
+// served zero usage (twin PoC: 0 tokens/$0.0000 vs control
+// 100/50/$0.0011); the sqlite earliest-user-text rank and the
+// statusline latest-state pick are render-side and ride the same
+// rung for cycle coherence. Same keys, same persisted shape: the
+// VALUES move, so a warm v51 cache keeps serving the zeroed totals
+// on a cache hit (rm-230 convention). Minted at the fleet census
+// ceiling: this tree held the landed 51, sibling worktree
+// run-57c491338818 holds an uncommitted 52 — minted 53 so every
+// rung stays unique across the fleet. Entries regenerate once on
+// next scan.
 // Bumped 45 -> 46 (integration landing of run 33b7b7b5, conflict
 // case 58fbbd6c — the run's rung re-based a THIRD time, and the
 // first moved by a sibling claim rather than a landed ceiling: the

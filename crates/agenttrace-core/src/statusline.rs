@@ -711,17 +711,27 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
         })
         .collect();
 
-    let mut latest: [Option<usize>; 2] = [None, None];
+    // rm-955: the latest-state pick shares the rm-921 crossings
+    // discipline — one composite rank, captured_at first with journal
+    // position only as the tie-break — instead of array position, so
+    // an out-of-order journal (clock skew, an older journal merged
+    // in) cannot surface a stale-by-clock observation as the current
+    // window state. On an in-order journal the last position carries
+    // the greatest captured_at, so the pick is identical to the old
+    // array-order pick.
+    let mut latest: [Option<(i64, usize)>; 2] = [None, None];
     for (position, states) in windows.iter().enumerate() {
-        if states[0].is_some() {
-            latest[0] = Some(position);
-        }
-        if states[1].is_some() {
-            latest[1] = Some(position);
+        for window in 0..2 {
+            if states[window].is_some() {
+                let rank = (deduped[position].captured_at, position);
+                if latest[window].is_none_or(|current| rank > current) {
+                    latest[window] = Some(rank);
+                }
+            }
         }
     }
-    let five_hour = latest[0].and_then(|position| windows[position][0].clone());
-    let seven_day = latest[1].and_then(|position| windows[position][1].clone());
+    let five_hour = latest[0].and_then(|(_, position)| windows[position][0].clone());
+    let seven_day = latest[1].and_then(|(_, position)| windows[position][1].clone());
 
     let peak = |window: usize| {
         windows
@@ -1810,6 +1820,36 @@ mod tests {
             "the latest observed state wins"
         );
         assert_eq!(insights.five_hour_peak_used_percentage, Some(96.0));
+    }
+
+    #[test]
+    fn out_of_order_journal_picks_latest_state_by_captured_at() {
+        // rm-955: "latest observed state" used to be picked by journal
+        // position while the rm-921 crossing probes sorted by
+        // captured_at — so the exact out-of-order journal those probes
+        // defend (clock skew, an older journal merged in) reported a
+        // stale-by-clock window as current. The pick now ranks by
+        // (captured_at, journal position), the crossings discipline:
+        // here the journal's LAST capture carries the OLDER clock, and
+        // the fresh-clock capture must still win both windows.
+        let mut stale_clock_last_position = capture_at(FIXTURE, 1_760_000_100);
+        stale_clock_last_position.payload["rate_limits"]["five_hour"]["used_percentage"] =
+            serde_json::json!(41.0);
+        stale_clock_last_position.payload["rate_limits"]["seven_day"]["used_percentage"] =
+            serde_json::json!(21.0);
+        let fresh_clock_first_position = capture_at(FIXTURE, 1_760_090_000);
+        let insights =
+            statusline_insights(&[fresh_clock_first_position, stale_clock_last_position]);
+        assert_eq!(
+            insights.five_hour.and_then(|state| state.used_percentage),
+            Some(84.0),
+            "the greatest captured_at wins five_hour regardless of journal position"
+        );
+        assert_eq!(
+            insights.seven_day.and_then(|state| state.used_percentage),
+            Some(46.0),
+            "the greatest captured_at wins seven_day regardless of journal position"
+        );
     }
 
     #[test]

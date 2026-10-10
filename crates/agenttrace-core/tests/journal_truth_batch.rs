@@ -430,6 +430,34 @@ fn fixture_codex_0160_fork_pair_surfaces_wire_on_both_sides() {
     );
 }
 
+// ---------------------------------------------------------------- rm-619
+// usage-accounting/opencode-reasoning-rescue: message-level `tokens`
+// objects carrying only non-billing keys (a reasoning-only breakdown, or
+// entirely unknown names) must not suppress the step-finish part rescue.
+// The pre-fix fold returned true for ANY object, so the step's billing
+// was silently lost with zero disclosure.
+#[test]
+fn fixture_opencode_reasoning_rescue_counts_step_finish_usage() {
+    let session_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/usage-accounting/opencode-reasoning-rescue")
+        .join("opencode/storage/session/ses_rescue/ses_rescue.json");
+    let parsed = agenttrace_core::parse_file(&session_path)
+        .expect("parse opencode reasoning-rescue session");
+    assert_eq!(parsed.metrics.source_tool, "opencode");
+    assert_eq!(
+        parsed.metrics.tokens_input, 107,
+        "both step-finish rescues must count (100 + 7)"
+    );
+    assert_eq!(
+        parsed.metrics.tokens_output, 58,
+        "both step-finish rescues must count (50 + 8)"
+    );
+    assert_eq!(
+        parsed.metrics.tokens_reasoning, 777,
+        "message-level reasoning folds once as the disclosed breakdown (pass-9 CU-20: rides within output, never additive)"
+    );
+}
+
 #[test]
 fn fixture_advisor_iterations_attribution_round_trips() {
     // usage-accounting/claude-advisor: the tokscale #1386 shape — the
