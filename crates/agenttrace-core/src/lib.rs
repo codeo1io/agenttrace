@@ -512,7 +512,11 @@ pub struct Metrics {
     /// (catalog × unpriced tokens + recorded USD) instead of comparing
     /// a catalog-only total against a recorded-cost-inclusive one and
     /// false-tripping a drift note on every recorded-cost session
-    /// (rm-520).
+    /// (rm-520). Cache rows written before the schema 41 bump surface
+    /// with these all-zero beside a positive `upstream_cost_usd` —
+    /// that shape is a basis that cannot be reproduced, never
+    /// evidence of zero upstream-priced tokens (rm-578 withholds the
+    /// re-price there).
     #[serde(skip_serializing_if = "zero_i64")]
     pub upstream_priced_input: i64,
     #[serde(skip_serializing_if = "zero_i64")]
@@ -1319,6 +1323,10 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // to metrics.disclosure_counters — the non-loss disclosure channel
     // — so they stay visible under the disclosure row without tanking
     // confidence for an otherwise-exact parse.
+    //
+    // rm-490: capture a family fallback before the loop consumes `events` —
+    // meta-only sessions (codex usage journals, copilot metric records)
+    // otherwise end with an empty source_tool.
     let meta_fallback_source_tool = events
         .iter()
         .find(|event| !event.source_tool.is_empty())

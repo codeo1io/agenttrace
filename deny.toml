@@ -46,6 +46,16 @@ yanked = "deny"
 # merged lock for both scopes, so the widening is a pure policy
 # strengthening, not a new gate failure).
 unsound = "all"
+# rm-007 arm (cycle 3, run e94bb1ee "trust & truthfulness", unioned at
+# conflict case c5e676d9, 2026-10-10): unmaintained advisories FAIL this
+# lane instead of passing silently — with the unsound policy above, both
+# informational classes cargo-deny lets through by default are now denied
+# by policy. The candidate's original probe note ("no unsound deny knob
+# in v2") is corrected by the landed rm-587/rm-498 lines above: `unsound =
+# "all"` is exactly that knob. The bump-past-the-patch-floor operating
+# rule stays the remediation path for any advisory the policy flags —
+# lru 0.18.1 → 0.18.5 was already landed here as rm-552.
+unmaintained = "all"
 ignore = []
 
 [licenses]

@@ -2203,6 +2203,12 @@ impl GoMetrics {
             line_skips: self.line_skips.clone(),
             zero_usage_events: self.zero_usage_events,
             upstream_cost_usd: self.upstream_cost_usd,
+            // rm-520: the upstream-priced token split round-trips with
+            // the row (schema 41) so a cached recorded-cost session
+            // keeps its rm-436 basis. Rows written before that bump
+            // deserialize as zeros beside a positive
+            // `upstream_cost_usd` — governance treats that shape as a
+            // basis it must not report as rate drift (rm-578).
             upstream_priced_input: self.upstream_priced_input,
             upstream_priced_output: self.upstream_priced_output,
             upstream_priced_cache_w: self.upstream_priced_cache_w,

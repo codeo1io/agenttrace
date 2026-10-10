@@ -301,20 +301,18 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
     let remote = remote_name();
     let ref_name = ref_name();
 
-    // Fail fast with the same hints scripts/upstream-delta gives. rm-543:
-    // only a probe that RAN and failed counts as a missing prerequisite —
-    // a probe that timed out is terminal (named deadline), so a wedged
-    // git can never masquerade as "not inside a git repository".
-    match git_bounded(&["rev-parse", "--show-toplevel"]) {
-        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
-        Err(_) => bail!("not inside a git repository"),
-        Ok(_) => {}
-    }
-    let remote_url = match git_bounded(&["remote", "get-url", &remote]) {
-        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
-        Err(_) => bail!("no '{remote}' remote configured (git remote add {remote} <url>)"),
-        Ok(url) => url,
-    };
+    // Fail fast with the same hints scripts/upstream-delta gives.
+    // rm-543 + rm-579 routing lives in `git_probe`: only a probe that
+    // RAN and failed counts as a missing prerequisite, so these hints
+    // stay truthful under every failure mode.
+    git_probe(
+        &["rev-parse", "--show-toplevel"],
+        "not inside a git repository",
+    )?;
+    let remote_url = git_probe(
+        &["remote", "get-url", &remote],
+        &format!("no '{remote}' remote configured (git remote add {remote} <url>)"),
+    )?;
     if fetch {
         // rm-404: PRIVACY.md promises fully-offline-by-default, so every opt-in
         // network touch announces itself on stderr before any request goes out.
@@ -322,11 +320,10 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         fetch_remote(&remote)?;
     }
     let tracking = format!("refs/remotes/{remote}/{ref_name}");
-    match git_bounded(&["rev-parse", "--verify", &tracking]) {
-        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
-        Err(_) => bail!("no remote-tracking ref {tracking}; run agenttrace --fetch upstream"),
-        Ok(_) => {}
-    }
+    git_probe(
+        &["rev-parse", "--verify", &tracking],
+        &format!("no remote-tracking ref {tracking}; run agenttrace --fetch upstream"),
+    )?;
 
     let local_head = git(&["rev-parse", "HEAD"])?;
     let local_branch = match git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
@@ -430,6 +427,28 @@ fn fetch_remote(remote: &str) -> anyhow::Result<()> {
 fn git_bounded(args: &[&str]) -> Result<String, GitRunError> {
     let (_, stdout, _) = run_bounded("git", args, UPSTREAM_GIT_TIMEOUT)?;
     Ok(stdout.trim_end().to_string())
+}
+
+/// rm-543/rm-579: run one fail-fast prerequisite probe and collapse
+/// its failure into the caller's missing-prerequisite hint — routing
+/// the failure classes distinctly so the hint stays truthful. Only a
+/// probe that RAN and failed (non-zero exit) is a missing
+/// prerequisite. A probe that timed out is terminal and names its
+/// deadline (rm-543), so a wedged git can never masquerade as "not
+/// inside a git repository". A probe that could not even start git
+/// (binary absent from PATH, exec failed) is an environment failure,
+/// not a repository fact: it must name the spawn instead of collapsing
+/// into the hint, so a PATH-less shell is not misdiagnosed as a
+/// missing repository/remote/ref (rm-579).
+fn git_probe(args: &[&str], missing: &str) -> anyhow::Result<String> {
+    match git_bounded(args) {
+        Ok(output) => Ok(output),
+        Err(err @ GitRunError::Timeout { .. }) => bail!("{err}"),
+        Err(err @ GitRunError::Spawn { .. }) => {
+            bail!("{err} — git could not be started; is git installed and on PATH?")
+        }
+        Err(_) => bail!("{missing}"),
+    }
 }
 
 /// Runs git and returns trimmed stdout; errors carry the command and a

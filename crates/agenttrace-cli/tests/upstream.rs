@@ -267,6 +267,51 @@ fn outside_a_git_repository_fails() {
 }
 
 #[test]
+fn missing_git_binary_is_a_spawn_diagnosis_not_a_missing_repository() {
+    // rm-579: run inside a REAL git repository but with a PATH that
+    // cannot resolve `git`. The first prerequisite probe cannot even
+    // start git — an environment failure that must name the spawn,
+    // not collapse into the probe's semantic verdict ("not inside a
+    // git repository"). Pinned in both renderings: the human report
+    // and `-f json` share the anyhow error channel, so each must
+    // carry the spawn diagnosis on stderr with a non-zero exit.
+    let fixture = Fixture::new("spawn");
+
+    let run_without_git = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+        if json {
+            command.arg("-f").arg("json");
+        }
+        command.arg("upstream").current_dir(&fixture.fork);
+        for (key, value) in GIT_ENV {
+            command.env(key, value);
+        }
+        command.env("PATH", "/nonexistent-agenttrace-rm579");
+        command.output().expect("run agenttrace CLI")
+    };
+
+    for output in [run_without_git(false), run_without_git(true)] {
+        assert!(
+            !output.status.success(),
+            "a PATH-less environment must fail, not report"
+        );
+        let err = stderr(&output);
+        assert!(
+            err.contains("failed to spawn git rev-parse --show-toplevel"),
+            "expected the spawn diagnosis naming the probe, got {err:?}"
+        );
+        assert!(
+            err.contains("is git installed and on PATH"),
+            "expected the PATH hint, got {err:?}"
+        );
+        assert!(
+            !err.contains("not inside a git repository"),
+            "a spawn failure must not masquerade as a repository verdict, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn fetch_flag_refreshes_remote_tracking_refs() {
     let fixture = Fixture::new("fetchflag");
     fixture.upstream_commit("up1.txt", "upstream: before clone-visible window");
