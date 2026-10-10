@@ -372,8 +372,9 @@ The overview also carries attribution dimensions over the same scope:
 - `by_model`: which model the spend went to, keyed by the catalog's
   normalized model name. **Session counts in these buckets deliberately
   overlap**: a session that used more than one model is counted once in
-  *each* attributed model bucket and also once in the headline
-  `multiple-models` count, so `sum(by_model.sessions)` is intentionally
+  *each* attributed model bucket and also once in the headline `multiple`
+  bucket (the literal by_model key multi-model sessions collapse under),
+  so `sum(by_model.sessions)` is intentionally
   *not* `total_sessions` — do not additively combine them in CI checks.
   Cost and token sums remain exact (each session's spend is attributed
   to the models that actually produced it, with no double counting of
