@@ -58,7 +58,10 @@ args = ["mcp"]
 ## Protocol surface
 
 Newline-delimited JSON-RPC 2.0 over stdio — one JSON message per line
-in, one per line out, flushed per message.
+in, one per line out, flushed per message. One line is capped at 1 MiB
+(`MCP_INPUT_MAX_BYTES`, mirroring the statusline host's stdin stance): a
+longer line is drained through its newline and answered with a `-32600`
+error naming the cap, and the messages after it still answer.
 
 | Method | Answers |
 | --- | --- |

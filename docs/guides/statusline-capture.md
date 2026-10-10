@@ -62,6 +62,12 @@ Every invocation appends one JSON line — `{"captured_at": <unix seconds>,
 Retention is bounded at 10 MiB: past that, oldest **whole** lines are dropped
 until the journal fits half the bound, through a temp-file rename so a crash
 mid-compaction cannot truncate it. Torn or malformed lines are skipped on read.
+The read side honors the same bound: a journal planted or grown past it by any
+other means is read newest-first within 10 MiB (the stats lane discloses this
+with `read_truncated`), and decoding is lossy — invalid UTF-8 damages only
+its own line (skipped like a torn one when the corruption breaks its JSON
+structure, still disclosed when it does not), while every other line still
+reports; the next compaction rewrites the journal as clean UTF-8.
 
 ## Schema (what agenttrace reads)
 

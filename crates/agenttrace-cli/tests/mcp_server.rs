@@ -370,3 +370,41 @@ fn empty_home_is_a_tool_error_not_a_crash() {
         .contains("No session files found"));
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
+
+#[test]
+fn oversized_message_line_is_refused_and_the_stream_stays_framed() {
+    // rm-923: the transport caps one stdin message line at 1 MiB,
+    // mirroring the statusline host's stdin stance. An over-cap line —
+    // VALID JSON a host could otherwise process, as here (the
+    // pristine binary answered it with a normal initialize result) —
+    // is answered with a JSON-RPC error (id null: the discarded
+    // message cannot be trusted to carry an id) and drained through
+    // its newline, so the requests after it still answer and the
+    // server exits 0.
+    let (home, cache) = seed_home("oversize", false);
+    let padding = "x".repeat(1024 * 1024 + 64);
+    let requests = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"pad\":\"{padding}\"}}}}\n\
+         {{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}}\n"
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, &requests);
+    assert_eq!(Some(0), code, "the server survives an over-cap line");
+    assert_eq!(2, responses.len(), "one response per line: {responses:?}");
+    let refused = responses[0]
+        .get("error")
+        .unwrap_or_else(|| panic!("the over-cap line is refused, not answered: {responses:?}"));
+    assert_eq!(refused["code"], -32600);
+    assert!(
+        refused["message"]
+            .as_str()
+            .expect("error message")
+            .contains("transport cap"),
+        "the refusal names the bound: {refused}"
+    );
+    assert_eq!(responses[1]["id"], 2);
+    assert!(
+        responses[1].get("result").is_some(),
+        "the stream stays framed after the refusal: {responses:?}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
