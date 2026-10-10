@@ -5,6 +5,13 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   verify:
     name: Verify release sources
@@ -15,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
@@ -22,15 +31,16 @@ jobs:
           # rm-173: aligned with rust-toolchain.toml (the toolchain file
           # overrides this input for every cargo step in the repo).
           toolchain: "1.98.1"
+          components: rustfmt, clippy
 
       - name: Cache Rust dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-verify-${{ hashFiles('**/Cargo.lock') }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace --all-targets -- -D warnings
 
       - name: Rust tests (locked)
         run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
@@ -70,6 +80,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
@@ -84,26 +96,24 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Cache Rust dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}
 
       - name: Build
         shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
         run: |
           release_version="${GITHUB_REF_NAME#v}"
           AGENTTRACE_RELEASE_VERSION="$release_version" \
-            cargo build --release -p agenttrace --target "${{ matrix.target }}" --locked
-          out="${{ matrix.asset }}"
+            cargo build --release -p agenttrace --target "$TARGET" --locked
+          out="$ASSET"
           exe=""
-          if [[ "${{ matrix.target }}" == *windows* ]]; then exe=".exe"; fi
-          cp "target/${{ matrix.target }}/release/agenttrace${exe}" "$out"
+          if [[ "$TARGET" == *windows* ]]; then exe=".exe"; fi
+          cp "target/$TARGET/release/agenttrace${exe}" "$out"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$out" > "${out}.sha256"
           else
@@ -130,6 +140,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -140,7 +152,7 @@ jobs:
       - name: Create checksums
         run: |
           cd dist
-          cat *.sha256 > checksums.txt
+          cat ./*.sha256 > checksums.txt
           sort -o checksums.txt checksums.txt
 
       - name: Attest release assets
@@ -160,6 +172,7 @@ jobs:
       - name: Pack npm launcher
         run: |
           version="${GITHUB_REF_NAME#v}"
+          # shellcheck disable=SC2016
           RELEASE_VERSION="$version" node -e '
             const fs = require("fs");
             const file = "npm/package.json";
@@ -182,9 +195,14 @@ jobs:
 
       - name: Publish npm launcher
         run: |
-          npm publish "./dist/zack78-agenttrace-${GITHUB_REF_NAME#v}.tgz" --access public
+          version="${GITHUB_REF_NAME#v}"
+          if npm view "@zack78/agenttrace@${version}" version >/dev/null 2>&1; then
+            echo "@zack78/agenttrace@${version} is already published; skipping"
+            exit 0
+          fi
+          npm publish "./dist/zack78-agenttrace-${version}.tgz" --access public --provenance
 
-      - name: Render Homebrew and WinGet manifests
+      - name: Render Homebrew Formula
         run: |
           scripts/release/render-channels.sh \
             "${GITHUB_REF_NAME#v}" \
@@ -195,68 +213,6 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          test -n "$HOMEBREW_TAP_TOKEN" || {
-            echo "HOMEBREW_TAP_TOKEN is required to update luoyuctl/homebrew-tap." >&2
-            exit 1
-          }
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/luoyuctl/homebrew-tap.git" homebrew-tap
-          install -Dm644 channel-dist/homebrew/Formula/agenttrace.rb homebrew-tap/Formula/agenttrace.rb
-          cd homebrew-tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/agenttrace.rb
-          git diff --cached --quiet || git commit -m "agenttrace ${GITHUB_REF_NAME}"
-          git push origin HEAD
-
-      - name: Upload WinGet manifests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: agenttrace-winget-${{ github.ref_name }}
-          path: channel-dist/winget
-          if-no-files-found: error
-
-  winget:
-    # rm-156, cycle 1 ("Truthful posture, enforced gates"): WinGet
-    # submission moved off `ghcr.io/microsoft/winget-create:latest` — an
-    # image that does not exist, so every automated submission was already
-    # failing, and the only unpinned runner in the token-bearing release
-    # lane. Ported from upstream luoyuctl/agenttrace #292 (merged
-    # 2026-09-30): a pinned wingetcreate.exe downloaded from its GitHub
-    # release and verified by SHA256 before it ever sees a token.
-    name: Submit WinGet manifest
-    needs: release
-    runs-on: windows-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    env:
-      WINGETCREATE_VERSION: v1.12.13.0
-      WINGETCREATE_SHA256: 24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA
-    steps:
-      - name: Download WinGet manifests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: agenttrace-winget-${{ github.ref_name }}
-          path: winget
-
-      - name: Download pinned wingetcreate
-        shell: pwsh
-        run: |
-          $url = "https://github.com/microsoft/winget-create/releases/download/$env:WINGETCREATE_VERSION/wingetcreate.exe"
-          Invoke-WebRequest -Uri $url -OutFile wingetcreate.exe
-          $actual = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
-          if ($actual -ne $env:WINGETCREATE_SHA256) {
-            throw "wingetcreate.exe checksum mismatch: $actual"
-          }
-
-      - name: Submit manifest
-        shell: pwsh
-        env:
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
-        run: |
-          if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
-            throw "WINGET_GITHUB_TOKEN is required to submit the WinGet manifest."
-          }
-          $manifest = Get-ChildItem -Path winget/manifests -Recurse -Filter "Luoyuctl.AgentTrace.yaml" | Select-Object -First 1
-          if (-not $manifest) { throw "WinGet version manifest not found" }
-          ./wingetcreate.exe submit $manifest.DirectoryName --prtitle "New version: Luoyuctl.AgentTrace $env:GITHUB_REF_NAME" --no-open
+          scripts/release/publish-homebrew.sh \
+            "$GITHUB_REF_NAME" \
+            channel-dist/homebrew/Formula/agenttrace.rb

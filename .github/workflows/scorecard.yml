@@ -1,24 +1,12 @@
-name: Scorecard supply-chain security
-
-# rm-155, cycle 1 ("Truthful posture, enforced gates").
-#
-# OpenSSF Scorecard was deferred on a false premise: the fork remote was
-# believed private, but codeo1io/agenttrace is public (verified live
-# 2026-09-30 via `gh repo view --json visibility,isPrivate`), so the
-# deferral rationale recorded in deny.toml, ROADMAP.md rm-010, and
-# docs/solutions/security-issues/rustsec-advisory-shipped-via-ungated-
-# lockfile.md was factually wrong. This lane replaces it.
-#
-# All actions are digest-pinned to match the repo's supply-chain posture
-# (rm-009/rm-010); tag comments record which release each SHA resolves to.
+name: Scorecard
 
 on:
   branch_protection_rule:
   schedule:
-    - cron: "31 2 * * 2"
+    - cron: "23 4 * * 1"
   push:
-    branches:
-      - master
+    branches: [master]
+  workflow_dispatch:
 
 permissions: read-all
 
@@ -27,41 +15,29 @@ jobs:
     name: Scorecard analysis
     runs-on: ubuntu-latest
     permissions:
-      # Needed for Code scanning upload
       security-events: write
-      # Needed for GitHub OIDC token if publish_results is true
       id-token: write
-      contents: read
-      actions: read
-      checks: read
-      deployments: read
-      issues: read
-      discussions: read
-      packages: read
-      pull-requests: read
-      repository-projects: read
-
     steps:
-      - name: "Checkout code"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (same pin as ci.yml/release.yml)
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
-      - name: "Run analysis"
-        uses: ossf/scorecard-action@05b42c624433fc40578a4040d5cf5e36ddca8cde # v2.4.2
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc
         with:
           results_file: results.sarif
           results_format: sarif
-          # Scorecard publication is safe and desired on this public repo;
-          # it publishes the aggregate score, not repo content.
           publish_results: true
 
-      - name: "Upload artifact"
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # same pin as ci.yml/release.yml
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: SARIF file
+          name: scorecard-sarif
           path: results.sarif
           retention-days: 5
 
-      - name: "Upload to code-scanning"
-        uses: github/codeql-action/upload-sarif@3599b3baa15b485a2e49ef411a7a4bb2452e7f93 # v3.30.5
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
         with:
           sarif_file: results.sarif

@@ -364,29 +364,137 @@
 - Added `scripts/pricing/update-snapshot.sh` to regenerate the bundled pricing snapshot.
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
-## v0.9.0 - 2026-09-30
+## v0.10.1 - 2026-10-05
 
-Backfilled from the GitHub release notes for the tags that shipped without
-changelog entries (`v0.8.0`, `v0.8.1`, `v0.9.0`; full changelogs:
-[v0.8.1...v0.9.0](https://github.com/luoyuctl/agenttrace/compare/v0.8.1...v0.9.0)).
+Upstream release adopted by this merge (`merge: adopt upstream v0.10.1`). Both parser fixes
+were already ported into this fork's parser ahead of the merge (documented in the Unreleased
+section); this section records the upstream release being adopted wholesale:
+
+- **parser:** Sum every WorkBuddy usage record instead of keeping the last ([#311](https://github.com/luoyuctl/agenttrace/pull/311))
+- **parser:** Correct token accounting across agents; drop Gemini CLI ([#312](https://github.com/luoyuctl/agenttrace/pull/312)) — the Gemini lane is retained in this fork
+- **docs:** Add v0.10.0 changelog and backfill v0.9.1 ([#308](https://github.com/luoyuctl/agenttrace/pull/308))
+
+## v0.10.0 - 2026-10-04
+
+### Added
+
+- **install:** Checksum-verified installers, PATH setup, agenttrace update; drop WinGet ([#301](https://github.com/luoyuctl/agenttrace/pull/301))
+- **tui:** Adaptive 120 FPS motion and aligned layouts ([#302](https://github.com/luoyuctl/agenttrace/pull/302))
+- Attribute Claude Code subagent cost and tokens to the parent session ([#305](https://github.com/luoyuctl/agenttrace/pull/305))
+- **cli:** --daily/--weekly/--monthly with --tz, and 5-hour --blocks ([#306](https://github.com/luoyuctl/agenttrace/pull/306))
 
 ### Fixed
 
-- Parser: skip leading non-session lines in Oh My Pi JSONL ([#284](https://github.com/luoyuctl/agenttrace/pull/284)).
-- Windows: link the MSVC CRT statically so installed binaries no longer require the
-  Visual C++ Redistributable ([#285](https://github.com/luoyuctl/agenttrace/pull/285)).
-- Codex cost double counting fixed and TUI triage tightened ([#286](https://github.com/luoyuctl/agenttrace/pull/286));
-  includes the total-usage rewind/high-water handling that `rm-162` ports into
-  this fork's parser.
+- **parser:** Stop classifying Claude Code transcripts with session_id as Qwen Code ([#304](https://github.com/luoyuctl/agenttrace/pull/304))
+- Usage report and update edge cases from post-0.9.0 review ([#307](https://github.com/luoyuctl/agenttrace/pull/307))
+
+### Build and CI
+
+- Split jobs, cache, cross-OS tests, MSRV 1.85, actionlint, idempotent release ([#303](https://github.com/luoyuctl/agenttrace/pull/303))
+
+## v0.9.1 - 2026-10-04
+
+### Added
+
+- **i18n:** Localize reports, governance, doctor, search and CLI ([#299](https://github.com/luoyuctl/agenttrace/pull/299))
+
+### Fixed
+
+- **diagnostics:** Separate unmatched tool calls from explicit timeouts ([#296](https://github.com/luoyuctl/agenttrace/pull/296))
+
+### Documentation
+
+- Add coverage and OpenSSF Scorecard badges ([#290](https://github.com/luoyuctl/agenttrace/pull/290))
+
+### Build and CI
+
+- Add CodeRabbit review config and Codecov coverage ([#287](https://github.com/luoyuctl/agenttrace/pull/287))
+- Add cargo-deny and OpenSSF Scorecard; patch rustls advisory ([#288](https://github.com/luoyuctl/agenttrace/pull/288))
+- Generate CHANGELOG entries with git-cliff after each release ([#289](https://github.com/luoyuctl/agenttrace/pull/289))
+- Add manual workflow to republish Homebrew and WinGet for an existing release ([#291](https://github.com/luoyuctl/agenttrace/pull/291))
+- **release:** Submit WinGet with pinned wingetcreate.exe on Windows ([#292](https://github.com/luoyuctl/agenttrace/pull/292))
+- Switch CodeRabbit reviews and summaries to English ([#293](https://github.com/luoyuctl/agenttrace/pull/293))
+- Ignore generated_at in deterministic output check ([#294](https://github.com/luoyuctl/agenttrace/pull/294))
+- **release:** Render WinGet manifests that pass winget-pkgs validation ([#295](https://github.com/luoyuctl/agenttrace/pull/295))
+
+### Maintenance
+
+- **coderabbit:** Assertive profile + request-changes workflow ([#300](https://github.com/luoyuctl/agenttrace/pull/300))
+- **i18n:** Unify en/zh strings on rust-i18n locale files ([#297](https://github.com/luoyuctl/agenttrace/pull/297))
+- **i18n:** Key core messages and localize live TUI gaps ([#298](https://github.com/luoyuctl/agenttrace/pull/298))
+
+## v0.9.0 - 2026-09-29
+
+### Fixed
+
+- **parser:** Skip leading non-session lines in Oh My Pi JSONL ([#284](https://github.com/luoyuctl/agenttrace/pull/284))
+
+### Changed
+
+- Fix Codex cost double counting and tighten TUI triage ([#286](https://github.com/luoyuctl/agenttrace/pull/286))
+
+### Build and CI
+
+- **windows:** Link the MSVC CRT statically ([#285](https://github.com/luoyuctl/agenttrace/pull/285))
 
 ## v0.8.1 - 2026-09-06
 
-Annotated retroactively (`rm-303`): this tag shipped without a changelog
-section. Its delta is the TUI navigation/feedback/loading-progress work of
-[#283](https://github.com/luoyuctl/agenttrace/pull/283) (`a34dea2`); the
-v0.9.0 section above backfills the release notes for `v0.8.0`–`v0.9.0` in
-one place
-([release page](https://github.com/luoyuctl/agenttrace/releases/tag/v0.8.1)).
+### Changed
+
+- Improve TUI navigation, feedback and loading progress ([#283](https://github.com/luoyuctl/agenttrace/pull/283))
+
+### Documentation
+
+- Remove stale README run summary ([#281](https://github.com/luoyuctl/agenttrace/pull/281))
+
+## v0.8.0 - 2026-08-22
+
+### Changed
+
+- Authenticate GHCR and remove obsolete Pages surfaces
+- Improve pricing provenance and TUI session exploration ([#280](https://github.com/luoyuctl/agenttrace/pull/280))
+
+### Dependencies
+
+- **deps:** Bump the github-actions group with 2 updates ([#277](https://github.com/luoyuctl/agenttrace/pull/277))
+
+## v0.7.7 - 2026-07-25
+
+### Fixed
+
+- Fix release channel script permissions
+
+## v0.7.6 - 2026-07-25
+
+### Changed
+
+- Publish npm launcher under zack78 scope
+
+## v0.7.5 - 2026-07-20
+
+### Fixed
+
+- Configure npm auth before publishing
+
+## v0.7.3 - 2026-07-20
+
+### Fixed
+
+- Publish npm tarball as a file
+
+## v0.7.2 - 2026-07-20
+
+### Added
+
+- Publish CLI through npm brew and winget
+
+### Fixed
+
+- Decouple pages checks from release version
+
+### Maintenance
+
+- Derive release versions from tags
 
 ## v0.7.1 - 2026-07-20
 

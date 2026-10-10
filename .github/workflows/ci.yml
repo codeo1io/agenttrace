@@ -15,230 +15,67 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   lint:
-    # PR fast lane (2026-09-19): fmt + clippy only — the compile-check
-    # surface, ~2min warm on the persisted cargo target. Everything else
-    # (tests, release build, the smoke scripts) moved to `full`, which runs
-    # on push(master), the nightly schedule, and dispatch — never on
-    # pull_request. The single job used to take 560s per PR (run
-    # 35105368113), dominated by the 291s release build.
-    # PR-only (2026-09-19b): on master the two jobs serialize on the single
-    # self-hosted runner (run 35458293806: 17:30 run start, Lint didn't get
-    # the runner until 18:07 — 38min wall for 9min of work). `full` covers
-    # fmt+clippy on non-PR refs via its own check step, so lint stays the
-    # PR gate only.
-    if: github.event_name == 'pull_request'
-    name: Lint
+    name: Lint and repo contracts
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
-          # rm-173: aligned with the repo's rust-toolchain.toml pin. The
-          # toolchain file governs every cargo step below (rustup resolution:
-          # toolchain file > `rustup default`), so this input must name the
-          # same version or the action installs a toolchain nothing runs.
+          # rm-173: aligned with rust-toolchain.toml (the toolchain file
+          # governs every cargo step; this input must name the same
+          # version or the action installs a toolchain nothing runs).
           toolchain: "1.98.1"
+          components: rustfmt, clippy
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      # Self-hosted cargo target persistence: branch checkouts invalidate the
-      # workspace target dir; a lockfile-keyed tarball under the runner's
-      # persistent tool dir restores a warm tree so clippy/checks hit the
-      # incremental cache (2026-09-19: clippy alone was 2m36s cold on run
-      # measured; target dir is 369M).
-      - name: Restore cargo target
+      - name: Lint workflows
         run: |
-          KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
-          CACHE_DIR="$RUNNER_TOOL_CACHE/../cargo-cache"
-          mkdir -p "$CACHE_DIR"
-          if [ -f "$CACHE_DIR/$KEY.tar" ]; then
-            mkdir -p target
-            # rm-170: a tar truncated by a killed save used to fail the step
-            # outright — a cold build is strictly better than a red PR, so a
-            # corrupt cache is deleted and the run continues cold.
-            if tar -xf "$CACHE_DIR/$KEY.tar" -C .; then
-              echo "restored from $KEY"
-            else
-              rm -f "$CACHE_DIR/$KEY.tar"
-              rm -rf target
-              echo "cache for $KEY was corrupt; removed, building cold"
-            fi
-          else
-            echo "no cache for $KEY"
-          fi
+          # actionlint v1.7.12
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
 
       - name: Check Rust formatting
         run: cargo fmt --check
 
       - name: Clippy
         # rm-654: the wall-discipline form — test/bench/example targets
-        # too. Clippy-on-lib-only let real errors rot in the Lint lane
-        # before (check+fmt-only merge rounds); both forms run every
-        # merge round, mirroring the local gate.
-        run: |
-          cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+        # too. Clippy-on-lib-only let real errors rot in the lint lane
+        # before; this mirrors the local gate.
+        run: cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace --all-targets -- -D warnings
 
-      - name: Lockfile enforcement (cargo --locked)
-        run: scripts/ci/check-locked-cargo.sh
-
-      - name: Installer ref drift gate
-        run: scripts/ci/check-install-ref-drift.sh
-
-      - name: Save cargo target
-        run: |
-          KEY="cargo-$(sha256sum Cargo.lock | cut -c1-16)"
-          CACHE_DIR="$RUNNER_TOOL_CACHE/../cargo-cache"
-          mkdir -p "$CACHE_DIR"
-          # rm-170: the cache is bounded (newest 3 lockfile keys, ~370M per
-          # tar). Re-archiving an unchanged tree burned a full 369M write on
-          # every lint run, so only re-tar when the restored cache is
-          # missing or the build actually produced newer artifacts.
-          if [ -f "$CACHE_DIR/$KEY.tar" ] \
-            && ! find target -newer "$CACHE_DIR/$KEY.tar" -print -quit 2>/dev/null | grep -q .; then
-            echo "cache for $KEY is current; skipping re-tar"
-          else
-            tar -cf "$CACHE_DIR/$KEY.tar" target
-            echo "saved $KEY"
-          fi
-          ls -t "$CACHE_DIR"/*.tar 2>/dev/null | tail -n +4 | xargs -r rm -f
-
-  full:
-    # Full verification: everything beyond the lint surface — tests, the
-    # release build, and all smoke scripts. Runs on push(master), nightly
-    # schedule, and dispatch; NOT on pull_request (the `lint` job is the PR
-    # gate). Artifacts upload unchanged.
-    if: github.event_name != 'pull_request'
-    name: Test and build
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          # rm-173: same pin as the Lint job above / rust-toolchain.toml.
-          toolchain: "1.98.1"
-
-      - name: Check Rust formatting
-        run: cargo fmt --check
-
-      - name: Clippy
-        # rm-654: the wall-discipline form — test/bench/example targets
-        # too. Clippy-on-lib-only let real errors rot in the Lint lane
-        # before (check+fmt-only merge rounds); both forms run every
-        # merge round, mirroring the local gate.
-        run: |
-          cargo clippy --locked -p agenttrace-core -p agenttrace-tui -p agenttrace -- -D warnings
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: Rust tests
-        run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
-
-      - name: MSRV floor check
-        # rm-386: prove the Cargo.toml `rust-version` floor is real —
-        # the declared floor must itself compile the workspace. Runs on
-        # the nightly schedule and manual dispatch only: a second
-        # toolchain means a cold target dir, and the PR/push lanes stay
-        # fast. The floor is read from Cargo.toml so this lane and the
-        # manifest cannot drift apart; older toolchains are rejected
-        # loudly by cargo's own rust-version guard.
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: |
-          MSRV="$(sed -nE 's/^rust-version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
-          [ -n "$MSRV" ] || { echo "no rust-version found in Cargo.toml" >&2; exit 1; }
-          echo "declared MSRV: $MSRV"
-          rustup toolchain install "$MSRV" --profile minimal
-          cargo "+$MSRV" check --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
-
-      - name: Build CLI
-        run: cargo build --release --locked -p agenttrace
-
-      - name: Single binary CLI and TUI entrypoints
-        run: cargo test --locked -p agenttrace --test entrypoints
-
-      - name: Demo and report output contract
-        run: |
-          AGENTTRACE_BIN=target/release/agenttrace \
-          AGENTTRACE_CI_OUT=ci-artifacts \
-            scripts/ci/check-output-contract.sh
-
-      - name: Deterministic demo output
-        run: |
-          AGENTTRACE_BIN=target/release/agenttrace \
-          AGENTTRACE_CI_OUT=ci-artifacts \
-            scripts/ci/check-deterministic-output.sh
-
-      - name: Report semantic consistency
-        run: |
-          AGENTTRACE_BIN=target/release/agenttrace \
-          AGENTTRACE_CI_OUT=ci-artifacts \
-            scripts/ci/check-report-semantics.sh
+      - name: Validate Cargo manifests
+        run: scripts/ci/check-cargo-manifests.sh
 
       - name: Release surface drift
         run: scripts/ci/check-release-surfaces.sh
 
-      - name: Example workflow supply-chain pinning
-        run: scripts/ci/check-example-workflows.sh
-
-      - name: Install runtime verification
+      - name: Validate helper scripts
         run: |
-          AGENTTRACE_BIN=target/release/agenttrace \
-            scripts/ci/check-install-runtime.sh
+          bash -n scripts/record-demo.sh scripts/ci/*.sh scripts/release/*.sh
+          sh -n install.sh
 
-      - name: Documented command smoke tests
-        run: |
-          AGENTTRACE_BIN=target/release/agenttrace \
-          AGENTTRACE_CI_OUT=ci-artifacts \
-            scripts/ci/check-docs-commands.sh
+      - name: Lockfile enforcement (cargo --locked)
+        # rm-170 lineage: every CI cargo step runs --locked; this gate
+        # makes a drifted lockfile a named failure, not a surprise.
+        run: scripts/ci/check-locked-cargo.sh
 
-      - name: Rust CLI fixture smoke
-        run: |
-          AGENTTRACE_BIN=target/release/agenttrace \
-          AGENTTRACE_REAL_CLI_DIR=testdata \
-          AGENTTRACE_REAL_CLI_QUERY=internal/ws \
-          AGENTTRACE_REAL_CLI_FILE_LIMIT=20 \
-          AGENTTRACE_REAL_CLI_OUT=ci-artifacts/real-cli-smoke \
-            scripts/ci/check-rust-real-cli-smoke.sh
-
-      - name: Rust TUI real-data smoke
-        # Pass-11 A11-8 (N5/P4-5), fixed in cycle 7: this gate used to read
-        # `env.AGENTTRACE_TUI_REAL_DIR != ''`, which is set nowhere in the
-        # workflow, the job, or the step — a never-true condition that
-        # silently disabled the PTY smoke. The gate is now the repository
-        # variable of the same name: opt in by setting
-        # AGENTTRACE_TUI_REAL_DIR in repo settings, and the step forwards
-        # it to the script.
-        if: vars.AGENTTRACE_TUI_REAL_DIR != ''
-        env:
-          AGENTTRACE_TUI_REAL_DIR: ${{ vars.AGENTTRACE_TUI_REAL_DIR }}
-        run: |
-          AGENTTRACE_BIN=target/release/agenttrace \
-            scripts/ci/check-rust-tui-real-smoke.sh
-
-      - name: Upload demo report artifacts
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: agenttrace-ci-reports
-          path: ci-artifacts
-          if-no-files-found: warn
-
-      - name: Validate Homebrew formula syntax
-        run: ruby -c homebrew/Formula/agenttrace.rb
-
-      - name: Test npm package contract
-        run: npm --prefix npm test
-
-      - name: Validate Cargo manifests
-        run: scripts/ci/check-cargo-manifests.sh
+      - name: Installer ref drift gate
+        # rm-017: install.sh's default AGENTTRACE_SOURCE_REF must track
+        # the newest CHANGELOG release heading.
+        run: scripts/ci/check-install-ref-drift.sh
 
       - name: Codex plugin version sync
         run: |
@@ -247,35 +84,81 @@ jobs:
           git fetch --tags --quiet || true
           scripts/ci/check-plugin-version.sh
 
-      - name: Validate helper scripts
-        run: |
-          bash -n scripts/record-demo.sh scripts/ci/*.sh
-          sh -n install.sh
+      - name: Validate Homebrew formula syntax
+        run: ruby -c homebrew/Formula/agenttrace.rb
 
-      - name: Lockfile enforcement (cargo --locked)
-        run: scripts/ci/check-locked-cargo.sh
+      - name: Test npm package contract
+        run: npm --prefix npm test
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux tests run under the coverage job.
+        os: [macos-14, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # rm-173: same pin as the lint job / rust-toolchain.toml.
+          toolchain: "1.98.1"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Rust tests
+        shell: bash
+        run: cargo test --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.89"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check
+        # The repo pins rust-toolchain.toml (rm-173), which outranks the
+        # action's toolchain input; the explicit +1.89 selector makes the
+        # floor the version that actually compiles here.
+        run: cargo +1.89 check --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
 
   conformance:
     # rm-053, cycle 2 ("Conformance guardrail: token-accounting truth"):
     # the checked-in conformance pack (testdata/conformance/ — manifest
     # plus fixtures derived from the five audited AgentMeasure billing-bug
-    # classes, first cases importing the rm-046 adversarial corpus
-    # verbatim) runs against parser+pricing through both halves: the
+    # classes) runs against parser+pricing through both halves: the
     # library harness (crates/agenttrace-core/tests/token_conformance.rs,
     # which also re-derives every cost literal from the bundled pricing
     # snapshot so a snapshot refresh forces a pack refresh) and the
     # offline CLI runner (scripts/conformance/run.sh). Any silent
     # double-count, mis-price, or unprovable total fails the job.
     #
-    # Gating (rm-053 acceptance: "gates PRs touching parser.rs or
-    # pricing.rs"): the audit step below greps the PR diff for that
-    # surface and states it greppably, but the pack itself is cheap and
-    # fully offline, so the job runs on every event like `deny` — a
-    # conditionally-skipped job can never actually gate a PR, and the
-    # superset also guards against token-accounting drift introduced
-    # from files the acceptance did not name.
+    # The pack is cheap and fully offline, so the job runs on every event
+    # like `deny` — a conditionally-skipped job can never actually gate a
+    # PR, and the superset also guards against token-accounting drift
+    # introduced from files the acceptance did not name.
     name: Token conformance
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -284,7 +167,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
-          # rm-173: same pin as the Lint/full jobs / rust-toolchain.toml.
+          # rm-173: same pin as the lint/full jobs / rust-toolchain.toml.
           toolchain: "1.98.1"
 
       - name: Gate surface audit
@@ -322,21 +205,148 @@ jobs:
       - name: Validate runner script
         run: bash -n scripts/conformance/run.sh
 
+  smoke:
+    name: Release binary smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AGENTTRACE_BIN: target/release/agenttrace
+      AGENTTRACE_CI_OUT: ci-artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # rm-173: same pin as the lint job / rust-toolchain.toml.
+          toolchain: "1.98.1"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build CLI
+        run: cargo build --locked --release -p agenttrace
+
+      - name: Demo and report output contract
+        run: scripts/ci/check-output-contract.sh
+
+      - name: Deterministic demo output
+        run: scripts/ci/check-deterministic-output.sh
+
+      - name: Report semantic consistency
+        run: scripts/ci/check-report-semantics.sh
+
+      - name: Example workflow supply-chain pinning
+        run: scripts/ci/check-example-workflows.sh
+
+      - name: Install runtime verification
+        run: |
+          AGENTTRACE_BIN=target/release/agenttrace \
+            scripts/ci/check-install-runtime.sh
+
+      - name: Documented command smoke tests
+        run: scripts/ci/check-docs-commands.sh
+
+      - name: Rust CLI fixture smoke
+        env:
+          AGENTTRACE_REAL_CLI_DIR: testdata
+          AGENTTRACE_REAL_CLI_QUERY: internal/ws
+          AGENTTRACE_REAL_CLI_FILE_LIMIT: "20"
+          AGENTTRACE_REAL_CLI_OUT: ci-artifacts/real-cli-smoke
+        run: scripts/ci/check-rust-real-cli-smoke.sh
+
+      - name: Install expect
+        run: sudo apt-get update && sudo apt-get install -y expect
+
+      - name: Rust TUI fixture smoke
+        env:
+          AGENTTRACE_TUI_REAL_DIR: testdata
+        run: scripts/ci/check-rust-tui-real-smoke.sh
+
+      - name: Upload demo report artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: agenttrace-ci-reports
+          path: ci-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+  coverage:
+    name: Test and coverage (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          # rm-173: same pin as the lint job / rust-toolchain.toml.
+          toolchain: "1.98.1"
+          components: llvm-tools-preview
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Rust tests with coverage
+        run: cargo llvm-cov --locked -p agenttrace-core -p agenttrace-tui -p agenttrace --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
+        with:
+          files: lcov.info
+          disable_search: true
+          use_oidc: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+          fail_ci_if_error: false
+
   deny:
     # rm-010, cycle 1 ("Trusted transport, gated supply chain"): dependency
     # policy gate — advisories (RUSTSEC), licenses, bans, sources — against
-    # deny.toml at the repo root. Pattern from upstream PR #288 (merged
-    # 2026-09-30); runs on every push/PR/schedule like upstream, independent
-    # of the lint/full split (metadata-only, no compile, ~1min).
+    # deny.toml at the repo root. Runs on every push/PR/schedule
+    # (metadata-only, no compile, ~1min).
     name: Dependency policy (cargo-deny)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Check advisories, licenses, bans and sources
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           command: check
           arguments: --all-features
+
+  # Single required status check for the master ruleset; keep this job name stable.
+  gate:
+    name: Test and build
+    if: always()
+    needs: [lint, test, msrv, conformance, smoke, coverage, deny]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all CI jobs to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            [[ "$result" == "success" ]] || exit 1
+          done

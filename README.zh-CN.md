@@ -14,12 +14,13 @@
 
 <p align="center">
   <a href="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml"><img src="https://github.com/luoyuctl/agenttrace/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/luoyuctl/agenttrace"><img src="https://codecov.io/gh/luoyuctl/agenttrace/graph/badge.svg" alt="Coverage"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/luoyuctl/agenttrace"><img src="https://api.scorecard.dev/projects/github.com/luoyuctl/agenttrace/badge" alt="OpenSSF Scorecard"></a>
   <a href="https://github.com/luoyuctl/agenttrace/releases/latest"><img src="https://img.shields.io/github/v/release/luoyuctl/agenttrace?color=00ADD8" alt="Release"></a>
   <img src="https://img.shields.io/badge/Rust-stable-f74c00.svg" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
   <a href="https://github.com/luoyuctl/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-tap-2bbc8a.svg" alt="Homebrew tap"></a>
   <a href="https://www.npmjs.com/package/@zack78/agenttrace"><img src="https://img.shields.io/npm/v/@zack78/agenttrace?label=npm" alt="npm"></a>
-  <a href="https://github.com/microsoft/winget-pkgs"><img src="https://img.shields.io/badge/WinGet-Luoyuctl.AgentTrace-0078D4.svg" alt="WinGet"></a>
 </p>
 
 <p align="center">
@@ -28,7 +29,7 @@
 
 ---
 
-**agenttrace** 是一个本地优先的终端 TUI 和报告生成工具，用来分析 AI 编程 Agent 的会话历史。它会读取 Claude Code、Codex CLI、Gemini CLI、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Pi、Oh My Pi、Kimi CLI、Copilot-style logs 和通用 JSON/JSONL traces，主要帮你做两件事：汇总多个 Agent 历史会话的成本、Token 和耗时；定位某次任务为什么跑得慢。
+**agenttrace** 是一个本地优先的终端 TUI 和报告生成工具，用来分析 AI 编程 Agent 的会话历史。它会读取 Claude Code、Codex CLI、Qwen Code、Cline、Aider、Cursor exports、Hermes Agent、OpenCode、OpenClaw、Pi、Oh My Pi、Kimi CLI、Copilot-style logs 和通用 JSON/JSONL traces，主要帮你做两件事：汇总多个 Agent 历史会话的成本、Token 和耗时；定位某次任务为什么跑得慢。
 
 CLI 和 TUI 来自同一个 `agenttrace` 二进制：不带报告动作时进入 TUI，传入 `--sessions`、`--overview` 等参数时输出 CLI 报告。
 
@@ -69,7 +70,29 @@ agenttrace
 
 ## 安装
 
-优先通过包管理器安装当前公开版本；可用 `agenttrace --version` 检查实际版本。
+macOS 和 Linux：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+```
+
+Windows CMD：
+
+```bat
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.cmd -o install.cmd && install.cmd && del install.cmd
+```
+
+安装脚本会下载对应平台的发布版程序，按发布的校验和验证 SHA-256，并把安装目录
+（`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）加入 PATH。
+设置 `AGENTTRACE_VERSION=v0.9.1`（PowerShell 用 `-Version v0.9.1`）可固定版本。
+
+包管理器：
 
 ```bash
 # macOS 和 Linux
@@ -77,24 +100,21 @@ brew install luoyuctl/tap/agenttrace
 
 # macOS、Linux 和 Windows（需要 Node.js 18+）
 npm install -g @zack78/agenttrace
-```
 
-Windows：
-
-```powershell
-winget install --id Luoyuctl.AgentTrace --exact
-```
-
-以上包名会在对应版本发布后可用。没有包管理器时，仍可直接安装：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | sh
+# 从源码安装
 cargo install --git https://github.com/luoyuctl/agenttrace agenttrace
 ```
 
-```powershell
-iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
-```
+可用 `agenttrace --version` 检查实际版本。
+
+### 更新
+
+| 安装方式 | 更新命令 |
+| --- | --- |
+| Homebrew | `brew upgrade luoyuctl/tap/agenttrace` |
+| npm | `npm install -g @zack78/agenttrace@latest` |
+| cargo | `cargo install --git https://github.com/luoyuctl/agenttrace agenttrace --force` |
+
 
 预编译二进制与当前主机不兼容时（例如基于更新版本 libc 构建）不会
 被静默安装：安装器会报告加载器的错误信息，install.sh 会自动回退到
