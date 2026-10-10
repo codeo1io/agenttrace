@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 52 and the SQLite snapshot is schema 10; the
+The session cache is schema 57 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -279,7 +279,14 @@ note), and entry/listing keys encode non-UTF-8 paths losslessly
 (`at-bytes:` percent-escaping) so a warm store no longer hides the
 very non-UTF-8 journals it exists to remember; concurrent saves and
 clears serialize under an advisory lock sibling (`sessions.json.lock`)
-instead of racing last-writer-wins; the SQLite snapshot to 7
+instead of racing last-writer-wins, and to 57 at the usage-truthfulness
+batch (repository-maintenance run 331684778f6b cycle 1, 2026-10-11 —
+rm-961 workbuddy message-only dialect admission + rm-251 id-less
+requestId fold, minted at the 2026-10-11 fleet census over the
+committed ceiling 53 and the sibling worktree claims 54/55/56/65): a
+warm v52 entry serves a recorded workbuddy journal as the generic
+text estimate under `source_tool: generic` and splits one id-less
+streamed response into per-emission turns; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

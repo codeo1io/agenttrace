@@ -264,30 +264,49 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
         Ok(session)
     };
-    if parsed_value.is_none() {
-        // Workbuddy parses FIRST (probe order) but carries its own
-        // disclosure channel for the cache-clamp counter (rm-600,
-        // upstream #316) — exactly like kimi's alias counters below.
-        // rm-538 (integrated 2026-10-06) moved the whole
-        // workbuddy_input_basis:* family onto Metrics.disclosure_counters
-        // — the non-loss channel — so the clamp fact rides the SAME map
-        // as its cache_subtracted / zeroed_suspected_mismatch siblings
-        // (landed by the aggregator's meta arm) instead of degrading
-        // data_health.confidence and rendering under "Dropped lines".
-        // The session itself still goes through the rm-526 `finish`
-        // closure (re-threaded at the independent review, conflict case
-        // 7a502782): moving workbuddy out of the probe array for its own
-        // counter channel must not lose the jsonl line-skips census — a
-        // torn-tail workbuddy journal discloses `unparseable_line` in
-        // `line_skips` exactly like every other probe-path format, while
-        // its basis counters stay on the non-loss channel.
-        if let Some((events, parse_counters)) = parse_workbuddy_jsonl(&objs) {
-            let mut session = finish(events)?;
-            for (key, count) in parse_counters {
-                *session.metrics.disclosure_counters.entry(key).or_insert(0) += count as usize;
-            }
-            return Ok(session);
+    // Workbuddy parses FIRST (probe order) but carries its own
+    // disclosure channel for the cache-clamp counter (rm-600,
+    // upstream #316) — exactly like kimi's alias counters below.
+    // rm-538 (integrated 2026-10-06) moved the whole
+    // workbuddy_input_basis:* family onto Metrics.disclosure_counters
+    // — the non-loss channel — so the clamp fact rides the SAME map
+    // as its cache_subtracted / zeroed_suspected_mismatch siblings
+    // (landed by the aggregator's meta arm) instead of degrading
+    // data_health.confidence and rendering under "Dropped lines".
+    // The session itself still goes through the rm-526 `finish`
+    // closure (re-threaded at the independent review, conflict case
+    // 7a502782): moving workbuddy out of the probe array for its own
+    // counter channel must not lose the jsonl line-skips census — a
+    // torn-tail workbuddy journal discloses `unparseable_line` in
+    // `line_skips` exactly like every other probe-path format, while
+    // its basis counters stay on the non-loss channel.
+    //
+    // rm-961 (2026-10-11): this arm sits ABOVE the
+    // `parsed_value.is_none()` gate below, not inside it. A
+    // single-entry workbuddy journal is one JSON line, which ALSO
+    // parses as a whole-file JSON object — inside the gate, those
+    // files were routed past the entire jsonl probe chain to the
+    // generic value path, so a one-message journal with recorded
+    // `message.usage` still rendered as a text estimate under
+    // source_tool "generic" (the live red pair: control.jsonl vs
+    // ctl2.jsonl differ only in the function_call marker line). The
+    // admission gate inside parse_workbuddy_jsonl is tight enough
+    // (type:"message" AND sessionId AND cwd AND a non-empty usage
+    // object on the same record, or the classic tool/reasoning
+    // marker) to hold first claim for every shape; arrays and
+    // foreign objects fail it immediately.
+    if let Some((events, parse_counters)) = parse_workbuddy_jsonl(&objs) {
+        let mut session = finish(events)?;
+        for (key, count) in parse_counters {
+            *session.metrics.disclosure_counters.entry(key).or_insert(0) += count as usize;
         }
+        return Ok(session);
+    }
+    if parsed_value.is_none() {
+        // (Workbuddy used to parse first INSIDE this gate; rm-961
+        // hoisted the arm above it so single-object — i.e. one-line —
+        // journals reach the probe at all. The four-array probes and
+        // the kimi lane below still only see true multi-line jsonl.)
         let probes: [JsonlProbe; 4] = [
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
@@ -1430,13 +1449,42 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
 }
 
 fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounters)> {
-    if !objs.iter().any(|entry| {
+    // rm-961 (2026-10-11): admission needs a workbuddy-shaped marker,
+    // but NOT necessarily a tool/reasoning one. The vendor writes
+    // `type:"message"` rows with recorded `message.usage` (or
+    // `providerData.usage`) from the FIRST turn — long before any
+    // function_call exists — and gating only on tool/reasoning markers
+    // dropped those whole journals to the generic serde lane, which
+    // reads no usage at all (live red: recorded 100/10 rendered as a
+    // 7/0 text estimate under source_tool "generic"). The relaxed arm
+    // stays tightly workbuddy-shaped — `type:"message"` AND sessionId
+    // AND cwd AND a NON-EMPTY usage object on the same record — so the
+    // claude_code lane (`type: user|assistant`), the array-JSON claude
+    // transcript lane, and unknown producers keep their probes; a
+    // `usage:{}` block has nothing to lose and also stays generic
+    // (pinned by message-only-empty-usage.jsonl).
+    let admits = objs.iter().any(|entry| {
         matches!(
             string(entry.get("type")),
             Some("function_call" | "function_call_result" | "reasoning")
         ) && entry.contains_key("sessionId")
             && entry.contains_key("cwd")
-    }) {
+    }) || objs.iter().any(|entry| {
+        matches!(string(entry.get("type")), Some("message"))
+            && entry.contains_key("sessionId")
+            && entry.contains_key("cwd")
+            && entry
+                .get("message")
+                .and_then(|message| message.get("usage"))
+                .or_else(|| {
+                    entry
+                        .get("providerData")
+                        .and_then(|provider| provider.get("usage"))
+                })
+                .and_then(Value::as_object)
+                .is_some_and(|usage| !usage.is_empty())
+    });
+    if !admits {
         return None;
     }
     let mut events = Vec::new();
@@ -1484,8 +1532,26 @@ fn parse_workbuddy_jsonl(objs: &[JsonObject]) -> Option<(Vec<Event>, ParseCounte
         let cwd_disclosure = cwd_truncation_disclosure("workbuddy", cwd_truncated);
         match string(entry.get("type")).unwrap_or("") {
             "message" => {
-                let role = string(entry.get("role")).unwrap_or("");
-                let content = workbuddy_content(entry.get("content"));
+                // rm-961 (2026-10-11): the vendor nests `role`/`content`
+                // under the same `message` object that carries `usage`
+                // (exactly the shape the admission arm above now lets
+                // in); some journals also write them top-level. Resolve
+                // `message` first, then the entry — without this, a
+                // message-only journal pushed ZERO events and
+                // `non_empty` at the tail returned None, dropping the
+                // whole admitted file to the generic serde lane anyway
+                // (recorded usage re-rendered as a text estimate,
+                // source_tool "generic").
+                let message_obj = entry.get("message").and_then(Value::as_object);
+                let role = message_obj
+                    .and_then(|message| string(message.get("role")))
+                    .or_else(|| string(entry.get("role")))
+                    .unwrap_or("");
+                let content = workbuddy_content(
+                    message_obj
+                        .and_then(|message| message.get("content"))
+                        .or_else(|| entry.get("content")),
+                );
                 if !content.is_empty() {
                     events.push(Event {
                         role: role.to_string(),
@@ -4538,7 +4604,11 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // event per id, keeping the max per token class (never the sum: a
     // 5-block stream tripled the reported output). Exact duplicates
     // collapse to the same values; id-less messages keep the legacy
-    // behavior of counting every emission (pinned by fixture).
+    // behavior of counting every emission (pinned by fixture) — except
+    // those sharing a top-level requestId, which fold on it since the
+    // rm-251 id-less arm (2026-10-11): scrubbed exports strip
+    // message.id but keep requestId, and counting every emission of
+    // one response inflated sessions 2-3x (ccusage #1837's class).
     // rm-834: the fold is not usage-only — a re-emission is a full
     // SNAPSHOT of the message, so the per-id assistant event is replaced
     // in place by the latest (richest) snapshot and the meta slot's
@@ -4606,9 +4676,28 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         model = next_model.to_string();
                     }
                 }
+                // rm-251 id-less arm (2026-10-11, ccusage #1837's
+                // inflation class): the streaming re-emission fold's
+                // grouping key. message.id wins; for id-less messages
+                // (scrubbed exports keep the top-level requestId but
+                // strip message ids) the requestId is the response's
+                // stable identity, so re-emissions of one response fold
+                // into its last snapshot instead of counting every
+                // emission — 3 content-block snapshots of one response
+                // used to report 3 turns and 2-3x the tokens. Neither
+                // present -> empty key = legacy per-emission behavior,
+                // still pinned by claude-stream-idless.jsonl. The
+                // namespaced "requestId:" prefix cannot collide with a
+                // real message id (msg_*).
+                let fold_key = match string(message.get("id")).filter(|v| !v.is_empty()) {
+                    Some(id) => id.to_string(),
+                    None => string(obj.get("requestId"))
+                        .filter(|v| !v.is_empty())
+                        .map(|rid| format!("requestId:{rid}"))
+                        .unwrap_or_default(),
+                };
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
-                    let message_id = string(message.get("id")).unwrap_or("");
-                    match usage_by_message.get(message_id).copied() {
+                    match usage_by_message.get(&fold_key).copied() {
                         Some(index) => {
                             for (key, value) in usage {
                                 let slot = events[index].usage.entry(key).or_insert(0);
@@ -4624,8 +4713,8 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             }
                         }
                         None => {
-                            if !message_id.is_empty() {
-                                usage_by_message.insert(message_id.to_string(), events.len());
+                            if !fold_key.is_empty() {
+                                usage_by_message.insert(fold_key.clone(), events.len());
                             }
                             events.push(Event {
                                 role: "meta".to_string(),
@@ -4647,7 +4736,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 // streaming re-emissions repeat it verbatim); type:"message"
                 // entries are sub-turn duplicates of the top-level numbers
                 // and are NEVER folded, only disclosed.
-                claude_iterations_events(message, &ts, &model, &mut iterations_mined, &mut events);
+                claude_iterations_events(
+                    &fold_key,
+                    message,
+                    &ts,
+                    &model,
+                    &mut iterations_mined,
+                    &mut events,
+                );
                 let mut assistant_parts = Vec::new();
                 let mut reasoning_parts = Vec::new();
                 let mut tool_calls = Vec::new();
@@ -4695,16 +4791,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             // folds away.
                             let tool_use_id =
                                 string(block.get("tool_use_id")).unwrap_or("").to_string();
-                            let message_id = string(message.get("id")).unwrap_or("");
                             tool_result_ordinal += 1;
                             let dedup_key = if tool_use_id.is_empty() {
                                 format!("#{tool_result_ordinal}")
                             } else {
                                 tool_use_id.clone()
                             };
-                            if !message_id.is_empty()
-                                && !tool_results_by_message
-                                    .insert((message_id.to_string(), dedup_key))
+                            if !fold_key.is_empty()
+                                && !tool_results_by_message.insert((fold_key.clone(), dedup_key))
                             {
                                 continue;
                             }
@@ -4741,13 +4835,14 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     // rm-834: fold the snapshot per message id — the last
                     // re-emission (the complete one) replaces the earlier
                     // partial snapshot in place, so turns, tool calls,
-                    // anomalies and spans see the message once. Id-less
-                    // rows keep one event per row (pinned legacy).
-                    let message_id = string(message.get("id")).unwrap_or("");
-                    if message_id.is_empty() {
+                    // anomalies and spans see the message once. rm-251:
+                    // id-less rows with a requestId fold on it (same
+                    // response); rows with neither keep one event per row
+                    // (pinned legacy).
+                    if fold_key.is_empty() {
                         events.push(assistant_event);
                     } else {
-                        match assistant_by_message.get_mut(message_id) {
+                        match assistant_by_message.get_mut(&fold_key) {
                             Some(index) => {
                                 // rm-891: the fold is keep-max for usage
                                 // but used to be last-wins for content — a
@@ -4773,7 +4868,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                                 }
                             }
                             None => {
-                                assistant_by_message.insert(message_id.to_string(), events.len());
+                                assistant_by_message.insert(fold_key.clone(), events.len());
                                 events.push(assistant_event);
                             }
                         }
@@ -4800,17 +4895,19 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
 /// unrecognized shape surface as disclosure counters instead of
 /// silently vanishing or double-counting.
 fn claude_iterations_events(
+    fold_key: &str,
     message: &JsonObject,
     ts: &str,
     model: &str,
     mined: &mut BTreeSet<String>,
     events: &mut Vec<Event>,
 ) {
-    let message_id = string(message.get("id")).unwrap_or("");
     // Id-less messages mirror the legacy rm-601 behavior for top-level
-    // usage (every emission counts); an id-bearing message is mined
-    // exactly once no matter how many streaming rows repeat the array.
-    if !message_id.is_empty() && !mined.insert(message_id.to_string()) {
+    // usage (every emission counts); an id-bearing message — or, since
+    // the rm-251 id-less arm, an id-less row sharing one requestId —
+    // is mined exactly once no matter how many streaming rows repeat
+    // the array.
+    if !fold_key.is_empty() && !mined.insert(fold_key.to_string()) {
         return;
     }
     let Some(iterations) = message

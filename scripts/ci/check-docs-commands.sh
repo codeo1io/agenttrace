@@ -156,6 +156,35 @@ blank_docs=$(printf '%s\n' "$help_text" | awk '
 [[ "$blank_docs" -eq 0 ]] \
   || fail "$blank_docs flag(s) render a blank --help description; every Args field needs a doc comment"
 
+# rm-963 (2026-10-11): README PROSE must keep the same flag-truth the
+# rm-207 table parity holds for the flag table. README.md:151 shipped a
+# phantom `--since` filter for months — the binary rejects the flag
+# (--range is the real window filter) — and the count-parity gate was
+# green the whole time because prose mentions are not table rows. Any
+# backticked long flag in the README prose (including inside backticked
+# invocation snippets like `--sessions -f json`) must exist in the
+# --help output of the binary this gate ran against; drift fails closed
+# in either direction together with rm-207 above.
+for doc in README.md README.zh-CN.md; do
+  [[ -f "$doc" ]] || continue
+  while IFS= read -r flag; do
+    # Same ERE-quoting discipline as the skills sweep above, with
+    # ONE extra boundary class: help descriptions quote flags in
+    # backticks themselves (`framed for `--model`), so a pure
+    # whitespace boundary would miss those mentions and false-fail a
+    # truthful README that cites them.
+    flag_ere=$(printf '%s' "$flag" | sed -e 's/[][\\.*^$(){}?+|]/\\&/g')
+    # here-string, not a pipe: grep -q exits on first match and would
+    # SIGPIPE the ~6KB help text under pipefail (same hazard as the
+    # skills sweep above).
+    if ! grep -qE -- "(^|[[:space:]\`])${flag_ere}([[:space:]=,\`]|$)" <<<"$help_text"; then
+      fail "$doc documents flag $flag in prose, which is missing from --help"
+    fi
+  done < <(grep -oE '`[^`]*`' "$doc" | tr ' `\n\t' '\n\n\n\n' \
+      | sed -e 's/=.*$//' -e '/^$/d' \
+      | grep -E '^--[a-zA-Z0-9][a-zA-Z0-9_-]*$|^-[a-zA-Z]$' | sort -u)
+done
+
 # rm-455: the MCP server guide must exist and pin the local-truth
 # posture truthfully — read-only, stdio-only, no network — the same
 # one-truth rule the other guides carry. The guide must also keep the

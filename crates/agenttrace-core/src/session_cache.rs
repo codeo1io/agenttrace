@@ -5,7 +5,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 52;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 57;
+// Bumped 52 -> 57 (repository-maintenance cycle 1, run 331684778f6b,
+// 2026-10-11, "usage truthfulness & honest CLI semantics" batch —
+// rm-961 workbuddy message-only dialect admission + the rm-251 id-less
+// requestId fold: both change what a persisted session's usage and
+// turn shape mean for whole journal classes — a warm pre-bump entry
+// serves a recorded workbuddy journal as the generic text estimate
+// and splits one id-less streamed response into per-emission turns —
+// so the store regenerates once. 57 = the lowest rung unique above
+// the live fleet census at mint (2026-10-11: canonical committed 53;
+// sibling worktrees hold 54 — several lineages — 55 (run-8937be8e),
+// 56 (run-5a04ae3b) and 65 (run-5488904df7ec); 57-64 unclaimed),
+// one invalidation either way per the documented convention.
 // Bumped 51 -> 52 (integration of run 2d92ee95, "session-cache
 // store integrity" batch — rm-292 LEAD schema-change restore
 // lifecycle + rm-041 lossless cache keys + the rm-298 concurrent-
