@@ -222,3 +222,212 @@ fn doctor_counts_dropped_session_rows_as_failures() {
         row.failure_samples
     );
 }
+
+use rusqlite::Connection;
+
+// --- rm-893: enrichment-row drop disclosure (red-first arms) -----------------
+// Lanes under test (pre-fix they silently skipped rows whose columns
+// failed to decode): the opencode message lane, the opencode part
+// lane, the opencode user-text join, the hermes role-count lane and
+// the hermes tool-outcome lane. Each fixture stores a BLOB where a
+// lane reads TEXT: SQLite column affinity converts INTEGER inserts
+// into TEXT columns, but never converts BLOBs — so x'39'/x'37' is
+// the minimal value that reaches the reader as a non-TEXT storage
+// class, making rusqlite's String decode fail with
+// InvalidColumnType so the row used to vanish with no counter
+// anywhere. The fixtures sweep their temp home
+// first: a killed earlier run must not leave a half-built database
+// that turns the first execute_batch into "table already exists".
+
+fn opencode_enrichment_shell(tag: &str) -> std::path::PathBuf {
+    let home = temp_home(tag);
+    let _ = std::fs::remove_dir_all(&home);
+    let dir = home.join(".local/share/opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("opencode.db");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "create table session (id TEXT primary key, title TEXT, time_created INTEGER, \
+         time_updated INTEGER, parent_id TEXT); \
+         insert into session (id, title, time_created, time_updated) \
+         values ('s1', 'one session', 0, 0);",
+    )
+    .unwrap();
+    std::mem::drop(db);
+    home
+}
+
+#[test]
+fn discloses_opencode_message_row_drop() {
+    let home = opencode_enrichment_shell("oc-msg");
+    let db = Connection::open(home.join(".local/share/opencode/opencode.db")).unwrap();
+    // The user-text join matches p.message_id against m.id, so p1
+    // joins m1 and p2 joins m2 — the mistyped message is reached by
+    // both lanes that read message.data.
+    db.execute_batch(
+        "create table message (session_id TEXT, id TEXT, time_created INTEGER, \
+         message_id TEXT, data TEXT); \
+         insert into message (session_id, id, time_created, message_id, data) \
+         values ('s1', 'm1', 0, 'msg1', '{\"type\":\"message\"}'); \
+         insert into message (session_id, id, time_created, message_id, data) \
+         values ('s1', 'm2', 1, 'msg1', x'37'); \
+         create table part (session_id TEXT, id TEXT, time_created INTEGER, \
+         message_id TEXT, data TEXT); \
+         insert into part (session_id, id, time_created, message_id, data) \
+         values ('s1', 'p1', 0, 'm1', '{\"type\":\"text\"}'); \
+         insert into part (session_id, id, time_created, message_id, data) \
+         values ('s1', 'p2', 2, 'm2', '{\"type\":\"text\"}');",
+    )
+    .unwrap();
+    std::mem::drop(db);
+    let (sessions, report) = with_home(&home, load_sqlite_backed_sessions_reported_once);
+    std::fs::remove_dir_all(&home).ok();
+    // Exactly one session must survive; the mistyped row must not erase it.
+    assert_eq!(sessions.len(), 1, "good session must survive");
+    let rows: Vec<_> = report
+        .dropped_rows
+        .iter()
+        .filter(|row| row.source == "opencode")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "rm-893: one dropped-rows record for the opencode db: {:?}",
+        report.dropped_rows
+    );
+    // The mistyped message trips two lanes that read message.data: the
+    // message lane itself and the user-text join (p2 -> m2).
+    assert_eq!(rows[0].dropped, 2, "sample: {:?}", rows[0].sample);
+    assert!(
+        !rows[0].sample.is_empty(),
+        "the drop must be explained by a failure sample"
+    );
+}
+
+#[test]
+fn discloses_opencode_part_row_drop() {
+    let home = opencode_enrichment_shell("oc-part");
+    let db = Connection::open(home.join(".local/share/opencode/opencode.db")).unwrap();
+    db.execute_batch(
+        "create table message (session_id TEXT, id TEXT, time_created INTEGER, \
+         message_id TEXT, data TEXT); \
+         insert into message (session_id, id, time_created, message_id, data) \
+         values ('s1', 'm1', 0, 'msg1', '{\"type\":\"message\"}'); \
+         create table part (session_id TEXT, id TEXT, time_created INTEGER, \
+         message_id TEXT, data TEXT); \
+         insert into part (session_id, id, time_created, message_id, data) \
+         values ('s1', 'p1', 0, 'm1', '{\"type\":\"text\"}'); \
+         insert into part (session_id, id, time_created, message_id, data) \
+         values ('s1', 'p2', 1, 'm1', x'39');",
+    )
+    .unwrap();
+    std::mem::drop(db);
+    let (sessions, report) = with_home(&home, load_sqlite_backed_sessions_reported_once);
+    std::fs::remove_dir_all(&home).ok();
+    assert_eq!(sessions.len(), 1, "good session must survive");
+    let rows: Vec<_> = report
+        .dropped_rows
+        .iter()
+        .filter(|row| row.source == "opencode")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "rm-893: one dropped-rows record for the opencode db: {:?}",
+        report.dropped_rows
+    );
+    // The mistyped part trips two lanes that read part.data: the part
+    // lane itself and the user-text join (p2 -> m1).
+    assert_eq!(rows[0].dropped, 2, "sample: {:?}", rows[0].sample);
+    assert!(
+        !rows[0].sample.is_empty(),
+        "the drop must be explained by a failure sample"
+    );
+}
+
+fn hermes_enrichment_shell(tag: &str) -> std::path::PathBuf {
+    let home = temp_home(tag);
+    let _ = std::fs::remove_dir_all(&home);
+    let dir = home.join(".hermes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+    let db = Connection::open(&path).unwrap();
+    // INTEGER times: the sessions row decodes started_at/ended_at as
+    // f64, and a TEXT timestamp would fail that row — a different drop
+    // class than the one under test.
+    db.execute_batch(
+        "create table sessions (id TEXT primary key, model TEXT, started_at INTEGER, \
+         ended_at INTEGER, message_count INTEGER, tool_call_count INTEGER, \
+         input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, \
+         cache_write_tokens INTEGER); \
+         insert into sessions (id, model, started_at, ended_at) \
+         values ('h1', 'sonnet', 0, 60);",
+    )
+    .unwrap();
+    std::mem::drop(db);
+    home
+}
+
+#[test]
+fn discloses_hermes_role_row_drop() {
+    let home = hermes_enrichment_shell("hermes-role");
+    let db = Connection::open(home.join(".hermes/state.db")).unwrap();
+    db.execute_batch(
+        "create table messages (id TEXT, session_id TEXT, role TEXT, content TEXT); \
+         insert into messages (id, session_id, role, content) \
+         values ('x1', 'h1', 'user', 'hello'); \
+         insert into messages (id, session_id, role, content) \
+         values ('x2', 'h1', x'39', 'again');",
+    )
+    .unwrap();
+    std::mem::drop(db);
+    let (sessions, report) = with_home(&home, load_sqlite_backed_sessions_reported_once);
+    std::fs::remove_dir_all(&home).ok();
+    assert_eq!(sessions.len(), 1, "good session must survive");
+    assert!(
+        !report.dropped_rows.is_empty(),
+        "rm-893: role row with a mistyped role was dropped silently"
+    );
+    let row = &report.dropped_rows[0];
+    assert_eq!(row.source, "hermes");
+    // The mistyped role trips only the role-count lane: the
+    // tool-outcome query filters `where role = 'tool'`, and SQLite's
+    // type-strict comparison never returns an INTEGER role row.
+    assert_eq!(row.dropped, 1, "sample: {:?}", row.sample);
+    assert!(
+        !row.sample.is_empty(),
+        "the drop must be explained by a failure sample"
+    );
+}
+
+#[test]
+fn discloses_hermes_tool_outcome_row_drop() {
+    let home = hermes_enrichment_shell("hermes-tools");
+    let db = Connection::open(home.join(".hermes/state.db")).unwrap();
+    // The row must carry role='tool' to reach the tool-outcome lane's
+    // decoder; the INTEGER session_id then fails BOTH that lane and
+    // the role-count lane (each reads session_id as TEXT).
+    db.execute_batch(
+        "create table messages (id TEXT, session_id TEXT, role TEXT, content TEXT); \
+         insert into messages (id, session_id, role, content) \
+         values ('x1', 'h1', 'user', 'hello'); \
+         insert into messages (id, session_id, role, content) \
+         values ('x2', x'33', 'tool', 'Error executing tool demo: boom');",
+    )
+    .unwrap();
+    std::mem::drop(db);
+    let (sessions, report) = with_home(&home, load_sqlite_backed_sessions_reported_once);
+    std::fs::remove_dir_all(&home).ok();
+    assert_eq!(sessions.len(), 1, "good session must survive");
+    assert!(
+        !report.dropped_rows.is_empty(),
+        "rm-893: tool-outcome row with a mistyped session_id was dropped silently"
+    );
+    let row = &report.dropped_rows[0];
+    assert_eq!(row.source, "hermes");
+    assert_eq!(row.dropped, 2, "sample: {:?}", row.sample);
+    assert!(
+        !row.sample.is_empty(),
+        "the drop must be explained by a failure sample"
+    );
+}

@@ -523,7 +523,16 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
 // sessions onto one id and mis-report the retired sqlite-lane
 // fork-exclusion count (rm-791 supersession — children are retained
 // and attributed), so they regenerate once.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 9;
+// rm-893 rider: the snapshot schema advances 9 -> 10 because
+// enrichment-lane row drops (opencode message/part rows and the
+// part×message user-text join, hermes role-count and tool-outcome
+// groups) now count into the same per-file disclosure as session-row
+// drops — a database cached by a pre-rm-893 binary, whose silent
+// enrichment drops left the session lane looking clean, would keep
+// serving its snapshot forever on an unchanged (size, mtime)
+// fingerprint and hide the new drop counts. One regeneration retires
+// the stale entry (rm-230 convention).
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 10;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -2424,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_nine_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_ten_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -2464,10 +2473,14 @@ mod tests {
         store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version nine carries three rationales: rm-548 — snapshots
-        // now carry their opencode fork-exclusion count, so v7
-        // snapshots would disclose a silently-missing count and must
-        // regenerate; the rm-734 poison gate — a failed read banks
+        // Version ten (rm-893): enrichment-lane row drops began
+        // counting into the per-file disclosure, so v9 snapshots
+        // banked while those drops were silent must regenerate
+        // instead of hiding the new drop counts. Version nine carries
+        // three rationales: rm-548 — snapshots now carry their opencode
+        // fork-exclusion count, so v7 snapshots would disclose a
+        // silently-missing count and must regenerate; the rm-734 poison
+        // gate — a failed read banks
         // nothing and any EMPTY v7 snapshot a pre-gate run banked for
         // an unreadable database is evicted (the fingerprint alone
         // would keep serving it); and rm-790 — sqlite-backed sessions
@@ -2480,7 +2493,7 @@ mod tests {
         // (cycle-1 rm-198): hermes tool outcome semantics changed
         // (ok/fail now derive from the messages table), so v6 snapshots
         // carry stale splits.
-        assert_eq!(doc["schema_version"], 9);
+        assert_eq!(doc["schema_version"], 10);
         assert_eq!(
             doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
                 .and_then(serde_json::Value::as_str),
@@ -2491,8 +2504,7 @@ mod tests {
             Some(&serde_json::Value::from(720)),
             "the stored-versus-derived delta must survive the snapshot cache"
         );
-        let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema nine cache hit");
+        let loaded = load_sqlite_snapshot_from(&database, &snapshot).expect("schema ten cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
@@ -2506,10 +2518,10 @@ mod tests {
             "rm-791: the raw parent row id round-trips for post-load attribution"
         );
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(8);
+        old["schema_version"] = serde_json::Value::from(9);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema eight json"),
+            serde_json::to_vec(&old).expect("schema nine json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());

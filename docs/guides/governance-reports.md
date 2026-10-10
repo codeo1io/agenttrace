@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 51 and the SQLite snapshot is schema 9; the
+The session cache is schema 51 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -276,7 +276,7 @@ parent row id, making derived-history identity per-row instead of
 per-(database, second) so same-second sessions in one database stop
 folding onto a single history record (rm-790, run 2023f222 cycle 1 —
 landed at its base 611242d1 as 7 → 8, re-based at integration onto the
-advanced ceiling as 8 → 9). Older versions are discarded and
+advanced ceiling as 8 → 9), and to 10 when enrichment-lane row drops — opencode message/part rows and the part×message user-text join, plus hermes role-count and tool-outcome groups — began counting into the per-file drop disclosure, so a snapshot banked while those drops were still silent regenerates instead of hiding the new drop counts (rm-893). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the snapshot is bounded at
