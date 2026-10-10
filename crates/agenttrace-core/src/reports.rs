@@ -913,12 +913,28 @@ fn card_daily_series(sessions: &[Session], days: usize) -> Vec<(chrono::NaiveDat
     let mut buckets: std::collections::BTreeMap<chrono::NaiveDate, f64> =
         std::collections::BTreeMap::new();
     for session in sessions {
-        let day = session
-            .metrics
-            .timestamps
-            .iter()
+        // rm-911 (arm b): the bucket day comes from the cache-surviving
+        // session bounds first. `SessionMetrics::timestamps` is
+        // #[serde(skip)], so a warm-cache replay carries it EMPTY and
+        // the timestamps-only derivation collapsed the whole series
+        // onto the 1970-01-01 flat window (assess F1 PoC: c6-warm.svg).
+        // `session_start`/`session_end` round-trip the session cache,
+        // and lib.rs derives them from the sorted timestamp list on
+        // every lane that has one, so cold renders keep their exact
+        // buckets while warm replays stop collapsing. The raw-stamp max
+        // stays as the fallback for lanes whose bound string does not
+        // parse through the shared lenient arm — the same precedence
+        // rm-502 set for otel's `session_bounds`.
+        let day = crate::parse_ts(&session.metrics.session_end)
             .map(|ts| ts.naive_utc().date())
-            .max();
+            .or_else(|| {
+                session
+                    .metrics
+                    .timestamps
+                    .iter()
+                    .map(|ts| ts.naive_utc().date())
+                    .max()
+            });
         let Some(day) = day else { continue };
         latest = Some(match latest {
             Some(current) if current >= day => current,
@@ -1132,7 +1148,7 @@ fn render_usage_card(
 
     // Sparkline: daily spend over the corpus's trailing 14 days.
     out.push_str(&format!(
-        "<text{} x=\"40\" y=\"356\" fill=\"{}\" font-size=\"13\" font-family=\"ui-monospace, Menlo, monospace\">Daily spend \u{b7} last 14 days</text>\n",
+        "<text{} x=\"40\" y=\"356\" fill=\"{}\" font-size=\"13\" font-family=\"ui-monospace, Menlo, monospace\">Daily spend \u{b7} last 14 days \u{b7} binned by session end date</text>\n",
         cls("card-fg"),
         p.fg
     ));

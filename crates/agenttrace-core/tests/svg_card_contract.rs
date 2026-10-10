@@ -156,7 +156,14 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
         .expect("fixed anchor")
         .with_timezone(&chrono::Utc);
     for (i, session) in sessions.iter_mut().enumerate() {
-        session.metrics.timestamps = vec![anchor - chrono::Duration::days(i as i64)];
+        let stamp = anchor - chrono::Duration::days(i as i64);
+        session.metrics.timestamps = vec![stamp];
+        // rm-911: the card's daily series reads the cache-surviving
+        // session bounds FIRST (session_end == last event stamp on
+        // every lane that has one), so a corpus-clock fixture must set
+        // the bounds too — timestamps alone no longer move the axis.
+        session.metrics.session_start = stamp.to_rfc3339();
+        session.metrics.session_end = stamp.to_rfc3339();
     }
     let overview = compute_overview(&sessions);
     let card = report_overview_svg(&overview, &sessions, SvgCardTheme::Light);
@@ -208,5 +215,41 @@ fn theme_parser_rejects_unknown_values() {
         SvgCardTheme::parse("AUTO"),
         None,
         "case-sensitive like --lang"
+    );
+}
+
+#[test]
+fn daily_series_survives_the_warm_cache_replay_shape() {
+    // rm-911 (assess F1): `SessionMetrics::timestamps` is
+    // #[serde(skip)], so the warm session cache replays sessions with
+    // an EMPTY timestamp list while `session_start`/`session_end`
+    // survive the round trip (session_cache's GoMetrics carries them
+    // as strings). The card's daily-spend series used to read only
+    // `timestamps`, so warm replays rendered the flat 1970-01-01
+    // window (live PoC: /tmp/at-assess/c6-warm.svg). The series now
+    // derives from the surviving bounds, so the replay-shape corpus
+    // must render the SAME card as the full-shape corpus — byte for
+    // byte, and never the 1970 flat window.
+    let mut warm_shape = demo_sessions().expect("demo sessions parse");
+    for session in warm_shape.iter_mut() {
+        assert!(
+            !session.metrics.session_end.is_empty(),
+            "fixture sanity: demo sessions carry a session_end bound"
+        );
+        session.metrics.timestamps.clear();
+    }
+    let cold = card_of(SvgCardTheme::Light);
+    let warm = {
+        let overview = compute_overview(&warm_shape);
+        report_overview_svg(&overview, &warm_shape, SvgCardTheme::Light)
+    };
+    assert!(
+        !warm.contains("1970-01-01"),
+        "the warm-cache replay shape must not collapse the axis to the epoch"
+    );
+    assert_eq!(
+        cold, warm,
+        "the card must not depend on cache-dropped fields: same corpus, \
+         timestamps present vs replay-shape, byte-identical render"
     );
 }

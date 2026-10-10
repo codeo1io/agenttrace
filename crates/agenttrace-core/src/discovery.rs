@@ -60,6 +60,12 @@ pub struct LoadReport {
     /// rollout hint), so an all-corrupt directory can say what actually
     /// happened instead of "no sessions match the filters".
     pub first_parse_failure: Option<String>,
+    /// rm-912 (assess F2): every discovered file the loader ATTEMPTED
+    /// but failed to parse, in discovery order — the CLI's -o
+    /// membership check must cover these too, or
+    /// `--overview -d dir -o dir/bad.jsonl` silently overwrites the
+    /// unparseable input (a `.orig` twin is not a recovery path).
+    pub parse_failure_paths: Vec<PathBuf>,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -352,6 +358,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // LoadReport so the CLI can say what actually happened.
     let mut parse_failures = 0usize;
     let mut first_parse_failure: Option<String> = None;
+    // rm-912: attempted-but-failed paths in discovery order, for the
+    // CLI's -o membership check (see LoadReport::parse_failure_paths).
+    let mut parse_failure_paths: Vec<PathBuf> = Vec::new();
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Option<Session>, Option<String>)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -388,6 +397,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
                         if first_parse_failure.is_none() {
                             first_parse_failure = failure;
                         }
+                        // rm-912: the loader ATTEMPTED this path — it
+                        // joins the -o refusal set even though no
+                        // session was produced from it.
+                        parse_failure_paths.push(files[next].clone());
                         parse_failures += 1;
                     }
                 }
@@ -479,6 +492,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         opencode_fork_excluded,
         parse_failures,
         first_parse_failure,
+        parse_failure_paths,
         unlinked_subagents,
     }
 }
