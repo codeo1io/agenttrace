@@ -179,7 +179,10 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     let parsed_value = serde_json::from_str::<Value>(trimmed).ok();
     if let Some(value) = &parsed_value {
         if is_qwen_code_document(value) {
-            return session_from_events(name, path, parse_qwen_code_value(value)?);
+            let (events, qwen_skips) = parse_qwen_code_value(value)?;
+            let mut session = session_from_events(name, path, events)?;
+            attach_qwen_skip_counts(&mut session, &qwen_skips);
+            return Ok(session);
         }
         if let Some(events) = parse_openclaw_value(value) {
             return session_from_events(name, path, events);
@@ -218,8 +221,18 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                 // codex_unmatched_*) and the compaction usage-record
                 // accounting decisions stay on line_skips and keep the
                 // 39acfe43 contract: genuinely dropped lines degrade
-                // confidence.
-                if key == "codex_ignorable_line" || key == "codex_world_state" {
+                // confidence. The accounting-truth batch (rm-251 R1
+                // rider) adds two more non-loss keys in the same class:
+                // `codex_token_count_skipped:*` is the deliberate
+                // anti-inflation skip of a usage-less token_count
+                // line, and `codex_rate_limits_observed` counts quota
+                // snapshots wherever the line landed — both
+                // assumption-class disclosures, not parse loss.
+                if key == "codex_ignorable_line"
+                    || key == "codex_world_state"
+                    || key == "codex_rate_limits_observed"
+                    || key.starts_with("codex_token_count_skipped:")
+                {
                     *session.metrics.disclosure_counters.entry(key).or_insert(0) += count;
                 } else {
                     *session.metrics.line_skips.entry(key).or_insert(0) += count;
@@ -235,7 +248,10 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     // zero skips and its usage undercounted. Count the drops here and
     // attach them to every session parsed out of `objs`, through the
     // same `line_skips` channel the codex parser and the generic
-    // fallback already disclose through.
+    // fallback already disclose through. The qwen lane counts its own
+    // per-reason skips (qwen_entry_skipped, qwen_missing_message:* —
+    // accounting-truth batch, run 0a55a397 cycle 1) through
+    // attach_qwen_skip_counts, keeping the same channel contract.
     let (objs, jsonl_line_skips) = jsonl_objects_counted(raw);
     let finish = |events: Vec<Event>| -> anyhow::Result<Session> {
         let mut session = session_from_events(name, path, events)?;
@@ -315,7 +331,10 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if is_qwen_code_jsonl(&objs) {
-        return finish(parse_qwen_code_jsonl(&objs)?);
+        let (events, qwen_skips) = parse_qwen_code_jsonl(&objs)?;
+        let mut session = finish(events)?;
+        attach_qwen_skip_counts(&mut session, &qwen_skips);
+        return Ok(session);
     }
     if is_oh_my_pi_jsonl(&objs) {
         return finish(parse_oh_my_pi_jsonl(path, &objs)?);
@@ -2733,10 +2752,13 @@ fn oh_my_pi_content(raw: Option<&Value>) -> (String, String, bool, Vec<ToolCall>
 fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let obj = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
-    let input = sum_numbers(obj, &["input", "input_tokens"]);
-    let output = sum_numbers(obj, &["output", "output_tokens"]);
-    let cache_read = sum_numbers(obj, &["cacheRead", "cache_read_input_tokens"]);
-    let cache_write = sum_numbers(obj, &["cacheWrite", "cache_creation_input_tokens"]);
+    // rm-618: the alias pairs are the SAME quantity re-keyed by newer snapshots —
+    // first present wins, never the sum (the qwen lane pins the house convention;
+    // a hybrid snapshot carrying both keys must not double-count).
+    let input = first_present(obj, &["input", "input_tokens"]);
+    let output = first_present(obj, &["output", "output_tokens"]);
+    let cache_read = first_present(obj, &["cacheRead", "cache_read_input_tokens"]);
+    let cache_write = first_present(obj, &["cacheWrite", "cache_creation_input_tokens"]);
     if input > 0 {
         usage.insert("input_tokens".to_string(), input);
     }
@@ -2871,14 +2893,16 @@ fn is_qwen_code_json_output(obj: &Map<String, Value>) -> bool {
         && (obj.contains_key("stats") || obj.contains_key("usage"))
 }
 
-fn parse_qwen_code_jsonl(objs: &[JsonObject]) -> anyhow::Result<Vec<Event>> {
+fn parse_qwen_code_jsonl(
+    objs: &[JsonObject],
+) -> anyhow::Result<(Vec<Event>, BTreeMap<String, usize>)> {
     parse_qwen_code_objects(objs)
 }
 
-fn parse_qwen_code_value(value: &Value) -> anyhow::Result<Vec<Event>> {
+fn parse_qwen_code_value(value: &Value) -> anyhow::Result<(Vec<Event>, BTreeMap<String, usize>)> {
     match value {
         Value::Object(obj) if is_qwen_code_json_output(obj) && !is_qwen_code_event(obj) => {
-            parse_qwen_code_json_output(obj)
+            Ok((parse_qwen_code_json_output(obj)?, BTreeMap::new()))
         }
         Value::Object(obj) => parse_qwen_code_objects(std::slice::from_ref(obj)),
         Value::Array(items) => {
@@ -2893,12 +2917,21 @@ fn parse_qwen_code_value(value: &Value) -> anyhow::Result<Vec<Event>> {
     }
 }
 
-fn parse_qwen_code_objects<I>(objs: I) -> anyhow::Result<Vec<Event>>
+// Accounting-truth batch (run 0a55a397 cycle 1; the selection's
+// rm-619 qwen skip-table arm — numeral reconciliation rides the
+// roadmap fold): the qwen lane used to drop non-qwen objects,
+// records without a `message` object, and unrecognized entry types
+// (the classifier admits `stream_event`) with no count at all — a
+// usage undercount with zero disclosure. Count each skip per-reason
+// and thread the table out (see `attach_qwen_skip_counts` for the
+// channel split).
+fn parse_qwen_code_objects<I>(objs: I) -> anyhow::Result<(Vec<Event>, BTreeMap<String, usize>)>
 where
     I: IntoIterator,
     I::Item: std::borrow::Borrow<Map<String, Value>>,
 {
     let mut meta_events = Vec::new();
+    let mut skips: BTreeMap<String, usize> = BTreeMap::new();
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut has_assistant = false;
@@ -2907,6 +2940,9 @@ where
     for obj in objs {
         let obj = std::borrow::Borrow::borrow(&obj);
         if !is_qwen_code_event(obj) {
+            // Foreign or claude-shaped line in a qwen-classified file:
+            // dropped whole — count it (true loss).
+            *skips.entry("qwen_entry_skipped".to_string()).or_insert(0) += 1;
             continue;
         }
         let typ = string(obj.get("type")).unwrap_or("");
@@ -2927,12 +2963,18 @@ where
             }
             "user" => {
                 let Some(message) = obj.get("message").and_then(Value::as_object) else {
+                    *skips
+                        .entry("qwen_missing_message:user".to_string())
+                        .or_insert(0) += 1;
                     continue;
                 };
                 events.extend(qwen_message_events(message, &ts, &mut model));
             }
             "assistant" => {
                 let Some(message) = obj.get("message").and_then(Value::as_object) else {
+                    *skips
+                        .entry("qwen_missing_message:assistant".to_string())
+                        .or_insert(0) += 1;
                     continue;
                 };
                 for event in qwen_message_events(message, &ts, &mut model) {
@@ -2993,7 +3035,14 @@ where
                 // records arrive mid-turn.
                 has_usage = false;
             }
-            _ => {}
+            other => {
+                // Only `stream_event` can reach here (the classifier
+                // admits it): format-defined streamed deltas whose
+                // content the assistant record already carries.
+                *skips
+                    .entry(format!("qwen_unmatched_type:{other}"))
+                    .or_insert(0) += 1;
+            }
         }
     }
 
@@ -3001,7 +3050,30 @@ where
         bail!("qwen_code: no parseable events");
     }
     meta_events.extend(events);
-    Ok(meta_events)
+    Ok((meta_events, skips))
+}
+
+/// Accounting-truth batch (run 0a55a397 cycle 1; the selection's
+/// rm-619 qwen skip-table arm): attach the qwen lane's per-reason
+/// skip table through the rm-538 channel split. A dropped line
+/// (foreign object, record without a message object) is TRUE loss and
+/// rides `line_skips` — it degrades data_health.confidence exactly
+/// like the codex true-loss family — while a format-defined
+/// uncounted entry type (`stream_event` deltas, covered by the
+/// assistant record) is a structural fact and rides the non-loss
+/// `disclosure_counters` channel, like `codex_ignorable_line`.
+fn attach_qwen_skip_counts(session: &mut Session, skips: &BTreeMap<String, usize>) {
+    for (key, count) in skips {
+        if key.starts_with("qwen_unmatched_type:") {
+            *session
+                .metrics
+                .disclosure_counters
+                .entry(key.clone())
+                .or_insert(0) += *count;
+        } else {
+            *session.metrics.line_skips.entry(key.clone()).or_insert(0) += *count;
+        }
+    }
 }
 
 fn parse_qwen_code_json_output(obj: &Map<String, Value>) -> anyhow::Result<Vec<Event>> {
@@ -3385,11 +3457,14 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     let mut codex_totals = CodexTotals::default();
     // rm-880: session-level quota wire extracted off token_count
     // rate_limits snapshots (stable identity facts: plan, limit id /
-    // name) plus the observed-line count. The values ride the token
-    // meta events; the fold in `analyze` is last-wins, so the freshest
-    // snapshot a journal carried is the one the report serves.
+    // name). The values ride the token meta events; the fold in
+    // `analyze` is last-wins, so the freshest snapshot a journal
+    // carried is the one the report serves.
     let mut codex_rate_wire: BTreeMap<String, String> = BTreeMap::new();
-    let mut codex_rate_limit_lines: i64 = 0;
+    // Accounting-truth batch (rm-251 R1 rider): set when a
+    // rate-limit-only line updated the wire without producing an
+    // event — the terminal carrier below lands it.
+    let mut codex_rate_wire_pending = false;
     // rm-047: the head-probe fast path used to discard lines invisibly;
     // count every skip so parse diagnostics can surface it. rm-401
     // widened the map to the compaction-usage decisions too.
@@ -3581,12 +3656,23 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                     saw_token_count_row = true;
                     // rm-880: the rate_limits snapshot rides the token
                     // line itself (codex 0.160.1 wire) — extract its
-                    // stable identity facts and count the observation;
-                    // the per-window numbers are churn, not session
-                    // identity, and stay out of the accounting.
+                    // stable identity facts; the per-window numbers are
+                    // churn, not session identity, and stay out of the
+                    // accounting. Accounting-truth batch (rm-251 R1
+                    // rider, run 0a55a397 cycle 1): the observation is
+                    // minted ONCE PER LINE, wherever that line lands —
+                    // on its usage event, or through the counters when
+                    // the line is skipped below — so the summed
+                    // `codex_rate_limits_observed` equals the number of
+                    // snapshots the journal carried. The old
+                    // running-total insert put 1+2+…+n on successive
+                    // usage events and the lib fold SUMS disclosure
+                    // counters, so the assess F1 probe saw 3 snapshots
+                    // disclose 6.
+                    let mut rate_observed = 0;
                     if let Some(rate_limits) = payload.get("rate_limits").and_then(Value::as_object)
                     {
-                        codex_rate_limit_lines += 1;
+                        rate_observed = 1;
                         put_wire_str(
                             &mut codex_rate_wire,
                             "codex_plan_type",
@@ -3603,26 +3689,56 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                             string(rate_limits.get("limit_name")),
                         );
                     }
-                    if let Some(usage) =
-                        codex_token_count_usage(payload.get("info"), &mut codex_totals)
-                    {
-                        let mut disclosure = BTreeMap::new();
-                        if codex_rate_limit_lines > 0 {
-                            disclosure.insert(
-                                "codex_rate_limits_observed".to_string(),
-                                codex_rate_limit_lines,
-                            );
+                    match codex_token_count_usage(payload.get("info"), &mut codex_totals) {
+                        CodexCountOutcome::Usage(usage) => {
+                            let mut disclosure = BTreeMap::new();
+                            if rate_observed > 0 {
+                                disclosure.insert(
+                                    "codex_rate_limits_observed".to_string(),
+                                    rate_observed,
+                                );
+                            }
+                            events.push(Event {
+                                role: "meta".to_string(),
+                                timestamp: ts,
+                                usage,
+                                model_used: model.clone(),
+                                source_tool: "codex_cli".to_string(),
+                                disclosure_counters: disclosure,
+                                wire_metadata: codex_rate_wire.clone(),
+                                ..Event::default()
+                            });
+                            codex_rate_wire_pending = false;
                         }
-                        events.push(Event {
-                            role: "meta".to_string(),
-                            timestamp: ts,
-                            usage,
-                            model_used: model.clone(),
-                            source_tool: "codex_cli".to_string(),
-                            disclosure_counters: disclosure,
-                            wire_metadata: codex_rate_wire.clone(),
-                            ..Event::default()
-                        });
+                        outcome => {
+                            // Accounting-truth batch (rm-251 R1 rider) +
+                            // review fix L3: a token_count line that
+                            // yields no usage — a rate-limit-only
+                            // snapshot, empty `info`, or a running
+                            // total the ledger already counted — is
+                            // deliberately ignored for accounting (the
+                            // anti-inflation semantic) but never
+                            // silently: the lane STATES which exit it
+                            // took, the skip is counted per-reason, and
+                            // when the line carried a quota snapshot
+                            // its identity facts still have to land
+                            // (flag below; the terminal carrier event
+                            // after the loop lands the freshest wire
+                            // when no later usage event would carry
+                            // it).
+                            *counters
+                                .entry(format!(
+                                    "codex_token_count_skipped:{}",
+                                    outcome.skip_reason()
+                                ))
+                                .or_insert(0) += 1;
+                            if rate_observed > 0 {
+                                *counters
+                                    .entry("codex_rate_limits_observed".to_string())
+                                    .or_insert(0) += 1;
+                                codex_rate_wire_pending = true;
+                            }
+                        }
                     }
                 } else if payload_type == Some("session_configured") {
                     // rm-880: codex 0.160.1 persists a session_configured
@@ -4003,11 +4119,18 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
         // folded. No arithmetic remains in this arm, so the rm-162
         // saturating discipline now applies to the callers' sums only.
         let output = record.usage.get("output_tokens").copied().unwrap_or(0);
+        // Review fix L2 (run 0a55a397): clamp a negative reasoning
+        // breakdown at the boundary — a hostile/malformed negative
+        // reads as zero (absent), never subtracted from output the way
+        // the pre-batch saturating_add did. Both intakes fold
+        // non-positive wire values away upstream (token_usage_map), so
+        // this pins the invariant against future intake changes.
         let reasoning = record
             .usage
             .get("reasoning_output_tokens")
             .copied()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(0);
         let mut usage = BTreeMap::from([
             ("input_tokens".to_string(), input),
             ("output_tokens".to_string(), output),
@@ -4028,6 +4151,27 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
         *counters
             .entry("codex_compaction_usage_record".to_string())
             .or_insert(0) += 1;
+    }
+    // Accounting-truth batch (rm-251 R1 rider): if the freshest
+    // quota-wire facts came off a rate-limit-only line (no usage event
+    // carried them), land them on one terminal meta event — identity
+    // facts are disclosed, not dropped, even in journals whose only
+    // quota signal never paired with a counted usage row. No
+    // disclosure rides this carrier: the per-line observations were
+    // already counted above.
+    if saw_codex && codex_rate_wire_pending && !codex_rate_wire.is_empty() {
+        let carrier_ts = events
+            .last()
+            .map(|event| event.timestamp.clone())
+            .unwrap_or_default();
+        events.push(Event {
+            role: "meta".to_string(),
+            timestamp: carrier_ts,
+            model_used: model.clone(),
+            source_tool: "codex_cli".to_string(),
+            wire_metadata: codex_rate_wire.clone(),
+            ..Event::default()
+        });
     }
     // rm-716 (tokscale #1405): a rollout with zero usage rows on every
     // source this lane reads is the pre-Sept-2026 codex CLI's journal
@@ -4162,11 +4306,57 @@ fn json_container_depth(bytes: &[u8], pos: usize) -> usize {
     depth
 }
 
+/// Accounting-truth batch (rm-251 R1 rider, run 0a55a397 cycle 1):
+/// Review fix L3 (run 0a55a397 cycle 1): the token_count lane now
+/// STATES its own exit instead of a mirror re-deriving it. The old
+/// `codex_token_count_skip_reason` mirror reconstructed the decision
+/// from the line alone and could mislabel the corners against each
+/// other — a value-less window the ledger had already counted, and a
+/// FRESH value-less window labeled `deduplicated` — because the dedup
+/// exits compare against ledger state (`prev`, `seen`) that the lane
+/// updates before every return, so post-hoc inspection cannot recover
+/// what was compared. Returning the exit from the lane itself makes
+/// the disclosure label correct by construction.
+enum CodexCountOutcome {
+    Usage(TokenUsage),
+    NoUsageInfo,
+    Deduplicated,
+    NoCounts,
+}
+
+impl CodexCountOutcome {
+    /// Test/extraction helper: the usage map of a counted outcome.
+    #[cfg(test)]
+    fn usage(self) -> Option<TokenUsage> {
+        match self {
+            CodexCountOutcome::Usage(usage) => Some(usage),
+            _ => None,
+        }
+    }
+
+    /// The rm-251 skip-disclosure label. The `Usage` arm is never
+    /// disclosed as a skip (the call site matches on it first); its
+    /// label is defensive only.
+    fn skip_reason(&self) -> &'static str {
+        match self {
+            CodexCountOutcome::Usage(_) => "counted",
+            CodexCountOutcome::NoUsageInfo => "no_usage_info",
+            CodexCountOutcome::Deduplicated => "deduplicated",
+            CodexCountOutcome::NoCounts => "no_counts",
+        }
+    }
+}
+
 fn codex_token_count_usage(
     raw_info: Option<&Value>,
     totals: &mut CodexTotals,
-) -> Option<TokenUsage> {
-    let info = raw_info?.as_object()?;
+) -> CodexCountOutcome {
+    let Some(raw) = raw_info else {
+        return CodexCountOutcome::NoUsageInfo;
+    };
+    let Some(info) = raw.as_object() else {
+        return CodexCountOutcome::NoUsageInfo;
+    };
     let total = token_usage_map(info.get("total_token_usage"));
     let last = token_usage_map(info.get("last_token_usage"));
     let counts = if total.is_empty() {
@@ -4179,7 +4369,7 @@ fn codex_token_count_usage(
             // nothing. Stated as an explicit comparison against `prev`
             // so the guard survives the ledger rollovers rm-711 added
             // below (envelope boundary + size cap).
-            return None;
+            return CodexCountOutcome::Deduplicated;
         }
         if totals.seen.len() >= MAX_CODEX_SEEN_TOTALS {
             // rm-711 (assess SL3): bounded-recent distincts — roll the
@@ -4192,7 +4382,7 @@ fn codex_token_count_usage(
             // a fresh window. `compacted` markers clear the ledger
             // (CodexTotals::begin_envelope) because the re-based counters
             // re-emit old values while carrying fresh usage.
-            return None;
+            return CodexCountOutcome::Deduplicated;
         }
         if usage_has_values(&last) {
             // The snapshot of the call that just finished IS the fresh
@@ -4205,7 +4395,7 @@ fn codex_token_count_usage(
         }
     };
     if counts.is_empty() || !usage_has_values(&counts) {
-        return None;
+        return CodexCountOutcome::NoCounts;
     }
 
     let mut cache_read = counts.get("cached_input_tokens").copied().unwrap_or(0);
@@ -4228,7 +4418,16 @@ fn codex_token_count_usage(
     // the "deliberate fold" clause above is rm-603-era history, kept for
     // the record.)
     let output = counts.get("output_tokens").copied().unwrap_or(0);
-    let reasoning = counts.get("reasoning_output_tokens").copied().unwrap_or(0);
+    // Review fix L2 (run 0a55a397): same clamp-at-the-boundary contract
+    // as the record arm — `counts` arrives through token_usage_map's
+    // positive-only fold, so a wire negative is dropped at intake as
+    // noise; the clamp pins that a future intake change can never carry
+    // an unclamped negative past this guard.
+    let reasoning = counts
+        .get("reasoning_output_tokens")
+        .copied()
+        .unwrap_or(0)
+        .max(0);
 
     let mut usage = BTreeMap::new();
     usage.insert("input_tokens".to_string(), input);
@@ -4238,7 +4437,7 @@ fn codex_token_count_usage(
     }
     usage.insert("cache_creation_input_tokens".to_string(), cache_write);
     usage.insert("cache_read_input_tokens".to_string(), cache_read);
-    Some(usage)
+    CodexCountOutcome::Usage(usage)
 }
 
 /// rm-554 (upstream #312): token_count accounting state — the distinct
@@ -6051,14 +6250,14 @@ fn first_number(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
         .unwrap_or(0)
 }
 
-fn sum_numbers(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
+fn first_present(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
+    // rm-618: alias pairs are the same quantity re-keyed; the first present key
+    // is authoritative — never sum the pair (hybrid snapshots double-count).
     keys.iter()
         .filter_map(|key| obj.get(*key))
         .filter_map(number_as_i64)
-        // Saturating: alias keys can each carry a legal in-range value whose
-        // sum overflows (e.g. two i64::MAX entries for the same counter),
-        // which previously wrapped the usage negative.
-        .fold(0i64, i64::saturating_add)
+        .next()
+        .unwrap_or(0)
 }
 
 pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
@@ -7446,7 +7645,9 @@ mod tests {
             }
         });
         let mut totals = CodexTotals::default();
-        let usage = codex_token_count_usage(Some(&info), &mut totals).expect("usage event");
+        let usage = codex_token_count_usage(Some(&info), &mut totals)
+            .usage()
+            .expect("usage event");
         assert_eq!(usage["input_tokens"], 10);
         assert_eq!(usage["output_tokens"], i64::MAX);
         assert_eq!(usage["reasoning_tokens"], i64::MAX);
@@ -7468,20 +7669,108 @@ mod tests {
             })
         };
         let mut totals = CodexTotals::default();
-        let first = codex_token_count_usage(Some(&step(2500)), &mut totals).expect("first event");
+        let first = codex_token_count_usage(Some(&step(2500)), &mut totals)
+            .usage()
+            .expect("first event");
         assert_eq!(first["input_tokens"], 2500);
-        // Rewind to 1000 fabricates no usage (negative delta -> no event).
+        // Rewind to 1000 fabricates no usage (negative delta -> no event);
+        // review fix L3 pins the lane's own exit name, not just absence.
         let rewound = codex_token_count_usage(Some(&step(1000)), &mut totals);
-        assert!(rewound.is_none());
+        assert!(matches!(rewound, CodexCountOutcome::NoCounts));
         // Rebound to 3000 counts the full 2000-token growth from the reset
         // baseline — the old pin (500, climb past the old mark only) was
         // the undercount this defect removes.
-        let rebound =
-            codex_token_count_usage(Some(&step(3000)), &mut totals).expect("rebound event");
+        let rebound = codex_token_count_usage(Some(&step(3000)), &mut totals)
+            .usage()
+            .expect("rebound event");
         assert_eq!(rebound["input_tokens"], 2000);
-        // A re-emitted total (rate-limit-only update) counts nothing.
+        // A re-emitted total (rate-limit-only update) counts nothing —
+        // and is disclosed as the consecutive duplicate it is.
         let repeated = codex_token_count_usage(Some(&step(3000)), &mut totals);
-        assert!(repeated.is_none());
+        assert!(matches!(repeated, CodexCountOutcome::Deduplicated));
+    }
+
+    #[test]
+    fn codex_token_count_exits_name_their_reason() {
+        // Review fix L3 (run 0a55a397): the lane states its own exit —
+        // usage, absent info, the rm-554 consecutive re-emit, the
+        // rm-711 seen-ledger rewind catch, or a value-less window — so
+        // the skip disclosure can never mislabel one corner as another
+        // (the deleted mirror labeled a FRESH value-less window
+        // `deduplicated` because it could not see the ledger).
+        let step = |input: i64| {
+            serde_json::json!({
+                "total_token_usage": {"input_tokens": input}
+            })
+        };
+        let mut totals = CodexTotals::default();
+        assert!(matches!(
+            codex_token_count_usage(Some(&step(2500)), &mut totals),
+            CodexCountOutcome::Usage(_)
+        ));
+        // Rate-limit-only update: the same total re-emitted.
+        assert!(matches!(
+            codex_token_count_usage(Some(&step(2500)), &mut totals),
+            CodexCountOutcome::Deduplicated
+        ));
+        // Fresh but value-less window (negative delta, no last snapshot).
+        assert!(matches!(
+            codex_token_count_usage(Some(&step(1000)), &mut totals),
+            CodexCountOutcome::NoCounts
+        ));
+        assert!(matches!(
+            codex_token_count_usage(Some(&step(3000)), &mut totals),
+            CodexCountOutcome::Usage(_)
+        ));
+        // Rewind-and-climb-back to a total the seen ledger already
+        // holds (not a consecutive duplicate — prev is the 3000 window).
+        assert!(matches!(
+            codex_token_count_usage(Some(&step(1000)), &mut totals),
+            CodexCountOutcome::Deduplicated
+        ));
+        // Absent and non-object `info`.
+        assert!(matches!(
+            codex_token_count_usage(None, &mut totals),
+            CodexCountOutcome::NoUsageInfo
+        ));
+        assert!(matches!(
+            codex_token_count_usage(Some(&serde_json::json!("not-an-object")), &mut totals),
+            CodexCountOutcome::NoUsageInfo
+        ));
+        // A snapshot with no positive counts anywhere.
+        let zeros = serde_json::json!({
+            "total_token_usage": {"input_tokens": 0},
+            "last_token_usage": {"input_tokens": 0}
+        });
+        assert!(matches!(
+            codex_token_count_usage(Some(&zeros), &mut totals),
+            CodexCountOutcome::NoCounts
+        ));
+    }
+
+    #[test]
+    fn codex_negative_reasoning_breakdown_reads_as_absent() {
+        // Review fix L2 (run 0a55a397): a hostile negative reasoning
+        // breakdown never touches output and reads as an absent
+        // breakdown. `token_usage_map` folds non-positive wire values
+        // away at intake (the lane's uniform noise normalization), and
+        // the boundary clamps at both read sites pin the contract
+        // against a future intake change. This is a contract pin, not a
+        // regression arm: no current code path can carry a negative to
+        // the guard.
+        let info = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": 100,
+                "output_tokens": 400,
+                "reasoning_output_tokens": -50
+            }
+        });
+        let mut totals = CodexTotals::default();
+        let usage = codex_token_count_usage(Some(&info), &mut totals)
+            .usage()
+            .expect("usage event");
+        assert_eq!(usage["output_tokens"], 400);
+        assert!(!usage.contains_key("reasoning_tokens"));
     }
 
     #[test]
@@ -8019,16 +8308,18 @@ mod tests {
     }
 
     #[test]
-    fn sum_numbers_saturates_alias_pairs_instead_of_overflowing() {
-        // `input` and `input_tokens` are both legal in-range integers; the
-        // alias sum previously wrapped negative on i64::MAX pairs.
+    fn first_present_never_sums_so_alias_pairs_cannot_overflow() {
+        // `input` and `input_tokens` are both legal in-range integers; the old
+        // alias SUM saturated (and before that wrapped negative) on i64::MAX
+        // pairs. First-present (rm-618) takes a single value, so overflow is
+        // structurally impossible.
         let value = serde_json::json!({
             "input": 9_223_372_036_854_775_807i64,
             "input_tokens": 9_223_372_036_854_775_807i64,
         });
         let obj = value.as_object().expect("object");
-        assert_eq!(sum_numbers(obj, &["input", "input_tokens"]), i64::MAX);
-        assert_eq!(sum_numbers(obj, &["output", "output_tokens"]), 0);
+        assert_eq!(first_present(obj, &["input", "input_tokens"]), i64::MAX);
+        assert_eq!(first_present(obj, &["output", "output_tokens"]), 0);
     }
 
     #[test]
@@ -8234,6 +8525,61 @@ mod tests {
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\u中文测试"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"\uzzzz not hex"}"#).is_none());
         assert!(parse_jsonl_value_lenient(r#"{"prompt":"truncated \u4e2"}"#).is_none());
+    }
+
+    // rm-618: the pi tee re-keys the same counters under legacy and new
+    // aliases; a hybrid block carrying BOTH must count the FIRST present key,
+    // never the sum (the qwen lane pins the house convention). RED on
+    // 181630e: the sum arm folds input 100+250=350.
+    #[test]
+    fn oh_my_pi_alias_pairs_first_present_never_the_sum() {
+        let usage = serde_json::json!({
+            "input": 100, "input_tokens": 250,
+            "output": 40, "output_tokens": 80,
+            "cacheRead": 10, "cache_read_input_tokens": 30,
+            "cacheWrite": 5, "cache_creation_input_tokens": 15
+        });
+        let usage = oh_my_pi_usage(Some(&usage)).expect("usage");
+        // first present wins, never the pair sum
+        assert_eq!(usage.get("input_tokens"), Some(&100));
+        assert_eq!(usage.get("output_tokens"), Some(&40));
+        assert_eq!(usage.get("cache_read_input_tokens"), Some(&10));
+        assert_eq!(usage.get("cache_creation_input_tokens"), Some(&5));
+    }
+
+    // rm-617: the codex rollout `token_usage_record` epilogue reports
+    // reasoning as a BREAKDOWN of output_tokens, never an addend; the
+    // breakdown rides the same `reasoning_tokens` key the qwen lane uses
+    // so tokens_reasoning carries it. Concise repro: a post-compaction
+    // usage record whose output_tokens 400 already contains reasoning 150.
+    // RED on 181630e: output folds 400+150=550.
+    #[test]
+    fn codex_token_usage_record_reasoning_is_a_breakdown_not_an_addend() {
+        let lines = [
+            serde_json::json!({"timestamp":"2026-10-09T11:59:00Z","type":"session_meta","payload":{"cwd":"/tmp/x","model":"gpt-5.3-codex"}}),
+            serde_json::json!({"timestamp":"2026-10-09T12:00:01Z","type":"compacted","payload":{"compaction_response_id":"resp_617a"}}),
+            serde_json::json!({"timestamp":"2026-10-09T12:00:05Z","type":"token_usage_record","payload":{"response_id":"resp_617a","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":400,"reasoning_output_tokens":150,"cache_creation_input_tokens":50}}}),
+        ];
+        let raw = lines
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = parse_raw_session("codex", "rollout-usage-record.jsonl", &raw)
+            .expect("codex rollout parses");
+        // input nets the cached repeat; output is NOT output+reasoning
+        assert_eq!(session.metrics.tokens_input, 400);
+        assert_eq!(session.metrics.tokens_output, 400);
+        assert_eq!(session.metrics.tokens_reasoning, 150);
+        assert_eq!(session.metrics.tokens_cache_r, 600);
+        assert_eq!(session.metrics.tokens_cache_w, 50);
+        assert_eq!(
+            session
+                .metrics
+                .line_skips
+                .get("codex_compaction_usage_record"),
+            Some(&1)
+        );
     }
 
     #[test]

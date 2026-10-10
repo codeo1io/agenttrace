@@ -1,0 +1,3 @@
+{"type": "session", "id": "00000000-0000-4000-8000-0000000000b1", "timestamp": "2026-06-20T10:00:00.000Z", "cwd": "/redacted/project"}
+{"id": "00000000-0000-4000-8000-0000000000b3", "timestamp": "2026-06-20T10:00:01.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "hi"}], "timestamp": "2026-06-20T10:00:01.000Z"}, "type": "message"}
+{"type": "usage", "kind": "cache_warm", "id": "00000000-0000-4000-8000-0000000000b2", "timestamp": "2026-06-20T10:00:05.000Z", "model": "gpt-5", "usage": {"input": 100, "input_tokens": 250, "output": 40, "output_tokens": 80, "cacheRead": 10, "cache_read_input_tokens": 30, "cacheWrite": 5, "cache_creation_input_tokens": 15}}

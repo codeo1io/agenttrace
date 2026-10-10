@@ -1631,6 +1631,20 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 51 (run 0a55a397 cycle-1 "accounting
+                // truth" residual batch: the parser's served values
+                // moved — codex token_usage_record output unbundled
+                // from reasoning (upstream #312 oracle, rm-617), pi
+                // hybrid usage snapshots first-present-per-class
+                // instead of the alias sum (rm-618), qwen skip lines
+                // disclosed through per-reason line_skips /
+                // disclosure_counters tables, and
+                // codex_rate_limits_observed minted once per snapshot
+                // line instead of the triangular running total (the
+                // rm-251 R1 rider) — minted at the fleet census
+                // ceiling over the sibling 49/50 rungs, landing here
+                // above the 46 ceiling whose 44/45/46 rungs predate
+                // this fixture's narrative);
                 // Schema 43 (integration of run fabd9fb8cf73,
                 // rm-831/rm-721 hostile-value truthfulness —
                 // antigravity fold saturation + negative insert
