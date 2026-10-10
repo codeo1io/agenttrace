@@ -370,3 +370,33 @@ fn empty_home_is_a_tool_error_not_a_crash() {
         .contains("No session files found"));
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
+
+#[test]
+fn mcp_server_rejects_oversized_request_line_rm935() {
+    // rm-935: a request line above the server's 1 MiB cap must be
+    // answered with a parse error naming the cap; the server never
+    // buffers the whole line and exits cleanly afterwards.
+    let mut line = String::with_capacity((1 << 20) + 64);
+    line.push_str(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bloat","version":"0"}},"pad":""#,
+    );
+    while line.len() <= 1 << 20 {
+        line.push('x');
+    }
+    line.push_str("\"}\n");
+    let (home, cache) = seed_home("mcp-oversize", false);
+    let (status, responses, stderr) = mcp_session(&home, &cache, &line);
+    assert_eq!(status, Some(0), "server must exit cleanly: {stderr}");
+    assert_eq!(
+        responses.len(),
+        1,
+        "exactly one error response: {responses:?}"
+    );
+    let error = responses[0].get("error").expect("parse-error envelope");
+    assert_eq!(error.get("code").and_then(|c| c.as_i64()), Some(-32700));
+    let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    assert!(
+        message.contains("exceeds"),
+        "expected the oversize explanation, got: {message}"
+    );
+}

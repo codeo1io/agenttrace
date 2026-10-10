@@ -31,7 +31,7 @@
 //! methods of a text protocol; an SDK (with its transitive tree and
 //! licensing review) would be its own change-unit if ever wanted.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 use agenttrace_core::{
     compute_overview, data_health_scoped, load_sessions_with_options,
@@ -62,14 +62,62 @@ const RECENT_SESSIONS_LIMIT: usize = 10;
 /// host went away — that is a clean shutdown, not a failure, so it
 /// exits 0 the way the statusline host command treats host-side
 /// disconnects.
+/// rm-935: hard cap on a single stdin line. A wedged or hostile local
+/// client streaming an unterminated line must not grow RSS without
+/// bound. When a request line exceeds the cap the server answers one
+/// `-32700` with an explanatory message and exits — the client is
+/// broken, and reading on would resume mid-line anyway.
+const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB, far above any sane JSON-RPC line
+
 pub fn serve() -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
+    for line in bounded_lines(stdin.lock(), MAX_LINE_BYTES) {
         let line = match line {
             Ok(line) => line,
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
-            Err(error) => return Err(error.into()),
+            Err(BoundedLineError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+                return Ok(())
+            }
+            Err(BoundedLineError::Io(error)) => return Err(error.into()),
+            Err(BoundedLineError::Oversize(limit)) => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    error_response(
+                        None,
+                        -32700,
+                        &format!("Parse error: request line exceeds the {limit}-byte limit")
+                    )
+                )
+                .and_then(|_| stdout.flush())
+                .or_else(|e| {
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })?;
+                return Ok(());
+            }
+            Err(BoundedLineError::InvalidUtf8) => {
+                // Parity with the previous `lines()` behavior: invalid
+                // UTF-8 was a read error; answer the parse-error arm and
+                // keep the server up for the next line.
+                if let Err(error) = writeln!(
+                    stdout,
+                    "{}",
+                    error_response(None, -32700, "Parse error: invalid UTF-8")
+                )
+                .and_then(|_| stdout.flush())
+                {
+                    return if error.kind() == io::ErrorKind::BrokenPipe {
+                        Ok(())
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                continue;
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -413,4 +461,53 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> String {
         json!({ "code": code, "message": message }),
     );
     Value::Object(object).to_string()
+}
+
+/// Error outcomes of [`bounded_lines`] (rm-935).
+enum BoundedLineError {
+    Io(io::Error),
+    /// The line exceeded the byte cap; the iterator yields this once
+    /// and then stops.
+    Oversize(usize),
+    InvalidUtf8,
+}
+
+/// Newline-delimited reader with a per-line byte cap: like
+/// `BufRead::lines()` (yielding `Result<String, _>` per line) except a
+/// line longer than `limit` yields `Err(Oversize)` and ends iteration,
+/// and invalid UTF-8 yields `Err(InvalidUtf8)` without ending
+/// iteration (the newline was consumed, so the stream stays framed).
+fn bounded_lines<R: BufRead>(
+    mut reader: R,
+    limit: usize,
+) -> impl Iterator<Item = Result<String, BoundedLineError>> {
+    std::iter::from_fn(move || {
+        let mut buf = Vec::with_capacity(256);
+        // Read at most limit+1 bytes while searching for the newline:
+        // the +1 detects an oversize line without buffering it fully.
+        let mut limited = reader.by_ref().take(limit as u64 + 1);
+        match limited.read_until(b'\n', &mut buf) {
+            Ok(0) => None, // EOF
+            Ok(_) => {
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                } else if buf.len() > limit {
+                    // No newline within the cap: oversize line. Consume
+                    // the remainder of the line so a caller that keeps
+                    // reading stays framed, then report.
+                    let mut sink = Vec::new();
+                    let _ = reader.read_until(b'\n', &mut sink);
+                    return Some(Err(BoundedLineError::Oversize(limit)));
+                }
+                match String::from_utf8(buf) {
+                    Ok(line) => Some(Ok(line)),
+                    Err(_) => Some(Err(BoundedLineError::InvalidUtf8)),
+                }
+            }
+            Err(error) => Some(Err(BoundedLineError::Io(error))),
+        }
+    })
 }

@@ -1591,8 +1591,26 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // -f json) stays clean; exit codes are unchanged.
     disclose_sqlite_ingest(&report.sqlite);
     disclose_unlinked_subagents(report.unlinked_subagents);
+    disclose_unreadable_dirs(&report.unreadable_dirs);
     if sessions.is_empty() {
         if report.discovered == 0 {
+            // rm-931: an unreadable directory must not be reported as
+            // "no session files" — the process could not look inside it,
+            // so it cannot know what it holds.
+            if !report.unreadable_dirs.is_empty() {
+                let listed = report
+                    .unreadable_dirs
+                    .iter()
+                    .map(|d| format!("{} ({})", d.path.display(), d.reason))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "No session files found in {} — {} unreadable director(y/ies) could not be read and may contain sessions: {}",
+                    args.dir.as_deref().unwrap_or("<auto-discovered homes>"),
+                    report.unreadable_dirs.len(),
+                    listed
+                );
+            }
             match args.dir.as_deref() {
                 Some(dir) => bail!(
                     "No session files found in {dir} (directory exists but holds no session files)"
@@ -1658,6 +1676,19 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // admitted) — loud BEFORE any bytes are staged.
     ensure_output_is_not_an_input(args, &sessions)?;
     Ok((sessions, Some(report)))
+}
+
+/// rm-931: one stderr line per directory the walker could not read —
+/// an unreadable subtree is disclosed, never silently conflated with an
+/// empty corpus. stdout (and -f json) stays clean; exit codes unchanged.
+fn disclose_unreadable_dirs(dirs: &[agenttrace_core::UnreadableDir]) {
+    for d in dirs {
+        eprintln!(
+            "agenttrace: warning: session directory found but unreadable: {} ({})",
+            d.path.display(),
+            d.reason
+        );
+    }
 }
 
 /// rm-799: one stderr line when subagent transcripts could not be

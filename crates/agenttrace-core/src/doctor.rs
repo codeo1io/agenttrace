@@ -145,6 +145,7 @@ struct DoctorDiscovery {
     cache: SessionCacheReport,
     cache_size_bytes: u64,
     files: Vec<PathBuf>,
+    unreadable_dirs: Vec<crate::discovery::UnreadableDir>,
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
@@ -174,16 +175,18 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            unreadable_dirs: Vec::new(),
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
+    let (files, opencode_fork_excluded, unreadable_dirs) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        (find_session_files(dir), 0)
+        let (files, unreadable) = find_session_files(dir);
+        (files, 0, unreadable)
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -207,6 +210,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        unreadable_dirs,
     }
 }
 
@@ -218,6 +222,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        unreadable_dirs,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -258,6 +263,11 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             "opencode_fork_excluded_sessions".to_string(),
             opencode_fork_excluded_total,
         );
+    }
+    // rm-931: a directory the walker could not read is disclosed, never
+    // silently conflated with an empty corpus.
+    if !unreadable_dirs.is_empty() {
+        disclosures.insert("unreadable_session_dirs".to_string(), unreadable_dirs.len());
     }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
@@ -579,9 +589,12 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+fn find_reportable_session_files(
+    dir: Option<&Path>,
+) -> (Vec<PathBuf>, usize, Vec<crate::discovery::UnreadableDir>) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        let (files, unreadable) = find_session_files(dir);
+        return (files, 0, unreadable);
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -597,12 +610,12 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
+    let (files, opencode_fork_excluded, unreadable_dirs) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, unreadable_dirs)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite
