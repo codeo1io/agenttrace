@@ -1367,6 +1367,86 @@ fn clear_cache_document_lanes_route_announcements_to_stderr() {
 }
 
 #[test]
+fn sessions_tsv_lane_is_requestable_and_stdout_pure() {
+    // rm-937: the --sessions default lane IS a TSV document on stdout,
+    // yet `-f tsv` was rejected by the value_parser (only `text`
+    // silently emitted the TSV), and the rm-301/rm-912 announce set
+    // keyed on -f values only, so the DEFAULT lane kept "Session cache
+    // cleared." as row 1 of a redirected `--sessions > rows.tsv`.
+    // Both spellings must now deliver table-only stdout with the
+    // announcement on stderr, byte-identical to each other; tsv
+    // outside --sessions fails loudly instead of falling back.
+    let sandbox = std::env::temp_dir().join(format!(
+        "agenttrace-rm937-purity-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = sandbox.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let run = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+        cmd.env("HOME", &sandbox)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(args);
+        let output = cmd.output().expect("run agenttrace CLI");
+        assert!(
+            output.status.success(),
+            "{args:?} CLI failed: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    let (default_stdout, default_stderr) = run(&["--clear-cache", "--sessions", "--demo"]);
+    assert!(
+        default_stdout.starts_with("SESSION\t"),
+        "default --sessions stdout must start with the TSV header, got {default_stdout:?}"
+    );
+    assert!(
+        !default_stdout.contains("Session cache cleared."),
+        "a redirected `--sessions > rows.tsv` must be table-only bytes: {default_stdout:?}"
+    );
+    assert!(
+        default_stderr.contains("Session cache cleared."),
+        "the default sessions lane moves its announcement to stderr, not away: {default_stderr:?}"
+    );
+
+    let (tsv_stdout, tsv_stderr) = run(&["--clear-cache", "--sessions", "--demo", "-f", "tsv"]);
+    assert!(
+        tsv_stdout.starts_with("SESSION\t"),
+        "-f tsv stdout must start with the TSV header, got {tsv_stdout:?}"
+    );
+    assert!(!tsv_stdout.contains("Session cache cleared."));
+    assert!(tsv_stderr.contains("Session cache cleared."));
+    assert_eq!(
+        default_stdout, tsv_stdout,
+        "-f tsv must be byte-identical to the default text lane"
+    );
+
+    // The explicit spelling names the sessions table; no other lane
+    // renders tsv, so the combination fails loudly.
+    let refused = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &sandbox)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .args(["--overview", "--demo", "-f", "tsv"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("tsv format requires --sessions"),
+        "the guard must name the flag: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
 fn governance_reports_honor_gate_flags() {
     // rm-346 arm-a: the --fail-* gate flags are parsed on every report
     // path, but used to be evaluated only in the --overview arm — `--audit

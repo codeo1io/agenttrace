@@ -206,19 +206,23 @@ fn tempdir(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn tsv_is_not_a_cli_value_and_stays_rejected() {
-    // Review fix (rm-625 F4): the campaign row's `tsv` matrix column was
-    // an over-spec — `-f tsv` is not a CLI value for `--sessions` (clap
-    // rejects it with rc 2) and tab-separated output is reached only
-    // through `--delivery-evidence`. Pin the real contract instead of
-    // the aspirational one so the matrix documents the actual surface.
+fn tsv_is_a_sessions_scoped_cli_value_with_a_named_guard_elsewhere() {
+    // Review fix lineage: rm-625 F4 pinned the THEN-real contract (clap
+    // rejected `-f tsv`; TSV was reachable only via `--delivery-evidence`).
+    // rm-937 (2026-10-10, run b5b85faa61c9) deliberately made `tsv` a real
+    // CLI value scoped to `--sessions` — the default sessions lane IS a TSV
+    // document, so the explicit value must be requestable and byte-identical
+    // to the default. Same pin-the-real-contract discipline, new contract:
+    // (a) `--sessions -f tsv` succeeds and renders the table lane; (b) the
+    // value is NOT a render lane elsewhere — `--overview -f tsv` exits with
+    // the named guard error instead of silently rendering something else.
     let tmp = tempdir("output-safety-tsv");
     let corpus = tmp.join("corpus");
     fs::create_dir_all(&corpus).unwrap();
     write_poisoned_corpus(&corpus);
     let home = tmp.join("home");
     fs::create_dir_all(home.join(".cache")).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
         .arg("-d")
         .arg(&corpus)
         .arg("--sessions")
@@ -229,10 +233,32 @@ fn tsv_is_not_a_cli_value_and_stays_rejected() {
         .output()
         .expect("agenttrace runs");
     assert_eq!(
-        out.status.code(),
-        Some(2),
-        "-f tsv is rejected by the CLI, not a render lane: {}",
-        String::from_utf8_lossy(&out.stderr)
+        sessions.status.code(),
+        Some(0),
+        "--sessions -f tsv is a requestable lane (rm-937): {}",
+        String::from_utf8_lossy(&sessions.stderr)
+    );
+    let overview = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("-d")
+        .arg(&corpus)
+        .arg("--overview")
+        .arg("-f")
+        .arg("tsv")
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .output()
+        .expect("agenttrace runs");
+    let stderr = String::from_utf8_lossy(&overview.stderr);
+    assert_eq!(
+        overview.status.code(),
+        Some(1),
+        "-f tsv outside --sessions is a named guard error, not a render lane: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("tsv format requires --sessions"),
+        "the guard names the scoping rule: {}",
+        stderr
     );
 }
 

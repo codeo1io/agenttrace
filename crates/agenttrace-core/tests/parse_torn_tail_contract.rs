@@ -104,6 +104,77 @@ fn torn_tail_line_is_disclosed_not_dropped() {
 }
 
 #[test]
+fn codex_fast_path_torn_tail_discloses_through_line_skips() {
+    // rm-709's integration arm: the codex lane is the one format this
+    // sweep does not otherwise cover at the parse_file entry — its
+    // torn drops ride the FAST path (parse_codex_rollout_jsonl, taken
+    // as soon as a session_meta line is seen), which the generic
+    // `jsonl_objects_counted` census above never runs for codex
+    // journals. rm-584 landed the counters (verified live at aad1f7b:
+    // the torn twin discloses `codex_unparseable_line:1` while the
+    // intact twin counts the full snapshot); this pin is the parity
+    // oracle rm-709's acceptance names — the fast path must disclose
+    // its torn tail exactly like the slow generic lane above
+    // (`unparseable_line`) instead of silently dropping it — and it
+    // must keep the drop on the LOSS channel (line_skips), not the
+    // assumption channel (disclosure_counters, the rm-730 split).
+    let meta = "{\"timestamp\":\"2026-10-09T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\",\"originator\":\"codex_cli_rs\"}}";
+    let turn = "{\"timestamp\":\"2026-10-09T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}}";
+    let first_count = "{\"timestamp\":\"2026-10-09T10:00:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1500,\"cached_input_tokens\":0,\"output_tokens\":200,\"reasoning_output_tokens\":0},\"last_token_usage\":{\"input_tokens\":1500,\"cached_input_tokens\":0,\"output_tokens\":200,\"reasoning_output_tokens\":0}}}}";
+    // The final cumulative snapshot, complete ...
+    let final_count = "{\"timestamp\":\"2026-10-09T10:00:06Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":3000,\"cached_input_tokens\":0,\"output_tokens\":400,\"reasoning_output_tokens\":0},\"last_token_usage\":{\"input_tokens\":3000,\"cached_input_tokens\":0,\"output_tokens\":400,\"reasoning_output_tokens\":0}}}}";
+    // ... and torn mid-object where the writer crashed. ASCII-only
+    // payloads keep the byte-slice cut a char-boundary cut.
+    let torn_tail = &final_count[..final_count.len() - 80];
+
+    let torn = parse_file(&fixture(
+        "codex-torn",
+        &[
+            meta.to_string(),
+            turn.to_string(),
+            first_count.to_string(),
+            torn_tail.to_string(),
+        ],
+    ))
+    .expect("a torn codex journal still parses — that is the hazard");
+    assert_eq!(
+        torn.metrics.line_skips.get("codex_unparseable_line"),
+        Some(&1),
+        "the torn tail must surface on the loss channel: {:?}",
+        torn.metrics.line_skips
+    );
+    assert!(
+        !torn.metrics.disclosure_counters.contains_key("codex_unparseable_line"),
+        "a torn drop is real loss, not an assumption: it must not ride the rm-730 disclosure channel"
+    );
+    // The torn line carried the session's final cumulative usage
+    // snapshot; the undercount is the reader's truth, disclosed above.
+    assert_eq!(torn.metrics.tokens_input, 1500);
+    assert_eq!(torn.metrics.tokens_output, 200);
+
+    let intact = parse_file(&fixture(
+        "codex-intact",
+        &[
+            meta.to_string(),
+            turn.to_string(),
+            first_count.to_string(),
+            final_count.to_string(),
+        ],
+    ))
+    .expect("the intact twin parses");
+    assert!(
+        !intact
+            .metrics
+            .line_skips
+            .contains_key("codex_unparseable_line"),
+        "the intact twin must not report torn drops: {:?}",
+        intact.metrics.line_skips
+    );
+    assert_eq!(intact.metrics.tokens_input, 4500);
+    assert_eq!(intact.metrics.tokens_output, 600);
+}
+
+#[test]
 fn workbuddy_torn_tail_discloses_through_both_channels() {
     // Regression pin for the rm-526 x rm-538/rm-600 seam (re-threaded at
     // the independent review, conflict case 7a502782): rm-538 moved

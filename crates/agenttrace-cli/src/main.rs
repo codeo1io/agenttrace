@@ -40,14 +40,15 @@ struct Args {
     path: Option<String>,
     /// Output format for the requested view: text (default), json, csv,
     /// markdown/md, html, svg (the shareable usage card; requires
-    /// --overview), or otel (the OTLP-JSON export of the whole
-    /// corpus; requires --overview). Unsupported combinations fail
-    /// loudly instead of falling back to text.
+    /// --overview), otel (the OTLP-JSON export of the whole corpus;
+    /// requires --overview), or tsv (the --sessions table, byte-identical
+    /// to its default text render; requires --sessions). Unsupported
+    /// combinations fail loudly instead of falling back to text.
     #[arg(
         short = 'f',
         long = "format",
         default_value = "text",
-        value_parser = ["text", "json", "csv", "markdown", "md", "html", "otel", "svg"]
+        value_parser = ["text", "json", "csv", "markdown", "md", "html", "otel", "svg", "tsv"]
     )]
     format: String,
     /// rm-576: color scheme of the SVG usage card (`-f svg`). `auto`
@@ -418,6 +419,16 @@ fn run() -> anyhow::Result<()> {
     if args.format == "csv" && !(args.overview || args.sessions) {
         bail!("csv format requires --overview or --sessions");
     }
+    // rm-937: `-f tsv` is the explicit spelling of the --sessions
+    // table — that action's default text lane already renders TSV, but
+    // the value_parser set did not accept "tsv", so the document was
+    // only reachable by asking for "text". Accept it, and gate it to
+    // the sessions table: no other lane renders tsv, and a silent
+    // fall-through to text would be the incoherence this guard family
+    // exists to prevent.
+    if args.format == "tsv" && !args.sessions {
+        bail!("tsv format requires --sessions (the session table)");
+    }
     // rm-599: `-f otel` renders the OTLP-JSON export of the whole
     // session corpus, so it rides the --overview lane (which loads
     // every session). On any other lane it would silently render text
@@ -461,10 +472,17 @@ fn run() -> anyhow::Result<()> {
     // share pattern) used to prefix "Session cache cleared." to the
     // SVG bytes and corrupt the file — so svg/markdown/md/html join
     // the stderr-routing set.
+    // rm-937: the --sessions lane is a TSV document on stdout in both
+    // its spellings — the explicit `-f tsv` and the default `text`
+    // (render_session_list's fall-through arm) — so the default lane
+    // joins the stderr-routing set too: a redirected
+    // `--clear-cache --sessions > rows.tsv` used to carry
+    // "Session cache cleared." as row 1 of the table.
     let announce: fn(&str) -> anyhow::Result<()> = if matches!(
         args.format.as_str(),
-        "json" | "csv" | "otel" | "svg" | "markdown" | "md" | "html"
-    ) {
+        "json" | "csv" | "otel" | "svg" | "markdown" | "md" | "html" | "tsv"
+    ) || (args.sessions && args.format == "text")
+    {
         write_stderr
     } else {
         write_stdout
@@ -3033,6 +3051,40 @@ mod tests {
             cells.contains(&"0.0105"),
             "own cost stays its own cell: {row}"
         );
+    }
+
+    #[test]
+    fn session_list_tsv_is_the_default_text_lane_byte_for_byte() {
+        // rm-937: `-f tsv` names the --sessions table explicitly; the
+        // default `text` spelling of the same action renders the very
+        // same TSV via render_session_list's fall-through arm. Both
+        // spellings must stay byte-identical — one renderer, one
+        // truncation behavior, no format-specific branches.
+        let sessions: Vec<Session> = (0..5)
+            .map(|i| Session {
+                name: format!("s{i}"),
+                path: format!("/tmp/s{i}.jsonl"),
+                cwd: String::new(),
+                branch: String::new(),
+                metrics: Metrics::default(),
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: agenttrace_core::Diagnostics::default(),
+            })
+            .collect();
+        for limit in [20usize, 2] {
+            let via_text = render_session_list(&sessions, "text", limit);
+            let via_tsv = render_session_list(&sessions, "tsv", limit);
+            assert_eq!(
+                via_text, via_tsv,
+                "-f tsv and the default text lane must be byte-identical (limit {limit})"
+            );
+            assert!(
+                via_tsv.starts_with("SESSION\t"),
+                "both spellings render the TSV header: {via_tsv:?}"
+            );
+        }
     }
 
     #[test]
