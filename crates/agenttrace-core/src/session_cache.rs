@@ -5,7 +5,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 55;
+// Bumped 51 -> 55 (run 8937be8e implement 49500183, rm-956): the
+// Copilot OTel export seam changed the METRICS' serialized shape —
+// `copilotOtelCalls` / `copilotShutdownIntervals` fact vectors ride
+// GoMetrics now — and changed what parse produces for UNCHANGED
+// journal bytes (re-exported spans stop double-counting; marker
+// events no longer reach `analyze`), so stale at-bytes cache entries
+// must not serve. 55 (not 52/53/54) because the live fleet census at
+// this implement turn found uncommitted siblings already on 52
+// (canonical 16506c4c mid-merge, runs 57c491338818/59406b6da19e/
+// d2bd9afa2de4/aeaa0ecb4da5) and 53/54 (runs e944a060a640 and the
+// integration worktrees b171537d4e3d/ca6d6ad27107) — 55 is the
+// lowest free rung above all of them.
 // Bumped 50 -> 51 (run 0a55a397 cycle-1 "accounting truth"
 // residual batch, attempt 5712b6f0: codex record-arm reasoning
 // breakdown rm-617 + pi alias first-present rm-618 + qwen per-reason
@@ -923,6 +935,23 @@ struct GoMetrics {
         skip_serializing_if = "String::is_empty"
     )]
     parent_session: String,
+    /// rm-956 arm 2: Copilot cross-root reconcile facts, round-tripped
+    /// so a cache hit reproduces the reconcile (the pass consumes them
+    /// as it applies, which keeps a reload idempotent). Both vectors
+    /// stay empty for every non-Copilot session, so the cached shape of
+    /// everything else is byte-identical.
+    #[serde(
+        default,
+        rename = "CopilotOtelCalls",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    copilot_otel_calls: Vec<crate::parser::CopilotOtelCall>,
+    #[serde(
+        default,
+        rename = "CopilotShutdownIntervals",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    copilot_shutdown_intervals: Vec<crate::parser::CopilotShutdownInterval>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2177,6 +2206,8 @@ impl GoMetrics {
             provenance: metrics.provenance.clone(),
             session_key: metrics.session_key.clone(),
             parent_session: metrics.parent_session.clone(),
+            copilot_otel_calls: metrics.copilot_otel_calls.clone(),
+            copilot_shutdown_intervals: metrics.copilot_shutdown_intervals.clone(),
         }
     }
 
@@ -2238,6 +2269,8 @@ impl GoMetrics {
             // for them.
             session_key: self.session_key,
             parent_session: self.parent_session,
+            copilot_otel_calls: self.copilot_otel_calls,
+            copilot_shutdown_intervals: self.copilot_shutdown_intervals,
             ..Metrics::default()
         }
     }
@@ -3063,6 +3096,52 @@ mod tests {
         });
         let legacy: GoMetrics = serde_json::from_value(legacy).expect("legacy entry parses");
         assert_eq!(legacy.tokens_reasoning, 0);
+    }
+
+    #[test]
+    fn copilot_cross_root_facts_survive_the_cache_round_trip() {
+        // rm-956: the cross-root reconcile's fact vectors ride the
+        // cached metrics (copilotOtelCalls / copilotShutdownIntervals,
+        // schema 55). A cache written by this build must restore both,
+        // and one written before the fields existed must deserialize
+        // them as EMPTY (serde defaults), never fail — the reconcile
+        // then simply sees no facts, which is the pre-bump behavior.
+        let call = crate::parser::CopilotOtelCall {
+            conversation_id: "conv-a".to_string(),
+            model: "gpt-4.1".to_string(),
+            usage: std::collections::BTreeMap::from([
+                ("input_tokens".to_string(), 10),
+                ("output_tokens".to_string(), 2),
+            ]),
+            timestamp_ns: 1_791_540_000_000_000_000,
+        };
+        let interval = crate::parser::CopilotShutdownInterval {
+            model: "gpt-4.1".to_string(),
+            usage: std::collections::BTreeMap::from([("input_tokens".to_string(), 10)]),
+            requests_count: 1,
+            timestamp_ns: 1_791_540_040_000_000_000,
+        };
+        let metrics = Metrics {
+            copilot_otel_calls: vec![call.clone()],
+            copilot_shutdown_intervals: vec![interval.clone()],
+            ..Metrics::default()
+        };
+        let cached = GoMetrics::from_metrics(&metrics);
+        assert_eq!(cached.copilot_otel_calls, vec![call]);
+        assert_eq!(cached.copilot_shutdown_intervals, vec![interval]);
+        let restored: Metrics = cached.into_metrics();
+        assert_eq!(restored.copilot_otel_calls.len(), 1);
+        assert_eq!(restored.copilot_otel_calls[0].conversation_id, "conv-a");
+        assert_eq!(restored.copilot_shutdown_intervals[0].requests_count, 1);
+
+        // Pre-55 JSON without either field parses to empty vectors.
+        let legacy = serde_json::json!({
+            "TokensInput": 5,
+            "TokensOutput": 5
+        });
+        let legacy: GoMetrics = serde_json::from_value(legacy).expect("legacy entry parses");
+        assert!(legacy.copilot_otel_calls.is_empty());
+        assert!(legacy.copilot_shutdown_intervals.is_empty());
     }
 
     #[test]
