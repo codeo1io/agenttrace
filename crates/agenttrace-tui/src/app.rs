@@ -197,6 +197,7 @@ enum SortKey {
     Source,
     Name,
     Anomalies,
+    Branch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -284,6 +285,7 @@ struct App {
     health_filter: String,
     source_filter: String,
     model_filter: String,
+    branch_filter: String,
     project_filter: String,
     project_id_filter: String,
     range_filter: TimeRange,
@@ -343,6 +345,7 @@ struct SearchSnapshot {
     health_filter: String,
     source_filter: String,
     model_filter: String,
+    branch_filter: String,
     project_filter: String,
     project_id_filter: String,
     range_filter: TimeRange,
@@ -419,6 +422,7 @@ impl App {
             health_filter: String::new(),
             source_filter: String::new(),
             model_filter: String::new(),
+            branch_filter: String::new(),
             project_filter: String::new(),
             project_id_filter: String::new(),
             range_filter: TimeRange::All,
@@ -519,6 +523,7 @@ impl App {
             health_filter: self.health_filter.clone(),
             source_filter: self.source_filter.clone(),
             model_filter: self.model_filter.clone(),
+            branch_filter: self.branch_filter.clone(),
             project_filter: self.project_filter.clone(),
             project_id_filter: self.project_id_filter.clone(),
             range_filter: self.range_filter,
@@ -537,6 +542,7 @@ impl App {
         self.health_filter = snapshot.health_filter;
         self.source_filter = snapshot.source_filter;
         self.model_filter = snapshot.model_filter;
+        self.branch_filter = snapshot.branch_filter;
         self.project_filter = snapshot.project_filter;
         self.project_id_filter = snapshot.project_id_filter;
         self.range_filter = snapshot.range_filter;
@@ -577,6 +583,7 @@ impl App {
             "source" => self.source_filter.clear(),
             "project" => self.project_filter.clear(),
             "model" => self.model_filter.clear(),
+            "branch" => self.branch_filter.clear(),
             "today" | "7d" | "30d" => self.range_filter = TimeRange::All,
             _ => {}
         }
@@ -616,6 +623,10 @@ impl App {
             }
             "model" => {
                 self.model_filter = rest.to_string();
+                !rest.is_empty()
+            }
+            "branch" => {
+                self.branch_filter = rest.to_string();
                 !rest.is_empty()
             }
             "today" if rest.is_empty() => {
@@ -786,6 +797,16 @@ impl App {
                     self.model_filter
                 );
             }
+            _ if lower.starts_with("branch ") => {
+                self.branch_filter = command_value(command);
+                self.refresh_filtered();
+                self.view = View::List;
+                self.status = format!(
+                    "{}: {}",
+                    self.t("filter branch", "筛选分支"),
+                    self.branch_filter
+                );
+            }
             _ if lower.starts_with("project ") => {
                 self.project_filter = command_value(command);
                 self.project_id_filter.clear();
@@ -877,8 +898,8 @@ impl App {
                 None => {
                     self.status = self
                         .t(
-                            "usage: :top cost|turns|failures|health|source|anomalies",
-                            "用法：:top cost|turns|failures|health|source|anomalies",
+                            "usage: :top cost|turns|failures|health|source|anomalies|branch",
+                            "用法：:top cost|turns|failures|health|source|anomalies|branch",
                         )
                         .to_string()
                 }
@@ -888,8 +909,8 @@ impl App {
                 if fields.len() < 2 || fields.len() > 3 {
                     self.status = self
                         .t(
-                            "usage: :sort health|cost|turns|failures|source|name|anomalies [asc|desc]",
-                            "用法：:sort health|cost|turns|failures|source|name|anomalies [asc|desc]",
+                            "usage: :sort health|cost|turns|failures|source|name|anomalies|branch [asc|desc]",
+                            "用法：:sort health|cost|turns|failures|source|name|anomalies|branch [asc|desc]",
                         )
                         .to_string();
                 } else if let Some(key) = parse_sort_key(fields[1]) {
@@ -913,8 +934,8 @@ impl App {
                 } else {
                     self.status = self
                         .t(
-                            "usage: :sort health|cost|turns|failures|source|name|anomalies [asc|desc]",
-                            "用法：:sort health|cost|turns|failures|source|name|anomalies [asc|desc]",
+                            "usage: :sort health|cost|turns|failures|source|name|anomalies|branch [asc|desc]",
+                            "用法：:sort health|cost|turns|failures|source|name|anomalies|branch [asc|desc]",
                         )
                         .to_string();
                 }
@@ -1230,6 +1251,7 @@ impl App {
         self.clear_triage_filters();
         self.source_filter.clear();
         self.model_filter.clear();
+        self.branch_filter.clear();
         self.project_filter.clear();
         self.project_id_filter.clear();
         self.range_filter = TimeRange::All;
@@ -1251,6 +1273,7 @@ impl App {
             || !self.health_filter.is_empty()
             || !self.source_filter.is_empty()
             || !self.model_filter.is_empty()
+            || !self.branch_filter.is_empty()
             || !self.project_filter.is_empty()
             || !self.project_id_filter.is_empty()
             || self.range_filter != TimeRange::All
@@ -1496,6 +1519,7 @@ impl App {
             && matches_health_filter(session, &self.health_filter)
             && matches_source_filter(session, &self.source_filter)
             && matches_text_filter(&session.metrics.model_used, &self.model_filter)
+            && matches_branch_filter(session, &self.branch_filter)
             && matches_text_filter(
                 &self.project_identity(session).display_name,
                 &self.project_filter,
@@ -1785,6 +1809,7 @@ fn sort_key_label(key: SortKey, language: Language) -> &'static str {
         SortKey::Source => text(language, "Source", "来源"),
         SortKey::Name => text(language, "Name", "名称"),
         SortKey::Anomalies => text(language, "Anomalies", "异常"),
+        SortKey::Branch => text(language, "Branch", "分支"),
     }
 }
 
@@ -1859,18 +1884,12 @@ mod explorer;
 mod filters;
 #[path = "i18n.rs"]
 mod i18n;
-#[cfg(test)]
-#[path = "presentation.rs"]
-mod presentation;
 #[path = "shared.rs"]
 mod shared;
 
 use explorer::*;
 use filters::*;
 use i18n::UiText;
-#[cfg(test)]
-use presentation::*;
-#[cfg(not(test))]
 use shared::*;
 
 #[cfg(test)]

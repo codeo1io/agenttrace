@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::*;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -357,16 +355,52 @@ mod tests {
         assert!(format!("{:?}", lines[0]).contains("Ready"));
         assert_eq!(display_source_label("codex_cli"), "Codex");
         // rm-084 review follow-up: fork ids must render as labels, never
-        // leak as raw slugs — here and in the presentation.rs twin.
+        // leak as raw slugs. rm-014: the presentation.rs twin that used to
+        // be re-checked here was deleted together with the test-only
+        // renderer; this is now the single implementation.
         assert_eq!(display_source_label("pi_senpi"), "Pi (senpi) sessions");
         assert_eq!(display_source_label("pi_omo"), "Pi (omo) sessions");
-        assert_eq!(
-            crate::app::presentation::display_source_label("pi_senpi"),
-            "Pi (senpi) sessions"
-        );
-        assert_eq!(
-            crate::app::presentation::display_source_label("pi_omo"),
-            "Pi (omo) sessions"
-        );
+    }
+
+    #[test]
+    fn top_anomaly_driver_counts_every_anomaly_occurrence() {
+        // rm-014 parity evidence: the deleted presentation.rs twin deduped
+        // anomaly kinds per session (+1 per session per kind). Production
+        // semantics — the ones that now have exactly one implementation —
+        // count every anomaly instance, so a session carrying two latency
+        // anomalies contributes 2, not 1. Recorded 2026-10-11 by the
+        // transitional parity probe (9 divergences; this was the one
+        // aggregation-semantics divergence).
+        use agenttrace_core::{Anomaly, Metrics, Session};
+        let session = Session {
+            name: "billing".to_string(),
+            path: "/tmp/billing.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                tokens_input: 10,
+                tokens_output: 5,
+                ..Metrics::default()
+            },
+            anomalies: vec![
+                Anomaly {
+                    kind: "latency".to_string(),
+                    severity: "medium".to_string(),
+                    detail: String::new(),
+                },
+                Anomaly {
+                    kind: "latency".to_string(),
+                    severity: "low".to_string(),
+                    detail: String::new(),
+                },
+            ],
+            health: 80,
+            tool_warnings: Vec::new(),
+            diagnostics: Default::default(),
+        };
+        let top = top_anomaly_driver(&[session]).expect("one latency group");
+        assert_eq!(top.label, "latency");
+        assert_eq!(top.sessions, 2);
+        assert_eq!(top.tokens, 15);
     }
 }

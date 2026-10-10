@@ -425,114 +425,57 @@ fn explorer_attention_uses_core_inspect_reason_and_cost_shows_provenance() {
 
 #[test]
 fn chinese_workspace_copy_is_plain_language_and_width_aware() {
-    let mut item = agenttrace_core::Recommendation {
-        id: "tool-failures".to_string(),
-        priority: "P1".to_string(),
-        severity: "high".to_string(),
-        category: "tool_failure".to_string(),
-        title: "Reduce failing tool calls".to_string(),
-        rationale: String::new(),
-        evidence: Vec::new(),
-        estimated_savings_usd: 0.0,
-        estimated_savings_tokens: 0,
-        confidence: "high".to_string(),
-        action: "Inspect arguments and results".to_string(),
-        validation_command: String::new(),
-    };
-    assert_eq!(
-        recommendation_title(&item, Language::Zh),
-        "减少失败的工具调用"
-    );
-    assert!(recommendation_action(&item, Language::Zh).contains("不要原样重试"));
+    // rm-014 provenance: the `recommendation_title`/
+    // `recommendation_action` asserts that used to live here pinned the
+    // legacy renderer's per-item titles for the never-shipped governance
+    // panels (presentation.rs). The production surface for guidance is
+    // `explorer_recommendation` (one plain-language line per session in
+    // the explorer preview), so the zh table lookups were deleted with
+    // the renderer; the width-aware truncation and the localized active
+    // filter summary below are production surfaces and stay.
     assert_eq!(short("中文宽度", 4), "...");
     assert_eq!(short("中文宽度", 5), "中...");
-    item.id = "slow-tool".to_string();
-    assert_eq!(
-        recommendation_title(&item, Language::Zh),
-        "给慢工具设定时间上限"
-    );
     let mut app = App::new(Vec::new(), "test", None);
     app.model_filter = "gpt-5".to_string();
     app.issue_filter = "failures".to_string();
+    // rm-900: the branch filter rides the same summary dialect.
+    app.branch_filter = "feat/x".to_string();
     assert_eq!(
         active_filter_summary(&app, Language::Zh),
-        "模型: gpt-5 · 问题: 工具失败"
+        "模型: gpt-5 · 问题: 工具失败 · 分支: feat/x"
     );
 }
 
+// rm-014 provenance (deleted test `workspaces_render_filtered_reports_and_project_resolution`):
+// it pinned the legacy tabbed governance chrome — "Action Center" / "Efficiency" /
+// "Delivery evidence" panels, "Workspace"/"Projects" headers — which only the test-only
+// renderer presentation.rs ever drew; the shipped explorer never reads `app.view`, so those
+// panels are unreachable in production and their rendering tests cannot port. What survived
+// on production surfaces: project resolution is pinned by the two rm-038 memo tests below
+// (`project_identity_memo_answers_from_load_not_the_filesystem`,
+// `project_identity_memo_rebuilds_when_sessions_are_replaced`), and the delivery worker
+// lifecycle (spawn → pending → snapshot / error → retry-on-reopen) is pinned state-level by
+// `delivery_evidence_worker_survives_first_scan_and_retries_after_failure` below.
 #[test]
-fn workspaces_render_filtered_reports_and_project_resolution() {
-    let mut governed = session(
-        "governed",
-        "claude_code",
-        "claude-sonnet-4",
-        45,
-        1.2,
-        "mcp__demo__lookup",
-    );
-    governed.cwd = env!("CARGO_MANIFEST_DIR").to_string();
-    governed.metrics.tokens_cache_r = 250;
-    governed.metrics.tokens_output = 100;
-    governed.metrics.tool_calls_fail = 1;
-    governed.metrics.tool_calls_total = 2;
-    governed
-        .metrics
-        .tool_authority
-        .insert("write_files".to_string(), 1);
-    governed.diagnostics.context_utilization.risk_level = "critical".to_string();
-    governed.diagnostics.context_utilization.utilization_pct = 95.0;
-    let mut app = App::new(vec![governed], "test", None);
-    let backend = TestBackend::new(140, 44);
-    let mut terminal = Terminal::new(backend).expect("test terminal");
-
-    for (command, expected) in [("action", "Action Center"), ("efficiency", "Efficiency")] {
-        app.run_command(command).expect("open governance view");
-        assert!(matches!(app.view, View::Governance(_)));
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("render governance view");
-        let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("Workspace"));
-        assert!(rendered.contains(expected));
-        assert!(rendered.contains("Projects"));
-        assert!(rendered.contains("git_root"));
-    }
-
-    app.run_command("delivery")
-        .expect("open delivery workspace");
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("start delivery workspace");
-    let pending = format!("{:?}", terminal.backend().buffer());
-    assert!(pending.contains("Correlating local Git commits"));
-    // Deadline-based rather than a fixed iteration count: under heavy CI
-    // load the governance thread can exceed a fixed 0.5s budget and the
-    // following assertion would flake (same class as the TUI loader
-    // waits below).
-    let delivery_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.governance_delivery_pending() {
-        app.poll_governance_delivery();
-        if !app.governance_delivery_pending() {
-            break;
-        }
-        if std::time::Instant::now() >= delivery_deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render delivery workspace");
-    let delivery = format!("{:?}", terminal.backend().buffer());
-    assert!(delivery.contains("Delivery evidence"));
-
+fn governance_commands_route_panel_state() {
+    // The "action"/"efficiency"/"delivery" command arms and the panel
+    // rotation are shipped App state machinery (run_command + Tab on a
+    // governance view). rm-014: only the RENDERING of these panels was
+    // legacy — the routing itself stays live, so it keeps a state-level
+    // pin (no buffer asserts; the explorer does not draw `app.view`).
+    let mut app = App::new(Vec::new(), "test", None);
+    app.run_command("action").expect("route action center");
+    assert!(matches!(app.view, View::Governance(GovernancePanel::ActionCenter)));
+    app.run_command("efficiency").expect("route efficiency");
+    assert!(matches!(app.view, View::Governance(GovernancePanel::Efficiency)));
+    app.run_command("delivery").expect("route delivery");
+    assert!(matches!(app.view, View::Governance(GovernancePanel::Delivery)));
     app.next_governance_panel();
     assert!(matches!(
         app.view,
         View::Governance(GovernancePanel::ActionCenter)
     ));
     app.view = View::List;
-    app.explorer_detail = None;
     assert_eq!(app.view, View::List);
 }
 
@@ -899,46 +842,46 @@ fn language_defaults_to_english_and_l_toggles_chinese() {
         None,
     );
     assert_eq!(app.language, Language::En);
-    assert!(help_text(View::Overview, app.language).contains("Triage workflow"));
-
+    // rm-014 provenance: the old asserts pinned `help_text(View::Overview)`
+    // ("Triage workflow"/"分诊流程") from the legacy tabbed renderer. The
+    // production help surface is the explorer help overlay (rendered below).
     app.handle_normal_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
         .expect("toggle language");
     assert_eq!(app.language, Language::Zh);
     assert_eq!(app.status, "语言：中文（已保存）");
-    assert!(help_text(View::Overview, app.language).contains("分诊流程"));
 
+    // rm-014: render through the production explorer (render_explorer).
+    // rm-014 provenance: the raw report (`detail_text` + raw_report_expanded,
+    // "AI 智能体会话性能报告") and the waste-analysis diagnostics
+    // (`diagnostics_text`, "浪费分析") were legacy detail-tab panels with no
+    // explorer surface; their asserts were deleted with the renderer. The
+    // full CLI report lane keeps its own localization pins in core/CLI.
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    app.view = View::Overview;
     terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render zh overview");
-    let overview = format!("{:?}", terminal.backend().buffer());
-    assert!(overview.contains("概览"));
-    assert!(overview.contains("优先检查"));
-    assert!(overview.contains("健康度严重"));
-    assert!(overview.contains("打开诊断查看严重健康问题"));
-    assert!(!detail_text(&app).contains("AI 智能体会话性能报告"));
-    app.raw_report_expanded = true;
-    assert!(detail_text(&app).contains("AI 智能体会话性能报告"));
-    app.raw_report_expanded = false;
-    let diagnostics = diagnostics_text(&app);
-    assert!(diagnostics.contains("浪费分析"));
-    assert!(!diagnostics.contains("Waste Analysis"));
+        .draw(|frame| render_explorer(frame, &app))
+        .expect("render zh explorer");
+    let explorer = format!("{:?}", terminal.backend().buffer());
+    assert!(explorer.contains("为什么先看这个"), "zh preview heading missing");
+    assert!(explorer.contains("这个会话看起来不健康"), "zh primary finding missing");
+    assert!(explorer.contains("现在的问题"), "zh findings heading missing");
 
-    app.help_context = View::Overview;
-    app.view = View::Help;
+    app.explorer_overlay = ExplorerOverlay::Help;
     terminal
-        .draw(|frame| render(frame, &mut app))
-        .expect("render zh help");
+        .draw(|frame| render_explorer(frame, &app))
+        .expect("render zh help overlay");
     let help = format!("{:?}", terminal.backend().buffer());
-    assert!(help.contains("分诊流程"));
-    assert!(help.contains("当前视图：概览"));
+    assert!(help.contains("快捷键"), "zh help heading missing");
 
+    app.explorer_overlay = ExplorerOverlay::None;
     app.handle_normal_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
         .expect("toggle language back");
     assert_eq!(app.language, Language::En);
     assert_eq!(app.status, "language: English (saved)");
+    terminal
+        .draw(|frame| render_explorer(frame, &app))
+        .expect("render en explorer");
+    assert!(format!("{:?}", terminal.backend().buffer()).contains("Why look here"));
 }
 
 #[test]
@@ -1192,17 +1135,12 @@ fn go_navigation_keys_and_pairwise_diff_stay_compatible() {
     assert_eq!(app.explorer_overlay, ExplorerOverlay::None);
 
     app.selected = 1;
-    app.view = View::Diff;
-    let visible = app.visible_sessions();
-    let (left, right) = diff_pair(visible.len(), app.selected);
-    let diff = diff_text(&app);
-    assert!(diff.contains(&visible[left].name));
-    assert!(diff.contains(&visible[right].name));
-    let omitted = (0..visible.len())
-        .find(|index| *index != left && *index != right)
-        .unwrap();
-    assert!(!diff.contains(&format!("{}          ", visible[omitted].name)));
-
+    // rm-014 provenance: this block pinned the legacy Diff tab
+    // (`diff_pair` + `diff_text`, presentation.rs) — the shipped surface
+    // for comparing two sessions is the explorer compare view
+    // (space-mark + `c`, render_compare), which has its own pins in
+    // the compare tests. The go-key navigation asserts above/below are
+    // production behavior and stay.
     app.view = View::List;
     app.handle_normal_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE))
         .unwrap();

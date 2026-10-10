@@ -9,6 +9,7 @@ pub(super) fn session_matches(session: &Session, query: &str) -> bool {
         || contains(&session.metrics.source_tool, query)
         || contains(&display_session_source(session), query)
         || contains(&session.metrics.model_used, query)
+        || contains(&session.branch, query)
         || session
             .metrics
             .tool_usage
@@ -35,6 +36,13 @@ pub(super) fn matches_source_filter(session: &Session, filter: &str) -> bool {
     filter.is_empty()
         || contains(&session.metrics.source_tool, &filter)
         || contains(&display_session_source(session), &filter)
+}
+
+pub(super) fn matches_branch_filter(session: &Session, filter: &str) -> bool {
+    // rm-900: branch joins the filter dialect alongside source/model —
+    // empty filter matches everything, otherwise case-insensitive
+    // contains, mirroring matches_text_filter.
+    matches_text_filter(&session.branch, filter)
 }
 
 pub(super) fn matches_health_filter(session: &Session, filter: &str) -> bool {
@@ -161,6 +169,7 @@ pub(super) fn parse_sort_key(value: &str) -> Option<SortKey> {
         "source" | "agent" => Some(SortKey::Source),
         "name" | "session" => Some(SortKey::Name),
         "anom" | "anomaly" | "anomalies" => Some(SortKey::Anomalies),
+        "branch" | "git branch" => Some(SortKey::Branch),
         _ => None,
     }
 }
@@ -187,6 +196,9 @@ pub(super) fn active_filter_summary(app: &App, language: Language) -> String {
     }
     if !app.model_filter.is_empty() {
         filters.push(format!("{}: {}", label("model", "模型"), app.model_filter));
+    }
+    if !app.branch_filter.is_empty() {
+        filters.push(format!("{}: {}", label("branch", "分支"), app.branch_filter));
     }
     let project = active_project_filter_label(app);
     if !project.is_empty() {
@@ -350,6 +362,7 @@ pub(super) fn compare_sessions(a: &Session, b: &Session, key: SortKey, desc: boo
             .len()
             .cmp(&b.anomalies.len())
             .then_with(|| a.name.cmp(&b.name)),
+        SortKey::Branch => a.branch.cmp(&b.branch).then_with(|| a.name.cmp(&b.name)),
     };
     if desc {
         ord.reverse()
