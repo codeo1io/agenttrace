@@ -316,8 +316,12 @@ fn query_hermes_sqlite_sessions(
             return (Vec::new(), failures);
         }
     };
-    let roles = sqlite_role_counts(&db, "messages", "session_id", "role");
-    let tool_outcomes = hermes_tool_outcome_counts(&db);
+    // rm-893: the enrichment lanes share the per-file failure
+    // accumulator, so a row that fails column decode is counted into
+    // the same disclosure as session-row drops (one record per
+    // database file).
+    let roles = sqlite_role_counts(&db, "messages", "session_id", "role", &mut failures);
+    let tool_outcomes = hermes_tool_outcome_counts(&db, &mut failures);
     let cwd = if sqlite_has_column(&db, "sessions", "cwd") {
         "cwd"
     } else {
@@ -471,9 +475,11 @@ fn query_opencode_sqlite_sessions(
     if aggs.is_empty() {
         return (Vec::new(), failures, fork_excluded);
     }
-    add_opencode_sqlite_messages(&db, &mut aggs);
-    add_opencode_sqlite_parts(&db, &mut aggs);
-    capture_opencode_user_text(&db, &mut aggs);
+    // rm-893: enrichment decode failures count into the same per-file
+    // disclosure as session-row drops.
+    add_opencode_sqlite_messages(&db, &mut aggs, &mut failures);
+    add_opencode_sqlite_parts(&db, &mut aggs, &mut failures);
+    capture_opencode_user_text(&db, &mut aggs, &mut failures);
 
     let sessions = aggs
         .into_values()
@@ -697,7 +703,17 @@ fn opencode_sqlite_session_rows(
     (aggs, failures, 0)
 }
 
-fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
+/// rm-893: message rows whose columns fail to decode (a hostile or
+/// hand-edited database can carry a non-TEXT storage class where the
+/// lane reads TEXT — a BLOB bypasses column affinity and survives
+/// storage) are counted into `failures` instead of silently skipped —
+/// the drop class rm-753 closed for session rows, extended to the
+/// enrichment lanes reading the same databases.
+fn add_opencode_sqlite_messages(
+    db: &Connection,
+    aggs: &mut HashMap<String, SqliteSessionAgg>,
+    failures: &mut SqliteFileFailures,
+) {
     let Ok(mut stmt) = db.prepare("select session_id, data from message") else {
         return;
     };
@@ -706,7 +722,15 @@ fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, Sqli
     }) else {
         return;
     };
-    for (session_id, raw) in rows.filter_map(Result::ok) {
+    for row in rows {
+        let (session_id, raw) = match row {
+            Ok(pair) => pair,
+            // rm-893: counted and sampled, never filter_map-dropped.
+            Err(error) => {
+                failures.record_dropped(&error);
+                continue;
+            }
+        };
         let Some(agg) = aggs.get_mut(&session_id) else {
             continue;
         };
@@ -736,7 +760,15 @@ fn add_opencode_sqlite_messages(db: &Connection, aggs: &mut HashMap<String, Sqli
 /// prose in `part` rows of type `text`, not on the `message` row itself,
 /// so the join recovers the prompt behind placeholder titles like
 /// `New session - <timestamp>`.
-fn capture_opencode_user_text(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
+/// rm-893: rows of the part x message join that fail column decode
+/// are counted into `failures` — the join reads the same message.data
+/// and part.data columns the dedicated lanes read, so a mistyped
+/// value trips every lane that reaches it and each trip is disclosed.
+fn capture_opencode_user_text(
+    db: &Connection,
+    aggs: &mut HashMap<String, SqliteSessionAgg>,
+    failures: &mut SqliteFileFailures,
+) {
     // rm-753 perf rider: this used to `order by p.time_created`,
     // sorting the ENTIRE part table on every load to find each
     // session's earliest user text. One unordered pass keeping the
@@ -763,7 +795,15 @@ fn capture_opencode_user_text(db: &Connection, aggs: &mut HashMap<String, Sqlite
         return;
     };
     let mut earliest: HashMap<String, (Option<i64>, i64, String)> = HashMap::new();
-    for (session_id, part_raw, message_raw, time_created, rowid) in rows.filter_map(Result::ok) {
+    for row in rows {
+        let (session_id, part_raw, message_raw, time_created, rowid) = match row {
+            Ok(quint) => quint,
+            // rm-893: counted and sampled, never filter_map-dropped.
+            Err(error) => {
+                failures.record_dropped(&error);
+                continue;
+            }
+        };
         let Ok(serde_json::Value::Object(message)) = serde_json::from_str::<Value>(&message_raw)
         else {
             continue;
@@ -798,7 +838,14 @@ fn capture_opencode_user_text(db: &Connection, aggs: &mut HashMap<String, Sqlite
     }
 }
 
-fn add_opencode_sqlite_parts(db: &Connection, aggs: &mut HashMap<String, SqliteSessionAgg>) {
+/// rm-893: part rows whose columns fail to decode are counted into
+/// `failures` instead of silently skipped (same disclosure class as
+/// the message lane above).
+fn add_opencode_sqlite_parts(
+    db: &Connection,
+    aggs: &mut HashMap<String, SqliteSessionAgg>,
+    failures: &mut SqliteFileFailures,
+) {
     let Ok(mut stmt) = db.prepare("select session_id, data from part") else {
         return;
     };
@@ -807,7 +854,15 @@ fn add_opencode_sqlite_parts(db: &Connection, aggs: &mut HashMap<String, SqliteS
     }) else {
         return;
     };
-    for (session_id, raw) in rows.filter_map(Result::ok) {
+    for row in rows {
+        let (session_id, raw) = match row {
+            Ok(pair) => pair,
+            // rm-893: counted and sampled, never filter_map-dropped.
+            Err(error) => {
+                failures.record_dropped(&error);
+                continue;
+            }
+        };
         let Some(agg) = aggs.get_mut(&session_id) else {
             continue;
         };
@@ -909,11 +964,17 @@ fn opencode_sqlite_message_model(doc: &serde_json::Map<String, Value>) -> String
         .unwrap_or_default()
 }
 
+/// rm-893: grouped role rows that fail column decode (e.g. a non-TEXT
+/// storage class where the lane reads TEXT — BLOBs bypass column
+/// affinity and survive storage) are counted into `failures`
+/// instead of silently skipped — role counts feed session messaging
+/// metrics, and a vanished group is a silent mis-report.
 fn sqlite_role_counts(
     db: &Connection,
     table: &str,
     session_column: &str,
     role_column: &str,
+    failures: &mut SqliteFileFailures,
 ) -> HashMap<String, RoleCounts> {
     let sql = format!(
         "select {session_column}, {role_column}, count(*) from {table} group by {session_column}, {role_column}"
@@ -931,7 +992,15 @@ fn sqlite_role_counts(
         return HashMap::new();
     };
     let mut out = HashMap::new();
-    for (session_id, role, count) in rows.filter_map(Result::ok) {
+    for row in rows {
+        let (session_id, role, count) = match row {
+            Ok(triple) => triple,
+            // rm-893: counted and sampled, never filter_map-dropped.
+            Err(error) => {
+                failures.record_dropped(&error);
+                continue;
+            }
+        };
         let entry = out.entry(session_id).or_insert_with(RoleCounts::default);
         match role.as_str() {
             "user" => entry.user = count.max(0) as usize,
@@ -959,7 +1028,14 @@ struct HermesToolOutcomes {
     failures: usize,
 }
 
-fn hermes_tool_outcome_counts(db: &Connection) -> HashMap<String, HermesToolOutcomes> {
+/// rm-893: grouped tool-outcome rows that fail column decode are
+/// counted into `failures` instead of silently skipped — the failure
+/// tallies drive the ok/fail split, and a dropped group silently
+/// flips a session to all-ok.
+fn hermes_tool_outcome_counts(
+    db: &Connection,
+    failures: &mut SqliteFileFailures,
+) -> HashMap<String, HermesToolOutcomes> {
     if !sqlite_has_column(db, "messages", "content") {
         return HashMap::new();
     }
@@ -981,12 +1057,20 @@ fn hermes_tool_outcome_counts(db: &Connection) -> HashMap<String, HermesToolOutc
         return HashMap::new();
     };
     let mut out = HashMap::new();
-    for (session_id, results, failures) in rows.filter_map(Result::ok) {
+    for row in rows {
+        let (session_id, results, failed) = match row {
+            Ok(triple) => triple,
+            // rm-893: counted and sampled, never filter_map-dropped.
+            Err(error) => {
+                failures.record_dropped(&error);
+                continue;
+            }
+        };
         out.insert(
             session_id,
             HermesToolOutcomes {
                 results: results.max(0) as usize,
-                failures: failures.max(0) as usize,
+                failures: failed.max(0) as usize,
             },
         );
     }
