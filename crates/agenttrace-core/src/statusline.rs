@@ -907,17 +907,24 @@ fn render_statusline_report_text(
     }
     // rm-385: the weekly budget line rides the already-parsed capture
     // journal; budget unset keeps the report byte-compatible.
+    // rm-917: an empty calendar window discloses instead of verdicting.
     if let Some(budget) = weekly_budget {
-        let remaining = budget - series.total;
-        let state = if remaining < 0.0 {
-            format!("OVER by ${:.2}", -remaining)
+        if series.daily.is_empty() {
+            out.push_str(&format!(
+                "Budget: no cost samples in the trailing 7 calendar days (budget ${budget:.2})\n"
+            ));
         } else {
-            format!("${remaining:.2} remaining")
-        };
-        out.push_str(&format!(
-            "Budget: 7d spend ${:.2} of ${budget:.2} — {state}\n",
-            series.total
-        ));
+            let remaining = budget - series.total;
+            let state = if remaining < 0.0 {
+                format!("OVER by ${:.2}", -remaining)
+            } else {
+                format!("${remaining:.2} remaining")
+            };
+            out.push_str(&format!(
+                "Budget: 7d spend ${:.2} of ${budget:.2} — {state}\n",
+                series.total
+            ));
+        }
     }
     if !insights.session_caches.is_empty() {
         out.push_str("Prompt cache per session:\n");
@@ -985,12 +992,23 @@ fn utc_day(epoch: i64) -> String {
 /// day's spend is the rise of that cumulative value across the day's
 /// samples; a value that drops (session epoch reset) contributes only
 /// itself. Days are UTC buckets over the trailing window, ascending.
+/// rm-917: the window is CALENDAR-anchored — the trailing `days`
+/// calendar days ending today (UTC), never the newest `days` *sampled*
+/// days, so a stale journal cannot charge the weekly envelope a
+/// weeks-old sum.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatuslineBudgetSeries {
-    /// UTC day (`YYYY-MM-DD`) -> spend in USD, ascending.
+    /// UTC day (`YYYY-MM-DD`) -> spend in USD, ascending: one bucket
+    /// per calendar day in the window once any sample falls inside it
+    /// (missing days render as explicit $0.00 rows); empty when the
+    /// window holds no samples at all.
     pub daily: Vec<(String, f64)>,
-    /// Sum of `daily`.
+    /// Sum of `daily` (in-window spend only).
     pub total: f64,
+    /// rm-917: distinct sampled UTC days strictly older than the
+    /// calendar window — excluded from `daily`/`total` and disclosed
+    /// by the budget views so a stale journal is visible, not silent.
+    pub excluded_older_days: usize,
 }
 
 pub fn statusline_budget_series(
@@ -1032,27 +1050,62 @@ pub fn statusline_budget_series(
             previous = *cumulative;
         }
     }
-    // Keep only the trailing `days` calendar days anchored at `now`:
-    // the budget-window rider re-anchored the window on 2026-10-07.
-    // Before that, the window kept the first `days` *observed* days,
-    // so a journal with a week-old gap billed days outside the
-    // current week against the weekly budget (a corpus capturing
-    // $4/$5/$1 on the 21st/26th/6th rendered "7d total $10.00" with
-    // only $1 in the current week). Design follows upstream #306's
-    // calendar windows. ISO day strings compare lexicographically, so
-    // string bounds filter them; `days == 0` anchors the cutoff AT
-    // `now`, so today's entries are retained (a one-day window), not
-    // dropped. Review 95d74221 F8: the window is also bounded ABOVE by
-    // today — a future-dated capture (clock skew, a hostile journal)
-    // no longer bills into "the last 7 days".
-    let cutoff = (now.date_naive() - Duration::days(days.saturating_sub(1) as i64))
-        .format("%Y-%m-%d")
-        .to_string();
-    let today = now.date_naive().format("%Y-%m-%d").to_string();
-    let window: Vec<(String, f64)> = daily
+    // rm-917 (run d02291d0, composed at integration over the
+    // 2026-10-07 budget-window rider): keep only the trailing `days`
+    // CALENDAR days ending today (UTC) — NOT the newest `days`
+    // sampled days, which charged the weekly envelope a possibly
+    // weeks-old sum whenever the journal went stale (the live PoC:
+    // a 13-day-old sample span drove `7d total $7.00` / `OVER by
+    // $2.00` against --weekly-budget 5 with zero true trailing-week
+    // samples; before the rider, the window kept the first `days`
+    // *observed* days, so a corpus capturing $4/$5/$1 on the
+    // 21st/26th/6th rendered "7d total $10.00" with only $1 in the
+    // current week). The rider's mechanics survive as the anchor: the
+    // window ends at `now`'s UTC day (the pinned-`now` testability
+    // param from review 95d74221) and is bounded ABOVE by today, so
+    // a future-dated capture (clock skew, a hostile journal — review
+    // 95d74221 F8) bills into no window. rm-917 adds on top: in-window
+    // gap days zero-fill as explicit $0.00 rows, strictly-older
+    // sampled days are excluded from `daily`/`total` and disclosed
+    // through `excluded_older_days`, and an empty calendar window
+    // keeps the "(no cost samples in the window)" disclosure honest
+    // instead of verdicting off stale samples. `days == 0` is an
+    // EMPTY window — zero calendar days zero-fill to zero rows
+    // (superseding the rider's read that `days == 0` anchors a
+    // one-day window; no test pinned that edge either way).
+    let today = now.date_naive();
+    if days == 0 {
+        return StatuslineBudgetSeries {
+            daily: Vec::new(),
+            total: 0.0,
+            excluded_older_days: daily.len(),
+        };
+    }
+    let window_start = today - Duration::days(days as i64 - 1);
+    let by_day: BTreeMap<chrono::NaiveDate, f64> = daily
         .into_iter()
-        .filter(|(day, _)| day.as_str() >= cutoff.as_str() && day.as_str() <= today.as_str())
+        .filter_map(|(day, spend)| Some((day.parse::<chrono::NaiveDate>().ok()?, spend)))
         .collect();
+    let excluded_older_days = by_day.range(..window_start).count();
+    let any_in_window = by_day.range(window_start..=today).next().is_some();
+    let window: Vec<(String, f64)> = if any_in_window {
+        // Zero-fill the calendar days inside the window so gaps are
+        // explicit $0.00 rows instead of silently missing days.
+        (0..days as i64)
+            .map(|offset| {
+                let date = window_start + Duration::days(offset);
+                (
+                    date.format("%Y-%m-%d").to_string(),
+                    by_day.get(&date).copied().unwrap_or(0.0),
+                )
+            })
+            .collect()
+    } else {
+        // No sample inside the calendar window: an empty series keeps
+        // the "(no cost samples in the window)" disclosure honest and
+        // never verdicts off stale samples.
+        Vec::new()
+    };
     // Review 5b9a9470 F4: an empty window's f64 reduction is lowered
     // by LLVM to the additive identity -0.0 in optimized builds, which
     // rendered as "$-0.00" at both budget display sites (the fresh-
@@ -1062,6 +1115,7 @@ pub fn statusline_budget_series(
     StatuslineBudgetSeries {
         daily: window,
         total,
+        excluded_older_days,
     }
 }
 
@@ -1096,6 +1150,8 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
                 }))
                 .collect::<Vec<_>>(),
             "spend_7d_usd": series.total,
+            // rm-917: stale sampled days the calendar window excluded.
+            "excluded_older_days": series.excluded_older_days,
         });
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
@@ -1110,7 +1166,11 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             path.display()
         ));
     }
-    let mut out = String::from("Weekly budget — last 7 days (statusline journal)\n");
+    // rm-917 header (README/CHANGELOG pin the phrasing); the series
+    // is the ONE rm-684/rm-898 shared single-read computation above —
+    // the candidate's text arm re-read the journal here (superseded
+    // mechanics, dropped at integration).
+    let mut out = String::from("Weekly budget — trailing 7 calendar days (statusline journal)\n");
     for (day, spend) in &series.daily {
         out.push_str(&format!("  {day}  ${spend:.2}\n"));
     }
@@ -1118,7 +1178,23 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
         out.push_str("  (no cost samples in the window)\n");
     }
     out.push_str(&format!("  7d total ${:.2}\n", series.total));
+    if series.excluded_older_days > 0 {
+        out.push_str(&format!(
+            "  ({} older day{} outside the window not counted)\n",
+            series.excluded_older_days,
+            if series.excluded_older_days == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
     match weekly_budget {
+        // rm-917: an empty calendar window never drives a spend
+        // verdict — stale samples must not read as OVER/remaining.
+        Some(budget) if series.daily.is_empty() => out.push_str(&format!(
+            "  budget ${budget:.2} — no cost samples in the trailing 7 calendar days; no spend verdict\n"
+        )),
         Some(budget) => {
             let remaining = budget - series.total;
             if remaining < 0.0 {
@@ -1154,6 +1230,95 @@ mod tests {
             captured_at,
             payload,
         }
+    }
+
+    fn epoch_on_day_offset(days_ago: i64, secs_into_day: i64) -> i64 {
+        use chrono::TimeZone;
+        // Noon UTC keeps the sample safely inside the intended UTC day
+        // no matter when the test runs.
+        let noon = (chrono::Utc::now().date_naive() - chrono::TimeDelta::days(days_ago))
+            .and_hms_opt(12, 0, 0)
+            .expect("noon exists");
+        chrono::Utc.from_utc_datetime(&noon).timestamp() + secs_into_day
+    }
+
+    #[test]
+    fn budget_series_stale_span_outside_calendar_window_is_empty() {
+        // rm-917 (assess a38c3665 PoC shape): samples on 13 distinct
+        // days, ALL strictly older than the trailing 7 calendar days.
+        // The sampled window used to keep the newest 7 of those days
+        // and charged the weekly envelope a weeks-old sum (live PoC:
+        // "7d total $7.00" / "OVER by $2.00" against --weekly-budget 5
+        // with zero true trailing-week samples). A calendar window
+        // holds none of these days: the series is empty.
+        let mut captures = Vec::new();
+        let mut cumulative = 0.0;
+        for days_ago in (8..=20).rev() {
+            captures.push(budget_capture(
+                "A",
+                epoch_on_day_offset(days_ago, 100),
+                cumulative,
+            ));
+            cumulative += 1.00;
+        }
+        let series = statusline_budget_series(&captures, 7, Utc::now());
+        assert!(series.daily.is_empty(), "{:?}", series.daily);
+        assert_eq!(series.total.to_bits(), 0.0f64.to_bits(), "{series:?}");
+    }
+
+    #[test]
+    fn budget_series_calendar_window_zero_fills_missing_days() {
+        // rm-917: the window is the trailing 7 CALENDAR days ending
+        // today. Days inside the window with no samples render as
+        // explicit $0.00 rows; days outside it are excluded from the
+        // sum entirely.
+        let captures = vec![
+            budget_capture("A", epoch_on_day_offset(5, 100), 2.00),
+            budget_capture("A", epoch_on_day_offset(0, 100), 5.00),
+        ];
+        let series = statusline_budget_series(&captures, 7, Utc::now());
+        assert_eq!(series.daily.len(), 7, "{:?}", series.daily);
+        let today = chrono::Utc::now().date_naive();
+        for (i, (day, spend)) in series.daily.iter().enumerate() {
+            let expect_date = today - chrono::TimeDelta::days(6 - i as i64);
+            assert_eq!(
+                day,
+                &expect_date.format("%Y-%m-%d").to_string(),
+                "{:?}",
+                series.daily
+            );
+            let expect_spend = match 6 - i as i64 {
+                5 => 2.00, // first sample contributes itself
+                0 => 3.00, // rise from 2.00 to 5.00
+                _ => 0.00,
+            };
+            assert!((spend - expect_spend).abs() < 1e-9, "{:?}", series.daily);
+        }
+        assert!((series.total - 5.00).abs() < 1e-9, "{series:?}");
+    }
+
+    #[test]
+    fn budget_report_renders_no_verdict_when_calendar_window_has_no_samples() {
+        // rm-917: an empty calendar window must never drive an
+        // OVER/remaining verdict off stale samples — the disclosure
+        // line replaces the verdict.
+        let series = statusline_budget_series(&[], 7, Utc::now());
+        let text = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 3,
+                bytes: 100,
+                retained_max_bytes: 1024,
+                capped_away_bytes: 0,
+            },
+            &statusline_insights(&[]),
+            Some(5.0),
+            &series,
+        );
+        assert!(text.contains("no cost samples"), "{text}");
+        assert!(!text.contains("remaining"), "{text}");
+        assert!(!text.contains("OVER"), "{text}");
     }
 
     #[test]
@@ -1218,11 +1383,13 @@ mod tests {
         // 0.25 per day (cumulative 0.25, 0.50, ...) — a reset that
         // never rises again burns nothing. The window is the seven
         // CALENDAR days ending at `now`: with `now` pinned, days
-        // -6..-1 are inside and everything older falls OUT of the
-        // weekly budget instead of hiding inside an observed-days gap
-        // (the 2026-10-07 budget-window rider: the window used to keep
-        // the first seven *observed* days, so week-old spend still
-        // counted against the current weekly budget).
+        // -6..-1 are inside, `now`'s own day zero-fills (rm-917), and
+        // everything older falls OUT of the weekly budget and into
+        // `excluded_older_days` instead of hiding inside an
+        // observed-days gap (the 2026-10-07 budget-window rider: the
+        // window used to keep the first seven *observed* days, so
+        // week-old spend still counted against the current weekly
+        // budget).
         use chrono::TimeZone;
         let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
         let base = now.timestamp();
@@ -1245,13 +1412,19 @@ mod tests {
         // (its 0.25 sample sits below day -9's 3.50 cumulative, so its
         // rise is max(0, ·) = 0), and days -7..0 hold only the -7..-1
         // tail — each burning 0.25. `now` itself has no samples, so
-        // six daily entries of 0.25.
-        assert_eq!(series.daily.len(), 6, "{:?}", series.daily);
+        // six sampled entries of 0.25 plus rm-917's zero-filled
+        // today — seven calendar rows, same 1.50 total.
+        assert_eq!(series.daily.len(), 7, "{:?}", series.daily);
         assert!((series.total - 6.0 * 0.25).abs() < 1e-9, "{:?}", series);
+        // rm-917: the four sampled days strictly older than the
+        // calendar window (-10, -9, -8, -7) are excluded and
+        // disclosed, not billed.
+        assert_eq!(series.excluded_older_days, 4, "{series:?}");
         // The full-journal variant still sums all the burn: day -8
         // contributes 0 (the reset), so only the SEVEN tail days burn
         // 0.25 — 2.00 + 1.50 + 1.00 + 7×0.25 = 6.25 (tomorrow's $99
-        // future capture excluded by the upper bound).
+        // future capture excluded by the upper bound; rm-917
+        // zero-fills the 20 unsampled in-window days).
         let full = statusline_budget_series(&captures, 30, now);
         assert!(
             (full.total - (2.00 + 1.50 + 1.00 + 7.0 * 0.25)).abs() < 1e-9,
@@ -1317,7 +1490,49 @@ mod tests {
     }
 
     #[test]
+    fn budget_series_excludes_and_discloses_older_days() {
+        // rm-917: sampled days strictly older than the calendar window
+        // are excluded from `daily`/`total` and disclosed in
+        // `excluded_older_days` — distinct days, not captures.
+        let mut captures = Vec::new();
+        let mut cumulative = 0.0;
+        for days_ago in (8..=20).rev() {
+            captures.push(budget_capture(
+                "A",
+                epoch_on_day_offset(days_ago, 100),
+                cumulative,
+            ));
+            cumulative += 1.00;
+        }
+        // All 13 sampled days are older than the trailing week.
+        let stale = statusline_budget_series(&captures, 7, Utc::now());
+        assert_eq!(stale.excluded_older_days, 13, "{stale:?}");
+        assert!(stale.daily.is_empty());
+        // Mixed: two in-window days plus the same stale span.
+        captures.push(budget_capture("A", epoch_on_day_offset(0, 100), cumulative));
+        captures.push(budget_capture(
+            "A",
+            epoch_on_day_offset(3, 100),
+            cumulative + 2.00,
+        ));
+        let mixed = statusline_budget_series(&captures, 7, Utc::now());
+        assert_eq!(mixed.excluded_older_days, 13, "{mixed:?}");
+        assert_eq!(mixed.daily.len(), 7, "{:?}", mixed.daily);
+        // In-window: today's rise 1.00 + D-3's rise 2.00 = 3.00.
+        assert!((mixed.total - 3.00).abs() < 1e-9, "{mixed:?}");
+        // A 30-day window still reaches back past the stale span's
+        // oldest day (D-20): nothing is excluded.
+        let wide = statusline_budget_series(&captures, 30, Utc::now());
+        assert_eq!(wide.excluded_older_days, 0, "{wide:?}");
+    }
+
+    #[test]
     fn budget_view_renders_spend_budget_and_unconfigured_state() {
+        // Pinned `now` (review 95d74221 determinism; the candidate's
+        // real-today variant retired): both captures land inside
+        // `now`'s UTC day, which rm-917's calendar window keeps as
+        // today's row — the first capture (2.00) contributes itself,
+        // the second adds a 1.00 rise.
         use chrono::TimeZone;
         let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
         let base = now.timestamp();
@@ -1342,6 +1557,35 @@ mod tests {
         );
         assert!(text.contains("Budget: 7d spend $3.00 of $10.00"), "{text}");
         assert!(text.contains("$7.00 remaining"), "{text}");
+        // rm-917: a journal with nothing inside the calendar window
+        // discloses instead of verdicting.
+        let stale_series = statusline_budget_series(
+            &[budget_capture(
+                "A",
+                now.timestamp() - 20 * 86_400 + 100,
+                2.00,
+            )],
+            7,
+            now,
+        );
+        let stale_text = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 1,
+                bytes: 50,
+                retained_max_bytes: 1024,
+                capped_away_bytes: 0,
+            },
+            &statusline_insights(&[]),
+            budget,
+            &stale_series,
+        );
+        assert!(
+            stale_text.contains("Budget: no cost samples in the trailing 7 calendar days"),
+            "{stale_text}"
+        );
+        assert!(!stale_text.contains("remaining"), "{stale_text}");
         let unbudgeted = render_statusline_report_text(
             &StatuslineJournalStats {
                 path: "journal".to_string(),
