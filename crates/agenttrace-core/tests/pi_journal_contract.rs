@@ -344,3 +344,154 @@ fn known_version_set_is_current() {
     // release lands and extend the fixtures to match.
     assert!(KNOWN_PI_JOURNAL_VERSIONS.contains(&3));
 }
+
+/// Parses a bundled fixture journal into a Session for the writer-
+/// surface contract tests below.
+fn parse_fixture_session(name: &str, path: &str) -> agenttrace_core::Session {
+    parse_raw_session(name, path, &fixture(path))
+        .unwrap_or_else(|error| panic!("{name} must parse as pi journal: {error}"))
+}
+
+// rm-939 writer-surface drift contract. pi's dist session-manager.js
+// writes exactly 13 entry types (verified 1.0.3 vs 1.0.4 tarballs,
+// session-manager.js byte-identical; research C1). This contract pins
+// the parser's response to EVERY one of them: each type must land in
+// exactly one bucket — DISCLOSED (pi_entry_skipped:<type>) or HANDLED
+// (no skip counter) — and every HANDLED type that can carry spend
+// must actually land its spend in the totals. This is the regression
+// gate for the handled-but-partial class the compaction arm embodied:
+// the type counted as handled (pi_entry_skipped 0) while its usage
+// block was silently discarded, leaving the largest single cost in a
+// pi session invisible in every number AND every disclosure. If a
+// future pi release adds/reshapes a writer type, one of the three
+// assertions below fails until the arm (and this table) is updated
+// with intent: the enumeration asserts the expected classification,
+// the totals assert the spend landed, the skip-key sweep asserts no
+// type silently falls between the buckets.
+const WRITER_SURFACE_FIXTURE: &str = "tests/fixtures/pi-writer-surface/journal.jsonl";
+
+#[test]
+fn pi_writer_surface_contract_covers_all_thirteen_dist_types() {
+    let session = parse_fixture_session("pi-writer-surface", WRITER_SURFACE_FIXTURE);
+    let counters = &session.metrics.disclosure_counters;
+
+    // The complete 13-type enumeration from pi's dist
+    // session-manager.js writer surface, with the classification each
+    // type must hold. true = the type is deliberately skipped and
+    // named in a pi_entry_skipped:<type> counter; false = a parser
+    // arm consumes it and NO skip counter may fire for it.
+    const WRITER_SURFACE: [(&str, bool); 13] = [
+        ("session", false), // header: id/cwd/version
+        ("label", true),
+        ("text", true),
+        ("usage", false), // rm-436 standalone usage arm
+        ("thinking_level_change", true),
+        ("session_info", true),
+        ("model_change", false), // rm-438 tracked-model switch
+        ("message", false),
+        // custom_message rides the message path (the omp arm routes it
+        // through :1612) — handled, not skipped.
+        ("custom_message", false),
+        ("custom", true),
+        ("context_edit", true),
+        // rm-939: usage folded, disclosed per kind — the summary turn
+        // and the usage meta event are BOTH accounted, and the kind is
+        // distinguishable in the counters.
+        ("compaction", false),
+        ("branch_summary", false),
+    ];
+
+    for (typ, disclosed) in WRITER_SURFACE {
+        let key = format!("pi_entry_skipped:{typ}");
+        let hits = counters.get(&key).copied().unwrap_or(0);
+        if disclosed {
+            assert_eq!(hits, 1, "writer type {typ} must disclose its skip");
+        } else {
+            assert_eq!(hits, 0, "writer type {typ} is handled — a skip counter here means an arm regressed to the catch-all");
+        }
+    }
+
+    // No pi_entry_skipped key may exist outside the 13-type table: a
+    // stray key means a type reshaped on the wire (or a new type)
+    // fell through the arms unclassified.
+    for key in counters.keys() {
+        if let Some(typ) = key.strip_prefix("pi_entry_skipped:") {
+            assert!(
+                WRITER_SURFACE.iter().any(|(t, d)| *d && *t == typ),
+                "unexpected pi_entry_skipped:{typ} — the writer surface drifted beyond the 13-type contract; update the table and the arm with intent"
+            );
+        }
+    }
+
+    // The spend assertions: every HANDLED type that carries usage in
+    // the fixture must land its tokens in the totals — message
+    // (500/1000/25000/5000), usage entry (100/20), compaction
+    // (38000/900, upstream-recorded $0.0123), branch_summary (700/80).
+    let m = &session.metrics;
+    assert_eq!(
+        m.tokens_input,
+        500 + 100 + 38000 + 700,
+        "all four usage-bearing types must count input"
+    );
+    assert_eq!(
+        m.tokens_output,
+        1000 + 20 + 900 + 80,
+        "all four usage-bearing types must count output"
+    );
+    assert_eq!(m.tokens_cache_r, 25000);
+    assert_eq!(m.tokens_cache_w, 5000);
+    assert_eq!(
+        m.upstream_cost_usd, 0.0123,
+        "the compaction call's upstream-recorded cost must ride along"
+    );
+    assert_eq!(
+        m.assistant_turns, 3,
+        "message + compaction summary + branch_summary summary"
+    );
+    assert_eq!(counters.get("pi_usage_entry:main").copied().unwrap_or(0), 1);
+    assert_eq!(
+        counters.get("pi_compaction_usage_counted:compaction").copied().unwrap_or(0),
+        1,
+        "the compaction usage fold must be disclosed per kind — its absence is the pre-rm-939 silent drop"
+    );
+    assert_eq!(
+        counters
+            .get("pi_compaction_usage_counted:branch_summary")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "branch_summary usage folds through the same arm and stay separately countable"
+    );
+}
+
+// rm-939 sentinel: the assess PoC shape pinned green at the parse
+// level. One user/assistant exchange plus one compaction call whose
+// inline usage block (38000 in / 900 out / $0.0123 upstream-recorded)
+// was the whole-context call's real spend. Pre-fix the session
+// reported $0.0023 (catalog of the exchange alone); spec-true is the
+// catalog PLUS the compaction call's recorded cost — asserted to the
+// cent in pi_usage_tree_accounting::compaction_usage_composes_with_
+// catalog; here the parse-level facts are pinned: the tokens count,
+// the recorded cost rides along, the fold is disclosed, and nothing
+// skips.
+#[test]
+fn pi_compaction_usage_sentinel_counts_tokens_cost_and_disclosure() {
+    let session = parse_fixture_session("pi-writer-surface", WRITER_SURFACE_FIXTURE);
+    let counters = &session.metrics.disclosure_counters;
+    assert_eq!(session.metrics.upstream_cost_usd, 0.0123);
+    assert_eq!(session.metrics.assistant_turns, 3);
+    assert_eq!(
+        counters
+            .get("pi_entry_skipped:compaction")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(
+        counters
+            .get("pi_compaction_usage_counted:compaction")
+            .copied()
+            .unwrap_or(0),
+        1
+    );
+}

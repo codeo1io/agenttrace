@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 52 and the SQLite snapshot is schema 10; the
+The session cache is schema 53 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -279,7 +279,19 @@ note), and entry/listing keys encode non-UTF-8 paths losslessly
 (`at-bytes:` percent-escaping) so a warm store no longer hides the
 very non-UTF-8 journals it exists to remember; concurrent saves and
 clears serialize under an advisory lock sibling (`sessions.json.lock`)
-instead of racing last-writer-wins; the SQLite snapshot to 7
+instead of racing last-writer-wins, and to 53 when the pi journal's
+compaction/`branch_summary` entries stopped dropping their inline
+usage blocks — the whole-context compaction call's real spend (tokens
+plus the upstream-recorded cost, disclosed per kind as
+`pi_compaction_usage_counted:<kind>`) folds into session totals
+instead of being discarded while the entry type counted as handled
+(PoC $0.0023 reported vs ~$0.0143 spec-true), so a warm v52 entry
+keeps serving the compaction undercount for unchanged files (rm-939
+of run 4ffc4fbb, minted campaign-locally as rm-543 and double-minted
+as the campaign-local rm-551 — renumbered at integration since the
+landed rm-551 is the Copilot per-model fold; the batch's own
+27 → 28 bump re-based onto the advanced ceiling as 52 → 53, one
+invalidation either way); the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

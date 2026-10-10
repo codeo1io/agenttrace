@@ -5,7 +5,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 52;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 53;
+// Bumped 52 -> 53 (integration of run 4ffc4fbb2e9c, conflict case
+// a1c5cb6f54f34484bd2b404fc90d99a0, candidate fa1d831 — the run's
+// rm-939 'pi journal: compaction/branch_summary usage is silently
+// dropped', minted campaign-locally as rm-543 and double-minted as
+// the campaign-local rm-551; renumbered at integration because the
+// landed rm-551 is run 254b2417's Copilot per-model fold): pi's
+// appendCompaction writes the compaction LLM call's usage block
+// inline, and the 'branch_summary' | 'compaction' arm used to
+// extract only the summary — the real spend of the whole-context
+// call was dropped with zero disclosure while the entry type
+// counted as handled (PoC $0.0023 reported vs ~$0.0143 spec-true;
+// wild census 11,587 compaction entries / 519 usage-bearing). The
+// fold now counts tokens plus the upstream-recorded cost and
+// discloses per kind as pi_compaction_usage_counted, so sessions
+// with pi compaction entries report HIGHER truthful totals for
+// unchanged files — a warm v52 cache must not keep serving the
+// undercount (rm-230 convention: parser-semantics changes that
+// alter reported totals bump the schema so cached sessions
+// regenerate). The batch minted its bump as 27 -> 28 against its
+// own ceiling 27 (its merge-forward re-base); this integration
+// re-bases it onto the already-advanced ceiling 52, one
+// invalidation either way. Entries regenerate once on next scan.
 // Bumped 51 -> 52 (integration of run 2d92ee95, "session-cache
 // store integrity" batch — rm-292 LEAD schema-change restore
 // lifecycle + rm-041 lossless cache keys + the rm-298 concurrent-
@@ -412,6 +434,25 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 52;
 // the bump onto the already-advanced ceiling (25 was rm-450, 26 was
 // rm-485, 27 was rm-542, 28 was rm-529) per the same convention.
 // Entries regenerate once on next scan.
+// Historical rung (run 4ffc4fbb's base-local bump, minted as its own
+// schema 28 above its ceiling 27 — on the landed ladder slot 28
+// belongs to rm-529/run 66e75e39 above, and this batch's bump
+// re-bases at integration onto the advanced ceiling as 52 -> 53 per
+// the top rung; rm-939 = the campaign-local rm-543, itself
+// double-minted as the campaign-local rm-551 and renumbered at
+// integration, the landed rm-551 being run 254b2417's Copilot
+// per-model fold): the pi journal's inline compaction/branch_summary
+// usage block is now folded into session accounting (tokens plus the
+// upstream-recorded cost, disclosed per kind as
+// pi_compaction_usage_counted) instead of being dropped while the
+// entry type counted as handled — so sessions with pi compaction
+// entries report HIGHER truthful totals for unchanged files and a
+// warm v27 cache must not keep serving the undercount (PoC $0.0023
+// reported vs ~$0.0143 spec-true; wild census 11,587 compaction
+// entries / 519 usage-bearing). Minted against schema 25 when the
+// landed wall was at rm-540 — slot 26 was rm-485, slot 27 was
+// rm-542's codex custom-tools parse. Entries regenerate once on
+// next scan.
 // Bumped 27 -> 28 (integration of run 66e75e39, rm-529 'Clamp cache
 // counts to cache-inclusive input (port upstream open PR #316)'):
 // the shared subtract_cached_input clamps each cache count to what is

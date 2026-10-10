@@ -2373,6 +2373,36 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                         ..Event::default()
                     });
                 }
+                // rm-939: pi's appendCompaction writes the compaction
+                // LLM call's usage block INLINE (input/output/cacheRead/
+                // cacheWrite plus an upstream-recorded cost when the
+                // provider reports one). The type was handled — summary
+                // extracted, pi_entry_skipped 0 — while the real spend
+                // of the whole-context call was discarded whole (PoC
+                // $0.0023 reported vs ~$0.0143 spec-true; wild census
+                // 11,587 compaction entries, 519 usage-bearing). Same
+                // read+fold as the rm-436 standalone usage arm: usage
+                // is inline, so no response-id pairing is needed
+                // (contrast the codex rm-401 fix); attributed to the
+                // session-tracked model (the wire shape carries no
+                // model of its own) and disclosed per kind so
+                // compaction and branch_summary stay separable.
+                let usage = oh_my_pi_usage(obj.get("usage"));
+                let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"));
+                if usage.is_some() || recorded_cost_usd.is_some() {
+                    *counters
+                        .entry(disclosure_key("pi_compaction_usage_counted", typ))
+                        .or_insert(0) += 1;
+                    meta_events.push(Event {
+                        role: "meta".to_string(),
+                        timestamp: ts.to_string(),
+                        usage: usage.unwrap_or_default(),
+                        model_used: model.clone(),
+                        recorded_cost_usd,
+                        source_tool: source_tool.clone(),
+                        ..Event::default()
+                    });
+                }
             }
             // rm-436: standalone usage entries. The wire shape (spec +
             // 1.0.2 dist appendUsage(kind, provider, model, usage))

@@ -1,0 +1,13 @@
+{"type": "session", "version": 3, "id": "writer-surface-1", "timestamp": "2026-10-06T09:00:00.000Z", "cwd": "/tmp/writer-surface"}
+{"type": "label", "id": "11", "parentId": null, "timestamp": "2026-10-06T09:00:01.000Z", "label": "milestone"}
+{"type": "text", "id": "12", "parentId": "11", "timestamp": "2026-10-06T09:00:02.000Z", "text": "ambient note"}
+{"type": "usage", "id": "13", "parentId": "12", "timestamp": "2026-10-06T09:00:03.000Z", "kind": "main", "provider": "anthropic", "model": "claude-sonnet-4-5", "usage": {"input": 100, "output": 20, "cacheRead": 0, "cacheWrite": 0}}
+{"type": "thinking_level_change", "id": "14", "parentId": "13", "timestamp": "2026-10-06T09:00:04.000Z", "level": "high"}
+{"type": "session_info", "id": "15", "parentId": "14", "timestamp": "2026-10-06T09:00:05.000Z", "key": "foo", "value": "bar"}
+{"type": "model_change", "id": "16", "parentId": "15", "timestamp": "2026-10-06T09:00:06.000Z", "provider": "anthropic", "modelId": "claude-sonnet-4-5"}
+{"type": "message", "id": "17", "parentId": "16", "timestamp": "2026-10-06T09:00:07.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "writer surface reply"}], "timestamp": 1789558801000, "usage": {"input": 500, "output": 1000, "cacheRead": 25000, "cacheWrite": 5000}, "model": "claude-sonnet-4-5"}}
+{"type": "custom_message", "id": "18", "parentId": "17", "timestamp": "2026-10-06T09:00:08.000Z", "message": {"role": "user", "content": "custom"}}
+{"type": "custom", "id": "19", "parentId": "18", "timestamp": "2026-10-06T09:00:09.000Z", "customType": "note", "payload": {"a": 1}}
+{"type": "context_edit", "id": "20", "parentId": "19", "timestamp": "2026-10-06T09:00:10.000Z", "payload": {"kind": "trim"}}
+{"type": "compaction", "id": "21", "parentId": "20", "timestamp": "2026-10-06T09:00:11.000Z", "summary": "compacted the context", "tokensBefore": 123, "systemMessage": "sys", "firstKeptEntryId": "17", "usage": {"input": 38000, "output": 900, "cacheRead": 0, "cacheWrite": 0, "cost": {"input": 0.0123, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.0123}}}
+{"type": "branch_summary", "id": "22", "parentId": "21", "timestamp": "2026-10-06T09:00:12.000Z", "summary": "branched from 17", "usage": {"input": 700, "output": 80, "cacheRead": 0, "cacheWrite": 0}}
