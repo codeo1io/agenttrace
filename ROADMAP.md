@@ -4029,3 +4029,77 @@ F1 (high, session_cache.rs:8) SESSION_CACHE_SCHEMA_VERSION 35 → 36 + ladder ru
 - rider (2026-10-08, review bbe295b60d7c F4, fix 3238a517): the limits surface should carry the bare-negative-only workbuddy edge — a usage block whose ONLY class is a negative count yields NO usage at all (parser.rs workbuddy_usage exits at the `?` before the measured-zero re-seed that negative-plus-other-classes gets; corrupt in its entirety, documented in-comment at the fix) — as one row of the structural-asymmetry class.
 
 <!-- end cycle-2 mint band (run fabd9fb8cf73, attempt 2a55d5f8) -->
+
+<!-- 2026-10-10 cycle-1 mint band (run cfe690770f6644dbb0402c89cb3e47a5, agenttrace repo, roadmap attempt 768ded26563b42bb820633f7399c89cb) -->
+
+Mint census run at this band (2026-10-10, this run, against HEAD f9aa0eff porcelain-clean): 370 def rows on the landed wall, def-max rm-904 at ROADMAP.md:3858; landed prose ceiling rm-920 (last landed mint's own floor declaration); strict family-scoped spool sweep (files matching rm-915+ THEN containing agenttrace-80c75f65b7 / /work/projects/agenttrace / crates/agenttrace-core) → live uncommitted frontier rm-919 held by sibling 535cbb3f scratch (ROADMAP.patch/postimage/NOTES), d02291d0efbb's 917/918 already recorded on-wall in the rm-904 row. Foreign numerals excluded per family-scoping rule (rm-920–929, rm-13640, rm-99251, rm-23085 in the spool belong to foreign-family walls, fleet dashboards, and crossterm build hashes). Floor rm-921 = max(observed)+1, held collision-free above the frontier.
+
+Research datums riding this band (sources: this run's assess 8b24227c + research 73f45769, artifacts under their delegate scratch dirs; all probed live 2026-10-10):
+- note 2026-10-10 (roadmap 768ded26): rm-550 (Windows installer parity, minted 2026-10-06) gains post-mint evidence — upstream #317 merged 2026-10-06 makes install.ps1 honor AGENTTRACE_VERSION; extend rm-550 acceptance with pin-parity when that row is next touched.
+- watch: MCP spec newest release still 2026-07-28 (rm-780/rm-789/rm-797/rm-823/rm-840 family evidence current, no urgency change); OTel semantic-conventions-genai still zero tags (rm-493 family); serde_json max unyanked still 1.0.151, serde-rs/json quiet since 2026-08-08 (rm-803/rm-825–834 pin posture unchanged); workspace deps current (anyhow 1.0.104, chrono 0.4.45, clap 4.6.7, rusqlite 0.40.2, serde 1.0.229, ureq 3.4.2 — sha2 0.11.0 and base64 0.23.1 majors pending); models.dev 226 providers / 8,457 models (flat); gemini-cli 0.63.0 stable + 0.64.0-preview + 0.65 nightlies active (rm-715 freeze-vs-drop input: the upstream CLI is not discontinued); claude-haiku-5.5 now IN the bundled 2026-10-08 snapshot (rm-176 watch cleared — only the length-tier schema gap remains, minted here as rm-921); claude-code 2.1.296 adaptive-thinking token-count fix + new subagent frontmatter key autoCompactWindow (rm-037/rm-406 radar input); opencode 1.18.35 and codex 0.162.1 current.
+- pricing drift-check run at this mint (repo's own scripts/pricing/drift-check.sh, RC=0): bundled 3,130 (2026-10-08) vs live 3,134 costed-chat; new-costed 8 (incl. github_copilot/claude-haiku-5.5), retired 4, rate-changed 26, deprecation-new 54 — steady wave, cadence-threshold review after pricing-drift.yml's first week of signal.
+
+### Length-tiered pricing representation (context-length rate tiers)
+- id: `rm-921` | track: capability | priority: 3 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: sessions above tier thresholds are mispriced today — claude-haiku-5.5 length-tiered $0.50/$2.50 over 100K is unrepresentable in the snapshot schema (2026-10-08 rider); LiteLLM live model_prices_and_context_window.json carries tier fields our convert path drops; codeburn #1706 (open 2026-10-09) codex long-context tier with cache-write-inclusive threshold.
+- acceptance: (1) pricing snapshot schema + convert_litellm retain per-tier rate sets keyed by context-length threshold; (2) pricing resolution emits the tier actually applied plus a carrier note; (3) drift-check keep-filter accounts tier fields instead of silently excluding them; (4) fixture pricing-snapshot with a tiered model (claude-haiku-5.5) asserts both rate sets and the >100K switch; (5) report lane shows the applied tier for tiered sessions.
+- evidence: crates/agenttrace-core/src/pricing.rs (convert_litellm, match_variants), crates/agenttrace-core/src/pricing_snapshot.json (2026-10-08 vintage), scripts/pricing/drift-check.sh RC=0 2026-10-10, codeburn issue #1706, models.dev api.json.
+- notes: adjacent rm-845 (plan-scope tier) and rm-793 (per-request rate rows) share the schema surface but are disjoint axes; integration may fold by title if it prefers a single pricing-schema row.
+
+### Antigravity model resolution and unpriced-model fallback
+- id: `rm-922` | track: capability | priority: 3 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: codeburn #1711 (open 2026-10-09) Antigravity crash on legacy .pb cascades and unpriced models; codeburn #1712 (open) robust model resolution, placeholder mapping, pricing fallback; we already ship both antigravity lanes (discovery.rs antigravity-cli brain + conversations).
+- acceptance: (1) model resolution survives legacy .pb cascade directory shapes without panic; (2) placeholder model ids map or disclose, never silently mislabel; (3) unpriced app models get a disclosed priced-fallback basis (per-session disclosure, otel.rs pattern); (4) regression fixture with legacy-cascade + placeholder + unpriced corpus passes.
+- evidence: crates/agenttrace-core/src/discovery.rs antigravity homes, crates/agenttrace-core/src/pricing.rs (normalize_model, fallback), codeburn #1711/#1712, upstream radar #236.
+- notes: boundary against the completed antigravity rows (fold arithmetic, app-model pricing): this row is resolution/robustness, not arithmetic.
+
+### Copilot session-credits and modelMetrics coverage
+- id: `rm-923` | track: capability | priority: 3 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: ccusage #1823 (open) usage missing when modelMetrics does not cover the whole session; ccusage #1824 (open) session credits missing from modelMetrics; codeburn #1705 copilot JetBrains claude-opus-4.7 mispricing; github_copilot/claude-haiku-5.5 newly priced in live LiteLLM (2026-10-10 drift-check new-costed list).
+- acceptance: (1) copilot session-state + otel lanes reconcile per-session usage when modelMetrics is partial, with a coverage disclosure; (2) session-credit rows surface as disclosed fallback when absent from modelMetrics; (3) copilot model catalog maps claude-haiku-5.5 and claude-opus-4.7 rates; (4) fixture with partial-coverage and credit-bearing sessions.
+- evidence: crates/agenttrace-core/src/discovery.rs copilot homes, By-Provider rollups, ccusage #1823/#1824, codeburn #1705, drift-check new-costed list 2026-10-10.
+- notes: none.
+
+### Codex Flex usage accounting
+- id: `rm-924` | track: capability | priority: 4 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: ccusage #1814 (open since 2026-10-06) "account for OpenAI Flex usage"; codex CLI active at 0.162.1 (2026-10-09).
+- acceptance: (1) flex-flagged codex usage rows price with flex rates or a disclosed fallback note; (2) fixture with flex-marked rollout entries; (3) usage-basis documentation names the flex lane.
+- evidence: crates/agenttrace-core/src/parser.rs codex lane, ccusage #1814, registry @openai/codex 0.162.1.
+- notes: interacts with rm-921 if flex and length tiers co-occur.
+
+### Qwen export and dual-output session surfaces
+- id: `rm-925` | track: capability | priority: 4 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: upstream radar #237 (open) "Track Qwen Code export and dual-output session surfaces"; @qwen-code/qwen-code 0.25.0 shipped 2026-10-09 (lane active, format evolving).
+- acceptance: (1) qwen export-format sessions parse or are skipped-with-disclosure, never misattributed to the transcripts lane; (2) dual-output sessions do not double-count turns or tokens; (3) fixture from a qwen 0.25.0 export sample.
+- evidence: crates/agenttrace-core/src/discovery.rs qwen projects home, upstream issue #237, registry @qwen-code/qwen-code.
+- notes: boundary against the completed qwen usage-key ports: this row is session surfaces, not usage keys.
+
+### Local-timezone day bucketing for budget and statusline series
+- id: `rm-926` | track: correctness | priority: 2 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: statusline budget series buckets by UTC day (statusline.rs:870-877 utc_day, 944-952 now-based cutoff) while the rm-040 `today` contract is local-midnight (insights.rs:84-97) and MCP tools_list advertises "your local calendar day"; codeburn #1709 (midnight-straddling turns) and #1713 (timezone change on cache upgrade) are same-day 2026-10-09 fixes for exactly this class.
+- acceptance: (1) budget/statusline series and `today`-range dashboards share one day-bucket basis (local midnight) or a consistently documented UTC basis with disclosure in both surfaces; (2) fixture session at 23:30 local crossing UTC midnight lands wholly in one bucket; (3) basis stated in the series docs and tools_list copy.
+- evidence: crates/agenttrace-core/src/statusline.rs:870-877,944-952; crates/agenttrace-core/src/insights.rs:84-97; crates/agenttrace-cli/src/mcp.rs tools_list; codeburn #1709/#1713; this run's assess finding F5.
+- notes: adjacent to the completed cross-bucket totals invariant row (rm-549) — that row proved totals equality, this row is bucket boundary basis.
+
+### Release-channel integrity (owner decision required)
+- id: `rm-927` | track: reliability | priority: 1 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals (this run's assess, network-verified 2026-10-10): every install path (README.md:16-17,70,86,87,91; install.sh:7; npm/scripts/install.js:20; SECURITY.md:15) serves luoyuctl/agenttrace, which has diverged from this repo's origin codeo1io/agenttrace (GitHub compare: ahead 30 / behind 220; origin carries zero releases while upstream's newest is v0.10.1 of 2026-10-05); npm @zack78/agenttrace sits at 0.10.1 (2026-10-05) while this repo's CHANGELOG newest entry is v0.9.0; scripts/ci/check-install-ref-drift.sh:14-17 checks installer↔changelog agreement, not freshness vs the published channel; released binaries therefore predate 220 commits including security-relevant fixes.
+- acceptance: (1) OWNER DECISION recorded in-row first: single canonical channel (re-point installers to origin and cut a release there, or adopt upstream as the release home with a documented sync lane) — channel ownership is a business call the prioritize phase must surface, not a code call; (2) installers and SECURITY.md advisory routing point at the decided channel; (3) check-install-ref-drift gains a freshness leg (published latest ≥ changelog newest within a bound) or a documented exemption; (4) CHANGELOG backfills v0.9.1/v0.10.x; (5) verify leg: fresh `curl|sh` install of the decided channel lands a binary whose `--version` matches the changelog.
+- evidence: git remote -v (origin git@github.com:codeo1io/agenttrace.git); api.github.com/repos/codeo1io/agenttrace (+ /releases: []; /compare/master...luoyuctl:master: diverged 30/220, probed 2026-10-10); api.github.com/repos/luoyuctl/agenttrace releases v0.10.0/v0.10.1; registry.npmjs.org/@zack78/agenttrace; scripts/ci/check-install-ref-drift.sh:14-17; upstream #308/#317.
+- notes: assess F3 (450 inline `.t()` call sites vs upstream's rust-i18n migration #297) rides this row as a resync-cost consideration for the channel decision.
+
+### README zh-CN parity regeneration
+- id: `rm-928` | track: docs | priority: 3 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: README.zh-CN.md carries 12 headings vs 57 in README.md and zero flag-table rows vs 57 (this run's assess, counted 2026-10-10) — the zh-CN lane silently dropped behind the EN surface.
+- acceptance: (1) zh-CN regenerated to structural parity (headings, tables, flag rows) or explicitly marked machine-translated with a dated parity note; (2) docs CI or a dated parity line keeps EN↔zh drift visible; (3) verify leg: heading/flag-row counts within a stated tolerance.
+- evidence: README.md vs README.zh-CN.md heading and flag-row counts 2026-10-10 (assess F4).
+- notes: none.
+
+### Duration rendering clamp and sentinel-duration disclosure
+- id: `rm-929` | track: correctness | priority: 4 | status: candidate (minted 2026-10-10, run cfe690770f6644dbb0402c89cb3e47a5 roadmap 768ded26563b42bb820633f7399c89cb)
+- signals: fmt_duration tops out at hours (lib.rs:2395-2405) while corpus total_duration_seconds sums raw unclamped duration_sec (reports.rs:2464→2476) — a 9999-12-31 timestamped session renders "69895680h 0m"/raw float in the timeline (this run's assess F6; sibling run 472afca assess af5bf1 hit the same surface live).
+- acceptance: (1) fmt_duration gains day/year units or a documented cap; (2) corpus totals clamp or flag sentinel durations with a disclosure counter instead of propagating raw floats; (3) fixture with a 9999-12-31 session asserts a disclosed bounded rendering.
+- evidence: crates/agenttrace-core/src/lib.rs:2395-2405; crates/agenttrace-core/src/reports.rs:2464,2476; assess F6 (this run).
+- notes: known-open P3, re-pinned at current line numbers this cycle.
+
+<!-- end cycle-1 mint band (run cfe690770f6644dbb0402c89cb3e47a5, attempt 768ded26563b42bb820633f7399c89cb) -->
