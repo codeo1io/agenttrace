@@ -295,10 +295,29 @@ fn render_status_line(payload: &Value) -> String {
 /// markdown/HTML renderers apply their own escaping before this class
 /// applies. Printable CSI/OSC tails may legitimately survive — only the
 /// control bytes themselves (ESC, BEL, …) are neutralized.
+/// rm-936: Unicode bidi/format controls (general category Cf) that reorder
+/// or disguise adjacent rendered text. `char::is_control()` matches only
+/// category Cc, so these rode raw through every export lane before this
+/// predicate existed: the embedding/override initiators and pops
+/// (U+202A-202E), the left/right marks (U+200E-200F), the isolate initiators
+/// and pops (U+2066-2069), and the Arabic letter mark (U+061C).
+pub fn is_bidi_format_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 pub fn sanitize_line_segment(segment: &str) -> String {
     segment
         .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            if c.is_control() || is_bidi_format_control(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -308,15 +327,19 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 /// one physical line), whole documents legitimately carry layout
 /// bytes: LF, CR and TAB are layout and stay; every other control
 /// byte — ESC (the OSC/CSI introducer), BEL, DEL, and the C1 range —
-/// is neutralized to U+FFFD so terminal emulators never interpret
-/// transcript-derived sequences. Idempotent by construction: U+FFFD is
+/// byte is neutralized to U+FFFD so terminal emulators never interpret
+/// transcript-derived sequences. rm-936 adds the Cf bidi/format set to the
+/// same substitution (see [`is_bidi_format_control`]) — serde and every
+/// structural escaper pass those through raw, so this boundary is where
+/// they die in every non-JSON lane. Idempotent by construction: U+FFFD is
 /// printable, so already-sanitized documents (including cells that
 /// first went through the rm-383/rm-540 line sanitizer) pass through
 /// unchanged — the two layers compose instead of corrupting.
 pub fn sanitize_output_document(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+            if (c.is_control() || is_bidi_format_control(c)) && c != '\n' && c != '\r' && c != '\t'
+            {
                 '\u{FFFD}'
             } else {
                 c
@@ -1334,6 +1357,44 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rm936_is_bidi_format_control_bounds() {
+        // The directional/format set (Cf) the lane sanitizers must kill.
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{200E}', '\u{200F}',
+            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{061C}',
+        ] {
+            assert!(is_bidi_format_control(c), "{c:?} must be flagged");
+        }
+        // Everything else stays on its own path.
+        assert!(!is_bidi_format_control('a'));
+        assert!(!is_bidi_format_control('\u{FFFD}'));
+        assert!(!is_bidi_format_control('\u{1B}')); // Cc: is_control's job
+        assert!(!is_bidi_format_control('\u{00AD}')); // Cf but not directional
+        assert!(!is_bidi_format_control('\u{0A0}')); // Zl layout, not Cf
+    }
+
+    #[test]
+    fn rm936_line_segments_neutralize_bidi_format_controls() {
+        for c in ['\u{202E}', '\u{202A}', '\u{200F}', '\u{2066}', '\u{061C}'] {
+            let out = sanitize_line_segment(&format!("a{c}b"));
+            assert!(!out.contains(c), "raw {c:?} survived line sanitization");
+            assert!(out.contains('\u{FFFD}'), "no replacement marker for {c:?}");
+        }
+        // The pre-existing Cc contract is unchanged.
+        assert!(sanitize_line_segment("x\u{1B}[0my").contains('\u{FFFD}'));
+        assert_eq!(sanitize_line_segment("plain-1"), "plain-1");
+    }
+
+    #[test]
+    fn rm936_output_document_keeps_layout_bytes_but_drops_directional_controls() {
+        let poisoned = "model: claude\u{202E}evil cost: $5.00";
+        let out = sanitize_output_document(poisoned);
+        assert!(!out.contains('\u{202E}'));
+        assert!(out.contains('\u{FFFD}'));
+        // rm-625's structural-whitespace contract is untouched.
+        assert_eq!(sanitize_output_document("a\nb\tc\rd"), "a\nb\tc\rd");
+    }
     use super::*;
 
     fn budget_capture(session: &str, captured_at: i64, cost: f64) -> CapturedStatusline {

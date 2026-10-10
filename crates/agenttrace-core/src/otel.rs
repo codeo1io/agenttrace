@@ -121,13 +121,19 @@ enum AnyValue {
 /// and their UIs) treat control bytes in attribute values as hostile
 /// payload. Stated equivalence with the fleet's rm-539 sanitization
 /// lane (same U+FFFD substitution for C0/C1/DEL); when that lane lands
-/// this folds into its shared helper.
+/// this folds into its shared helper. rm-936: the fold landed — the Cc
+/// test now composes with the shared Cf predicate
+/// ([`crate::statusline::is_bidi_format_control`]) so span names and
+/// attribute values cannot carry directional controls either.
 fn sanitize_otel_string(value: &str) -> String {
     value
         .chars()
         .map(|c| {
             let code = c as u32;
-            if code < 0x20 || code == 0x7f || (0x80..=0x9f).contains(&code) {
+            if c.is_control()
+                || crate::statusline::is_bidi_format_control(c)
+                || (0x80..=0x9f).contains(&code)
+            {
                 '\u{FFFD}'
             } else {
                 c
@@ -409,6 +415,24 @@ pub fn gen_ai_system_for_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rm936_sanitize_otel_string_neutralizes_bidi_format_controls() {
+        // rm-936: span names and attribute values must not carry raw
+        // directional controls; is_control() alone passes every Cf.
+        let out = sanitize_otel_string("span\u{202E}name \u{2066}\u{061C}");
+        for c in ['\u{202E}', '\u{2066}', '\u{061C}'] {
+            assert!(!out.contains(c), "raw {c:?} survived otel sanitization");
+        }
+        assert_eq!(out.matches('\u{FFFD}').count(), 3);
+        // The pre-existing Cc/C1/DEL contract is unchanged.
+        assert!(
+            sanitize_otel_string("a\u{1B}[0mb\u{85}c\u{7F}d")
+                .matches('\u{FFFD}')
+                .count()
+                == 3
+        );
+        assert_eq!(sanitize_otel_string("plain"), "plain");
+    }
     use super::*;
 
     #[test]

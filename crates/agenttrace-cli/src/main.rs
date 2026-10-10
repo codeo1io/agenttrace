@@ -1110,7 +1110,22 @@ fn write_stdout(value: &str) -> anyhow::Result<()> {
 /// stable.
 fn dispatch_sanitize(format: &str, out: String) -> String {
     if format == "json" {
-        out
+        // rm-625: JSON stays lossless — serde escaping already encodes
+        // control bytes, and neutralizing layout bytes in a serialized
+        // document would corrupt string lengths for downstream tooling.
+        // rm-936 carve-out: serde does NOT encode Unicode Cf directional
+        // controls (U+202E-class), so they would ride this lane raw and
+        // reorder adjacent text in every downstream renderer. Neutralize
+        // ONLY that class; every other character passes untouched.
+        out.chars()
+            .map(|c| {
+                if agenttrace_core::is_bidi_format_control(c) {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect()
     } else {
         agenttrace_core::sanitize_output_document(&out)
     }

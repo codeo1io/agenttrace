@@ -375,8 +375,8 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
 
     let npm_state = if fetch {
         match npm_registry_version() {
-            Some(version) => format!("{NPM_PACKAGE}@{version} (registry)"),
-            None => "unavailable (registry probe failed or curl absent)".to_string(),
+            Ok(version) => format!("{NPM_PACKAGE}@{version} (registry)"),
+            Err(failure) => failure.label().to_string(),
         }
     } else {
         "unknown (offline; agenttrace --fetch upstream)".to_string()
@@ -561,19 +561,153 @@ fn mtime_age(path: &std::path::Path) -> Option<u64> {
         .map(|age| age.as_secs())
 }
 
-/// npm registry probe behind `--fetch` only. Degrades to `None` (never
-/// fails the report) when curl is absent or the registry answers badly.
-fn npm_registry_version() -> Option<String> {
-    let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "15", NPM_REGISTRY_URL])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Ceiling for the npm registry metadata read (rm-052). The version
+/// document is a few KB; 256 KiB leaves orders of magnitude of slack
+/// while bounding the body a hostile or MITM'd endpoint can push
+/// through the subprocess pipe. The ceiling is enforced on OUR side of
+/// the pipe (`read_capped` + process-group kill) because curl 7.81.0
+/// honors `--max-filesize` only when the response declares a size —
+/// chunked, size-less responses sail past it (review ff418327 F2 live
+/// PoC: 1,100,014 bytes delivered under this cap with rc=0).
+/// `--max-filesize` stays in the argv as the early abort for
+/// size-declaring endpoints (exit 63).
+const NPM_REGISTRY_MAX_BYTES: u64 = 256 * 1024;
+
+/// rm-052: why an npm registry probe produced no version. These stay
+/// distinct so `agenttrace --fetch upstream` no longer labels an absent
+/// probe tool the same as a registry failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NpmProbeFailure {
+    /// curl was not found on PATH — the only spawn error that means the
+    /// tooling is absent. Every other spawn failure (permissions,
+    /// resources) is a `ProbeFailed`, not tool absence (review ff418327 F5).
+    ToolAbsent,
+    /// curl could not produce a usable response: network error,
+    /// HTTP >= 400 (`-f`), timeout, an unspawnable-for-another-reason
+    /// curl, or a read error on the response pipe.
+    ProbeFailed,
+    /// The response pushed past the byte ceiling — either curl aborted
+    /// with exit 63 (size-declaring endpoint) or our own capped read
+    /// tripped on a size-less stream.
+    ResponseOverflow,
+    /// curl succeeded but the metadata carried no usable version.
+    Unparseable,
+}
+
+impl NpmProbeFailure {
+    fn label(self) -> &'static str {
+        match self {
+            NpmProbeFailure::ToolAbsent => "unavailable (probe tooling absent: curl not on PATH)",
+            NpmProbeFailure::ProbeFailed => {
+                "unavailable (registry probe failed: network or HTTP error)"
+            }
+            NpmProbeFailure::ResponseOverflow => {
+                "unavailable (registry probe failed: response exceeded byte cap)"
+            }
+            NpmProbeFailure::Unparseable => "unknown (registry returned unparseable metadata)",
+        }
     }
-    let body =
-        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&output.stdout)).ok()?;
-    body.get("version")?.as_str().map(str::to_string)
+}
+
+/// curl argv for the registry probe, split out so tests can pin the
+/// bounding flags without shelling out.
+fn npm_registry_curl_args() -> Vec<String> {
+    [
+        "-fsSL".to_string(),
+        "--max-time".to_string(),
+        "15".to_string(),
+        "--max-filesize".to_string(),
+        NPM_REGISTRY_MAX_BYTES.to_string(),
+        NPM_REGISTRY_URL.to_string(),
+    ]
+    .into()
+}
+
+/// Extract the `version` field from an npm registry metadata document.
+/// Split out so the parser is testable hermetically (no network).
+fn parse_npm_registry_version(body: &str) -> Option<String> {
+    let doc = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    doc.get("version")?.as_str().map(str::to_string)
+}
+
+/// Read `reader` to EOF, stopping as soon as more than `cap` bytes
+/// have been seen (review fix ff418327 F2). Returns the bytes read
+/// (at most one chunk past the ceiling) and whether the cap was
+/// exceeded. This — not curl's `--max-filesize` — is the byte bound:
+/// curl 7.81.0 ignores `--max-filesize` for responses without
+/// Content-Length, so a hostile endpoint streaming chunked bodies is
+/// bounded only by what WE are willing to buffer.
+fn read_capped<R: Read>(mut reader: R, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok((body, false));
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if body.len() as u64 > cap {
+            return Ok((body, true));
+        }
+    }
+}
+
+/// npm registry probe behind `--fetch` only. Degrades to an `Err` label
+/// (never fails the report) when curl is absent or the registry answers
+/// badly — with the failure cause kept distinct (rm-052) and the body
+/// read byte-bounded at OUR end of the pipe: stdout is piped and read
+/// through `read_capped`, and the subprocess tree is killed the moment
+/// it pushes past the ceiling (curl's `--max-filesize` alone does NOT
+/// bound size-less responses — review ff418327 F2; exit 63 remains the
+/// early-abort signal for size-declaring endpoints).
+fn npm_registry_version() -> Result<String, NpmProbeFailure> {
+    let mut command = Command::new("curl");
+    command
+        .args(npm_registry_curl_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // stderr is deliberately null: the probe labels by exit code and
+        // body, never by curl's stderr text.
+        .stderr(Stdio::null());
+    // rm-583 discipline: own process group so the overflow kill takes
+    // the whole subprocess tree down in one signal.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|err| {
+        // Review fix (ff418327 F5): only NotFound means "curl is not
+        // installed" — anything else is a probe failure.
+        if err.kind() == std::io::ErrorKind::NotFound {
+            NpmProbeFailure::ToolAbsent
+        } else {
+            NpmProbeFailure::ProbeFailed
+        }
+    })?;
+    let (body, exceeded) = match child.stdout.take() {
+        Some(pipe) => {
+            read_capped(pipe, NPM_REGISTRY_MAX_BYTES).map_err(|_| NpmProbeFailure::ProbeFailed)?
+        }
+        // Unreachable with Stdio::piped above; fail as a probe failure,
+        // never panic the report.
+        None => return Err(NpmProbeFailure::ProbeFailed),
+    };
+    if exceeded {
+        // The endpoint streamed past the ceiling without declaring a
+        // size — the exact case curl's --max-filesize cannot see. Kill
+        // the tree; the label is the same ResponseOverflow the exit-63
+        // path produces.
+        kill_process_tree(&mut child);
+    }
+    let status = child.wait().map_err(|_| NpmProbeFailure::ProbeFailed)?;
+    if exceeded || status.code() == Some(63) {
+        return Err(NpmProbeFailure::ResponseOverflow);
+    }
+    if !status.success() {
+        return Err(NpmProbeFailure::ProbeFailed);
+    }
+    parse_npm_registry_version(&String::from_utf8_lossy(&body)).ok_or(NpmProbeFailure::Unparseable)
 }
 
 fn age_phrase(seconds: Option<u64>) -> String {
@@ -708,6 +842,84 @@ fn short(sha: &str, len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rm052_curl_probe_args_are_time_and_byte_bounded() {
+        // rm-052: the registry probe must be bounded in BOTH dimensions —
+        // the wall row pins the timeout at 15s and the body read at
+        // 256 KiB. --max-filesize surfaces as curl exit 63, mapped to
+        // ResponseOverflow (see npm_registry_version).
+        let args = npm_registry_curl_args();
+        assert_eq!(args[0], "-fsSL");
+        assert_eq!(args[1], "--max-time");
+        assert_eq!(args[2], "15");
+        assert_eq!(args[3], "--max-filesize");
+        assert_eq!(args[4], "262144", "256 KiB byte ceiling");
+        assert!(args.last().is_some_and(|u| u.starts_with("https://")));
+    }
+
+    #[test]
+    fn rm052_read_capped_enforces_the_ceiling_without_content_length() {
+        // Review fix (ff418327 F2): curl 7.81.0 ignores --max-filesize
+        // for responses with no Content-Length, so the byte ceiling is
+        // enforced by read_capped at OUR end of the pipe. Hermetic pin:
+        // a size-less stream past the ceiling trips the cap after at
+        // most one read chunk of slack, and an under-cap body is
+        // returned whole.
+        let cap = NPM_REGISTRY_MAX_BYTES;
+        let oversized = vec![b'x'; cap as usize + 64 * 1024];
+        let (body, exceeded) = read_capped(std::io::Cursor::new(oversized), cap).unwrap();
+        assert!(exceeded, "a stream past the ceiling must trip the cap");
+        assert!(
+            body.len() as u64 <= cap + 16 * 1024,
+            "at most one 16 KiB read chunk past the ceiling may be buffered"
+        );
+        let under = vec![b'x'; 1024];
+        let (body, exceeded) = read_capped(std::io::Cursor::new(under), cap).unwrap();
+        assert!(!exceeded, "an under-cap body must not trip the cap");
+        assert_eq!(body.len(), 1024, "an under-cap body is returned whole");
+    }
+
+    #[test]
+    fn rm052_parse_npm_registry_version_extracts_version_field() {
+        assert_eq!(
+            parse_npm_registry_version(r#"{"name":"agenttrace","version":"0.10.1"}"#),
+            Some("0.10.1".to_string())
+        );
+        assert_eq!(parse_npm_registry_version("{}"), None);
+        assert_eq!(parse_npm_registry_version("not json"), None);
+        assert_eq!(parse_npm_registry_version(r#"{"version":42}"#), None);
+    }
+
+    #[test]
+    fn rm052_probe_failure_labels_are_distinct() {
+        // The conflation this row exists to remove: "curl absent" and
+        // "registry answered badly" must never share one label.
+        let labels = [
+            NpmProbeFailure::ToolAbsent.label(),
+            NpmProbeFailure::ProbeFailed.label(),
+            NpmProbeFailure::ResponseOverflow.label(),
+            NpmProbeFailure::Unparseable.label(),
+        ];
+        assert_eq!(
+            labels.len(),
+            labels
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "labels must be pairwise distinct"
+        );
+        assert_eq!(
+            NpmProbeFailure::ToolAbsent.label(),
+            "unavailable (probe tooling absent: curl not on PATH)"
+        );
+        assert!(NpmProbeFailure::ProbeFailed
+            .label()
+            .contains("network or HTTP error"));
+        assert!(NpmProbeFailure::ResponseOverflow
+            .label()
+            .contains("byte cap"));
+    }
 
     #[test]
     fn upstream_subprocess_timeouts_are_pinned_to_the_stated_classes() {

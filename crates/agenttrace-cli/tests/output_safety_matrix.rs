@@ -26,6 +26,16 @@ use std::process::Command;
 /// in the tool name; file B carries OSC-52+BEL in the model id. Names
 /// flow from the loader into every renderer that prints session names,
 /// models, tool names, or message text.
+///
+/// FIXTURE FORM IS CONTRACT (review fix ff418327 F1): the control bytes
+/// must be JSON-escape TEXT (`\u001b` / `\u0007`) inside these raw
+/// strings. `\u{001b}` is Rust escape syntax that raw strings never
+/// process — it stays 8 literal characters, `\u{` is an INVALID JSON
+/// u-escape, and serde_json drops the whole line: every zero-ESC
+/// assertion then goes green VACUOUSLY (no ESC ever enters the
+/// pipeline; the session name falls back to the filename, the model
+/// renders 'default'). A raw ESC byte written directly inside a JSON
+/// string is equally invalid — only JSON-escape text parses.
 fn write_poisoned_corpus(root: &std::path::Path) -> Vec<PathBuf> {
     let a = root.join("20261001T100000+0000-poc-9873.jsonl");
     fs::write(
@@ -123,6 +133,30 @@ fn no_raw_control_bytes_in_any_non_json_output_lane() {
         "raw control bytes reached the terminal (rm-625):\n  {}",
         failures.join("\n  ")
     );
+
+    // Vacuity guard (review fix ff418327 F1): a green zero-ESC matrix
+    // proves nothing unless the poison actually REACHED the lanes. The
+    // overview text lane renders the poisoned model id through the
+    // substitution path — if the fixtures ever stop parsing (e.g. a
+    // raw-string `\u{001b}` "fix" that serde_json drops), the model
+    // renders 'default', no U+FFFD is substituted, and this assertion
+    // goes red instead of the matrix silently passing empty.
+    let text = run_cell(
+        &corpus,
+        &home,
+        &Cell {
+            report: "--overview",
+            format: "text",
+        },
+    );
+    assert!(
+        text.windows(3).any(|w| w == [0xef, 0xbf, 0xbd].as_slice()),
+        "poison never reached the text lane: no U+FFFD substitution found — fixture vacuity (see write_poisoned_corpus contract note)"
+    );
+    assert!(
+        text.windows(b"poc-model".len()).any(|w| w == b"poc-model"),
+        "poisoned model id missing from the text lane (rendered 'default'? fixture vacuity)"
+    );
 }
 
 /// JSON lanes keep the poisoned payload but never emit a RAW control
@@ -152,6 +186,17 @@ fn json_lanes_escape_control_bytes_instead_of_emitting_raw() {
             (esc, bel),
             (0, 0),
             "{report} -f json emitted raw control bytes (json escaping must encode them)"
+        );
+        // Vacuity guard (review fix ff418327 F1): JSON lanes must keep
+        // the payload LOSSLESSLY — the \u001b escape TEXT is the proof
+        // the poisoned fixtures parsed and delivered. If the fixtures
+        // break (invalid \u{ escape), the escape text vanishes and this
+        // assertion catches the vacuous green.
+        assert!(
+            stdout
+                .windows(b"\\u001b".len())
+                .any(|w| w == b"\\u001b"),
+            "{report} -f json carries no \\u001b escape text — the poisoned payload never parsed (fixture vacuity)"
         );
     }
 }
@@ -187,6 +232,17 @@ fn output_file_lane_is_sanitized_too() {
         (esc, bel),
         (0, 0),
         "-o file output carried raw control bytes (rm-625 choke point must cover file writes)"
+    );
+    // Vacuity guard (review fix ff418327 F1): same contract as the
+    // stdout guards — the written file must show the substitution
+    // (U+FFFD) and the poisoned model id, proving the fixtures parsed.
+    assert!(
+        bytes.windows(3).any(|w| w == [0xef, 0xbf, 0xbd].as_slice()),
+        "-o file carries no U+FFFD substitution — fixture vacuity"
+    );
+    assert!(
+        bytes.windows(b"poc-model".len()).any(|w| w == b"poc-model"),
+        "-o file lost the poisoned model id — fixture vacuity"
     );
 }
 
@@ -335,4 +391,87 @@ fn upstream_status_lane_stays_sanitized() {
         (0, 0),
         "upstream text lane emitted raw control bytes"
     );
+}
+
+/// rm-936 PoC corpus: directional/format controls (Cf) in every
+/// transcript-derived position — session-name source (first user message),
+/// model id, tool name, assistant text. None of these may survive into any
+/// lane; they reorder adjacent cost/model text in terminals and
+/// spreadsheets (the OSC-52 sibling of this class rides the same lanes).
+fn write_bidi_corpus(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let f = root.join("20261003T100000+0000-poc-bidi.jsonl");
+    fs::write(
+        &f,
+        concat!(
+            "{\"type\": \"user\", \"uuid\": \"u1\", \"timestamp\": \"2026-10-03T10:00:00Z\", ",
+            "\"cwd\": \"/tmp/at-rm936-poc\", \"message\": {\"role\": \"user\", ",
+            "\"content\": \"poc-bidi \u{202e} name \u{202d} tail \u{200f} mark\"}}\n",
+            "{\"type\": \"assistant\", \"uuid\": \"a1\", \"timestamp\": \"2026-10-03T10:00:05Z\", ",
+            "\"message\": {\"role\": \"assistant\", \"model\": \"claude-sonnet-4\u{202e}5x\", ",
+            "\"content\": [ {\"type\": \"tool_use\", \"id\": \"t1\", \"name\": \"Bash\u{2066}iso\", ",
+            "\"input\": {\"command\": \"echo hi\"}}, {\"type\": \"text\", \"text\": \"done \u{061c}\"}], ",
+            "\"usage\": {\"input_tokens\": 10, \"output_tokens\": 5}}}\n"
+        ),
+    )
+    .unwrap();
+    vec![f]
+}
+
+#[test]
+fn rm936_bidi_format_controls_neutralized_across_every_lane() {
+    let tmp = tempdir("output-safety-bidi");
+    let corpus = tmp.join("corpus-bidi");
+    fs::create_dir_all(&corpus).unwrap();
+    write_bidi_corpus(&corpus);
+    let home = tmp.join("home");
+    fs::create_dir_all(home.join(".cache")).unwrap();
+
+    // Every lane the dispatch boundary knows, plus the two formats the
+    // default matrix omits: json (rm-625 carve-out now Cf-filtered) and
+    // otel (attribute-value sanitizer).
+    let mut cells = matrix();
+    cells.push(Cell {
+        report: "--overview",
+        format: "json",
+    });
+    cells.push(Cell {
+        report: "--sessions",
+        format: "json",
+    });
+    cells.push(Cell {
+        report: "--overview",
+        format: "otel",
+    });
+    // Review fix (ff418327 F3): pin the svg lane too — it is one of the
+    // seven acceptance lanes and was previously verified only by the
+    // implementer's manual PoC, not by this matrix.
+    cells.push(Cell {
+        report: "--overview",
+        format: "svg",
+    });
+
+    let raw_cf: [&[u8]; 5] = [
+        &[0xe2, 0x80, 0xae], // U+202E RLO
+        &[0xe2, 0x80, 0xaa], // U+202A LRE
+        &[0xe2, 0x80, 0x8f], // U+200F RLM
+        &[0xe2, 0x81, 0xa6], // U+2066 LRI
+        &[0xd8, 0x9c],       // U+061C ALM
+    ];
+    for cell in &cells {
+        let out = run_cell(&corpus, &home, cell);
+        assert!(
+            !out.is_empty(),
+            "empty output for {} -f {} (rm-936 lane lost)",
+            cell.report,
+            cell.format
+        );
+        for enc in raw_cf {
+            assert!(
+                !out.windows(enc.len()).any(|w| w == enc),
+                "raw Cf directional control leaked into lane {} -f {}",
+                cell.report,
+                cell.format
+            );
+        }
+    }
 }
