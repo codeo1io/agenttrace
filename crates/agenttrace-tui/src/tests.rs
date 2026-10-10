@@ -1631,6 +1631,14 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 52 (integration of run 2d92ee95
+                // "session-cache store integrity" — rm-292
+                // schema-change restore lifecycle + rm-041 lossless
+                // `at-bytes:` keys: the invalidation is disclosed in
+                // a bounded journal instead of torching the store,
+                // and lossy `to_string_lossy` keys are dropped once;
+                // the campaign's own 24 -> 26 bump re-based onto the
+                // advanced 51 ceiling);
                 // Schema 51 (run 0a55a397 cycle-1 "accounting
                 // truth" residual batch: the parser's served values
                 // moved — codex token_usage_record output unbundled

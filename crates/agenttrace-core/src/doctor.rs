@@ -58,6 +58,13 @@ pub struct DoctorReport {
     /// assess run measured directly (2,768 of 25,889 reusable on the
     /// operator corpus). `session_files - cached_valid`.
     pub reparsed_this_scan: usize,
+    /// rm-292 disclosure parity (review fix R3, run 2d92ee95): the
+    /// journal's `schema_invalidations` ledger summarized for humans —
+    /// how many invalidations the surviving journal records and the
+    /// newest record verbatim (schema bumps and pricing-catalog
+    /// changes alike). `None` when the journal has never recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_invalidation_note: Option<String>,
     pub sessions: usize,
     pub session_files: usize,
     /// rm-607 disclosure: sibling sqlite databases (outside the
@@ -119,6 +126,7 @@ struct SessionCacheReport {
     path: PathBuf,
     entries: BTreeMap<String, CacheEntryHeader>,
     dirs: usize,
+    invalidation_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +183,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
                 path: session_cache_path(),
                 entries: BTreeMap::new(),
                 dirs: 0,
+                invalidation_note: None,
             },
             cache_size_bytes: 0,
             files: Vec::new(),
@@ -286,6 +295,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_entry_bound: entry_bound,
         cache_entry_bound_source: entry_bound_source.to_string(),
         reparsed_this_scan,
+        cache_invalidation_note: cache.invalidation_note.clone(),
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
@@ -1055,6 +1065,9 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first; entry bound from {})\n",
         report.cache_size_bytes, report.cache_limits, report.cache_entry_bound_source
     ));
+    if let Some(note) = &report.cache_invalidation_note {
+        out.push_str(&format!("  cache disclosure: {note}\n"));
+    }
     let statusline_state = if report.statusline.exists {
         format!(
             "{} captures, {} distinct sessions, {} bytes",
@@ -1179,10 +1192,28 @@ fn load_session_cache_report() -> SessionCacheReport {
                 .count()
         })
         .unwrap_or(0);
+    // rm-292 disclosure parity (review fix R3, run 2d92ee95): surface
+    // the persisted invalidation ledger — schema bumps AND pricing
+    // catalog changes — so a re-parse cascade is visible from
+    // `--doctor` (text and JSON) instead of only by opening the
+    // journal by hand.
+    let invalidation_note = doc
+        .get("schema_invalidations")
+        .and_then(Value::as_array)
+        .filter(|records| !records.is_empty())
+        .map(|records| {
+            format!(
+                "{} invalidation record(s) recorded; newest: {}",
+                records.len(),
+                serde_json::to_string(&records[records.len() - 1])
+                    .unwrap_or_else(|_| "<unserializable record>".to_string())
+            )
+        });
     SessionCacheReport {
         path,
         entries,
         dirs,
+        invalidation_note,
     }
 }
 

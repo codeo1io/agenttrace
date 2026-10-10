@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 51 and the SQLite snapshot is schema 10; the
+The session cache is schema 52 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -263,7 +263,23 @@ deterministically via `earliest()` instead of degrading to an empty
 session_start (rm-899; run 33b7b7b5 cycle 1 — minted 43 above its
 base's ceiling 41, re-based twice at review-fix as origin landed 43
 (fabd9fb8) and then 44 (fb1addd56503), landing here as 45, the lowest
-rung unique above the ceiling); the SQLite snapshot to 7
+rung unique above the ceiling), and to 52 at this integration when
+schema-upgrade handling itself was corrected (run 2d92ee95's
+"session-cache store integrity" batch, rm-292 LEAD + rm-041 + the
+rm-298 concurrent-save lock rider, conflict case 79d8fd06 (first dispatch 51ee80dc) — the
+batch's own 24 → 26 bump re-based onto the advanced 51 ceiling, one
+invalidation either way): a stale-schema store now invalidates its
+parsed entries WITH DISCLOSURE — every bump changed parse or
+accounting semantics — while preserving its walk-current directory
+listings (they survive on their own `DIR_LISTING_WALK_VERSION` lane,
+now 5), records the invalidation in a bounded `schema_invalidations`
+ledger inside `sessions.json` instead of discarding silently
+(`--doctor` surfaces the newest record as a `cache disclosure:`
+note), and entry/listing keys encode non-UTF-8 paths losslessly
+(`at-bytes:` percent-escaping) so a warm store no longer hides the
+very non-UTF-8 journals it exists to remember; concurrent saves and
+clears serialize under an advisory lock sibling (`sessions.json.lock`)
+instead of racing last-writer-wins; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

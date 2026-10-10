@@ -1376,14 +1376,14 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v41 — see the rm-520, rm-585/rm-730, rm-834/
+        // version (v52 — see the rm-520, rm-585/rm-730, rm-834/
         // rm-694, rm-718/719/716, rm-754, rm-502, rm-720/rm-721,
         // rm-710, rm-616, usage-accounting-truthfulness,
         // rm-551, rm-538, rm-600, rm-529, rm-542,
         // rm-485, rm-450, rm-436/437/438, rm-408 and rm-400/401 bump notes
-        // in session_cache.rs; the rm-520 recorded-cost basis is
-        // what carried 40 -> 41 at this integration, re-based off the
-        // campaign's own 24 -> 25 bump).
+        // in session_cache.rs; the session-cache store-integrity batch
+        // (rm-292/rm-041, run 2d92ee95) carried 51 -> 52 at this
+        // integration, re-based off the campaign's own 24 -> 26 bump).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(SESSION_CACHE_SCHEMA_VERSION)

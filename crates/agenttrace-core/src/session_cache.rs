@@ -5,7 +5,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 52;
+// Bumped 51 -> 52 (integration of run 2d92ee95, "session-cache
+// store integrity" batch — rm-292 LEAD schema-change restore
+// lifecycle + rm-041 lossless cache keys + the rm-298 concurrent-
+// save lock rider; conflict case 79d8fd06 (first dispatch 51ee80dc), candidate 0aba09b): the
+// batch's own ladder moved 24 -> 26 at its base 1511547 (25/26 were
+// consumed by sibling/upstream landings between the base and the
+// ceiling merge); this integration re-bases the bump onto the
+// already-advanced ceiling 51 per the documented convention, one
+// invalidation either way. The rm-041 key semantics ride the rung:
+// entries and listing members may now hold losslessly-encoded
+// non-UTF-8 keys (see `LOSSLESS_KEY_PREFIX`), so pre-52 entries
+// keyed under `to_string_lossy` output are invalidated once. What
+// the bump does NOT do anymore is discard silently: the
+// schema-invalidations path in `load_session_cache` records the
+// invalidation (observed/schema version, dropped entries/dirs,
+// kept listings) in a bounded journal instead of torching the
+// store invisibly — parsed entries drop and regenerate once on
+// next scan, walk-current directory listings survive on their own
+// DIR_LISTING_WALK_VERSION lane.
 // Bumped 50 -> 51 (run 0a55a397 cycle-1 "accounting truth"
 // residual batch, attempt 5712b6f0: codex record-arm reasoning
 // breakdown rm-617 + pi alias first-present rm-618 + qwen per-reason
@@ -645,6 +664,13 @@ pub fn session_cache_entries_source() -> &'static str {
     }
 }
 
+/// How many `schema_invalidations` records the journal keeps. The
+/// ledger discloses every schema upgrade the store survived (dropped
+/// entries, kept listings); it is bounded so a journal that outlives
+/// many upgrades cannot grow the disclosure without limit — the byte
+/// bound counts it either way.
+const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
+
 /// Walk-semantics version for cached directory listings. Bumped when the
 /// discovery walk's directory set changes so stale listings are dropped
 /// once at load (see `load_session_cache`). v2: symlinked child
@@ -662,8 +688,18 @@ pub fn session_cache_entries_source() -> &'static str {
 /// (or between a valid walk and a later fifo creation) still names
 /// non-regular entries as files, and admitting one by name wedged every
 /// load path on the parser's blocking open; pre-v4 listings are dropped
-/// once and re-walked through the gate.
-const DIR_LISTING_WALK_VERSION: i64 = 4;
+/// once and re-walked through the gate. v5 (run 2d92ee95, rm-041): listing
+/// members and entry keys are losslessly-encoded paths (`at-bytes:`
+/// percent-escaping for non-UTF-8 names) — a v4 listing holds
+/// `to_string_lossy` member names, and the replay extends `listing.files`
+/// verbatim, so a warm v4 journal keeps hiding the very non-UTF-8
+/// journals the lossless keys exist to surface (`bad\u{FFFD}name.jsonl`
+/// replays as a path that does not exist). Lossy members cannot be told
+/// apart from genuine U+FFFD filenames, so the listings drop once at
+/// load instead of being filtered. The batch's own 3 -> 4 bump re-bases
+/// onto the already-landed v4 lane (rm-732) per the same convention one
+/// lane up.
+const DIR_LISTING_WALK_VERSION: i64 = 5;
 
 fn dirs_were_empty(doc: &Map<String, Value>) -> bool {
     doc.get("dirs")
@@ -678,6 +714,21 @@ pub struct SessionCache {
     entries: BTreeMap<String, CacheEntry>,
     raw_entries: BTreeMap<String, Value>,
     dirs: BTreeMap<String, DirCacheEntry>,
+    /// Entry keys this process invalidated (freshness misses, header
+    /// decode failures, prunes). The save-side merge under the cache
+    /// lock uses the set to keep a concurrent writer's state from
+    /// resurrecting keys that were deleted on purpose (rm-298
+    /// residual).
+    removed: BTreeSet<String>,
+    /// Dir-listing keys this process invalidated; same role as
+    /// `removed` for the `dirs` map.
+    removed_dirs: BTreeSet<String>,
+    /// Durable disclosure of schema invalidations observed by this
+    /// process or carried forward from the journal — see
+    /// `schema_invalidations()`. Persisted as the top-level
+    /// `schema_invalidations` member at save time (bounded by
+    /// `MAX_SCHEMA_INVALIDATION_RECORDS`).
+    schema_invalidations: Vec<Value>,
     dirty: bool,
 }
 
@@ -728,6 +779,14 @@ struct SqliteSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DirCacheEntry {
     mod_time: i64,
+    /// Byte size of the directory itself at store time — the
+    /// same-tick freshness guard (rm-041): mtime granularity can hide
+    /// a mutation that landed inside the same tick as the stored
+    /// listing, while adding or removing a child moves the directory's
+    /// own size on the common local filesystems. Absent (listings
+    /// stored before the field existed) compares mtime only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dir_size: Option<u64>,
     files: Vec<String>,
     dirs: Vec<String>,
     /// rm-548 (independent-review fix): memoized opencode fork-marker
@@ -959,6 +1018,10 @@ pub fn session_cache_path() -> PathBuf {
 pub(crate) fn cache_artifact_paths() -> Vec<PathBuf> {
     vec![
         session_cache_path(),
+        // Advisory lock sibling of the store (see `CacheFileLock`):
+        // registered so `--clear-cache` sweeps it with the rest. It is
+        // empty — it carries no session data.
+        session_cache_lock_path(),
         sqlite_snapshot_path("hermes"),
         sqlite_snapshot_path("opencode"),
         crate::statusline::statusline_capture_path(),
@@ -966,7 +1029,217 @@ pub(crate) fn cache_artifact_paths() -> Vec<PathBuf> {
     ]
 }
 
+/// Advisory-lock sibling for the session cache: `sessions.json.lock`
+/// next to the store. It exists only to serialize the save/clear
+/// read-modify-write between concurrent agenttrace processes
+/// (rm-298 residual) and holds no data.
+pub fn session_cache_lock_path() -> PathBuf {
+    lock_sibling(&session_cache_path())
+}
+
+fn lock_sibling(path: &Path) -> PathBuf {
+    match path.file_name() {
+        Some(name) => {
+            let mut file_name = name.to_os_string();
+            file_name.push(".lock");
+            path.with_file_name(file_name)
+        }
+        None => {
+            let mut fallback = path.as_os_str().to_os_string();
+            fallback.push(".lock");
+            PathBuf::from(fallback)
+        }
+    }
+}
+
+/// Bounded advisory lock over a cache rewrite (rm-298 residual).
+///
+/// Protocol (MSRV-1.80 std-only — `File::try_lock` is 1.89):
+/// - acquire = `create_new` (O_EXCL) on the lock sibling, fenced by a
+///   `<pid>-<unique>` token written into it;
+/// - release = remove the file only if it still carries our token
+///   (a peer that stole a stale lock owns the name now — the token
+///   check keeps our Drop from deleting theirs);
+/// - staleness is content-first, age-second: a lock whose token
+///   names a process that no longer exists — or whose content is not
+///   a token at all (a stray file parked on the lock name, or a
+///   writer that crashed between creating the file and writing its
+///   token, past `CACHE_LOCK_EMPTY_GRACE`) — is stolen immediately by
+///   atomic rename; a live holder is stolen only after
+///   `CACHE_LOCK_STALE_AFTER`, which covers a wedged-but-alive
+///   writer. Content-first matters for liveness too: an inert file on
+///   the lock name must not wedge every future save behind the full
+///   wait budget;
+/// - a stolen victim fences its own write (`still_ours` re-reads the
+///   token before the rename in `save_session_cache`), so a writer
+///   whose lock was stolen mid-flight aborts and re-serializes
+///   instead of clobbering the thief's state;
+/// - stealing (`STALE_AFTER`) fires long before waiting gives up
+///   (`WAIT`): giving up means proceeding unlocked, which reopens the
+///   lost-update window the lock exists to close, so it is the last
+///   resort, reached only when a live peer holds for `CACHE_LOCK_WAIT`
+///   straight.
+struct CacheFileLock(PathBuf, String);
+
+const CACHE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const CACHE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+const CACHE_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+const CACHE_LOCK_EMPTY_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+/// How many fenced re-serialization attempts `save_session_cache`
+/// makes when its lock keeps being stolen mid-flight before landing
+/// the write anyway (see the fence in `save_session_cache`).
+const CACHE_LOCK_ATTEMPTS: usize = 3;
+
+impl CacheFileLock {
+    fn acquire(path: &Path) -> Option<Self> {
+        let lock_path = lock_sibling(path);
+        if let Some(parent) = lock_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let token = format!(
+            "{}-{}",
+            std::process::id(),
+            unique_temp_path(&lock_path).display()
+        );
+        let deadline = std::time::Instant::now() + CACHE_LOCK_WAIT;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    drop(file);
+                    // Owner-only, like every other cache artifact: the
+                    // lock sits in the same private directory.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
+                    }
+                    let _ = fs::write(&lock_path, token.as_bytes());
+                    return Some(CacheFileLock(lock_path, token));
+                }
+                Err(_) => {
+                    if lock_stealable(&lock_path) {
+                        // Atomic claim: only one racer's rename
+                        // succeeds; the loser re-loops. The victim, if
+                        // alive, fences at its rename and retries.
+                        let claimed = unique_temp_path(&lock_path);
+                        if fs::rename(&lock_path, &claimed).is_ok() {
+                            let _ = fs::remove_file(&claimed);
+                        }
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        // Wait budget spent on a live holder: proceed
+                        // unlocked (see the struct comment for why that
+                        // is the last-resort degrade).
+                        return None;
+                    }
+                    std::thread::sleep(CACHE_LOCK_RETRY);
+                }
+            }
+        }
+    }
+
+    /// Fencing check: true while the lock file on disk still carries
+    /// exactly our token. A writer whose lock was stolen while it was
+    /// mid-rewrite must not land its rename over the thief's state.
+    fn still_ours(&self) -> bool {
+        matches!(fs::read_to_string(&self.0), Ok(ref text) if text == &self.1)
+    }
+}
+
+/// Whether the lock file at `path` may be stolen right now: content
+/// first (empty past the grace window, unreadable, or a token naming
+/// a dead process), age second (a live-token lock is stolen only past
+/// `CACHE_LOCK_STALE_AFTER` — a wedged-but-alive writer; the common
+/// crashed-writer case is caught instantly by the dead pid). An empty
+/// file inside the grace window is a creator between create and
+/// token-write, so it is respected.
+fn lock_stealable(lock_path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(lock_path) else {
+        return false;
+    };
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|moment| moment.elapsed().ok())
+        // An unreadable clock reads as fully aged: the age lane stays
+        // usable instead of the lock becoming unstealable.
+        .unwrap_or(CACHE_LOCK_STALE_AFTER);
+    match fs::read_to_string(lock_path) {
+        Ok(text) => lock_decision(&text, age),
+        Err(_) => true,
+    }
+}
+
+/// The staleness decision for a lock whose content read back as
+/// `text` at `age` since its last write — the pure core of
+/// `lock_stealable`, split out so the age lanes (the empty-file
+/// grace window, the wedged-but-alive threshold) can be pinned
+/// deterministically instead of through filesystem timestamps a
+/// loaded test runner may sample late. Content first: a stray
+/// non-token and a token naming a dead process are stealable at any
+/// age; age second: an empty file is a creator mid-create only
+/// inside the grace window, and a live-token lock is stolen only
+/// past `CACHE_LOCK_STALE_AFTER`.
+fn lock_decision(text: &str, age: std::time::Duration) -> bool {
+    if text.is_empty() {
+        return age > CACHE_LOCK_EMPTY_GRACE;
+    }
+    match lock_token_pid(text) {
+        Some(pid) if lock_pid_is_alive(pid) => age > CACHE_LOCK_STALE_AFTER,
+        // Not a recognizable token: a stray file parked on the
+        // lock name (never ours to respect) or a hand-mangled
+        // leftover — steal now rather than wedge every future
+        // save behind it.
+        _ => true,
+    }
+}
+
+/// Leading `<pid>-` of a lock token, when the content looks like one.
+fn lock_token_pid(text: &str) -> Option<u32> {
+    let pid = text.split('-').next()?;
+    if !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        pid.parse().ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn lock_pid_is_alive(pid: u32) -> bool {
+    // /proc is the std-only liveness probe on the unix family this
+    // tool ships on; where it is absent the age lane still catches
+    // the crash.
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(unix))]
+fn lock_pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+impl Drop for CacheFileLock {
+    fn drop(&mut self) {
+        if matches!(fs::read_to_string(&self.0), Ok(ref text) if text == &self.1) {
+            let _ = fs::remove_file(&self.0);
+        }
+        // A missing or foreign-tokened lock is not ours to remove —
+        // leave it; the stale-steal path reclaims crashed writers'
+        // leftovers.
+    }
+}
+
 pub fn clear_session_cache() -> anyhow::Result<()> {
+    // Serialize with any in-flight cache rewrite before removing the
+    // artifacts (rm-298 residual). A clear that races a save can
+    // still end with a resurrected store written after the purge —
+    // that is inherent to the operation — but the two no longer
+    // interleave mid-write.
+    let _lock = CacheFileLock::acquire(&session_cache_path());
     let mut paths = cache_artifact_paths();
     paths.extend(legacy_cache_artifact_paths());
     remove_cache_artifacts(&paths)
@@ -1329,9 +1602,57 @@ pub fn load_session_cache() -> SessionCache {
             ..SessionCache::default()
         };
     };
-    if doc.get("schema_version").and_then(Value::as_i64) != Some(SESSION_CACHE_SCHEMA_VERSION) {
+    let observed_schema_version = doc.get("schema_version").and_then(Value::as_i64);
+    if observed_schema_version != Some(SESSION_CACHE_SCHEMA_VERSION) {
+        // Store-integrity lead: a schema bump invalidates parsed
+        // entries by design — every bump in the history above changed
+        // parse or accounting semantics, so stale numbers must never
+        // be served. The bump must not silently torch the whole
+        // store, though. Directory listings are walk semantics on
+        // their own version lane (`DIR_LISTING_WALK_VERSION`), so
+        // listings whose lane is still current survive the bump — an
+        // upgrade costs a re-parse, not a full tree re-walk — and the
+        // invalidation itself is recorded durably in the journal
+        // (`schema_invalidations`) so the discard is disclosed instead
+        // of invisible. The next save re-writes the store at the
+        // current schema with the survivor set: self-heal forward.
+        let listings_current = doc.get("dir_listing_version").and_then(Value::as_i64)
+            == Some(DIR_LISTING_WALK_VERSION);
+        let mut dirs: BTreeMap<String, DirCacheEntry> = BTreeMap::new();
+        if listings_current {
+            if let Some(Value::Object(listing_map)) = doc.get("dirs") {
+                for (key, raw) in listing_map {
+                    if let Ok(entry) = serde_json::from_value::<DirCacheEntry>(raw.clone()) {
+                        dirs.insert(key.clone(), entry);
+                    }
+                }
+            }
+        }
+        let dropped_entries = doc
+            .get("entries")
+            .and_then(Value::as_object)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        let dropped_dirs = doc
+            .get("dirs")
+            .and_then(Value::as_object)
+            .map(|dirs| dirs.len())
+            .unwrap_or(0)
+            .saturating_sub(dirs.len());
+        let mut schema_invalidations = persisted_schema_invalidations(&doc);
+        schema_invalidations.push(serde_json::json!({
+            "reason": "schema",
+            "observed_schema_version": observed_schema_version,
+            "schema_version": SESSION_CACHE_SCHEMA_VERSION,
+            "dropped_entries": dropped_entries,
+            "dropped_dirs": dropped_dirs,
+            "kept_dir_listings": dirs.len(),
+        }));
+        cap_schema_invalidations(&mut schema_invalidations);
         return SessionCache {
             path,
+            dirs,
+            schema_invalidations,
             dirty: true,
             ..SessionCache::default()
         };
@@ -1388,10 +1709,45 @@ pub fn load_session_cache() -> SessionCache {
         BTreeMap::new()
     };
     let listing_stale = !listings_current && !dirs_were_empty(&doc);
+    let mut schema_invalidations = persisted_schema_invalidations(&doc);
+    if !pricing_matches {
+        // Review fix R3 (2026-10-06, run 2d92ee95 independent_review
+        // 90bc04b9): the pricing arm drops every entry so they re-parse
+        // at the new catalog, but unlike the schema arm it appended
+        // NOTHING to the disclosure ledger — the invalidation was
+        // invisible (acceptance contract on the batch lead, rm-292:
+        // "a schema OR pricing-catalog mismatch invalidates entries
+        // WITH DISCLOSURE"). Same ledger, same shape, plus the
+        // discriminator and the observed id. Records written before the
+        // `reason` key existed are schema-arm records by construction.
+        let observed_pricing_catalog_id = doc
+            .get("pricing_catalog_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<absent>");
+        let dropped_entries = doc
+            .get("entries")
+            .and_then(Value::as_object)
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        schema_invalidations.push(serde_json::json!({
+            "reason": "pricing_catalog",
+            "observed_pricing_catalog_id": observed_pricing_catalog_id,
+            "observed_schema_version": doc
+                .get("schema_version")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            "schema_version": SESSION_CACHE_SCHEMA_VERSION,
+            "dropped_entries": dropped_entries,
+            "dropped_dirs": 0,
+            "kept_dir_listings": dirs.len(),
+        }));
+        cap_schema_invalidations(&mut schema_invalidations);
+    }
     let mut cache = SessionCache {
         path,
         raw_entries,
         dirs,
+        schema_invalidations,
         // A catalog mismatch dirties the cache so the emptied entry map
         // is persisted with the new id at the next save (rm-196).
         dirty: listing_stale || !pricing_matches,
@@ -1415,22 +1771,29 @@ fn prune_dead_entries(cache: &mut SessionCache) -> usize {
         .raw_entries
         .keys()
         .chain(cache.entries.keys())
-        .filter(|path| !Path::new(path).exists())
+        // Keys may be losslessly-encoded non-UTF-8 paths (rm-041) —
+        // decode before asking the filesystem.
+        .filter(|path| !path_from_key(path).exists())
         .cloned()
         .collect();
     for path in dead_paths {
         if cache.entries.remove(&path).is_some() | cache.raw_entries.remove(&path).is_some() {
+            // Remember the prune so the save-side merge under the
+            // cache lock cannot resurrect a dead key (rm-298
+            // residual).
+            cache.removed.insert(path);
             pruned += 1;
         }
     }
     let dead_dirs: Vec<String> = cache
         .dirs
         .keys()
-        .filter(|dir| !Path::new(dir).exists())
+        .filter(|dir| !path_from_key(dir).exists())
         .cloned()
         .collect();
     for dir in dead_dirs {
         cache.dirs.remove(&dir);
+        cache.removed_dirs.insert(dir);
         pruned += 1;
     }
     if pruned > 0 {
@@ -1452,7 +1815,9 @@ pub fn load_cached_sessions_from_cache(
         .raw_entries
         .keys()
         .chain(cache.entries.keys())
-        .map(PathBuf::from)
+        // Losslessly-encoded keys (rm-041) decode back to the real
+        // path before the directory filter runs.
+        .map(|key| path_from_key(key))
         .collect::<BTreeSet<_>>();
     let sessions = paths
         .into_iter()
@@ -1480,6 +1845,16 @@ impl SessionCache {
         self.dirs.len()
     }
 
+    /// Durable record of the cache invalidations this process observed
+    /// (or carried forward from the journal): each record names the
+    /// schema that was found, the schema that replaced it, how many
+    /// entries were dropped, and how many directory listings survived.
+    /// Surfaces like the doctor lane can disclose stale-schema
+    /// stranding from here without the loader staying silent.
+    pub fn schema_invalidations(&self) -> &[Value] {
+        self.schema_invalidations.as_slice()
+    }
+
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -1492,15 +1867,43 @@ pub(crate) fn cached_dir_listing(dir: &Path, cache: &mut SessionCache) -> Option
         return None;
     }
     let entry = cache.dirs.get(&key)?;
-    if entry.mod_time != file_mod_time_nanos(&metadata) {
+    if entry.mod_time != file_mod_time_nanos(&metadata)
+        // Same-tick freshness guard (rm-041): a listing whose directory
+        // changed size since it was stored is stale even when the
+        // mtime has not moved yet.
+        || dir_size_changed(entry, &metadata)
+    {
         cache.dirs.remove(&key);
+        cache.removed_dirs.insert(key);
         cache.dirty = true;
         return None;
     }
+    // Listing members may be losslessly-encoded non-UTF-8 paths
+    // (rm-041): decode back to the real paths the walk consumed.
     Some(CachedDirListing {
-        files: entry.files.iter().map(PathBuf::from).collect(),
-        dirs: entry.dirs.iter().map(PathBuf::from).collect(),
+        files: entry.files.iter().map(|file| path_from_key(file)).collect(),
+        dirs: entry
+            .dirs
+            .iter()
+            .map(|child| path_from_key(child))
+            .collect(),
     })
+}
+
+/// Same-tick freshness (rm-041): mtime granularity can hide a mutation
+/// that landed inside the same tick as the stored listing — `create
+/// file; read` within one coarse timestamp leaves the cached replay
+/// serving the pre-create file set. A stored listing also carries the
+/// directory's own byte size; adding or removing a child moves that
+/// size on the common local filesystems, catching same-tick mutations
+/// the mtime compare cannot. Listings stored before the size was
+/// recorded (field absent) compare mtime only, so they behave exactly
+/// as before. Residual, documented: a create+delete pair that nets the
+/// size back to the stored value within one tick stays invisible until
+/// the next mtime change — closing that would cost a `read_dir` per
+/// hit, which is the walk the listing exists to skip.
+fn dir_size_changed(entry: &DirCacheEntry, metadata: &fs::Metadata) -> bool {
+    entry.dir_size.is_some_and(|size| size != metadata.len())
 }
 
 pub(crate) fn store_dir_listing(
@@ -1510,10 +1913,15 @@ pub(crate) fn store_dir_listing(
     cache: &mut SessionCache,
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(dir)?;
+    let key = cache_key(dir);
+    // A fresh store wins over any pending deletion of this key, so the
+    // save-side merge keeps it (rm-298 residual).
+    cache.removed_dirs.remove(&key);
     cache.dirs.insert(
-        cache_key(dir),
+        key,
         DirCacheEntry {
             mod_time: file_mod_time_nanos(&metadata),
+            dir_size: Some(metadata.len()),
             files: files.iter().map(|path| cache_key(path)).collect(),
             dirs: dirs.iter().map(|path| cache_key(path)).collect(),
             fork_parents: BTreeMap::new(),
@@ -1668,6 +2076,10 @@ pub(crate) fn delete_cached_session(path: &Path, cache: &mut SessionCache) {
 
 fn delete_cached_session_key(path: &str, cache: &mut SessionCache) {
     if cache.entries.remove(path).is_some() || cache.raw_entries.remove(path).is_some() {
+        // Remember the invalidation so the save-side merge under the
+        // cache lock cannot resurrect a key this process dropped
+        // (rm-298 residual).
+        cache.removed.insert(path.to_string());
         cache.dirty = true;
     }
 }
@@ -1734,14 +2146,30 @@ fn dirs_member_bytes(cache: &SessionCache) -> usize {
         .sum()
 }
 
+/// Serialized length of the `schema_invalidations` array as
+/// `save_session_cache` writes it (brackets, commas, and records
+/// included). Zero records are omitted from the document entirely, so
+/// the projection — and a fresh store's bytes — stay byte-identical
+/// to the pre-ledger layout.
+fn invalidations_member_bytes(records: &[Value]) -> usize {
+    if records.is_empty() {
+        return 0;
+    }
+    serde_json::to_string(records)
+        .map(|text| text.len())
+        .unwrap_or(0)
+}
+
 /// Length of the document `save_session_cache` writes for these
 /// blocks: the fixed top-level fields, the entries map, the `dirs`
-/// member (when non-empty), and the closing brace (rm-298).
+/// member (when non-empty), the `schema_invalidations` ledger (when
+/// non-empty), and the closing brace (rm-298).
 fn doc_frame_len(
     entries_member_bytes: usize,
     entries_count: usize,
     dirs_bytes: usize,
     dirs_count: usize,
+    invalidations_bytes: usize,
 ) -> usize {
     let mut total = format!(
         "{{\"schema_version\":{},\"dir_listing_version\":{},\"pricing_catalog_id\":",
@@ -1760,6 +2188,9 @@ fn doc_frame_len(
     total += json_object_len(entries_member_bytes, entries_count);
     if dirs_count > 0 {
         total += 1 + "\"dirs\":".len() + json_object_len(dirs_bytes, dirs_count);
+    }
+    if invalidations_bytes > 0 {
+        total += 1 + "\"schema_invalidations\":".len() + invalidations_bytes;
     }
     total + 1
 }
@@ -1781,6 +2212,7 @@ fn serialized_doc_size(cache: &SessionCache) -> usize {
         sized.len(),
         dirs_member_bytes(cache),
         cache.dirs.len(),
+        invalidations_member_bytes(&cache.schema_invalidations),
     )
 }
 
@@ -1905,6 +2337,7 @@ fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
         entries_count,
         dirs_bytes,
         cache.dirs.len(),
+        invalidations_member_bytes(&cache.schema_invalidations),
     );
     if total <= max {
         return 0;
@@ -1931,6 +2364,95 @@ fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
     dropped
 }
 
+/// Reads the persisted `schema_invalidations` ledger out of a cache
+/// document, bounded to the last `MAX_SCHEMA_INVALIDATION_RECORDS`
+/// records (oldest dropped first).
+fn persisted_schema_invalidations(doc: &Map<String, Value>) -> Vec<Value> {
+    let mut records = doc
+        .get("schema_invalidations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    cap_schema_invalidations(&mut records);
+    records
+}
+
+fn cap_schema_invalidations(records: &mut Vec<Value>) {
+    let len = records.len();
+    if len > MAX_SCHEMA_INVALIDATION_RECORDS {
+        records.drain(0..len - MAX_SCHEMA_INVALIDATION_RECORDS);
+    }
+}
+
+/// Merges the on-disk store into the in-memory one under the cache
+/// lock (rm-298 residual): keys another process saved after this
+/// process loaded are unioned in instead of clobbered by this save.
+/// Keys deleted locally (`removed` / `removed_dirs`) stay deleted,
+/// keys stored locally win over their on-disk copy, and entries
+/// priced under a different catalog are left for the catalog gate to
+/// re-price rather than served as if they were ours. A store the
+/// merge cannot trust (foreign schema, foreign walk version,
+/// unparsable bytes) is skipped, which degrades to the pre-merge
+/// last-writer-wins behavior instead of guessing.
+fn merge_concurrent_disk_state(cache: &mut SessionCache) {
+    let Ok(text) = fs::read_to_string(&cache.path) else {
+        return;
+    };
+    let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    if doc.get("schema_version").and_then(Value::as_i64) != Some(SESSION_CACHE_SCHEMA_VERSION) {
+        return;
+    }
+    if doc.get("dir_listing_version").and_then(Value::as_i64) != Some(DIR_LISTING_WALK_VERSION) {
+        return;
+    }
+    let pricing_matches = doc
+        .get("pricing_catalog_id")
+        .and_then(Value::as_str)
+        .map(|stamped| stamped == crate::pricing::catalog_identity())
+        .unwrap_or(false);
+    if pricing_matches {
+        if let Some(Value::Object(entries)) = doc.get("entries") {
+            for (key, raw) in entries {
+                if cache.entries.contains_key(key)
+                    || cache.raw_entries.contains_key(key)
+                    || cache.removed.contains(key)
+                {
+                    continue;
+                }
+                match serde_json::from_value::<CacheEntry>(raw.clone()) {
+                    Ok(entry) => {
+                        cache.entries.insert(key.clone(), entry);
+                    }
+                    Err(_) => {
+                        cache.raw_entries.insert(key.clone(), raw.clone());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(Value::Object(dirs)) = doc.get("dirs") {
+        for (key, raw) in dirs {
+            if cache.dirs.contains_key(key) || cache.removed_dirs.contains(key) {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_value::<DirCacheEntry>(raw.clone()) {
+                cache.dirs.insert(key.clone(), entry);
+            }
+        }
+    }
+    // Carry the disk's disclosure records alongside ours.
+    if let Some(records) = doc.get("schema_invalidations").and_then(Value::as_array) {
+        for record in records {
+            if !cache.schema_invalidations.contains(record) {
+                cache.schema_invalidations.push(record.clone());
+            }
+        }
+        cap_schema_invalidations(&mut cache.schema_invalidations);
+    }
+}
+
 pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
     // A default-constructed cache is the in-memory sentinel (library
     // embeds and tests pass `SessionCache::default()` so no host file
@@ -1945,59 +2467,104 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
     if cache.path.as_os_str().is_empty() {
         return Ok(());
     }
-    // Hard bounds before serializing: beyond the EFFECTIVE entry
-    // bound (the default const, or the configured
-    // `session_cache_entries`/`AGENTTRACE_SESSION_CACHE_ENTRIES` knob,
-    // rm-298 capacity arm) the oldest-fingerprint entries are dropped
-    // (pass-8 F8-3); the dirs map keeps its own count and byte budgets
-    // (rm-298); and the serialized document is capped at
-    // MAX_SESSION_CACHE_BYTES over every byte this function writes —
-    // keys, punctuation, top-level fields, and dirs included (pass-9
-    // CU-22; byte-true rm-298).
-    enforce_entry_bound(cache, effective_session_cache_entries());
-    enforce_dirs_bound(cache, MAX_SESSION_CACHE_DIRS, MAX_SESSION_CACHE_DIR_BYTES);
-    enforce_byte_bound(cache, MAX_SESSION_CACHE_BYTES);
     if let Some(parent) = cache.path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut doc = Map::new();
-    doc.insert(
-        "schema_version".to_string(),
-        Value::Number(SESSION_CACHE_SCHEMA_VERSION.into()),
-    );
-    doc.insert(
-        "dir_listing_version".to_string(),
-        Value::Number(DIR_LISTING_WALK_VERSION.into()),
-    );
-    doc.insert(
-        "pricing_catalog_id".to_string(),
-        Value::String(crate::pricing::catalog_identity().to_string()),
-    );
-    let mut entries = Map::new();
-    for (path, value) in &cache.raw_entries {
-        entries.insert(path.clone(), value.clone());
-    }
-    for (path, entry) in &cache.entries {
-        entries.insert(
-            path.clone(),
-            serde_json::to_value(entry).expect("cache entry serialize"),
+    // rm-298 residual: save used to be a lockless read-modify-write —
+    // two agenttrace processes that loaded the store before either
+    // saved each clobbered the other's entries wholesale. The rewrite
+    // now serializes on the advisory lock sibling, merges the freshly
+    // re-read on-disk state under it, and FENCES the rename against
+    // lock theft (`still_ours`): an attempt whose lock was stolen
+    // while it built the document is discarded and re-serialized
+    // around the thief's state, so concurrent writers compose instead
+    // of racing (see `merge_concurrent_disk_state` and
+    // `CacheFileLock`).
+    for attempt in 0..CACHE_LOCK_ATTEMPTS {
+        let lock = CacheFileLock::acquire(&cache.path);
+        merge_concurrent_disk_state(cache);
+        // Hard bounds after the merge, before serializing: beyond the
+        // EFFECTIVE entry bound (the default const, or the configured
+        // `session_cache_entries`/`AGENTTRACE_SESSION_CACHE_ENTRIES`
+        // knob, rm-298 capacity arm) the oldest-fingerprint entries are
+        // dropped (pass-8 F8-3); the dirs map keeps its own count and byte
+        // budgets (rm-298); and the serialized document is capped at
+        // MAX_SESSION_CACHE_BYTES over every byte this function writes —
+        // keys, punctuation, top-level fields, invalidation records, and
+        // dirs included (pass-9 CU-22; byte-true rm-298). The bounds run
+        // over the merged state so they hold for the document actually
+        // written.
+        enforce_entry_bound(cache, effective_session_cache_entries());
+        enforce_dirs_bound(cache, MAX_SESSION_CACHE_DIRS, MAX_SESSION_CACHE_DIR_BYTES);
+        enforce_byte_bound(cache, MAX_SESSION_CACHE_BYTES);
+        let mut doc = Map::new();
+        doc.insert(
+            "schema_version".to_string(),
+            Value::Number(SESSION_CACHE_SCHEMA_VERSION.into()),
         );
+        doc.insert(
+            "dir_listing_version".to_string(),
+            Value::Number(DIR_LISTING_WALK_VERSION.into()),
+        );
+        doc.insert(
+            "pricing_catalog_id".to_string(),
+            Value::String(crate::pricing::catalog_identity().to_string()),
+        );
+        let mut entries = Map::new();
+        for (path, value) in &cache.raw_entries {
+            entries.insert(path.clone(), value.clone());
+        }
+        for (path, entry) in &cache.entries {
+            entries.insert(
+                path.clone(),
+                serde_json::to_value(entry).expect("cache entry serialize"),
+            );
+        }
+        doc.insert("entries".to_string(), Value::Object(entries));
+        if !cache.dirs.is_empty() {
+            let dirs = cache
+                .dirs
+                .iter()
+                .map(|(path, entry)| {
+                    (
+                        path.clone(),
+                        serde_json::to_value(entry).expect("dir cache entry serialize"),
+                    )
+                })
+                .collect();
+            doc.insert("dirs".to_string(), Value::Object(dirs));
+        }
+        // The invalidation ledger (schema upgrades this store survived) —
+        // durable disclosure, bounded to the last
+        // MAX_SCHEMA_INVALIDATION_RECORDS records and omitted entirely
+        // when empty so a fresh store writes the pre-ledger layout.
+        if !cache.schema_invalidations.is_empty() {
+            doc.insert(
+                "schema_invalidations".to_string(),
+                Value::Array(cache.schema_invalidations.clone()),
+            );
+        }
+        let tmp = unique_temp_path(&cache.path);
+        write_private(&tmp, &serde_json::to_vec(&Value::Object(doc))?)?;
+        // Fence the rename: if our lock was stolen while this document
+        // was being built, a peer owns the rewrite — discard the
+        // attempt and re-serialize around their on-disk state instead
+        // of clobbering it. An unlocked attempt (acquire gave up) or a
+        // lock still carrying our token proceeds.
+        let fenced_out = matches!(&lock, Some(lock) if !lock.still_ours());
+        if fenced_out {
+            let _ = fs::remove_file(&tmp);
+            if attempt + 1 < CACHE_LOCK_ATTEMPTS {
+                continue;
+            }
+            // Last attempt fenced out too: fall through and land the
+            // write — the merge above already took the thief's state
+            // into account, and refusing to persist at all would drop
+            // this process's own entries permanently.
+        }
+        fs::rename(tmp, &cache.path)?;
+        return Ok(());
     }
-    doc.insert("entries".to_string(), Value::Object(entries));
-    if !cache.dirs.is_empty() {
-        let dirs = cache
-            .dirs
-            .iter()
-            .map(|(path, entry)| {
-                (
-                    path.clone(),
-                    serde_json::to_value(entry).expect("dir cache entry serialize"),
-                )
-            })
-            .collect();
-        doc.insert("dirs".to_string(), Value::Object(dirs));
-    }
-    write_private_exclusive(&cache.path, &serde_json::to_vec(&Value::Object(doc))?)?;
     Ok(())
 }
 
@@ -2021,7 +2588,11 @@ pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> 
         return None;
     }
     let entry = cached_entry(&key, cache)?;
-    Some(entry.session.clone().into_session(&key))
+    // The fallback path is display-only (Session.path is a String),
+    // but it must name the real file: decode a losslessly-encoded key
+    // (rm-041) instead of exposing the encoded form.
+    let fallback_path = path_from_key(&key).to_string_lossy().to_string();
+    Some(entry.session.clone().into_session(&fallback_path))
 }
 
 pub fn store_session(
@@ -2040,6 +2611,9 @@ pub fn store_session(
         },
     );
     cache.raw_entries.remove(&key);
+    // A fresh store wins over any pending deletion of this key, so the
+    // save-side merge keeps it (rm-298 residual).
+    cache.removed.remove(&key);
     cache.dirty = true;
     Ok(())
 }
@@ -2280,7 +2854,96 @@ fn user_cache_dir() -> PathBuf {
 }
 
 fn cache_key(path: &Path) -> String {
-    path.to_string_lossy().to_string()
+    if let Some(text) = path.to_str() {
+        return text.to_string();
+    }
+    #[cfg(unix)]
+    {
+        lossless_key_from_bytes(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
+    }
+    // Non-unix platforms have no portable lossless byte round trip
+    // through JSON keys; the lossy fallback preserves the prior
+    // behavior there instead of failing the walk.
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// Prefix marking a key whose source path was not valid UTF-8
+/// (rm-041). Cache keys are JSON object keys, so a losslessly-encoded
+/// key preserves every byte of the original path instead of
+/// collapsing to `U+FFFD` — a `bad\xff\xfename.jsonl` journal used to
+/// be invisible through the cached replay (the listing named a file
+/// that does not exist) and two distinct non-UTF-8 names could
+/// collide on one lossy key. Keys are absolute paths and therefore
+/// begin with the root separator, which is what keeps the prefix
+/// unambiguous against verbatim keys.
+const LOSSLESS_KEY_PREFIX: &str = "at-bytes:";
+
+#[cfg(unix)]
+fn lossless_key_from_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::from(LOSSLESS_KEY_PREFIX);
+    for &byte in bytes {
+        match byte {
+            // `%` itself is escaped, so the escape alphabet is
+            // self-describing and decoding is unambiguous.
+            b'%' => key.push_str("%25"),
+            0x21..=0x7E => key.push(byte as char),
+            _ => {
+                let _ = write!(key, "%{byte:02X}");
+            }
+        }
+    }
+    key
+}
+
+/// Inverse of `cache_key` (rm-041): decodes a losslessly-encoded key
+/// back to the original path. Keys without the prefix are verbatim
+/// paths. A prefixed key that does not decode cleanly (a truncated or
+/// malformed escape — only reachable through hand-edited journals)
+/// fails safe: the key is returned as-is rather than guessed at.
+fn path_from_key(key: &str) -> PathBuf {
+    let Some(encoded) = key.strip_prefix(LOSSLESS_KEY_PREFIX) else {
+        return PathBuf::from(key);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        decode_lossless_key(encoded)
+            .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            .unwrap_or_else(|| PathBuf::from(key))
+    }
+    // Non-unix: encoded keys are never produced (see `cache_key`), so
+    // the verbatim fallback is the only honest answer.
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(key)
+    }
+}
+
+#[cfg(unix)]
+fn decode_lossless_key(encoded: &str) -> Option<Vec<u8>> {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let hex = bytes.get(index + 1..index + 3)?;
+            let high = (hex[0] as char).to_digit(16)?;
+            let low = (hex[1] as char).to_digit(16)?;
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+        } else if byte.is_ascii_graphic() {
+            decoded.push(byte);
+            index += 1;
+        } else {
+            return None;
+        }
+    }
+    Some(decoded)
 }
 
 fn is_fresh(path: &Path, entry: &CacheEntryHeader) -> bool {
@@ -2793,6 +3456,7 @@ mod tests {
         store_session(&dead, &session, &mut cache).expect("store dead entry");
         let listing = DirCacheEntry {
             mod_time: 0,
+            dir_size: None,
             files: Vec::new(),
             dirs: Vec::new(),
             fork_parents: BTreeMap::new(),
@@ -3347,6 +4011,7 @@ mod tests {
                 format!("/corpus/projects/probe-{i}"),
                 DirCacheEntry {
                     mod_time: 500_000 + i,
+                    dir_size: None,
                     files: vec!["f".repeat(120); 6],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
@@ -3441,6 +4106,7 @@ mod tests {
             "/corpus/projects/probe \"quoted-0\"\\slash".to_string(),
             DirCacheEntry {
                 mod_time: 500_000,
+                dir_size: None,
                 files: vec!["f".repeat(120); 6],
                 dirs: Vec::new(),
                 fork_parents: BTreeMap::new(),
@@ -3535,6 +4201,7 @@ mod tests {
                 format!("/corpus/projects/probe-{i}"),
                 DirCacheEntry {
                     mod_time: 400_000 + i * 1_000,
+                    dir_size: None,
                     files: vec![format!("file-{i}-{}.jsonl", "f".repeat(60)); 4],
                     dirs: Vec::new(),
                     fork_parents: BTreeMap::new(),
@@ -3825,8 +4492,8 @@ mod tests {
             .collect();
         assert_eq!(
             paths.len(),
-            5,
-            "registry: session cache, two sqlite snapshots, statusline journal, pricing catalog"
+            6,
+            "registry: session cache, its advisory lock, two sqlite snapshots, statusline journal, pricing catalog"
         );
         for path in &paths {
             fs::write(path, b"x").expect("write artifact");
@@ -3994,6 +4661,899 @@ mod tests {
             "sessions.json must be owner-only, got {:o}",
             mode & 0o777
         );
+        // The advisory lock sibling exists only while a rewrite holds
+        // it (O_EXCL acquire, token-fenced release) and must be
+        // owner-only for the while (rm-298 residual) — gone once
+        // released.
+        let lock = CacheFileLock::acquire(&cache.path).expect("lock acquired");
+        let mode = fs::metadata(lock_sibling(&cache.path))
+            .expect("sessions.json.lock exists while held")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "sessions.json.lock must be owner-only, got {:o}",
+            mode & 0o777
+        );
+        drop(lock);
+        assert!(
+            !lock_sibling(&cache.path).exists(),
+            "a released lock leaves no file behind"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lock_staleness_is_content_first_and_never_wedges_on_stray_files() {
+        // rm-298 residual protocol: an inert file parked on the lock
+        // name (or a token naming a process that no longer exists)
+        // must be stealable IMMEDIATELY — a purely age-based rule
+        // would wedge every save behind the wait budget — while a
+        // fresh lock from a live process (ours) and the empty window
+        // between create and token-write are respected.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-lock-stale-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let lock_path = lock_sibling(&root.join("sessions.json"));
+        fs::create_dir_all(lock_path.parent().expect("parent")).expect("create cache dir");
+
+        // A stray non-token file: stealable at once, whatever its age.
+        fs::write(&lock_path, b"x").expect("write stray lock");
+        assert!(
+            lock_stealable(&lock_path),
+            "a stray file never wedges saves"
+        );
+
+        // A token naming a dead process: stealable at once (this
+        // process is alive by construction, so borrow a pid that is
+        // not — /proc has none above pid_max). The liveness probe is
+        // unix-only; elsewhere the age lane carries staleness.
+        #[cfg(unix)]
+        {
+            fs::write(&lock_path, format!("999999999-{}", lock_path.display()))
+                .expect("write dead-owner lock");
+            assert!(
+                lock_stealable(&lock_path),
+                "a dead owner's lock is stale now"
+            );
+        }
+        assert_eq!(lock_token_pid("999999999-x"), Some(999999999));
+        assert_eq!(lock_token_pid("not-a-token"), None);
+        assert_eq!(lock_token_pid(""), None);
+
+        // A fresh empty file is a creator between create and
+        // token-write: respected inside the grace window. The grace
+        // semantics themselves are pinned deterministically on
+        // `lock_decision` below (synthetic ages, no clock in the
+        // loop); this filesystem leg only confirms the wiring, and
+        // tolerates a loaded runner aging the observation past the
+        // window before the stat lands — it rewrites the empty file
+        // and resamples rather than failing on scheduler noise.
+        let mut respected_empty = false;
+        for _ in 0..8 {
+            fs::write(&lock_path, b"").expect("write empty lock");
+            let stealable = lock_stealable(&lock_path);
+            let sampled_inside_grace = fs::metadata(&lock_path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|written| written.elapsed().ok())
+                .map(|age| age <= CACHE_LOCK_EMPTY_GRACE)
+                .unwrap_or(false);
+            assert!(
+                !(stealable && sampled_inside_grace),
+                "a just-created empty lock belongs to a live creator"
+            );
+            if !stealable {
+                respected_empty = true;
+                break;
+            }
+        }
+        assert!(
+            respected_empty,
+            "the empty-file grace window was never observed respected"
+        );
+
+        // A live owner (this process) holding a fresh lock: respected.
+        // Same tolerance as above — the deterministic age lane is
+        // the `lock_decision` pin on the live token below; re-writing
+        // our own token is a keepalive that refreshes the lock's age
+        // without changing ownership (`still_ours` stays true).
+        let lock = CacheFileLock::acquire(&root.join("sessions.json"))
+            .expect("acquire over the respected lock states");
+        assert!(lock.still_ours(), "the lock we hold carries our token");
+        let mut respected_live = false;
+        for _ in 0..8 {
+            let _ = fs::write(&lock.0, lock.1.as_bytes());
+            let stealable = lock_stealable(&lock.0);
+            let sampled_fresh = fs::metadata(&lock.0)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|written| written.elapsed().ok())
+                .map(|age| age <= CACHE_LOCK_STALE_AFTER)
+                .unwrap_or(false);
+            assert!(
+                !(stealable && sampled_fresh),
+                "a fresh lock from a live process is not stealable"
+            );
+            if !stealable {
+                respected_live = true;
+                break;
+            }
+        }
+        assert!(
+            respected_live,
+            "a live owner's fresh lock was never observed respected"
+        );
+        drop(lock);
+        assert!(!lock_path.exists(), "release removes the lock file");
+
+        // Deterministic age-lane pins (no filesystem timestamps in
+        // the loop): the empty grace window and the wedged-but-alive
+        // threshold are respected below their bounds and stealable
+        // above them, while content-first classes (stray, dead
+        // owner) steal at any age — this process is alive by
+        // construction, so its token exercises the live lane.
+        assert!(!lock_decision("", std::time::Duration::from_millis(10)));
+        assert!(lock_decision(
+            "",
+            CACHE_LOCK_EMPTY_GRACE + std::time::Duration::from_millis(10)
+        ));
+        let live_token = format!("{}-held", std::process::id());
+        assert!(!lock_decision(
+            &live_token,
+            std::time::Duration::from_millis(10)
+        ));
+        assert!(lock_decision(
+            &live_token,
+            CACHE_LOCK_STALE_AFTER + std::time::Duration::from_millis(10)
+        ));
+        assert!(lock_decision(
+            "not-a-token",
+            std::time::Duration::from_millis(10)
+        ));
+        #[cfg(unix)]
+        assert!(lock_decision(
+            "999999999-x",
+            std::time::Duration::from_millis(10)
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lossless_key_encoding_round_trips_every_path() {
+        // rm-041: keys are JSON object keys, so a non-UTF-8 path must
+        // survive the round trip without collapsing to `U+FFFD` —
+        // while UTF-8 paths keep their verbatim key (nothing changes
+        // for the 99.999% case) and hand-written junk fails safe.
+        let verbatim = [
+            "/home/u/.claude/sessions/2026/ok.jsonl",
+            "/tmp/emoji-\u{1F600}-name.jsonl",
+            "/tmp/percent-%-and-%25-name.jsonl",
+            "/tmp/spaces in name.jsonl",
+            // Valid multi-byte UTF-8 stays verbatim too — only non-
+            // UTF-8 byte sequences need the encoded form.
+            "/tmp/\u{00E4}-umlaut.jsonl",
+        ];
+        for path in verbatim {
+            let path = PathBuf::from(path);
+            let key = cache_key(&path);
+            assert!(
+                !key.starts_with(LOSSLESS_KEY_PREFIX),
+                "UTF-8 key stays verbatim: {key}"
+            );
+            assert_eq!(path_from_key(&key), path, "verbatim key decodes to itself");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = [
+                b"/tmp/bad\xff\xfename.jsonl".to_vec(),
+                b"/tmp/pct-%-in-\xff-name.jsonl".to_vec(),
+                b"/tmp/lone-\x80-start.jsonl".to_vec(),
+            ];
+            for bytes in raw {
+                let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+                let key = cache_key(&path);
+                assert!(
+                    key.starts_with(LOSSLESS_KEY_PREFIX),
+                    "non-UTF-8 key is encoded: {key}"
+                );
+                assert!(
+                    key.is_ascii(),
+                    "encoded keys are plain JSON-safe ASCII: {key}"
+                );
+                assert_eq!(
+                    path_from_key(&key),
+                    path,
+                    "lossless key round-trips every byte"
+                );
+            }
+            // Fail-safe: a prefixed key with a malformed escape is
+            // returned verbatim rather than guessed at.
+            assert_eq!(
+                path_from_key("at-bytes:%zz-broken"),
+                PathBuf::from("at-bytes:%zz-broken")
+            );
+        }
+        // Keys without the prefix always decode to themselves.
+        assert_eq!(
+            path_from_key("/plain/path.jsonl"),
+            PathBuf::from("/plain/path.jsonl")
+        );
+    }
+
+    #[test]
+    fn schema_invalidation_ledger_is_bounded_and_exposed() {
+        // Store-integrity lead: the disclosure ledger is capped at
+        // MAX_SCHEMA_INVALIDATION_RECORDS (a journal that outlives
+        // many upgrades cannot grow it without limit) and survives
+        // saves so the disclosure stays durable until `--clear-cache`.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-ledger-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // A journal already carrying a full ledger (eight records),
+        // then one more schema flip: the oldest record drops, the new
+        // one lands, and the cap holds.
+        let mut doc = serde_json::Map::new();
+        doc.insert(
+            "schema_version".to_string(),
+            serde_json::json!(SESSION_CACHE_SCHEMA_VERSION - 1),
+        );
+        doc.insert(
+            "pricing_catalog_id".to_string(),
+            serde_json::json!(crate::pricing::catalog_identity()),
+        );
+        doc.insert(
+            "dir_listing_version".to_string(),
+            serde_json::json!(DIR_LISTING_WALK_VERSION),
+        );
+        doc.insert(
+            "schema_invalidations".to_string(),
+            serde_json::json!((0..MAX_SCHEMA_INVALIDATION_RECORDS)
+                .map(|i| {
+                    serde_json::json!({"observed_schema_version": i, "schema_version": i + 1})
+                })
+                .collect::<Vec<_>>()),
+        );
+        fs::write(
+            session_cache_path(),
+            serde_json::to_string(&Value::Object(doc)).expect("serialize doc"),
+        )
+        .expect("write doc");
+
+        let mut cache = load_session_cache();
+        let exposed = cache.schema_invalidations();
+        assert_eq!(
+            exposed.len(),
+            MAX_SCHEMA_INVALIDATION_RECORDS,
+            "the ledger stays capped after appending the new record"
+        );
+        let observed: Vec<i64> = exposed
+            .iter()
+            .filter_map(|record| {
+                record
+                    .get("observed_schema_version")
+                    .and_then(Value::as_i64)
+            })
+            .collect();
+        // The hand-written 0th record was dropped; the flip's own
+        // record (observed = SESSION_CACHE_SCHEMA_VERSION - 1) is last.
+        assert!(
+            !observed.contains(&0),
+            "the oldest record drops past the cap"
+        );
+        assert_eq!(
+            *observed.last().expect("ledger non-empty"),
+            SESSION_CACHE_SCHEMA_VERSION - 1,
+            "the newest flip is the newest record"
+        );
+
+        // The ledger persists through a save and reloads intact.
+        save_session_cache(&mut cache).expect("save store");
+        let raw = fs::read_to_string(session_cache_path()).expect("read store");
+        let doc: Value = serde_json::from_str(&raw).expect("store parses");
+        let persisted = doc
+            .get("schema_invalidations")
+            .and_then(Value::as_array)
+            .expect("ledger persisted");
+        assert_eq!(persisted.len(), MAX_SCHEMA_INVALIDATION_RECORDS);
+        let cache = load_session_cache();
+        assert_eq!(
+            cache.schema_invalidations().len(),
+            MAX_SCHEMA_INVALIDATION_RECORDS,
+            "a matching-schema load carries the ledger forward untouched"
+        );
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pricing_catalog_mismatch_is_disclosed_in_the_ledger() {
+        // Review fix R3 (2026-10-06, run 2d92ee95 independent_review
+        // 90bc04b9): the pricing arm re-parses every entry when the
+        // catalog identity changes but used to record NOTHING — the
+        // invalidation was invisible, violating the lead's acceptance
+        // contract ("a schema or pricing-catalog mismatch invalidates
+        // entries WITH DISCLOSURE"). The disclosure must land in the
+        // SAME bounded ledger the schema arm writes, naming the reason
+        // and the observed catalog id.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-flip-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).expect("create corpus dir");
+        let journal = corpus.join("session.jsonl");
+        fs::write(&journal, b"{}").expect("write journal");
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // Populate a store at the CURRENT schema and CURRENT catalog.
+        let mut cache = load_session_cache();
+        let session = Session {
+            name: "price".to_string(),
+            path: journal.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_session(&journal, &session, &mut cache).expect("store session");
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+            .expect("store listing");
+        save_session_cache(&mut cache).expect("save store");
+        assert!(cache.schema_invalidations().is_empty());
+
+        // Rewrite the persisted pricing_catalog_id to a foreign value,
+        // leaving schema + walk lane untouched: exactly the reviewer's
+        // PoC B.
+        let raw = fs::read_to_string(session_cache_path()).expect("read store");
+        let mut foreign =
+            serde_json::from_str::<serde_json::Value>(&raw).expect("store parses as JSON");
+        foreign["pricing_catalog_id"] = serde_json::json!("bogus-catalog-identity-0000");
+        fs::write(
+            session_cache_path(),
+            serde_json::to_string(&foreign).expect("serialize foreign store"),
+        )
+        .expect("write foreign store");
+
+        // Load under the real catalog: every entry is dropped for
+        // re-parse, AND the ledger gains the disclosure record.
+        let mut reloaded = load_session_cache();
+        let journal_metadata = fs::metadata(&journal).expect("journal metadata");
+        assert!(
+            cached_file_mod_time_if_fresh(&journal, &journal_metadata, &mut reloaded).is_none(),
+            "entries re-parse at the new catalog"
+        );
+        let records = reloaded.schema_invalidations().to_vec();
+        assert_eq!(records.len(), 1, "the pricing arm appends a ledger record");
+        let record = &records[0];
+        assert_eq!(
+            record.get("reason").and_then(serde_json::Value::as_str),
+            Some("pricing_catalog"),
+            "the record names the pricing arm"
+        );
+        assert_eq!(
+            record
+                .get("observed_pricing_catalog_id")
+                .and_then(serde_json::Value::as_str),
+            Some("bogus-catalog-identity-0000"),
+            "the record names the observed (foreign) catalog id"
+        );
+        assert_eq!(
+            record
+                .get("dropped_entries")
+                .and_then(serde_json::Value::as_i64),
+            Some(1),
+            "the record counts the re-parsed entries"
+        );
+        assert_eq!(
+            record
+                .get("kept_dir_listings")
+                .and_then(serde_json::Value::as_i64),
+            Some(1),
+            "walk-current listings survive the pricing flip"
+        );
+
+        // The record persists: saving re-stamps the real catalog id and
+        // the next load must NOT double-append.
+        save_session_cache(&mut reloaded).expect("save reloaded store");
+        let mut again = load_session_cache();
+        assert_eq!(
+            again.schema_invalidations().len(),
+            1,
+            "no duplicate record on reload"
+        );
+        save_session_cache(&mut again).expect("save again store");
+        let raw = fs::read_to_string(session_cache_path()).expect("read final store");
+        let final_doc: serde_json::Value = serde_json::from_str(&raw).expect("final store parses");
+        assert_ne!(
+            final_doc
+                .get("pricing_catalog_id")
+                .and_then(serde_json::Value::as_str),
+            Some("bogus-catalog-identity-0000"),
+            "the real catalog id is re-stamped"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        if let Some(prior) = prior_cache {
+            std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", prior);
+        } else {
+            std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        }
+    }
+
+    #[test]
+    fn schema_flip_restores_dir_listings_and_records_the_invalidation() {
+        // Session-cache store integrity (lead): a schema bump must
+        // invalidate parsed entries — every bump in the schema history
+        // changed parse or accounting semantics, so stale numbers must
+        // never be served — but it must not silently torch the whole
+        // store. Directory listings are walk semantics on their own
+        // version lane, so when that lane still matches they survive
+        // the bump (no full tree re-walk on upgrade), and the
+        // invalidation itself is recorded in the journal instead of
+        // happening invisibly.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-schema-flip-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).expect("create corpus dir");
+        let journal = corpus.join("session.jsonl");
+        fs::write(&journal, b"{}").expect("write journal");
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // Populate a store at the CURRENT schema: one entry + one
+        // live listing for a real directory.
+        let mut cache = load_session_cache();
+        let session = Session {
+            name: "flip".to_string(),
+            path: journal.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_session(&journal, &session, &mut cache).expect("store session");
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+            .expect("store listing");
+        save_session_cache(&mut cache).expect("save store");
+
+        // Flip the persisted schema to simulate an upgrade between
+        // invocations; every other field of the document stays as
+        // written.
+        let raw = fs::read_to_string(session_cache_path()).expect("read store");
+        let mut flipped: serde_json::Value =
+            serde_json::from_str(&raw).expect("store parses as JSON");
+        flipped["schema_version"] = serde_json::json!(SESSION_CACHE_SCHEMA_VERSION - 1);
+        fs::write(
+            session_cache_path(),
+            serde_json::to_string(&flipped).expect("serialize flipped store"),
+        )
+        .expect("write flipped store");
+
+        let mut cache = load_session_cache();
+        let journal_metadata = fs::metadata(&journal).expect("journal metadata");
+        assert!(
+            cached_file_mod_time_if_fresh(&journal, &journal_metadata, &mut cache).is_none(),
+            "stale-schema entries are never served"
+        );
+        let listing = cached_dir_listing(&corpus, &mut cache)
+            .expect("walk-version listings survive the schema bump");
+        assert_eq!(listing.files, vec![journal.clone()]);
+        assert!(
+            cache.is_dirty(),
+            "the invalidation must persist at the next save"
+        );
+
+        // The post-flip save lands at the new schema with the listing
+        // preserved, the entries dropped, and the disclosure persisted.
+        save_session_cache(&mut cache).expect("save migrated store");
+        let raw = fs::read_to_string(session_cache_path()).expect("read migrated store");
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw).expect("migrated store parses as JSON");
+        assert_eq!(
+            doc["schema_version"],
+            serde_json::json!(SESSION_CACHE_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            doc["entries"].as_object().map(|entries| entries.len()),
+            Some(0),
+            "stale-schema entries stay dropped"
+        );
+        assert_eq!(
+            doc["dirs"].as_object().map(|dirs| dirs.len()),
+            Some(1),
+            "the restored listing is part of the migrated store"
+        );
+        let records = doc["schema_invalidations"]
+            .as_array()
+            .expect("the invalidation is disclosed in the journal");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0]["observed_schema_version"],
+            serde_json::json!(SESSION_CACHE_SCHEMA_VERSION - 1)
+        );
+        assert_eq!(
+            records[0]["schema_version"],
+            serde_json::json!(SESSION_CACHE_SCHEMA_VERSION)
+        );
+        assert_eq!(records[0]["dropped_entries"], serde_json::json!(1));
+        assert_eq!(records[0]["dropped_dirs"], serde_json::json!(0));
+        assert_eq!(records[0]["kept_dir_listings"], serde_json::json!(1));
+
+        // The migrated store still serves the listing on the next run.
+        let mut cache = load_session_cache();
+        assert!(
+            cached_dir_listing(&corpus, &mut cache).is_some(),
+            "the restored listing still serves after the save"
+        );
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_utf8_paths_round_trip_through_the_cache_store() {
+        // rm-041: cache keys and listing members used to collapse
+        // non-UTF-8 paths to `U+FFFD`, so a `bad\xff\xfename.jsonl`
+        // journal was invisible through the cached replay — the
+        // listing named a file that does not exist, and two distinct
+        // non-UTF-8 names could collide on one lossy key. Keys are now
+        // lossless: the listing member must equal the real path.
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-lossless-keys-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).expect("create corpus dir");
+        let journal = corpus.join(std::ffi::OsString::from_vec(
+            b"bad\xff\xfename.jsonl".to_vec(),
+        ));
+        fs::write(&journal, b"{}").expect("write journal");
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        let mut cache = load_session_cache();
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+            .expect("store listing");
+        save_session_cache(&mut cache).expect("save store");
+
+        let mut cache = load_session_cache();
+        let listing =
+            cached_dir_listing(&corpus, &mut cache).expect("listing serves for a UTF-8 directory");
+        assert_eq!(
+            listing.files,
+            vec![journal.clone()],
+            "the non-UTF-8 file name must round-trip losslessly"
+        );
+
+        // The entry round trip must keep working through the encoded
+        // key: store, persist, reload, serve.
+        let session = Session {
+            name: "raw name".to_string(),
+            path: journal.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            // A non-empty source tool keeps the empty-source-tool
+            // eviction gate (below) from treating this entry as
+            // pre-gate legacy junk once it reloads into raw_entries.
+            metrics: Metrics {
+                source_tool: "agenttrace-test".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_session(&journal, &session, &mut cache).expect("store session");
+        save_session_cache(&mut cache).expect("save store");
+        let mut cache = load_session_cache();
+        let served = cached_session(&journal, &mut cache)
+            .expect("the cached entry serves through the lossless key");
+        assert_eq!(served.name, "raw name");
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn legacy_lossy_listing_members_are_dropped_once_at_load() {
+        // rm-041 upgrade seam: a pre-v4 store carries listing members
+        // built with `to_string_lossy`, so a non-UTF-8 journal is stored
+        // as a verbatim U+FFFD name — and the replay extends
+        // `listing.files` verbatim, which would keep hiding the real
+        // file through the warm cache forever. A lossy member cannot
+        // be told apart from a genuine U+FFFD filename, so the walk
+        // lane (not a filter) is what drops them: the listing below
+        // has a CURRENT mtime and no size to drift, so only the
+        // walk-version gate can invalidate it.
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-legacy-lossy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).expect("create corpus dir");
+        let journal = corpus.join(std::ffi::OsString::from_vec(
+            b"bad\xff\xfename.jsonl".to_vec(),
+        ));
+        fs::write(&journal, b"{}").expect("write journal");
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // Seed the store exactly as a pre-upgrade binary would have:
+        // older schema, the last lossy-member walk lane, lossy member
+        // name. The lane value is the ABSOLUTE legacy 3, not
+        // `DIR_LISTING_WALK_VERSION - 1`: the defect this pins is a
+        // binary whose current lane still equals the lossy lane — a
+        // const-relative seed would self-adjust and never see it.
+        let legacy_lossy_lane: i64 = 3;
+        let corpus_metadata = fs::metadata(&corpus).expect("corpus metadata");
+        let lossy_member = format!("{}/bad\u{FFFD}name.jsonl", corpus.to_string_lossy());
+        let legacy = serde_json::json!({
+            "schema_version": SESSION_CACHE_SCHEMA_VERSION - 1,
+            "dir_listing_version": legacy_lossy_lane,
+            "dirs": {
+                corpus.to_string_lossy().to_string(): {
+                    "mod_time": file_mod_time_nanos(&corpus_metadata),
+                    "files": [lossy_member],
+                    "dirs": [],
+                },
+            },
+        });
+        fs::write(
+            session_cache_path(),
+            serde_json::to_string(&legacy).expect("serialize legacy store"),
+        )
+        .expect("write legacy store");
+
+        let mut cache = load_session_cache();
+        assert!(
+            cached_dir_listing(&corpus, &mut cache).is_none(),
+            "a lossy-member listing from the previous walk lane must not serve"
+        );
+        // The drop is disclosed like every schema-side invalidation.
+        let record = cache
+            .schema_invalidations()
+            .last()
+            .expect("invalidation recorded");
+        assert_eq!(record["kept_dir_listings"], serde_json::json!(0));
+        assert_eq!(record["dropped_dirs"], serde_json::json!(1));
+
+        // Self-heal forward: the re-walk stores the listing with the
+        // lossless member, and the store serves the real path after a
+        // save/reload.
+        store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+            .expect("store fresh listing");
+        save_session_cache(&mut cache).expect("save store");
+        let mut cache = load_session_cache();
+        let listing = cached_dir_listing(&corpus, &mut cache).expect("fresh listing serves");
+        assert_eq!(listing.files, vec![journal.clone()]);
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn directory_listing_freshness_also_compares_the_directory_size() {
+        // rm-041: listing freshness compared the directory mtime
+        // alone, so a mutation that landed inside the same mtime tick
+        // as the stored listing stayed invisible until the next mtime
+        // change. The stored listing also carries the directory's byte
+        // size; a drift in either invalidates.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-same-tick-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).expect("create corpus dir");
+        let journal = corpus.join("session.jsonl");
+        fs::write(&journal, b"{}").expect("write journal");
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        let rewrite_listing = |mod_time: i64, dir_size: serde_json::Value| {
+            let mut cache = load_session_cache();
+            store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
+                .expect("store listing");
+            save_session_cache(&mut cache).expect("save store");
+            let raw = fs::read_to_string(session_cache_path()).expect("read store");
+            let mut doc: serde_json::Value =
+                serde_json::from_str(&raw).expect("store parses as JSON");
+            let key = corpus.to_string_lossy().to_string();
+            doc["dirs"][key.as_str()]["mod_time"] = serde_json::json!(mod_time);
+            doc["dirs"][key.as_str()]["dir_size"] = dir_size;
+            fs::write(
+                session_cache_path(),
+                serde_json::to_string(&doc).expect("serialize store"),
+            )
+            .expect("write store");
+        };
+        let current = fs::metadata(&corpus).expect("corpus metadata");
+        let now_nanos = file_mod_time_nanos(&current);
+        let real_size = current.len();
+
+        // Same-tick drift: the mtime still matches, the size does not.
+        rewrite_listing(now_nanos, serde_json::json!(real_size + 4096));
+        let mut cache = load_session_cache();
+        assert!(
+            cached_dir_listing(&corpus, &mut cache).is_none(),
+            "a same-tick size drift must invalidate the listing"
+        );
+
+        // No false invalidation: mtime and size both current.
+        rewrite_listing(now_nanos, serde_json::json!(real_size));
+        let mut cache = load_session_cache();
+        assert!(
+            cached_dir_listing(&corpus, &mut cache).is_some(),
+            "a listing whose mtime and size both match still serves"
+        );
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_saves_merge_instead_of_last_writer_wins() {
+        // rm-298 residual: save was a lockless read-modify-write — two
+        // agenttrace processes that load the store before either saves
+        // each overwrite the other's entries wholesale. Saves now
+        // serialize on an advisory lock and merge the freshly re-read
+        // on-disk state, so every writer's entry survives.
+        use std::sync::{Arc, Barrier};
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-merge-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).expect("create corpus dir");
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // Seed the on-disk store with one entry.
+        let seed_file = corpus.join("seed.jsonl");
+        fs::write(&seed_file, b"{}").expect("write seed");
+        let mut cache = load_session_cache();
+        let session = Session {
+            name: "seed".to_string(),
+            path: seed_file.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                source_tool: "agenttrace-test".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_session(&seed_file, &session, &mut cache).expect("store seed");
+        save_session_cache(&mut cache).expect("save seed");
+
+        // Every writer loads BEFORE any of them saves (the barrier),
+        // exactly like processes that start together.
+        let writers: Vec<_> = (0..6)
+            .map(|i| {
+                let file = corpus.join(format!("writer-{i}.jsonl"));
+                fs::write(&file, b"{}").expect("write journal");
+                (i, file)
+            })
+            .collect();
+        let barrier = Arc::new(Barrier::new(writers.len()));
+        let mut handles = Vec::new();
+        for (i, file) in writers.iter() {
+            let i = *i;
+            let barrier = Arc::clone(&barrier);
+            let file = file.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut cache = load_session_cache();
+                barrier.wait();
+                let session = Session {
+                    name: format!("writer-{i}"),
+                    path: file.to_string_lossy().to_string(),
+                    cwd: String::new(),
+                    branch: String::new(),
+                    metrics: Metrics {
+                        source_tool: "agenttrace-test".to_string(),
+                        ..Metrics::default()
+                    },
+                    anomalies: Vec::new(),
+                    health: 100,
+                    tool_warnings: Vec::new(),
+                    diagnostics: Diagnostics::default(),
+                };
+                store_session(&file, &session, &mut cache).expect("store session");
+                save_session_cache(&mut cache).expect("save cache");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let mut cache = load_session_cache();
+        let served = cached_session(&seed_file, &mut cache).expect("seed survives");
+        assert_eq!(served.name, "seed");
+        for (i, file) in &writers {
+            let served = cached_session(file, &mut cache).unwrap_or_else(|| {
+                panic!("writer-{i}'s entry was lost to a concurrent save");
+            });
+            assert_eq!(served.name, format!("writer-{i}"));
+        }
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
         let _ = fs::remove_dir_all(root);
     }
 }
