@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -439,48 +439,99 @@ fn compact_statusline_capture_under(path: &Path, keep_under: u64) -> io::Result<
 /// materialize at once. Mirrors the retention bound below — the compaction
 /// REWRITE always kept to it, but the READ side (three sites) loaded the
 /// whole journal into memory first, so a hostile or runaway journal was
-/// fully loaded before any bounded handling could kick in.
-const STATUSLINE_READ_CAP_BYTES: u64 = 10 * 1024 * 1024;
+/// fully loaded before any bounded handling could kick in. rm-922 (merged
+/// at integration): the read-side bound IS the retention bound — both
+/// constants name the same 10 MiB — and it now guards the DECODE as well
+/// (see [`read_statusline_capture_bounded`]), so the two names stay
+/// lockstep-aliased instead of drifting apart again.
+const STATUSLINE_READ_CAP_BYTES: u64 = STATUSLINE_CAPTURE_MAX_BYTES;
 
-/// rm-898: read at most [`STATUSLINE_READ_CAP_BYTES`] bytes from the TAIL of
-/// the journal (the fleet-proven rm-821 `read_journal_capped` shape). Returns
-/// the tail contents and the number of bytes cut from the head. A cut that
-/// lands mid-line or mid-character is resolved by advancing to the next char
-/// boundary and dropping the (torn) first line — mirroring the torn-tail
-/// tolerance the journal lanes already apply to truncated writers.
-fn read_journal_tail_capped(path: &Path) -> io::Result<(String, u64)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let len = fs::metadata(path)?.len();
-    if len <= STATUSLINE_READ_CAP_BYTES {
-        return Ok((fs::read_to_string(path)?, 0));
+/// rm-898 + rm-922 (composed at integration): one bounded, UTF-8-recovering
+/// journal read. rm-898: read at most [`STATUSLINE_READ_CAP_BYTES`] bytes
+/// from the TAIL of the journal (the fleet-proven rm-821 `read_journal_capped`
+/// shape), returning the tail contents and the number of bytes cut from the
+/// head. A cut that lands mid-line or mid-character is resolved by advancing
+/// to the next char boundary and dropping the (torn) first line — mirroring
+/// the torn-tail tolerance the journal lanes already apply to truncated
+/// writers. rm-922: the same read now bounds the DECODE too. The 10 MiB
+/// bound used to be enforced on the APPEND side only, so a journal planted
+/// or grown by any other means was read and re-serialized whole by every
+/// consumer; and one invalid UTF-8 byte made the read fail outright — every
+/// insight silently zeroed, and because compaction's own read failed the
+/// same way, retention never repaired and the journal grew past the ceiling
+/// with the error surfaced nowhere. The read decodes lossily, so every
+/// VALID line still discloses and the next compaction rewrites the journal
+/// as clean UTF-8.
+#[derive(Debug, Default, PartialEq)]
+struct JournalRead {
+    text: String,
+    /// The on-disk journal exceeded [`STATUSLINE_READ_CAP_BYTES`] and only
+    /// its newest tail was kept (disclosed in the stats lane; benign
+    /// journals stay `false` and serialize nothing).
+    truncated: bool,
+    /// Bytes cut from the head of the journal when it exceeded the read
+    /// cap (`0` = the read was complete) — the exact count the stats lane
+    /// discloses as `capped_away_bytes`.
+    capped_away_bytes: u64,
+}
+
+fn read_statusline_capture_bounded(path: &Path) -> JournalRead {
+    let Ok(mut file) = fs::File::open(path) else {
+        return JournalRead::default();
+    };
+    let Ok(size) = file.metadata().map(|meta| meta.len()) else {
+        return JournalRead::default();
+    };
+    if size <= STATUSLINE_READ_CAP_BYTES {
+        // Common case: inside the bound. `take` bounds even this arm
+        // against a journal growing between the metadata probe and the
+        // read; the lossy decode keeps every valid line parseable while
+        // the damaged line's U+FFFD replacements make it fail JSON
+        // parsing — it is skipped like any torn line instead of zeroing
+        // the whole report (rm-922: the prior `read_to_string` failed
+        // outright on the first invalid byte).
+        let mut bytes = Vec::new();
+        let mut limited = file.take(STATUSLINE_READ_CAP_BYTES);
+        let _ = limited.read_to_end(&mut bytes);
+        return JournalRead {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            truncated: false,
+            capped_away_bytes: 0,
+        };
     }
-    let mut cut = len - STATUSLINE_READ_CAP_BYTES;
-    let mut file = fs::File::open(path)?;
+    // Oversized (planted, or grown by a non-statusline writer): keep the
+    // NEWEST bound bytes — journal semantics keep the newest lines. A cut
+    // landing inside a multi-byte character advances to the next boundary
+    // (the buffer then begins with a continuation byte and from_utf8 fails
+    // at offset 0; a valid start byte can be preceded by at most three
+    // continuation bytes, so the advance is bounded — review-fix 9fb0a017
+    // F2: the prior guard compared valid_up_to() == buf.len(), which
+    // from_utf8 can never produce on an Err; that branch was dead and the
+    // raw cut leaked through the lossy fallback). Any other invalid UTF-8
+    // (interior corruption, a torn writer's mid-character EOF) falls back
+    // to a lossy read so the lane stays usable (same tolerance as torn
+    // writers, rm-922).
+    let mut cut = size - STATUSLINE_READ_CAP_BYTES;
     let mut buf = Vec::with_capacity(STATUSLINE_READ_CAP_BYTES as usize);
     let mut advances_left = 3u32; // a valid start byte has at most 3 continuation bytes before it
     let raw = loop {
-        file.seek(SeekFrom::Start(cut))?;
+        if file.seek(SeekFrom::Start(cut)).is_err() {
+            return JournalRead::default();
+        }
         buf.clear();
-        (&mut file)
+        if (&mut file)
             .take(STATUSLINE_READ_CAP_BYTES)
-            .read_to_end(&mut buf)?;
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            return JournalRead::default();
+        }
         match std::str::from_utf8(&buf) {
             Ok(s) => break s.to_string(),
             Err(e) => {
-                // A cut landing inside a multi-byte character advances to the
-                // next boundary — the buffer then begins with a continuation
-                // byte and from_utf8 fails at offset 0; a valid start byte
-                // can be preceded by at most three continuation bytes, so the
-                // advance is bounded. Any other invalid UTF-8 (interior
-                // corruption, a torn writer's mid-character EOF) falls back to
-                // a lossy read so the lane stays usable (same tolerance as
-                // torn writers). Review-fix 9fb0a017 F2: the prior guard
-                // compared valid_up_to() == buf.len(), which from_utf8 can
-                // never produce on an Err — that branch was dead and the raw
-                // cut leaked through the lossy fallback.
                 if e.valid_up_to() == 0
                     && advances_left > 0
-                    && cut < len
+                    && cut < size
                     && matches!(buf.first(), Some(b) if (0x80..=0xBF).contains(b))
                 {
                     cut += 1;
@@ -491,22 +542,33 @@ fn read_journal_tail_capped(path: &Path) -> io::Result<(String, u64)> {
             }
         }
     };
-    let away = cut;
     // Drop a torn head line: after a head cut the first line is complete
-    // only when the cut landed exactly at a line boundary.
-    let body = if away > 0 {
-        match raw.find('\n') {
-            Some(i) => raw[i + 1..].to_string(),
-            None => String::new(),
-        }
-    } else {
-        raw
+    // only when the cut landed exactly at a line boundary (a tail entirely
+    // inside one line keeps nothing whole).
+    let text = match raw.find('\n') {
+        Some(i) => raw[i + 1..].to_string(),
+        None => String::new(),
     };
-    Ok((body, away))
+    JournalRead {
+        text,
+        truncated: true,
+        capped_away_bytes: cut,
+    }
 }
 
 fn compact_statusline_capture_locked(path: &Path, keep_under: u64) -> io::Result<()> {
-    let (raw, _capped_away_bytes) = read_journal_tail_capped(path)?;
+    // rm-922: the compaction read rides the SAME bounded, lossy
+    // decode as every consumer (this used to be a bare
+    // `read_to_string`, so one invalid UTF-8 byte made retention
+    // fail forever — the journal grew unboundedly past the 10 MiB
+    // ceiling with the error surfaced nowhere). A rewrite now
+    // repairs such a journal: invalid bytes are replaced with
+    // U+FFFD in the rewritten — already unparseable — lines, and the
+    // next read sees clean UTF-8. rm-898 (composed at integration):
+    // the shared read is also TAIL-bounded, so a journal that grew
+    // past the read cap without passing through the append-side
+    // retention check re-fits on its next compaction.
+    let raw = read_statusline_capture_buffer(path);
     let mut kept: Vec<&str> = Vec::new();
     let mut kept_bytes = 0u64;
     for line in raw.lines().rev() {
@@ -541,23 +603,22 @@ fn compact_statusline_capture_locked(path: &Path, keep_under: u64) -> io::Result
 /// Reads the journal, skipping malformed lines (a torn tail line from a
 /// crashed append is tolerated, matching append-only semantics).
 pub fn read_statusline_captures(path: &Path) -> Vec<CapturedStatusline> {
-    let (raw, _capped_away_bytes) = read_journal_tail_capped(path).unwrap_or_default();
+    let raw = read_statusline_capture_buffer(path);
     parse_statusline_captures(&raw)
 }
 
-/// The journal text actually read: empty when the file is absent or
+/// The raw journal text actually read: empty when the file is absent or
 /// unreadable, the same tolerance [`read_statusline_captures`] always
-/// had. rm-684 (review 95d74221 F6): the budget view and the report
-/// read the journal exactly ONCE per invocation — the stats
-/// disclosure, the JSON arm, the text arm and the captures all share
-/// this buffer instead of each re-reading the (up to 10 MiB) file.
-/// rm-898: the shared read is itself bounded — at most
-/// [`STATUSLINE_READ_CAP_BYTES`] taken from the TAIL — and the bytes
-/// cut from the head ride along so the stats can disclose them as
-/// `capped_away_bytes` instead of silently undercounting a huge
-/// journal.
-fn read_statusline_capture_buffer(path: &Path) -> (String, u64) {
-    read_journal_tail_capped(path).unwrap_or_default()
+/// had. rm-684 (review 95d74221 F6): the budget view and the report read
+/// the journal exactly ONCE per invocation — the stats disclosure, the
+/// JSON arm, the text arm and the captures all share this buffer instead
+/// of each re-reading the (up to 10 MiB) file. rm-898: the shared read is
+/// itself bounded — at most [`STATUSLINE_READ_CAP_BYTES`] taken from the
+/// TAIL — with the head cut riding along for stats disclosure. rm-922: it
+/// is also UTF-8-recovering — see [`read_statusline_capture_bounded`],
+/// which this wraps for callers that need only the text.
+fn read_statusline_capture_buffer(path: &Path) -> String {
+    read_statusline_capture_bounded(path).text
 }
 
 /// Parses already-read journal text (the torn-tail-tolerant half of
@@ -631,22 +692,41 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
         }
     }
 
-    let mut latest: [Option<&CapturedStatusline>; 2] = [None, None];
-    for capture in &deduped {
-        if capture.rate_limit("five_hour").is_some() {
-            latest[0] = Some(capture);
+    // rm-921: each capture's window state is parsed EXACTLY ONCE.
+    // The aggregation below used to call `rate_limit` (a serde Value
+    // clone + `from_value`) per capture per PROBE, so a journal whose
+    // captures carry `resets_at` but no `used_percentage` (older
+    // hosts, null fields, hostile input) paid one parse per capture
+    // per distinct boundary — n·k parses, measured quadratic (0.05 s
+    // → 8.3 s at n=250→2000 in release, minutes-scale at the 10 MiB
+    // retention ceiling) on otherwise-correct output. These two
+    // parsed states per capture feed every consumer below.
+    let windows: Vec<[Option<StatuslineRateLimitState>; 2]> = deduped
+        .iter()
+        .map(|capture| {
+            [
+                capture.rate_limit("five_hour"),
+                capture.rate_limit("seven_day"),
+            ]
+        })
+        .collect();
+
+    let mut latest: [Option<usize>; 2] = [None, None];
+    for (position, states) in windows.iter().enumerate() {
+        if states[0].is_some() {
+            latest[0] = Some(position);
         }
-        if capture.rate_limit("seven_day").is_some() {
-            latest[1] = Some(capture);
+        if states[1].is_some() {
+            latest[1] = Some(position);
         }
     }
-    let five_hour = latest[0].and_then(|capture| capture.rate_limit("five_hour"));
-    let seven_day = latest[1].and_then(|capture| capture.rate_limit("seven_day"));
+    let five_hour = latest[0].and_then(|position| windows[position][0].clone());
+    let seven_day = latest[1].and_then(|position| windows[position][1].clone());
 
-    let peak = |window: &str| {
-        deduped
+    let peak = |window: usize| {
+        windows
             .iter()
-            .filter_map(|capture| capture.rate_limit(window))
+            .filter_map(|states| states[window].as_ref())
             .filter_map(|state| state.used_percentage)
             .fold(None::<f64>, |acc, used| {
                 Some(match acc {
@@ -657,31 +737,42 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
     };
 
     let mut crossings: Vec<StatuslineLimitCrossing> = Vec::new();
-    for window in ["five_hour", "seven_day"] {
-        let mut distinct: Vec<i64> = deduped
+    for (window_index, window) in ["five_hour", "seven_day"].iter().enumerate() {
+        // rm-921 (F2+F5): one sorted sweep replaces the per-boundary
+        // probe. The observations that can evidence a crossing
+        // (captures with a `used_percentage` in this window) are
+        // sorted once by (captured_at, journal position) and a
+        // boundary's before/after is a binary search into that order
+        // — and the pick is by captured_at (greatest strictly-before /
+        // least at-or-after) instead of array position, so an
+        // out-of-order journal (clock skew, an older journal merged
+        // in) no longer reports a stale observation at the boundary.
+        // On an in-order journal the picks are identical to the old
+        // array-order picks: resolving captured_at ties by journal
+        // position reproduces exactly what next_back/next returned
+        // over the sorted array.
+        let mut used: Vec<(i64, usize, f64)> = windows
             .iter()
-            .filter_map(|capture| capture.rate_limit(window))
-            .filter_map(|state| state.resets_at)
+            .enumerate()
+            .filter_map(|(position, states)| {
+                let used_percentage = states[window_index].as_ref()?.used_percentage?;
+                Some((deduped[position].captured_at, position, used_percentage))
+            })
             .collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        for resets_at in distinct {
-            let used_at = |capture: &&CapturedStatusline| {
-                capture
-                    .rate_limit(window)
-                    .and_then(|state| state.used_percentage)
-            };
-            let before = deduped
-                .iter()
-                .filter(|capture| capture.captured_at < resets_at)
-                .filter_map(used_at)
-                .next_back();
-            let after = deduped
-                .iter()
-                .filter(|capture| capture.captured_at >= resets_at)
-                .filter_map(used_at)
-                .next();
-            if before.is_some() && after.is_some() {
+        used.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut boundaries: Vec<i64> = windows
+            .iter()
+            .filter_map(|states| states[window_index].as_ref()?.resets_at)
+            .collect();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for resets_at in boundaries {
+            // Observations strictly before the boundary form a prefix
+            // of the sorted sweep; `partition_point` finds the split.
+            let split = used.partition_point(|(captured_at, _, _)| *captured_at < resets_at);
+            let before = (split > 0).then(|| used[split - 1].2);
+            let after = (split < used.len()).then(|| used[split].2);
+            if let (Some(used_percentage_before), Some(used_percentage_after)) = (before, after) {
                 // A crossing is evidenced by observations on both sides:
                 // usage observed while the window was running and the
                 // first observation after the boundary. A bare
@@ -690,8 +781,8 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
                 crossings.push(StatuslineLimitCrossing {
                     window: window.to_string(),
                     resets_at,
-                    used_percentage_before: before,
-                    used_percentage_after: after,
+                    used_percentage_before: Some(used_percentage_before),
+                    used_percentage_after: Some(used_percentage_after),
                 });
             }
         }
@@ -729,8 +820,8 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
         sessions: sessions.len(),
         five_hour,
         seven_day,
-        five_hour_peak_used_percentage: peak("five_hour"),
-        seven_day_peak_used_percentage: peak("seven_day"),
+        five_hour_peak_used_percentage: peak(0),
+        seven_day_peak_used_percentage: peak(1),
         limit_crossings: crossings,
         session_caches,
         miss_causes,
@@ -759,29 +850,47 @@ pub struct StatuslineJournalStats {
     /// journal fits half of this once it crosses it.
     pub retained_max_bytes: u64,
     /// rm-898: bytes cut from the head of the journal by
-    /// [`read_journal_tail_capped`] when it exceeds
+    /// [`read_statusline_capture_bounded`] when it exceeds
     /// [`STATUSLINE_READ_CAP_BYTES`] (`0` = the read was complete). The
     /// statusline-report JSON surfaces this so a bounded read is disclosed
     /// rather than silently undercounting a huge journal.
     pub capped_away_bytes: u64,
+    /// rm-922: the on-disk journal exceeded the read bound and the read
+    /// kept only its newest tail (the bound used to be enforced on the
+    /// append side only). Serialized only when set, so benign journals keep
+    /// their report bytes identical. On the merged reader this flag means
+    /// exactly `capped_away_bytes > 0`; both are kept so each side's
+    /// pinned disclosure shape survives the integration.
+    #[serde(skip_serializing_if = "is_false")]
+    pub read_truncated: bool,
+}
+
+/// `serde(skip_serializing_if)` helper for the rm-922 truncation
+/// flag: absent from serialized output while `false`.
+fn is_false(flag: &bool) -> bool {
+    !*flag
 }
 
 pub fn statusline_journal_stats(path: &Path) -> StatuslineJournalStats {
-    let (raw, capped_away_bytes) = read_statusline_capture_buffer(path);
-    statusline_journal_stats_from_buffer(path, &raw, capped_away_bytes)
+    let read = read_statusline_capture_bounded(path);
+    statusline_journal_stats_from_buffer(path, &read.text, read.capped_away_bytes)
 }
 
 /// Stats derived from an already-read journal buffer (rm-684: the
 /// budget view computes these from its single read instead of a
 /// second full read). `lines` describes the text that was actually
 /// read; `capped_away_bytes` carries the head cut from that same
-/// shared bounded read (rm-898); `exists` still probes the path so an
-/// absent journal discloses itself, and `bytes` always names the
-/// on-disk metadata size — review 95d74221 F7: an undecodable journal
-/// decodes to an empty buffer and reporting `bytes: 0` exactly when
-/// the journal is corrupt would hide its real footprint (and rm-898
-/// extends the same rule to the over-cap case: a bounded read must
-/// never shrink the reported footprint of the file it truncated).
+/// shared bounded read (rm-898) and derives the rm-922 `read_truncated`
+/// flag; `exists` still probes the path so an absent journal discloses
+/// itself, and `bytes` always names the on-disk metadata size — review
+/// 95d74221 F7: an undecodable journal decodes to an empty buffer and
+/// reporting `bytes: 0` exactly when the journal is corrupt would hide
+/// its real footprint (and rm-898 extends the same rule to the over-cap
+/// case: a bounded read must never shrink the reported footprint of
+/// the file it truncated; rm-922's lossy decode makes empty-buffer
+/// reads rarer still, but the metadata stays the single truth source
+/// — the integration keeps this landed rule over the candidate's
+/// read-length accounting).
 fn statusline_journal_stats_from_buffer(
     path: &Path,
     raw: &str,
@@ -791,7 +900,8 @@ fn statusline_journal_stats_from_buffer(
     let bytes = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
     // rm-898: bounded tail read — line counts for an over-cap journal
     // cover only the retained tail; the shared buffer's `away` discloses
-    // the head that was cut (no second read, rm-684/F6).
+    // the head that was cut (no second read, rm-684/F6). rm-922: the
+    // truncation flag is exactly `away > 0` on the merged reader.
     let lines = if exists {
         raw.lines().filter(|line| !line.trim().is_empty()).count()
     } else {
@@ -804,6 +914,7 @@ fn statusline_journal_stats_from_buffer(
         bytes,
         retained_max_bytes: STATUSLINE_CAPTURE_MAX_BYTES,
         capped_away_bytes,
+        read_truncated: capped_away_bytes > 0,
     }
 }
 
@@ -819,10 +930,11 @@ pub fn render_statusline_report(
     // single-read pattern render_budget_view uses (stats and captures
     // share the buffer; this used to read the journal twice
     // back-to-back). rm-898: the shared read is the bounded tail read,
-    // and the head cut rides along into the stats.
-    let (raw, capped_away_bytes) = read_statusline_capture_buffer(&path);
-    let stats = statusline_journal_stats_from_buffer(&path, &raw, capped_away_bytes);
-    let captures = parse_statusline_captures(&raw);
+    // and the head cut rides along into the stats; rm-922: it is also
+    // the lossy, over-cap-disclosing decode.
+    let read = read_statusline_capture_bounded(&path);
+    let stats = statusline_journal_stats_from_buffer(&path, &read.text, read.capped_away_bytes);
+    let captures = parse_statusline_captures(&read.text);
     let insights = statusline_insights(&captures);
     let series = statusline_budget_series(&captures, 7, Utc::now());
     if format == "json" {
@@ -880,7 +992,9 @@ fn render_statusline_report_text(
     // counts above describe the retained tail, not the whole file —
     // disclose the cut instead of silently undercounting a huge
     // journal. The JSON arm carries the same fact as the
-    // `capped_away_bytes` field on the serialized journal stats.
+    // `capped_away_bytes` and `read_truncated` fields on the serialized
+    // journal stats (rm-922's text phrasing is subsumed by this richer
+    // line — the docs pin this wording).
     if stats.capped_away_bytes > 0 {
         out.push_str(&format!(
             "  journal exceeds the {} MiB read bound: head truncated, {} of {} bytes unread; counts cover the retained tail only\n",
@@ -1133,10 +1247,11 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
     // (previously the journal was read three times per invocation:
     // once for stats, once for captures, and a second capture read in
     // the text arm). rm-898: the shared read is the bounded tail read,
-    // and the head cut rides along into the stats disclosure.
-    let (raw, capped_away_bytes) = read_statusline_capture_buffer(&path);
-    let stats = statusline_journal_stats_from_buffer(&path, &raw, capped_away_bytes);
-    let captures = parse_statusline_captures(&raw);
+    // and the head cut rides along into the stats disclosure; rm-922: it
+    // is also the lossy, over-cap-disclosing decode.
+    let read = read_statusline_capture_bounded(&path);
+    let stats = statusline_journal_stats_from_buffer(&path, &read.text, read.capped_away_bytes);
+    let captures = parse_statusline_captures(&read.text);
     let series = statusline_budget_series(&captures, 7, Utc::now());
     if format == "json" {
         let mut value = serde_json::json!({
@@ -1311,6 +1426,7 @@ mod tests {
                 bytes: 100,
                 retained_max_bytes: 1024,
                 capped_away_bytes: 0,
+                read_truncated: false,
             },
             &statusline_insights(&[]),
             Some(5.0),
@@ -1550,6 +1666,7 @@ mod tests {
                 bytes: 100,
                 retained_max_bytes: 1024,
                 capped_away_bytes: 0,
+                read_truncated: false,
             },
             &statusline_insights(&captures),
             budget,
@@ -1576,6 +1693,7 @@ mod tests {
                 bytes: 50,
                 retained_max_bytes: 1024,
                 capped_away_bytes: 0,
+                read_truncated: false,
             },
             &statusline_insights(&[]),
             budget,
@@ -1594,6 +1712,7 @@ mod tests {
                 bytes: 100,
                 retained_max_bytes: 1024,
                 capped_away_bytes: 0,
+                read_truncated: false,
             },
             &statusline_insights(&captures),
             None,
@@ -1924,6 +2043,262 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// rm-921 fixture: one capture carrying exactly the given window
+    /// states (used_percentage, resets_at), so the sweep's pick and
+    /// order semantics are pinned without leaning on the shared
+    /// FIXTURE's fields.
+    fn window_capture(
+        captured_at: i64,
+        five_hour: Option<(f64, Option<i64>)>,
+        seven_day: Option<(f64, Option<i64>)>,
+    ) -> CapturedStatusline {
+        let mut rate_limits = serde_json::Map::new();
+        for (window, state) in [("five_hour", five_hour), ("seven_day", seven_day)] {
+            if let Some((used_percentage, resets_at)) = state {
+                rate_limits.insert(
+                    window.to_string(),
+                    serde_json::json!({
+                        "used_percentage": used_percentage,
+                        "resets_at": resets_at,
+                    }),
+                );
+            }
+        }
+        CapturedStatusline {
+            captured_at,
+            payload: serde_json::json!({
+                "session_id": "session",
+                "model": {"id": "claude-opus-4-5", "display_name": "Opus 4.5"},
+                "cost": {"total_cost_usd": 1.0},
+                "rate_limits": rate_limits,
+            }),
+        }
+    }
+
+    #[test]
+    fn crossings_pick_observations_by_captured_at_not_array_order() {
+        // rm-921 (F5): journal order is not captured_at order — clock
+        // skew, or an older journal merged in. The boundary pick used
+        // to take the first/last JOURNAL-POSITION match (next()/
+        // next_back() over the array filter), so this journal reported
+        // the stale t=50 observation before the reset (20%) and the
+        // t=300 one after it (7%) — the pristine-binary PoC pinned
+        // exactly those wrong numbers. The pick is by captured_at
+        // now: greatest strictly before, least at-or-after.
+        let captures = [
+            window_capture(100, Some((10.0, Some(150))), None),
+            window_capture(50, Some((20.0, None)), None),
+            window_capture(300, Some((7.0, None)), None),
+            window_capture(200, Some((5.0, None)), None),
+        ];
+        let insights = statusline_insights(&captures);
+        assert_eq!(insights.limit_crossings.len(), 1);
+        let crossing = &insights.limit_crossings[0];
+        assert_eq!(crossing.window, "five_hour");
+        assert_eq!(crossing.resets_at, 150);
+        assert_eq!(crossing.used_percentage_before, Some(10.0));
+        assert_eq!(crossing.used_percentage_after, Some(5.0));
+    }
+
+    #[test]
+    fn crossings_output_order_is_window_then_boundary_ascending() {
+        // rm-921: the sorted sweep must keep the rendered order the
+        // old array probe produced on an in-order journal — windows in
+        // [five_hour, seven_day] order, boundaries ascending — so
+        // governance reports stay byte-identical for benign journals
+        // (the no-boundary arms prove nothing: 3000 is dropped with no
+        // after-side, 2500 the same).
+        let captures = [
+            window_capture(100, Some((10.0, Some(1000))), Some((50.0, Some(1500)))),
+            window_capture(200, Some((20.0, Some(1000))), Some((60.0, Some(1500)))),
+            window_capture(1100, Some((5.0, Some(2000))), Some((40.0, Some(1500)))),
+            window_capture(2100, Some((8.0, Some(3000))), Some((30.0, Some(2500)))),
+        ];
+        let insights = statusline_insights(&captures);
+        let seen: Vec<(&str, i64, Option<f64>, Option<f64>)> = insights
+            .limit_crossings
+            .iter()
+            .map(|crossing| {
+                (
+                    crossing.window.as_str(),
+                    crossing.resets_at,
+                    crossing.used_percentage_before,
+                    crossing.used_percentage_after,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("five_hour", 1000, Some(20.0), Some(5.0)),
+                ("five_hour", 2000, Some(5.0), Some(8.0)),
+                ("seven_day", 1500, Some(40.0), Some(30.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn crossings_on_sparse_journals_stay_linear() {
+        // rm-921 (F2): a journal whose captures carry resets_at but no
+        // used_percentage made every boundary probe re-parse every
+        // capture's window state — n·k serde round-trips, measured
+        // quadratic (the pristine-binary PoC: 0.05 s → 8.3 s at
+        // n=250→2000 in RELEASE; the ceiling case is a 10 MiB journal,
+        // minutes-scale). The sweep parses each window once and
+        // binary-searches; 4000 distinct boundaries complete in
+        // milliseconds where the quadratic shape needs ~35 s in
+        // release. The bound is wall time with a wide margin.
+        let captures: Vec<CapturedStatusline> = (0..4000)
+            .map(|i| {
+                let at = 1_700_000_000 + i * 60;
+                CapturedStatusline {
+                    captured_at: at,
+                    payload: serde_json::json!({
+                        "model": {"display_name": "Sonnet"},
+                        "rate_limits": {
+                            "five_hour": {"resets_at": at},
+                            "seven_day": {"resets_at": at},
+                        },
+                    }),
+                }
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let insights = statusline_insights(&captures);
+        let elapsed = started.elapsed();
+        assert_eq!(insights.captures, 4000);
+        // 4000 distinct boundaries, no usable observations: no
+        // crossing is evidenced, but every boundary was probed.
+        assert!(
+            insights.limit_crossings.is_empty(),
+            "sparse shapes evidence no crossing"
+        );
+        assert!(
+            elapsed.as_secs() < 10,
+            "sparse-journal aggregation stays linear-scale: took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_journal_reads_bounded_and_discloses_truncation() {
+        // rm-922: the 10 MiB retention bound used to be enforced on
+        // the append side only — a journal planted or grown by other
+        // means was read and re-serialized whole by every consumer
+        // (the pristine-binary PoC disclosed lines 130000 / bytes
+        // 10938890 against this exact shape). The read keeps the
+        // newest STATUSLINE_CAPTURE_MAX_BYTES now, and the stats lane
+        // carries the flag.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-oversize-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let mut raw = String::new();
+        let mut seq = 0;
+        while raw.len() <= STATUSLINE_CAPTURE_MAX_BYTES as usize {
+            raw.push_str(&format!(
+                "{{\"captured_at\":1000,\"payload\":{{\"seq\":{seq},\"filler\":\"{}\"}}}}\n",
+                "x".repeat(96)
+            ));
+            seq += 1;
+        }
+        let on_disk = raw.len() as u64;
+        fs::write(&journal, &raw).expect("write oversized journal");
+        let read = read_statusline_capture_bounded(&journal);
+        assert!(
+            read.truncated,
+            "an over-bound journal discloses its read bound"
+        );
+        assert!(read.text.len() as u64 <= STATUSLINE_CAPTURE_MAX_BYTES);
+        assert!(read.text.starts_with('{'), "the torn first line is dropped");
+        let stats = statusline_journal_stats(&journal);
+        assert!(stats.read_truncated);
+        assert!(
+            stats.capped_away_bytes > 0,
+            "the exact head cut is disclosed"
+        );
+        // Integration: the landed rm-898 rule (review 95d74221 F7)
+        // keeps `bytes` naming the ON-DISK metadata size — a bounded
+        // read must never shrink the reported footprint of the file it
+        // truncated — superseding the candidate's read-length
+        // accounting here; the cut itself is disclosed by
+        // `capped_away_bytes` above and by the report text lane.
+        assert_eq!(stats.bytes, on_disk);
+        assert!(
+            read.text.len() < on_disk as usize,
+            "the head past the bound is not read"
+        );
+        let parsed = read_statusline_captures(&journal);
+        assert_eq!(stats.lines, parsed.len(), "every kept line is valid here");
+        // Only the newest tail is kept: the earliest sequences are gone.
+        let first_kept = parsed[0].payload["seq"].as_i64().expect("seq");
+        assert!(first_kept > 0, "oldest lines are the ones dropped");
+        // The flag serializes only when set (benign byte-identity).
+        let serialized = serde_json::to_string(&stats).expect("serialize stats");
+        assert!(serialized.contains("\"read_truncated\":true"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_utf8_journal_still_discloses_and_retention_repairs() {
+        // rm-922: one invalid UTF-8 byte used to fail the whole read —
+        // every insight silently zeroed (the pristine-binary PoC:
+        // captures 0, sessions 0, lines 0 against a journal holding
+        // two valid lines), and because compaction's read failed the
+        // same way retention never repaired. The read decodes lossily
+        // now: valid lines disclose, the damaged line is skipped like
+        // a torn one, and the next compaction rewrites the journal as
+        // clean UTF-8.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-badbyte-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let journal = root.join("statusline.jsonl");
+        let good1 = br#"{"captured_at":100,"payload":{"session_id":"one","model":{"display_name":"A"},"rate_limits":{"five_hour":{"used_percentage":10.0,"resets_at":200}}}}"#;
+        let damaged = b"{\"captured_at\":200,\"payload\":{\"junk\":\"\xFF\xFE\"}}";
+        let good2 = br#"{"captured_at":300,"payload":{"session_id":"two","model":{"display_name":"B"},"rate_limits":{"five_hour":{"used_percentage":30.0,"resets_at":400}}}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(good1);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(damaged);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(good2);
+        bytes.push(b'\n');
+        fs::write(&journal, &bytes).expect("write damaged journal");
+        let captures = read_statusline_captures(&journal);
+        // The damaged line's invalid bytes decode to U+FFFD INSIDE a
+        // JSON string here, so it still parses and discloses — the
+        // payload is nonsense but it is the journal's own nonsense,
+        // not a silent hole. (A damaged line that breaks JSON
+        // structure — the more common crash shape — is skipped like a
+        // torn one.)
+        assert_eq!(
+            captures.len(),
+            3,
+            "every line discloses; the invalid bytes damage only their own line"
+        );
+        let insights = statusline_insights(&captures);
+        assert_eq!(
+            insights.sessions, 2,
+            "the damaged line's payload carries no session_id"
+        );
+        let stats = statusline_journal_stats(&journal);
+        assert!(!stats.read_truncated, "a small journal is not truncated");
+        assert_eq!(stats.lines, 3, "the stats lane still counts every line");
+        // Retention repairs instead of failing forever.
+        compact_statusline_capture_under(&journal, 1024)
+            .expect("compaction survives invalid UTF-8");
+        let rewritten = fs::read(&journal).expect("journal rewritten");
+        String::from_utf8(rewritten).expect("the rewritten journal is clean UTF-8");
+        let repaired = read_statusline_captures(&journal);
+        assert_eq!(repaired.len(), 3, "every line survived the repair");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn over_cap_reads_are_disclosed_not_silently_undercounted() {
         // rm-898 disclosure arm: `bytes` still names the real journal
@@ -2010,6 +2385,70 @@ mod tests {
         assert_eq!(stats.bytes, total, "bytes keeps the real file size");
         assert!(stats.lines > 100, "the ASCII filler lines survive the cut");
         std::fs::remove_file(&journal).ok();
+    }
+
+    #[test]
+    fn bad_byte_journal_recovers_retention_through_append() {
+        // rm-922, the wedge leg: an over-bound journal carrying a
+        // damaged line made append_statusline_capture fail (its
+        // compaction read was the same bare read_to_string) — the
+        // host tee would error on every prompt while the journal
+        // grew past the ceiling. The append path rides the bounded
+        // lossy read now: the append succeeds, compaction re-trims
+        // under the bound, and the rewritten file is clean UTF-8.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-statusline-appendfix-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        // Point the environment at the temp root before any append
+        // (the default path is the user's real journal), under the
+        // shared env lock so sibling tests cannot re-point it.
+        let _env = crate::test_env::lock_env();
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let journal = root.join("statusline.jsonl");
+        let mut bytes = Vec::new();
+        while bytes.len() <= STATUSLINE_CAPTURE_MAX_BYTES as usize {
+            bytes.extend_from_slice(
+                format!(
+                    "{{\"captured_at\":1000,\"payload\":{{\"filler\":\"{}\"}}}}\n",
+                    "x".repeat(96)
+                )
+                .as_bytes(),
+            );
+        }
+        // A damaged line NEAR THE NEWEST END survives compaction, so
+        // the rewrite's lossy repair is what makes the file valid.
+        bytes.extend_from_slice(b"{\"captured_at\":2000,\"payload\":{\"junk\":\"\xFF\xFE\"}}\n");
+        fs::write(&journal, &bytes).expect("write oversized damaged journal");
+        let payload: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+        append_statusline_capture(&payload).expect("append survives a damaged oversized journal");
+        let rewritten = fs::read(&journal).expect("journal rewritten");
+        String::from_utf8(rewritten).expect("the compacted journal is clean UTF-8");
+        let size = fs::metadata(&journal).expect("metadata").len();
+        assert!(
+            size <= STATUSLINE_CAPTURE_MAX_BYTES,
+            "retention re-enforced: {size} bytes"
+        );
+        let stats = statusline_journal_stats(&journal);
+        assert!(!stats.read_truncated, "under the bound again");
+        let captures = read_statusline_captures(&journal);
+        let appended = captures
+            .last()
+            .expect("the appended payload survived compaction");
+        assert_eq!(
+            appended.payload["session_id"].as_str(),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
+            "the newest capture is the appended FIXTURE payload"
+        );
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

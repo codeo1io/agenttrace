@@ -65,10 +65,19 @@ mid-compaction cannot truncate it. Torn or malformed lines are skipped on read.
 Reads are bounded by the same 10 MiB cap taken from the tail (rm-898): if the
 journal is larger than that when read — a runaway writer that outpaced
 compaction, or a hostile one — only the newest whole lines under the cap are
-loaded, never the whole file; the text report says so (`head truncated, N of
+loaded, never the whole file (a cut landing inside a multi-byte character is
+advanced to the next character boundary so the tail never begins mid-
+character); the text report says so (`head truncated, N of
 M bytes unread; counts cover the retained tail only`) and the JSON report
-carries `capped_away_bytes` on the journal stats, so an over-cap journal reads
-as what it is instead of silently undercounting.
+carries `capped_away_bytes` (with the equivalent `read_truncated` flag,
+rm-922) on the journal stats, so an over-cap journal reads
+as what it is instead of silently undercounting. Decoding is lossy
+(rm-922): invalid UTF-8 damages only its own line (skipped like a torn one
+when the corruption breaks its JSON structure, still disclosed when it does
+not), while every other line still reports — and because compaction's own
+read rides the same bounded, lossy path, the next compaction rewrites the
+journal as clean UTF-8, so a damaged journal self-repairs instead of wedging
+retention forever.
 
 ## Schema (what agenttrace reads)
 

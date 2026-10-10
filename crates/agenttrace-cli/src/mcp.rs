@@ -65,9 +65,31 @@ const RECENT_SESSIONS_LIMIT: usize = 10;
 pub fn serve() -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
+    loop {
+        let line = match read_message_line(&mut stdin.lock()) {
+            Ok(MessageLine::Eof) => return Ok(()),
+            Ok(MessageLine::Line(line)) => line,
+            Ok(MessageLine::Overlong) => {
+                // rm-923: the oversized line is already drained through
+                // its newline, so the stream stays framed — the requests
+                // after it still answer. The refusal is disclosed on
+                // the wire (id `null`: the discarded message could not
+                // be trusted to carry an id) instead of buffering
+                // host-chosen bytes.
+                let refused = error_response(
+                    None,
+                    CODE_INVALID_REQUEST,
+                    "Invalid Request: message line exceeds the 1048576-byte transport cap and was discarded",
+                );
+                if let Err(error) = writeln!(stdout, "{refused}").and_then(|_| stdout.flush()) {
+                    return if error.kind() == io::ErrorKind::BrokenPipe {
+                        Ok(())
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                continue;
+            }
             Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
             Err(error) => return Err(error.into()),
         };
@@ -84,7 +106,85 @@ pub fn serve() -> anyhow::Result<()> {
             }
         }
     }
-    Ok(())
+}
+
+/// rm-923: hard cap on one stdin message line, mirroring the
+/// statusline host's `STATUSLINE_INPUT_MAX_BYTES` stance (the same
+/// host, the same peer — the transport used to buffer a single
+/// arbitrarily long line unboundedly; `BufRead::lines` has no bound
+/// of its own). A line that crosses the cap is drained through its
+/// terminating newline and reported [`MessageLine::Overlong`].
+const MCP_INPUT_MAX_BYTES: usize = 1024 * 1024;
+
+/// One framed stdin read for [`serve`]: a complete line, a refused
+/// overlong line (already drained through its newline), or EOF.
+enum MessageLine {
+    Line(String),
+    Overlong,
+    Eof,
+}
+
+/// Reads one newline-terminated message with a hard byte cap.
+/// `BufRead::lines` semantics are preserved exactly: UTF-8 is
+/// required (errors surface as `io::ErrorKind::InvalidData`), and a
+/// trailing `\r` is dropped only when the line was
+/// newline-terminated — including the final line of a stream, which
+/// may lack its newline and still yields.
+fn read_message_line(reader: &mut impl BufRead) -> io::Result<MessageLine> {
+    let mut line = Vec::new();
+    let mut overlong = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                MessageLine::Eof
+            } else if overlong {
+                MessageLine::Overlong
+            } else {
+                MessageLine::Line(decode_message_line(&line, false)?)
+            });
+        }
+        match available.iter().position(|&byte| byte == b'\n') {
+            Some(position) => {
+                line.extend_from_slice(&available[..position]);
+                reader.consume(position + 1);
+                return Ok(if overlong || line.len() > MCP_INPUT_MAX_BYTES {
+                    MessageLine::Overlong
+                } else {
+                    MessageLine::Line(decode_message_line(&line, true)?)
+                });
+            }
+            None => {
+                line.extend_from_slice(available);
+                let consumed = available.len();
+                reader.consume(consumed);
+                if line.len() > MCP_INPUT_MAX_BYTES {
+                    overlong = true;
+                    line.clear(); // the tail is discarded as it arrives
+                }
+            }
+        }
+    }
+}
+
+/// `BufRead::lines` decoding for the collected bytes of one message
+/// line: invalid UTF-8 is an `InvalidData` error (as `lines` reported
+/// it), and the `\r` of a CRLF pair goes only with its `\n`.
+fn decode_message_line(bytes: &[u8], newline_terminated: bool) -> io::Result<String> {
+    let mut text = String::from_utf8(bytes.to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })?;
+    if newline_terminated && text.ends_with('\r') {
+        text.pop();
+    }
+    Ok(text)
 }
 
 /// Handle one wire message. `None` means "no reply" (a notification);
