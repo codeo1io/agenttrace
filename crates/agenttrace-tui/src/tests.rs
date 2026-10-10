@@ -1631,6 +1631,19 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 51 (run 0a55a397 cycle-1 "accounting
+                // truth" residual batch: the parser's served values
+                // moved — codex token_usage_record output unbundled
+                // from reasoning (upstream #312 oracle, rm-617), pi
+                // hybrid usage snapshots first-present-per-class
+                // instead of the alias sum (rm-618), qwen skip lines
+                // disclosed through per-reason line_skips /
+                // disclosure_counters tables, and
+                // codex_rate_limits_observed minted once per snapshot
+                // line instead of the triangular running total (the
+                // rm-251 R1 rider) — minted at the fleet census
+                // ceiling over the sibling 49/50 rungs, 42 being the
+                // 14954d7a journal-truth rung below).
                 // Schema 42 (integration of run 14954d7a, cycle-1
                 // "journal truth: contain hostile input, surface hidden
                 // wire" — Metrics persist `wire_metadata` (codex

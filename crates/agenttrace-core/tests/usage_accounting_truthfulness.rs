@@ -177,3 +177,123 @@ fn copilot_later_checkpoint_still_ends_the_session() {
     assert_eq!(session.metrics.session_end, "2026-01-04T00:00:30Z");
     assert_eq!(session.metrics.duration_sec, 30.0);
 }
+
+#[test]
+fn codex_rollout_record_reasoning_is_a_breakdown_not_an_addend() {
+    // Accounting-truth batch (run 0a55a397 cycle 1, rm-617 residual
+    // record arm): a compaction-paired token_usage_record carries
+    // output_tokens 400 WITH reasoning_output_tokens 150 as a
+    // breakdown of it (upstream #312). The pre-batch record arm
+    // saturated output+reasoning (550) and folded the reasoning away.
+    // Together with the token_count snapshot (5000/3000/1000/300,
+    // cache-inclusive input) the session must read input 2000+400=2400,
+    // output 1000+400=1400 (NOT 1000+550=1550), reasoning 300+150=450.
+    let session = fixture("codex-record-reasoning.jsonl");
+    assert_eq!(session.metrics.source_tool, "codex_cli");
+    assert_eq!(session.metrics.tokens_input, 2400);
+    assert_eq!(session.metrics.tokens_output, 1400);
+    assert_eq!(session.metrics.tokens_reasoning, 450);
+    assert_eq!(session.metrics.tokens_cache_r, 3600);
+    // The compaction-pairing decision stays disclosed (rm-401).
+    assert_eq!(
+        session
+            .metrics
+            .line_skips
+            .get("codex_compaction_usage_record"),
+        Some(&1)
+    );
+}
+
+#[test]
+fn pi_usage_aliases_count_first_present_never_the_sum() {
+    // Accounting-truth batch (rm-618 residual arm): a hybrid pi usage
+    // snapshot carrying BOTH spellings of every class describes ONE
+    // quantity re-keyed — first present per class wins (input 100 over
+    // input_tokens 250, output 40 over 80, cacheRead 10, cacheWrite
+    // 5), never the alias sum (the pre-batch summing read
+    // 350/120/40/20). Input stays on the pi lane's landed raw basis
+    // (folded as-is beside the cache lines).
+    let session = fixture("pi-alias-first-present.jsonl");
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_output, 40);
+    assert_eq!(session.metrics.tokens_cache_r, 10);
+    assert_eq!(session.metrics.tokens_cache_w, 5);
+}
+
+#[test]
+fn qwen_skip_lines_carry_per_reason_counts() {
+    // Accounting-truth batch (the selection's rm-619 qwen skip-table
+    // arm): the qwen lane used to drop a user/assistant record with no
+    // `message` object, a non-qwen line, and an unhandled entry type
+    // with zero disclosure. Each skip now carries a per-reason count:
+    // missing-message and foreign-object skips are TRUE loss
+    // (line_skips, confidence-degrading), while the format-defined
+    // `stream_event` deltas (content covered by the assistant record)
+    // ride the non-loss disclosure channel — the rm-538 split.
+    let session = fixture("qwen-skip-tables.jsonl");
+    assert_eq!(session.metrics.source_tool, "qwen_code");
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_output, 20);
+    assert_eq!(
+        session.metrics.line_skips.get("qwen_missing_message:user"),
+        Some(&1)
+    );
+    assert_eq!(
+        session
+            .metrics
+            .line_skips
+            .get("qwen_missing_message:assistant"),
+        Some(&1)
+    );
+    assert_eq!(
+        session.metrics.line_skips.get("qwen_entry_skipped"),
+        Some(&1)
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("qwen_unmatched_type:stream_event"),
+        Some(&1)
+    );
+}
+
+#[test]
+fn codex_event_msg_rate_limit_snapshots_without_usage_are_ignored() {
+    // Accounting-truth batch (rm-251 R1 rider): rate-limit-only
+    // token_count lines (no `info`) contribute NO usage — the
+    // anti-inflation semantic — but are never silent: each names its
+    // skip reason, and `codex_rate_limits_observed` is minted once PER
+    // LINE wherever it landed (the pre-batch running-total insert
+    // summed 1+2+…+n across usage events: this journal's 4 snapshots
+    // disclosed 5). The quota wire survives too: the freshest
+    // snapshot's identity facts (limit_name 5h-final, off a usage-less
+    // line with no later usage event to carry them) land via the
+    // terminal carrier event instead of vanishing.
+    let session = fixture("codex-rate-only-snapshots.jsonl");
+    assert_eq!(session.metrics.source_tool, "codex_cli");
+    assert_eq!(session.metrics.tokens_input, 150);
+    assert_eq!(session.metrics.tokens_output, 75);
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("codex_rate_limits_observed"),
+        Some(&4)
+    );
+    assert_eq!(
+        session
+            .metrics
+            .disclosure_counters
+            .get("codex_token_count_skipped:no_usage_info"),
+        Some(&3)
+    );
+    assert_eq!(
+        session.metrics.wire_metadata.get("codex_rate_limit_name"),
+        Some(&"5h-final".to_string())
+    );
+    assert_eq!(
+        session.metrics.wire_metadata.get("codex_plan_type"),
+        Some(&"pro".to_string())
+    );
+}

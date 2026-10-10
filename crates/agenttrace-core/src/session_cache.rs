@@ -5,7 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 42;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
+// Bumped 50 -> 51 (run 0a55a397 cycle-1 "accounting truth"
+// residual batch, attempt 5712b6f0: codex record-arm reasoning
+// breakdown rm-617 + pi alias first-present rm-618 + qwen per-reason
+// skip tables + the rm-251 R1 per-line rate-limit observation rider).
+// The parser now reports: codex `token_usage_record` output as
+// `output_tokens` with `reasoning_output_tokens` disclosed beside it
+// (upstream #312 oracle — the old fold-in over-counted output +64%
+// across upstream's 1166-file corpus), pi hybrid usage snapshots at
+// first-present-per-class instead of the alias sum, qwen skip lines
+// through `line_skips`/`disclosure_counters` tables that did not
+// exist, and `codex_rate_limits_observed` once per snapshot line
+// instead of the triangular running total — plus a terminal wire
+// carrier so a usage-less quota snapshot's identity facts still land.
+// Same keys, same persisted shape: the values behind them move, so a
+// warm v50 cache would keep serving the inflated/hidden pre-batch
+// totals on a cache hit (rm-230 convention: parser-semantics changes
+// that alter the served report bump the schema so cached sessions
+// regenerate). Minted at the fleet census ceiling: origin/master was
+// 43, sibling worktrees held 43 (33b7b7b5/e4917d16/e7d85133) and 49/50
+// (2a5cdb9e/5eb82325), spool claims maxed at 50 — minted 51.
+// Entries regenerate once on next scan.
 // Bumped 41 -> 42 (integration of run 14954d7a, "journal truth:
 // contain hostile input, surface hidden wire", rm-880 + rm-406's
 // dated 2026-10-07 arm): Metrics gained two persisted-only fields —

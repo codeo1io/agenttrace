@@ -1,0 +1,6 @@
+{"type":"user","session_id":"s1","timestamp":"2026-10-01T10:00:00Z"}
+{"type":"assistant","session_id":"s1","timestamp":"2026-10-01T10:00:01Z"}
+{"type":"user","uuid":"u-3","timestamp":"2026-10-01T10:00:02Z","message":{"role":"user","content":"hi"}}
+{"type":"assistant","uuid":"u-4","timestamp":"2026-10-01T10:00:03Z","message":{"role":"assistant","model":"qwen3-coder-plus","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":100,"output_tokens":20,"cacheRead":0,"cacheWrite":0}}}
+{"type":"note","session_id":"s1","timestamp":"2026-10-01T10:00:04Z"}
+{"type":"stream_event","session_id":"s1","timestamp":"2026-10-01T10:00:05Z"}

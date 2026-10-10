@@ -84,18 +84,26 @@ fn remote_compaction_usage_is_counted_after_the_fix() {
     //
     //   pre-fix agenttrace report   in 1000 / cache   0 / out 200 / rea   0
     //   rm-304/rm-401 pin            in 1700 / cache 800 / out 620 / rea   0
-    //   rm-554 pin (this, 2026-10-06) in 2300 / cache 800 / out 720 / rea   0
+    //   rm-554 pin (2026-10-06)      in 2300 / cache 800 / out 720 / rea   0
+    //   accounting-truth batch       in 2300 / cache 800 / out 600 / rea 120
+    //   (2026-10-10, rm-617 record arm)
     //
     // The compaction turn's record is counted once in the parser's codex
     // decomposition: net input 1500-800=700 beside turn 1's 1000, cache_read
-    // 800 tracked separately, output 300 with reasoning 120 folded in (420
-    // beside turn 1's 200). Dated pin change 2026-10-06 (rm-554, upstream
-    // #312): the post-compaction token_count snapshot is a DISTINCT
+    // 800 tracked separately, output 300 AS-RECORDED with reasoning 120
+    // disclosed beside it (upstream #312's oracle ruling — "output =
+    // output_tokens": `reasoning_output_tokens` is a BREAKDOWN of
+    // `output_tokens` on the OpenAI wire, never an addend; the pre-batch
+    // fold-in was measured over-counting output +64% across upstream's
+    // 1166-file codex corpus). The rm-554 row above pinned that fold-in
+    // (300+120); this batch (run 0a55a397 cycle 1) supersedes it: the
+    // same events, output unbundled, reasoning carried as its own class.
+    // The post-compaction token_count snapshot is a DISTINCT
     // cumulative total whose `last_token_usage` (600 in / 100 out) is the
     // fresh call's billed usage — the compacted context is re-sent after
     // the reset — so the old rm-162/#286 high-water refusal of that whole
-    // window was an undercount, not a guard. It now counts once; the
-    // turn-1 and record rows above are unchanged. Dropping back to either
+    // window was an undercount, not a guard. It still counts once; the
+    // turn-1 and record rows above are unchanged. Dropping back to any
     // earlier row is exactly the regression this pin exists to catch.
     let reported = parse_fixture("remote-compaction.jsonl");
     assert_eq!(
@@ -103,8 +111,8 @@ fn remote_compaction_usage_is_counted_after_the_fix() {
         Usage {
             input: 2300,
             cache_r: 800,
-            output: 720,
-            reasoning: 0,
+            output: 600,
+            reasoning: 120,
         }
     );
     eprintln!(

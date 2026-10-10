@@ -107,10 +107,10 @@ fn qwen_multi_result_usage_accumulates_per_turn() {
 /// skips at confidence "high", and of v32 totals undercounted by the
 /// pre-rm-711 parsers.
 #[test]
-fn warm_cache_replays_cold_disclosure_and_schema_42_invalidates_v32() {
+fn warm_cache_replays_cold_disclosure_and_schema_51_invalidates_v32() {
     assert_eq!(
-        SESSION_CACHE_SCHEMA_VERSION, 42,
-        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834 report-truthfulness stream-fold integration, to 40 at the rm-585/rm-730 honest-attribution integration, and to 41 at the rm-520/rm-521 recorded-cost-basis integration (run ac14e52c, conflict case c1c77f5e), and to 42 at the journal-truth integration (run 14954d7a, rm-880 + the rm-406 dated 2026-10-07 arm — Metrics persist `wire_metadata` and `model_attribution` through the Go mirror, conflict case 8b8d096a), so this assert pins the live constant)"
+        SESSION_CACHE_SCHEMA_VERSION, 51,
+        "rm-710: this oracle pins the bump (landed 32 → 33 at the run's base, re-based at integration onto the advanced ceiling as 33 → 34; the ceiling advanced to 35 at the rm-720/rm-721 agent-lane integration, to 36 at the rm-502 timestamp-unification integration, to 37 at the rm-754 priced-loop-cost integration, to 38 at the rm-718/rm-719/rm-716 disclosure-plane-honesty integration, to 39 at the rm-834 report-truthfulness stream-fold integration, to 40 at the rm-585/rm-730 honest-attribution integration, and to 41 at the rm-520/rm-521 recorded-cost-basis integration (run ac14e52c, conflict case c1c77f5e), and to 42 at the journal-truth integration (run 14954d7a, rm-880 + the rm-406 dated 2026-10-07 arm — Metrics persist `wire_metadata` and `model_attribution` through the Go mirror, conflict case 8b8d096a), and to 51 at the accounting-truth residual batch (run 0a55a397 cycle 1: codex record reasoning breakdown rm-617, pi alias first-present rm-618, qwen per-reason skip tables, rm-251 R1 rate-limit rider — minted at the fleet census ceiling over the sibling 49/50 rungs), so this assert pins the live constant)"
     );
     let root = std::env::temp_dir().join(format!(
         "agenttrace-contract-warmcold-{}",
@@ -156,7 +156,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_42_invalidates_v32() {
     );
 
     // Stale-schema leg: degrade the persisted file to schema 32 (what a
-    // pre-bump cache looks like) — it must not be served at 41.
+    // pre-bump cache looks like) — it must not be served at 51.
     let cache_file = session_cache_path();
     let raw = fs::read_to_string(&cache_file).expect("cache file exists");
     let mut degraded: Value = serde_json::from_str(&raw).expect("cache file is JSON");
@@ -165,7 +165,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_42_invalidates_v32() {
     let mut stale_cache: SessionCache = load_session_cache();
     assert!(
         cached_session(&journal, &mut stale_cache).is_none(),
-        "rm-710: a schema-32 entry must not be served at the live schema ceiling (41 at this tree)"
+        "rm-710: a schema-32 entry must not be served at the live schema ceiling (51 at this tree)"
     );
 
     std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
