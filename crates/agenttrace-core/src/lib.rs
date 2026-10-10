@@ -64,8 +64,8 @@ pub use pricing::{
     render_model_pricing_list, render_test_match, update_pricing,
 };
 pub use reports::{
-    add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
-    report_json, report_json_with_language, report_overview_html,
+    add_baseline_comparison, fmt_duration_for_language, report_compare, report_compare_json,
+    report_compare_with_language, report_json, report_json_with_language, report_overview_html,
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,
@@ -1709,7 +1709,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 // Upstream-recorded cost already sits in the seed; credit
                 // the block's model with it so attribution sums to the
                 // session total.
-                entry.cost_usd = round4(entry.cost_usd + event.recorded_cost_usd.unwrap_or(0.0));
+                // rm-944: accumulate raw — the bucket rounds exactly once after
+                // the loop; per-addition round4 compounded rounding drift.
+                entry.cost_usd += event.recorded_cost_usd.unwrap_or(0.0);
                 continue;
             }
             let block_price = if event.model_used.is_empty() || event.model_used == "unknown" {
@@ -1745,7 +1747,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     / 1e6
                     * block_price.cr;
             per_block_cost += block_cost;
-            entry.cost_usd = round4(entry.cost_usd + block_cost);
+            // rm-944: accumulate raw — rounded once, after the loop.
+            entry.cost_usd += block_cost;
         }
         round4(per_block_cost)
     } else {
@@ -1793,6 +1796,36 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         // rm-406: keep the split that produced the per-block total on
         // the metrics — by_model reads it so the advisor/model-switch
         // spend lands on each producing model's bucket.
+        //
+        // rm-944 (2026-10-10): by_model buckets round exactly ONCE, here — the
+        // old per-addition round4 accumulated drift until
+        // sum(model_attribution[].cost_usd) broke away from the session total the
+        // buckets distribute (PoC: total 0.0002 vs Σ buckets 0.0004, twice the
+        // session's true spend, in one --overview). Each bucket rounds once;
+        // then the largest-remainder residual (cost_estimated − Σ buckets,
+        // at most a few 1e-4 units from independent rounding) lands on the
+        // max-cost bucket so the sum equals cost_estimated exactly — the
+        // sum(by_model) == total invariant the overview machine consumers rely on.
+        for entry in model_attribution.values_mut() {
+            entry.cost_usd = round4(entry.cost_usd);
+        }
+        let bucket_sum: f64 = model_attribution.values().map(|entry| entry.cost_usd).sum();
+        let residual = round4(metrics.cost_estimated - bucket_sum);
+        if residual != 0.0 {
+            if let Some(max_key) = model_attribution
+                .iter()
+                .max_by(|a, b| {
+                    a.1.cost_usd
+                        .partial_cmp(&b.1.cost_usd)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(key, _)| key.clone())
+            {
+                if let Some(entry) = model_attribution.get_mut(&max_key) {
+                    entry.cost_usd = round4(entry.cost_usd + residual);
+                }
+            }
+        }
         metrics.model_attribution = model_attribution;
         // Per-block cost seeds from the upstream-recorded total, so the
         // mixed-model row keeps the recorded-cost hint the single-model
@@ -2400,10 +2433,16 @@ pub fn round4(value: f64) -> f64 {
 pub(crate) use pricing::token_cost;
 
 pub fn fmt_duration(seconds: f64) -> String {
+    // rm-946 (2026-10-10): display truncates toward zero at each arm's
+    // precision — a rendered duration never claims time that did not elapse,
+    // so a value below 60.0s can never render "60s" and one below 3600.0s can
+    // never render "60.0m". The old round-half-up crossed both boundaries
+    // (59.6s → "60s", 3599.8s → "60.0m"), inconsistently with raw-second
+    // lines in the same report.
     if seconds < 60.0 {
-        format!("{:.0}s", seconds)
+        format!("{}s", seconds.trunc() as i64)
     } else if seconds < 3600.0 {
-        format!("{:.1}m", seconds / 60.0)
+        format!("{:.1}m", (seconds / 60.0 * 10.0).trunc() / 10.0)
     } else {
         let hours = (seconds / 3600.0) as i64;
         let minutes = ((seconds as i64) % 3600) / 60;

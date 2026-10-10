@@ -5838,17 +5838,65 @@ fn opencode_message_model(msg: &Map<String, Value>) -> String {
         .to_string()
 }
 
+fn usage_total(usage: &BTreeMap<String, i64>) -> i64 {
+    // rm-619 review fix F6 (2026-10-11, review 04eedd96): token classes
+    // already at the rm-046 i64::MAX clamp overflow a plain `sum` — debug
+    // builds panic, release wraps negative and flips the >0 verdict
+    // (the hostile fixture ses_h619 pins the panic). Fold saturating,
+    // like every other accumulator in this file.
+    usage
+        .values()
+        .fold(0i64, |acc, value| acc.saturating_add(*value))
+}
+
 fn add_opencode_tokens(usage: &mut BTreeMap<String, i64>, raw: Option<&Value>) -> bool {
     let Some(tokens) = raw.and_then(Value::as_object) else {
         return false;
     };
+    // rm-619 (2026-10-10): opencode persists `tokens.reasoning` as a first-class
+    // sibling of input/output (upstream session/message.ts tokens schema
+    // {input, output, reasoning, cache{read,write}}; the ai-sdk adapter folds
+    // reasoningTokens ?? outputTokenDetails.reasoningTokens into it). A
+    // reasoning-only object used to fold NOTHING while its mere presence still
+    // marked the message as covered — suppressing the step-finish fallback and
+    // losing every token plus all cost (twin PoC: 777 reasoning rendered as 2
+    // estimated output tokens, cost 0.0). Mirror the qwen CU-20 convention
+    // the opencode_db lane already uses (sqlite_sessions.rs:522/:876:
+    // output.saturating_add(reasoning) — ADDITIVE; the object's own output
+    // is never REPLACED by reasoning): reasoning ADDS to output_tokens so
+    // the pricing loop bills it at the output rate, and the breakdown
+    // stays visible on its own reasoning_tokens line. Review fix F1
+    // (2026-10-11, review 04eedd96): the first cut folded reasoning ALONE
+    // and dropped the object's `output` — a mixed {output:50,
+    // reasoning:30} message billed 30, below even the no-reasoning control
+    // (fixture ses_m619 pins 80 = 50 ⊕ 30). Codex's
+    // reasoning_output_tokens is a breakdown OF output (rm-617) and stays
+    // unfolded; opencode's is a persisted sibling, so it folds.
+    let before: i64 = usage_total(usage);
     add_usage_value(usage, "input_tokens", tokens.get("input"));
-    add_usage_value(usage, "output_tokens", tokens.get("output"));
+    match tokens
+        .get("reasoning")
+        .and_then(number_as_i64)
+        .filter(|value| *value > 0)
+    {
+        Some(reasoning) => {
+            add_usage_value(usage, "reasoning_tokens", tokens.get("reasoning"));
+            // F1 (review 04eedd96): ADDITIVE — the object's own output
+            // bills too, then reasoning folds on top of it.
+            add_usage_value(usage, "output_tokens", tokens.get("output"));
+            let folded = serde_json::json!(reasoning);
+            add_usage_value(usage, "output_tokens", Some(&folded));
+        }
+        None => add_usage_value(usage, "output_tokens", tokens.get("output")),
+    }
     if let Some(cache) = tokens.get("cache").and_then(Value::as_object) {
         add_usage_value(usage, "cache_read_input_tokens", cache.get("read"));
         add_usage_value(usage, "cache_creation_input_tokens", cache.get("write"));
     }
-    true
+    // rm-619, suppression prong: only a fold that ADDED real usage may mark the
+    // message covered — an all-zero tokens object must let the step-finish
+    // part fallback run instead of dropping its usage on the floor.
+    usage_total(usage) > before
 }
 
 fn add_usage(dst: &mut BTreeMap<String, i64>, src: &BTreeMap<String, i64>) {

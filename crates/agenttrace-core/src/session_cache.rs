@@ -5,7 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 56;
+// Bumped 51 -> 56 (run 5a04ae3b cycle-3 "accounting truth" batch
+// rm-619 + rm-944 + rm-946, review-fix attempt f89a289b over
+// independent review 04eedd96 F1/F2): the opencode storage lane's
+// reasoning fold is ADDITIVE — the object's own output bills too
+// (output.saturating_add(reasoning), the opencode_db
+// sqlite_sessions.rs:522/:876 + qwen CU-20 oracle; the pre-review
+// cut folded reasoning ALONE and dropped a mixed message's visible
+// output) — and by_model buckets round exactly once (rm-944); both
+// move cached token/cost values for UNCHANGED opencode storage
+// bytes (review warm-cache PoC: a v51 entry served the pre-fix
+// 60 tokens/$0.0008 beside the cold path's 787/$0.0117). Minted
+// at the fleet census ceiling: origin/master 53, integration
+// branches 54 (66da52a9c130/ca6d6ad27107), sibling worktree
+// run-8937be8e 55 — 56 is the lowest rung free. Per the rm-230
+// convention entries regenerate once on next scan.
 // Bumped 50 -> 51 (run 0a55a397 cycle-1 "accounting truth"
 // residual batch, attempt 5712b6f0: codex record-arm reasoning
 // breakdown rm-617 + pi alias first-present rm-618 + qwen per-reason

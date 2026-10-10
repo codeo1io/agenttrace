@@ -390,6 +390,12 @@ fn fixture(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {path:?}: {err}"))
 }
 
+fn fixture_path(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(rel)
+}
+
 #[test]
 fn fixture_claude_deepcwd_corpus_is_capped_and_disclosed() {
     // journal-truth/claude-deepcwd: the assess F1 hostile shape at
@@ -452,5 +458,180 @@ fn fixture_advisor_iterations_attribution_round_trips() {
         agenttrace_core::round4(summed),
         overview.total_cost,
         "by_model cost column must partition the true total at the pricing precision"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rm-619 (2026-10-10): opencode reasoning tokens — fold + suppression fix.
+// The opencode storage-JSON lane dropped ALL usage for messages whose
+// tokens object carried only `reasoning` (folded nothing, still returned
+// true, suppressed the step-finish part fallback).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn opencode_reasoning_only_message_keeps_usage_and_bills_output_rate() {
+    let session = agenttrace_core::parse_file(&fixture_path(
+        "usage-accounting/opencode/storage/session/proj/ses_r619.json",
+    ))
+    .expect("parse opencode reasoning-sibling session");
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, 0, "fixture has no input tokens");
+    assert_eq!(
+        metrics.tokens_reasoning, 777,
+        "the reasoning breakdown must stay visible"
+    );
+    // House convention (CU-20, and the opencode_db lane's stored rule
+    // sqlite_sessions.rs:522/:876): reasoning ADDS to the billed output
+    // count at the output rate — output.saturating_add(reasoning), the
+    // additive fold both oracles pin.
+    assert_eq!(
+        metrics.tokens_output, 777,
+        "reasoning-only output must bill 777 output tokens, not estimate text"
+    );
+    assert!(
+        metrics.cost_estimated > 0.0,
+        "777 billed output tokens must price above zero (was 0.0 before rm-619)"
+    );
+}
+
+// Independent review 04eedd96 (2026-10-11) fix pins: F1 the mixed-shape
+// additive fold (the pre-fix Some(reasoning) arm folded reasoning ALONE
+// and dropped the object's own `output`), F6 the saturating totals.
+
+#[test]
+fn opencode_mixed_message_bills_output_and_reasoning_additively() {
+    // F1: a mixed {input:10, output:50, reasoning:30} message must bill
+    // 80 output tokens (output ⊕ reasoning, the opencode_db
+    // sqlite_sessions.rs:522/:876 and qwen CU-20 parser.rs:3319 oracles) —
+    // the pre-fix arm billed 30 and dropped the 50, below even the
+    // no-reasoning control (60).
+    let session = agenttrace_core::parse_file(&fixture_path(
+        "usage-accounting/opencode/storage/session/proj/ses_m619.json",
+    ))
+    .expect("parse opencode mixed-tokens session");
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, 10);
+    assert_eq!(metrics.tokens_reasoning, 30, "breakdown stays visible");
+    assert_eq!(
+        metrics.tokens_output, 80,
+        "mixed {{output:50, reasoning:30}} must bill 80 output tokens, not 30"
+    );
+    assert!(
+        metrics.cost_estimated > 0.0,
+        "90 billed tokens must price above zero"
+    );
+}
+
+#[test]
+fn opencode_hostile_clamp_totals_do_not_overflow() {
+    // F6: token classes already at the rm-046 i64::MAX clamp overflowed
+    // the plain `sum` behind the suppression verdict (debug panic,
+    // release wrap-to-negative flipping the verdict). Totals fold
+    // saturating like every other accumulator in this file.
+    let session = agenttrace_core::parse_file(&fixture_path(
+        "usage-accounting/opencode/storage/session/proj/ses_h619.json",
+    ))
+    .expect("parse opencode hostile-clamp session");
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, i64::MAX, "clamped input survives");
+    assert_eq!(
+        metrics.tokens_output,
+        i64::MAX,
+        "output ⊕ reasoning at the clamp stays at the clamp, never wraps"
+    );
+    assert_eq!(metrics.tokens_reasoning, i64::MAX);
+    assert!(metrics.cost_estimated.is_finite());
+}
+
+#[test]
+fn opencode_all_zero_message_tokens_fall_back_to_step_finish_part() {
+    let session = agenttrace_core::parse_file(&fixture_path(
+        "usage-accounting/opencode/storage/session/proj/ses_f619.json",
+    ))
+    .expect("parse opencode part-fallback session");
+    let metrics = &session.metrics;
+    assert_eq!(metrics.tokens_input, 100, "step-finish part input");
+    assert_eq!(metrics.tokens_output, 50, "step-finish part output");
+    assert_eq!(metrics.tokens_reasoning, 0);
+    assert!(
+        metrics.cost_estimated > 0.0,
+        "the part's real usage must price above zero"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rm-944 (2026-10-10): by_model buckets rounded once. Per-addition round4
+// drifted sum(by_model[].cost_usd) away from the session total the buckets
+// distribute (drift PoC: total 0.0002 vs Σ 0.0004).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn by_model_buckets_sum_exactly_to_session_cost() {
+    // Advisor-iteration corpus at the 1e-4 rounding granularity (assess
+    // PoC 1, adopted verbatim): three fable sub-5e-5 advisor blocks under
+    // an opus message — the shape that inflated the fable bucket 3x under
+    // per-addition rounding (total 0.0002 vs Σ 0.0004 on the unfixed code).
+    let lines = [
+        r#"{"timestamp":"2026-10-10T10:00:00Z","type":"assistant","message":{"id":"msg_01","model":"claude-opus-5-5","usage":{"input_tokens":15,"output_tokens":0,"iterations":[{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":6},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":6},{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":6}]}}}"#,
+    ];
+    let session = parse_lines(&lines);
+    let attribution_sum: f64 = session
+        .metrics
+        .model_attribution
+        .values()
+        .map(|entry| entry.cost_usd)
+        .sum();
+    let total = session.metrics.cost_estimated;
+    assert!(
+        !session.metrics.model_attribution.is_empty(),
+        "advisor corpus must attribute per model"
+    );
+    assert!(session
+        .metrics
+        .model_attribution
+        .contains_key("claude-fable-5-1"));
+    assert!(
+        (attribution_sum - total).abs() < 1e-9,
+        "sum(by_model) {attribution_sum} must equal the session total {total}"
+    );
+    // The drift corpus specifically: the honest total stays 0.0002,
+    // not the drifted 0.0004 the per-addition rounding produced.
+    assert_eq!(agenttrace_core::round4(total), 0.0002);
+}
+
+fn parse_lines(lines: &[&str]) -> Session {
+    let raw = lines.join("\n");
+    let name = "rm944-multi.jsonl";
+    let path = std::env::temp_dir().join("journal-truth-rm944.jsonl");
+    std::fs::write(&path, &raw).unwrap();
+    parse_raw_session(name, &path.to_string_lossy(), &raw).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// rm-946 (2026-10-10): fmt_duration display truncates toward zero — a
+// rendered duration never claims time that did not elapse, so values below
+// a unit boundary can never round up to "60s" / "60.0m".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fmt_duration_never_rounds_up_across_a_unit_boundary() {
+    assert_eq!(agenttrace_core::fmt_duration(59.6), "59s");
+    assert_eq!(agenttrace_core::fmt_duration(3599.8), "59.9m");
+    // Arms and unchanged shapes stay stable.
+    assert_eq!(agenttrace_core::fmt_duration(40.0), "40s");
+    assert_eq!(agenttrace_core::fmt_duration(90.0), "1.5m");
+    assert_eq!(agenttrace_core::fmt_duration(6180.0), "1h 43m");
+}
+
+#[test]
+fn fmt_duration_zh_never_rounds_up_across_a_unit_boundary() {
+    use agenttrace_core::ReportLanguage;
+    assert_eq!(
+        agenttrace_core::fmt_duration_for_language(59.6, ReportLanguage::Zh),
+        "59秒"
+    );
+    assert_eq!(
+        agenttrace_core::fmt_duration_for_language(3599.8, ReportLanguage::Zh),
+        "59.9分钟"
     );
 }

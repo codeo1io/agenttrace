@@ -2404,14 +2404,17 @@ fn write_anomalies_json(
     out.push(']');
 }
 
-fn fmt_duration_for_language(seconds: f64, language: ReportLanguage) -> String {
+pub fn fmt_duration_for_language(seconds: f64, language: ReportLanguage) -> String {
     match language {
         ReportLanguage::En => fmt_duration(seconds),
         ReportLanguage::Zh => {
+            // rm-946 (2026-10-10): truncation toward zero at each arm's precision
+            // mirrors fmt_duration — 59.6s renders "59秒", 3599.8s renders
+            // "59.9分钟", never the next unit's round number.
             if seconds < 60.0 {
-                format!("{seconds:.0}秒")
+                format!("{}秒", seconds.trunc() as i64)
             } else if seconds < 3600.0 {
-                format!("{:.1}分钟", seconds / 60.0)
+                format!("{:.1}分钟", (seconds / 60.0 * 10.0).trunc() / 10.0)
             } else {
                 let hours = (seconds / 3600.0) as i64;
                 let minutes = ((seconds as i64) % 3600) / 60;
