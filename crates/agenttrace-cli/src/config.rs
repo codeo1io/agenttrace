@@ -223,12 +223,29 @@ fn parse_scalar(text: &str) -> anyhow::Result<Scalar> {
 }
 
 /// Strip a trailing `# comment` that sits outside quotes.
+/// rm-918: a `#` opens a comment only at the start of the line or
+/// directly after whitespace (the TOML rule the README documents). A
+/// `#` embedded in an unquoted value — `pricing_file = /tmp/a#b.toml`
+/// — stays part of the value; cutting it there was silent value loss
+/// against the loud-failure promise. Inside quotes `#` is literal.
 fn strip_comment(line: &str) -> &str {
     let mut in_quotes = false;
+    // Whether the previous character seen OUTSIDE quotes was
+    // whitespace — only then can a following `#` open a comment.
+    let mut after_whitespace = false;
     for (index, character) in line.char_indices() {
         match character {
-            '"' => in_quotes = !in_quotes,
-            '#' if !in_quotes => return &line[..index],
+            '"' => {
+                in_quotes = !in_quotes;
+                after_whitespace = false;
+            }
+            '#' if !in_quotes => {
+                if index == 0 || after_whitespace {
+                    return &line[..index];
+                }
+                after_whitespace = false;
+            }
+            other if !in_quotes => after_whitespace = other.is_whitespace(),
             _ => {}
         }
     }
@@ -610,6 +627,37 @@ mod tests {
         );
         assert_eq!(file.weekly_budget_usd, Some(12.5));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embedded_hash_in_unquoted_value_is_kept_not_truncated() {
+        // rm-918 (a): a '#' embedded in an unquoted bare value stays
+        // part of the value — '#' opens a comment only at line start or
+        // after whitespace (the TOML rule for this TOML-shaped config).
+        // The old parser truncated this value to /tmp/probe — silent
+        // loss against the loud-failure promise (README: a typo never
+        // silently does nothing).
+        let path = Path::new("config.toml");
+        let file = parse_config("pricing_file = /tmp/probe#x.toml\n", path).unwrap();
+        assert_eq!(file.pricing_file, Some(PathBuf::from("/tmp/probe#x.toml")));
+    }
+
+    #[test]
+    fn hash_after_whitespace_still_opens_a_comment() {
+        // rm-918 (a) boundary: the comment rule is whitespace-anchored
+        // — quoted '#', embedded '#', and a trailing '# comment' after
+        // whitespace all behave per TOML.
+        let path = Path::new("config.toml");
+        let file = parse_config(
+            "history_dir = \"/tmp/at-history\"  # comment\n\
+             pricing_file = /tmp/at-p#x.json # trailing note\n\
+             weekly_budget_usd = 5.0 # cap\n",
+            path,
+        )
+        .unwrap();
+        assert_eq!(file.history_dir, Some(PathBuf::from("/tmp/at-history")));
+        assert_eq!(file.pricing_file, Some(PathBuf::from("/tmp/at-p#x.json")));
+        assert_eq!(file.weekly_budget_usd, Some(5.0));
     }
 
     #[test]
