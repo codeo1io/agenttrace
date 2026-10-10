@@ -5,7 +5,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 51;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 54;
+// Bumped 51 -> 54 (run 514cf6cb cycle-1 "bounded reads, honest
+// refusal" batch, attempt 8a1b21a3: rm-700 whole-file read cap +
+// rm-959 bounded auxiliary reads). The parser now refuses any
+// session file over 128 MiB on stat BEFORE the read, skips opencode
+// storage records (message/part/session-info docs and the
+// fork-parent probe) over 32 MiB per record with the skip count
+// disclosed as `opencode_records_oversize_skipped` on the session's
+// disclosure_counters, and bounds the `.git` worktree-marker probe
+// to a 4 KiB read. Same persisted shape, same keys for healthy
+// corpora — but a session whose auxiliary records were previously
+// read whole (and could parse or fail either way) now serves a
+// DIFFERENT disclosure picture: the new skip counter appears where a
+// warm v51 cache would keep serving the pre-skip session as
+// complete (rm-230 convention: parser-semantics changes that alter
+// the served report bump the schema so cached sessions regenerate).
+// Minted at the fleet census ceiling: this tree's landed ceiling was
+// 51, and the live fleet census at the implement turn held 52
+// (worktrees 0cf712f/c3652ba/16506c4 — the upstream v0.10.1
+// adoption lineage) and 53 (canonical a9c18c4 post-adoption) with 54
+// free and 55 pre-claimed by run 8937be8e's uncommitted batch — so 54
+// is the lowest rung unique above every live claim. Entries
+// regenerate once on next scan.
 // Bumped 50 -> 51 (run 0a55a397 cycle-1 "accounting truth"
 // residual batch, attempt 5712b6f0: codex record-arm reasoning
 // breakdown rm-617 + pi alias first-present rm-618 + qwen per-reason

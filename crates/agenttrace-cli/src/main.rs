@@ -477,8 +477,11 @@ fn run() -> anyhow::Result<()> {
         // action must never be silently dropped by the clear-and-exit —
         // this guard and --update-pricing's below consult the ONE
         // shared action-introspection helper, not a hand-maintained
-        // subset that drifts as arms are added.
-        if !has_followup_action(&args) {
+        // subset that drifts as arms are added. rm-301 residual
+        // (assess 2495 A1): the sibling side effect --update-pricing
+        // runs right AFTER this exit, so it keeps the dispatch alive
+        // too (has_post_clear_cache_action).
+        if !has_post_clear_cache_action(&args) {
             return Ok(());
         }
     }
@@ -870,6 +873,23 @@ fn run() -> anyhow::Result<()> {
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
+        // rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): the
+        // fork-parent probe refuses to read info docs over the
+        // opencode record cap; that refusal is disclosed here (loader
+        // lane) instead of silently treating those sessions as
+        // non-forks. The sessions themselves stay in the aggregates —
+        // over-cap is corrupt-or-foreign, not proof of fork-ness —
+        // and the doctor mirrors the same count through its
+        // `opencode_fork_probe_over_cap` disclosures key.
+        if let Some(report) = load_report.as_ref() {
+            if report.opencode_fork_probe_over_cap > 0 {
+                eprintln!(
+                    "Note: {} opencode session info doc(s) exceed the {} MiB record cap; the fork-parent probe refused to read them, so they are aggregated as independent sessions (usage may double-count if they are fork copies).",
+                    report.opencode_fork_probe_over_cap,
+                    agenttrace_core::OPENCODE_RECORD_MAX_BYTES / (1024 * 1024)
+                );
+            }
+        }
         if args.limit < sessions.len() {
             eprintln!(
                 "Note: --limit caps list views only; this overview's aggregates cover all {} sessions.",
@@ -2421,6 +2441,20 @@ fn has_followup_action(args: &Args) -> bool {
         || args.budget
 }
 
+/// rm-301 residual (assess 2495 A1, run 514cf6cb cycle 1): the guard
+/// for the `--clear-cache` early exit. Unlike `--update-pricing`, the
+/// clear-cache exit has a side-effect SIBLING that runs immediately
+/// after it in code order — `--update-pricing` — so that flag counts
+/// as a pending action here (it is not a follow-up action in the
+/// shared sense, but proceeding past this exit is exactly what runs
+/// it). `--clear-cache` itself does not count: it just ran. Before
+/// this predicate existed, `--clear-cache --update-pricing` announced
+/// "Session cache cleared.", returned Ok, and silently dropped the
+/// pricing update in either flag order (rc0, stderr empty).
+fn has_post_clear_cache_action(args: &Args) -> bool {
+    args.update_pricing || has_followup_action(args)
+}
+
 /// Session-report actions only — the interactive-TUI fallback and the
 /// `--range` applicability guard (rm-244). Deliberately NARROWER than
 /// `has_followup_action`: `--doctor`, `--list-models`, `--test-match`,
@@ -2914,6 +2948,10 @@ mod tests {
                 has_followup_action(args),
                 "{flag} must count as a follow-up action for BOTH side-effect guards"
             );
+            assert!(
+                has_post_clear_cache_action(args),
+                "{flag} must keep the dispatch alive past the --clear-cache exit"
+            );
         }
         for (flag, args) in [
             ("--clear-cache", {
@@ -2932,6 +2970,26 @@ mod tests {
                 "{flag} is a side effect, not a follow-up action"
             );
         }
+        // rm-301 residual (assess 2495 A1): --update-pricing is not a
+        // follow-up action, but it IS a pending side effect that runs
+        // right after the clear-cache exit — so the clear-cache guard
+        // must keep the dispatch alive for it. This is the leg that
+        // silently dropped the pricing update before
+        // has_post_clear_cache_action existed.
+        let mut pricing_sibling = base();
+        pricing_sibling.update_pricing = true;
+        assert!(
+            has_post_clear_cache_action(&pricing_sibling),
+            "--clear-cache --update-pricing must run BOTH side effects: the \
+             clear-cache exit cannot return early over the pending pricing update"
+        );
+        // ... while --clear-cache alone keeps its clear-and-exit contract.
+        let mut clear_only = base();
+        clear_only.clear_cache = true;
+        assert!(
+            !has_post_clear_cache_action(&clear_only),
+            "--clear-cache alone still clears and exits"
+        );
         // The search lane keeps the shared non-empty rule.
         let mut whitespace = base();
         whitespace.search = Some("   ".to_string());

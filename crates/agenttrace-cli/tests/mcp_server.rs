@@ -408,3 +408,57 @@ fn oversized_message_line_is_refused_and_the_stream_stays_framed() {
     );
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
+
+/// rm-960: `initialize` never echoes a protocol version the server has
+/// not agreed to. The server speaks the JSON-RPC-over-stdio handshake
+/// of the revisions in its supported set; a client requesting anything
+/// else — a future revision we have not audited, a bogus probe — gets
+/// the newest SUPPORTED revision answered instead (the spec's
+/// negotiation rule), with a one-line stderr note naming the
+/// downgrade. Requested-and-supported versions (including the oldest)
+/// still echo verbatim, which is the compatibility contract the
+/// harness in `initialize_answers_with_expected_shape` pins.
+#[test]
+fn initialize_never_echoes_an_unsupported_protocol_version() {
+    let (home, cache) = seed_home("protocol", false);
+    let requests = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"9.9.9-future\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"0\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"0\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"probe\",\"version\":\"0\"}}}\n"
+    );
+    let (code, responses, stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "all three handshakes answer cleanly");
+    assert_eq!(
+        3,
+        responses.len(),
+        "one response per request: {responses:?}"
+    );
+
+    let answered = |i: usize, note: &str| {
+        responses[i]["result"]["protocolVersion"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{note}: {responses:?}"))
+            .to_string()
+    };
+
+    // An unsupported request is downgraded to a version the server
+    // actually supports — never an echo of the unagreed one.
+    let future = answered(0, "future version answered");
+    assert_ne!(
+        "9.9.9-future", future,
+        "the server must not echo a version it did not agree to: {responses:?}"
+    );
+    assert!(
+        future.starts_with("20"),
+        "the downgrade answer is a real revision: {responses:?}"
+    );
+    assert!(
+        stderr.contains("9.9.9-future"),
+        "the downgrade is disclosed on stderr, naming the request: {stderr:?}"
+    );
+
+    // Supported revisions — including the oldest — still echo verbatim.
+    assert_eq!("2024-11-05", answered(1, "oldest supported echoes"));
+    assert_eq!("2025-06-18", answered(2, "newest supported echoes"));
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}

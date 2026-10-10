@@ -155,6 +155,13 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    /// rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): storage
+    /// info docs the fork-parent probe refused to read (over the
+    /// opencode record cap). Disclosed through the doctor's
+    /// `opencode_fork_probe_over_cap` key when non-zero — the refusal
+    /// must never be silent, and the sessions themselves stay in the
+    /// inventory (over-cap is not proof of fork-ness).
+    opencode_fork_probe_over_cap: usize,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -181,16 +188,17 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            opencode_fork_probe_over_cap: 0,
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
+    let (files, opencode_fork_excluded, opencode_fork_probe_over_cap) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        (find_session_files(dir), 0)
+        (find_session_files(dir), 0, 0)
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -218,6 +226,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        opencode_fork_probe_over_cap,
     }
 }
 
@@ -229,6 +238,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        opencode_fork_probe_over_cap,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -268,6 +278,18 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures.insert(
             "opencode_fork_excluded_sessions".to_string(),
             opencode_fork_excluded_total,
+        );
+    }
+    // rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): the
+    // fork-parent probe's over-cap refusals ride the same
+    // disclosures channel (0-count-clean, like every disclosure key
+    // above) — the refusal must never be silent, and the affected
+    // sessions stay counted in the inventory (over-cap is not proof
+    // of fork-ness).
+    if opencode_fork_probe_over_cap > 0 {
+        disclosures.insert(
+            "opencode_fork_probe_over_cap".to_string(),
+            opencode_fork_probe_over_cap,
         );
     }
     let mut report = DoctorReport {
@@ -591,9 +613,9 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize, usize) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        return (find_session_files(dir), 0, 0);
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -609,12 +631,12 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
+    let (files, opencode_fork_excluded, opencode_fork_probe_over_cap) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, opencode_fork_probe_over_cap)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite

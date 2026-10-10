@@ -49,6 +49,20 @@ const CODE_INVALID_PARAMS: i64 = -32602;
 /// Protocol version answered when the client does not send one.
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// rm-960: the protocol revisions whose wire surface this server has
+/// been audited against — the JSON-RPC-over-stdio handshake these
+/// revisions define (initialize, notifications/initialized,
+/// tools/list, tools/call) is unchanged across all three. The set is
+/// exhaustive on purpose: anything outside it is a revision this
+/// server has NOT agreed to.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// The newest supported revision — the answer handed to clients that
+/// request a version outside the supported set. Kept derived from the
+/// set (sorted ascending) so the two cannot drift apart.
+const LATEST_SUPPORTED_PROTOCOL_VERSION: &str =
+    SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len() - 1];
+
 /// Overview `recent_sessions` display limit; mirrors the CLI default
 /// and `RECENT_SESSIONS_MAX` in `agenttrace-core` (nothing here may
 /// grow past that cap).
@@ -245,15 +259,29 @@ fn handle_message(raw: &str) -> Option<String> {
     })
 }
 
-/// `initialize` result: echo the client's protocol version when sent,
-/// and state the read-only, stdio-only capability surface.
+/// `initialize` result: negotiate the protocol version. A requested
+/// version inside the supported set echoes verbatim; anything else —
+/// a future revision this server has not audited, or a bogus probe —
+/// is answered with the newest SUPPORTED revision instead of an echo
+/// (the spec's negotiation rule: the server must never proceed
+/// against a version it did not agree to), with a one-line stderr
+/// note naming the downgrade.
 fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
     let requested = params
         .get("protocolVersion")
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    let answered = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        eprintln!(
+            "agenttrace mcp: client requested protocol {requested}; \
+answering with supported {LATEST_SUPPORTED_PROTOCOL_VERSION}"
+        );
+        LATEST_SUPPORTED_PROTOCOL_VERSION
+    };
     Ok(json!({
-        "protocolVersion": requested,
+        "protocolVersion": answered,
         "capabilities": {
             "tools": { "listChanged": false }
         },

@@ -49,6 +49,14 @@ pub struct LoadReport {
     /// channel can report the exclusion instead of dropping sessions
     /// silently.
     pub opencode_fork_excluded: usize,
+    /// rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): storage
+    /// session info docs the fork-parent probe REFUSED to read because
+    /// they are over the opencode record cap — counted so the refusal
+    /// is disclosed (loader note + doctor `opencode_fork_probe_over_cap`
+    /// disclosure key), never silent. Such a session is NOT proven to
+    /// be a fork, so it stays in aggregation; only the probe refusal
+    /// is reported.
+    pub opencode_fork_probe_over_cap: usize,
     /// rm-835 (minted campaign-locally as rm-695 by run f7f81aea, rebound
     /// at integration — the landed wall already holds an rm-695): how many
     /// discovered files failed to parse (the parse share of `skipped`,
@@ -319,7 +327,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (files, json_fork_excluded, fork_probe_over_cap) = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -490,6 +498,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         cache_hits,
         sqlite: sqlite_ingest,
         opencode_fork_excluded,
+        opencode_fork_probe_over_cap: fork_probe_over_cap,
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
@@ -538,15 +547,15 @@ pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> (Vec<PathBuf>, usize) {
+) -> (Vec<PathBuf>, usize, usize) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return (vec![dir.to_path_buf()], 0);
+            return (vec![dir.to_path_buf()], 0, 0);
         }
         // rm-548: an explicitly requested directory keeps every file —
         // a forked copy loaded by explicit path still renders (the
         // exclusion is an aggregation rule, not a parse block).
-        return (collect_session_files_cached(dir, cache), 0);
+        return (collect_session_files_cached(dir, cache), 0, 0);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
@@ -577,16 +586,61 @@ pub(crate) fn find_session_files_cached(
     // cached dir listing (fingerprint-keyed, see
     // `opencode_session_fork_parent_cached`) so warm runs stop
     // re-reading every storage session info doc on discovery.
+    //
+    // rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): an info
+    // doc over the record cap is refused by the probe — that refusal
+    // is itself disclosed: it counts into the THIRD tuple element
+    // (`opencode_fork_probe_over_cap`), while the session stays in
+    // aggregation (over-cap is corrupt-or-foreign, not proof of
+    // fork-ness). The refusal must never be a silent None again.
     let mut opencode_fork_excluded = 0usize;
-    all.retain(|path| {
-        if opencode_session_fork_parent_cached(path, cache).is_some() {
+    let mut opencode_fork_probe_over_cap = 0usize;
+    all.retain(|path| match opencode_session_fork_parent_cached(path, cache) {
+        ForkProbeOutcome::Fork(_) => {
             opencode_fork_excluded += 1;
             false
-        } else {
+        }
+        ForkProbeOutcome::NotFork => true,
+        ForkProbeOutcome::OverCap => {
+            opencode_fork_probe_over_cap += 1;
             true
         }
     });
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+    (
+        sort_paths_by_cache(all, cache),
+        opencode_fork_excluded,
+        opencode_fork_probe_over_cap,
+    )
+}
+
+/// rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): outcome of
+/// the fork-parent probe, so an over-cap info doc is DISCLOSED
+/// instead of silently reading as a non-fork (the pre-fix `None`
+/// shape made the refusal indistinguishable from "no `parentID`").
+/// The refusal is counted by the discovery walk and surfaced as
+/// `opencode_fork_probe_over_cap` (loader + doctor); the session
+/// itself stays in aggregation — over-cap is corrupt-or-foreign, not
+/// proof of fork-ness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ForkProbeOutcome {
+    /// Not a fork: no `parentID`, or the doc is absent/not an info
+    /// doc/unparsable.
+    NotFork,
+    /// `parentID` set — a fork copy of that parent.
+    Fork(String),
+    /// The info doc is over `OPENCODE_RECORD_MAX_BYTES`; the probe
+    /// refused to read it and the caller must count the refusal.
+    OverCap,
+}
+
+/// rm-959 review-fix F3: stat-gate half of the probe, split out so
+/// the memoized wrapper can check it BEFORE consulting the memo —
+/// otherwise the first run would journal the over-cap doc as a
+/// non-fork (None) and warm runs would stop counting the refusal.
+fn fork_probe_over_cap(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.len() > crate::parser::OPENCODE_RECORD_MAX_BYTES)
+        .unwrap_or(false)
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/
@@ -596,7 +650,7 @@ pub(crate) fn find_session_files_cached(
 /// pinned in docs/guides/opencode-fork-marker.md). Replaying a fork
 /// re-emits the parent's history — ccusage hit the same class as
 /// #1782 — so aggregation must not count both.
-pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
+pub(crate) fn opencode_session_fork_parent(path: &Path) -> ForkProbeOutcome {
     let mut components = path.components().rev();
     let file_is_json = components
         .next()
@@ -609,15 +663,34 @@ pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
             .is_some_and(|actual| actual == *segment)
     });
     if !file_is_json || !path_is_session_info {
-        return None;
+        return ForkProbeOutcome::NotFork;
     }
-    let raw = fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    value
-        .get("parentID")?
-        .as_str()
+    // rm-959: the probe reads an opencode session-info doc — a
+    // KB-scale JSON record (same shape class as the storage records
+    // `read_opencode_records` caps). A corrupt or foreign blob parked
+    // in the info tree must not make the walk read it whole; the
+    // refusal returns `OverCap` (review-fix F3) so the walk can count
+    // and disclose it instead of silently treating the session as a
+    // non-fork. The memoized wrapper below still fingerprints the
+    // file, so a doc rewritten under the cap re-probes as before.
+    let Ok(meta) = fs::metadata(path) else {
+        return ForkProbeOutcome::NotFork;
+    };
+    if meta.len() > crate::parser::OPENCODE_RECORD_MAX_BYTES {
+        return ForkProbeOutcome::OverCap;
+    }
+    let raw = fs::read_to_string(path).ok();
+    let value: Option<serde_json::Value> =
+        raw.and_then(|raw| serde_json::from_str(&raw).ok());
+    match value
+        .as_ref()
+        .and_then(|value| value.get("parentID"))
+        .and_then(|parent| parent.as_str())
         .filter(|parent| !parent.is_empty())
-        .map(str::to_string)
+    {
+        Some(parent) => ForkProbeOutcome::Fork(parent.to_string()),
+        None => ForkProbeOutcome::NotFork,
+    }
 }
 
 /// rm-548 (independent-review fix): [`opencode_session_fork_parent`]
@@ -627,10 +700,17 @@ pub(crate) fn opencode_session_fork_parent(path: &Path) -> Option<String> {
 /// when the file's fingerprint still matches the probe-time one, so a
 /// rewritten doc — one that gained a `parentID`, i.e. the exact state
 /// change rm-548 exists to disclose — always re-probes.
+///
+/// rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): an over-cap
+/// info doc never consults the memo and never journals one — the
+/// refusal must count on EVERY run, cold and warm (a memoized
+/// non-fork would hide it on the second run), and there is nothing
+/// worth caching in a doc we refuse to read anyway. `OverCap` is
+/// reconstructed from the stat gate, so both probe paths agree.
 pub(crate) fn opencode_session_fork_parent_cached(
     path: &Path,
     cache: &mut SessionCache,
-) -> Option<String> {
+) -> ForkProbeOutcome {
     let is_info_doc = path
         .components()
         .rev()
@@ -642,11 +722,29 @@ pub(crate) fn opencode_session_fork_parent_cached(
     if !is_info_doc {
         return opencode_session_fork_parent(path);
     }
+    // Before the memo: over-cap docs are refused on every run (see
+    // the doc comment above) — a metadata stat, never a read.
+    if fork_probe_over_cap(path) {
+        return ForkProbeOutcome::OverCap;
+    }
     if let Some(memo) = crate::session_cache::cached_fork_parent(path, cache) {
-        return memo;
+        return match memo {
+            Some(parent) => ForkProbeOutcome::Fork(parent),
+            None => ForkProbeOutcome::NotFork,
+        };
     }
     let probed = opencode_session_fork_parent(path);
-    crate::session_cache::store_fork_parent_probe(path, probed.clone(), cache);
+    crate::session_cache::store_fork_parent_probe(
+        path,
+        match &probed {
+            ForkProbeOutcome::Fork(parent) => Some(parent.clone()),
+            // OverCap cannot happen here (the stat gate above already
+            // returned), but keep the refusal unmemoized if it ever
+            // races a size change between the two stats.
+            ForkProbeOutcome::NotFork | ForkProbeOutcome::OverCap => None,
+        },
+        cache,
+    );
     probed
 }
 
@@ -1262,5 +1360,58 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rm-959 (site 4): the opencode fork-parent probe reads a
+    /// KB-scale session-info doc — an over-cap blob parked in the info
+    /// tree must refuse loudly (OverCap), not be read whole; a
+    /// healthy under-cap doc still resolves its parentID.
+    #[test]
+    fn fork_parent_probe_skips_over_cap_info_docs_rm959() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm959-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+
+        // Realistic info-doc shape: .../storage/session/info/<id>.json
+        // (the probe requires the doc as a DIRECT child of `info/`).
+        let info_dir = root.join("storage/session/info");
+        fs::create_dir_all(&info_dir).expect("mkdir info");
+        let healthy = info_dir.join("fork-1.json");
+        fs::write(
+            &healthy,
+            r#"{"id":"fork-1","parentID":"parent-1","time":{"created":"2026-10-11T01:02:03Z"}}"#,
+        )
+        .expect("write healthy info doc");
+        assert_eq!(
+            opencode_session_fork_parent(&healthy),
+            ForkProbeOutcome::Fork("parent-1".to_string()),
+            "under-cap info doc must still resolve its parentID"
+        );
+
+        let over_cap = info_dir.join("fork-2.json");
+        fs::write(&over_cap, b"{\"parentID\":\"p\"}\n").expect("seed info doc");
+        let handle = fs::File::options()
+            .write(true)
+            .open(&over_cap)
+            .expect("open info doc");
+        handle
+            .set_len(crate::parser::OPENCODE_RECORD_MAX_BYTES + 1)
+            .expect("extend over cap");
+        drop(handle);
+        assert_eq!(
+            opencode_session_fork_parent(&over_cap),
+            ForkProbeOutcome::OverCap,
+            "over-cap info doc must refuse (OverCap) for disclosure, not be read whole"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
