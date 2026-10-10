@@ -1,0 +1,3 @@
+{"type":"message","sessionId":"s-wb-ctl-1","cwd":"/home/user/proj","timestamp":1,"providerData":{"model":"some-model-3"},"message":{"content":[{"text":"answer"}],"usage":{"input_tokens":175,"cache_read_input_tokens":40,"output_tokens":40}}}
+{"type":"function_call","sessionId":"s-wb-ctl-1","cwd":"/home/user/proj","timestamp":2,"callId":"c1","name":"shell","arguments":"{}"}
+{"type":"function_call_result","sessionId":"s-wb-ctl-1","cwd":"/home/user/proj","timestamp":3,"callId":"c1","status":"completed","output":"ok"}

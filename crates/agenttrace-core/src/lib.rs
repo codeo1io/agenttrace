@@ -534,6 +534,13 @@ pub struct Metrics {
     /// `workbuddy_input_basis:zeroed_suspected_mismatch` when a usage
     /// block reports cache but zeroes input — assumptions, not lost
     /// lines, so they never degrade `data_health.confidence` (rm-538).
+    /// The same non-loss channel carries the parse-time siblings:
+    /// `workbuddy_input_basis:cache_clamped` (rm-600, upstream #316 —
+    /// a cache count clamped down to the remaining input) and
+    /// `workbuddy_usage_dropped:function_call_result` (rm-497 residual,
+    /// run 1f12309a — a result-record usage echo kept visibly
+    /// uncounted because counting it would double-bill the request
+    /// its message/function_call record already summed).
     /// Empty for journals without disclosures.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosure_counters: BTreeMap<String, usize>,

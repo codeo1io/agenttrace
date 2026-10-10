@@ -184,7 +184,10 @@ pub struct DataHealth {
     /// `pi_entry_skipped:<type>`, `pi_message_role:<role>`; plus the
     /// workbuddy input-basis notes (rm-450 minted, rm-538 moved):
     /// `workbuddy_input_basis:cache_subtracted`,
-    /// `workbuddy_input_basis:zeroed_suspected_mismatch`. Facts the
+    /// `workbuddy_input_basis:zeroed_suspected_mismatch`, plus the
+    /// parse-time siblings `workbuddy_input_basis:cache_clamped`
+    /// (rm-600) and `workbuddy_usage_dropped:function_call_result`
+    /// (rm-497 residual, run 1f12309a). Facts the
     /// journal documents that the accounting deliberately does not
     /// count (or counts across all branches), plus input-basis
     /// assumptions, kept visible instead of silently dropped — and

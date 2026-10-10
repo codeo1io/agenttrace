@@ -21,15 +21,31 @@ yanked = "deny"
 # the DB with the lock pinned to 0.18.1 — a false clean. Soundness bugs
 # are now considered for the whole tree.
 #
-# Integration note (2026-10-07, conflict case 39acfe43231b446f876b1cec36dff965):
-# the landing originally shipped with a dated ignore carve-out for
-# RUSTSEC-2026-0253 because the candidate's base (8991144) still pinned
-# lru 0.18.1. The integration HEAD had already landed the rm-552 bump
-# (lru 0.18.5 in Cargo.lock), so per the row's own removal rule ("drop the
-# entry the moment the lock reaches >= 0.18.2") the carve-out was dropped
-# at this merge and only the policy survives — the lane now flags an
-# unsound advisory against the current lock, not past it.
-unsound = "transitive"
+# rm-498 (run 1f12309a, cycle-3 compound 9d0f19d6): the unsound class must
+# be a policy decision, not an accident of scope defaults. cargo-deny's
+# default unsound scope excludes transitive dependencies, which kept
+# RUSTSEC-2026-0253 (lru <=0.18.1, reached here via
+# ratatui -> ratatui-core -> lru) invisible to this gate while the advisory
+# db already contained it (reproduced red-first: repo config -> `advisories
+# ok`, one added line `unsound = "all"` -> FAILED). Keep this explicit even
+# while the lock is clean so the class is denied by policy, not by luck.
+#
+# Integration note (2026-10-07, conflict case 39acfe43231b446f876b1cec36dff965,
+# updated 2026-10-10 by conflict case 739e7bc4): the rm-587 landing originally
+# shipped with a dated ignore carve-out for RUSTSEC-2026-0253 because the
+# candidate's base (8991144) still pinned lru 0.18.1. The integration HEAD
+# had already landed the rm-552 bump (lru 0.18.5 in Cargo.lock), so per the
+# row's own removal rule ("drop the entry the moment the lock reaches
+# >= 0.18.2") the carve-out was dropped at that merge and only the policy
+# survives — the lane now flags an unsound advisory against the current
+# lock, not past it. This merge unions the two policy decisions: rm-587
+# shipped `"transitive"` under a "whole tree" prose intent; rm-498's
+# acceptance accepts either `"transitive"` or `"all"` and its red-first
+# reproduction pins the stronger scope. `unsound = "all"` satisfies both
+# (verified live at this merge: `cargo deny check advisories` = ok on the
+# merged lock for both scopes, so the widening is a pure policy
+# strengthening, not a new gate failure).
+unsound = "all"
 ignore = []
 
 [licenses]
