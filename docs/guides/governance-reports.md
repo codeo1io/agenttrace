@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 53 and the SQLite snapshot is schema 10; the
+The session cache is schema 54 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -291,7 +291,17 @@ of run 4ffc4fbb, minted campaign-locally as rm-543 and double-minted
 as the campaign-local rm-551 — renumbered at integration since the
 landed rm-551 is the Copilot per-model fold; the batch's own
 27 → 28 bump re-based onto the advanced ceiling as 52 → 53, one
-invalidation either way); the SQLite snapshot to 7
+invalidation either way), and to 54 when usage-truth disclosure reached
+every claiming lane — single-object hermes event documents stopped
+being claimed and re-accounted by the gemini lane, capital-spelled
+usage containers became visible to the disclosure classifier, the
+whole-JSON hermes/gemini document lanes disclose their usage
+containers, and estimates fabricated over a present-but-unusable usage
+block carry the `+usage_unusable` provenance suffix (rm-760 + the
+rm-449 F3/F4 fold arms, run ec762a618372 — the batch's own 32 → 33
+bump, minted at its base 92149bd, re-based at integration onto the
+advanced ceiling as 53 → 54, one invalidation either way); the SQLite
+snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

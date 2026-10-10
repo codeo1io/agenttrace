@@ -5,7 +5,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 53;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 54;
+// Bumped 53 -> 54 (integration of run ec762a618372, repository-
+// maintenance fad1cbf4 cycle 3, candidate 6317565 — rm-760
+// 'usage-truth disclosures on every claiming lane' + the rm-449
+// F3/F4 fold arms (gemini strict-claim probe, nested/shadowed scans);
+// conflict case a042df3e2bc648c0a594e3ebad3692d3, superseding the
+// never-completed first dispatch c7c07e48): the batch changes what
+// parsing REPORTS for UNCHANGED source files — single-object hermes
+// event documents stop being claimed and re-accounted by the gemini
+// lane (same map, different line count used to flip source_tool and
+// token totals), the disclosure classifier case-matches the `Usage`
+// spelling `Event` itself deserializes and runs on the whole-JSON
+// hermes and gemini document lanes' success paths, all-noncanonical
+// usage maps now ride the rm-408 zero_usage_reported rider, token
+// estimates fabricated over a present-but-unusable usage block carry
+// the `+usage_unusable:<N>` provenance suffix, and new counter keys
+// (`usage_non_object:<kind>`, `usage_key_non_numeric:<name>`, the
+// case-matched and document-lane tiers of the rm-449 vocabulary)
+// mint where the old parse was silent — so a warm v53 cache keeps
+// serving the swallowed or fabricated totals with matching
+// fingerprints and never re-parses (rm-230 convention: parser-
+// semantics changes that alter the served report for unchanged files
+// bump the schema so cached sessions regenerate once under corrected
+// accounting). The batch minted its bump as 32 -> 33 against its base
+// 92149bd (ceiling 32); this integration re-bases it onto the
+// already-advanced ceiling 53 per the documented convention, one
+// invalidation either way.
 // Bumped 52 -> 53 (integration of run 4ffc4fbb2e9c, conflict case
 // a1c5cb6f54f34484bd2b404fc90d99a0, candidate fa1d831 — the run's
 // rm-939 'pi journal: compaction/branch_summary usage is silently

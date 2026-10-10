@@ -627,13 +627,20 @@ fn zero_i64(value: &i64) -> bool {
     *value == 0
 }
 
-/// rm-408: a present usage block whose recognized values are all zero.
-/// Every parser attaches zeros through `usage_from_value_with_keys`
-/// (which inserts explicit `0` values), so a non-empty all-zero map is
-/// exactly the client-reported-zero population — the one stated rule
-/// across formats instead of per-format accidents.
+/// rm-408 + rm-760: a present usage block counts as zero-reported
+/// when every consumed class in it is zero. `usage_from_value_with_keys`
+/// attaches zeros through explicit canonical names, so a non-empty
+/// all-zero canonical map is exactly the client-reported-zero
+/// population — the one stated rule across formats instead of
+/// per-format accidents. rm-760 extends it to maps whose keys never
+/// map at all (aliases, unknown names — the `usage:{bogus_metric:9999}`
+/// shape): they carry no token truth either way, and without this they
 pub fn usage_is_all_zero(usage: &BTreeMap<String, i64>) -> bool {
-    !usage.is_empty() && usage.values().all(|value| *value == 0)
+    !usage.is_empty()
+        && usage
+            .iter()
+            .filter(|(key, _)| parser::usage_key_is_consumed(key))
+            .all(|(_, value)| *value == 0)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -782,6 +789,19 @@ pub struct SearchResult {
 /// both spellings the canonical value wins and the alias value is
 /// discarded (never summed) — pinned by `disclosure_plane_honesty`'s
 /// canonical-wins pair; the discarded alias stays silent there too.
+///
+/// rm-760 (run ec762a618372 cycle 3): classification itself is now
+/// delegated to the ONE shared tier engine,
+/// [`parser::usage_container_truth_disclosures`], so this JSONL lane
+/// and every document lane (whole-JSON hermes, gemini) mint the same
+/// tiers from the same wire shapes. The engine adds the two rm-449
+/// F3/F4 tiers on this seam — `usage_non_object:<kind>` (a `usage`
+/// value that is not a container at all: `"usage":5`, `"usage":[]`)
+/// and `usage_key_non_numeric:<name>` (a KNOWN name whose value is
+/// not numeric — a value defect, not an unknown key). The rm-718
+/// read-location silence rides the engine's consumed set below, so
+/// the landed semantics are preserved byte-for-byte on every shape
+/// `disclosure_plane_honesty` pins.
 fn usage_field_case_folded<'a>(
     object: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -795,6 +815,30 @@ fn usage_field_case_folded<'a>(
     folded.push(first.to_ascii_uppercase());
     folded.push_str(chars.as_str());
     object.get(&folded)
+}
+
+/// rm-449 F3 / rm-760: token truth that came from the text estimator
+/// while a usage block existed but was not a container the accounting
+/// could read (`usage_non_object:*` disclosures minted alongside) rides
+/// a `+usage_unusable:<N>` suffix beside rm-408's
+/// `+zero_usage_reported` suffixes, so the human renderers can tell
+/// "no usage recorded" from "usage present, unusable".
+pub(crate) fn flag_estimated_from_unusable_usage(
+    metrics: &mut Metrics,
+    skips: &BTreeMap<String, usize>,
+) {
+    let count: usize = skips
+        .iter()
+        .filter(|(key, _)| key.starts_with("usage_non_object"))
+        .map(|(_, count)| count)
+        .sum();
+    if count == 0 {
+        return;
+    }
+    if metrics.provenance.tokens.split('+').next() != Some("estimated_from_text") {
+        return;
+    }
+    metrics.provenance.tokens = format!("{}+usage_unusable:{}", metrics.provenance.tokens, count);
 }
 
 pub(crate) fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> {
@@ -828,68 +872,36 @@ pub(crate) fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> 
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let meta_line = matches!(role, "session_meta" | "meta");
+    // rm-760: `Event` deserializes both `usage` (alias) and `Usage`
+    // (rename) spellings wherever it reads the container, so the
+    // classifier probes the same two spellings at all three containers
+    // — what the event machinery can see, the disclosure machinery can
+    // see (arm 3: the caps-assistant/caps-meta-bogus/msgcaps shapes).
+    // `consumed` names the wire keys this lane's accounting takes from
+    // the READ container (top-level `usage` of a meta line): the five
+    // canonical names PLUS, per rm-718 above, the two cache-read alias
+    // spellings `lenient_usage_map` normalizes onto the canonical key
+    // there — accounted at that place, silent like canonical names.
+    let mut consumed: Vec<&'static str> = Vec::new();
+    if meta_line {
+        consumed.extend_from_slice(parser::USAGE_KEYS_CONSUMED);
+        consumed.push("cachedContentTokenCount");
+        consumed.push("cacheReadInputTokens");
+    }
     let mut keys = Vec::new();
-    // (usage value, is this the place the lane's accounting reads?)
-    for (usage, consumed_location) in [
-        (usage_field_case_folded(object, "usage"), meta_line),
-        (message_usage, false),
-        (provider_usage, false),
+    // (usage value, wire keys this lane's accounting consumes here)
+    for (usage, consumed) in [
+        (
+            usage_field_case_folded(object, "usage"),
+            consumed.as_slice(),
+        ),
+        (message_usage, &[][..]),
+        (provider_usage, &[][..]),
     ]
     .into_iter()
-    .filter_map(|(usage, consumed_location)| usage.map(|usage| (usage, consumed_location)))
+    .filter_map(|(usage, consumed)| usage.map(|usage| (usage, consumed)))
     {
-        let Some(map) = usage.as_object() else {
-            continue;
-        };
-        for (wire_key, wire_value) in map {
-            // Does this entry flatten to a canonical / recognized name
-            // with a numeric value the accounting could take?
-            let (canonical, recognized) = match wire_value {
-                serde_json::Value::Object(nested) => {
-                    let mut canonical = false;
-                    let mut recognized = false;
-                    for (leaf, leaf_value) in nested {
-                        if parser::number_as_i64(leaf_value).is_some() {
-                            let flat = format!("{wire_key}_{leaf}");
-                            canonical |= parser::usage_key_is_consumed(&flat);
-                            recognized |= parser::usage_wire_key_is_recognized(&flat);
-                        }
-                    }
-                    (canonical, recognized)
-                }
-                other => {
-                    let numeric = parser::number_as_i64(other).is_some();
-                    (
-                        numeric && parser::usage_key_is_consumed(wire_key),
-                        numeric && parser::usage_wire_key_is_recognized(wire_key),
-                    )
-                }
-            };
-            // rm-718: the intake normalization (see the helper's doc
-            // above) consumes the two cache-read alias spellings at
-            // the read location — `cachedContentTokenCount` /
-            // `cacheReadInputTokens` on a meta line's top-level
-            // `usage` fold onto the canonical key, so they are
-            // accounted there and must stay silent like a canonical
-            // key. Everywhere else they fall through to the alias
-            // tier unchanged.
-            let normalized_cache_read_spelling = matches!(
-                wire_key.as_str(),
-                "cachedContentTokenCount" | "cacheReadInputTokens",
-            );
-            let prefix = if consumed_location && (canonical || normalized_cache_read_spelling) {
-                continue; // actually accounted: canonical at the read
-                          // place, or an rm-718-normalized spelling
-                          // folded onto it
-            } else if canonical {
-                "usage_unconsumed_location"
-            } else if recognized {
-                "usage_alias_unmapped"
-            } else {
-                "usage_unknown_key"
-            };
-            keys.push(parser::disclosure_key(prefix, wire_key));
-        }
+        parser::usage_container_truth_disclosures(usage, consumed, &mut keys);
     }
     keys
 }
@@ -1027,6 +1039,10 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
         event.source_tool = source_tool.to_string();
     }
     let mut session = session_from_events(name, path, events)?;
+    // rm-449 F3 / rm-760: mark estimates the estimator fabricated
+    // while a usage block was present but unusable — BEFORE the merge
+    // below, so the marker reads this lane's own skips.
+    flag_estimated_from_unusable_usage(&mut session.metrics, &line_skips);
     // rm-616: merge, never overwrite — analyze() may have put its own
     // disclosure counters (rm-450 workbuddy basis, rm-616
     // usage_present_not_counted) into metrics.line_skips, and clobbering

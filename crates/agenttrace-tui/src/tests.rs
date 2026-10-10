@@ -1631,6 +1631,18 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 54 (integration of run ec762a618372,
+                // rm-760 + rm-449 F3/F4: usage-truth disclosure on
+                // every claiming lane — single-object hermes event
+                // documents no longer gemini-claimed, the classifier
+                // case-matches `Usage` and delegates to the one shared
+                // tier engine, the whole-JSON hermes/gemini document
+                // lanes disclose their usage containers, unusable
+                // usage blocks flag their estimates, and the new
+                // counter keys (`usage_non_object:*`,
+                // `usage_key_non_numeric:*`) mint where the old parse
+                // was silent — minted at its base 92149bd as 32 -> 33,
+                // re-based onto the landed 52 -> 53 ceiling here);
                 // Schema 52 (integration of run 2d92ee95
                 // "session-cache store integrity" — rm-292
                 // schema-change restore lifecycle + rm-041 lossless
@@ -2649,5 +2661,27 @@ fn load_summary_discloses_unlinked_subagents_zero_count_clean() {
         !load_summary_line(&app).contains("unlinked"),
         "clean corpus must not carry the clause: {}",
         load_summary_line(&app)
+    );
+}
+
+#[test]
+fn provenance_label_marks_usage_unusable_estimates() {
+    // rm-449 F3 / rm-760: an estimate made while a usage block existed
+    // but could not be read (`usage_non_object:*` disclosures, the
+    // `+usage_unusable:<N>` provenance suffix) is a different fact
+    // from plain "no usage recorded" — the label must say so instead
+    // of silently reading as the ordinary estimate.
+    assert_eq!(
+        i18n::provenance_label("estimated_from_text+usage_unusable:2", Language::En),
+        "estimated from text (usage unusable)"
+    );
+    assert_eq!(
+        i18n::provenance_label("estimated_from_text+usage_unusable:2", Language::Zh),
+        "根据文本估算（用量不可用）"
+    );
+    // Plain estimates and other suffixes are unaffected.
+    assert_eq!(
+        i18n::provenance_label("estimated_from_text+zero_usage_reported:1", Language::En),
+        i18n::provenance_label("estimated_from_text", Language::En)
     );
 }

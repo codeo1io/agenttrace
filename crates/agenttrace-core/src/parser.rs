@@ -188,7 +188,12 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             return session_from_events(name, path, events);
         }
         if let Some(events) = parse_hermes_json_value(value) {
-            return session_from_events(name, path, events);
+            return session_with_usage_truth(
+                name,
+                path,
+                events,
+                hermes_doc_usage_disclosures(value),
+            );
         }
         // Single-object Antigravity trajectory sidecars
         // (<uuid>.trajectory.json) sit next to the SQLite conversation
@@ -381,7 +386,12 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             return session_from_events(name, path, events);
         }
         if let Some(events) = parse_gemini_value(&value) {
-            return session_from_events(name, path, events);
+            return session_with_usage_truth(
+                name,
+                path,
+                events,
+                gemini_doc_usage_disclosures(&value),
+            );
         }
         if let Some(events) = parse_kimi_value(&value) {
             return session_from_events(name, path, events);
@@ -5363,6 +5373,19 @@ fn parse_gemini_object(value: &Value, model: &mut String, events: &mut Vec<Event
     let Some(obj) = value.as_object() else {
         return;
     };
+    // rm-760 arm 1/2: a wire object that is itself a hermes/generic
+    // EVENT line (`type` + `role` keys, the journal grammar this crate
+    // parses line by line) is not a Gemini response. The claiming
+    // probe below used to swallow it through the bare `usage`
+    // container and re-account its tokens under gemini_cli with zero
+    // disclosures — same map, different line count, different truth
+    // (assess 984bcea3 F1). Such documents now fall through to the
+    // JSONL lane, where the usage-truth classifier runs. Real Gemini
+    // responses (candidates/usageMetadata/contents or nested
+    // checkpoint/session/chat wrappers) carry no type+role pair.
+    if obj.contains_key("type") && obj.contains_key("role") {
+        return;
+    }
     for key in ["modelVersion", "model", "modelId"] {
         if let Some(value) = string(obj.get(key)) {
             if !value.is_empty() {
@@ -6184,69 +6207,300 @@ fn timestamp_millis_nanos(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// rm-449 F3 / F4: `usage_non_object:<kind>` disclosures carry the
+/// JSON kind of a `usage` value that is not a container — the
+/// pre-existing `json_value_kind` helper ("number" / "array" / …).
+/// rm-760: the one usage-truth tier engine every claiming lane runs.
+/// `consumed` names the wire keys this lane's accounting takes from
+/// THIS container — the JSONL lane passes the five canonical names on
+/// meta lines, the gemini lane passes its alias vocabulary, the
+/// whole-JSON hermes lane passes what `usage_from_value` matched at
+/// the root. Everything else discloses, tier by tier:
+/// `usage_unconsumed_location` (canonical name, unread here),
+/// `usage_alias_unmapped` (known wire synonym, unmapped here),
+/// `usage_unknown_key` (name outside the vocabulary),
+/// `usage_key_non_numeric` (rm-449 F4: KNOWN name, non-numeric value —
+/// `input_tokens:"\ud800"` is a value defect, not an unknown key), and
+/// `usage_non_object:<kind>` (rm-449 F3: a `usage` value that is not a
+/// container at all — `"usage": 5`, `"usage": []`).
+pub(crate) fn usage_container_truth_disclosures(
+    container: &Value,
+    consumed: &[&str],
+    keys: &mut Vec<String>,
+) {
+    let Some(map) = container.as_object() else {
+        keys.push(disclosure_key(
+            "usage_non_object",
+            json_value_kind(container),
+        ));
+        return;
+    };
+    for (wire_key, wire_value) in map {
+        // Does this entry flatten to a canonical / recognized name
+        // with a numeric value the accounting could take?
+        let (canonical, recognized, any_numeric) = match wire_value {
+            Value::Object(nested) => {
+                let mut canonical = false;
+                let mut recognized = false;
+                let mut any_numeric = false;
+                for (leaf, leaf_value) in nested {
+                    if number_as_i64(leaf_value).is_some() {
+                        any_numeric = true;
+                        let flat = format!("{wire_key}_{leaf}");
+                        canonical |= usage_key_is_consumed(&flat);
+                        recognized |= usage_wire_key_is_recognized(&flat);
+                    }
+                }
+                (canonical, recognized, any_numeric)
+            }
+            other => {
+                let numeric = number_as_i64(other).is_some();
+                (
+                    numeric && usage_key_is_consumed(wire_key),
+                    numeric && usage_wire_key_is_recognized(wire_key),
+                    numeric,
+                )
+            }
+        };
+        if !any_numeric && !wire_value.is_object() {
+            let name_known = consumed.contains(&wire_key.as_str())
+                || usage_key_is_consumed(wire_key)
+                || usage_wire_key_is_recognized(wire_key);
+            if name_known {
+                keys.push(disclosure_key("usage_key_non_numeric", wire_key));
+                continue;
+            }
+        }
+        // Did this entry actually get accounted here? (nested entries
+        // flatten: `"input": {"tokens": 7}` is consumed when
+        // `input_tokens` is.)
+        let accounted = match wire_value {
+            Value::Object(nested) => nested.iter().any(|(leaf, leaf_value)| {
+                number_as_i64(leaf_value).is_some()
+                    && consumed.contains(&format!("{wire_key}_{leaf}").as_str())
+            }),
+            other => number_as_i64(other).is_some() && consumed.contains(&wire_key.as_str()),
+        };
+        let prefix = if accounted {
+            continue; // actually accounted: canonical at the read place
+        } else if canonical {
+            "usage_unconsumed_location"
+        } else if recognized {
+            "usage_alias_unmapped"
+        } else {
+            "usage_unknown_key"
+        };
+        keys.push(disclosure_key(prefix, wire_key));
+    }
+}
+
+/// rm-760: usage-truth scan for the whole-JSON hermes lane. Root usage
+/// is consumed via `usage_from_value` (aliases mapped — only the wire
+/// keys it matched are consumed here); the capital `Usage` twin is not
+/// read at all; per-message `usage`/`Usage` containers are not read by
+/// this lane's accounting (message events carry no usage — accounting
+/// them AND the root would double-count), so every key there
+/// discloses instead of vanishing (arm 4).
+fn hermes_doc_usage_disclosures(value: &Value) -> BTreeMap<String, usize> {
+    let Some(doc) = value.as_object() else {
+        return BTreeMap::new();
+    };
+    let mut keys = Vec::new();
+    if let Some(container) = doc.get("usage") {
+        let matched = usage_from_value_with_keys(container).1;
+        usage_container_truth_disclosures(container, &matched, &mut keys);
+    }
+    if let Some(container) = doc.get("Usage") {
+        usage_container_truth_disclosures(container, &[], &mut keys);
+    }
+    if let Some(messages) = doc.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            for container in [message.get("usage").or_else(|| message.get("Usage"))]
+                .into_iter()
+                .flatten()
+            {
+                usage_container_truth_disclosures(container, &[], &mut keys);
+            }
+        }
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for key in keys {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// rm-760: usage-truth scan for the gemini lane, mirroring where
+/// `parse_gemini_object` actually claims usage: the
+/// `usageMetadata`/`usage`/`tokenUsage` containers at EVERY object
+/// level it walks — the document root AND the nested
+/// `checkpoint`/`session`/`chat` wrappers it recurses into (review
+/// e747789a F3: the recursion claims a wrapper's usage container, so
+/// the scan reads it at every depth too — a `bogus_metric` inside
+/// `checkpoint.usage` disclosed nowhere before). The keys consumed at
+/// each container are exactly the ones `gemini_usage` reads there
+/// (`gemini_consumed_keys`), so a duplicate same-class alias the
+/// probe's first-match precedence never reached is disclosed instead
+/// of silently dropped (review F2). Capital twins and per-entry
+/// containers in the document's message arrays are never read here —
+/// present-but-unread usage discloses instead of vanishing (arm b:
+/// disclosure on every claiming lane's success path).
+fn gemini_doc_usage_disclosures(value: &Value) -> BTreeMap<String, usize> {
+    let Some(doc) = value.as_object() else {
+        return BTreeMap::new();
+    };
+    let mut keys = Vec::new();
+    gemini_object_usage_disclosures(doc, &mut keys);
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for key in keys {
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// One object level of the gemini usage-truth scan (see
+/// [`gemini_doc_usage_disclosures`]); the trailing recursion into
+/// `checkpoint`/`session`/`chat` mirrors `parse_gemini_object`'s own,
+/// so every container the parser claims is scanned at the level the
+/// parser found it.
+fn gemini_object_usage_disclosures(obj: &Map<String, Value>, keys: &mut Vec<String>) {
+    for key in ["usageMetadata", "usage", "tokenUsage"] {
+        if let Some(container) = obj.get(key) {
+            let consumed = gemini_consumed_keys(container);
+            usage_container_truth_disclosures(container, &consumed, keys);
+        }
+    }
+    for key in ["Usage", "UsageMetadata", "TokenUsage"] {
+        if let Some(container) = obj.get(key) {
+            usage_container_truth_disclosures(container, &[], keys);
+        }
+    }
+    for array in [
+        "messages",
+        "history",
+        "conversation",
+        "clientHistory",
+        "chatHistory",
+        "contents",
+        "candidates",
+    ] {
+        for item in obj
+            .get(array)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for key in ["usage", "Usage", "usageMetadata", "UsageMetadata"] {
+                if let Some(container) = item.get(key) {
+                    usage_container_truth_disclosures(container, &[], keys);
+                }
+            }
+        }
+    }
+    for key in ["checkpoint", "session", "chat"] {
+        if let Some(nested) = obj.get(key).and_then(Value::as_object) {
+            gemini_object_usage_disclosures(nested, keys);
+        }
+    }
+}
+
+/// The wire keys `gemini_usage` actually reads from THIS container:
+/// per class, the first PRESENT key in `first_number`'s probe order —
+/// presence, not numeracy, because the first present alias shadows its
+/// class siblings even when its own value is non-numeric (the
+/// accounting takes 0 from it and never looks further). A shadowed
+/// duplicate is therefore NOT consumed and discloses instead of
+/// vanishing (review e747789a F2: `promptTokenCount:100` +
+/// `input_tokens:50` used to drop the 50 with zero disclosure).
+fn gemini_consumed_keys(container: &Value) -> Vec<&'static str> {
+    let Some(obj) = container.as_object() else {
+        return Vec::new();
+    };
+    [
+        &GEMINI_INPUT_KEYS[..],
+        &GEMINI_OUTPUT_KEYS[..],
+        &GEMINI_REASONING_KEYS[..],
+        &GEMINI_CACHE_KEYS[..],
+    ]
+    .into_iter()
+    .filter_map(|class| class.iter().copied().find(|key| obj.contains_key(*key)))
+    .collect()
+}
+
+/// rm-760: fold a claiming lane's document-level usage-truth
+/// disclosures into the session it is about to return (the JSONL
+/// path does the same inside `parse_jsonl_session`). Integration
+/// review 865c4bc6: the mints ride the shared capped helper
+/// (`crate::mint_disclosure`, the landed rm-594 residual) exactly
+/// like every other wire-named mint site — the document lanes mint
+/// wire-controlled `usage_*` keys of their own, so a hostile
+/// document must hit the same 1,000-distinct-key bound (with the
+/// self-disclosing `disclosure_keys_capped` counter) as the JSONL
+/// and array lanes instead of ballooning `line_skips` unbounded.
+fn session_with_usage_truth(
+    name: &str,
+    path: &str,
+    events: Vec<Event>,
+    disclosures: BTreeMap<String, usize>,
+) -> anyhow::Result<Session> {
+    let mut session = session_from_events(name, path, events)?;
+    if !disclosures.is_empty() {
+        crate::flag_estimated_from_unusable_usage(&mut session.metrics, &disclosures);
+        for (key, count) in disclosures {
+            crate::mint_disclosure(&mut session.metrics.line_skips, key, count);
+        }
+    }
+    Ok(session)
+}
+
+const GEMINI_INPUT_KEYS: [&str; 5] = [
+    "promptTokenCount",
+    "inputTokenCount",
+    "inputTokens",
+    "input_tokens",
+    "prompt_tokens",
+];
+const GEMINI_OUTPUT_KEYS: [&str; 5] = [
+    "candidatesTokenCount",
+    "outputTokenCount",
+    "outputTokens",
+    "output_tokens",
+    "completion_tokens",
+];
+const GEMINI_REASONING_KEYS: [&str; 4] = [
+    "thoughtsTokenCount",
+    "thinkingTokenCount",
+    "thinking_tokens",
+    "reasoning_tokens",
+];
+const GEMINI_CACHE_KEYS: [&str; 3] = [
+    "cachedContentTokenCount",
+    "cacheReadInputTokens",
+    "cache_read_input_tokens",
+];
+
 fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
     let obj = value.as_object()?;
     let mut usage = BTreeMap::new();
     usage.insert(
         "input_tokens".to_string(),
-        first_number(
-            obj,
-            &[
-                "promptTokenCount",
-                "inputTokenCount",
-                "inputTokens",
-                "input_tokens",
-                "prompt_tokens",
-            ],
-        ),
+        first_number(obj, &GEMINI_INPUT_KEYS),
     );
     usage.insert(
         "output_tokens".to_string(),
-        first_number(
-            obj,
-            &[
-                "candidatesTokenCount",
-                "outputTokenCount",
-                "outputTokens",
-                "output_tokens",
-                "completion_tokens",
-            ],
-        )
-        .saturating_add(first_number(
-            obj,
-            &[
-                "thoughtsTokenCount",
-                "thinkingTokenCount",
-                "thinking_tokens",
-                "reasoning_tokens",
-            ],
-        )),
+        first_number(obj, &GEMINI_OUTPUT_KEYS)
+            .saturating_add(first_number(obj, &GEMINI_REASONING_KEYS)),
     );
     // Thinking tokens are billed at the output rate but reported
     // separately by the API (Gemini usageMetadata.thoughtsTokenCount);
     // folded above, broken out here for the audit (pass-9 CU-20).
-    let reasoning = first_number(
-        obj,
-        &[
-            "thoughtsTokenCount",
-            "thinkingTokenCount",
-            "thinking_tokens",
-            "reasoning_tokens",
-        ],
-    );
+    let reasoning = first_number(obj, &GEMINI_REASONING_KEYS);
     if reasoning > 0 {
         usage.insert("reasoning_tokens".to_string(), reasoning);
     }
     usage.insert(
         "cache_read_input_tokens".to_string(),
-        first_number(
-            obj,
-            &[
-                "cachedContentTokenCount",
-                "cacheReadInputTokens",
-                "cache_read_input_tokens",
-            ],
-        ),
+        first_number(obj, &GEMINI_CACHE_KEYS),
     );
     Some(usage)
 }
@@ -6766,8 +7020,22 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
     // Thinking tokens ride the output rate but are reported separately
     // (Gemini usageMetadata.thoughtsTokenCount and the OpenAI-compatible
     // reasoning aliases); fold into output and keep the breakdown
-    // (pass-9 CU-20).
-    if let Some(reasoning) = [
+    // (pass-9 CU-20). The fold CONSUMES the winning wire key, so it
+    // rides `matched_keys` like the class winners above — otherwise the
+    // whole-JSON disclosure scan reports the value it just accounted
+    // as unconsumed (review e747789a F1: a benign root
+    // `usage:{...,reasoning_tokens:5}` minted a standing false
+    // `usage_unconsumed_location:reasoning_tokens`). Consumption is
+    // NUMERACY-based like the winners (first present key that yields a
+    // number), so an explicit `reasoning_tokens: 0` — a standard member
+    // of OpenAI-compatible usage objects — counts as consumed on this
+    // lane exactly as it does on the JSONL lane (USAGE_KEYS_CONSUMED
+    // lists it); only the map insert stays gated on > 0, because
+    // folding a zero adds nothing. The other matched_keys consumer
+    // (kimi StatusUpdate, parser.rs parse_kimi_wire_jsonl) filters on
+    // KIMI_USAGE_ALIAS_KEYS, which carries no reasoning synonym, so
+    // the extra push is a no-op there.
+    if let Some((key, reasoning)) = [
         "thoughtsTokenCount",
         "thinkingTokenCount",
         "thinking_tokens",
@@ -6778,16 +7046,22 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
         "reasoningTokens",
     ]
     .iter()
-    .find_map(|key| obj.get(*key))
-    .and_then(number_as_i64)
-    .filter(|value| *value > 0)
+    .filter_map(|key| {
+        obj.get(*key)
+            .and_then(number_as_i64)
+            .map(|value| (*key, value))
+    })
+    .next()
     {
-        if let Some(output) = usage.get_mut("output_tokens") {
-            *output = output.saturating_add(reasoning);
-        } else {
-            usage.insert("output_tokens".to_string(), reasoning);
+        matched_keys.push(key);
+        if reasoning > 0 {
+            if let Some(output) = usage.get_mut("output_tokens") {
+                *output = output.saturating_add(reasoning);
+            } else {
+                usage.insert("output_tokens".to_string(), reasoning);
+            }
+            usage.insert("reasoning_tokens".to_string(), reasoning);
         }
-        usage.insert("reasoning_tokens".to_string(), reasoning);
     }
     if usage.is_empty() {
         (None, matched_keys)
