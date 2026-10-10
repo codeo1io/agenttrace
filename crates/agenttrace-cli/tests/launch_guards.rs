@@ -395,3 +395,105 @@ fn output_colliding_with_walked_journal_is_rejected_without_touching_it() {
     );
     std::fs::remove_dir_all(&scratch).ok();
 }
+
+#[test]
+fn output_colliding_with_unparseable_walked_journal_is_rejected() {
+    // rm-912 (assess F2 PoC): the -o membership check used to cover
+    // only the sessions the loader PRODUCED, so a discovered-but-
+    // unparseable journal (here: a real journal saved as UTF-16LE, the
+    // classic Windows PowerShell redirect) was invisible to the guard
+    // — `--overview -d dir -o dir/bad.jsonl` exited 0 and OVERWROTE
+    // the unparseable input (assess live PoC: bad.jsonl replaced, only
+    // a silent .orig twin left behind). The guard must cover every
+    // path the loader ATTEMPTED: parse-failure paths join the
+    // membership set and the run refuses BEFORE any write, naming the
+    // input transcript — the user's only unfixable copy is never
+    // destroyed.
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm912-mixed-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let sessions_dir = scratch.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions scratch");
+    std::fs::write(sessions_dir.join("good.jsonl"), claude_journal_lines())
+        .expect("write good journal");
+    let mut utf16: Vec<u8> = vec![0xff, 0xfe];
+    utf16.extend(
+        claude_journal_lines()
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes()),
+    );
+    let victim = sessions_dir.join("bad.jsonl");
+    std::fs::write(&victim, utf16).expect("write bad journal");
+    let before = std::fs::read(&victim).expect("read bad journal before");
+    let dir_arg = sessions_dir
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+    let victim_arg = victim.to_str().expect("utf-8 scratch path").to_string();
+
+    let (code, stdout, stderr) =
+        run_isolated(&["--overview", "-d", &dir_arg, "-o", &victim_arg], &scratch);
+    assert_ne!(
+        code, 0,
+        "-o at an attempted-but-unparseable input must refuse; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("--output") && stderr.contains("failed to parse"),
+        "refusal must name --output and the parse failure, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("bad.jsonl"),
+        "refusal must name the input transcript, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).expect("read bad journal after"),
+        before,
+        "the unparseable input must stay byte-identical — no overwrite, no .orig twin"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn all_unparseable_dir_with_colliding_output_keeps_the_parse_bail() {
+    // rm-912 regression pin: when EVERY discovered journal fails to
+    // parse, the rm-835 all-failed bail still fires FIRST — the run is
+    // condemned for having produced nothing, long before the -o
+    // collision matters. The guard must not reorder or swallow that.
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm912-allbad-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let sessions_dir = scratch.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions scratch");
+    let mut utf16: Vec<u8> = vec![0xff, 0xfe];
+    utf16.extend(
+        claude_journal_lines()
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes()),
+    );
+    let victim = sessions_dir.join("bad.jsonl");
+    std::fs::write(&victim, utf16).expect("write bad journal");
+    let before = std::fs::read(&victim).expect("read bad journal before");
+    let dir_arg = sessions_dir
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+    let victim_arg = victim.to_str().expect("utf-8 scratch path").to_string();
+
+    let (code, _stdout, stderr) =
+        run_isolated(&["--overview", "-d", &dir_arg, "-o", &victim_arg], &scratch);
+    assert_ne!(code, 0, "an all-failed corpus must stay a failure");
+    assert!(
+        stderr.contains("No sessions parsed"),
+        "the rm-835 all-failed bail must win over the -o guard, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).expect("read bad journal after"),
+        before,
+        "nothing may be written either way"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}

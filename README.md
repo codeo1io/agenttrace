@@ -355,7 +355,8 @@ fails when the README table drifts from the binary's actual flag count
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `-f, --format <FORMAT>` | `text` | Output format for the requested view: text (default), json, csv, markdown/md, html, or otel (the OTLP-JSON export of the whole corpus; requires --overview). Unsupported combinations fail loudly instead of falling back to text |
+| `-f, --format <FORMAT>` | `text` | Output format for the requested view: text (default), json, csv, markdown/md, html, svg (the shareable usage card; requires --overview), or otel (the OTLP-JSON export of the whole corpus; requires --overview). Unsupported combinations fail loudly instead of falling back to text |
+| `--card-theme <CARD_THEME>` | `auto` | rm-576: color scheme of the SVG usage card (`-f svg`). `auto` ships the light palette plus a `prefers-color-scheme` override so the static file adapts to the viewer; bytes stay deterministic |
 | `-d, --dir <DIR>` |  | Session directory to scan instead of auto-discovered agent homes |
 | `--compare` |  | Compare the inspected session against the healthy-baseline summary (narrative framed for `--model`) |
 | `--audit` |  | Render the governance audit report across matching sessions (tool-authority drift and spend oversight; `--sample` bounds it) |
@@ -425,7 +426,7 @@ fails when the README table drifts from the binary's actual flag count
 | Slow-task diagnosis | Latency stats, long gaps, hanging sessions, retry loops, slow tools, large params, and context pressure |
 | Regression evidence | Local baseline comparison when supplied, incident timelines, and conservative tool authority categories in reports |
 | First-session triage | Sort and filter by cost, duration, health, failures, anomalies, model, source, or text search |
-| Shareable evidence | JSON, Markdown, and self-contained HTML reports |
+| Shareable evidence | JSON, Markdown, and self-contained HTML reports, plus the single-file SVG usage card |
 | Local-first inspection | No hosted backend required |
 
 ## Docs

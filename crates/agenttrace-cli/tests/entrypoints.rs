@@ -1272,6 +1272,68 @@ fn clear_cache_json_stdout_is_a_single_json_document() {
 }
 
 #[test]
+fn clear_cache_document_lanes_route_announcements_to_stderr() {
+    // rm-912 rider (assess F3): the rm-301 announce routing listed only
+    // json|csv|otel as machine lanes, so every DOCUMENT lane
+    // (-f svg, markdown, md, html) still prefixed "Session cache
+    // cleared." to the rendered bytes on stdout — a piped
+    // `agenttrace --clear-cache --overview -f svg > card.svg` (the
+    // documented share pattern) produced a corrupt SVG whose first
+    // line was the announcement. Document outputs must stay pure the
+    // same way machine formats do: announcements to stderr, stdout =
+    // exactly one renderable document.
+    let sandbox = std::env::temp_dir().join(format!(
+        "agenttrace-rm912-purity-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cache = sandbox.join("cache");
+    std::fs::create_dir_all(&cache).expect("create sandbox cache dir");
+    let run = |format: &str| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+        cmd.env("HOME", &sandbox)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(["--clear-cache", "--overview", "--demo", "-f", format]);
+        let output = cmd.output().expect("run agenttrace CLI");
+        assert!(
+            output.status.success(),
+            "-f {format} CLI failed: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+    };
+
+    let (stdout, stderr) = run("svg");
+    assert!(
+        stdout.starts_with("<?xml"),
+        "-f svg stdout must start with the XML prolog, got {stdout:?}"
+    );
+    assert!(!stdout.contains("Session cache cleared."));
+    assert!(
+        stderr.contains("Session cache cleared."),
+        "-f svg announcement must move to stderr, got {stderr:?}"
+    );
+
+    for format in ["markdown", "md", "html"] {
+        let (stdout, stderr) = run(format);
+        assert!(
+            !stdout.contains("Session cache cleared."),
+            "-f {format} stdout must stay pure, got {stdout:?}"
+        );
+        assert!(
+            stderr.contains("Session cache cleared."),
+            "-f {format} announcement must move to stderr, got {stderr:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
 fn governance_reports_honor_gate_flags() {
     // rm-346 arm-a: the --fail-* gate flags are parsed on every report
     // path, but used to be evaluated only in the --overview arm — `--audit

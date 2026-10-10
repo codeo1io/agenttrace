@@ -445,12 +445,19 @@ fn run() -> anyhow::Result<()> {
     // stdout stream must stay a single parseable JSON document end to
     // end (a downstream `jq` breaks on any leading line), so they route
     // to stderr. The human path keeps them on stdout exactly as before.
-    let announce: fn(&str) -> anyhow::Result<()> =
-        if matches!(args.format.as_str(), "json" | "csv" | "otel") {
-            write_stderr
-        } else {
-            write_stdout
-        };
+    // rm-912 rider (assess F3): the DOCUMENT lanes are machine-piped
+    // too — `--clear-cache --overview -f svg > card.svg` (the README
+    // share pattern) used to prefix "Session cache cleared." to the
+    // SVG bytes and corrupt the file — so svg/markdown/md/html join
+    // the stderr-routing set.
+    let announce: fn(&str) -> anyhow::Result<()> = if matches!(
+        args.format.as_str(),
+        "json" | "csv" | "otel" | "svg" | "markdown" | "md" | "html"
+    ) {
+        write_stderr
+    } else {
+        write_stdout
+    };
 
     if args.clear_cache {
         agenttrace_core::clear_session_cache()?;
@@ -1645,8 +1652,10 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     }
     // rm-534: discovery/-d-walk arm of the input-journal membership
     // check (`-o <name>.jsonl` colliding with any journal a walk
-    // admitted) — loud BEFORE any bytes are staged.
-    ensure_output_is_not_an_input(args, &sessions)?;
+    // admitted) — loud BEFORE any bytes are staged. rm-912: the walk
+    // lane also contributes its attempted-but-unparseable journals —
+    // overwriting one would destroy the user's only copy.
+    ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
     Ok((sessions, Some(report)))
 }
 
@@ -1709,7 +1718,19 @@ fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
 /// set — explicit positional files and every journal admitted by a `-d`
 /// walk — with both sides resolved, so relative paths and symlinks to
 /// live journals are caught too.
-fn ensure_output_is_not_an_input(args: &Args, sessions: &[Session]) -> anyhow::Result<()> {
+///
+/// rm-912 (assess F2): the membership set also covers every path the
+/// loader ATTEMPTED and failed to parse — a discovered-but-unparseable
+/// journal (e.g. a UTF-16LE PowerShell redirect) used to be invisible
+/// to this guard, so `--overview -d dir -o dir/bad.jsonl` exited 0 and
+/// silently overwrote the unfixable input (only a `.orig` twin left
+/// behind). Attempted-but-failed paths join the refusal set and the
+/// error names the transcript.
+fn ensure_output_is_not_an_input(
+    args: &Args,
+    sessions: &[Session],
+    attempted_parse_failures: &[PathBuf],
+) -> anyhow::Result<()> {
     let Some(output) = args.output.as_deref() else {
         return Ok(());
     };
@@ -1721,6 +1742,17 @@ fn ensure_output_is_not_an_input(args: &Args, sessions: &[Session]) -> anyhow::R
                     "--output {} is an input session journal ({}); refusing to overwrite a transcript — choose a different --output destination",
                     output.display(),
                     session.path
+                );
+            }
+        }
+    }
+    for candidate in attempted_parse_failures {
+        if let Ok(source) = fs::canonicalize(candidate) {
+            if source == resolved {
+                bail!(
+                    "--output {} is an input session journal that failed to parse ({}); refusing to overwrite a transcript — convert or move the journal, or choose a different --output destination",
+                    output.display(),
+                    candidate.display()
                 );
             }
         }
@@ -1768,7 +1800,11 @@ fn prepare_explicit_sessions(
 ) -> anyhow::Result<Vec<Session>> {
     // rm-534: reject --output destinations that ARE an input journal
     // before any lane work (explicit positional file + demo paths).
-    ensure_output_is_not_an_input(args, &sessions)?;
+    // rm-912: the explicit lane has no attempted-parse-failure set — an
+    // explicit positional file that fails to parse bails at `parse_file`
+    // (non-zero, before any write), so nothing attempted-and-failed
+    // can reach this guard.
+    ensure_output_is_not_an_input(args, &sessions, &[])?;
     if args.preserve_history {
         agenttrace_core::preserve_derived_history(&sessions)?;
     }
