@@ -1,4 +1,5 @@
 use super::*;
+use agenttrace_core::sanitize_line_segment;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 fn panel(title: impl Into<String>) -> Block<'static> {
@@ -1221,8 +1222,8 @@ fn action_center_text(governance: &GovernanceSnapshot, language: Language) -> St
         for item in audit.by_provider_model.iter().take(3) {
             lines.push(format!(
                 "  {} / {}  current={} stored={}  {}",
-                item.provider,
-                item.model,
+                sanitize_line_segment(&item.provider),
+                sanitize_line_segment(&item.model),
                 format_optional_cost(item.estimated_cost_usd, language),
                 format_compact_cost(item.stored_estimated_cost_usd),
                 pricing_status_label(&item.pricing_status, language)
@@ -1638,8 +1639,8 @@ fn audit_text(audit: &CostAudit, language: Language) -> String {
     for item in audit.by_provider_model.iter().take(20) {
         lines.push(format!(
             "- {} / {}  sessions={}  current={}  stored={}  tokens={}  {}",
-            item.provider,
-            item.model,
+            sanitize_line_segment(&item.provider),
+            sanitize_line_segment(&item.model),
             item.sessions,
             format_optional_cost(item.estimated_cost_usd, language),
             format_compact_cost(item.stored_estimated_cost_usd),
@@ -3397,7 +3398,7 @@ pub(super) fn top_model_line(app: &App) -> String {
         format!(
             "{} {}  {} {}  {} {}",
             app.t("top model", "最高频模型"),
-            short(model, 24),
+            short(&sanitize_line_segment(model), 24),
             app.t("sessions", "会话"),
             format_count(group.sessions as i64),
             app.t("cost", "成本"),
@@ -4024,5 +4025,22 @@ mod loop_basis_disclosure_tests {
             !en_priced.contains("basis=synthetic"),
             "priced must stay unmarked: {en_priced}"
         );
+    }
+
+    #[test]
+    fn top_model_line_neutralizes_spoofing_format_chars() {
+        // rm-933: the TUI render path wraps transcript-derived model
+        // ids in sanitize_line_segment - a hostile id carrying bidi
+        // overrides and tag characters must surface as U+FFFD, never
+        // as raw Cf bytes the terminal could act on.
+        let basis = LoopCostBasis::Synthetic;
+        let mut session = session_with_loop(basis);
+        session.metrics.model_used = String::from("\u{202E}evil\u{E0041}model\u{200B}");
+        let app = crate::app::App::new(vec![session], "test", None);
+        let line = top_model_line(&app);
+        assert!(!line.contains('\u{202E}'), "raw RLO survived top_model_line");
+        assert!(!line.contains('\u{E0041}'), "tag char survived top_model_line");
+        assert!(!line.contains('\u{200B}'), "ZWSP survived top_model_line");
+        assert!(line.contains('\u{FFFD}'), "hostile model was dropped, not neutralized");
     }
 }
