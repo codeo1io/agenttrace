@@ -1,4 +1,5 @@
 use crate::{Anomaly, Diagnostics, Metrics, Session, ToolWarning};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -827,6 +828,11 @@ pub fn session_cache_entries_source() -> &'static str {
 /// bound counts it either way.
 const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 
+/// rm-993: bound on the durable transcript-shrink ledger (newest
+/// records kept); the cumulative `transcript_shrink_total` counts past
+/// the bound. Sized like the schema-invalidation ledger it mirrors.
+const MAX_TRANSCRIPT_SHRINK_RECORDS: usize = 8;
+
 /// Walk-semantics version for cached directory listings. Bumped when the
 /// discovery walk's directory set changes so stale listings are dropped
 /// once at load (see `load_session_cache`). v2: symlinked child
@@ -885,7 +891,68 @@ pub struct SessionCache {
     /// `schema_invalidations` member at save time (bounded by
     /// `MAX_SCHEMA_INVALIDATION_RECORDS`).
     schema_invalidations: Vec<Value>,
+    /// rm-993: transient baselines for entries invalidated THIS process
+    /// (freshness misses etc.). Captured when a live entry is dropped in
+    /// `delete_cached_session_key`, consumed by `store_session` when the
+    /// re-parse of the same file lands; a baseline never consumed (the
+    /// file died, or the re-parse failed) is simply dropped — a deleted
+    /// file is not a shrink. Never persisted.
+    shrink_baselines: BTreeMap<String, ShrinkBaseline>,
+    /// rm-993: durable, bounded transcript-shrink ledger — re-parses of
+    /// previously-cached files whose totals DECREASED (the signature of
+    /// Claude Code \u{2265}2.1.296 local GC rewriting a transcript in
+    /// place, `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`). Persisted as the
+    /// top-level `transcript_shrink_events` member at save time,
+    /// bounded to the newest MAX_TRANSCRIPT_SHRINK_RECORDS records;
+    /// `transcript_shrink_total` keeps the cumulative count past the
+    /// bound. The corpus total never silently re-baselines: the drop
+    /// is disclosed here and in --doctor.
+    transcript_shrink_events: Vec<Value>,
+    /// rm-993: cumulative shrink count (monotone past the bounded
+    /// ledger); persisted beside `transcript_shrink_events`.
+    transcript_shrink_total: u64,
     dirty: bool,
+}
+
+/// rm-993: the pre-invalidation totals a re-parse is compared
+/// against, plus the session identity the disclosure names.
+#[derive(Debug, Clone)]
+struct ShrinkBaseline {
+    name: String,
+    tokens_total: i64,
+    events_total: usize,
+}
+
+impl SessionCache {
+    /// rm-993: cumulative transcript-shrink count recorded in the
+    /// journal (and this process's observations).
+    pub fn transcript_shrink_total(&self) -> u64 {
+        self.transcript_shrink_total
+    }
+
+    /// rm-993: the bounded shrink ledger, newest last — for doctor and
+    /// tests.
+    pub fn transcript_shrink_events(&self) -> &[Value] {
+        &self.transcript_shrink_events
+    }
+}
+
+/// rm-993: counted-token mass + event count off a cache entry's
+/// session (the same saturating arithmetic `total_tokens` uses), or
+/// None when the entry is too malformed to compare — no baseline
+/// means no disclosure, never a fabricated shrink.
+fn shrink_baseline_from_entry(entry: &CacheEntry) -> Option<ShrinkBaseline> {
+    let metrics = &entry.session.metrics;
+    let tokens_total = metrics
+        .tokens_input
+        .saturating_add(metrics.tokens_output)
+        .saturating_add(metrics.tokens_cache_w)
+        .saturating_add(metrics.tokens_cache_r);
+    Some(ShrinkBaseline {
+        name: entry.session.name.clone(),
+        tokens_total,
+        events_total: metrics.events_total,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1785,6 +1852,25 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
+/// rm-993: the persisted transcript-shrink ledger + cumulative
+/// counter off a cache document (both members are written together;
+/// missing/legacy docs carry none).
+fn persisted_transcript_shrink(doc: &Map<String, Value>) -> (Vec<Value>, u64) {
+    let events = doc
+        .get("transcript_shrink_events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total = doc
+        .get("transcript_shrink_total")
+        .and_then(Value::as_u64)
+        // The counter can never trail the ledger it counts; a legacy
+        // doc without the member still self-corrects from the events.
+        .map(|total| total.max(events.len() as u64))
+        .unwrap_or(events.len() as u64);
+    (events, total)
+}
+
 pub fn load_session_cache() -> SessionCache {
     let path = session_cache_path();
     sweep_orphaned_temps(&path, ORPHAN_TEMP_MAX_AGE);
@@ -1847,10 +1933,13 @@ pub fn load_session_cache() -> SessionCache {
             "kept_dir_listings": dirs.len(),
         }));
         cap_schema_invalidations(&mut schema_invalidations);
+        let (transcript_shrink_events, transcript_shrink_total) = persisted_transcript_shrink(&doc);
         return SessionCache {
             path,
             dirs,
             schema_invalidations,
+            transcript_shrink_events,
+            transcript_shrink_total,
             dirty: true,
             ..SessionCache::default()
         };
@@ -1941,11 +2030,17 @@ pub fn load_session_cache() -> SessionCache {
         }));
         cap_schema_invalidations(&mut schema_invalidations);
     }
+    let (transcript_shrink_events, transcript_shrink_total) = persisted_transcript_shrink(&doc);
     let mut cache = SessionCache {
         path,
         raw_entries,
         dirs,
         schema_invalidations,
+        // rm-993: the shrink ledger outlives schema bumps and catalog
+        // refreshes — it is a disclosure, not parsed state, so the
+        // cumulative count never resets because the store rebuilt.
+        transcript_shrink_events,
+        transcript_shrink_total,
         // A catalog mismatch dirties the cache so the emptied entry map
         // is persisted with the new id at the next save (rm-196).
         dirty: listing_stale || !pricing_matches,
@@ -2273,7 +2368,30 @@ pub(crate) fn delete_cached_session(path: &Path, cache: &mut SessionCache) {
 }
 
 fn delete_cached_session_key(path: &str, cache: &mut SessionCache) {
-    if cache.entries.remove(path).is_some() || cache.raw_entries.remove(path).is_some() {
+    // rm-993: capture the outgoing entry's totals BEFORE the removal
+    // drops them — a re-parse of this file that lands LOWER totals is
+    // the local-GC rewrite signature the shrink ledger discloses. The
+    // baseline is transient: `store_session` consumes it, everything
+    // else forgets it (a deleted file is not a shrink).
+    let decoded = cache.entries.remove(path);
+    let raw = if decoded.is_some() {
+        None
+    } else {
+        cache.raw_entries.remove(path)
+    };
+    let baseline = decoded
+        .as_ref()
+        .and_then(shrink_baseline_from_entry)
+        .or_else(|| {
+            raw.as_ref()
+                .and_then(|value| serde_json::from_value::<CacheEntry>(value.clone()).ok())
+                .as_ref()
+                .and_then(shrink_baseline_from_entry)
+        });
+    if let Some(baseline) = baseline {
+        cache.shrink_baselines.insert(path.to_string(), baseline);
+    }
+    if decoded.is_some() || raw.is_some() {
         // Remember the invalidation so the save-side merge under the
         // cache lock cannot resurrect a key this process dropped
         // (rm-298 residual).
@@ -2368,6 +2486,8 @@ fn doc_frame_len(
     dirs_bytes: usize,
     dirs_count: usize,
     invalidations_bytes: usize,
+    shrink_events_bytes: usize,
+    shrink_total: u64,
 ) -> usize {
     let mut total = format!(
         "{{\"schema_version\":{},\"dir_listing_version\":{},\"pricing_catalog_id\":",
@@ -2390,6 +2510,16 @@ fn doc_frame_len(
     if invalidations_bytes > 0 {
         total += 1 + "\"schema_invalidations\":".len() + invalidations_bytes;
     }
+    // rm-993: the shrink members are written together (events imply the
+    // cumulative counter), so both count together.
+    if shrink_events_bytes > 0 {
+        total += 1 + "\"transcript_shrink_events\":".len() + shrink_events_bytes;
+        total += 1
+            + "\"transcript_shrink_total\":".len()
+            + serde_json::to_string(&shrink_total)
+                .map(|n| n.len())
+                .unwrap_or(0);
+    }
     total + 1
 }
 
@@ -2411,6 +2541,8 @@ fn serialized_doc_size(cache: &SessionCache) -> usize {
         dirs_member_bytes(cache),
         cache.dirs.len(),
         invalidations_member_bytes(&cache.schema_invalidations),
+        invalidations_member_bytes(&cache.transcript_shrink_events),
+        cache.transcript_shrink_total,
     )
 }
 
@@ -2536,6 +2668,8 @@ fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
         dirs_bytes,
         cache.dirs.len(),
         invalidations_member_bytes(&cache.schema_invalidations),
+        invalidations_member_bytes(&cache.transcript_shrink_events),
+        cache.transcript_shrink_total,
     );
     if total <= max {
         return 0;
@@ -2649,6 +2783,28 @@ fn merge_concurrent_disk_state(cache: &mut SessionCache) {
         }
         cap_schema_invalidations(&mut cache.schema_invalidations);
     }
+    // rm-993: same carry for the transcript-shrink ledger — a
+    // concurrent writer's shrink observations must survive our save.
+    if let Some(records) = doc
+        .get("transcript_shrink_events")
+        .and_then(Value::as_array)
+    {
+        for record in records {
+            if !cache.transcript_shrink_events.contains(record) {
+                cache.transcript_shrink_events.push(record.clone());
+            }
+        }
+        let overflow = cache
+            .transcript_shrink_events
+            .len()
+            .saturating_sub(MAX_TRANSCRIPT_SHRINK_RECORDS);
+        if overflow > 0 {
+            cache.transcript_shrink_events.drain(..overflow);
+        }
+    }
+    if let Some(total) = doc.get("transcript_shrink_total").and_then(Value::as_u64) {
+        cache.transcript_shrink_total = cache.transcript_shrink_total.max(total);
+    }
 }
 
 pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
@@ -2742,6 +2898,21 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
                 Value::Array(cache.schema_invalidations.clone()),
             );
         }
+        // rm-993: the transcript-shrink ledger — same discipline as the
+        // invalidation ledger: omitted entirely when empty so a fresh
+        // store writes the exact pre-ledger byte layout, bounded to the
+        // newest records with the cumulative counter beside it (the
+        // counter is what survives past the record bound).
+        if !cache.transcript_shrink_events.is_empty() {
+            doc.insert(
+                "transcript_shrink_events".to_string(),
+                Value::Array(cache.transcript_shrink_events.clone()),
+            );
+            doc.insert(
+                "transcript_shrink_total".to_string(),
+                Value::Number(cache.transcript_shrink_total.into()),
+            );
+        }
         let tmp = unique_temp_path(&cache.path);
         write_private(&tmp, &serde_json::to_vec(&Value::Object(doc))?)?;
         // Fence the rename: if our lock was stolen while this document
@@ -2800,6 +2971,44 @@ pub fn store_session(
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(path)?;
     let key = cache_key(path);
+    // rm-993: this file's PREVIOUS cached totals (captured when the
+    // stale entry was invalidated). A re-parse that lands LOWER totals
+    // is the local-GC rewrite signature (Claude Code \u{2265}2.1.296
+    // rewrites live transcripts in place, dropping oldest messages):
+    // record it in the durable ledger instead of silently
+    // re-baselining the corpus. Growth or an equal re-parse just
+    // forgets the baseline — appends are the normal story. The fresh
+    // totals still become the cache's new baseline (the report shows
+    // what the file now holds); the disclosure lives in the ledger,
+    // --doctor, and the load report.
+    if let Some(baseline) = cache.shrink_baselines.remove(&key) {
+        let metrics = &session.metrics;
+        let new_tokens = metrics
+            .tokens_input
+            .saturating_add(metrics.tokens_output)
+            .saturating_add(metrics.tokens_cache_w)
+            .saturating_add(metrics.tokens_cache_r);
+        if new_tokens < baseline.tokens_total || metrics.events_total < baseline.events_total {
+            cache.transcript_shrink_total += 1;
+            cache.dirty = true;
+            cache.transcript_shrink_events.push(serde_json::json!({
+                "path": path_from_key(&key).display().to_string(),
+                "session": baseline.name,
+                "tokens_total_before": baseline.tokens_total,
+                "tokens_total_after": new_tokens,
+                "events_total_before": baseline.events_total,
+                "events_total_after": metrics.events_total,
+                "observed_at": Utc::now().to_rfc3339(),
+            }));
+            let overflow = cache
+                .transcript_shrink_events
+                .len()
+                .saturating_sub(MAX_TRANSCRIPT_SHRINK_RECORDS);
+            if overflow > 0 {
+                cache.transcript_shrink_events.drain(..overflow);
+            }
+        }
+    }
     cache.entries.insert(
         key.clone(),
         CacheEntry {

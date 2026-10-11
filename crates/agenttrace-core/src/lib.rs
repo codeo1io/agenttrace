@@ -64,8 +64,8 @@ pub use pricing::{
     render_model_pricing_list, render_test_match, update_pricing,
 };
 pub use reports::{
-    add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
-    report_json, report_json_with_language, report_overview_html,
+    add_baseline_comparison, generation_speed_payload, report_compare, report_compare_json,
+    report_compare_with_language, report_json, report_json_with_language, report_overview_html,
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,
@@ -509,6 +509,14 @@ pub struct Metrics {
     pub tokens_cache_r: i64,
     #[serde(skip)]
     pub timestamps: Vec<DateTime<Utc>>,
+    /// rm-995: timestamp of the FIRST assistant-turn event, for
+    /// time-to-first-token. Parse-time only (`#[serde(skip)]`, like
+    /// `timestamps` — deliberately NOT a cache field): warm-cache
+    /// sessions honestly degrade to `None` instead of re-deriving from
+    /// imprecise spans, which is why the report surfaces carry the
+    /// sessions-with-timestamps basis beside any TTFT number.
+    #[serde(skip)]
+    pub first_assistant_ts: Option<DateTime<Utc>>,
     pub gaps_sec: Vec<f64>,
     pub model_used: String,
     pub source_tool: String,
@@ -1505,6 +1513,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
 
         if let Some((ts, form)) = parse_ts_form(&event.timestamp) {
             metrics.timestamps.push(ts);
+            // rm-995: latch the first assistant stamp for
+            // time-to-first-token (rendered as
+            // `first_assistant_ts - timestamps.first()`); later assistant
+            // turns never overwrite the latch, and a session whose
+            // assistant turns carry no stamps keeps `None`.
+            if metrics.first_assistant_ts.is_none() && event.role == "assistant" {
+                metrics.first_assistant_ts = Some(ts);
+            }
             if matches!(form, TimestampForm::NaiveUtc) {
                 metrics.naive_utc_stamps += 1;
             }
@@ -2576,6 +2592,47 @@ pub fn total_tokens(session: &Session) -> i64 {
         .saturating_add(session.metrics.tokens_output)
         .saturating_add(session.metrics.tokens_cache_w)
         .saturating_add(session.metrics.tokens_cache_r)
+}
+
+impl Metrics {
+    /// rm-995: generation speed in counted tokens per second over the
+    /// session's timestamp span (`duration_sec`). Pure render-time
+    /// aggregation over already-parsed fields — deliberately NOT a
+    /// cache field — so the number is identical for a cold-parsed and
+    /// a warm-cache session. `None` when the session carries no
+    /// positive duration (a single-event session, or a source whose
+    /// stamps never admitted a span) rather than an Infinity or a
+    /// zero-duration blowup.
+    pub fn tokens_per_sec(&self) -> Option<f64> {
+        if self.duration_sec <= 0.0 || !self.duration_sec.is_finite() {
+            return None;
+        }
+        let tokens = self
+            .tokens_input
+            .saturating_add(self.tokens_output)
+            .saturating_add(self.tokens_cache_w)
+            .saturating_add(self.tokens_cache_r);
+        if tokens <= 0 {
+            return None;
+        }
+        Some(tokens as f64 / self.duration_sec)
+    }
+
+    /// rm-995: time-to-first-token in seconds — first assistant-turn
+    /// stamp minus the earliest event stamp. Only computable where
+    /// timestamps allow (cold-parsed sessions; the cache does not
+    /// round-trip `timestamps`/`first_assistant_ts`), and `None` when
+    /// the session has no assistant stamp, no span, or a negative
+    /// (clock-skewed) difference instead of reporting fiction.
+    pub fn ttft_sec(&self) -> Option<f64> {
+        let start = *self.timestamps.first()?;
+        let first_response = self.first_assistant_ts?;
+        let delta = (first_response - start).num_milliseconds();
+        if delta < 0 {
+            return None;
+        }
+        Some(delta as f64 / 1000.0)
+    }
 }
 
 pub fn format_tokens(value: i64) -> String {

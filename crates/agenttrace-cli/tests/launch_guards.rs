@@ -497,3 +497,260 @@ fn all_unparseable_dir_with_colliding_output_keeps_the_parse_bail() {
     );
     std::fs::remove_dir_all(&scratch).ok();
 }
+
+// ---------------------------------------------------------------------------
+// rm-997 (batch run 12e2c18c implement): `--search` with an explicitly
+// passed empty/whitespace operand. Red-first: against the pre-change
+// binary the empty operand matched no action row (the table only
+// counted a non-empty query), fell through run() into the interactive
+// TUI launcher, and a piped stdout rendered the launcher's own failure
+// ("stdout is not a terminal", assess aa5eb07a P-SEARCH PoC) instead of
+// a usage error — and `--search '' --overview` silently reported rc0
+// with an empty-string header. The guard must reject the operand loudly
+// and BEFORE any output staging or loading.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_search_operand_is_a_loud_usage_error() {
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm997-empty-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(scratch.join("sessions")).expect("mkdir sessions scratch");
+    let sessions_dir = scratch
+        .join("sessions")
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+
+    for operand in ["", "   "] {
+        let out_path = scratch.join(format!("out-{:?}.jsonl", operand));
+        let out_arg = out_path.to_str().expect("utf-8 path").to_string();
+        let (code, stdout, stderr) = run_isolated(
+            &["--search", operand, "-d", &sessions_dir, "-o", &out_arg],
+            &scratch,
+        );
+        assert_ne!(
+            code, 0,
+            "an explicitly empty/whitespace --search operand ({operand:?}) must be an error"
+        );
+        assert!(
+            stdout.is_empty(),
+            "no report bytes on stdout for a rejected operand, got: {stdout}"
+        );
+        assert!(
+            stderr.contains("--search"),
+            "the usage error must name the flag, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("non-empty"),
+            "the usage error must say what is wrong, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("stdout is not a terminal"),
+            "the rejection must happen in validate_primary_action, not by \
+             falling through into the interactive launcher, got: {stderr}"
+        );
+        assert!(
+            !out_path.exists(),
+            "a rejected operand must not stage or write any --output file"
+        );
+    }
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn empty_search_operand_never_reaches_the_launcher_or_companions() {
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm997-companion-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(scratch.join("sessions")).expect("mkdir sessions scratch");
+    let sessions_dir = scratch
+        .join("sessions")
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+
+    // The companion arm of the PoC: `--search '' --overview` used to
+    // render rc0 with an `Search results: ""` header. The empty operand
+    // must dominate the companion flag.
+    let (code, stdout, stderr) = run_isolated(
+        &["--search", "", "--overview", "-d", &sessions_dir],
+        &scratch,
+    );
+    assert_ne!(code, 0, "the empty operand must dominate --overview");
+    assert!(
+        stdout.is_empty(),
+        "no overview bytes may render for a rejected operand, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("--search"),
+        "error must name --search, got: {stderr}"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn nonempty_zero_hit_search_output_is_unchanged() {
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm997-zerohit-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let sessions_dir = scratch.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions scratch");
+    std::fs::write(sessions_dir.join("a.jsonl"), claude_journal_lines())
+        .expect("write claude journal");
+    let sessions_arg = sessions_dir
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+
+    // A non-empty query with zero hits keeps its pre-change story
+    // byte-for-byte: rc0, the Search-results header naming the query
+    // and the 0 count (assess PoC pinned `--search z` rc0).
+    let (code, stdout, stderr) = run_isolated(&["--search", "z", "-d", &sessions_arg], &scratch);
+    assert_eq!(code, 0, "zero-hit is a successful empty answer");
+    assert!(
+        stdout.contains("Search results"),
+        "the header must render, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"z\""),
+        "header names the query, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("0"),
+        "header reports the 0 count, got: {stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "no warning for a clean zero-hit search, got: {stderr}"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+// ---------------------------------------------------------------------------
+// rm-995 (batch run 12e2c18c implement): the CLI surfaces of the
+// generation-speed analytics — `--sessions -f json` carries per-row
+// `generation_tokens_per_sec` (identical cold/warm: render-time
+// arithmetic, not a cache field) and `time_to_first_token_sec` (null
+// warm: the cache does not round-trip event stamps, and null is the
+// honest basis), plus the sibling `generation_speed` rollup mirroring
+// the overview's. The overview text renders the "── Generation speed
+// ──" section with its basis sizes. Fixture: 20 counted tokens
+// (10+5+2+3) over a 5s span (01:00:00 -> 01:00:05) = 4.0 tok/s, TTFT
+// 5s.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sessions_json_and_overview_text_carry_generation_speed() {
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm995-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let sessions_dir = scratch.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions scratch");
+    std::fs::write(sessions_dir.join("a.jsonl"), claude_journal_lines())
+        .expect("write claude journal");
+    let sessions_arg = sessions_dir
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+
+    // Cold pass.
+    let (code, stdout, stderr) =
+        run_isolated(&["--sessions", "-f", "json", "-d", &sessions_arg], &scratch);
+    assert_eq!(code, 0, "sessions json exits clean, stderr: {stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("sessions json parses");
+    assert_eq!(
+        doc.pointer("/generation_speed/tokens_per_sec")
+            .and_then(serde_json::Value::as_f64),
+        Some(4.0),
+        "sibling rollup: 20 tokens / 5s = 4.0 tok/s: {stdout}"
+    );
+    let row = doc.pointer("/sessions/0").expect("one session row");
+    assert_eq!(
+        row.get("generation_tokens_per_sec")
+            .and_then(serde_json::Value::as_f64),
+        Some(4.0),
+        "per-row rate: {row}"
+    );
+    assert_eq!(
+        row.get("time_to_first_token_sec")
+            .and_then(serde_json::Value::as_f64),
+        Some(5.0),
+        "cold row carries TTFT (assistant stamp 5s after first): {row}"
+    );
+
+    // Warm pass over the same scratch cache: rate identical, TTFT
+    // honestly null.
+    let (code, stdout, stderr) =
+        run_isolated(&["--sessions", "-f", "json", "-d", &sessions_arg], &scratch);
+    assert_eq!(code, 0, "warm sessions json exits clean, stderr: {stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("warm sessions json parses");
+    let row = doc.pointer("/sessions/0").expect("warm session row");
+    assert_eq!(
+        row.get("generation_tokens_per_sec")
+            .and_then(serde_json::Value::as_f64),
+        Some(4.0),
+        "warm-cache rate identical to cold (render-time arithmetic): {row}"
+    );
+    assert!(
+        row.get("time_to_first_token_sec")
+            .map(serde_json::Value::is_null)
+            == Some(true),
+        "warm-cache TTFT must be null (cache does not round-trip event stamps): {row}"
+    );
+
+    // Overview text, COLD (fresh scratch): section + basis sizes,
+    // including the TTFT clause.
+    let cold_scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm995-cold-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let cold_sessions = cold_scratch.join("sessions");
+    std::fs::create_dir_all(&cold_sessions).expect("mkdir cold sessions");
+    std::fs::write(cold_sessions.join("a.jsonl"), claude_journal_lines())
+        .expect("write cold journal");
+    let cold_arg = cold_sessions
+        .to_str()
+        .expect("utf-8 scratch path")
+        .to_string();
+    let (code, stdout, stderr) = run_isolated(&["--overview", "-d", &cold_arg], &cold_scratch);
+    assert_eq!(code, 0, "overview exits clean, stderr: {stderr}");
+    assert!(
+        stdout.contains("── Generation speed ──"),
+        "overview renders the speed section: {stdout}"
+    );
+    assert!(stdout.contains("4.0 tok/s"), "rate renders: {stdout}");
+    assert!(
+        stdout.contains("corpus: 4.0 tok/s over 1 session(s) with a span"),
+        "corpus basis renders: {stdout}"
+    );
+    assert!(
+        stdout.contains("time-to-first-token: 5.0s avg over 1 session(s)"),
+        "cold overview carries the TTFT clause: {stdout}"
+    );
+    std::fs::remove_dir_all(&cold_scratch).ok();
+
+    // Overview text, WARM (the scratch that already cached): the rate
+    // and its basis render identically, but the TTFT clause is
+    // honestly absent — no parse-time stamps survive the cache.
+    let (code, stdout, stderr) = run_isolated(&["--overview", "-d", &sessions_arg], &scratch);
+    assert_eq!(code, 0, "warm overview exits clean, stderr: {stderr}");
+    assert!(
+        stdout.contains("corpus: 4.0 tok/s over 1 session(s) with a span"),
+        "warm overview keeps the rate: {stdout}"
+    );
+    assert!(
+        !stdout.contains("time-to-first-token"),
+        "warm overview must not fabricate a TTFT basis: {stdout}"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}

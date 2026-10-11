@@ -2674,6 +2674,153 @@ fn opencode_glob_duplicate_db_sessions_are_deduped_and_disclosed() {
     let _ = fs::remove_dir_all(root);
 }
 
+// ---------------------------------------------------------------------------
+// rm-993 (batch run 12e2c18c implement): transcript-GC shrink
+// disclosure. Red-first: before the change, a re-parse of a file whose
+// cached entry held LARGER totals silently re-baselined the corpus —
+// the totals in every report just got smaller and nothing said why
+// (Claude Code >= 2.1.296 rewrites live transcripts in place when
+// CLAUDE_CODE_TRANSCRIPT_LOCAL_GC fires, dropping oldest messages
+// first). The disclosure contract: fresh smaller totals stay (they are
+// what the file now holds), the shrink is recorded durably in the
+// cache journal (`transcript_shrink_events`, bounded, + cumulative
+// `transcript_shrink_total`) and counted per-run on the LoadReport.
+// ---------------------------------------------------------------------------
+
+const GC_JOURNAL_V1: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"meta","ModelUsed":"claude-sonnet-4","Usage":{"input_tokens":1000,"output_tokens":500}}
+{"role":"user","content":"Inspect billing export.","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"assistant","content":"I will inspect the route.","timestamp":"2026-05-02T10:00:01Z","reasoning":"Find the route.","ModelUsed":"claude-sonnet-4"}
+{"role":"tool","content":"{\"success\":true}","tool_call_id":"t1","timestamp":"2026-05-02T10:00:02Z"}
+"#;
+
+/// Same session after local GC rewrote the transcript in place: the
+/// oldest exchange (the tool round-trip, and with it part of the
+/// Usage accounting) is gone — 1500 counted tokens -> 900, 5 events -> 4.
+const GC_JOURNAL_V2: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"meta","ModelUsed":"claude-sonnet-4","Usage":{"input_tokens":600,"output_tokens":300}}
+{"role":"user","content":"Inspect billing export.","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"assistant","content":"I will inspect the route.","timestamp":"2026-05-02T10:00:01Z","reasoning":"Find the route.","ModelUsed":"claude-sonnet-4"}
+"#;
+
+/// The normal story after the GC window: the transcript keeps growing
+/// (the tool round-trip came back, plus more work). Growth must never
+/// record a shrink.
+const GC_JOURNAL_V3: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"meta","ModelUsed":"claude-sonnet-4","Usage":{"input_tokens":1200,"output_tokens":600}}
+{"role":"user","content":"Inspect billing export.","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4"}
+{"role":"assistant","content":"I will inspect the route.","timestamp":"2026-05-02T10:00:01Z","reasoning":"Find the route.","ModelUsed":"claude-sonnet-4"}
+{"role":"tool","content":"{\"success\":true}","tool_call_id":"t1","timestamp":"2026-05-02T10:00:02Z"}
+"#;
+
+#[test]
+fn transcript_shrink_is_disclosed_not_silent() {
+    let root = temp_root("agenttrace-rm993-gc");
+    let home = root.join("home");
+    let sessions_dir = home.join("sessions");
+    let cache_dir = home.join("cache");
+    fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    let session_path = sessions_dir.join("session.jsonl");
+    fs::write(&session_path, GC_JOURNAL_V1).expect("write session v1");
+
+    with_home_and_cache(&home, &cache_dir, || {
+        // Pass 1 — cold parse, nothing has shrunk: the journal must
+        // stay 0-count-clean (NO transcript_shrink members at all, the
+        // same discipline as the schema-invalidations ledger).
+        let first = load_sessions_with_options(Some(&sessions_dir), &LoadOptions::default());
+        assert_eq!(first.sessions.len(), 1);
+        assert_eq!(first.transcript_shrunk, 0, "cold parse cannot shrink");
+        let raw = fs::read_to_string(session_cache_path()).expect("read journal pass 1");
+        assert!(
+            !raw.contains("transcript_shrink"),
+            "0-count-clean: a never-shrunk journal must not carry the members: {raw}"
+        );
+
+        // Local GC rewrites the transcript in place — fewer messages,
+        // lower totals.
+        fs::write(&session_path, GC_JOURNAL_V2).expect("rewrite session gc'd");
+
+        // Pass 2 — fingerprint miss (size changed), re-parse lands
+        // LOWER totals: the shrink must be DISCLOSED, and the report
+        // keeps showing the fresh (smaller) truth.
+        let second = load_sessions_with_options(Some(&sessions_dir), &LoadOptions::default());
+        assert_eq!(second.sessions.len(), 1);
+        assert_eq!(
+            second.transcript_shrunk, 1,
+            "the GC re-parse must be counted on the LoadReport"
+        );
+        let fresh = &second.sessions[0].metrics;
+        assert_eq!(
+            fresh.tokens_input.saturating_add(fresh.tokens_output),
+            900,
+            "fresh totals reflect the smaller transcript (they are the truth)"
+        );
+
+        // Durable disclosure in the journal: bounded ledger + cumulative
+        // counter, with before/after evidence.
+        let raw = fs::read_to_string(session_cache_path()).expect("read journal pass 2");
+        let doc: Value = serde_json::from_str(&raw).expect("journal json");
+        assert_eq!(
+            doc.pointer("/transcript_shrink_total")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        let events = doc
+            .pointer("/transcript_shrink_events")
+            .and_then(Value::as_array)
+            .expect("shrink ledger persisted");
+        assert_eq!(events.len(), 1);
+        let record = &events[0];
+        assert_eq!(
+            record.get("tokens_total_before").and_then(Value::as_i64),
+            Some(1500)
+        );
+        assert_eq!(
+            record.get("tokens_total_after").and_then(Value::as_i64),
+            Some(900)
+        );
+        assert_eq!(
+            record.get("events_total_before").and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            record.get("events_total_after").and_then(Value::as_u64),
+            Some(4)
+        );
+        assert!(
+            record
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p.ends_with("session.jsonl")),
+            "record names the file: {record}"
+        );
+
+        // Pass 3 — the transcript grows back (the normal story):
+        // appends must NOT record a shrink; the cumulative counter
+        // stays at the one real observation.
+        fs::write(&session_path, GC_JOURNAL_V3).expect("rewrite session grown");
+        let third = load_sessions_with_options(Some(&sessions_dir), &LoadOptions::default());
+        assert_eq!(third.sessions.len(), 1);
+        assert_eq!(third.transcript_shrunk, 0, "growth is not a shrink");
+        let raw = fs::read_to_string(session_cache_path()).expect("read journal pass 3");
+        let doc: Value = serde_json::from_str(&raw).expect("journal json");
+        assert_eq!(
+            doc.pointer("/transcript_shrink_total")
+                .and_then(Value::as_u64),
+            Some(1),
+            "cumulative count survives past the growth re-parse"
+        );
+        assert_eq!(
+            doc.pointer("/transcript_shrink_events")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn temp_root(prefix: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
