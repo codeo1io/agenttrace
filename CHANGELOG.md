@@ -364,6 +364,12 @@
 - Added `scripts/pricing/update-snapshot.sh` to regenerate the bundled pricing snapshot.
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
+### Fixed
+
+- Git-lane subprocess drains no longer read to EOF with no byte bound: drains are chunked and capped at `UPSTREAM_GIT_MAX_BYTES` (256 KiB, the npm-probe cap's sibling), the process tree is killed the moment a pipe overruns, and the failure surfaces as a named error instead of unbounded buffering (rm-052, run `b171537d`).
+- Directional bidi/format controls no longer spoof the interactive TUI: session names and card text are neutralized at the display boundary through the shared `is_bidi_format_control` predicate, and the predicate's doc now states the exact directional subset it covers (rm-933 slice 2, run `b171537d`).
+- `--clear-cache --update-pricing` no longer silently drops the pricing update: the pair now runs both actions in either order, while every solo flag keeps its own exit (rm-301, run `b171537d`).
+
 ## v0.9.0 - 2026-09-30
 
 Backfilled from the GitHub release notes for the tags that shipped without
