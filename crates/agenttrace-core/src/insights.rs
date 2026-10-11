@@ -715,7 +715,23 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
 // Linked worktrees carry a `.git` file ("gitdir: <repo>/.git/worktrees/<name>"); group them
 // under the main checkout so every agent worktree counts as the same project.
 fn worktree_main_root(marker: &Path) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(marker).ok()?;
+    // rm-959: the `.git` marker file is a ~40-byte pointer; one
+    // line, no JSON. A multi-MiB blob parked as `.git` is foreign by
+    // definition — read at most 4 KiB and require the `gitdir:`
+    // prefix within it, so the marker probe stays O(1) in the worst
+    // case instead of a whole-file read under attacker control.
+    const GIT_MARKER_MAX_READ: usize = 4 * 1024;
+    use std::io::Read;
+    let mut file = std::fs::File::open(marker).ok()?;
+    let mut buf = vec![0u8; GIT_MARKER_MAX_READ + 1];
+    let read = file.read(&mut buf).ok()?;
+    buf.truncate(read);
+    if buf.len() > GIT_MARKER_MAX_READ {
+        // Oversized marker: refuse before parsing rather than reading
+        // it whole (the +1 probe byte above detects the overflow).
+        return None;
+    }
+    let content = String::from_utf8_lossy(&buf);
     let gitdir = PathBuf::from(content.strip_prefix("gitdir:")?.trim());
     let git = gitdir.parent()?.parent()?;
     (git.file_name()? == ".git").then(|| git.parent().map(Path::to_path_buf))?
@@ -1387,5 +1403,38 @@ mod tests {
         assert!(TimeRange::Today
             .since(now)
             .is_some_and(|start| start <= now));
+    }
+
+    /// rm-959 (site 5): the `.git` worktree-marker probe reads a
+    /// ~40-byte pointer; an oversized marker blob must be refused on
+    /// the bounded read instead of read whole.
+    #[test]
+    fn oversized_git_marker_file_is_refused_rm959() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm959-marker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+
+        let healthy = root.join("git-healthy");
+        fs::write(&healthy, "gitdir: /work/r/.git/worktrees/w\n").expect("write marker");
+        assert_eq!(
+            worktree_main_root(&healthy),
+            Some(PathBuf::from("/work/r")),
+            "under-cap marker must still resolve the main checkout"
+        );
+
+        let oversized = root.join("git-blob");
+        let mut blob = String::from("gitdir: /work/r/.git/worktrees/w\n");
+        blob.push_str(&"x".repeat(8 * 1024));
+        fs::write(&oversized, blob).expect("write blob marker");
+        assert_eq!(
+            worktree_main_root(&oversized),
+            None,
+            "over-cap marker must be refused on the bounded read"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

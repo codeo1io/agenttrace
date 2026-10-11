@@ -375,8 +375,14 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
 
     let npm_state = if fetch {
         match npm_registry_version() {
-            Some(version) => format!("{NPM_PACKAGE}@{version} (registry)"),
-            None => "unavailable (registry probe failed or curl absent)".to_string(),
+            NpmRegistryProbe::Version(version) => format!("{NPM_PACKAGE}@{version} (registry)"),
+            NpmRegistryProbe::Oversized => format!(
+                "unavailable (registry response over the {} MiB read cap — skipped, not read whole)",
+                NPM_REGISTRY_MAX_BYTES / (1024 * 1024)
+            ),
+            NpmRegistryProbe::Failed => {
+                "unavailable (registry probe failed or curl absent)".to_string()
+            }
         }
     } else {
         "unknown (offline; agenttrace --fetch upstream)".to_string()
@@ -561,19 +567,134 @@ fn mtime_age(path: &std::path::Path) -> Option<u64> {
         .map(|age| age.as_secs())
 }
 
-/// npm registry probe behind `--fetch` only. Degrades to `None` (never
-/// fails the report) when curl is absent or the registry answers badly.
-fn npm_registry_version() -> Option<String> {
-    let output = Command::new("curl")
-        .args(["-fsSL", "--max-time", "15", NPM_REGISTRY_URL])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// npm registry probe behind `--fetch` only. Degrades to a FAILED
+/// state (never fails the report) when curl is absent or the registry
+/// answers badly. rm-959: the response body is size-bounded on BOTH
+/// legs — curl gets `--max-filesize` (exit 63 when the registry
+/// declares a larger Content-Length), and stdout is read through the
+/// bounded stream reader (`read_stream_up_to`, review-fix F4), so even
+/// a chunked response that eludes the pre-flight is cut at the cap
+/// instead of being buffered whole into memory. An oversized registry
+/// document is skipped-and-disclosed, never read whole. The state
+/// lands verbatim in `npm_state` so the report tells the three
+/// outcomes apart.
+enum NpmRegistryProbe {
+    Version(String),
+    Oversized,
+    Failed,
+}
+
+/// rm-959: read cap for the npm registry document. The real document
+/// is a few hundred KiB; 8 MiB is generous headroom while keeping the
+/// probe's memory bounded against a hostile or broken registry.
+const NPM_REGISTRY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// curl exit code when `--max-filesize` trips.
+const CURL_EXIT_FILESIZE_EXCEEDED: i32 = 63;
+
+/// rm-959 review-fix F4 (run 514cf6cb attempt deb20c30): bounded
+/// reader for the registry probe's stdout. `Command::output()` buffers
+/// the ENTIRE stream before any length check, so a chunked response
+/// (no Content-Length — the case `--max-filesize` cannot pre-flight)
+/// was read whole into memory and only then skipped, contradicting the
+/// probe's own "skipped, not read whole" disclosure and the batch's
+/// PR-2 (no `.output()` on the fetch path without a size cap). This
+/// reader holds at most `cap` bytes plus one 64 KiB chunk: it returns
+/// `Some(body)` when the stream ended within the cap (body.len() <=
+/// cap) and `None` the moment the running total exceeds it, so the
+/// caller can kill the child and disclose the skip.
+fn read_stream_up_to<R: std::io::Read>(
+    reader: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(Some(body));
+        }
+        body.extend_from_slice(&chunk[..read]);
+        if body.len() > cap {
+            return Ok(None);
+        }
     }
-    let body =
-        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&output.stdout)).ok()?;
-    body.get("version")?.as_str().map(str::to_string)
+}
+
+fn npm_registry_version() -> NpmRegistryProbe {
+    // rm-959 review-fix F4: stdout is piped and read through the
+    // bounded reader — curl's whole output is never buffered, so the
+    // skip disclosure is literally true even for chunked responses
+    // that elude `--max-filesize`'s Content-Length pre-flight (which
+    // stays as the first leg, exit 63; `parse_npm_registry_body`'s
+    // boundary check stays as the unit-tested belt-and-braces).
+    let child = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "15",
+            "--max-filesize",
+            &NPM_REGISTRY_MAX_BYTES.to_string(),
+            NPM_REGISTRY_URL,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(_) => return NpmRegistryProbe::Failed,
+    };
+    let bounded = child
+        .stdout
+        .take()
+        .map(|mut stdout| read_stream_up_to(&mut stdout, NPM_REGISTRY_MAX_BYTES));
+    let body = match bounded {
+        Some(Ok(Some(body))) => body,
+        // Stream ran over the cap mid-read: kill curl (its write side
+        // would otherwise block forever on the full pipe) and take the
+        // skip-with-disclosure path.
+        Some(Ok(None)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return NpmRegistryProbe::Oversized;
+        }
+        Some(Err(_)) | None => {
+            let _ = child.wait();
+            return NpmRegistryProbe::Failed;
+        }
+    };
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(_) => return NpmRegistryProbe::Failed,
+    };
+    if !status.success() {
+        // curl exit 63 = `--max-filesize` exceeded: the registry answer
+        // is over the cap, which is a skip-with-disclosure, not a probe
+        // failure.
+        return if status.code() == Some(CURL_EXIT_FILESIZE_EXCEEDED) {
+            NpmRegistryProbe::Oversized
+        } else {
+            NpmRegistryProbe::Failed
+        };
+    }
+    parse_npm_registry_body(&body)
+}
+
+/// Body half of the probe, split out so the cap and the version
+/// extraction are unit-testable without curl or the network.
+fn parse_npm_registry_body(body: &[u8]) -> NpmRegistryProbe {
+    if body.len() > NPM_REGISTRY_MAX_BYTES {
+        return NpmRegistryProbe::Oversized;
+    }
+    let parsed = serde_json::from_slice::<serde_json::Value>(body);
+    match parsed
+        .ok()
+        .and_then(|value| value.get("version").cloned())
+        .and_then(|version| version.as_str().map(str::to_string))
+    {
+        Some(version) => NpmRegistryProbe::Version(version),
+        None => NpmRegistryProbe::Failed,
+    }
 }
 
 fn age_phrase(seconds: Option<u64>) -> String {
@@ -707,6 +828,82 @@ fn short(sha: &str, len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stream_reader_stops_at_the_cap_instead_of_buffering_whole_review_f4() {
+        // rm-959 review-fix F4 (run 514cf6cb attempt deb20c30): the
+        // probe used `Command::output()`, which collects curl's ENTIRE
+        // stdout before any length check — a hostile chunked registry
+        // answer (no Content-Length, the case `--max-filesize` cannot
+        // pre-flight) was buffered whole into memory and only then
+        // skipped. The bounded stream reader must stop at the cap and
+        // report the overflow instead of ever holding more than
+        // cap + one chunk.
+        let cap = 16;
+        let under: Vec<u8> = b"0123456789abcdef".to_vec();
+        let mut reader = std::io::Cursor::new(under.clone());
+        assert_eq!(
+            read_stream_up_to(&mut reader, cap).expect("under-cap stream reads clean"),
+            Some(under),
+            "a stream that ends exactly AT the cap is within it, not over"
+        );
+
+        let over: Vec<u8> = vec![b'x'; cap + 1];
+        let mut reader = std::io::Cursor::new(over);
+        assert_eq!(
+            read_stream_up_to(&mut reader, cap).expect("over-cap stream reads clean"),
+            None,
+            "a stream one byte over the cap must report overflow, not the buffer"
+        );
+
+        let mut reader = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            read_stream_up_to(&mut reader, cap).expect("empty stream reads clean"),
+            Some(Vec::new()),
+            "an empty stream is a capped read of zero bytes, not an error"
+        );
+    }
+
+    #[test]
+    fn npm_registry_body_cap_skips_and_discloses_instead_of_reading_whole() {
+        // rm-959: an oversized registry document is a skip-with-state,
+        // never a whole-body read. The cap itself stays honest: the
+        // test body is 1 byte over, so the guard is boundary-exact.
+        let mut oversized = br#"{"version":"1.2.3"}"#.to_vec();
+        let pad = NPM_REGISTRY_MAX_BYTES + 1 - oversized.len();
+        oversized.extend(std::iter::repeat_n(b' ', pad));
+        assert!(matches!(
+            parse_npm_registry_body(&oversized),
+            NpmRegistryProbe::Oversized
+        ));
+
+        // At the cap exactly (valid document, no larger): still parsed.
+        let mut at_cap = br#"{"version":"1.2.3"}"#.to_vec();
+        let pad = NPM_REGISTRY_MAX_BYTES - at_cap.len();
+        at_cap.extend(std::iter::repeat_n(b' ', pad));
+        assert!(matches!(
+            parse_npm_registry_body(&at_cap),
+            NpmRegistryProbe::Version(ref v) if v == "1.2.3"
+        ));
+    }
+
+    #[test]
+    fn npm_registry_body_version_extraction_and_failure_classes() {
+        // The happy path and the two failure classes that are NOT the
+        // cap: garbage body and a body without a version field.
+        assert!(matches!(
+            parse_npm_registry_body(br#"{"version":"0.9.1"}"#),
+            NpmRegistryProbe::Version(ref v) if v == "0.9.1"
+        ));
+        assert!(matches!(
+            parse_npm_registry_body(b"not json at all"),
+            NpmRegistryProbe::Failed
+        ));
+        assert!(matches!(
+            parse_npm_registry_body(br#"{"no":"version field"}"#),
+            NpmRegistryProbe::Failed
+        ));
+    }
     use super::*;
 
     #[test]

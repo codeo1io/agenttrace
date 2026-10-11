@@ -13,6 +13,25 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 /// values have already been summed.
 type ParseCounters = Vec<(String, i64)>;
 
+/// rm-700: whole-file read cap for one session file, applied by
+/// `parse_file` BEFORE the read for every file-shaped entry — which
+/// covers discovery's parallel parse lane (its workers call
+/// `parse_file`) — and applied inside `parse_cline_task_dir` for the
+/// cline task-DIR member files, which reach the parser through the
+/// two delegations at the top of `parse_file` and therefore never
+/// see the file-shaped gate (review-fix F2, run 514cf6cb attempt
+/// deb20c30). Either way an over-cap file refuses loudly through
+/// the rm-835 parse-failure channel instead of being read whole. A
+/// session file over this is treated as corrupt-or-foreign.
+pub const SESSION_FILE_READ_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// rm-700: the parse_file size gate as a pure predicate, so its
+/// boundary (strictly greater than the cap) is unit-testable without
+/// materializing a 128 MiB file.
+fn session_file_over_read_cap(size: u64) -> bool {
+    size > SESSION_FILE_READ_MAX_BYTES
+}
+
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
@@ -23,6 +42,19 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
                 return Ok(session);
             }
         }
+    }
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("stat session file {}", path.display()))?
+        .len();
+    if session_file_over_read_cap(size) {
+        // rm-700: cap is stat-gated BEFORE the read, so the refusal
+        // costs one stat, not a whole-file allocation.
+        bail!(
+            "session file {} is {} bytes, over the {} MiB session-file read cap; refusing to read it whole",
+            path.display(),
+            size,
+            SESSION_FILE_READ_MAX_BYTES / (1024 * 1024)
+        );
     }
     let raw =
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
@@ -70,7 +102,7 @@ pub fn parse_stdin_bytes(raw: Vec<u8>) -> anyhow::Result<Session> {
 }
 
 fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
-    let metadata = read_json_value(&dir.join("task_metadata.json")).unwrap_or(Value::Null);
+    let metadata = read_json_value_capped(&dir.join("task_metadata.json"))?.unwrap_or(Value::Null);
     let model = metadata
         .as_object()
         .map(cline_model)
@@ -78,14 +110,14 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
     let mut events = Vec::new();
     let mut seen = BTreeSet::new();
 
-    if let Some(raw) = read_json_value(&dir.join("api_conversation_history.json")) {
+    if let Some(raw) = read_json_value_capped(&dir.join("api_conversation_history.json"))? {
         if let Some(api_events) = parse_cline_value(&raw, &model) {
             for event in api_events {
                 append_cline_event(&mut events, &mut seen, event);
             }
         }
     }
-    if let Some(raw) = read_json_value(&dir.join("ui_messages.json")) {
+    if let Some(raw) = read_json_value_capped(&dir.join("ui_messages.json"))? {
         for event in parse_cline_ui_messages(&raw, &model) {
             append_cline_event(&mut events, &mut seen, event);
         }
@@ -374,8 +406,20 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if let Some(value) = parsed_value {
-        if let Some(events) = parse_opencode_storage_value(path, &value) {
-            return session_from_events(name, path, events);
+        if let Some((events, oversize_skipped)) = parse_opencode_storage_value(path, &value) {
+            let mut session = session_from_events(name, path, events)?;
+            if oversize_skipped > 0 {
+                // rm-959: storage records over the per-record read cap
+                // are skipped, never read whole — and the skip rides the
+                // session's disclosed-facts channel so a warm corpus
+                // says what it left unread.
+                session
+                    .metrics
+                    .disclosure_counters
+                    .entry("opencode_records_oversize_skipped".to_string())
+                    .or_insert(oversize_skipped);
+            }
+            return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
             return session_from_events(name, path, events);
@@ -5474,7 +5518,7 @@ struct OpenCodeRecord {
     doc: Map<String, Value>,
 }
 
-fn parse_opencode_storage_value(path: &str, value: &Value) -> Option<Vec<Event>> {
+fn parse_opencode_storage_value(path: &str, value: &Value) -> Option<(Vec<Event>, usize)> {
     let doc = value.as_object()?;
     if !is_opencode_storage_session_doc(path, doc) {
         return None;
@@ -5532,14 +5576,23 @@ fn rel_from_root(root: &Path, path: &Path) -> Option<String> {
 fn parse_opencode_storage_session(
     path: &str,
     session: &Map<String, Value>,
-) -> anyhow::Result<Vec<Event>> {
+) -> anyhow::Result<(Vec<Event>, usize)> {
     let session_id = string(session.get("id")).unwrap_or("");
     if session_id.is_empty() {
         bail!("opencode: missing session id");
     }
     let storage_root = opencode_storage_root_from_session_file(path)
         .with_context(|| format!("opencode: unsupported storage path {path}"))?;
-    let mut messages = read_opencode_records(&storage_root.join("message").join(session_id));
+    // rm-959: every auxiliary read under the storage tree is
+    // size-stat-gated per record; skipped records are counted and the
+    // count rides the session's disclosure counters (merged onto the
+    // session in `parse_raw_session`) — a hostile or corrupt blob in
+    // the tree can no longer make the loader read it whole.
+    let mut oversize_skipped = 0usize;
+    let mut messages = read_opencode_records(
+        &storage_root.join("message").join(session_id),
+        &mut oversize_skipped,
+    );
     if messages.is_empty() {
         bail!("opencode: no messages found for session {}", session_id);
     }
@@ -5556,8 +5609,13 @@ fn parse_opencode_storage_session(
             }
         }
         let message_had_usage = add_opencode_tokens(&mut usage, msg.doc.get("tokens"));
-        let (events, part_usage) =
-            parse_opencode_message(&storage_root, &msg.doc, &model, message_had_usage);
+        let (events, part_usage) = parse_opencode_message(
+            &storage_root,
+            &msg.doc,
+            &model,
+            message_had_usage,
+            &mut oversize_skipped,
+        );
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
@@ -5580,7 +5638,7 @@ fn parse_opencode_storage_session(
         });
     }
     events.extend(body);
-    Ok(events)
+    Ok((events, oversize_skipped))
 }
 
 fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
@@ -5594,7 +5652,22 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn read_opencode_records(dir: &Path) -> Vec<OpenCodeRecord> {
+/// rm-959: per-record read cap for opencode storage documents
+/// (session info / message / part JSON), stat-gated at every read
+/// site (record walk + fork-parent probe). Real records are
+/// KB-scale; 32 MiB is generous headroom while keeping one hostile
+/// blob from bounding the loader's memory. Over-cap records are
+/// skipped and counted (the count rides the session's disclosure
+/// counters), never read whole.
+///
+/// rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): `pub` +
+/// re-exported from the crate root so the discovery-contract
+/// integration tests can pin the fork-probe refusal at the exact
+/// cap boundary (the walk-level disclosure test lives there), the
+/// same discipline as `SESSION_FILE_READ_MAX_BYTES`.
+pub const OPENCODE_RECORD_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_opencode_records(dir: &Path, oversize_skipped: &mut usize) -> Vec<OpenCodeRecord> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -5602,6 +5675,13 @@ fn read_opencode_records(dir: &Path) -> Vec<OpenCodeRecord> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() > OPENCODE_RECORD_MAX_BYTES {
+            *oversize_skipped += 1;
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -5629,11 +5709,13 @@ fn parse_opencode_message(
     msg: &Map<String, Value>,
     model: &str,
     message_had_usage: bool,
+    oversize_skipped: &mut usize,
 ) -> (Vec<Event>, BTreeMap<String, i64>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
     let msg_id = string(msg.get("id")).unwrap_or("");
-    let mut parts = read_opencode_records(&storage_root.join("part").join(msg_id));
+    let mut parts =
+        read_opencode_records(&storage_root.join("part").join(msg_id), oversize_skipped);
     sort_opencode_records(&mut parts);
 
     let mut events = Vec::new();
@@ -6915,6 +6997,29 @@ fn read_json_value(path: &Path) -> Option<Value> {
     serde_json::from_str(&raw).ok()
 }
 
+/// rm-700 review-fix F2 (run 514cf6cb attempt deb20c30): the capped
+/// twin of [`read_json_value`] for cline task-dir member files. The
+/// cline lane is reached through delegations that PRECEDE
+/// `parse_file`'s admission gate, so its member reads carry their own
+/// stat-gate under the same `SESSION_FILE_READ_MAX_BYTES` limit: an
+/// over-cap member refuses loudly (bails with the same message shape
+/// as the file-shaped gate) instead of being read whole; a missing or
+/// unparsable member still reads as absent, exactly as before.
+fn read_json_value_capped(path: &Path) -> anyhow::Result<Option<Value>> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(None);
+    };
+    if session_file_over_read_cap(meta.len()) {
+        bail!(
+            "session file {} is {} bytes, over the {} MiB session-file read cap; refusing to read it whole",
+            path.display(),
+            meta.len(),
+            SESSION_FILE_READ_MAX_BYTES / (1024 * 1024)
+        );
+    }
+    Ok(read_json_value(path))
+}
+
 fn cline_model(metadata: &Map<String, Value>) -> String {
     for key in ["model", "modelId", "model_id", "apiModelId"] {
         if let Some(model) = string(metadata.get(key)) {
@@ -7967,6 +8072,196 @@ mod tests {
             findings.iter().all(|finding| finding.kind != "latency"),
             "a fully-paired flat transcript must not escalate a latency finding"
         );
+    }
+
+    #[test]
+    fn oversized_session_file_is_refused_on_stat_before_the_read_rm700() {
+        // rm-700: `parse_file` used to read ANY file whole before
+        // rejecting it — a corrupt or foreign multi-hundred-MiB blob in
+        // the corpus meant a matching allocation. The cap is stat-gated
+        // BEFORE the read (sparse file: physical cost is one extent,
+        // so the test exercises the guard, not the allocator) and the
+        // refusal names the cap.
+        //
+        // Boundary exactness (AT the cap must not trip the guard) is
+        // pinned on the pure predicate below instead of on a real
+        // 128 MiB file: parsing an admitted at-cap file is a ~40s CPU
+        // walk in the current parser (measured live), which would make
+        // this one test dominate the suite. That walk is pre-existing
+        // parser behavior, out of this row's scope.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm700-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("oversize.jsonl");
+        fs::write(&file, b"{}\n").expect("seed sparse file");
+        let handle = fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open sparse file");
+        handle
+            .set_len(SESSION_FILE_READ_MAX_BYTES + 1)
+            .expect("extend over cap");
+        drop(handle);
+
+        let err = parse_file(&file).expect_err("over-cap file must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("session-file read cap"),
+            "refusal must name the read cap, got: {message}"
+        );
+        assert!(
+            message.contains("128 MiB"),
+            "refusal must state the cap size, got: {message}"
+        );
+
+        // Boundary exactness on the predicate itself: strictly greater
+        // than the cap refuses; at the cap and below does not.
+        assert!(session_file_over_read_cap(SESSION_FILE_READ_MAX_BYTES + 1));
+        assert!(!session_file_over_read_cap(SESSION_FILE_READ_MAX_BYTES));
+        assert!(!session_file_over_read_cap(0));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cline_task_dir_member_files_are_capped_rm700_review_f2() {
+        // rm-700 review-fix F2 (run 514cf6cb attempt deb20c30): the
+        // cline task-dir lane reaches `parse_cline_task_dir` through
+        // the two delegations at the top of `parse_file`, BEFORE the
+        // file-shaped admission gate — its member reads (api/
+        // ui/metadata json) must carry their own cap or a hostile
+        // multi-hundred-MiB blob parked as api_conversation_history.json
+        // is read whole again. Sparse files: the test exercises the
+        // stat gate, not the allocator (same discipline as the rm-700
+        // file-shaped pin above).
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm700f2-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        for member in ["api_conversation_history.json", "ui_messages.json"] {
+            let dir = root.join(member);
+            fs::create_dir_all(&dir).expect("create cline task dir");
+            fs::write(
+                dir.join("task_metadata.json"),
+                r#"{"id":"t-1","sessionType":"task"}"#,
+            )
+            .expect("seed metadata");
+            let file = dir.join(member);
+            fs::write(&file, b"[]\n").expect("seed sparse member");
+            let handle = fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open sparse member");
+            handle
+                .set_len(SESSION_FILE_READ_MAX_BYTES + 1)
+                .expect("extend over cap");
+            drop(handle);
+
+            // Directory-shaped entry: discovery feeds cline task dirs
+            // straight into parse_file, so this is the lane the review
+            // finding drove.
+            let err = parse_file(&dir)
+                .expect_err("over-cap member must refuse the whole task dir");
+            let message = err.to_string();
+            assert!(
+                message.contains("session-file read cap"),
+                "refusal must name the read cap, got: {message}"
+            );
+            assert!(
+                message.contains("128 MiB"),
+                "refusal must state the cap size, got: {message}"
+            );
+
+            // File-shaped entry with a cline task-file name: the
+            // delegation's failure must not swallow the cap — either
+            // the delegation refuses or the parse_file gate does (the
+            // cline-named file itself is over cap here, so the gate
+            // fires on the fall-through).
+            let named = dir.join(member);
+            let err = parse_file(&named)
+                .expect_err("over-cap cline-named file must refuse");
+            assert!(
+                err.to_string().contains("session-file read cap"),
+                "file-shaped refusal must name the read cap, got: {err}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opencode_oversize_records_are_skipped_and_disclosed_rm959() {
+        // rm-959: the opencode lane reads auxiliary storage records
+        // (message/part JSON) AFTER the session document was admitted;
+        // one oversized record used to be read whole. Records over the
+        // per-record cap are now skipped on stat and the skip count
+        // rides the session's disclosure counters — the session still
+        // parses from its healthy records.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm959-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        // The storage-root marker is path-shape based, so a temp dir
+        // named .../opencode/storage/session/se/ is enough — no env
+        // vars (tests run in parallel).
+        let storage = root.join("opencode").join("storage");
+        let session_dir = storage.join("session").join("se");
+        let message_dir = storage.join("message").join("sess-1");
+        let part_dir = storage.join("part").join("msg-1");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        fs::create_dir_all(&part_dir).expect("create part dir");
+
+        let session_file = session_dir.join("sess-1.json");
+        fs::write(
+            &session_file,
+            r#"{"id":"sess-1","projectID":"proj-1","time":{"created":"2026-01-02T03:04:05Z"}}"#,
+        )
+        .expect("write session doc");
+        // Healthy message + part: the session must parse from these.
+        fs::write(
+            message_dir.join("msg-1.json"),
+            r#"{"id":"msg-1","role":"assistant","time":{"created":"2026-01-02T03:04:06Z"}}"#,
+        )
+        .expect("write healthy message");
+        fs::write(
+            part_dir.join("part-1.json"),
+            r#"{"type":"text","text":"hello"}"#,
+        )
+        .expect("write healthy part");
+        // Oversize SIBLING message record: sparse, so the physical cost
+        // is one extent — the test pins the stat gate, not allocation.
+        let blob = message_dir.join("msg-2.json");
+        fs::write(&blob, b"{}").expect("seed sparse record");
+        let handle = fs::File::options()
+            .write(true)
+            .open(&blob)
+            .expect("open sparse record");
+        handle
+            .set_len(OPENCODE_RECORD_MAX_BYTES + 1)
+            .expect("extend record over cap");
+        drop(handle);
+
+        let parsed =
+            parse_file(&session_file).expect("session must still parse from its healthy records");
+        assert_eq!(
+            parsed.metrics.source_tool, "opencode",
+            "healthy records still classify opencode"
+        );
+        assert_eq!(
+            parsed
+                .metrics
+                .disclosure_counters
+                .get("opencode_records_oversize_skipped"),
+            Some(&1),
+            "the skipped oversize record must be disclosed on the session's counter channel"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

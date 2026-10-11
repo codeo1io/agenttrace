@@ -65,7 +65,7 @@ error naming the cap, and the messages after it still answer.
 
 | Method | Answers |
 | --- | --- |
-| `initialize` | `serverInfo`, `capabilities.tools`, echoes the client's `protocolVersion` |
+| `initialize` | `serverInfo`, `capabilities.tools`; negotiates `protocolVersion` — requests inside the supported set (`2024-11-05`, `2025-03-26`, `2025-06-18`) echo verbatim, anything else is answered with the newest supported revision plus a stderr note naming the downgrade |
 | `notifications/initialized` | silence (notifications are never answered) |
 | `ping` | `{}` |
 | `tools/list` | the two tools below |

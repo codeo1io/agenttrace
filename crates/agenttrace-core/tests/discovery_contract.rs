@@ -3767,6 +3767,117 @@ fn doctor_inventory_applies_the_fork_filter_and_discloses_it() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn over_cap_fork_probe_is_counted_and_disclosed_not_silent_review_f3() {
+    // rm-959 review-fix F3 (run 514cf6cb attempt deb20c30): an info
+    // doc over the record cap is never read whole — but the probe
+    // used to return plain None for it, silently treating that
+    // session as a NON-fork. Acceptance (a) ("never a silent drop,
+    // disclosed through a counter") is now met on this site too: the
+    // over-cap refusal rides a counter surfaced as
+    // `opencode_fork_probe_over_cap` (loader lane field + doctor
+    // disclosures), while the session itself STAYS in aggregation —
+    // over-cap is corrupt-or-foreign, not proof of fork-ness.
+    let root = temp_root("agenttrace-opencode-fork-probe-overcap");
+    let home = root.join("home");
+    let _storage = seed_opencode_storage_forks(&home);
+
+    let info = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("storage")
+        .join("session")
+        .join("info");
+    let huge = info.join("ses-huge.json");
+    fs::write(&huge, b"{\"id\":\"ses-huge\"}\n").expect("seed info doc");
+    let handle = fs::File::options()
+        .write(true)
+        .open(&huge)
+        .expect("open info doc");
+    handle
+        .set_len(agenttrace_core::OPENCODE_RECORD_MAX_BYTES + 1)
+        .expect("extend over cap");
+    drop(handle);
+    // A parseable message + part so the session lands in aggregation.
+    let message = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("storage")
+        .join("message")
+        .join("ses-huge");
+    fs::create_dir_all(&message).expect("create message dir");
+    fs::write(
+        message.join("m4.json"),
+        r#"{"id":"m4","sessionID":"ses-huge","role":"user","modelID":"claude-sonnet-4-5","time":{"created":1780000300000}}"#,
+    )
+    .expect("write message record");
+    let part_dir = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("storage")
+        .join("part")
+        .join("m4");
+    fs::create_dir_all(&part_dir).expect("create part dir");
+    fs::write(
+        part_dir.join("p4.json"),
+        r#"{"id":"p4","type":"text","text":"huge info doc session"}"#,
+    )
+    .expect("write part record");
+
+    with_home(&home, || {
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.opencode_fork_excluded, 1,
+            "the true fork stays the only exclusion"
+        );
+        assert_eq!(
+            report.opencode_fork_probe_over_cap, 1,
+            "the over-cap probe refusal must be counted, never silent"
+        );
+        let stems: Vec<String> = report
+            .sessions
+            .iter()
+            .map(|session| {
+                session
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(".json")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            stems,
+            vec!["ses-other".to_string(), "ses-parent".to_string()],
+            "the over-cap info doc is refused on BOTH legs — the probe (disclosed above) and the record cap at parse (the session has zero readable records, so it is skipped via the rm-835 channel, not silently misfiled as a fork-exclusion)"
+        );
+
+        // Warm leg: the fingerprint memo must never swallow the count —
+        // an over-cap probe skips the memo entirely, so cold and warm
+        // runs disclose identically (the memo would otherwise cache
+        // it as a non-fork and hide the refusal on the second run).
+        let warm = load_sessions_with_progress(None, &LoadOptions::default(), |_| {});
+        assert_eq!(
+            warm.opencode_fork_probe_over_cap, 1,
+            "warm run must disclose the over-cap probe identically"
+        );
+
+        // Doctor lane mirrors the disclosure through the same key.
+        let doctor = build_doctor_report(None, false);
+        assert_eq!(
+            doctor.disclosures.get("opencode_fork_probe_over_cap"),
+            Some(&1),
+            "doctor must disclose the over-cap probe like the loader lane"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn seed_opencode_fork_db(home: &std::path::Path) {
     let db_path = home
         .join(".local")

@@ -2561,9 +2561,10 @@ fn side_effect_early_exits_do_not_swallow_coadjacent_actions() {
     // one shared helper now, pinned here across the acceptance matrix
     // {--clear-cache} x {doctor, list-models, test-match,
     // statusline-report, budget, report verbs}. The --update-pricing
-    // guard shares the same helper; its e2e lane is network-bound
-    // (pricing.rs downloads from LiteLLM), so it is pinned by the
-    // `has_followup_action` unit matrix in main.rs instead.
+    // guard shares the same helper; the sibling combo leg for it is
+    // pinned offline at the tail of this test via a proxy env poison
+    // (rm-301 residual, assess 2495 A1), with the unit matrix in
+    // main.rs covering the guard predicates themselves.
     let sandbox = std::env::temp_dir().join(format!(
         "agenttrace-rm301-matrix-{}-{:?}",
         std::process::id(),
@@ -2655,6 +2656,57 @@ fn side_effect_early_exits_do_not_swallow_coadjacent_actions() {
         "Session cache cleared.",
         "--clear-cache alone keeps the clear-and-exit contract"
     );
+
+    // rm-301 residual (assess 2495 A1, run 514cf6cb cycle 1): the
+    // SIBLING side effect. `--clear-cache --update-pricing` announced
+    // the clear and returned Ok before the pricing arm could run —
+    // rc0, stderr empty, the update silently dropped in either flag
+    // order. The pricing half is network-bound (LiteLLM download), so
+    // this leg pins it OFFLINE-deterministically: the proxy env poison
+    // points the HTTP client at an unbound local port, which fails
+    // instantly and LOUDLY (verified live: `Error: download failed:
+    // io: Connection refused` in 8ms). The contract under test is the
+    // batch acceptance's disjunction: run BOTH side effects or refuse
+    // loudly — never rc0 with the update dropped. The load-bearing
+    // assert is the "Downloading pricing" announcement: on the
+    // pre-fix guard that line never happens, in any environment.
+    let sibling = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .env("HOME", &sandbox)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .args(["--clear-cache", "--update-pricing"])
+        .output()
+        .expect("run agenttrace CLI");
+    let sibling_out = String::from_utf8_lossy(&sibling.stdout);
+    let sibling_err = String::from_utf8_lossy(&sibling.stderr);
+    assert!(
+        sibling_out
+            .trim_start()
+            .starts_with("Session cache cleared."),
+        "the clear still runs and still announces FIRST in the combo: {sibling_out:?}"
+    );
+    assert!(
+        sibling_err.contains("Downloading pricing from LiteLLM..."),
+        "rm-301 residual: the pricing arm must RUN after the clear — \
+         rc {:?}, stdout {sibling_out:?}, stderr {sibling_err:?}",
+        sibling.status.code()
+    );
+    if sibling.status.success() {
+        assert!(
+            sibling_out.contains("Loaded"),
+            "rc0 requires BOTH side effects to have run: {sibling_out:?}"
+        );
+    } else {
+        assert!(
+            sibling_err.contains("download failed"),
+            "a failed combo must refuse LOUDLY, not exit rc0-silent: \
+             rc {:?}, stderr {sibling_err:?}",
+            sibling.status.code()
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
