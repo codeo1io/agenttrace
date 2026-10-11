@@ -853,7 +853,10 @@ fn capture_opencode_user_text(
     // storage-class semantics — NULL first, then numeric values, then
     // wrong-typed TEXT/BLOB (sqlite_value_asc_rank) — where the lenient
     // i64 converter used to degrade wrong-typed values into the NULL
-    // bucket; ties break by rowid.
+    // bucket; ties break by rowid. rm-975: the parity is now complete
+    // — REAL keeps its fraction (no i64 truncation) and TEXT ranks
+    // lexically inside its own class, so the selection matches
+    // `order by time_created` exactly.
     let Ok(mut stmt) = db.prepare(
         "select p.session_id, p.data, m.data, p.time_created, p.rowid from part p \
          join message m on p.message_id = m.id",
@@ -871,7 +874,7 @@ fn capture_opencode_user_text(
     }) else {
         return;
     };
-    let mut earliest: HashMap<String, ((i32, i64), i64, String)> = HashMap::new();
+    let mut earliest: HashMap<String, (SqliteAscRank, i64, String)> = HashMap::new();
     for row in rows {
         let (session_id, part_raw, message_raw, time_created, rowid) = match row {
             Ok(quint) => quint,
@@ -900,7 +903,9 @@ fn capture_opencode_user_text(
         }
         let better = match earliest.get(&session_id) {
             None => true,
-            Some((best_time, best_rowid, _)) => (time_created, rowid) < (*best_time, *best_rowid),
+            Some((best_time, best_rowid, _)) => {
+                time_created.is_before(rowid, best_time, *best_rowid)
+            }
         };
         if better {
             earliest.insert(session_id, (time_created, rowid, text.to_string()));
@@ -1311,23 +1316,75 @@ fn sqlite_has_column(db: &Connection, table: &str, column: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// rm-954: SQLite ASC orders NULL first, then numeric values by
-/// magnitude, then TEXT/BLOB. The lenient i64 reader folds wrong-typed
-/// values into the NULL bucket they never shared, so the earliest-part
-/// selection ranks them explicitly: NULL (0) < numeric (1) < wrong-typed
-/// (2), ties by rowid — matching what `order by time_created` would have
-/// picked instead of inverting it.
-fn sqlite_value_asc_rank(value: Option<rusqlite::types::Value>) -> (i32, i64) {
+/// rm-954 + rm-975: the ASC rank of one `part.time_created` value
+/// under SQLite's storage-class ordering — NULL first, then INTEGER
+/// and REAL together by numeric magnitude, then TEXT lexically, then
+/// BLOB by bytes; exact ties break by rowid at the call site. This is
+/// what `order by time_created` picks: rm-954 classed wrong-typed
+/// values explicitly instead of folding them into the NULL bucket the
+/// lenient i64 reader degraded them to; rm-975 completed the parity —
+/// REAL keeps its fraction (no i64 truncation: 1.2 ranks before 1.8)
+/// and numeric-LOOKING text stays TEXT (BINARY collation orders
+/// "10" < "9"; it never joins the numeric class).
+///
+/// The numeric key is f64: SQLite compares INTEGER and REAL exactly,
+/// and every i64 is exact in f64 through 2^53 — far above any epoch
+/// seconds or milliseconds timestamp a real corpus carries. (SQLite
+/// storage cannot hold a NaN REAL — it writes NULL — so the
+/// partial-comparison fallback never fires on stored data.)
+#[derive(Debug)]
+enum SqliteAscRank {
+    Null,
+    Number(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl SqliteAscRank {
+    /// Storage-class order, then in-class magnitude: NULL < numeric <
+    /// TEXT < BLOB; numerics by magnitude, TEXT/BLOB byte-lexically
+    /// (SQLite's default BINARY collation).
+    fn class_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn class(rank: &SqliteAscRank) -> i32 {
+            match rank {
+                SqliteAscRank::Null => 0,
+                SqliteAscRank::Number(_) => 1,
+                SqliteAscRank::Text(_) => 2,
+                SqliteAscRank::Blob(_) => 3,
+            }
+        }
+        match class(self).cmp(&class(other)) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+        match (self, other) {
+            (SqliteAscRank::Number(a), SqliteAscRank::Number(b)) => {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (SqliteAscRank::Text(a), SqliteAscRank::Text(b)) => a.as_str().cmp(b.as_str()),
+            (SqliteAscRank::Blob(a), SqliteAscRank::Blob(b)) => a.as_slice().cmp(b.as_slice()),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Full earliest-part selection key: class and magnitude first,
+    /// rowid breaking exact ties (rowid is unique, so the resulting
+    /// order is total — `order by time_created, rowid` picks this
+    /// part).
+    fn is_before(&self, rowid: i64, other: &Self, other_rowid: i64) -> bool {
+        self.class_cmp(other).then_with(|| rowid.cmp(&other_rowid)) == std::cmp::Ordering::Less
+    }
+}
+
+fn sqlite_value_asc_rank(value: Option<rusqlite::types::Value>) -> SqliteAscRank {
     use rusqlite::types::Value as SqliteValue;
     match value {
-        None => (0, 0),
-        Some(SqliteValue::Integer(number)) => (1, number),
-        Some(SqliteValue::Real(number)) => (1, number as i64),
-        Some(SqliteValue::Text(text)) => match text.parse::<i64>() {
-            Ok(number) => (1, number),
-            Err(_) => (2, 0),
-        },
-        Some(_) => (2, 0),
+        None => SqliteAscRank::Null,
+        Some(SqliteValue::Null) => SqliteAscRank::Null,
+        Some(SqliteValue::Integer(number)) => SqliteAscRank::Number(number as f64),
+        Some(SqliteValue::Real(number)) => SqliteAscRank::Number(number),
+        Some(SqliteValue::Text(text)) => SqliteAscRank::Text(text),
+        Some(SqliteValue::Blob(bytes)) => SqliteAscRank::Blob(bytes),
     }
 }
 

@@ -2535,19 +2535,31 @@ fn group_items(groups: &BTreeMap<String, GroupOverview>, agent_display: bool) ->
                 .then_with(|| string_value(a, "name").cmp(&string_value(b, "name")))
         });
     } else {
-        items.sort_by(|a, b| {
-            number_value(b, "cost")
-                .partial_cmp(&number_value(a, "cost"))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    number_value(b, "sessions")
-                        .partial_cmp(&number_value(a, "sessions"))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| string_value(a, "name").cmp(&string_value(b, "name")))
-        });
+        // rm-974: shared with the MCP `by_model_breakdown` tool so the
+        // section and the tool that mirrors it agree on tie-broken
+        // order.
+        items.sort_by(compare_by_model_rows);
     }
     items
+}
+
+/// rm-974: the tie-broken ordering of the overview's `by_model`
+/// section — cost-descending, then sessions-descending, then
+/// name-ascending — applied to the rendered `{name, sessions, cost}`
+/// rows. The MCP `by_model_breakdown` tool mirrors this section and
+/// applies this exact comparator so the two surfaces agree whenever
+/// models tie on cost (equal-cost models then differ by session
+/// count before name, not name alone).
+pub fn compare_by_model_rows(a: &Value, b: &Value) -> std::cmp::Ordering {
+    number_value(b, "cost")
+        .partial_cmp(&number_value(a, "cost"))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| {
+            number_value(b, "sessions")
+                .partial_cmp(&number_value(a, "sessions"))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| string_value(a, "name").cmp(&string_value(b, "name")))
 }
 
 /// rm-245: per-task-type rollup entries. Keys are the fixed taxonomy
