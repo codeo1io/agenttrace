@@ -20,6 +20,7 @@
 //! explicit flag. No new crate dependencies: `git` (and optionally
 //! `curl`) run as subprocesses, so the CLI crate stays network-free.
 
+use agenttrace_core::sanitize_line_segment;
 use anyhow::bail;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -334,9 +335,15 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@zack78%2fagenttrace/
 /// One-line network disclosure for the `--fetch` path (rm-404). Lists every
 /// network touch the flag triggers, derived from the same constants the code
 /// uses, so the disclosure cannot drift from the behavior it describes.
+/// rm-979 review rider: the URL is remote-derived — a tracked repo's git
+/// config can carry hostile bytes — and stderr is a terminal render too, so
+/// it goes through the same control-byte sanitizer as the report body.
+/// `sanitize_line_segment` is the identity on every legitimate URL (RFC
+/// 3986 admits no control bytes), so the disclosure stays truthful.
 fn fetch_disclosure_line(remote_url: &str) -> String {
     format!(
-        "network: --fetch upstream is opt-in — `git fetch {remote_url}` plus one HTTPS request to {NPM_REGISTRY_URL} (see PRIVACY.md)"
+        "network: --fetch upstream is opt-in — `git fetch {remote_url}` plus one HTTPS request to {NPM_REGISTRY_URL} (see PRIVACY.md)",
+        remote_url = sanitize_line_segment(remote_url)
     )
 }
 /// Text view caps the unported commit list; JSON carries all of them.
@@ -815,6 +822,25 @@ fn age_phrase(seconds: Option<u64>) -> String {
 }
 
 impl UpstreamStatus {
+    /// Text view. rm-979 (run 1ecd791b cycle 1, minted
+    /// campaign-locally as rm-594, rebound at integration — the
+    /// landed rm-594 is the journal-derived counter-key cap row):
+    /// every free-form string that originates
+    /// OUTSIDE this machine — the remote URL, the merge-base subject,
+    /// each unported commit subject, and the registry-probed npm
+    /// state — passes through `sanitize_line_segment` at this render
+    /// boundary like every other hostile-bytes text sink in the CLI
+    /// (rm-034/rm-383 family: control bytes become U+FFFD, so a
+    /// hostile upstream commit cannot carry an OSC-52 clipboard write
+    /// or CSI sequence onto the operator's terminal). Strings git
+    /// itself constrains stay raw: `remote`/`ref_name` come from
+    /// operator config (`UPSTREAM_REMOTE`/`UPSTREAM_REF`), `base_date`
+    /// is `--format=%cs`, release tags are ref names (git's ref format
+    /// forbids control bytes), and areas come from the static
+    /// `classify_area` table. The JSON view deliberately skips the
+    /// sanitizer — serde escaping already encodes control bytes
+    /// losslessly (`\u001b`) — and its keys are append-only, per the
+    /// documented schema.
     fn to_text(&self) -> String {
         let mode = if self.fetched {
             "post-fetch"
@@ -827,7 +853,9 @@ impl UpstreamStatus {
         );
         out.push_str(&format!(
             "  upstream:         {}/{} ({})\n",
-            self.remote, self.ref_name, self.remote_url
+            self.remote,
+            self.ref_name,
+            sanitize_line_segment(&self.remote_url)
         ));
         match &self.local_branch {
             Some(branch) => out.push_str(&format!(
@@ -844,7 +872,7 @@ impl UpstreamStatus {
             "  last sync:        {} ({}) — {}\n",
             short(&self.merge_base, 12),
             self.base_date,
-            self.base_subject
+            sanitize_line_segment(&self.base_subject)
         ));
         out.push_str(&format!("  ahead:            {} commit(s)\n", self.ahead));
         out.push_str(&format!("  behind:           {} commit(s)\n", self.behind));
@@ -863,7 +891,7 @@ impl UpstreamStatus {
             out.push_str(&format!(
                 "    {} {}\n",
                 short(&commit.sha, 8),
-                commit.subject
+                sanitize_line_segment(&commit.subject)
             ));
         }
         if self.unported.len() > MAX_UNPORTED_LISTED {
@@ -886,7 +914,7 @@ impl UpstreamStatus {
         out.push_str(&format!(
             "  npm:              {npm_state} | running agenttrace v{}\n",
             agenttrace_core::VERSION,
-            npm_state = self.npm_state
+            npm_state = sanitize_line_segment(&self.npm_state)
         ));
         out
     }
@@ -1406,6 +1434,66 @@ mod tests {
     }
 
     #[test]
+    fn text_render_sanitizes_remote_control_bytes_json_stays_raw() {
+        // rm-979, unit replay of the assess PoC (59bc617f): a repo the
+        // user tracks as upstream can carry attacker-chosen bytes in
+        // its commit subjects and its remote URL. The PoC's two live
+        // payloads — a BEL-terminated OSC-52 clipboard write and a CSI
+        // SGR hijack — plus an OSC-8 hyperlink variant across subject
+        // and remote_url must reach the text view with every control
+        // byte neutralized (U+FFFD), while the JSON arm keeps them
+        // verbatim behind serde's lossless escaping.
+        let mut status = sample_status();
+        let osc52 = "pwn\u{1b}]52;c;aGVsbG8=\u{7}OSC52clip";
+        let csi = "\u{1b}[31mREDTEXT\u{1b}[0m CSI-sgr hijack";
+        let osc8 = "\u{1b}]8;;https://evil.example\u{1b}\\OSC8 link\u{1b}]8;;\u{7}";
+        status.remote_url = format!("https://github.com/{osc8}/agenttrace.git");
+        status.base_subject = format!("Merge pull request {osc52}");
+        status.unported[0].subject = csi.to_string();
+        status.unported.push(UpstreamCommit {
+            sha: "36cded1a".to_string(),
+            subject: osc8.to_string(),
+            files: Vec::new(),
+        });
+
+        let text = status.to_text();
+        assert!(
+            text.chars().all(|c| !c.is_control() || c == '\n'),
+            "text view must carry no control bytes besides newlines"
+        );
+        assert!(!text.contains(osc52) && !text.contains(csi) && !text.contains(osc8));
+        assert!(text.contains('\u{FFFD}'), "control bytes become U+FFFD");
+        // Printable context survives verbatim around the neutralized
+        // bytes — the sanitizer is control-byte-scoped, not textual.
+        assert!(text.contains("upstream:         upstream/master"));
+        assert!(text.contains("Merge pull request"));
+        assert!(text.contains("REDTEXT"));
+        assert!(text.contains("OSC8 link"));
+
+        // JSON arm unchanged: raw payload bytes round-trip verbatim.
+        let raw = status.to_json().expect("json");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
+        assert_eq!(value["remote_url"], status.remote_url.as_str());
+        assert_eq!(value["last_sync"]["subject"], status.base_subject.as_str());
+        assert_eq!(value["unported_commits"][0]["subject"], csi);
+        assert_eq!(value["unported_commits"][1]["subject"], osc8);
+    }
+
+    #[test]
+    fn benign_text_rendering_is_byte_stable() {
+        // rm-979 byte-stability contract: sanitize_line_segment is the
+        // identity on control-free strings, so a benign repo renders
+        // exactly the bytes it rendered before the boundary existed —
+        // the docs/guides/upstream-status.md sample output stays true.
+        let status = sample_status();
+        let text = status.to_text();
+        assert!(!text.contains('\u{FFFD}'));
+        assert!(text.contains(&format!("({})", status.remote_url)));
+        assert!(text.contains(&status.base_subject));
+        assert!(text.contains(&status.unported[0].subject));
+    }
+
+    #[test]
     fn age_phrase_scales_the_units() {
         assert_eq!(age_phrase(None), "unknown age");
         assert_eq!(age_phrase(Some(45)), "45s old");
@@ -1444,9 +1532,14 @@ mod tests {
         );
 
         // The runtime disclosure line lists both touches, derived from the
-        // same constants the fetch path uses.
+        // same constants the fetch path uses — and renders a legitimate
+        // (control-free) URL verbatim.
         let line = fetch_disclosure_line("https://github.com/example/upstream.git");
         assert!(line.contains("git fetch"), "disclosure must name git fetch");
+        assert!(
+            line.contains("git fetch https://github.com/example/upstream.git"),
+            "benign URL renders verbatim in the disclosure"
+        );
         assert!(
             line.contains(NPM_REGISTRY_URL),
             "disclosure must name the npm probe URL"
@@ -1454,6 +1547,20 @@ mod tests {
         assert!(
             line.contains("PRIVACY.md"),
             "disclosure must point at PRIVACY.md"
+        );
+
+        // rm-979 review rider: the disclosure goes to stderr, which bypasses
+        // every stdout choke point, so hostile URL bytes must die at this
+        // boundary too — same class as the report body's render sites.
+        let hostile = "\u{1b}]8;;https://evil.example\u{1b}\\remote\u{1b}]8;;\u{7}";
+        let hostile_line = fetch_disclosure_line(hostile);
+        assert!(
+            hostile_line.chars().all(|c| !c.is_control()),
+            "disclosure line must carry no control bytes: {hostile_line:?}"
+        );
+        assert!(
+            hostile_line.contains("https://evil.example"),
+            "printable URL text survives the sanitizer"
         );
     }
 }
