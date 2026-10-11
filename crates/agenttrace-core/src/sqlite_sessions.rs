@@ -342,11 +342,21 @@ fn sqlite_file_exists(path: &Path) -> bool {
     path.is_file()
 }
 
+/// rm-626: without a busy timeout, a database locked by its writer fails
+/// the read immediately (SQLITE_BUSY), and that transient failure used
+/// to be persisted as an empty snapshot that masked the database on
+/// every later run. Waiting briefly lets the normal writer-release race
+/// resolve; reads that still time out fail the query — which the caller
+/// no longer caches — instead of caching "no data".
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    )?;
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    Ok(connection)
 }
 
 fn load_hermes_sqlite_sessions(
@@ -1505,6 +1515,254 @@ mod tests {
             "no fabricated success split when no results were observed"
         );
         assert_eq!(s2.metrics.tool_calls_fail, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_hermes_read_never_persists_or_serves_an_empty_snapshot() {
+        // rm-626 red-first (the home1 poison recipe): a database that
+        // cannot be read must not persist a snapshot. Pre-fix, the
+        // failed query returned Vec::new() and load stored it as the
+        // database's snapshot with a live fingerprint — and because the
+        // chmod 000 -> 644 recovery keeps mtime/size, that empty
+        // snapshot kept matching the fingerprint and masked the
+        // database on every later run until the cache was wiped.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm626-poison-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let database = root.join("state.db");
+        let hermes_snapshot = root.join("hermes-sqlite.json");
+        let opencode_database = root.join("storage.db");
+        let opencode_snapshot = root.join("opencode-sqlite.json");
+
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        // Leg 1 — a garbage database file: a deterministic query
+        // failure everywhere (including containers where chmod cannot
+        // stop a root reader). Nothing may be stored for the failure,
+        // on either the hermes or the opencode lane; the wall's
+        // disclosure shape (rm-753) must also carry the failure — the
+        // store gate is `failures.is_clean()`.
+        std::fs::write(&database, b"not a sqlite database at all").expect("write garbage db");
+        let mut report = SqliteIngestReport::default();
+        assert!(load_hermes_sqlite_sessions(&database, None, &mut report).is_empty());
+        assert!(
+            !hermes_snapshot.exists(),
+            "a failed hermes read must not persist any snapshot"
+        );
+        std::fs::write(&opencode_database, b"not a sqlite database either")
+            .expect("write garbage opencode db");
+        let mut opencode_report = SqliteIngestReport::default();
+        assert!(
+            load_opencode_sqlite_sessions(&opencode_database, None, &mut opencode_report)
+                .is_empty()
+        );
+        assert!(
+            !opencode_snapshot.exists(),
+            "a failed opencode read must not persist any snapshot"
+        );
+        assert!(
+            !opencode_report.unreadable.is_empty() && !report.unreadable.is_empty(),
+            "the unreadable databases must be disclosed, not nulled"
+        );
+
+        // Leg 2 — the original poison sequence: chmod 000 -> chmod 644
+        // leaves mtime/size untouched, so a stored empty snapshot would
+        // keep matching the fingerprint forever. Skipped when the
+        // runner reads through 000-mode files (root).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fixture_dir = root.join("fixture");
+            std::fs::create_dir_all(&fixture_dir).expect("fixture tempdir");
+            let fixture = hermes_state_db_fixture(&fixture_dir);
+            std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+            let blocked = std::fs::read(&fixture).is_err();
+            std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod 644");
+            if blocked {
+                std::fs::rename(&fixture, &database).expect("move fixture into place");
+                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o000))
+                    .expect("chmod 000");
+                assert!(load_hermes_sqlite_sessions(
+                    &database,
+                    None,
+                    &mut SqliteIngestReport::default()
+                )
+                .is_empty());
+                assert!(
+                    !hermes_snapshot.exists(),
+                    "the chmod-000 failure must not persist either"
+                );
+                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644))
+                    .expect("chmod 644");
+                let recovered = load_hermes_sqlite_sessions(
+                    &database,
+                    None,
+                    &mut SqliteIngestReport::default(),
+                );
+                assert_eq!(
+                    recovered.len(),
+                    2,
+                    "the healthy database must parse again without wiping the cache"
+                );
+                assert!(
+                    hermes_snapshot.exists(),
+                    "the successful re-read must populate the snapshot"
+                );
+            } else {
+                eprintln!("skipping chmod legs: runner reads through 000-mode files");
+            }
+        }
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn busy_timeout_waits_out_a_short_lock_and_fails_closed_without_storing_on_a_long_one() {
+        // rm-626 acceptance pin (independent_review 7d51a912 M1, landed at
+        // review-fix d48c5af7): the busy_timeout on open_sqlite_read_only
+        // is part of the fail-closed contract and must be pinned by a real
+        // concurrent-writer contention test, not only by the corruption
+        // legs. A SHORT exclusive lock (released inside SQLITE_BUSY_TIMEOUT)
+        // must be waited out; a LONG lock (held across the load) must fail
+        // closed AND persist nothing — the same no-store contract as the
+        // corruption legs, reached through the contention door. Adapted to
+        // this wall at integration: the load carries the rm-753
+        // SqliteIngestReport (3-arg call) and the no-store gate is
+        // `failures.is_clean()` on the disclosed failure.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-rm626-contention-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let database = hermes_state_db_fixture(&root);
+        let snapshot = root.join("hermes-sqlite.json");
+
+        let _env = crate::test_env::lock_env();
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+
+        use std::sync::mpsc;
+
+        // Leg 0 — the configured timeout itself. rusqlite installs a
+        // 5,000ms default busy timeout on every connection it opens
+        // (rusqlite 0.32.1 sets sqlite3_busy_timeout(db, 5000) in
+        // inner_connection.rs), so deleting our busy_timeout call does
+        // NOT make locked reads fail fast — it silently degrades every
+        // contended statement from a 250ms wait to a 5s wait. The
+        // behavioral legs below cannot see that regression (a short
+        // lock is waited out either way; the long-lock leg just stalls
+        // ~20s instead of ~1s), so the constant is pinned by reading it
+        // back off the connection the loader actually opens.
+        let pinned_timeout = open_sqlite_read_only(&database)
+            .expect("open read-only connection for the pragma probe")
+            .query_row("pragma busy_timeout", [], |row| row.get::<_, i64>(0))
+            .expect("read busy_timeout pragma");
+        assert_eq!(
+            pinned_timeout,
+            SQLITE_BUSY_TIMEOUT.as_millis() as i64,
+            "open_sqlite_read_only must keep SQLITE_BUSY_TIMEOUT (250ms); \
+             rusqlite's silent 5s default is the regression this pins out"
+        );
+
+        // Leg 1 — SHORT lock: released after 100ms (< SQLITE_BUSY_TIMEOUT
+        // 250ms), the loader must wait it out and the load must succeed.
+        // Together with leg 0 this pins busy_timeout: leg 0 pins the
+        // configured wait budget, this leg pins that a short lock is
+        // actually waited out rather than failing the read.
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let short_lock = {
+            let database = database.clone();
+            std::thread::spawn(move || {
+                let writer = rusqlite::Connection::open(&database).expect("open writer");
+                writer
+                    .execute_batch("BEGIN EXCLUSIVE")
+                    .expect("take exclusive lock");
+                locked_tx.send(()).expect("signal lock held");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                writer
+                    .execute_batch("ROLLBACK")
+                    .expect("release short lock");
+            })
+        };
+        locked_rx.recv().expect("wait for the short lock");
+        let short_sessions =
+            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default());
+        short_lock.join().expect("short writer thread");
+        assert_eq!(
+            short_sessions.len(),
+            2,
+            "a short exclusive lock must be waited out and the load succeed"
+        );
+        assert!(
+            snapshot.exists(),
+            "the waited-out load must persist its snapshot"
+        );
+
+        // Leg 2 — LONG lock: held across the whole load; the loader must
+        // fail closed and must NOT persist any snapshot — contention is a
+        // MISS, never a store.
+        std::fs::remove_file(&snapshot).expect("wipe snapshot between legs");
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let long_lock = {
+            let database = database.clone();
+            std::thread::spawn(move || {
+                let writer = rusqlite::Connection::open(&database).expect("open writer");
+                writer
+                    .execute_batch("BEGIN EXCLUSIVE")
+                    .expect("take exclusive lock");
+                held_tx.send(()).expect("signal lock held");
+                release_rx.recv().expect("wait for release");
+                let _ = writer.execute_batch("ROLLBACK");
+            })
+        };
+        held_rx.recv().expect("wait for the long lock");
+        let long_sessions =
+            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default());
+        assert!(
+            long_sessions.is_empty(),
+            "a permanently locked database must fail closed to zero sessions"
+        );
+        assert!(
+            !snapshot.exists(),
+            "a contended hermes read must not persist any snapshot"
+        );
+        release_tx.send(()).expect("release the long lock");
+        long_lock.join().expect("long writer thread");
+
+        // Leg 3 — recovery: once the lock is gone the same database loads
+        // and stores normally again.
+        let recovered =
+            load_hermes_sqlite_sessions(&database, None, &mut SqliteIngestReport::default());
+        assert_eq!(
+            recovered.len(),
+            2,
+            "after the lock releases the database must load normally"
+        );
+        assert!(
+            snapshot.exists(),
+            "the recovered load must persist its snapshot"
+        );
+
+        match prior_cache {
+            Some(v) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", v),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

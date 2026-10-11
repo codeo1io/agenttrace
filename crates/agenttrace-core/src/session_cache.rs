@@ -671,7 +671,21 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 56;
 // snapshot since v9, and runs at union time after each database's
 // cache resolves — so the snapshot schema STAYS at 10; the
 // candidate's own 7 -> 8 bump is moot on this ceiling.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 10;
+// Bumped 10 -> 11 (integration of run a0d0d353, rm-626/rm-627; the
+// candidate minted its own 7 -> 8 at base 8991144 while the advanced
+// ceiling had already taken 8 via rm-548/rm-734, so the merged wall
+// re-bases the bump to 10 -> 11 — one invalidation either way per the
+// rm-230 convention): the snapshot became a per-database LEDGER
+// keyed by database path. The pre-11 file was one flat snapshot
+// keyed by source name alone, so a plural-database home (default +
+// per-profile state.db files) clobbered its own cache on every store
+// and never warmed, and a failed read persisted an empty snapshot
+// that masked a healthy database across runs. v10 flat snapshots are
+// rejected by the version check and rebuilt once, in place, as a
+// ledger; the bump also composes with the landed rm-753/rm-734
+// poison gate (fail-closed reads never bank) and the schema-11
+// eviction retires any v10 entry a pre-gate binary already banked.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 11;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -867,8 +881,7 @@ struct FileFingerprint {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SqliteSnapshot {
-    schema_version: i64,
+struct SqliteSnapshotEntry {
     database: FileFingerprint,
     wal: Option<FileFingerprint>,
     shm: Option<FileFingerprint>,
@@ -889,6 +902,20 @@ struct SqliteSnapshot {
     /// report sums across lanes.
     #[serde(default)]
     fork_excluded: usize,
+}
+
+/// rm-627: the SQLite snapshot is a per-source LEDGER keyed by database
+/// path. The pre-8 file was a single flat snapshot keyed by source name
+/// alone, so a plural-database home (default + per-profile state.db
+/// files) clobbered its own cache on every store — the last database to
+/// write owned the slot and every sibling re-parsed forever (the 10-DB
+/// PoC home parsed 6,223 sessions with cache_hits 0 cold AND warm).
+/// Entries whose database no longer exists are pruned at store time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SqliteSnapshotLedger {
+    schema_version: i64,
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, SqliteSnapshotEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1432,9 +1459,15 @@ fn load_sqlite_snapshot_from(
     snapshot_path: &Path,
 ) -> Option<(Vec<Session>, usize)> {
     let raw = fs::read(snapshot_path).ok()?;
-    let snapshot = serde_json::from_slice::<SqliteSnapshot>(&raw).ok()?;
-    if snapshot.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION
-        || snapshot.database != file_fingerprint(database)?
+    let ledger = serde_json::from_slice::<SqliteSnapshotLedger>(&raw).ok()?;
+    if ledger.schema_version != SQLITE_SNAPSHOT_SCHEMA_VERSION {
+        return None;
+    }
+    let snapshot = ledger
+        .entries
+        .get(database.to_string_lossy().as_ref())?
+        .clone();
+    if snapshot.database != file_fingerprint(database)?
         || snapshot.wal != file_fingerprint(&sqlite_wal_path(database))
         || snapshot.shm != file_fingerprint(&sqlite_shm_path(database))
         || matches!(
@@ -1488,16 +1521,39 @@ fn store_sqlite_snapshot_at(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let snapshot = SqliteSnapshot {
-        schema_version: SQLITE_SNAPSHOT_SCHEMA_VERSION,
-        database: file_fingerprint(database).ok_or_else(|| anyhow::anyhow!("database missing"))?,
-        wal: file_fingerprint(&sqlite_wal_path(database)),
-        shm: file_fingerprint(&sqlite_shm_path(database)),
-        sessions: sessions.iter().map(GoSession::from_session).collect(),
-        pricing_catalog_id: Some(crate::pricing::catalog_identity().to_string()),
-        fork_excluded,
-    };
-    write_private_exclusive(path, &serde_json::to_vec(&snapshot)?)?;
+    // rm-627: merge into the per-source ledger so sibling databases
+    // keep their entries. A stale or foreign-version file — including
+    // the pre-ledger flat snapshot (schema 10 and older) — reads as an
+    // empty ledger and is replaced in place (the documented one-time
+    // rebuild).
+    let mut ledger = fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<SqliteSnapshotLedger>(&raw).ok())
+        .filter(|ledger| ledger.schema_version == SQLITE_SNAPSHOT_SCHEMA_VERSION)
+        .unwrap_or_else(|| SqliteSnapshotLedger {
+            schema_version: SQLITE_SNAPSHOT_SCHEMA_VERSION,
+            entries: std::collections::BTreeMap::new(),
+        });
+    // Churned profile paths must not grow the ledger forever: entries
+    // whose database no longer exists drop at store time (the journal's
+    // disappeared-source pruning rule, applied to the ledger).
+    ledger.entries.retain(|key, _| Path::new(key).exists());
+    ledger.entries.insert(
+        database.to_string_lossy().to_string(),
+        SqliteSnapshotEntry {
+            database: file_fingerprint(database)
+                .ok_or_else(|| anyhow::anyhow!("database missing"))?,
+            wal: file_fingerprint(&sqlite_wal_path(database)),
+            shm: file_fingerprint(&sqlite_shm_path(database)),
+            sessions: sessions.iter().map(GoSession::from_session).collect(),
+            pricing_catalog_id: Some(crate::pricing::catalog_identity().to_string()),
+            fork_excluded,
+        },
+    );
+    // rm-693: staged through an exclusive-create temp + rename (the
+    // write_private_exclusive retry loop), not a bare write_private —
+    // a planted symlink at the staging name must be refused.
+    write_private_exclusive(path, &serde_json::to_vec(&ledger)?)?;
     Ok(())
 }
 
@@ -3187,7 +3243,8 @@ mod tests {
             diagnostics: Diagnostics::default(),
         };
 
-        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+            .expect("store snapshot");
         assert_eq!(
             load_sqlite_snapshot_from(&database, &snapshot)
                 .expect("cache hit")
@@ -3222,7 +3279,76 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_ten_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_ledger_keeps_plural_databases_independently() {
+        // rm-627 red-first (the home2/home3 PoCs): the snapshot slot used
+        // to be keyed by source name alone, so a plural-database home
+        // (default state.db + per-profile state.db files) clobbered its
+        // own cache on every store — the 10-DB PoC home parsed 6,223
+        // sessions with cache_hits 0 cold AND warm. Each database path
+        // now owns its ledger entry under the same source file.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-sqlite-ledger-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let database_a = root.join("state.db");
+        let database_b = root.join("profiles").join("state.db");
+        let snapshot = root.join("hermes-sqlite.json");
+        fs::create_dir_all(database_b.parent().expect("parent")).expect("create temp dir");
+        fs::write(&database_a, b"a").expect("write database a");
+        fs::write(&database_b, b"b").expect("write database b");
+        let session_for = |name: &str, path: &Path| Session {
+            name: name.to_string(),
+            path: path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_sqlite_snapshot_at(&database_a, &snapshot, &[session_for("a", &database_a)], 0)
+            .expect("store database a");
+        store_sqlite_snapshot_at(&database_b, &snapshot, &[session_for("b", &database_b)], 0)
+            .expect("store database b");
+        let a = load_sqlite_snapshot_from(&database_a, &snapshot)
+            .expect("database a stays cached after database b stores");
+        let b = load_sqlite_snapshot_from(&database_b, &snapshot).expect("database b cached");
+        let (a, _) = a;
+        let (b, _) = b;
+        assert_eq!(a[0].name, "a");
+        assert_eq!(b[0].name, "b");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_snapshot_ledger_caches_healthy_empty_databases() {
+        // rm-626 boundary: an empty `Some` is a database that read
+        // cleanly with zero matching sessions — it stays cacheable (its
+        // own ledger entry can no longer clobber a sibling). Only a
+        // FAILED read (the fail-closed gate in sqlite_sessions.rs)
+        // skips the store; the cache layer banks healthy empties and
+        // the caller-side empty-distrust re-query still re-probes.
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-sqlite-empty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let database = root.join("state.db");
+        let snapshot = root.join("opencode-sqlite.json");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&database, b"db").expect("write database");
+        store_sqlite_snapshot_at(&database, &snapshot, &[], 0).expect("store empty database");
+        assert!(load_sqlite_snapshot_from(&database, &snapshot)
+            .expect("empty database stays a cache hit")
+            .0
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_snapshot_schema_eleven_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -3259,41 +3385,40 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+            .expect("store snapshot");
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
-        // Version ten (rm-893): enrichment-lane row drops began
-        // counting into the per-file disclosure, so v9 snapshots
-        // banked while those drops were silent must regenerate
-        // instead of hiding the new drop counts. Version nine carries
-        // three rationales: rm-548 — snapshots now carry their opencode
-        // fork-exclusion count, so v7 snapshots would disclose a
-        // silently-missing count and must regenerate; the rm-734 poison
-        // gate — a failed read banks
-        // nothing and any EMPTY v7 snapshot a pre-gate run banked for
-        // an unreadable database is evicted (the fingerprint alone
-        // would keep serving it); and rm-790 — sqlite-backed sessions
-        // now carry their source row key and opencode children their
-        // parent row id, so the derived-history identity is per-row
-        // instead of per-(db, second) and v8 snapshots would re-fold
-        // same-second sessions onto one id (one invalidation either
-        // way: the candidate's own 7 → 8 landed at base 611242d1 and
-        // re-bases onto the advanced ceiling as 8 → 9). Version seven
-        // (cycle-1 rm-198): hermes tool outcome semantics changed
-        // (ok/fail now derive from the messages table), so v6 snapshots
-        // carry stale splits.
-        assert_eq!(doc["schema_version"], 10);
+        let ledger_key = database.to_string_lossy().to_string();
+        // Version eleven (integration of run a0d0d353, rm-626/rm-627;
+        // the candidate minted 7 → 8 at base 8991144 and the merged
+        // wall re-bases the bump onto the advanced ceiling as 10 → 11,
+        // one invalidation either way per the rm-230 convention): the
+        // snapshot became a per-database LEDGER — plural-DB homes
+        // previously shared one name-keyed slot and never warmed, and
+        // failed reads persisted empty snapshots that masked healthy
+        // databases (the latter arm composing with the landed
+        // rm-753/rm-734 poison gate). Pre-ledger flat snapshots carry
+        // no per-database entries and must regenerate once, in place.
+        // Earlier rungs this ceiling carries: v10 (rm-893) —
+        // enrichment-lane row drops began counting into the per-file
+        // disclosure; v9 (rm-790/rm-791) — per-row SessionKey identity
+        // and the raw parent row id; v8 (rm-548/rm-734) — the opencode
+        // fork-exclusion count plus the poison-gate eviction; v7
+        // (rm-198) — hermes tool outcome semantics.
+        assert_eq!(doc["schema_version"], 11);
         assert_eq!(
-            doc.pointer("/sessions/0/Metrics/Provenance/Tokens")
-                .and_then(serde_json::Value::as_str),
+            doc["entries"][ledger_key.as_str()]["sessions"][0]["Metrics"]["Provenance"]["Tokens"]
+                .as_str(),
             Some("stored_session_totals")
         );
         assert_eq!(
-            doc.pointer("/sessions/0/Metrics/StoredTotalsDelta"),
-            Some(&serde_json::Value::from(720)),
+            &doc["entries"][ledger_key.as_str()]["sessions"][0]["Metrics"]["StoredTotalsDelta"],
+            &serde_json::Value::from(720),
             "the stored-versus-derived delta must survive the snapshot cache"
         );
-        let loaded = load_sqlite_snapshot_from(&database, &snapshot).expect("schema ten cache hit");
+        let loaded =
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eleven cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
@@ -3307,13 +3432,34 @@ mod tests {
             "rm-791: the raw parent row id round-trips for post-load attribution"
         );
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(9);
+        old["schema_version"] = serde_json::Value::from(10);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema nine json"),
+            serde_json::to_vec(&old).expect("schema ten json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
+        // The true pre-ledger shape: a FLAT snapshot (no entries map at
+        // all) — the v10-and-older file this wall wrote before rm-627.
+        // It must be rejected once and rebuilt in place — the
+        // documented one-slot migration.
+        let mut flat = old;
+        flat.as_object_mut().expect("ledger doc").remove("entries");
+        fs::write(
+            &snapshot,
+            serde_json::to_vec(&flat).expect("flat pre-ledger json"),
+        )
+        .expect("write flat pre-ledger snapshot");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_none(),
+            "a pre-ledger flat snapshot must be rejected"
+        );
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+            .expect("rebuild the slot after rejection");
+        assert!(
+            load_sqlite_snapshot_from(&database, &snapshot).is_some(),
+            "the rejected slot must rebuild on the next store"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4825,7 +4971,8 @@ mod tests {
             tool_warnings: Vec::new(),
             diagnostics: Diagnostics::default(),
         };
-        store_sqlite_snapshot_at(&database, &snapshot, &[session], 0).expect("store snapshot");
+        store_sqlite_snapshot_at(&database, &snapshot, std::slice::from_ref(&session), 0)
+            .expect("store snapshot");
         let mode = fs::metadata(&snapshot)
             .expect("snapshot exists")
             .permissions()
