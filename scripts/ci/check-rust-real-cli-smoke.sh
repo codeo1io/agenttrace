@@ -50,6 +50,11 @@ mkdir -p "$out_dir"
 
 snapshot_dir="$out_dir/real-session-snapshot"
 mkdir -p "$snapshot_dir"
+# rm-525: the snapshot stages REAL operator transcripts; stage it
+# private (umask 077 — observed live as -rw-rw-r-- copies landing next
+# to the binary's own 0600 cache files) and every later artifact of
+# this gate stays private too.
+umask 077
 copied=0
 while IFS= read -r file; do
   cp "$file" "$snapshot_dir/session-$copied-${file##*/}"
@@ -57,6 +62,11 @@ while IFS= read -r file; do
   [[ "$copied" -ge "$file_limit" ]] && break
 done < <(find "$source_dir" -type f 2>/dev/null | sort)
 [[ "$copied" -gt 0 ]] || fail "could not copy real session files from: $source_dir"
+
+# rm-525 acceptance arm: prove the staging is private — no group/other
+# access bits on any snapshot file.
+[[ -z "$(find "$snapshot_dir" -type f -perm /077 -print -quit)" ]] ||
+  fail "real-session snapshot must not be group/other accessible (rm-525)"
 
 run_capture doctor-default --doctor -f json
 run_capture doctor-snapshot --doctor -d "$snapshot_dir" -f json

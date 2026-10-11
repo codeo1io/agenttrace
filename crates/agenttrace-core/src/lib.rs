@@ -1,3 +1,4 @@
+mod cache_dir;
 mod demo;
 mod diagnostics;
 mod discovery;

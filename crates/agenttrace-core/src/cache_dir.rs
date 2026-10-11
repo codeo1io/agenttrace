@@ -1,0 +1,216 @@
+//! Operator cache-directory resolution, shared by every cache
+//! consumer (session cache `sessions.json`, doctor cache report,
+//! pricing snapshot, statusline capture journal).
+//!
+//! Extracted in cycle 4 (run 6f281d46) from the four byte-identical
+//! per-module copies (statusline carried the only injectable form);
+//! one decision table now pins the ladder for all of them.
+
+use std::ffi::OsStr;
+use std::path::PathBuf;
+
+/// Resolve the operator cache directory from explicit inputs — the
+/// same rules as [`user_cache_dir`] without touching process
+/// environment state, so the empty-env fallbacks are unit-testable
+/// without mutating (unsafe) globals (the `resolve_user_config_path`
+/// pattern from rm-683). `macos` is injected because the `cfg!`
+/// copies were compile-time dead code on every non-macOS host — the
+/// only way this crate's Linux CI legs can pin the macOS arm at all.
+///
+/// Decision order (cycle-4 U2; assess 8b46476c F2/F4):
+///
+/// 1. rm-248: an ABSOLUTE, non-empty `$XDG_CACHE_HOME` wins on EVERY
+///    OS — it precedes the macOS arm so the landed rm-596
+///    `doctor_demo_contract` sandbox (`HOME` + absolute
+///    `XDG_CACHE_HOME`, asserting no `$HOME` text in the report) is
+///    satisfiable on macOS too. A relative or empty value is treated
+///    as unset: the XDG spec only defines absolute values, and
+///    honoring a relative one scattered a per-cwd cache (observed
+///    live: `XDG_CACHE_HOME=rel-cache agenttrace --overview` wrote
+///    ./rel-cache/agenttrace from a scratch cwd).
+/// 2. On macOS a non-empty `HOME` selects `$HOME/Library/Caches`.
+/// 3. Otherwise a non-empty `HOME` selects `$HOME/.cache`.
+/// 4. Otherwise the process temp dir (always absolute).
+///
+/// Review 95d74221 F2 (2026-10-07): a set-but-empty `HOME` is
+/// treated as unset on BOTH home arms — the same XDG-spec v0.8 rule
+/// the user-config guard applies. Without the guard, `HOME=` joined
+/// the RELATIVE `Library/Caches` / `.cache`, so the cache resolved
+/// against the CWD and a `.cache/agenttrace/statusline.jsonl`
+/// planted in the working directory was read into the budget view
+/// (live PoC: `$999.00 ... OVER by $989.00` from a planted journal).
+pub(crate) fn resolve_user_cache_dir(
+    home: Option<&OsStr>,
+    xdg_cache_home: Option<&OsStr>,
+    macos: bool,
+) -> PathBuf {
+    if let Some(cache) = xdg_cache_home
+        .filter(|value| !value.is_empty())
+        .filter(|value| std::path::Path::new(value).is_absolute())
+    {
+        return PathBuf::from(cache);
+    }
+    if macos {
+        if let Some(home) = home.filter(|value| !value.is_empty()) {
+            return PathBuf::from(home).join("Library").join("Caches");
+        }
+    }
+    if let Some(home) = home.filter(|value| !value.is_empty()) {
+        return PathBuf::from(home).join(".cache");
+    }
+    std::env::temp_dir()
+}
+
+/// The environment-reading wrapper every cache consumer calls.
+pub(crate) fn user_cache_dir() -> PathBuf {
+    resolve_user_cache_dir(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        cfg!(target_os = "macos"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Row {
+        name: &'static str,
+        home: Option<&'static OsStr>,
+        xdg: Option<&'static OsStr>,
+        macos: bool,
+        expected: PathBuf,
+    }
+
+    /// The one decision table for all four consumers. The rows marked
+    /// RED-FIRST fail against the pre-cycle-4 copies (proven on the
+    /// embedded old algorithms): the old macOS arm preceded the XDG
+    /// arm (so an absolute `XDG_CACHE_HOME` was ignored on macOS),
+    /// and the old unfiltered `HOME` arms turned `HOME=` into the
+    /// RELATIVE `.cache` / `Library/Caches` (a CWD-planted cache).
+    #[test]
+    fn user_cache_dir_decision_table() {
+        let empty = Some(OsStr::new(""));
+        let home = Some(OsStr::new("/home/at-test"));
+        let xdg_abs = Some(OsStr::new("/xdg-cache"));
+        let xdg_rel = Some(OsStr::new("rel-cache"));
+
+        let cases: &[Row] = &[
+            // XDG arm: absolute + non-empty wins on EVERY OS.
+            // RED-FIRST: on macos the old order returned
+            // $HOME/Library/Caches here.
+            Row {
+                name: "absolute xdg wins on macos",
+                home,
+                xdg: xdg_abs,
+                macos: true,
+                expected: PathBuf::from("/xdg-cache"),
+            },
+            Row {
+                name: "absolute xdg wins on linux",
+                home,
+                xdg: xdg_abs,
+                macos: false,
+                expected: PathBuf::from("/xdg-cache"),
+            },
+            Row {
+                name: "absolute xdg wins with empty home",
+                home: empty,
+                xdg: xdg_abs,
+                macos: false,
+                expected: PathBuf::from("/xdg-cache"),
+            },
+            // Relative or empty XDG is treated as unset (rm-248).
+            Row {
+                name: "relative xdg ignored on macos",
+                home,
+                xdg: xdg_rel,
+                macos: true,
+                expected: PathBuf::from("/home/at-test/Library/Caches"),
+            },
+            Row {
+                name: "relative xdg ignored on linux",
+                home,
+                xdg: xdg_rel,
+                macos: false,
+                expected: PathBuf::from("/home/at-test/.cache"),
+            },
+            Row {
+                name: "empty xdg ignored on macos",
+                home,
+                xdg: empty,
+                macos: true,
+                expected: PathBuf::from("/home/at-test/Library/Caches"),
+            },
+            Row {
+                name: "empty xdg ignored on linux",
+                home,
+                xdg: empty,
+                macos: false,
+                expected: PathBuf::from("/home/at-test/.cache"),
+            },
+            // Unset XDG: the platform home arms.
+            Row {
+                name: "unset xdg on macos",
+                home,
+                xdg: None,
+                macos: true,
+                expected: PathBuf::from("/home/at-test/Library/Caches"),
+            },
+            Row {
+                name: "unset xdg on linux",
+                home,
+                xdg: None,
+                macos: false,
+                expected: PathBuf::from("/home/at-test/.cache"),
+            },
+            // RED-FIRST: an empty HOME must never produce a RELATIVE
+            // cache dir — the temp-dir fallback instead (both OS
+            // arms; the old copies joined "" into ".cache"/
+            // "Library/Caches" against the CWD).
+            Row {
+                name: "empty home falls to temp dir on macos",
+                home: empty,
+                xdg: None,
+                macos: true,
+                expected: std::env::temp_dir(),
+            },
+            Row {
+                name: "empty home falls to temp dir on linux",
+                home: empty,
+                xdg: None,
+                macos: false,
+                expected: std::env::temp_dir(),
+            },
+            Row {
+                name: "empty home + relative xdg falls to temp dir",
+                home: empty,
+                xdg: xdg_rel,
+                macos: false,
+                expected: std::env::temp_dir(),
+            },
+            // Everything unset: the ladder end, always absolute.
+            Row {
+                name: "both unset falls to temp dir",
+                home: None,
+                xdg: None,
+                macos: false,
+                expected: std::env::temp_dir(),
+            },
+        ];
+        for Row {
+            name,
+            home,
+            xdg,
+            macos,
+            expected,
+        } in cases
+        {
+            assert_eq!(
+                &resolve_user_cache_dir(*home, *xdg, *macos),
+                expected,
+                "case {name}"
+            );
+        }
+    }
+}

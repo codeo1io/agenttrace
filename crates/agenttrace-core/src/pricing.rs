@@ -1,3 +1,4 @@
+use crate::cache_dir::user_cache_dir;
 use crate::round4;
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
@@ -1943,29 +1944,12 @@ fn write_pricing_header(out: &mut String, name_width: usize) {
     out.push_str(&format!("  {}\n", "-".repeat(name_width + 24)));
 }
 
-fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
-    }
-    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
-    // $XDG_CACHE_HOME values; a relative one is treated as unset and
-    // falls through to the HOME-based default instead of scattering a
-    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
-    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
-    // scratch cwd).
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() && cache.is_absolute() {
-            return cache;
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".cache");
-    }
-    std::env::temp_dir()
-}
-
+// Cycle-4 U2 (run 6f281d46): the cache ladder lives in
+// `crate::cache_dir` — one shared resolver for pricing, session_cache,
+// doctor, and statusline. The copy this file carried resolved the
+// macOS `Library/Caches` arm BEFORE an absolute $XDG_CACHE_HOME and
+// joined a set-but-empty HOME into the RELATIVE `.cache` (a
+// CWD-planted cache).
 #[cfg(test)]
 mod tests {
     use super::*;
