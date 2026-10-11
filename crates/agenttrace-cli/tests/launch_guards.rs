@@ -497,3 +497,89 @@ fn all_unparseable_dir_with_colliding_output_keeps_the_parse_bail() {
     );
     std::fs::remove_dir_all(&scratch).ok();
 }
+
+/// rm-503 cap lane: spawn the binary with piped stdin, feed `bytes`,
+/// and hand back (code, stdout, stderr) with the host-derived stores
+/// pointed at a scratch root like `run_isolated` does.
+fn run_stdin_with_env(args: &[&str], bytes: &[u8], envs: &[(&str, &str)]) -> (i32, String, String) {
+    use std::io::Write as _;
+    let scratch = std::env::temp_dir().join(format!(
+        "at-stdin-cap-{}-{}",
+        std::process::id(),
+        bytes.len()
+    ));
+    let history_dir = scratch.join("history");
+    let cache_dir = scratch.join("cache");
+    std::fs::create_dir_all(&history_dir).expect("mkdir history scratch");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir cache scratch");
+    let mut child = Command::new(bin())
+        .args(args)
+        .env("AGENTTRACE_HISTORY_DIR", &history_dir)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache_dir)
+        .envs(envs.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agenttrace");
+    {
+        let stdin = child.stdin.as_mut().expect("piped stdin");
+        stdin.write_all(bytes).expect("feed stdin fixture");
+    }
+    let output = child.wait_with_output().expect("wait agenttrace");
+    std::fs::remove_dir_all(&scratch).ok();
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn stdin_lane_enforces_a_documented_byte_cap() {
+    // rm-503 cap arm (assess 314b395b PoC: `head -c 400000000
+    // /dev/zero | agenttrace -` buffered ~765 MB RSS before the
+    // parser rejected the first byte). The `-` lane fails closed at a
+    // ceiling instead of buffering unbounded stdin, naming the cap
+    // and the byte count. The boundary is pinned with a small cap so
+    // CI never ships a default-sized fixture: 4096-byte cap against a
+    // 4097-byte stream.
+    let oversized = vec![0u8; 4097];
+    let (code, _stdout, stderr) = run_stdin_with_env(
+        &["-"],
+        &oversized,
+        &[("AGENTTRACE_STDIN_CAP_BYTES", "4096")],
+    );
+    assert_ne!(code, 0, "oversized stdin must fail loudly, not buffer");
+    assert!(
+        stderr.contains("byte cap"),
+        "the error must name the cap: {stderr}"
+    );
+    assert!(
+        stderr.contains("4096"),
+        "the error must name the cap value: {stderr}"
+    );
+    assert!(
+        stderr.contains("4097"),
+        "the error must name the byte count read: {stderr}"
+    );
+}
+
+#[test]
+fn stdin_lane_under_the_cap_keeps_working() {
+    // rm-503 control: a stream comfortably under the ceiling parses
+    // exactly like today — the same real claude journal fixture the
+    // other stdin guards use.
+    let journal = claude_journal_lines().into_bytes();
+    let (code, stdout, stderr) =
+        run_stdin_with_env(&["-"], &journal, &[("AGENTTRACE_STDIN_CAP_BYTES", "65536")]);
+    assert_eq!(code, 0, "under-cap stream must succeed: {stderr}");
+    assert!(
+        !stdout.is_empty(),
+        "the single-session report still renders: {stdout}"
+    );
+    assert!(
+        !stderr.contains("byte cap"),
+        "no cap error under the ceiling: {stderr}"
+    );
+}

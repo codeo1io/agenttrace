@@ -2845,3 +2845,102 @@ fn doctor_json_artifact_carries_config_disclosure() {
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+#[test]
+fn test_match_operand_is_honored_not_ignored() {
+    // rm-089 (assess 314b395b PoC): `--test-match banana-phone` and
+    // `--test-match gpt-5.6` used to produce md5-identical output —
+    // the operand fell into the positional session-path slot and the
+    // early-exit probe never read it. The operand is now the model
+    // expression under test, resolved by the same matcher the probe
+    // table uses, so the two invocations must diverge and each must
+    // name the model it resolved.
+    let run_probe = |model: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(["--test-match", model])
+            .output()
+            .expect("run agenttrace --test-match")
+    };
+    let banana = run_probe("banana-phone");
+    let gpt = run_probe("gpt-5.6");
+    assert!(
+        banana.status.success(),
+        "banana-phone probe failed: {}",
+        String::from_utf8_lossy(&banana.stderr)
+    );
+    assert!(
+        gpt.status.success(),
+        "gpt-5.6 probe failed: {}",
+        String::from_utf8_lossy(&gpt.stderr)
+    );
+    let banana_out = String::from_utf8_lossy(&banana.stdout).to_string();
+    let gpt_out = String::from_utf8_lossy(&gpt.stdout).to_string();
+    assert!(
+        banana_out.contains("banana-phone"),
+        "the operand must be echoed as the model under test, never ignored: {banana_out}"
+    );
+    assert!(
+        gpt_out.contains("gpt-5.6"),
+        "the operand must be echoed as the model under test, never ignored: {gpt_out}"
+    );
+    assert_ne!(
+        banana_out, gpt_out,
+        "two different operands must produce different resolutions"
+    );
+    assert!(
+        !banana_out.contains("unknown-model-xyz"),
+        "the operand lane resolves ONE model, not the fixed probe table: {banana_out}"
+    );
+}
+
+#[test]
+fn test_match_bare_probe_table_is_unchanged() {
+    // rm-089 control: bare `--test-match` (no operand) keeps rendering
+    // the fixed probe table exactly as before — the fix arms the
+    // operand lane only.
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--test-match"])
+        .output()
+        .expect("run bare agenttrace --test-match");
+    assert!(
+        out.status.success(),
+        "bare probe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Pricing:"), "probe header kept: {stdout}");
+    assert!(
+        stdout.contains("unknown-model-xyz"),
+        "probe set kept: {stdout}"
+    );
+    assert!(
+        stdout.contains("claude-sonnet-4-5-20250929"),
+        "probe set kept: {stdout}"
+    );
+}
+
+#[test]
+fn test_match_operand_json_lane_resolves_just_that_model() {
+    // rm-089, -f json lane: the operand narrows the document to one
+    // row instead of the eleven-row probe array.
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--test-match", "-f", "json", "gpt-5.6"])
+        .output()
+        .expect("run agenttrace --test-match -f json");
+    assert!(
+        out.status.success(),
+        "json probe failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim_end())
+            .expect("stdout stays one pure JSON document");
+    let models = doc["models"]
+        .as_array()
+        .expect("models array kept in the operand lane");
+    assert_eq!(models.len(), 1, "one row for one operand: {doc}");
+    assert_eq!(
+        models[0]["model"], "gpt-5.6",
+        "the row is the requested model: {doc}"
+    );
+}
