@@ -1618,7 +1618,7 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     push_text_group_family(&mut out, &overview.by_branch, 40, |name| name.clone());
 
     out.push_str("  ── By Task Type ──\n");
-    for (task_type, group) in &overview.by_task_type {
+    for (task_type, group) in sorted_task_type_groups(&overview.by_task_type) {
         out.push_str(&format!(
             "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
             text_cell(task_type, 15),
@@ -1820,7 +1820,7 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
     out.push_str(
         "| Task type | Sessions | Tokens in | Tokens out | Cost |\n|---|---:|---:|---:|---:|\n",
     );
-    for (task_type, group) in &overview.by_task_type {
+    for (task_type, group) in sorted_task_type_groups(&overview.by_task_type) {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
             markdown_cell(task_type),
@@ -2078,7 +2078,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     w(group_section_close(overview.by_branch.len()));
 
     w("<section><h2>By task type</h2><table><thead><tr><th>Task type</th><th class=\"num\">Sessions</th><th class=\"num\">Tokens in</th><th class=\"num\">Tokens out</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
-    for (task_type, group) in &overview.by_task_type {
+    for (task_type, group) in sorted_task_type_groups(&overview.by_task_type) {
         w(format!(
             "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
             html_escape(task_type),
@@ -2596,6 +2596,25 @@ fn task_type_items(groups: &BTreeMap<String, TaskTypeOverview>, total_cost: f64)
             .then_with(|| string_value(a, "task_type").cmp(&string_value(b, "task_type")))
     });
     items
+}
+
+/// rm-919: the one by_task_type ordering contract — cost descending,
+/// task-type name ascending on ties — mirroring the json lane's
+/// comparator (task_type_items). Every human surface (text/markdown/
+/// html) renders through this helper; alphabetical BTreeMap order is
+/// never a render order for this family.
+fn sorted_task_type_groups(
+    groups: &BTreeMap<String, TaskTypeOverview>,
+) -> Vec<(&str, &TaskTypeOverview)> {
+    let mut rows: Vec<(&str, &TaskTypeOverview)> =
+        groups.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    rows.sort_by(|a, b| {
+        b.1.cost
+            .partial_cmp(&a.1.cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    rows
 }
 
 /// rm-245: ranked top-cost sessions with their share of total spend and

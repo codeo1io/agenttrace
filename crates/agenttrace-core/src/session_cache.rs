@@ -5,7 +5,34 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 57;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 58;
+// Bumped 57 -> 58 (integration of run 57c491338818 cycle 1 'the
+// report pipeline must not lie by structure' — the rm-300 U1 id-less
+// fold-key namespace arm (parser.rs ToolResultFoldKey) + the rm-439
+// --doctor positional-scan-root arm + the rm-919 by_task_type ordering
+// contract; conflict case a4ff3f6c72be4905a00dbb4d75cad452, candidate
+// c3652ba @ base 15a8da8): run 57c491338818 review 543ac419 F1 —
+// the id-less fold-key namespace changes computed disclosure on
+// journals the fingerprint cannot see: a hostile '#N' wire
+// tool_use_id can no longer alias an id-less fold row (a silently
+// dropped tool_result), fold ordinals are one-per-block emission
+// positions, and a genuine re-fold carries one structural meta
+// carrier (+1 events_total per session with re-folds; this lane
+// has no earlier meta carrier to attach to, review F4). A warm v57
+// cache would keep serving the pre-fix fold on untouched files
+// forever — this const is the invalidation trigger (rm-230
+// convention: parser-semantics changes that alter the served report
+// bump the schema so cached sessions regenerate). SEAM: the batch
+// minted its bump as 42 -> 52 at its base 15a8da8 above the fleet's
+// observed in-flight frontier (census 2026-10-10, review-fix
+// 670753a6: origin at 42, sibling worktrees' uncommitted consts at
+// 43/44/45 — and, earlier in review 543ac419 before those worktrees
+// were swept, spool claims through 51 — a held uncommitted number
+// can still land later, the wall moves mid-run); this integration
+// re-bases the rung onto this tree's already-advanced ceiling 57 as
+// 57 -> 58 per the landed-rung-keeps-numeral convention
+// (c7c07e48/58fbbd6c/7762d54b precedent), one invalidation either
+// way. Entries regenerate once on next scan.
 // Bumped 56 -> 57 (integration of run 2f02ecafb2674e529f662f7cc27162f4
 // cycle 2 'usage-accounting truthfulness closeout' — the campaign's
 // rm-685 codex occurrence-aware bounded ledger LEAD (landed here as

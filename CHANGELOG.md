@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Fixed
+
+- Session cache bumped to schema 58 (from 57; run 57c491338818 minted
+  the bump as 52 above its base 15a8da8's ceiling 42 — this
+  integration re-bases the rung onto the advanced wall per the
+  landed-rung-keeps-numeral convention, one invalidation either way):
+  id-less tool_result fold
+  keys no longer share a dedup namespace with wire tool_use_ids (a
+  hostile `"#N"` id could alias an id-less fold row and silently drop
+  its tool_result), fold ordinals are one-per-block emission positions,
+  and genuine re-folds emit one structural meta disclosure carrier
+  (+1 `events_total` per session with re-folds) — warm pre-bump caches
+  regenerate on next scan instead of serving the stale fold (review
+  543ac419 F1/F4 → fix 670753a6; `by_task_type` html band ordering
+  acceptance made loud — a missing/reordered band now fails instead of
+  passing vacuously, review F2).
+- `--overview` `By Task Type` now renders cost-descending on text,
+  markdown, and html like every sibling family and the json lane
+  (rm-919; alphabetical order was never a render order).
+- `--doctor <PATH>` honors the positional path as its scan scope
+  instead of silently walking the default corpus homes, and
+  `--doctor` with BOTH `--dir` and a positional is refused loudly
+  (rm-439 arm; the 49,457-file default walk hung ~25s with zero
+  output; the landed rm-608 `-d` validation still guards the `--dir`
+  arm — a typo'd or file-valued `--dir` stays rc2, never a healthy
+  report).
+
 ### Added
 
 - SQLite snapshot cache: failed database reads never bank a snapshot, and each database path now owns its own ledger entry (rm-626 + rm-627, run a0d0d353 cycle 2, integrated at conflict case 3f78ab2a over the advanced ceiling): a database that could not be read (locked by its writer, unreadable, or not a SQLite database at all) used to return an empty session list that the loader stored as the database's snapshot — and because a chmod-000-to-644 style recovery leaves mtime/size untouched, that empty snapshot kept matching the file fingerprint and masked the healthy database on every later run until the cache was wiped. Reads now carry a 250 ms busy timeout (`SQLITE_BUSY_TIMEOUT`), and on this wall the fail-closed gate is the landed rm-753 disclosure shape: the query returns `(sessions, SqliteFileFailures)`, the failure is disclosed through `SqliteIngestReport`, and the store is skipped whenever the failures are not clean — composing with (not replacing) the landed rm-753/rm-734 empty-snapshot distrust, which still re-queries an empty cache hit so a database that becomes unreadable later is re-detected; a healthy database with zero sessions stays cacheable. Independently, the snapshot slot was keyed by source name alone, so a plural-database home (the default plus per-profile `state.db` files) clobbered its own cache on every store — the last database to write owned the slot and every sibling re-parsed forever (a 10-database PoC home parsed 6,223 sessions with `cache_hits: 0` cold and warm). The snapshot file is now a per-database ledger keyed by database path (entries whose database disappeared are pruned at store time; writes stage through the rm-693 exclusive-create temp + rename), and `SQLITE_SNAPSHOT_SCHEMA_VERSION` moves 10 → 11 — the batch minted 7 → 8 at its base 8991144 and the merged wall re-bases the bump onto the advanced ceiling per the rm-230 convention, one invalidation either way: pre-ledger flat snapshots (v10 and older) are rejected once and rebuilt in place, and the bump also evicts any v10 entry a pre-poison-gate binary already banked. The governance guide's schema sentence is realigned (`scripts/ci/check-docs-commands.sh` verifies it against the live constant). Pinned red-first on the merged shape: the poison sequence (garbage database file → no snapshot stored and the unreadable database disclosed; chmod 000 → chmod 644 → the database parses again without wiping the cache), the plural-database warm-hit test (the single-slot clobber used to serve database b's session for database a's lookup), and the concurrent-writer contention pin (a short exclusive lock is waited out and stored, a long lock fails closed to zero sessions with nothing persisted, and release recovers).

@@ -490,3 +490,160 @@ fn by_branch_renders_on_every_surface() {
     let html = report_overview_html(&overview, &sessions);
     assert!(html.contains("<h2>By branch</h2>"), "html");
 }
+
+// rm-919 acceptance: by_task_type must render cost-descending on every
+// human surface, mirroring the json lane's comparator (cost_total desc,
+// task_type asc tie-break). The demo corpus carries three task types
+// whose alphabetical and cost orders differ (coding < debugging <
+// planning alphabetically; debugging > planning > coding by cost), so it
+// discriminates the two orderings exactly.
+
+fn expected_cost_order(overview: &agenttrace_core::Overview) -> Vec<String> {
+    let mut rows: Vec<(&String, f64)> = overview
+        .by_task_type
+        .iter()
+        .map(|(name, agg)| (name, agg.cost))
+        .collect();
+    rows.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .expect("costs are finite")
+            .then_with(|| a.0.cmp(b.0))
+    });
+    rows.into_iter().map(|(name, _)| name.clone()).collect()
+}
+
+fn human_task_type_rows(text: &str) -> Vec<String> {
+    // text lane: an aligned block under "── By Task Type ──"; the task
+    // type is the first token of each row line. markdown lane: a
+    // "| name | ..." table under a "### By Task Type" heading.
+    let mut rows = Vec::new();
+    let mut in_section = false;
+    let table = text.contains("| ");
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("by task type") {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if in_section
+            && (trimmed.starts_with("──") || trimmed.starts_with('#') || trimmed.starts_with("By "))
+        {
+            break;
+        }
+        if table {
+            if let Some(rest) = trimmed.strip_prefix("| ") {
+                if let Some(name) = rest.split(" |").next() {
+                    let name = name.trim();
+                    if !name.eq_ignore_ascii_case("task type")
+                        && !name.is_empty()
+                        && !name.starts_with("---")
+                        && name != "Metric"
+                    {
+                        rows.push(name.to_string());
+                    }
+                }
+            }
+        } else if !trimmed.is_empty() {
+            if let Some(name) = trimmed.split_whitespace().next() {
+                // only task-type rows (fixed single-word ids); separators
+                // and advisory glyphs that trail the section are not rows
+                if name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    rows.push(name.to_string());
+                }
+            }
+        }
+    }
+    rows
+}
+
+#[test]
+fn by_task_type_renders_cost_descending_on_all_human_surfaces() {
+    let sessions = demo_sessions().expect("demo sessions parse");
+    let overview = compute_overview(&sessions);
+    let expected = expected_cost_order(&overview);
+    assert!(
+        expected.len() >= 3,
+        "demo corpus must carry >=3 task types to discriminate orderings, got {expected:?}"
+    );
+    let alphabetical: Vec<String> = {
+        let mut v = expected.clone();
+        v.sort();
+        assert_ne!(
+            v, expected,
+            "demo corpus must not be order-ambiguous (alphabetical == cost order)"
+        );
+        v
+    };
+
+    let text = report_overview_text(&overview, &sessions);
+    let text_rows = human_task_type_rows(&text);
+    assert_eq!(
+        text_rows, expected,
+        "text lane: by_task_type must be cost-descending, not alphabetical {alphabetical:?}"
+    );
+
+    let markdown = report_overview_markdown(&overview, &sessions);
+    let md_rows = human_task_type_rows(&markdown);
+    assert_eq!(
+        md_rows, expected,
+        "markdown lane: by_task_type must be cost-descending, not alphabetical; got {md_rows:?} want {expected:?}; md section sample: {}",
+        markdown
+            .lines()
+            .skip(markdown.lines().position(|l| l.to_ascii_lowercase().contains("by task type")).unwrap_or(0))
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let html = report_overview_html(&overview, &sessions);
+    let html_rows: Vec<String> = html
+        .lines()
+        .filter(|l| l.contains("<td>"))
+        .scan(None::<String>, |state, line| {
+            let _ = state;
+            if line.contains("<h3>") || line.contains("By ") {
+                *state = None;
+            }
+            Some(line.trim().to_string())
+        })
+        .filter_map(|l| {
+            let row = l.strip_prefix("<tr>")?;
+            let cell = row.strip_prefix("<td>")?.split("</td>").next()?.to_string();
+            let cell = cell
+                .strip_prefix("<strong>")
+                .and_then(|c| c.strip_suffix("</strong>"))
+                .map(str::to_string)
+                .unwrap_or(cell);
+            Some(cell)
+        })
+        .collect();
+    // html rows interleave every group family's tables; restrict to the
+    // task-type band by slicing between the known first names.
+    // Review 543ac419 F2: this arm used to skip silently when the band was
+    // not locatable (the nested `if` guards could both pass vacuously on
+    // a regressed renderer) — a missing or reordered band must FAIL.
+    let start = html_rows
+        .iter()
+        .position(|r| *r == expected[0])
+        .expect("html lane: by_task_type first row missing from rendered output");
+    let end = html_rows
+        .iter()
+        .rposition(|r| *r == expected[expected.len() - 1])
+        .expect("html lane: by_task_type last row missing from rendered output");
+    assert!(
+        start <= end,
+        "html lane: by_task_type band endpoints inverted (start={start}, end={end})"
+    );
+    let band: Vec<String> = html_rows[start..=end].to_vec();
+    assert_eq!(
+        band, expected,
+        "html lane: by_task_type must be cost-descending, not alphabetical"
+    );
+}

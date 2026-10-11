@@ -114,3 +114,74 @@ fn doctor_demo_discloses_no_operator_home_paths() {
     );
     fs::remove_dir_all(home.parent().expect("sandbox root")).ok();
 }
+
+#[test]
+fn doctor_positional_path_is_honored_as_scan_root() {
+    // rm-439 arm (run 57c491338818 assess F2): `--doctor <positional>`
+    // must scan that root. Pre-fix, the positional is silently ignored
+    // and the scan runs over the DEFAULT agent homes — on a normal host
+    // that is a wrong-scope report, and on a large store an apparent
+    // hang (49,457-file walk observed). The planted home here makes the
+    // wrong-scope outcome observable without any hang risk.
+    // rm-439 arm: DISTINCT marker — the sibling test derives its marker
+    // from the same pid, so a shared name makes the two tests delete
+    // each other's planted project during cleanup.
+    let marker = format!("secretprojpositional{}", std::process::id());
+    let (home, cache) = planted_home(&marker);
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agenttrace-core/tests/fixtures/generic");
+
+    // rm-439 arm: this test must not share the pid-keyed doctor cache
+    // with the file's other concurrent test — two writers racing one
+    // sessions.json make the sibling's discovery flaky. Give this scan
+    // its own cache via the supported override.
+    let own_cache =
+        std::env::temp_dir().join(format!("at-rm439-positional-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&own_cache);
+    fs::create_dir_all(&own_cache).expect("own cache dir");
+    let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--doctor")
+        .arg("-f")
+        .arg("json")
+        .arg(&fixtures)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &own_cache)
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("spawn agenttrace");
+    assert!(
+        output.status.success(),
+        "doctor with a positional root failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("parse doctor json");
+    let dirs = report["directories"]
+        .as_array()
+        .map(|a| serde_json::to_string(a).unwrap_or_default())
+        .unwrap_or_default();
+    assert!(
+        dirs.contains("fixtures"),
+        "the positional root must be scanned: directories={dirs}"
+    );
+    assert!(
+        report["session_files"].as_u64().unwrap_or(0) >= 1,
+        "the positional root's journals must be counted: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&marker),
+        "default agent homes must not be scanned behind the operator's back: {stdout}"
+    );
+    // rm-439 arm: planted_home's sandbox is PID-keyed and shared with
+    // the file's other concurrent test (same home dir, different marker
+    // projects) — clean up ONLY this test's marker project and its
+    // private cache; never the shared home/root.
+    fs::remove_dir_all(
+        home.join(".claude")
+            .join("projects")
+            .join(format!("home-agent-{marker}")),
+    )
+    .ok();
+    fs::remove_dir_all(&own_cache).ok();
+}

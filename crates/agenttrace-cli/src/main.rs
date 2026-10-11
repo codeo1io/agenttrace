@@ -573,12 +573,29 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.doctor {
-        // rm-608: the doctor lane used to early-return before the -d
-        // guard, so a typo'd or file-valued directory reported rc=0
-        // "healthy". Route through the same validation as every other
-        // `-d` consumer before rendering anything.
-        validate_explicit_dir(args.dir.as_deref());
-        let doctor_dir = args.dir.as_deref().map(PathBuf::from);
+        // rm-439 arm (run 57c491338818 assess F2): the positional PATH is
+        // the scan root for --doctor exactly like every other action —
+        // never silently ignored in favor of the DEFAULT agent homes.
+        // Supplying both --dir and the positional is the same ambiguous
+        // source conflict the rm-596 --demo guard rejects.
+        let doctor_dir = match (args.dir.as_deref(), args.path.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(anyhow::anyhow!(
+                    "--doctor: pass either --dir or the positional scan root, not both"
+                ));
+            }
+            // rm-608 (landed after the run's base): the doctor lane used
+            // to early-return before the -d guard, so a typo'd or
+            // file-valued directory reported rc=0 "healthy". Route the
+            // --dir arm through the same validation as every other `-d`
+            // consumer before rendering anything.
+            (Some(d), None) => {
+                validate_explicit_dir(Some(d));
+                Some(PathBuf::from(d))
+            }
+            (None, Some(p)) => Some(PathBuf::from(p)),
+            (None, None) => None,
+        };
         // rm-384: disclose the configuration layers and the winning
         // source of every knob. JSON mode keeps stdout a single pure
         // object; the disclosure goes to stderr as its own document.

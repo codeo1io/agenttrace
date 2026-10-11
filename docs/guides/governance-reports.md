@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 57 and the SQLite snapshot is schema 11; the
+The session cache is schema 58 and the SQLite snapshot is schema 11; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -354,7 +354,16 @@ the first present alias per class instead of summing dual spellings
 2f02ecafb2674e529f662f7cc27162f4, landed at this integration as
 rm-980/rm-981; minted at the batch's base 518170a as 32 → 33 and
 re-based at integration onto the advanced ceiling as 56 → 57, one
-invalidation either way, conflict case edb878bb27db418fbb13184efccaa721)
+invalidation either way, conflict case edb878bb27db418fbb13184efccaa721),
+and to 58 when the id-less tool_result fold left the wire
+`tool_use_id` dedup namespace (run 57c491338818 cycle 1: a hostile
+`#N` tool_use_id can no longer alias the id-less row at ordinal N and
+silently drop its `tool_result`, fold ordinals are one-per-block
+emission positions, and genuine re-folds carry one structural
+`tool_result_refold:*` meta carrier — +1 `events_total` per session
+with re-folds; minted 42 → 52 at the run's base 15a8da8 and re-based
+at integration onto the advanced ceiling as 57 → 58, one invalidation
+either way, conflict case a4ff3f6c72be4905a00dbb4d75cad452)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
@@ -529,7 +538,11 @@ The overview also carries attribution dimensions over the same scope:
   `planning` (everything else). Token totals ride with each bucket.
   This is correlation over tool-mix and failure evidence, not ground
   truth; the cascade is documented and deterministic so two identical
-  sessions always classify identically.
+  sessions always classify identically. On every surface — text,
+  markdown, html, and json — the family renders cost-descending with the
+  task-type name as the tie-break (rm-919: one ordering contract shared
+  with every other group family); alphabetical order is never a render
+  order for `by_task_type`.
 - `top_cost_drivers`: the ranked top sessions by estimated cost, each
   with its share of total spend and its strict possible-driver note
   when one exists. Shares are computed over the full in-scope corpus,

@@ -1631,6 +1631,17 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 58 (integration of run
+                // 57c49133881840c4b7f81dba107d6333 cycle 1 — the
+                // id-less tool_result fold left the wire tool_use_id
+                // dedup namespace (ToolResultFoldKey), fold ordinals
+                // became one-per-block emission positions, and
+                // genuine re-folds emit one structural meta carrier
+                // (tool_result_refold:* counters); minted 42 -> 52 at
+                // its base 15a8da8, re-based onto this tree's advanced
+                // ceiling as 57 -> 58 per the
+                // landed-rung-keeps-numeral convention — conflict case
+                // a4ff3f6c72be4905a00dbb4d75cad452);
                 // Schema 57 (integration of run
                 // 2f02ecafb2674e529f662f7cc27162f4 cycle 2
                 // "usage-accounting truthfulness closeout" — codex
