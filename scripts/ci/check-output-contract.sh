@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
-out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
-
 fail() {
   echo "check-output-contract: $*" >&2
   exit 1
 }
+
+# rm-377 (assess fdaf8b39 F6, mirroring rm-369 in check-docs-commands.sh):
+# the binary default must be the repo's own release build, not
+# /tmp/agenttrace — /tmp persists across sessions and a stale or foreign
+# binary silently answered gate runs. AGENTTRACE_BIN still overrides for
+# A/B against a pinned build.
+repo_root="$(git rev-parse --show-toplevel)" \
+  || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 require_file() {
   local path="$1"

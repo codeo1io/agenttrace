@@ -348,7 +348,14 @@ fn collect_zero_usage(out: &mut DoctorZeroUsageReport, session: &Session) {
     if out.samples.len() < 6 {
         out.samples.push(format!(
             "{}: {} all-zero usage block(s) counted as measured",
-            crate::statusline::sanitize_line_segment(&session.name),
+            // rm-985 review-fix (review a3e986ef F1, the blocking PoC):
+            // the render emits `    {sample}` — the session name IS the
+            // line-leading segment, so a name beginning with a formula
+            // introducer re-arms on paste. The sanitized name segment
+            // rides the same guard_formula_cell the report lanes use.
+            crate::reports::guard_formula_cell(&crate::statusline::sanitize_line_segment(
+                &session.name,
+            )),
             events
         ));
     }
@@ -463,7 +470,11 @@ impl DoctorProjectDecodeReport {
                         format!(
                             "ambiguous: {} attributed via the longest-verified-path rule; \
                              verified alternatives shadowed: {}",
-                            crate::statusline::sanitize_line_segment(project),
+                            // rm-985 review-fix (a3e986ef F1): the encoded
+                            // project path is transcript-derived; guard it.
+                            crate::reports::guard_formula_cell(
+                                &crate::statusline::sanitize_line_segment(project),
+                            ),
                             shadowed
                         ),
                         *count,
@@ -477,7 +488,10 @@ impl DoctorProjectDecodeReport {
                         format!(
                             "unresolved: projects/{} has no verified decode; \
                              session attributed to `unknown`",
-                            crate::statusline::sanitize_line_segment(project)
+                            // rm-985 review-fix (a3e986ef F1): same guard.
+                            crate::reports::guard_formula_cell(
+                                &crate::statusline::sanitize_line_segment(project),
+                            )
                         ),
                         *count,
                     )
@@ -528,7 +542,14 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
             out.ambiguous += 1;
             let shadowed = shadowed
                 .iter()
-                .map(|alt| crate::statusline::sanitize_line_segment(alt))
+                .map(|alt| {
+                    // rm-985 review-fix (a3e986ef F1): transcript-derived
+                    // decode alternatives reach a rendered sample line —
+                    // guard the segment like every report lane.
+                    crate::reports::guard_formula_cell(&crate::statusline::sanitize_line_segment(
+                        alt,
+                    ))
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             out.record_ambiguous(&path, shadowed);
@@ -551,8 +572,14 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
                 &format!("{prefix}#{hash}"),
                 format!(
                     "truncated: >200-char encoded name decoded to its verified prefix {}#{}; the hash tail is opaque but stable",
-                    crate::statusline::sanitize_line_segment(&prefix),
-                    crate::statusline::sanitize_line_segment(&hash)
+                    // rm-985 review-fix (a3e986ef F1): guard the
+                    // transcript-derived segments of the sample line.
+                    crate::reports::guard_formula_cell(&crate::statusline::sanitize_line_segment(
+                        &prefix,
+                    )),
+                    crate::reports::guard_formula_cell(&crate::statusline::sanitize_line_segment(
+                        &hash,
+                    ))
                 ),
             );
         }
@@ -562,7 +589,10 @@ fn collect_project_decode(out: &mut DoctorProjectDecodeReport, session: &Session
                 &name,
                 format!(
                     "opaque: projects/{} kept as its own stable identity (CLAUDE_CODE_PROJECT_DIR_NAME-style names encode no path)",
-                    crate::statusline::sanitize_line_segment(&name)
+                    // rm-985 review-fix (a3e986ef F1): same segment guard.
+                    crate::reports::guard_formula_cell(&crate::statusline::sanitize_line_segment(
+                        &name,
+                    ))
                 ),
             );
         }

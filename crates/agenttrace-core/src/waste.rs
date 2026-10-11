@@ -478,7 +478,10 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
             // and this was the only default text lane with no sanitizer
             // import at all (assess PoC: `--waste` emitted one OSC-52
             // clipboard-write sequence from a crafted tool name).
-            sanitize_line_segment(&item.tool_name),
+            // rm-985 review-fix (a3e986ef F2): the name column starts at
+            // column 5 — first non-whitespace char of the line — so the
+            // sanitized name additionally rides the formula guard.
+            crate::reports::guard_formula_cell(&sanitize_line_segment(&item.tool_name)),
             item.call_count,
             format_cost(item.total_cost),
             share,

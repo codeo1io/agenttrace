@@ -90,8 +90,18 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
     };
     let env_home = |name: &str, fallback: PathBuf| {
         std::env::var_os(name)
-            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
+            // rm-248 (discovery arm, assess fdaf8b39 F5): the same
+            // absolute-only contract the config root (agenttrace-cli
+            // config.rs) and the history root (XDG_DATA_HOME, 4a13e1f)
+            // already enforce. A RELATIVE CODEX_HOME /
+            // CLAUDE_CONFIG_DIR / XDG_CONFIG_HOME resolves the discovery
+            // roots against the current working directory, so the
+            // scanned corpus silently differed per invocation directory;
+            // per the XDG Base Directory treatment this family adopted,
+            // a relative value is ignored as if unset (an absolute path
+            // is never empty, so the old emptiness filter folds in).
+            .filter(|dir| dir.is_absolute())
             .unwrap_or(fallback)
     };
     let mut dirs = vec![

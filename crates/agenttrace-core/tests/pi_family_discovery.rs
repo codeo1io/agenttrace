@@ -289,6 +289,66 @@ fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
     }
 }
 
+#[test]
+fn discovery_env_overrides_must_be_absolute() {
+    // rm-248 (discovery arm, assess fdaf8b39 F5): a RELATIVE CODEX_HOME
+    // or CLAUDE_CONFIG_DIR used to resolve the discovery roots against
+    // the current working directory — the same
+    // invocation-directory dependence the config root (agenttrace-cli
+    // config.rs) and the history root (XDG_DATA_HOME) dropped in 4a13e1f.
+    // A relative override must now be ignored as if unset (fallback
+    // under $HOME), while an absolute override is honored — from any
+    // working directory, because an absolute root cannot re-resolve.
+    let home = std::env::temp_dir().join("agenttrace-rm248-discovery-home");
+    std::fs::create_dir_all(&home).expect("create test home");
+    with_home(&home, || {
+        let cases: [(&str, &str, &str, &str); 2] = [
+            // (env var, registry row, fallback suffix, override suffix)
+            (
+                "CODEX_HOME",
+                "Codex CLI",
+                ".codex/sessions",
+                "abs-codex-override/sessions",
+            ),
+            (
+                "CLAUDE_CONFIG_DIR",
+                "Claude Code transcripts",
+                ".claude/transcripts",
+                "abs-claude-override/transcripts",
+            ),
+        ];
+        for (env_name, row, fallback_suffix, override_suffix) in cases {
+            let previous = std::env::var_os(env_name);
+            let registry = || {
+                known_session_dirs()
+                    .into_iter()
+                    .find(|dir| dir.name == row)
+                    .unwrap_or_else(|| panic!("{row} row missing from registry"))
+                    .path
+            };
+            // A relative override is ignored as if unset.
+            std::env::set_var(env_name, "relative-override");
+            assert_eq!(
+                registry(),
+                home.join(fallback_suffix),
+                "relative {env_name} must fall back under $HOME"
+            );
+            // An absolute override is honored.
+            let absolute = home.join(override_suffix.strip_suffix("/sessions").map_or(
+                home.join(override_suffix).parent().unwrap().to_path_buf(),
+                |base| home.join(base),
+            ));
+            std::env::set_var(env_name, &absolute);
+            assert_eq!(
+                registry(),
+                home.join(override_suffix),
+                "absolute {env_name} must be honored"
+            );
+            restore_env(env_name, previous);
+        }
+    });
+}
+
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     match LOCK.get_or_init(|| Mutex::new(())).lock() {
