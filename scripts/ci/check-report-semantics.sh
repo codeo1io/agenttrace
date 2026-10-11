@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 expected_cost_label="${AGENTTRACE_EXPECTED_COST_LABEL:-Total estimated cost}"
 
@@ -9,6 +8,15 @@ fail() {
   echo "check-report-semantics: $*" >&2
   exit 1
 }
+
+# rm-1010: the binary default is the repo's own release build, anchored
+# via git rev-parse (rm-369 lineage, same convention as
+# check-docs-commands.sh) — /tmp/agenttrace persists across sessions on
+# the CI fleet and a stale copy once answered this gate silently.
+# AGENTTRACE_BIN still overrides for A/B against a pinned build.
+repo_root="$(git rev-parse --show-toplevel)" \
+  || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir/semantics"

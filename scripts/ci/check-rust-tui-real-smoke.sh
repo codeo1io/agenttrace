@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-target/release/agenttrace}"
 source_dir="${AGENTTRACE_TUI_REAL_DIR:-$HOME/.pi/agent/sessions}"
 file_limit="${AGENTTRACE_TUI_REAL_FILE_LIMIT:-2}"
 timeout_seconds="${AGENTTRACE_TUI_TIMEOUT:-30}"
@@ -10,6 +9,13 @@ fail() {
 	echo "check-rust-tui-real-smoke: $*" >&2
 	exit 1
 }
+
+# rm-1010: anchor the default to the repo's own release build via
+# git rev-parse — the CWD-relative form silently depended on where the
+# gate was invoked from. AGENTTRACE_BIN still overrides.
+repo_root="$(git rev-parse --show-toplevel)" \
+	|| fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 [[ -d "$source_dir" ]] || fail "real sessions directory does not exist: $source_dir"

@@ -67,6 +67,13 @@ jobs:
           bash -n scripts/record-demo.sh scripts/ci/*.sh scripts/release/*.sh
           sh -n install.sh
 
+      - name: Gate binary hermeticity
+        # rm-1010: one AGENTTRACE_BIN convention — every scripts/ci gate
+        # reading it anchors its default to the repo's own release build
+        # via git rev-parse; external /tmp or CWD-relative defaults are
+        # named failures, not silent stale-binary risks.
+        run: scripts/ci/check-gate-hermeticity.sh
+
       - name: Lockfile enforcement (cargo --locked)
         # rm-170 lineage: every CI cargo step runs --locked; this gate
         # makes a drifted lockfile a named failure, not a surprise.

@@ -1,5 +1,5 @@
 use crate::{parse_jsonl_session, session_from_events, Event, Session, ToolCall};
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -446,7 +446,7 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     }
     if let Some(value) = parsed_value {
         if let Some(events) = parse_opencode_storage_value(path, &value) {
-            return session_from_events(name, path, events);
+            return session_from_events(name, path, events?);
         }
         if let Some(events) = parse_cursor_export(&value) {
             return session_from_events(name, path, events);
@@ -5777,18 +5777,37 @@ struct OpenCodeRecord {
     doc: Map<String, Value>,
 }
 
-fn parse_opencode_storage_value(path: &str, value: &Value) -> Option<Vec<Event>> {
+/// rm-1011: tri-state lane ownership. `None` = the file is not an
+/// opencode storage session (path shape mismatch) — the remaining
+/// format lanes try it, exactly as before. `Some(..)` = the storage
+/// lane owns the file and the outcome is authoritative: either the
+/// events, or the storage-specific error propagated verbatim
+/// ("opencode: missing session id", a missing `projectID`, "no
+/// messages found for session <id>"). The old `Option<Vec<Event>>`
+/// shape flattened this through `.ok()`, so every storage-lane refusal
+/// surfaced downstream as the generic "unsupported session format"
+/// mask — the real cause was discarded at this boundary.
+fn parse_opencode_storage_value(path: &str, value: &Value) -> Option<anyhow::Result<Vec<Event>>> {
     let doc = value.as_object()?;
-    if !is_opencode_storage_session_doc(path, doc) {
+    if !is_opencode_storage_session_file(path) {
         return None;
     }
-    parse_opencode_storage_session(path, doc).ok()
-}
-
-fn is_opencode_storage_session_doc(path: &str, doc: &Map<String, Value>) -> bool {
-    is_opencode_storage_session_file(path)
-        && !string(doc.get("id")).unwrap_or("").is_empty()
-        && !string(doc.get("projectID")).unwrap_or("").is_empty()
+    let session_id = string(doc.get("id")).unwrap_or("");
+    if session_id.is_empty() {
+        // Route through the lane parser so its own diagnostic (naming
+        // the missing field) is the error that surfaces.
+        return Some(parse_opencode_storage_session(path, doc));
+    }
+    let project_id = string(doc.get("projectID")).unwrap_or("");
+    if project_id.is_empty() {
+        // The old id+projectID pre-gate swallowed this silently; keep
+        // the refuse verdict but disclose the marker the lane parser
+        // never read.
+        return Some(Err(anyhow!(
+            "opencode: storage session {session_id} is missing projectID ({path})"
+        )));
+    }
+    Some(parse_opencode_storage_session(path, doc))
 }
 
 fn is_opencode_storage_session_file(path: &str) -> bool {
