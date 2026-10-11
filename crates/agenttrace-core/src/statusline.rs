@@ -144,7 +144,16 @@ fn resolve_user_cache_dir(
             return PathBuf::from(home).join("Library").join("Caches");
         }
     }
-    if let Some(cache) = xdg_cache_home.filter(|value| !value.is_empty()) {
+    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
+    // $XDG_CACHE_HOME values; a relative one is treated as unset and
+    // falls through to the HOME-based default instead of scattering a
+    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
+    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
+    // scratch cwd).
+    if let Some(cache) = xdg_cache_home
+        .filter(|value| !value.is_empty())
+        .filter(|value| std::path::Path::new(value).is_absolute())
+    {
         return PathBuf::from(cache);
     }
     if let Some(home) = home.filter(|value| !value.is_empty()) {
@@ -1662,6 +1671,21 @@ mod tests {
                 resolve_user_cache_dir(Some(OsStr::new("/home/at-test")), empty),
                 PathBuf::from("/home/at-test").join(".cache")
             );
+            // rm-248: a RELATIVE XDG_CACHE_HOME is treated as unset —
+            // the XDG spec only defines absolute values, and honoring
+            // a relative one scattered a per-cwd cache
+            // (XDG_CACHE_HOME=rel-cache wrote ./rel-cache/agenttrace
+            // from a scratch cwd). Same ladder as session_cache /
+            // doctor / pricing (`relative_xdg_cache_home_is_ignored_per_spec`).
+            assert_eq!(
+                resolve_user_cache_dir(
+                    Some(OsStr::new("/home/at-test")),
+                    Some(OsStr::new("rel-cache"))
+                ),
+                PathBuf::from("/home/at-test").join(".cache")
+            );
+            let relative_only = resolve_user_cache_dir(empty, Some(OsStr::new("rel-cache")));
+            assert!(relative_only.is_absolute(), "{relative_only:?}");
         }
     }
 

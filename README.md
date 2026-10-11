@@ -443,10 +443,10 @@ fails when the README table drifts from the binary's actual flag count
 | `--sort <SORT>` | `recent` | Sort key for list views: recent (default), health, cost, turns, failures, source, or name |
 | `--order <ORDER>` | `desc` | Sort direction for list views: desc (default) or asc |
 | `--limit <LIMIT>` | `20` | Maximum number of rows a list view renders (default 20) |
-| `--sample <SAMPLE>` |  | Explicitly bound governance reports to the newest N sessions. Governance reports audit every matching session by default; sampling is always disclosed via audited_sessions/total_sessions (pass-8 F8-1) |
+| `--sample <SAMPLE>` |  | Explicitly bound governance reports and `--compare` to the newest N sessions. Governance reports audit every matching session by default; sampling is always disclosed via audited_sessions/total_sessions (pass-8 F8-1). Every other lane (including `--overview`) rejects the flag loudly instead of silently aggregating the full corpus |
 | `--clear-cache` |  | Delete the session cache before running, forcing a full re-parse |
-| `--preserve-history` |  | Persist derived metrics to the history ledger so later `--include-history` runs can see them |
-| `--include-history` |  | Merge preserved-history sessions into the view (offline or retained-history analysis) |
+| `--preserve-history` |  | Persist derived metrics to the history ledger so later `--include-history` runs can see them; the interactive and utility lanes reject the flag loudly |
+| `--include-history` |  | Merge preserved-history sessions into the view (offline or retained-history analysis); the interactive and utility lanes reject the flag loudly |
 | `-h, --help` |  | Print help |
 
 ## What you get
