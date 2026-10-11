@@ -226,56 +226,14 @@ fn csv_cell(raw: &str) -> String {
     quoted
 }
 
-/// Prefixes spreadsheet-formula-looking cells with `'`. Bare numbers
-/// (including negatives such as `-1.5`, and whitespace-padded
-/// numerics such as `" -1.5"` — parsed on the trimmed cell, since
-/// `f64::from_str` itself rejects surrounding whitespace) are exempt
-/// so numeric columns still import as values.
+/// Prefixes spreadsheet-formula-looking cells with `'` (delegating
+/// — see the doc on the core owner `statusline::guard_formula_shape`).
 pub(crate) fn guard_formula(raw: &str) -> String {
-    let looks_numeric = raw.trim().parse::<f64>().is_ok();
-    if looks_numeric {
-        return raw.to_string();
-    }
-    // rm-540: judge the first NON-WHITESPACE character, not
-    // `chars().next()` — spreadsheet apps ignore a leading
-    // space/tab/CR/LF when deciding a cell is a formula, so
-    // `" =SUM(9+9)"` was a live formula the first-char-only check
-    // waved through (assess PoC F2). The sanitizer upstream already
-    // turns tab/CR/LF into U+FFFD; a plain leading space survives it,
-    // and this guard is the layer that catches that one.
-    let starts_formula = raw
-        .chars()
-        .find(|ch| !ch.is_whitespace())
-        .is_some_and(is_formula_introducer);
-    if starts_formula {
-        format!("'{raw}")
-    } else {
-        raw.to_string()
-    }
-}
-
-/// rm-540 (residual, assess F3): the introducer set covers the ASCII
-/// formula starters AND their fullwidth forms — U+FF1D `＝`, U+FF0B
-/// `＋`, U+FF20 `＠`, U+FF0D `－`. Spreadsheet apps (Excel, Sheets,
-/// LibreOffice) normalize fullwidth introducers to their ASCII meaning
-/// when a cell is entered or imported, so `＝1+2` executes exactly like
-/// `=1+2`; the sanitizer upstream only strips control characters, so
-/// the fullwidth bytes survive to this guard (live PoC
-/// `csv-fullwidth-model.jsonl`, run 06cc5c7d). Guarding is the safe
-/// direction: a false positive costs a leading apostrophe, a false
-/// negative executes a formula. Fullwidth "numbers" such as `－１.５`
-/// fail `f64::from_str` and are guarded too — conservative on purpose.
-fn is_formula_introducer(first: char) -> bool {
-    matches!(
-        first,
-        '=' | '+'
-            | '@'
-            | '-'
-            | '\u{FF1D}' // FULLWIDTH EQUALS SIGN
-            | '\u{FF0B}' // FULLWIDTH PLUS SIGN
-            | '\u{FF20}' // FULLWIDTH COMMERCIAL AT
-            | '\u{FF0D}' // FULLWIDTH HYPHEN-MINUS
-    )
+    // rm-992: the guard's single owner moved to agenttrace-core so
+    // every text render lane shares the exact introducer set with the
+    // CSV/TSV exports; this stays for the export paths that already
+    // called it.
+    agenttrace_core::guard_formula_shape(raw)
 }
 
 #[cfg(test)]

@@ -119,11 +119,16 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         // the terminal (assess PoC: --search -f text emitted a verbatim
         // clipboard-write sequence from a crafted tool name). JSON output
         // escapes control bytes losslessly and is intentionally untouched.
+        // rm-992: the same fields ride `sanitize_rendered_text` (control
+        // bytes + spreadsheet-formula shape) — search results get pasted
+        // into spreadsheets exactly like the CSV/TSV exports, and a model
+        // id `=2+5|cmd` used to render verbatim here while every export
+        // lane guarded it (assess PoC 0c03d32e F3, fourth live lane).
         out.push_str(&format!(
             "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
-            crate::statusline::sanitize_line_segment(&result.name),
-            crate::statusline::sanitize_line_segment(&result.source_tool),
-            crate::statusline::sanitize_line_segment(&result.model),
+            crate::statusline::sanitize_rendered_text(&result.name),
+            crate::statusline::sanitize_rendered_text(&result.source_tool),
+            crate::statusline::sanitize_rendered_text(&result.model),
             result.health,
             format_cost(result.cost),
             format_tokens(result.tokens)
@@ -131,19 +136,19 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         if !result.cwd.is_empty() {
             out.push_str(&format!(
                 "  cwd: {}\n",
-                crate::statusline::sanitize_line_segment(&result.cwd)
+                crate::statusline::sanitize_rendered_text(&result.cwd)
             ));
         }
         if !result.path.is_empty() {
             out.push_str(&format!(
                 "  path: {}\n",
-                crate::statusline::sanitize_line_segment(&result.path)
+                crate::statusline::sanitize_rendered_text(&result.path)
             ));
         }
         for item in &result.matches {
             out.push_str(&format!(
                 "  - {}\n",
-                crate::statusline::sanitize_line_segment(item)
+                crate::statusline::sanitize_rendered_text(item)
             ));
         }
     }
@@ -324,5 +329,87 @@ mod tests {
         );
         assert!(text.contains('\u{FFFD}'));
         assert!(text.contains("]52;c;aGVsbG8="));
+    }
+
+    #[test]
+    fn search_text_guards_spreadsheet_formula_shapes() {
+        // rm-992: the text search lane is one of the four live formula
+        // lanes (assess 0c03d32e F3) — name/model/tool strings rendered
+        // `=HYPERLINK(…)` and `=2+5|cmd` verbatim while the CSV/TSV
+        // export lanes guarded the identical strings. Every
+        // transcript-derived field now routes through
+        // sanitize_rendered_text, so an introducer-led value renders
+        // apostrophe-prefixed (inert when pasted into a spreadsheet),
+        // and the raw form never appears un-prefixed.
+        let result = SearchResult {
+            name: "=SUM(9+9)".to_string(),
+            path: "/tmp/=IMPORT(x).jsonl".to_string(),
+            cwd: "/tmp".to_string(),
+            source_tool: "+cmd|'/C calc'!A0".to_string(),
+            model: "=2+5|cmd".to_string(),
+            health: 88,
+            cost: 0.0,
+            tokens: 42,
+            matches: vec!["model: =2+5|cmd".to_string()],
+        };
+        let text = report_search_text(&[result], "probe");
+        for guarded in ["'=SUM(9+9)", "'+cmd|'/C calc'!A0", "'=2+5|cmd"] {
+            assert!(
+                text.contains(guarded),
+                "guarded form {guarded:?} missing from the search text lane"
+            );
+        }
+        // Shape contract, pinned: the guard prefixes only CELL-LEADING
+        // introducers, exactly like the CSV/TSV lanes. A path embeds
+        // the same characters MID-string (the cell begins with
+        // `/tmp/…`), so it stays raw — pasted whole it is not a
+        // formula. Pinning this keeps the text lane's semantics
+        // arm-for-arm with the exports instead of drifting stricter.
+        assert!(
+            text.contains("path: /tmp/=IMPORT(x).jsonl"),
+            "mid-string introducers are not cell-leading and stay raw: {text:?}"
+        );
+        assert!(
+            text.contains("  - model: =2+5|cmd"),
+            "match-evidence composites embed values mid-string (not cell-leading): {text:?}"
+        );
+        // Every RENDERED FIELD must be guarded where it leads: the
+        // result row separates fields with the renderer's double
+        // space, and fields 0..=2 are name / tool / model.
+        let row = text
+            .lines()
+            .find(|line| line.contains("TOKENS"))
+            .expect("result row renders");
+        let fields: Vec<&str> = row.split("  ").collect();
+        for field in fields.iter().take(3) {
+            assert!(
+                field.starts_with('\''),
+                "result-row field {field:?} must render guarded (rm-992)"
+            );
+        }
+        // And no line may LEAD with a bare introducer after the
+        // renderer's own label prefixes (cwd:/path:/- evidence).
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let body = trimmed
+                .strip_prefix("cwd: ")
+                .or_else(|| trimmed.strip_prefix("path: "))
+                .or_else(|| trimmed.strip_prefix("- "))
+                .map(|rest| rest.split(':').next().unwrap_or(rest))
+                .unwrap_or(trimmed.split_whitespace().next().unwrap_or(trimmed));
+            let Some(first) = body.chars().next() else {
+                continue;
+            };
+            if [
+                '=', '+', '@', '\u{ff1d}', '\u{ff0b}', '\u{ff20}', '\u{ff0d}',
+            ]
+            .contains(&first)
+            {
+                assert!(
+                    body.starts_with('\''),
+                    "un-guarded formula-shaped line rendered: {line:?}"
+                );
+            }
+        }
     }
 }

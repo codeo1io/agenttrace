@@ -557,3 +557,203 @@ fn rm936_bidi_format_controls_neutralized_across_every_lane() {
         }
     }
 }
+
+/// rm-992: the TEXT-LANE formula-guard REGISTRY. The shared guard
+/// (`agenttrace_core::sanitize_rendered_text` = control-byte sanitize
+/// composed with `guard_formula_shape`) owns every human-readable text
+/// render lane that carries transcript-derived strings, so an
+/// introducer-led model id / session name / project name / MCP server
+/// name renders apostrophe-prefixed (inert when pasted into a
+/// spreadsheet) — arm-for-arm with the CSV/TSV export lanes (rm-540)
+/// instead of the pre-rm-992 split where exports guarded the identical
+/// strings and these lanes rendered them raw (assess PoC 0c03d32e F3).
+/// This test IS the registry: it enumerates the live text lanes and
+/// their expected guarded probes — adding a text lane that renders
+/// transcript-derived strings WITHOUT the guard goes red here (or on
+/// the universal no-bare-introducer rule), not in production.
+///
+/// Guard-shape contract (mirrors the CSV lane exactly): only a cell
+/// that LEADS with an introducer is prefixed; introducers embedded
+/// mid-string (a path like `/tmp/=SUM(9+9).jsonl`, or the search
+/// match-evidence line `model: =2+5|cmd`) are NOT formulas when pasted
+/// whole and stay raw — one introducer set, one shape, every lane.
+/// JSON lanes stay lossless by design (data integrity over
+/// paste-safety) and are pinned at the bottom.
+fn write_formula_corpus(root: &std::path::Path) {
+    // A: hostile session stem AND hostile model id; newest timestamp
+    // so --diagnostics --latest renders its card.
+    fs::write(
+        root.join("=SUM(9+9).jsonl"),
+        concat!(
+            "{\"type\": \"assistant\", \"uuid\": \"a1\", \"timestamp\": \"2026-10-04T13:00:05Z\", ",
+            "\"cwd\": \"/tmp/at-992-poc\", \"message\": {\"role\": \"assistant\", ",
+            "\"model\": \"=2+5|cmd\", \"content\": [{\"type\": \"text\", \"text\": \"done\"}], ",
+            "\"usage\": {\"input_tokens\": 10, \"output_tokens\": 5}}}\n"
+        ),
+    )
+    .unwrap();
+    // B: benign session, hostile resolved PROJECT NAME (from cwd) —
+    // the delivery-evidence / context-trends project lane.
+    fs::write(
+        root.join("20261004T110000+0000-project.jsonl"),
+        concat!(
+            "{\"type\": \"assistant\", \"uuid\": \"b1\", \"timestamp\": \"2026-10-04T11:00:05Z\", ",
+            "\"cwd\": \"/tmp/at-992-keys/=SUM(9+9)-project\", ",
+            "\"message\": {\"role\": \"assistant\", \"model\": \"claude-sonnet-4-5\", ",
+            "\"content\": [{\"type\": \"text\", \"text\": \"done\"}], ",
+            "\"usage\": {\"input_tokens\": 10, \"output_tokens\": 5}}}\n"
+        ),
+    )
+    .unwrap();
+    // C: MCP tool whose inferred SERVER NAME is formula-shaped — the
+    // mcp-governance lane.
+    fs::write(
+        root.join("20261004T120000+0000-mcp.jsonl"),
+        concat!(
+            "{\"type\": \"user\", \"uuid\": \"c0\", \"timestamp\": \"2026-10-04T12:00:00Z\", ",
+            "\"cwd\": \"/tmp/at-992-poc\", \"message\": {\"role\": \"user\", \"content\": \"go\"}}\n",
+            "{\"type\": \"assistant\", \"uuid\": \"c1\", \"timestamp\": \"2026-10-04T12:00:05Z\", ",
+            "\"message\": {\"role\": \"assistant\", \"model\": \"claude-sonnet-4-5\", ",
+            "\"content\": [{\"type\": \"tool_use\", \"id\": \"t1\", \"name\": \"mcp__=SUM(9+9)__probe\", ",
+            "\"input\": {\"command\": \"echo hi\"}}, {\"type\": \"text\", \"text\": \"done\"}], ",
+            "\"usage\": {\"input_tokens\": 10, \"output_tokens\": 5}}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn assert_no_bare_introducer_leads_a_line(lane: &str, stdout: &[u8]) {
+    let text = String::from_utf8_lossy(stdout);
+    let introducers = [
+        '=', '+', '@', '\u{ff1d}', '\u{ff0b}', '\u{ff20}', '\u{ff0d}',
+    ];
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        // Governance-family bullets render as "- label: value".
+        let body = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let Some(first) = body.chars().next() else {
+            continue;
+        };
+        if !introducers.contains(&first) {
+            continue;
+        }
+        // The guard's own numeric exemption: a genuine negative number
+        // cell (-1.5) keeps importing as a value.
+        let chunk = body.split_whitespace().next().unwrap_or(body);
+        if chunk.trim().parse::<f64>().is_ok() {
+            continue;
+        }
+        assert!(
+            body.starts_with('\''),
+            "{lane}: un-guarded formula-shaped line rendered (rm-992): {line:?}"
+        );
+    }
+}
+
+#[test]
+fn text_formula_lanes_are_enumerated_and_guarded() {
+    let tmp = tempdir("output-safety-formula-registry");
+    let corpus = tmp.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    write_formula_corpus(&corpus);
+    let home = tmp.join("home");
+    fs::create_dir_all(home.join(".cache")).unwrap();
+
+    // THE REGISTRY: (lane, CLI tail, guarded probes that MUST appear).
+    // A lane whose probe is absent is either un-guarded (red here) or
+    // no longer renders that field (update the registry consciously).
+    let registry: &[(&str, &[&str], &[&str])] = &[
+        (
+            "--audit text",
+            &["--audit", "-f", "text"],
+            &["model: '=2+5|cmd"],
+        ),
+        (
+            "--delivery-evidence text",
+            &["--delivery-evidence", "-f", "text"],
+            &["session: '=SUM(9+9)", "project: '=SUM(9+9)-project"],
+        ),
+        (
+            "--overview text",
+            &["--overview", "-f", "text"],
+            &["'=2+5|cmd", "'=SUM(9+9)"],
+        ),
+        (
+            "--sessions text",
+            &["--sessions", "-f", "text"],
+            &["'=SUM(9+9)", "'=2+5|cmd"],
+        ),
+        (
+            "--search text",
+            &["--search", "cmd", "-f", "text"],
+            &["'=2+5|cmd"],
+        ),
+        (
+            "--mcp-governance text",
+            &["--mcp-governance", "-f", "text"],
+            &["server: '=SUM(9+9)"],
+        ),
+        (
+            "--context-trends text",
+            &["--context-trends", "-f", "text"],
+            &["project: '=SUM(9+9)-project"],
+        ),
+        (
+            "--diagnostics text",
+            &["--diagnostics", "--latest", "-f", "text"],
+            &["'=2+5|cmd"],
+        ),
+    ];
+
+    for (lane, tail, probes) in registry {
+        let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .arg("-d")
+            .arg(&corpus)
+            .args(*tail)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .output()
+            .expect("agenttrace runs");
+        assert!(
+            out.status.success(),
+            "{lane} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.stdout.is_empty(), "{lane} rendered nothing");
+        let text = String::from_utf8_lossy(&out.stdout);
+        for probe in *probes {
+            assert!(
+                text.contains(probe),
+                "{lane}: guarded probe {probe:?} missing — lane un-guarded or registry stale (rm-992)"
+            );
+        }
+        assert_no_bare_introducer_leads_a_line(lane, &out.stdout);
+    }
+
+    // JSON lanes stay lossless by design: the raw id rides un-prefixed
+    // (data integrity over paste-safety), pinning the carve-out so a
+    // future over-guarding of the data lanes is a conscious change.
+    for tail in [
+        ["--audit", "-f", "json"].as_slice(),
+        ["--overview", "-f", "json"].as_slice(),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .arg("-d")
+            .arg(&corpus)
+            .args(tail)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .output()
+            .expect("agenttrace runs");
+        assert!(out.status.success(), "{tail:?} failed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("=2+5|cmd"),
+            "{tail:?}: JSON lane must keep the raw id lossless (rm-992 carve-out)"
+        );
+        assert!(
+            !text.contains("'=2+5|cmd"),
+            "{tail:?}: JSON lane must NOT formula-guard its data (rm-992 carve-out)"
+        );
+    }
+}

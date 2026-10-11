@@ -2,8 +2,9 @@ use crate::{
     average_health, canonical_sessions, classify_tool_authority, context_trends, cost_audit,
     delivery_evidence, fmt_duration, format_cost, format_count, format_tokens,
     highest_authority_for_metrics, is_high_authority_category, mcp_governance, parse_ts,
-    recommendations, report_scope, round4, sanitize_line_segment, sorted_keys, sorted_set,
-    total_tokens, Anomaly, GroupOverview, Overview, Session, TaskTypeOverview, ToolCall, VERSION,
+    recommendations, report_scope, round4, sanitize_line_segment, sanitize_rendered_text,
+    sorted_keys, sorted_set, total_tokens, Anomaly, GroupOverview, Overview, Session,
+    TaskTypeOverview, ToolCall, VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -321,8 +322,11 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         format_cost(metrics.cost_estimated),
         language.t("model", "模型"),
         // rm-383: model strings are transcript-derived; sanitize for the
-        // terminal like every other text-renderer field.
-        sanitize_line_segment(&metrics.model_used)
+        // terminal like every other text-renderer field. rm-992: the
+        // shared render guard also prefixes formula-shaped ids — the
+        // session-card lane pastes into spreadsheets like every text
+        // lane (assess PoC: `=cmd|'/C calc'!A0` rendered raw here).
+        sanitize_rendered_text(&metrics.model_used)
     ));
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
@@ -408,7 +412,7 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
             // crafted tool name); no control byte may reach the terminal.
             out.push_str(&format!(
                 "  {:<35} {:>4}\n",
-                sanitize_line_segment(&tool),
+                sanitize_rendered_text(&tool),
                 count
             ));
         }
@@ -475,7 +479,7 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
                 anomaly_type_label_for_language(&anomaly.kind, language),
                 // rm-383: anomaly detail strings embed parsed transcript
                 // values; sanitize like every other text-renderer field.
-                sanitize_line_segment(&anomaly_detail_for_language(anomaly, language))
+                sanitize_rendered_text(&anomaly_detail_for_language(anomaly, language))
             ));
         }
     }
@@ -2180,7 +2184,7 @@ pub fn report_compare_with_language(
         // journal emitted one OSC-52 clipboard-write sequence). Route
         // through the shared sanitizer before layout so the 27-rune
         // budget applies to sanitized text.
-        let name = truncate_runes(&sanitize_line_segment(&session.name), 27);
+        let name = truncate_runes(&sanitize_rendered_text(&session.name), 27);
         out.push_str(&format!(
             "  {:<28} {:>4} {:>5} {:>5} {:>5} {:>9} {} {}/100\n",
             name,
@@ -3484,7 +3488,7 @@ fn text_cell(value: &str, limit: usize) -> String {
     // the `...` tail of an over-long cell is clean too. The
     // json/md/html/csv lanes never pass through here and stay
     // byte-identical.
-    let value = sanitize_line_segment(value);
+    let value = sanitize_rendered_text(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
@@ -3767,6 +3771,31 @@ mod tests {
         // Truncation still applies after sanitization.
         let long = "x".repeat(90);
         assert_eq!(text_cell(&long, 40).chars().count(), 40);
+    }
+
+    #[test]
+    fn text_cell_guards_spreadsheet_formula_shapes() {
+        // rm-992: text_cell is the composition point for every text
+        // report's tabular payload — by-model / by-provider / by-task
+        // family rows, session tables, incident timelines — so it
+        // routes through sanitize_rendered_text, arm-for-arm with the
+        // CSV/TSV export lanes (assess PoC 0c03d32e F3: `--overview
+        // -f text` rendered the by-model row for a model named
+        // `=cmd|'/C calc'!A0` raw while the CSV lane prefixed it).
+        assert_eq!(text_cell("=2+5|cmd", 25), "'=2+5|cmd");
+        assert_eq!(text_cell("+SUM(A1:A9)", 25), "'+SUM(A1:A9)");
+        assert_eq!(text_cell("\u{ff1d}1+1", 25), "'\u{ff1d}1+1");
+        assert_eq!(text_cell("@HYPERLINK(evil)", 25), "'@HYPERLINK(evil)");
+        // The numeric exemption survives the composition: genuine
+        // negative-number cells must keep importing as values. (A
+        // whitespace-padded numeric normalizes through text_cell's own
+        // whitespace collapse before the guard ever sees it.)
+        assert_eq!(text_cell("-1.5", 25), "-1.5");
+        assert_eq!(text_cell(" -1.5", 25), "-1.5");
+        // Truncation applies AFTER the guard, so the apostrophe and
+        // the introducer stay adjacent (never a `...` between them).
+        let guarded = text_cell("=HYPERLINK('evil.example')!A0", 12);
+        assert!(guarded.starts_with("'="), "guard must lead: {guarded:?}");
     }
 
     #[test]

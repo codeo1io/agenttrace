@@ -1409,11 +1409,21 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
     match value {
         serde_json::Value::Object(items) => items
             .iter()
-            .map(|(key, value)| match value {
-                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                    format!("{indent}{key}:\n{}", render_plain_value(value, depth + 1))
+            .map(|(key, value)| {
+                // rm-992: keys are part of the rendered line too — the
+                // governance text family serializes maps KEYED by
+                // journal-derived strings (--context-trends projects by
+                // resolved project name, per-project `files` maps by
+                // tool-touched paths), and a project named
+                // `=HYPERLINK(…)` rendered verbatim as a key while the
+                // leaf beside it was guarded. Same guard, same seam.
+                let key = agenttrace_core::sanitize_rendered_text(key);
+                match value {
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        format!("{indent}{key}:\n{}", render_plain_value(value, depth + 1))
+                    }
+                    _ => format!("{indent}{key}: {}", render_plain_value(value, 0)),
                 }
-                _ => format!("{indent}{key}: {}", render_plain_value(value, 0)),
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1431,7 +1441,12 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
         // journal-derived strings (e.g. mcp_server_name inferred from a
         // crafted tool name) through this leaf; control bytes must not
         // reach the terminal (same contract as the TSV/search renderers).
-        serde_json::Value::String(value) => sanitize_line_segment(value),
+        // rm-992: the leaf is the render boundary for the whole
+        // governance text family (--audit/--delivery-evidence/…), so the
+        // spreadsheet-formula guard rides the same seam — a session
+        // named `=HYPERLINK+SUM(9+9)|cmd` renders prefixed, never raw
+        // (assess PoC 0c03d32e F3).
+        serde_json::Value::String(value) => agenttrace_core::sanitize_rendered_text(value),
         _ => value.to_string(),
     }
 }
@@ -2628,11 +2643,11 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
         // transcript-derived), so no sanitization is owed here.
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
-            csv_export::guard_formula(&sanitize_line_segment(&session.name)),
+            agenttrace_core::sanitize_rendered_text(&session.name),
             session.health,
             session_capability(session),
-            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.source_tool)),
-            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.model_used)),
+            agenttrace_core::sanitize_rendered_text(&session.metrics.source_tool),
+            agenttrace_core::sanitize_rendered_text(&session.metrics.model_used),
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,
@@ -3614,6 +3629,55 @@ mod tests {
         // terminal trust, by design.
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert!(json.contains("\\u001b"));
+    }
+
+    #[test]
+    fn governance_text_render_guards_formula_shapes_in_leaves_and_keys() {
+        // rm-992 (CU-3): the governance-family plain renderer is the
+        // shared text boundary for --audit / --delivery-evidence /
+        // --recommend / --context-trends / --mcp-governance. Two
+        // positions carry journal-derived strings: VALUES (the
+        // assess PoC's model cell `=2+5|cmd` rendered raw) and MAP
+        // KEYS (the same name class can land in key position —
+        // project/file aggregates keyed by resolved project names). A
+        // rendered line `key: value` pastes into a spreadsheet as one
+        // cell either way, so both positions ride the same guard.
+        let report = serde_json::json!({
+            "=SUM(9+9)": {
+                "=HYPERLINK('evil.example')!A1": "+cmd|'/C calc'!A0",
+                "plain": 1,
+            }
+        });
+        let text = render_plain_value(&report, 0);
+        assert!(
+            text.contains("'=SUM(9+9):"),
+            "introducer-led key must render guarded: {text:?}"
+        );
+        assert!(
+            text.contains("'=HYPERLINK('evil.example')!A1: '+cmd|'/C calc'!A0"),
+            "key and leaf must both render guarded: {text:?}"
+        );
+        assert!(text.contains("plain: 1"));
+        // No line may lead (after indent) with a bare introducer.
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let body = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+            let leads = [
+                '=', '+', '@', '\u{ff1d}', '\u{ff0b}', '\u{ff20}', '\u{ff0d}',
+            ]
+            .iter()
+            .any(|c| body.starts_with(*c));
+            if leads {
+                assert!(
+                    body.starts_with('\''),
+                    "un-guarded formula-shaped line rendered: {line:?}"
+                );
+            }
+        }
+        // JSON lanes stay lossless by design (data integrity over
+        // paste-safety): the raw key survives untouched there.
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("\"=SUM(9+9)\""));
     }
 
     #[test]

@@ -440,8 +440,15 @@ pub fn provider_for(model: &str) -> Option<String> {
 }
 
 fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
-    let normalized = normalize_model(model);
-    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    // rm-988: hand resolve_alias the RAW id — its lookup path
+    // normalizes exactly once, mirroring lookup_price_tiered.
+    // Pre-normalizing here fed the second pass an already-normalized
+    // id, and normalize_model is not idempotent for
+    // "-YYYYMMDD-v<n>:<n>" ids (the first pass leaves the date suffix
+    // behind the "-v1" tail; the second strips it), so attribution
+    // missed the exact catalog row the rates path had just hit and
+    // bucketed catalog-priced bedrock twins as "unknown".
+    let resolved = resolve_alias(model, &catalog.aliases);
     let key = matching_catalog_key(&resolved, &catalog.entries)?;
     catalog
         .providers
@@ -455,8 +462,14 @@ fn pricing_source_for_catalog(
     catalog: &PricingCatalog,
     override_models: &BTreeSet<String>,
 ) -> String {
+    // rm-988: resolve from the RAW id so this label reflects the same
+    // catalog row lookup_price_tiered priced the session with (one
+    // normalization inside resolve_alias; the pre-normalized call
+    // double-normalized and labeled exact-match rows "built-in
+    // fallback"). `normalized` stays only for the rm-511 alias-arm
+    // comparison below, which is a label decision, not a lookup.
     let normalized = normalize_model(model);
-    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    let resolved = resolve_alias(model, &catalog.aliases);
     let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
         return "built-in fallback".to_string();
     };
@@ -2371,6 +2384,143 @@ mod tests {
         assert!(
             pricing_source_for_catalog("alias-model", &catalog, &overrides)
                 .contains("via user override alias")
+        );
+    }
+
+    #[test]
+    fn provenance_paths_track_the_rates_row_for_date_suffixed_twins() {
+        // rm-988: provider_for_in and pricing_source_for_catalog used
+        // to pre-normalize the id before resolve_alias, whose lookup
+        // path normalizes again — and normalize_model is NOT
+        // idempotent for "-YYYYMMDD-v<n>:<n>" ids: the first pass
+        // leaves the date suffix behind the "-v1" tail (strip_date is
+        // blocked by the ':' until strip_version removes it), the
+        // second pass strips the date. The double-normalized key then
+        // missed the exact catalog row the single-normalizing rates
+        // path (lookup_price_tiered) had just hit — the assess PoC's
+        // self-contradictory audit row: "built-in fallback" source +
+        // catalog_estimate status + "exact normalized model match"
+        // note, provider "unknown", on a session priced from the
+        // catalog. The fix: resolve from the RAW id so both paths
+        // share one normalization.
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "anthropic.claude-3-opus-20240229-v1".to_string(),
+                    Price {
+                        input: 15.0,
+                        output: 75.0,
+                        deprecation_date: Some("2025-01-01".to_string()),
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "claude-sonnet-4-5-20250929-v1".to_string(),
+                    Price {
+                        input: 3.3,
+                        output: 16.5,
+                        ..Price::default()
+                    },
+                ),
+            ]),
+            aliases: BTreeMap::new(),
+            source: "snapshot".to_string(),
+            providers: BTreeMap::from([
+                (
+                    "anthropic.claude-3-opus-20240229-v1".to_string(),
+                    "bedrock".to_string(),
+                ),
+                (
+                    "claude-sonnet-4-5-20250929-v1".to_string(),
+                    "bedrock_converse".to_string(),
+                ),
+            ]),
+            reference_date: Some(2026_1004),
+        };
+        let twin = "anthropic.claude-3-opus-20240229-v1:0";
+        // The rates path (one normalization) hits the exact row.
+        assert_eq!(lookup_price_in(twin, &catalog.entries).input, 15.0);
+        // Provenance must claim the very same row: provider, source,
+        // and — because this synthetic twin is vendor-retired — the
+        // rm-419 deprecation disclosure that the double-normalized
+        // lookup used to swallow.
+        assert_eq!(provider_for_in(twin, &catalog).as_deref(), Some("bedrock"));
+        let source = pricing_source_for_catalog(twin, &catalog, &BTreeSet::new());
+        assert!(
+            source.starts_with("LiteLLM snapshot"),
+            "twin source must be the catalog, was {source:?}"
+        );
+        assert!(
+            source.contains("model deprecated 2025-01-01"),
+            "retired twin must keep its deprecation disclosure, was {source:?}"
+        );
+        // The regional "us./eu." twins take the same shape: the
+        // marker strip removes the region prefix on the FIRST pass,
+        // so the raw-id seam resolves them to the exact row too.
+        let regional = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        assert_eq!(lookup_price_in(regional, &catalog.entries).input, 3.3);
+        assert_eq!(
+            provider_for_in(regional, &catalog).as_deref(),
+            Some("bedrock_converse")
+        );
+        let regional_source = pricing_source_for_catalog(regional, &catalog, &BTreeSet::new());
+        assert!(
+            regional_source.starts_with("LiteLLM snapshot"),
+            "regional twin source was {regional_source:?}"
+        );
+        // Pin the non-idempotence the raw-id seam compensates for:
+        // if normalize_model ever becomes idempotent, this pin goes
+        // red and the seam (and this test's rationale) must be
+        // revisited consciously, not silently.
+        assert_eq!(normalize_model(twin), "anthropic.claude-3-opus-20240229-v1");
+        assert_eq!(
+            normalize_model(&normalize_model(twin)),
+            "anthropic.claude-3-opus",
+            "normalize_model is deliberately single-pass; the provenance\
+             seam must keep passing RAW ids into resolve_alias"
+        );
+    }
+
+    #[test]
+    fn bundled_snapshot_prices_bedrock_twins_with_catalog_provenance() {
+        // rm-988 live-PoC pin (assess 0c03d32e @ 82e23b9): the bundled
+        // snapshot carries the bedrock "-v1:0" latency-profile twins
+        // (raw key anthropic.claude-3-opus-20240229-v1:0, bedrock
+        // provider, $15/M in), and a 1M-input session on that id
+        // prices at exactly $15.00 from the catalog — so the audit's
+        // provenance triple must agree: catalog source, bedrock
+        // provider, never "built-in fallback".
+        let catalog = fallback_catalog();
+        let twin = "anthropic.claude-3-opus-20240229-v1:0";
+        let key = "anthropic.claude-3-opus-20240229-v1";
+        let price = catalog
+            .entries
+            .get(key)
+            .unwrap_or_else(|| panic!("bundled snapshot must price {key}"));
+        assert!((price.input - 15.0).abs() < 1e-9, "input {}", price.input);
+        assert_eq!(provider_for_in(twin, &catalog).as_deref(), Some("bedrock"));
+        let source = pricing_source_for_catalog(twin, &catalog, &BTreeSet::new());
+        assert!(
+            source.starts_with("LiteLLM snapshot"),
+            "twin provenance must be the bundled catalog, was {source:?}"
+        );
+        // The regional twin class ships in the same snapshot (the
+        // dedup collapses bare/us./eu./bedrock-prefixed rows onto one
+        // normalized key; the surviving provider label for the sonnet
+        // twin is bedrock_converse — pinned so a refresh that flips
+        // the survivor goes red here, consciously).
+        assert_eq!(
+            provider_for_in("us.anthropic.claude-sonnet-4-5-20250929-v1:0", &catalog).as_deref(),
+            Some("bedrock_converse")
+        );
+        let regional = pricing_source_for_catalog(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            &catalog,
+            &BTreeSet::new(),
+        );
+        assert!(
+            regional.starts_with("LiteLLM snapshot"),
+            "regional twin provenance was {regional:?}"
         );
     }
 

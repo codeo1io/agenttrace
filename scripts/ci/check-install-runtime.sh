@@ -26,6 +26,37 @@ fail() {
 
 sh -n install.sh || fail "install.sh must remain valid POSIX sh"
 
+# — ref agreement (rm-989): derive the expected installer ref from
+# install.sh itself — the installer's pin is the single source of
+# truth (the same derivation check-install-ref-drift.sh uses), so
+# bumping it can never leave this gate asserting a ref the installer
+# no longer ships. The 82e23b9 state this replaces: this gate
+# hard-coded v0.9.0 at three sites while install.sh pinned v0.10.1,
+# and every push was CI-red on a two-minute fix the sibling drift
+# gate was structurally blind to. The derived pin is additionally
+# held against CHANGELOG.md's newest release heading, so a drifted
+# installer pin is CAUGHT here too, never blessed — test K at the
+# end flips the pin in a scratch copy and requires this check to go
+# red naming both files.
+check_ref_agreement() {
+	local install_sh="$1" changelog="$2" install_ref changelog_ref
+	install_ref="$(grep -m1 -oE 'AGENTTRACE_SOURCE_REF:-[^}"]+' "$install_sh" | head -1 | sed 's/.*:-//')"
+	if [ -z "$install_ref" ]; then
+		install_ref="$(grep -m1 -E '^REF=' "$install_sh" | head -1 | cut -d= -f2- | tr -d '"')"
+	fi
+	[ -n "$install_ref" ] ||
+		fail "could not read the default ref from $install_sh"
+	changelog_ref="$(grep -m1 -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' "$changelog" | sed 's/^## //')"
+	[ -n "$changelog_ref" ] ||
+		fail "could not read the newest '## v' heading from $changelog"
+	if [ "$install_ref" != "$changelog_ref" ]; then
+		fail "installer ref drift: $install_sh pins '$install_ref' but $changelog's newest release heading is '$changelog_ref' — refresh the installer pin or the changelog so they agree"
+	fi
+	printf '%s\n' "$install_ref"
+}
+
+expected_ref="$(check_ref_agreement "$repo_root/install.sh" "$repo_root/CHANGELOG.md")"
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -110,9 +141,10 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
-# The ref is the installer's pinned default (v0.9.0, rm-051) or whatever
-# AGENTTRACE_SOURCE_REF names, so the fallback never has to resolve
-# api.github.com in an offline run.
+# The ref is the installer's pinned default (rm-051; derived from
+# install.sh above per rm-989) or whatever AGENTTRACE_SOURCE_REF
+# names, so the fallback never has to resolve api.github.com in an
+# offline run.
 shims="$tmp/shims"
 mkdir -p "$shims"
 cat >"$shims/git" <<FAKE_GIT
@@ -149,8 +181,8 @@ grep -q "pinned ref" "$out" ||
 	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
-grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
-	fail "test D: install receipt must record the default pinned ref (rm-051)"
+grep -q "^ref=$expected_ref\$" "$tmp/d-receipt" ||
+	fail "test D: install receipt must record the default pinned ref '$expected_ref' (rm-051)"
 
 # — test E: the fallback clones a PINNED ref, never a moving default
 #   branch (rm-051) — this fake git refuses an unpinned clone and
@@ -194,9 +226,9 @@ if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
 	cat "$out" >&2
 	fail "test E: pinned source build must succeed"
 fi
-grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
-	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
-grep -q "pinned ref v0.9.0" "$out" ||
+grep -qF "clone --branch $expected_ref" "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch $expected_ref (the pinned default ref)"
+grep -qF "pinned ref $expected_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"
@@ -297,6 +329,34 @@ grep -q "Checksum mismatch" "$out" ||
 	fail "test J: refusal must diagnose the checksum mismatch"
 grep -q "not installing" "$out" ||
 	fail "test J: refusal must state the install is aborted"
+
+# — test K (rm-989): desync canary — a drifted installer pin must be
+#   CAUGHT, not blessed. Copy install.sh and CHANGELOG.md into a
+#   scratch root, flip the installer's pin, and the agreement check
+#   must fail naming BOTH files. (A purely derived gate with no
+#   changelog leg would happily test whatever the flipped installer
+#   says — the "blesses drift" failure mode this canary pins shut.) —
+canary="$tmp/ref-canary"
+mkdir -p "$canary"
+sed "s/AGENTTRACE_SOURCE_REF:-v[0-9][0-9.]*/AGENTTRACE_SOURCE_REF:-v0.0.0-canary/" \
+	"$repo_root/install.sh" >"$canary/install.sh"
+cp "$repo_root/CHANGELOG.md" "$canary/CHANGELOG.md"
+# NOTE: the probe runs in a subshell — fail() exits 1, and inside a
+# bare `if` condition that would kill the whole gate instead of
+# failing just this probe.
+out="$tmp/out.k"
+if (check_ref_agreement "$canary/install.sh" "$canary/CHANGELOG.md") >"$out" 2>&1; then
+	cat "$out" >&2
+	fail "test K: a drifted installer pin must be caught, not blessed"
+fi
+grep -q "$canary/install.sh" "$out" ||
+	fail "test K: the drift failure must name the installer file"
+grep -q "$canary/CHANGELOG.md" "$out" ||
+	fail "test K: the drift failure must name the changelog file"
+grep -q "v0.0.0-canary" "$out" ||
+	fail "test K: the drift failure must quote the drifted pin"
+# The undrifted check the gate itself runs at startup stays green on
+# the real files (already asserted above via expected_ref derivation).
 
 # — glibc-baseline guard: a locally built binary must not require a glibc
 #   newer than the compatibility floor we defend (Ubuntu 22.04 = 2.35) —

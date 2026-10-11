@@ -202,3 +202,73 @@ fn a_split_lost_to_a_cache_round_trip_stays_silent() {
     assert!(row.pricing_note.contains("no same-basis re-price"));
     assert_eq!(row.estimated_cost_usd, None);
 }
+
+/// rm-988 — provenance/rates agreement on the bedrock "-v1:0" twin.
+///
+/// The assess PoC (0c03d32e @ 82e23b9): 1M input tokens on
+/// `anthropic.claude-3-opus-20240229-v1:0` priced at exactly $15.00
+/// from the bundled snapshot, while the SAME audit row claimed
+/// `pricing_source: "built-in fallback"` beside
+/// `pricing_status: "catalog_estimate"` and the note "exact
+/// normalized model match in pricing catalog" — three mutually
+/// contradictory claims, because the provenance path normalized the
+/// model id twice and missed the row the rates path (one
+/// normalization) had just priced. The row must now be consistent:
+/// catalog source, catalog status, catalog note, $15.00.
+const TWIN_BEDROCK: &str = concat!(
+    r#"{"id": "t1", "timestamp": "2026-10-04T07:16:46.634Z", "type": "session", "version": 3, "cwd": "/redacted/project"}"#,
+    "\n",
+    r#"{"id": "t2", "parentId": "t1", "timestamp": "2026-10-04T07:16:46.700Z", "type": "session_info", "name": "bedrock-v1-0-twin"}"#,
+    "\n",
+    r#"{"id": "t3", "timestamp": "2026-10-04T07:16:47.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}], "timestamp": "2026-10-04T07:16:47.000Z"}, "type": "message"}"#,
+    "\n",
+    r#"{"id": "t4", "timestamp": "2026-10-04T07:16:48.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}], "timestamp": "2026-10-04T07:16:48.000Z", "usage": {"input": 1000000, "output": 0, "totalTokens": 1000000}, "model": "anthropic.claude-3-opus-20240229-v1:0"}, "type": "message"}"#,
+);
+
+#[test]
+fn bedrock_v1_0_twin_audit_row_is_self_consistent() {
+    let session = parsed("bedrock-twin.jsonl", TWIN_BEDROCK);
+    // Rates side: the bundled snapshot prices this twin at $15/M in,
+    // so 1M input is exactly $15 — catalog basis, no fallback.
+    let price = lookup_price("anthropic.claude-3-opus-20240229-v1:0");
+    assert!((price.input - 15.0).abs() < 1e-9, "input {}", price.input);
+    assert!((session.metrics.cost_estimated - 15.0).abs() < 1e-6);
+
+    // Provenance side must agree (this is the rm-988 defect: the
+    // double-normalized key used to miss the catalog row and label
+    // this exact session "built-in fallback").
+    let audit = session_cost_audit(&session);
+    assert!(
+        audit.pricing_source.contains("LiteLLM"),
+        "twin provenance must be the catalog, was: {}",
+        audit.pricing_source
+    );
+    assert!(
+        !audit.pricing_source.contains("built-in fallback"),
+        "a catalog-priced session must not claim fallback, was: {}",
+        audit.pricing_source
+    );
+    assert_eq!(audit.pricing_status, "catalog_estimate");
+    assert_eq!(
+        audit.pricing_note,
+        "exact normalized model match in pricing catalog",
+    );
+    let current = audit.estimated_cost_usd.expect("same-basis re-price");
+    assert!(
+        (current - 15.0).abs() < 1e-6,
+        "current-rate total {current} must match the catalog basis"
+    );
+
+    // The per-model audit row inherits the same consistency.
+    let report = cost_audit(&[session]);
+    let row = &report.by_provider_model[0];
+    assert_eq!(row.model, "anthropic.claude-3-opus-20240229-v1:0");
+    assert_eq!(row.pricing_status, "catalog_estimate");
+    assert!(
+        !row.pricing_source.contains("built-in fallback"),
+        "row provenance was: {}",
+        row.pricing_source
+    );
+    assert_eq!(row.estimated_cost_usd, Some(15.0));
+    assert_eq!(row.stored_estimated_cost_usd, 15.0);
+}

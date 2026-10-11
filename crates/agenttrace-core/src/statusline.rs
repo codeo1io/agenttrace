@@ -335,6 +335,79 @@ pub fn sanitize_line_segment(segment: &str) -> String {
         .collect()
 }
 
+/// rm-992: the spreadsheet-formula shape guard, owned here so every
+/// render boundary shares ONE introducer set (the CSV/TSV export
+/// lanes landed this logic first as agenttrace-cli's
+/// `csv_export::guard_formula`, which now delegates here). Prefixes
+/// spreadsheet-formula-looking text with `'`. Bare numbers (including
+/// negatives such as `-1.5`, and whitespace-padded numerics such as
+/// `" -1.5"` — parsed on the trimmed text, since `f64::from_str`
+/// itself rejects surrounding whitespace) are exempt so numeric cells
+/// still import as values.
+pub fn guard_formula_shape(raw: &str) -> String {
+    let looks_numeric = raw.trim().parse::<f64>().is_ok();
+    if looks_numeric {
+        return raw.to_string();
+    }
+    // rm-540: judge the first NON-WHITESPACE character, not
+    // `chars().next()` — spreadsheet apps ignore a leading
+    // space/tab/CR/LF when deciding a cell is a formula, so
+    // `" =SUM(9+9)"` was a live formula the first-char-only check
+    // waved through (assess PoC F2). The sanitizer upstream already
+    // turns tab/CR/LF into U+FFFD; a plain leading space survives it,
+    // and this guard is the layer that catches that one.
+    let starts_formula = raw
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(is_formula_introducer);
+    if starts_formula {
+        format!("'{raw}")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// rm-540 (residual, assess F3): the introducer set covers the ASCII
+/// formula starters AND their fullwidth forms — U+FF1D `＝`, U+FF0B
+/// `＋`, U+FF20 `＠`, U+FF0D `－`. Spreadsheet apps (Excel, Sheets,
+/// LibreOffice) normalize fullwidth introducers to their ASCII meaning
+/// when a cell is entered or imported, so `＝1+2` executes exactly like
+/// `=1+2`; the sanitizer upstream only strips control characters, so
+/// the fullwidth bytes survive to this guard (live PoC
+/// `csv-fullwidth-model.jsonl`, run 06cc5c7d). Guarding is the safe
+/// direction: a false positive costs a leading apostrophe, a false
+/// negative executes a formula. Fullwidth "numbers" such as `－１.５`
+/// fail `f64::from_str` and are guarded too — conservative on purpose.
+fn is_formula_introducer(first: char) -> bool {
+    matches!(
+        first,
+        '=' | '+'
+            | '@'
+            | '-'
+            | '\u{FF1D}' // FULLWIDTH EQUALS SIGN
+            | '\u{FF0B}' // FULLWIDTH PLUS SIGN
+            | '\u{FF20}' // FULLWIDTH COMMERCIAL AT
+            | '\u{FF0D}' // FULLWIDTH HYPHEN-MINUS
+    )
+}
+
+/// rm-992: the shared render-boundary guard for human-readable TEXT
+/// lanes — `sanitize_line_segment` (control bytes) composed with
+/// `guard_formula_shape`. Journal-derived model ids, session names,
+/// and free text ride terminal text lanes that operators paste into
+/// spreadsheets exactly as they paste the CSV/TSV exports (assess PoC
+/// 0c03d32e: `--overview`/`--audit`/`--delivery-evidence`/`--search`
+/// rendered `=cmd|'/C calc'!A0` and `=HYPERLINK+SUM(9+9)|cmd` verbatim
+/// while the TSV lane guarded them). One helper instead of per-lane
+/// sprinkles: every text renderer calls THIS, and
+/// `text_formula_lanes_are_enumerated_and_guarded` in
+/// output_safety_matrix.rs is the registry that fails when a lane is
+/// added without it. JSON lanes never pass through here and stay
+/// byte-identical (data integrity over paste-safety, by design).
+pub fn sanitize_rendered_text(segment: &str) -> String {
+    guard_formula_shape(&sanitize_line_segment(segment))
+}
+
 /// rm-625: document-level variant of [`sanitize_line_segment`] for the
 /// output-dispatch boundary (stdout and every `-o` write). Where the
 /// line-segment helper must kill EVERY control byte (a status line is
