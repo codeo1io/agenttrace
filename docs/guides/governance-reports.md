@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 58 and the SQLite snapshot is schema 11; the
+The session cache is schema 59 and the SQLite snapshot is schema 11; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -363,7 +363,17 @@ emission positions, and genuine re-folds carry one structural
 `tool_result_refold:*` meta carrier — +1 `events_total` per session
 with re-folds; minted 42 → 52 at the run's base 15a8da8 and re-based
 at integration onto the advanced ceiling as 57 → 58, one invalidation
-either way, conflict case a4ff3f6c72be4905a00dbb4d75cad452)
+either way, conflict case a4ff3f6c72be4905a00dbb4d75cad452),
+and to 59 when the kimi usage double-mirror was closed — a kimi
+session.json carrying BOTH a top-level `usage` and a
+`metadata.usage` mirror of the same counters counted each mirror and
+doubled every total; one source counts now, the top-level object
+preferred with the nested copy as fallback (run e5653f52 cycle 2, the
+upstream-#312 port fork-adjudicated, whose other arms were superseded
+by this tree's own landed lanes; minted 27 → 28 at the run's base
+8991144 and re-based at integration onto the advanced ceiling as
+58 → 59, one invalidation either way, conflict case
+963662941e3a40579e658a63f2b88da6)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

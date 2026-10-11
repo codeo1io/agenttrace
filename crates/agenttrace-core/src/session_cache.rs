@@ -5,7 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 58;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 59;
+// Bumped 58 -> 59 (integration of run e5653f52 cycle 2 'usage-accounting
+// truth (upstream #312 port, fork-adjudicated)', conflict case
+// 963662941e3a40579e658a63f2b88da6, candidate 3ad47fd @ base 8991144):
+// the batch's rm-616/rm-617 arms were almost entirely superseded by this
+// tree's own landed lanes (claude per-message-id fold rm-601/rm-834, qwen
+// first-alias + cache netting rm-602/rm-980, codex occurrence-adjacent
+// ring ledger rm-685/rm-711, reasoning-subset discipline rm-863, opencode
+// reasoning-breakdown rm-619), but ONE arm lands here as new semantics:
+// kimi sessions count `usage` OR `metadata.usage`, never both
+// (parse_kimi_value, top-level preferred, nested fallback) — a kimi
+// export mirroring the session usage in both objects was double-counted,
+// so reported totals change for unchanged files and a warm v58 cache
+// would keep serving the double-counted totals with matching
+// fingerprints (rm-230 convention: parser-semantics changes that alter
+// reported totals for unchanged files bump the schema so cached sessions
+// regenerate under corrected accounting). SEAM: the candidate minted its
+// bump as 27 -> 28 at its base 8991144; this integration re-bases the
+// rung onto this tree's already-advanced ceiling 58 as 58 -> 59 per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c/7762d54b
+// precedent), one invalidation either way. Entries regenerate once on
+// next scan.
 // Bumped 57 -> 58 (integration of run 57c491338818 cycle 1 'the
 // report pipeline must not lie by structure' — the rm-300 U1 id-less
 // fold-key namespace arm (parser.rs ToolResultFoldKey) + the rm-439

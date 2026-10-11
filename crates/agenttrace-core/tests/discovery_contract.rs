@@ -1198,6 +1198,17 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
+        // v59 (integration of run e5653f52 cycle 2 — the #312
+        // port's kimi arm survived its adjudication: `usage` XOR
+        // `metadata.usage` instead of both, so kimi exports that
+        // mirror the session usage in both objects regenerate at
+        // half their previous totals; the batch's other arms were
+        // superseded by this tree's own landed lanes — claude
+        // per-message-id fold rm-601/rm-834, qwen first-alias
+        // rm-602/rm-980, codex ring ledger rm-685/rm-711, reasoning
+        // subsets rm-863, opencode breakdown rm-619; re-based off the
+        // campaign's 27 -> 28 bump onto the advanced ceiling as
+        // 58 -> 59);
         // v41 (integration of run ac14e52c, rm-520 'audit cost
         // truthfulness — recorded-cost basis recompute + per-block
         // multiple note' — Metrics now persist the upstream_priced_*
@@ -1417,7 +1428,9 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v53 — see the rm-939, rm-520, rm-585/rm-730, rm-834/
+        // version (v59 — the kimi usage-XOR rung (run e5653f52,
+        // 58 -> 59, re-based off the campaign's own 27 -> 28 bump)
+        // above the rm-939, rm-520, rm-585/rm-730, rm-834/
         // rm-694, rm-718/719/716, rm-754, rm-502, rm-720/rm-721,
         // rm-710, rm-616, usage-accounting-truthfulness,
         // rm-551, rm-538, rm-600, rm-529, rm-542,

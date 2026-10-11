@@ -3396,6 +3396,17 @@ fn qwen_tool_result_events(raw: Option<&Value>, ts: &str, model: &str) -> Vec<Ev
 /// thinking counters are billed at the output rate and additionally
 /// broken out as reasoning_tokens.
 fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
+    // rm-616 (upstream #312 port): Qwen Code builds this map from
+    // Gemini-style metadata — the input side is `promptTokenCount`,
+    // which ALREADY contains `cachedContentTokenCount` (surfaced by
+    // Qwen Code as `cache_read_input_tokens`), so the cached share is
+    // netted out of input, and only the FIRST matching alias is read:
+    // the wire mirrors the same counter under several aliases
+    // (`input_tokens`/`prompt_tokens`/`input`/`promptTokenCount`), and
+    // summing the aliases counted each token once per alias (the
+    // mirrored-snapshot PoC double-counted input: 200 reported for a
+    // 100-token turn). The codex path already nets cached input out of
+    // `input_tokens` the same way.
     let obj = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
     let cache_read = first_number(
@@ -5337,21 +5348,16 @@ fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
     }
     let model = string(doc.get("model")).unwrap_or("unknown").to_string();
     let mut events = Vec::new();
-    if let Some(usage) = doc.get("usage").and_then(usage_from_value) {
-        events.push(Event {
-            role: "meta".to_string(),
-            usage,
-            model_used: model.clone(),
-            source_tool: "kimi_cli".to_string(),
-            ..Event::default()
-        });
-    }
-    if let Some(usage) = doc
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("usage"))
-        .and_then(usage_from_value)
-    {
+    // rm-616 (upstream #312 port): exports that carry BOTH a top-level
+    // `usage` and `metadata.usage` mirror the same counters — counting
+    // both doubled the session. Read ONE of the two, preferring the
+    // top-level object (the shape the docs bless).
+    if let Some(usage) = doc.get("usage").and_then(usage_from_value).or_else(|| {
+        doc.get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("usage"))
+            .and_then(usage_from_value)
+    }) {
         events.push(Event {
             role: "meta".to_string(),
             usage,
@@ -5620,6 +5626,17 @@ fn cursor_composer_message_events(composer: &Map<String, Value>, fallback_ts: &s
     events
 }
 
+// rm-617 divergence note (upstream #312 port): upstream agenttrace
+// DELETED its gemini parser in the same series that fixed token
+// accounting; this fork deliberately KEEPS it ("keep-and-own") because
+// the fork's discovery walks .gemini/tmp and the antigravity "brain"
+// layout (discovery.rs) that upstream no longer handles — 30 parser
+// references and the repo-root testdata/gemini-{checkpoint,current-chat,
+// thoughts-checkpoint}.json fixtures stay maintained here. The #312
+// accounting rules apply everywhere else; gemini usage keeps its own
+// gemini_usage alias table (input from promptTokenCount-class aliases,
+// thoughts folded into output) which already follows the same
+// first-matching/net-of-cache decomposition this batch pins elsewhere.
 fn parse_gemini_value(value: &Value) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -7637,7 +7654,7 @@ mod tests {
             // while output keeps climbing: this event still emits and is
             // exactly where the raw-total previous went wrong.
             token_count(2, total(600, 250, 350, 60)),
-            // Rebound over the old high-water mark.
+            // Rebound past the rewound cumulative.
             token_count(3, total(1100, 480, 500, 90)),
         ]
         .join("\n");
@@ -8178,7 +8195,7 @@ mod tests {
         // breakdown on its own line — so each class clamps independently
         // and the saturation contract lives on unchanged.
         let info = serde_json::json!({
-            "last_token_usage": {
+            "total_token_usage": {
                 "input_tokens": 10,
                 "output_tokens": i64::MAX,
                 "reasoning_output_tokens": i64::MAX
@@ -8361,6 +8378,140 @@ mod tests {
         let session =
             parse_raw_session("mid", "mid.jsonl", mid_content).expect("mid-content BOM parses");
         assert_eq!(session.metrics.user_messages, 1);
+    }
+
+    #[test]
+    fn claude_streamed_usage_rows_fold_into_one_event_per_message() {
+        // rm-616 (upstream #312): Claude Code streams one row per content
+        // block, each repeating the message's usage with a GROWING output
+        // count. The old dedup key embedded the full usage JSON, so every
+        // growing snapshot was distinct and input/cache re-counted per row
+        // (upstream's 155-file study measured ~1.9x input over-count). One
+        // meta event per message id now folds the rows with MAX-per-field:
+        // input counts once (50, not 100) and output takes the final row
+        // (25). Rows without a message id cannot be folded and stay
+        // per-row, matching the pre-port behavior for that shape.
+        let row = |output: i64| {
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-10-01T10:00:00Z",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4-5",
+                    "usage": {
+                        "input_tokens": 50,
+                        "cache_read_input_tokens": 5,
+                        "output_tokens": output
+                    },
+                    "content": [{"type": "text", "text": "chunk"}]
+                }
+            })
+            .to_string()
+        };
+        let raw = [row(10), row(25)].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_claude_code_jsonl(&objs).expect("claude streamed rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "both streamed rows fold into one usage event"
+        );
+        let usage = meta[0].usage.clone();
+        assert_eq!(usage["input_tokens"], 50);
+        assert_eq!(usage["cache_read_input_tokens"], 5);
+        assert_eq!(usage["output_tokens"], 25);
+    }
+
+    #[test]
+    fn claude_fold_never_indexes_one_past_the_last_event() {
+        // independent_review 3a0e F1 (review-fix): a first streamed row
+        // whose usage is present but unparseable ({}) and carries no
+        // content must NOT register a message-id slot pointing at
+        // events.len(); with such a slot a later valid usage row for the
+        // same id folded at that index and panicked `index out of bounds:
+        // the len is 0 but the index is 0` (probe corpus:
+        // /tmp/at-review-3a0e/claude-panic). The slot must only ever be
+        // registered for a meta event that was actually pushed.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-sonnet-4-5",
+                "usage": {},
+                "content": []
+            }
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:01Z",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 7}
+            }
+        })
+        .to_string();
+        let raw = [first, second].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_claude_code_jsonl(&objs).expect("claude streamed rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "the later valid usage row pushes one meta event"
+        );
+        let usage = meta[0].usage.clone();
+        assert_eq!(usage["input_tokens"], 10, "later valid usage counts once");
+        assert_eq!(usage["output_tokens"], 7);
+    }
+
+    #[test]
+    fn claude_usage_always_lands_on_a_meta_event() {
+        // independent_review 3a0e F1 (review-fix): registering the id slot
+        // before the conditional meta push pointed the slot at whatever
+        // event landed next. With a first content-bearing row whose usage
+        // was unparseable, that slot was the row's OWN assistant event, so
+        // later usage rows for the id folded usage into an assistant
+        // event — where the analyzer's meta-only usage fold silently
+        // dropped it (probe /tmp/at-review-3a0e/claude-misfold showed
+        // Input 0 vs true 75). Usage must land on a meta event even when
+        // the first row for the id carried content.
+        let first = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:00Z",
+            "message": {
+                "id": "msg_2",
+                "model": "claude-sonnet-4-5",
+                "usage": {},
+                "content": [{"type": "text", "text": "partial"}]
+            }
+        })
+        .to_string();
+        let second = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-01T10:00:01Z",
+            "message": {
+                "id": "msg_2",
+                "model": "claude-sonnet-4-5",
+                "usage": {"input_tokens": 40, "output_tokens": 35}
+            }
+        })
+        .to_string();
+        let raw = [first, second].join("\n");
+        let objs = jsonl_objects(&raw).collect::<Vec<_>>();
+        let events = parse_claude_code_jsonl(&objs).expect("claude streamed rows are recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "usage lands on a meta event even when the first row carried content"
+        );
+        let usage = meta[0].usage.clone();
+        assert_eq!(usage["input_tokens"], 40);
+        assert_eq!(usage["output_tokens"], 35);
     }
 
     #[test]
@@ -8770,6 +8921,28 @@ mod tests {
             session.metrics.source_tool, "antigravity_cli",
             "the lane still claims the file"
         );
+    }
+
+    #[test]
+    fn qwen_mirrored_input_aliases_count_once_and_cache_nets_out() {
+        // rm-616 (upstream #312, run e5653f52; survived its integration as
+        // an in-module pin beside the fixture-lane pins): Qwen Code mirrors
+        // the same input counter under input_tokens/prompt_tokens aliases
+        // — summing the aliases counted each token once per alias (assess
+        // PoC at the campaign base: Input 200 reported for a 100-token
+        // turn), and the input side (promptTokenCount) already contains
+        // the cached share, so cache_read is netted out of input the way
+        // the codex path already nets cached_input_tokens.
+        let usage = qwen_usage(Some(&serde_json::json!({
+            "input_tokens": 100,
+            "prompt_tokens": 100,
+            "cache_read_input_tokens": 60,
+            "output_tokens": 50
+        })))
+        .expect("qwen usage");
+        assert_eq!(usage["input_tokens"], 40);
+        assert_eq!(usage["cache_read_input_tokens"], 60);
+        assert_eq!(usage["output_tokens"], 50);
     }
 
     #[test]
@@ -9574,6 +9747,62 @@ mod tests {
     // integration from the campaign-local id) -------------------------
 
     #[test]
+    fn kimi_session_usage_and_metadata_usage_count_once() {
+        // rm-616 (upstream #312): kimi exports mirror the session usage in
+        // BOTH `usage` and `metadata.usage`. Counting each source emitted
+        // two meta events and doubled every total; one source counts now —
+        // the top-level `usage`, falling back to `metadata.usage` for
+        // exports that only carry the nested copy. The value parser is
+        // pinned directly: in the full dispatcher the generic gemini
+        // value probe runs first and can claim a usage-bearing doc before
+        // parse_kimi_value is reached (pre-existing routing order,
+        // recorded in the batch findings), so this test pins the kimi
+        // accounting itself.
+        let value = serde_json::json!({
+            "model": "kimi-k2.6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hi",
+                    "timestamp": "2026-10-01T10:00:00Z"
+                },
+                {
+                    "role": "assistant",
+                    "content": "hello",
+                    "timestamp": "2026-10-01T10:00:05Z"
+                }
+            ],
+            "usage": {"input_other": 100, "output": 40, "input_cache_read": 10},
+            "metadata": {"usage": {"input_other": 100, "output": 40, "input_cache_read": 10}}
+        });
+        let events = parse_kimi_value(&value).expect("kimi session value recognized");
+        let meta: Vec<_> = events.iter().filter(|event| event.role == "meta").collect();
+        assert_eq!(
+            meta.len(),
+            1,
+            "usage and metadata.usage count once, not twice"
+        );
+        assert_eq!(meta[0].usage["input_tokens"], 100);
+        assert_eq!(meta[0].usage["output_tokens"], 40);
+        assert_eq!(meta[0].usage["cache_read_input_tokens"], 10);
+        // The fallback arm: a metadata-only export still counts once.
+        let metadata_only = serde_json::json!({
+            "model": "kimi-k2.6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"usage": {"input_other": 7, "output": 3}}
+        });
+        let events = parse_kimi_value(&metadata_only).expect("metadata-only kimi parses");
+        let usage = events
+            .iter()
+            .find(|event| event.role == "meta")
+            .expect("fallback usage event")
+            .usage
+            .clone();
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
+    }
+
+    #[test]
     fn kimi_statusupdate_usage_uses_official_wire_aliases() {
         // Official MoonshotAI/kimi-code wire fixture (MIT, 130 lines,
         // 15 usage-bearing StatusUpdate records): the token_usage wire
@@ -10039,6 +10268,8 @@ mod tests {
         let session = parse_raw_session("codex", "rollout-compaction-replayed.jsonl", &raw)
             .expect("codex rollout parses");
         // 1000 from the snapshot + 700 net from the record, exactly once.
+        // rm-617: the record's reasoning share (120) stays inside its
+        // output_tokens instead of being added on top.
         assert_eq!(session.metrics.tokens_input, 1_700);
         assert_eq!(session.metrics.tokens_cache_r, 800);
         // rm-617: the record's output_tokens (300) already CONTAINS its
@@ -10090,6 +10321,9 @@ mod tests {
                 + session.metrics.tokens_output,
             1_720
         );
+        assert_eq!(session.metrics.tokens_input, 400);
+        assert_eq!(session.metrics.tokens_cache_r, 800);
+        assert_eq!(session.metrics.tokens_output, 520);
         assert_eq!(
             session
                 .metrics
