@@ -140,10 +140,15 @@ fn read_message_line(reader: &mut impl BufRead) -> io::Result<MessageLine> {
             Err(error) => return Err(error),
         };
         if available.is_empty() {
-            return Ok(if line.is_empty() {
-                MessageLine::Eof
-            } else if overlong {
+            // rm-921: consult `overlong` FIRST. A line whose cap-crossing
+            // accumulate was the stream's last act leaves the buffer
+            // cleared at EOF; testing `is_empty()` first made the refusal
+            // indistinguishable from clean EOF — the host got silence for
+            // a message it could not know was dropped.
+            return Ok(if overlong {
                 MessageLine::Overlong
+            } else if line.is_empty() {
+                MessageLine::Eof
             } else {
                 MessageLine::Line(decode_message_line(&line, false)?)
             });

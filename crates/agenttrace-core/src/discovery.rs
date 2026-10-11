@@ -122,6 +122,41 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
                 .join("antigravity-cli")
                 .join("conversations"),
         },
+        // rm-947: the ecosystem-default antigravity root family (ccusage
+        // paths.rs DEFAULT_ANTIGRAVITY_ROOTS). Every sibling carries the
+        // same documented `conversations/` sidecar store next to the
+        // already-scanned antigravity-cli root; before this family lane
+        // they were silently missed by default discovery (ccusage #1851
+        // reports the same class for antigravity-acp). The undocumented
+        // SQLite store itself stays out of scope: the trajectory sidecar
+        // is the documented reader surface.
+        KnownSessionDir {
+            name: "Antigravity conversations".to_string(),
+            path: home
+                .join(".gemini")
+                .join("antigravity")
+                .join("conversations"),
+        },
+        KnownSessionDir {
+            name: "Antigravity IDE conversations".to_string(),
+            path: home
+                .join(".gemini")
+                .join("antigravity-ide")
+                .join("conversations"),
+        },
+        KnownSessionDir {
+            name: "Antigravity backup conversations".to_string(),
+            path: home
+                .join(".gemini")
+                .join("antigravity-backup")
+                .join("conversations"),
+        },
+        KnownSessionDir {
+            name: "Antigravity config conversations".to_string(),
+            path: env_home("XDG_CONFIG_HOME", home.join(".config"))
+                .join("antigravity")
+                .join("conversations"),
+        },
         KnownSessionDir {
             name: "Claude Code transcripts".to_string(),
             path: env_home("CLAUDE_CONFIG_DIR", home.join(".claude")).join("transcripts"),

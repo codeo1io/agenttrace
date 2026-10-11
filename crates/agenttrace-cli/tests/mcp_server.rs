@@ -408,3 +408,36 @@ fn oversized_message_line_is_refused_and_the_stream_stays_framed() {
     );
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
+
+#[test]
+fn overlong_line_terminated_by_eof_is_refused_not_silently_dropped() {
+    // rm-921 residual: the transport's EOF arm consulted
+    // `line.is_empty()` before the `overlong` flag, so an over-cap line
+    // with NO trailing newline — sized so the cap-crossing accumulate is
+    // the stream's last act and clears the buffer — was
+    // indistinguishable from clean EOF: the host got silence and exit 0
+    // for a message it could not know was dropped. The refusal must
+    // survive to EOF.
+    let (home, cache) = seed_home("overlong-eof", false);
+    let mut sized = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}".to_string();
+    while sized.len() < 1024 * 1024 + 1 {
+        sized.push('x');
+    }
+    sized.truncate(1024 * 1024 + 1);
+    let (code, responses, _stderr) = mcp_session(&home, &cache, &sized);
+    assert_eq!(
+        Some(0),
+        code,
+        "EOF after an overlong line still exits clean: {_stderr}"
+    );
+    assert_eq!(
+        1,
+        responses.len(),
+        "the EOF-terminated overlong line is refused, not swallowed: {responses:?}"
+    );
+    assert!(
+        responses[0].get("error").is_some(),
+        "the refusal is a JSON-RPC error: {responses:?}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
