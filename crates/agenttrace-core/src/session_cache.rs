@@ -5,7 +5,34 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 56;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 57;
+// Bumped 56 -> 57 (integration of run 2f02ecafb2674e529f662f7cc27162f4
+// cycle 2 'usage-accounting truthfulness closeout' — the campaign's
+// rm-685 codex occurrence-aware bounded ledger LEAD (landed here as
+// rm-980) + rm-686 generic-extractor Gemini-inclusive alias netting
+// (landed as rm-981) + the rm-602 qwen-stats dual-alias extension;
+// conflict case edb878bb27db418fbb13184efccaa721, candidate d618555 @
+// base 518170a): codex token_count freshness is occurrence-adjacent
+// instead of a journal-wide set of distinct totals (a post-compaction
+// window whose running total merely happens to be value-equal to an
+// earlier one now counts; an identical last snapshot under a new total
+// falls to the totals delta; the ledger is the previous event's total
+// and snapshot plus a capped value-dedup ring for the legacy delta
+// path — composed with the landed rm-711 compaction envelope), the
+// generic usage extractor nets Gemini-inclusive promptTokenCount
+// against cachedContentTokenCount, and the qwen stats/modelUsage arms
+// take the first PRESENT alias per class instead of summing dual
+// spellings — reported totals change for UNCHANGED files in all three
+// shapes, so a warm v56 cache keeps serving the pre-fix totals with
+// matching fingerprints and never re-parses (rm-230 convention:
+// parser-semantics changes that alter reported totals for unchanged
+// files bump the schema so cached sessions regenerate under corrected
+// accounting). SEAM: the batch minted its bump as 32 -> 33 at its base
+// 518170a; this integration re-bases the rung onto this tree's
+// already-advanced ceiling 56 as 56 -> 57 per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c/a1c5cb6f
+// precedent), one invalidation either way. Entries regenerate once on
+// next scan.
 // Bumped 55 -> 56 (integration of run 32f3b7a1 cycle 3, rm-726
 // 'magnitude-clamp disclosure + implausible-magnitude anomaly
 // class', batch 'honest magnitudes, honest paths'; conflict case

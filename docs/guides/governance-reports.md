@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 56 and the SQLite snapshot is schema 11; the
+The session cache is schema 57 and the SQLite snapshot is schema 11; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -340,7 +340,23 @@ re-based at this integration onto the advanced ceiling as 55 → 56,
 one invalidation either way, conflict case
 2107fcf36cfa40b389723e98a9059636) — so cached sessions regenerate under
 the corrected reasoning totals, intake, attribution, disclosure
-tiers and the clamp census; the SQLite snapshot to 7
+tiers and the clamp census, and to 57 when the usage-accounting truthfulness closeout
+made Codex token-count freshness occurrence-adjacent (a post-compaction
+total that merely happens to be value-equal to an earlier one still
+counts, and the ledger keeps only the previous event's total and last
+snapshot — plus a capped value-dedup ring for legacy no-snapshot
+journals — instead of every distinct total, composed with the landed
+rm-711 compaction envelope), netted Gemini-inclusive
+`promptTokenCount` input against `cachedContentTokenCount` in the
+generic usage extractor, and made the Qwen stats/modelUsage arms take
+the first present alias per class instead of summing dual spellings
+(the campaign's rm-685/rm-686 plus the rm-602 extension of run
+2f02ecafb2674e529f662f7cc27162f4, landed at this integration as
+rm-980/rm-981; minted at the batch's base 518170a as 32 → 33 and
+re-based at integration onto the advanced ceiling as 56 → 57, one
+invalidation either way, conflict case edb878bb27db418fbb13184efccaa721)
+— so cached sessions regenerate under the corrected totals;
+the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

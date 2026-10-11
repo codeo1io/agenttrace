@@ -3,6 +3,7 @@ use anyhow::{bail, Context};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 type TokenUsage = BTreeMap<String, i64>;
@@ -3473,29 +3474,34 @@ fn qwen_stats_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
         let Some(tokens) = model_stats.get("tokens").and_then(Value::as_object) else {
             continue;
         };
-        add_usage_value(&mut usage, "input_tokens", tokens.get("input"));
-        add_usage_value(&mut usage, "input_tokens", tokens.get("input_tokens"));
-        add_usage_value(&mut usage, "output_tokens", tokens.get("output"));
-        add_usage_value(&mut usage, "output_tokens", tokens.get("output_tokens"));
-        add_usage_value(
+        // rm-602 extension: alias spellings of one class describe the
+        // same tokens — first PRESENT alias per class per model, never
+        // the sum (the `qwen_usage` rule; the old ADD-both arms doubled
+        // a dual-alias snapshot). Different models are different
+        // counters and do sum.
+        add_first_alias(
+            &mut usage,
+            "input_tokens",
+            tokens,
+            &["input_tokens", "input"],
+        );
+        add_first_alias(
+            &mut usage,
+            "output_tokens",
+            tokens,
+            &["output_tokens", "output"],
+        );
+        add_first_alias(
             &mut usage,
             "cache_read_input_tokens",
-            tokens.get("cacheRead"),
+            tokens,
+            &["cache_read_input_tokens", "cacheRead"],
         );
-        add_usage_value(
-            &mut usage,
-            "cache_read_input_tokens",
-            tokens.get("cache_read_input_tokens"),
-        );
-        add_usage_value(
+        add_first_alias(
             &mut usage,
             "cache_creation_input_tokens",
-            tokens.get("cacheWrite"),
-        );
-        add_usage_value(
-            &mut usage,
-            "cache_creation_input_tokens",
-            tokens.get("cache_creation_input_tokens"),
+            tokens,
+            &["cache_creation_input_tokens", "cacheWrite"],
         );
     }
     non_empty_usage(usage)
@@ -3505,33 +3511,31 @@ fn qwen_model_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let model_usage = raw.and_then(Value::as_object)?;
     let mut usage = BTreeMap::new();
     for model_stats in model_usage.values().filter_map(Value::as_object) {
-        add_usage_value(&mut usage, "input_tokens", model_stats.get("inputTokens"));
-        add_usage_value(&mut usage, "input_tokens", model_stats.get("input_tokens"));
-        add_usage_value(&mut usage, "output_tokens", model_stats.get("outputTokens"));
-        add_usage_value(
+        // rm-602 extension: first PRESENT alias per class, never the sum
+        // (see qwen_stats_usage).
+        add_first_alias(
+            &mut usage,
+            "input_tokens",
+            model_stats,
+            &["input_tokens", "inputTokens"],
+        );
+        add_first_alias(
             &mut usage,
             "output_tokens",
-            model_stats.get("output_tokens"),
+            model_stats,
+            &["output_tokens", "outputTokens"],
         );
-        add_usage_value(
+        add_first_alias(
             &mut usage,
             "cache_read_input_tokens",
-            model_stats.get("cacheReadInputTokens"),
+            model_stats,
+            &["cache_read_input_tokens", "cacheReadInputTokens"],
         );
-        add_usage_value(
-            &mut usage,
-            "cache_read_input_tokens",
-            model_stats.get("cache_read_input_tokens"),
-        );
-        add_usage_value(
+        add_first_alias(
             &mut usage,
             "cache_creation_input_tokens",
-            model_stats.get("cacheCreationInputTokens"),
-        );
-        add_usage_value(
-            &mut usage,
-            "cache_creation_input_tokens",
-            model_stats.get("cache_creation_input_tokens"),
+            model_stats,
+            &["cache_creation_input_tokens", "cacheCreationInputTokens"],
         );
     }
     non_empty_usage(usage)
@@ -3566,9 +3570,10 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_codex = false;
-    // rm-554 (upstream #312): token_count accounting state — the distinct
-    // running totals already counted plus the most recent total. Replaces
-    // the rm-162/#286 high-water mark, which refused ALL post-compaction
+    // rm-554 (upstream #312) / rm-685: token_count accounting state — the
+    // immediately previous event's running total and last snapshot
+    // (occurrence-adjacent freshness; see CodexTotals). Replaces the
+    // rm-162/#286 high-water mark, which refused ALL post-compaction
     // growth inside the old envelope even though those context re-sends
     // are billed usage.
     let mut codex_totals = CodexTotals::default();
@@ -4430,7 +4435,8 @@ fn json_container_depth(bytes: &[u8], pos: usize) -> usize {
 /// from the line alone and could mislabel the corners against each
 /// other — a value-less window the ledger had already counted, and a
 /// FRESH value-less window labeled `deduplicated` — because the dedup
-/// exits compare against ledger state (`prev`, `seen`) that the lane
+/// exits compare against ledger state (`prev`/`seen` at that fix —
+/// `prev`/`prev_last` plus the rm-685 ring now) that the lane
 /// updates before every return, so post-hoc inspection cannot recover
 /// what was compared. Returning the exit from the lane itself makes
 /// the disclosure label correct by construction.
@@ -4476,41 +4482,83 @@ fn codex_token_count_usage(
     };
     let total = token_usage_map(info.get("total_token_usage"));
     let last = token_usage_map(info.get("last_token_usage"));
+    // rm-711 (assess SL1): the lane states its own exit, so the skip
+    // disclosure can never mislabel one corner as another (the deleted
+    // mirror could not see the ledger). Both dedup corners — the
+    // consecutive re-emit and the ring-remembered rewind — report
+    // Deduplicated; value-less fresh windows report NoCounts below.
+    let mut deduplicated = false;
     let counts = if total.is_empty() {
-        last
+        last.clone()
     } else {
+        // rm-685: re-emission freshness is OCCURRENCE-ADJACENT, not
+        // value-global. The rm-554 `seen` set keyed the dedup on Value
+        // equality across the whole journal, which both dropped a
+        // post-compaction window whose running total merely happened to
+        // be value-equal to an earlier one (300 -> 1200 -> 300 silently
+        // lost the third window's billed re-send) and retained every
+        // distinct total for the whole parse (~1.4KB each; a long journal
+        // with many distinct totals peaked 6.3x the control's RSS,
+        // against the streaming discipline at the walk loop). With a
+        // last_token_usage snapshot the window IS the truth: count it
+        // whenever it is occurrence-fresh (new total, new snapshot) —
+        // even value-equal after a rewind. Without one (legacy
+        // journals), the counter is all there is and value-dedup stays
+        // (Go compat: a replayed counter sequence counts once), but the
+        // ledger keeps only the previous event's total and snapshot plus
+        // a BOUNDED ring of recent distinct totals — never one entry per
+        // distinct total ever seen.
         let prev = totals.prev.replace(total.clone());
-        if prev.as_ref() == Some(&total) {
-            // rm-554: the same running total re-emitted consecutively
-            // (rate-limit-only update) carries no fresh usage — count
-            // nothing. Stated as an explicit comparison against `prev`
-            // so the guard survives the ledger rollovers rm-711 added
-            // below (envelope boundary + size cap).
-            return CodexCountOutcome::Deduplicated;
-        }
-        if totals.seen.len() >= MAX_CODEX_SEEN_TOTALS {
-            // rm-711 (assess SL3): bounded-recent distincts — roll the
-            // ledger over instead of growing one set entry per call.
-            totals.seen.clear();
-        }
-        if !totals.seen.insert(total.clone()) {
-            // rm-554/rm-711: this exact total was already counted in the
-            // current compaction envelope — a rewind-and-climb-back, not
-            // a fresh window. `compacted` markers clear the ledger
-            // (CodexTotals::begin_envelope) because the re-based counters
-            // re-emit old values while carrying fresh usage.
-            return CodexCountOutcome::Deduplicated;
-        }
-        if usage_has_values(&last) {
+        let re_emitted = prev.as_ref() == Some(&total);
+        let fresh_last = usage_has_values(&last) && totals.prev_last.as_ref() != Some(&last);
+        deduplicated = re_emitted;
+        if re_emitted {
+            // rm-554: the same running total re-emitted (rate-limit-only
+            // update) carries no fresh usage — count nothing. Stated as
+            // an explicit comparison against `prev` so the guard
+            // survives the ledger rollovers rm-711 added (envelope
+            // boundary + ring cap).
+            BTreeMap::new()
+        } else if fresh_last {
             // The snapshot of the call that just finished IS the fresh
-            // usage this window added (post-compaction windows included).
-            last
+            // usage this window added (post-compaction windows included,
+            // value-equal-after-rewind included — assess F1). The
+            // cumulative total it rode on is now COUNTED GROUND:
+            // register it in the ring (independent review, conflict case
+            // 84bf882aa10d49f4b34281b36760e9ab) so a later no-snapshot
+            // event re-presenting that cumulative value cannot re-bill
+            // the climb through the delta path — the rm-554/rm-711
+            // `seen` ledger registered every counted total, snapshot
+            // windows included, and a mixed snapshot/legacy journal (a
+            // client upgrade mid-envelope) is the one shape that walks
+            // both arms.
+            totals.remember_total(total.clone());
+            last.clone()
+        } else if !totals.remember_total(total.clone()) {
+            // Legacy delta path only: this exact total was counted here
+            // recently — a replayed counter sequence re-presents old
+            // values (1000 -> 1200 -> 1000 -> 1200), and the re-climb
+            // over already-counted ground counts nothing (Go compat,
+            // discovery_contract's rewound-totals pin). A
+            // ring-remembered rewind is the ledger's other dedup corner
+            // (rm-711's exit label; the ring bounds the memory the
+            // journal-wide `seen` set once held).
+            deduplicated = true;
+            BTreeMap::new()
         } else {
-            // No last snapshot in older journals: approximate the window
-            // as the forward delta from the previous distinct total.
+            // No last snapshot in older journals — or the SAME last
+            // re-emitted under a new total (rm-685: it was already
+            // counted, so the window's growth is the totals delta):
+            // approximate the window as the forward delta from the
+            // previous event's total (fresh values count the full
+            // re-climb — the rm-554 post-compaction pin).
             token_usage_delta(&total, prev.as_ref())
         }
     };
+    totals.prev_last = Some(last);
+    if deduplicated {
+        return CodexCountOutcome::Deduplicated;
+    }
     if counts.is_empty() || !usage_has_values(&counts) {
         return CodexCountOutcome::NoCounts;
     }
@@ -4557,43 +4605,88 @@ fn codex_token_count_usage(
     CodexCountOutcome::Usage(usage)
 }
 
-/// rm-554 (upstream #312): token_count accounting state — the distinct
-/// running totals already counted and the most recent total. Replaces the
-/// rm-162/#286 high-water mark, which refused all post-compaction growth
-/// inside the old envelope even though those context re-sends are billed
-/// usage (the counters are cumulative and NOT monotonic: compaction resets
+/// rm-554 (upstream #312) / rm-685: token_count accounting state — the
+/// running total and last snapshot of the IMMEDIATELY PREVIOUS
+/// token_count event, plus a bounded ring of recently distinct totals
+/// for the legacy delta path's value-dedup. Replaces the rm-162/#286
+/// high-water mark, which refused all post-compaction growth inside the
+/// old envelope even though those context re-sends are billed usage
+/// (the counters are cumulative and NOT monotonic: compaction resets
 /// them, and the same total re-emits on rate-limit-only updates).
 ///
-/// rm-711 (assess SL1/SL3): the `seen` ledger is scoped to one compaction
-/// envelope (`begin_envelope` clears it at every `compacted` marker) and
-/// hard-capped, so the value-dedup never grows without bound while the
-/// post-compaction re-based counters still count their fresh `last`
-/// snapshots.
+/// rm-685 re-keys the rm-554 freshness test from a journal-wide set of
+/// distinct totals to occurrence adjacency — a re-emission is a total
+/// unchanged since the previous event, so a post-compaction total that
+/// merely happens to be value-equal to an earlier one still counts —
+/// and bounds the delta path's value-dedup to the ring below instead of
+/// one entry per distinct total ever seen (that retained set is what a
+/// long journal with many distinct totals turned into a 6.3x peak-RSS
+/// blowup; memory must scale with journal size, not turn count).
+///
+/// rm-711 (assess SL1/SL3, re-based onto the ring): the ledger is still
+/// scoped to one compaction envelope — `begin_envelope` clears it at
+/// every `compacted` marker — so the value-dedup never carries across a
+/// counter re-base while the post-compaction re-based counters still
+/// count their fresh `last` snapshots.
 #[derive(Default)]
 struct CodexTotals {
     prev: Option<TokenUsage>,
-    seen: BTreeSet<TokenUsage>,
+    prev_last: Option<TokenUsage>,
+    /// Legacy delta-path value-dedup ring (see `remember_total`).
+    recent: HashSet<TokenUsage>,
+    recent_order: VecDeque<TokenUsage>,
 }
 
-/// rm-711 (assess SL3): hard cap on the distinct-totals ledger. A journal
-/// with more distinct totals than this rolls the ledger over (treated as
-/// an implicit envelope boundary) instead of pinning one set entry per
-/// call in memory. The rate-limit guard is unaffected: its signature is
-/// the consecutive duplicate checked against `prev`, not set membership.
-/// 1024 distinct totals without a compaction marker is ~1024 calls;
-/// rewinds deeper than that lose value-dedup only.
-const MAX_CODEX_SEEN_TOTALS: usize = 1024;
+/// Ring capacity for `CodexTotals::recent`: distinct totals remembered
+/// for the legacy delta path's value-dedup. Sized so replayed counter
+/// sequences (duplicated token_count bursts — the Go-compat
+/// rewound-totals shape) dedup exactly, while steady-state state stays
+/// ~1.4MB (1.4KB x 1024) regardless of journal length.
+const CODEX_RECENT_TOTALS_CAP: usize = 1024;
 
 impl CodexTotals {
+    /// Value-dedup for DELTA-counted windows only (snapshot-carrying
+    /// windows never consult it, though they REGISTER their counted
+    /// totals so a later no-snapshot replay of the same cumulative
+    /// value cannot re-bill the climb — the rm-554/rm-711 `seen`
+    /// ledger's invariant, kept under the bounded ring). Returns false
+    /// when this exact total
+    /// was already counted recently — a replayed counter sequence
+    /// (1000 -> 1200 -> 1000 -> 1200) re-presents old values and the
+    /// re-climb over already-counted ground counts nothing (Go compat).
+    /// Bounded FIFO: beyond the cap the oldest distinct total is
+    /// forgotten, so a re-presented value from further back counts again
+    /// as a fresh window — bounded memory over unbounded dedup (the
+    /// rm-554 `seen` set's exact-forever dedup is the blowup rm-685
+    /// removes; monotonic climbs never revisit, so the ring is inert
+    /// weight for the adversarial many-distinct-totals shape).
+    fn remember_total(&mut self, total: TokenUsage) -> bool {
+        if self.recent.contains(&total) {
+            return false;
+        }
+        if self.recent.len() >= CODEX_RECENT_TOTALS_CAP {
+            if let Some(evicted) = self.recent_order.pop_front() {
+                self.recent.remove(&evicted);
+            }
+        }
+        self.recent.insert(total.clone());
+        self.recent_order.push_back(total);
+        true
+    }
+
     /// rm-711 (assess SL1): a `compacted` marker re-bases Codex's
     /// cumulative token counters — the compacted context is re-sent and
     /// billed, so values already counted in the previous envelope
     /// legitimately reappear carrying a fresh `last` snapshot. Open a new
-    /// envelope: drop the value-dedup ledger and the delta baseline so
-    /// the re-based windows count again.
+    /// envelope: drop the value-dedup ring and the occurrence-adjacent
+    /// baselines so the re-based windows count again (re-implemented
+    /// over the rm-685 ring — the rm-554/rm-711 whole-clear `seen` set
+    /// it superseded cleared the same logical state).
     fn begin_envelope(&mut self) {
-        self.seen.clear();
+        self.recent.clear();
+        self.recent_order.clear();
         self.prev = None;
+        self.prev_last = None;
     }
 }
 
@@ -4620,10 +4713,11 @@ fn token_usage_map(raw: Option<&Value>) -> TokenUsage {
 }
 
 // Codex can briefly rewind total_token_usage (e.g. after compaction) and then
-// climb back; rm-554 (upstream #312) counts each distinct total's last
-// snapshot once so the post-compaction climb is real usage — this replaced
-// the rm-035/rm-162 high-water helper (upstream #286), which double-refused
-// that window.
+// climb back; rm-554 (upstream #312) counts each fresh window's snapshot so
+// the post-compaction climb is real usage — this replaced the rm-035/rm-162
+// high-water helper (upstream #286), which double-refused that window.
+// rm-685: "fresh" compares against the immediately previous event, so a
+// rewind to a value seen earlier in the journal still counts its window.
 
 fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage {
     let Some(prev) = prev else {
@@ -6024,6 +6118,27 @@ fn add_usage_value(usage: &mut BTreeMap<String, i64>, key: &str, raw: Option<&Va
     false
 }
 
+/// rm-602 first-present-alias rule for aggregate maps: `first_number`
+/// semantics — the first alias of the class that yields a number wins,
+/// canonical keys first — accumulated across entries (different models
+/// in a qwen stats snapshot are different counters and DO sum). The
+/// stats/modelUsage arms previously ADDed every spelling of a class, so
+/// a snapshot carrying both `input` and `input_tokens` double-counted
+/// it.
+fn add_first_alias(
+    usage: &mut BTreeMap<String, i64>,
+    key: &str,
+    obj: &Map<String, Value>,
+    keys: &[&str],
+) {
+    let value = first_number(obj, keys);
+    if value > 0 {
+        let slot = usage.entry(key.to_string()).or_insert(0);
+        // rm-046: clamp instead of panicking/wrapping.
+        *slot = (*slot).saturating_add(value);
+    }
+}
+
 fn usage_has_values(usage: &BTreeMap<String, i64>) -> bool {
     usage.values().any(|value| *value > 0)
 }
@@ -6959,6 +7074,13 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
     };
     let mut usage = BTreeMap::new();
     let mut matched_keys = Vec::new();
+    // rm-686: Gemini's usageMetadata basis is cache-INCLUSIVE —
+    // promptTokenCount already contains the span reported beside it as
+    // cachedContentTokenCount — so when that alias wins the input class
+    // the cached read is netted out of input after the loop (the qwen
+    // arm's rule). Other input aliases are net-of-cache on their native
+    // wires and are deliberately left alone.
+    let mut inclusive_input = false;
     for (target, keys) in [
         (
             "input_tokens",
@@ -6997,9 +7119,12 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
             &[
                 "cache_read_input_tokens",
                 "cacheReadInputTokens",
-                // Gemini API JSON shape; the antigravity standalone app
-                // reports its cache reads through it (rm-720, codeburn
-                // #1655's ModelUsageStats field map).
+                // Gemini API JSON shape AND usageMetadata; the
+                // antigravity standalone app also reports its cache reads
+                // through it (rm-720, codeburn #1655's ModelUsageStats
+                // field map). rm-686 nets it out of the cache-INCLUSIVE
+                // promptTokenCount input basis in the generic extractor
+                // (one entry — the rm-720 and rm-686 additions deduped).
                 "cachedContentTokenCount",
                 "cache_read",
                 "cacheReadTokens",
@@ -7036,11 +7161,23 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
             })
             .collect();
         if let Some(&(key, value)) = present.iter().find(|(_, value)| *value >= 0) {
+            if key == "promptTokenCount" {
+                // rm-686: Gemini's usageMetadata basis is cache-INCLUSIVE
+                // — the winning input alias decides whether the loop's
+                // cache class is netted out of input afterwards.
+                inclusive_input = true;
+            }
             usage.insert(target.to_string(), value);
             matched_keys.push(key);
         } else if present.iter().any(|(_, value)| *value < 0) {
             note_negative_usage_refusal();
         }
+    }
+    if inclusive_input {
+        // rm-686: the shared clamped subtraction (rm-529/rm-600) — the
+        // inclusive input nets against the cache read, clamping either
+        // side when a degenerate record reports more cache than input.
+        subtract_cached_input(&mut usage, &["cache_read_input_tokens"]);
     }
     // rm-863: the reasoning fold follows the matched key's producer
     // semantics (see [`ReasoningKeySemantics`]) — a SIBLING alias
@@ -8005,7 +8142,8 @@ mod tests {
     fn codex_token_count_exits_name_their_reason() {
         // Review fix L3 (run 0a55a397): the lane states its own exit —
         // usage, absent info, the rm-554 consecutive re-emit, the
-        // rm-711 seen-ledger rewind catch, or a value-less window — so
+        // rm-711 ledger rewind catch (re-based onto the rm-685 ring at
+        // the closeout integration), or a value-less window — so
         // the skip disclosure can never mislabel one corner as another
         // (the deleted mirror labeled a FRESH value-less window
         // `deduplicated` because it could not see the ledger).
@@ -8033,7 +8171,7 @@ mod tests {
             codex_token_count_usage(Some(&step(3000)), &mut totals),
             CodexCountOutcome::Usage(_)
         ));
-        // Rewind-and-climb-back to a total the seen ledger already
+        // Rewind-and-climb-back to a total the ledger's ring already
         // holds (not a consecutive duplicate — prev is the 3000 window).
         assert!(matches!(
             codex_token_count_usage(Some(&step(1000)), &mut totals),
@@ -8680,6 +8818,160 @@ mod tests {
         );
         assert_eq!(generic["reasoning_tokens"], 4);
     }
+    #[test]
+    fn usage_from_value_declares_each_input_aliass_cache_basis() {
+        // rm-686 acceptance: the generic alias table's input class must
+        // declare its cache basis per alias. Gemini's usageMetadata
+        // (`promptTokenCount`) is INCLUSIVE — the span beside it as
+        // `cachedContentTokenCount` nets out of input. Every other input
+        // alias is exclusive/net-of-cache on its native wire and must be
+        // left alone (adding a new input alias means declaring its class
+        // here).
+        let inclusive = usage_from_value(&serde_json::json!({
+            "promptTokenCount": 900,
+            "cachedContentTokenCount": 800,
+            "candidatesTokenCount": 50
+        }))
+        .expect("inclusive basis");
+        assert_eq!(inclusive["input_tokens"], 100);
+        assert_eq!(inclusive["cache_read_input_tokens"], 800);
+        assert_eq!(inclusive["output_tokens"], 50);
+
+        // Exclusive aliases carry their input net-of-cache as reported —
+        // enumerate the input class's ACTUAL table inventory beside the
+        // inclusive Gemini alias (input_tokens, prompt_tokens,
+        // inputTokens, input_other), so the loop fails loudly when a new
+        // alias joins the class without being classified here.
+        for key in [
+            "input_tokens",
+            "prompt_tokens",
+            "inputTokens",
+            "input_other",
+        ] {
+            let exclusive = usage_from_value(&serde_json::json!({
+                key: 900,
+                "cache_read_input_tokens": 800,
+                "output_tokens": 50
+            }))
+            .expect("exclusive basis");
+            assert_eq!(exclusive["input_tokens"], 900, "alias {key}");
+            assert_eq!(exclusive["cache_read_input_tokens"], 800, "alias {key}");
+        }
+    }
+
+    #[test]
+    fn codex_token_count_freshness_is_occurrence_adjacent() {
+        // rm-685: re-emission freshness compares against the IMMEDIATELY
+        // PREVIOUS event, never against a journal-wide set of distinct
+        // totals (the rm-554 `seen` set dropped the value-equal window
+        // after a rewind and grew unboundedly with distinct totals).
+        let event = |total_in: i64, total_out: i64, last_in: i64, last_out: i64| {
+            serde_json::json!({
+                "total_token_usage": {
+                    "input_tokens": total_in,
+                    "output_tokens": total_out
+                },
+                "last_token_usage": {
+                    "input_tokens": last_in,
+                    "output_tokens": last_out
+                }
+            })
+        };
+        let count = |info: &Value, totals: &mut CodexTotals| {
+            codex_token_count_usage(Some(info), totals)
+                .usage()
+                .map(|usage| (usage["input_tokens"], usage["output_tokens"]))
+        };
+
+        // 300 -> 1200 -> 300: the value-equal third window is
+        // occurrence-fresh (the counter moved to get here) and counts
+        // its last snapshot — assess F1's undercount.
+        let mut totals = CodexTotals::default();
+        assert_eq!(
+            count(&event(300, 100, 300, 100), &mut totals),
+            Some((300, 100))
+        );
+        assert_eq!(
+            count(&event(1200, 400, 900, 300), &mut totals),
+            Some((900, 300))
+        );
+        assert_eq!(
+            count(&event(300, 100, 300, 100), &mut totals),
+            Some((300, 100))
+        );
+
+        // An immediate re-emission of the same total carries nothing
+        // (the narrow rm-554 guard, kept).
+        assert_eq!(count(&event(300, 100, 300, 100), &mut totals), None);
+
+        // An identical last under a NEW total falls to the totals delta —
+        // assess F5: the window grew 100/30, not a repeat of 100/50.
+        assert_eq!(
+            count(&event(100, 50, 100, 50), &mut totals),
+            Some((100, 50))
+        );
+        assert_eq!(
+            count(&event(200, 80, 100, 50), &mut totals),
+            Some((100, 30))
+        );
+
+        // rm-685, legacy delta path (no last snapshots): a REPLAYED
+        // counter sequence counts once — the re-presented values are
+        // already-counted ground (Go compat: discovery_contract's
+        // rewound-totals pin expects 1500, not 1700) — while a fresh
+        // value after a rewind counts the full re-climb from the reset
+        // baseline (rm-554: post-compaction re-sends are billed).
+        let total_only = |total_in: i64, total_out: i64| {
+            serde_json::json!({
+                "total_token_usage": {
+                    "input_tokens": total_in,
+                    "output_tokens": total_out
+                }
+            })
+        };
+        let mut totals = CodexTotals::default();
+        assert_eq!(
+            count(&total_only(1000, 100), &mut totals),
+            Some((1000, 100))
+        );
+        assert_eq!(count(&total_only(1200, 120), &mut totals), Some((200, 20)));
+        // Rewind then replay the climb: nothing new.
+        assert_eq!(count(&total_only(1000, 100), &mut totals), None);
+        assert_eq!(count(&total_only(1200, 120), &mut totals), None);
+        // New ground past the replay: only its delta.
+        assert_eq!(count(&total_only(1500, 150), &mut totals), Some((300, 30)));
+        // A rewind to a fresh value that then climbs to NEW heights
+        // counts the full re-climb (rm-554 post-compaction pin).
+        assert_eq!(count(&total_only(500, 50), &mut totals), None);
+        assert_eq!(
+            count(&total_only(2000, 200), &mut totals),
+            Some((1500, 150))
+        );
+
+        // Independent review (conflict case 84bf882aa10d49f4b34281b36760e9ab):
+        // a MIXED journal — snapshot windows then no-snapshot
+        // re-presentations, the shape a mid-envelope client upgrade
+        // writes — must not re-bill a climb a snapshot window already
+        // counted. The snapshot branch registers its cumulative total
+        // as counted ground, so the legacy delta path dedups the
+        // replay exactly as the rm-554/rm-711 `seen` ledger did for
+        // BOTH paths (without the registration the final line counts
+        // the 1000/100 the second snapshot already billed).
+        let mut totals = CodexTotals::default();
+        assert_eq!(
+            count(&event(1000, 100, 900, 90), &mut totals),
+            Some((900, 90))
+        );
+        assert_eq!(
+            count(&event(2000, 200, 1000, 100), &mut totals),
+            Some((1000, 100))
+        );
+        assert_eq!(count(&total_only(1000, 100), &mut totals), None);
+        assert_eq!(count(&total_only(2000, 200), &mut totals), None);
+        // New ground past the replay still counts its own delta.
+        assert_eq!(count(&total_only(2500, 250), &mut totals), Some((500, 50)));
+    }
+
     #[test]
     fn thinking_tokens_reach_the_session_metrics_breakdown() {
         // End to end through the Gemini checkpoint parser: the folded

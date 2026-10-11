@@ -1,0 +1,2 @@
+{"type": "user", "timestamp": "2026-10-01T09:00:00Z", "message": {"role": "user", "content": "hi"}}
+{"type": "assistant", "timestamp": "2026-10-01T09:00:05Z", "message": {"id": "msg_1", "model": "claude-sonnet-4-5", "usage": {"promptTokenCount": 900, "cachedContentTokenCount": 800, "candidatesTokenCount": 50, "thoughtsTokenCount": 20}, "content": [{"type": "text", "text": "yo"}]}}

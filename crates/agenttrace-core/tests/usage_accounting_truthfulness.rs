@@ -27,6 +27,23 @@
 //! - rm-556 copilot timestamp: a metrics-less shutdown record ends the
 //!   session; its timestamp reaches the credit event (or a terminal
 //!   marker) so duration reflects it.
+//!
+//! Closeout batch (run 2f02ecafb267 cycle 2, same theme, red-first at
+//! 518170a):
+//! - rm-685 codex totals: re-emission freshness is OCCURRENCE-ADJACENT —
+//!   a post-compaction total that merely happens to be value-equal to an
+//!   earlier one still counts, an identical `last_token_usage` under a
+//!   new total falls to the totals delta, and the ledger is bounded
+//!   (previous event's total + snapshot, plus a capped ring for the
+//!   legacy delta path's value-dedup) instead of a per-distinct-total
+//!   set (adversarial long journals peaked 6.3x the control's RSS
+//!   through the retained set).
+//! - rm-686 generic usage: Gemini-shaped `promptTokenCount` is
+//!   cache-INCLUSIVE — `cachedContentTokenCount` joins the cache-read
+//!   aliases and nets out of input with the shared clamped subtraction
+//!   (the qwen arm's rule).
+//! - rm-602 extension: the qwen stats/modelUsage arms take the first
+//!   PRESENT alias per class (never the sum), like `qwen_usage`.
 
 use agenttrace_core::parse_file;
 use std::path::PathBuf;
@@ -150,6 +167,61 @@ fn copilot_resumed_shutdown_replaces_instead_of_stacking() {
     assert_eq!(session.metrics.tokens_input, 800);
     assert_eq!(session.metrics.tokens_output, 80);
     assert!((session.metrics.credit_usd - 0.02).abs() < 1e-9);
+}
+
+#[test]
+fn codex_value_equal_total_after_a_rewind_still_counts() {
+    // rm-685 (assess F1): totals 300 -> 1200 -> 300, every event carrying
+    // its window's last_token_usage. The rm-554 `seen` set keyed the
+    // re-emission dedup on Value equality across the WHOLE journal, so
+    // the post-compaction third window — value-equal to the first total
+    // but occurrence-fresh (the counter moved 1200 -> 300 to get there)
+    // — was silently dropped: 1200/400 reported against the truth
+    // 1500/500 (the compacted context is re-sent and billed).
+    let session = fixture("codex-seen-collision.jsonl");
+    assert_eq!(session.metrics.source_tool, "codex_cli");
+    assert_eq!(session.metrics.tokens_input, 1500);
+    assert_eq!(session.metrics.tokens_output, 500);
+}
+
+#[test]
+fn codex_identical_last_under_a_new_total_counts_the_delta() {
+    // rm-685 (assess F5): totals {100,50} -> {200,80} with last_token_usage
+    // pinned {100,50} on both events. The repeated snapshot was counted
+    // twice (200/100 reported); the second window's growth is the totals
+    // delta, so the truth is 200/80.
+    let session = fixture("codex-same-last.jsonl");
+    assert_eq!(session.metrics.tokens_input, 200);
+    assert_eq!(session.metrics.tokens_output, 80);
+}
+
+#[test]
+fn qwen_stats_dual_aliases_count_first_present_never_the_sum() {
+    // rm-602 extension (assess F3): the stats arm ADDed both spellings of
+    // each class (`input` + `input_tokens`, `output` + `output_tokens`),
+    // so a dual-alias snapshot doubled — 200/100 reported; the
+    // qwen_usage first-present rule counts each class once: 100/50.
+    let session = fixture("qwen-stats-dual-alias.jsonl");
+    assert_eq!(session.metrics.source_tool, "qwen_code");
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_output, 50);
+}
+
+#[test]
+fn generic_gemini_shaped_usage_nets_inclusive_input_against_the_cache() {
+    // rm-686 (assess F4): a claude-family journal whose usage block is
+    // Gemini-shaped — promptTokenCount 900 (cache-INCLUSIVE) beside
+    // cachedContentTokenCount 800. The generic extractor took the 900 as
+    // net input with cache_r 0 (900/0/70 reported — an 800-token
+    // over-count at full input rate); cachedContentTokenCount is now a
+    // cache-read alias and the inclusive input nets against it with the
+    // shared clamped subtraction (the qwen arm's parity target):
+    // 100/800/70.
+    let session = fixture("claude-gemini-usage.jsonl");
+    assert_eq!(session.metrics.source_tool, "claude_code");
+    assert_eq!(session.metrics.tokens_input, 100);
+    assert_eq!(session.metrics.tokens_cache_r, 800);
+    assert_eq!(session.metrics.tokens_output, 70);
 }
 
 #[test]

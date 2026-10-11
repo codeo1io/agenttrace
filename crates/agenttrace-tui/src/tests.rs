@@ -1631,6 +1631,21 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 57 (integration of run
+                // 2f02ecafb2674e529f662f7cc27162f4 cycle 2
+                // "usage-accounting truthfulness closeout" — codex
+                // occurrence-adjacent token_count totals with the
+                // capped value-dedup ring (campaign rm-685, landed as
+                // rm-980; composed with the rm-711 compaction
+                // envelope), generic Gemini-inclusive
+                // promptTokenCount netting against
+                // cachedContentTokenCount (rm-686, landed as rm-981),
+                // and qwen stats/modelUsage first-present aliases (the
+                // rm-602 extension); minted 32 -> 33 at its base
+                // 518170a, re-based onto this tree's advanced ceiling
+                // as 56 -> 57 per the landed-rung-keeps-numeral
+                // convention — conflict case
+                // edb878bb27db418fbb13184efccaa721);
                 // Schema 56 (integration of run 32f3b7a1 cycle 3,
                 // rm-726 magnitude-clamp disclosure: the
                 // magnitude_clamped:* counters and the
