@@ -513,7 +513,7 @@ fn run() -> anyhow::Result<()> {
             "Cache saved: {}\n",
             pricing_cache_path().display()
         ))?;
-        if !has_followup_action(&args) {
+        if !has_post_pricing_action(&args) {
             return Ok(());
         }
     }
@@ -2440,12 +2440,25 @@ fn render_diagnostics(
 /// and `--test-match`, and neither knew `--statusline-report` or
 /// `--budget` — so `--clear-cache --doctor` (and four sibling combos)
 /// printed "Session cache cleared." and exited 0 without ever running
-/// the co-requested action. One shared helper now answers for BOTH
-/// guards: every action arm `run()` dispatches between the side-effect
-/// exits and the interactive fallback must appear here, and the unit
-/// matrix in `mod tests` pins the full flag set so a new action arm
-/// cannot be registered on one guard and not the other.
+/// the co-requested action. One shared helper per GUARD QUESTION: the
+/// clear-cache exit asks "does an arm AFTER me still need to run?" —
+/// `--update-pricing` qualifies (the pair must run both actions in
+/// either order, rm-301's residual) — while the pricing arm's own exit
+/// asks "does an arm after ME still need to run?" and deliberately
+/// excludes itself. Every action arm `run()` dispatches between the
+/// side-effect exits and the interactive fallback appears in one of
+/// the two helpers, and the unit matrix in `mod tests` pins the full
+/// flag set for both so a new action arm cannot be registered on one
+/// guard and not the other.
 fn has_followup_action(args: &Args) -> bool {
+    args.update_pricing || has_post_pricing_action(args)
+}
+
+/// The pricing arm's own guard: everything `run()` dispatches AFTER the
+/// `--update-pricing` arm completes. `--update-pricing` alone still
+/// exits when the download finishes — it is an action, not a follow-up
+/// of itself.
+fn has_post_pricing_action(args: &Args) -> bool {
     has_session_action(args)
         || args.list_models
         || args.test_match
@@ -2948,23 +2961,34 @@ mod tests {
                 "{flag} must count as a follow-up action for BOTH side-effect guards"
             );
         }
-        for (flag, args) in [
-            ("--clear-cache", {
-                let mut a = base();
-                a.clear_cache = true;
-                a
-            }),
-            ("--update-pricing", {
-                let mut a = base();
-                a.update_pricing = true;
-                a
-            }),
-        ] {
-            assert!(
-                !has_followup_action(&args),
-                "{flag} is a side effect, not a follow-up action"
-            );
-        }
+        let flag = "--clear-cache";
+        let mut a = base();
+        a.clear_cache = true;
+        assert!(
+            !has_followup_action(&a),
+            "{flag} is a side effect, not a follow-up action"
+        );
+        // rm-301 residual: --update-pricing answers the two guard
+        // questions differently. It IS a follow-up of the clear-cache
+        // exit (the pair must run both actions in either order — the
+        // old single predicate dropped the pricing update silently) but
+        // NOT of its own arm (--update-pricing alone still exits after
+        // the download instead of falling through to the TUI).
+        let mut pricing_only = base();
+        pricing_only.update_pricing = true;
+        assert!(
+            has_followup_action(&pricing_only),
+            "--update-pricing must survive the clear-cache guard"
+        );
+        assert!(
+            !has_post_pricing_action(&pricing_only),
+            "--update-pricing alone must still exit after its own arm"
+        );
+        let mut both = base();
+        both.clear_cache = true;
+        both.update_pricing = true;
+        assert!(has_followup_action(&both));
+        assert!(!has_post_pricing_action(&both));
         // The search lane keeps the shared non-empty rule.
         let mut whitespace = base();
         whitespace.search = Some("   ".to_string());

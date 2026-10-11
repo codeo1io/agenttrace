@@ -2295,7 +2295,11 @@ pub(super) fn detail_native_text(session: &Session, language: Language) -> Strin
         text(language, "Session Summary", "会话摘要").to_string(),
         "---------------".to_string(),
         report_context_line(session, language),
-        format!("{}: {}", text(language, "Name", "名称"), session.name),
+        format!(
+            "{}: {}",
+            text(language, "Name", "名称"),
+            sanitize_display(&session.name)
+        ),
         format!(
             "{}: {}",
             text(language, "Workspace", "工作区"),
