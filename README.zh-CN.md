@@ -143,8 +143,18 @@ agenttrace -f json sessions.jsonl    # -f json 生效
 JSON-RPC 2.0，让编程 Agent 在烧掉 token 的那个会话里直接问“我的
 token 花在哪了”。两个工具渲染 CLI 同一套本地发现的会话——
 `usage_overview`（即 `--overview -f json` 文档）和 `by_model_breakdown`
-（按模型统计成本与会话数）。服务器不打开任何 socket、不做任何
-网络探测、不在 agenttrace 会话缓存之外写任何东西；stdin 关闭即退出。
+（按模型统计成本与会话数）——并解析与 CLI 相同的分层配置：
+`--config` 层或 `--pricing-file` 覆盖对两条通道定价一致（rm-781）。
+`initialize` 协商双方共同支持的最新的协议版本（`2026-07-28`、
+`2025-11-25`、`2025-06-18`），绝不盲回显（rm-780）。服务器不打开任何
+socket、不做任何网络探测、不在 agenttrace 会话缓存之外写任何东西；
+stdin 关闭即退出；对非 UTF-8 的行回 `-32700`、对超过 1 MiB 传输上限的
+行回 `-32600`，两种情况都保持服务而不是崩溃（rm-782；超上限拒绝契约
+为 rm-923）。
+
+标志放在 `mcp` 关键字之前：`-d/--dir` 与配置族（`--config`、
+`--history-dir`、`--pricing-file`）生效，其余无法作用于服务器的标志
+以退出码 2 拒绝，不再被静默丢弃（rm-781）。
 
 ```json
 {

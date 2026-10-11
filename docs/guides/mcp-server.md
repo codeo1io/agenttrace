@@ -4,8 +4,12 @@
 coding agent can call from inside its own session: the agent asks
 "where did my tokens go" and gets the same `--overview` JSON a human
 gets in the terminal. It is a host-keyword command like
-`agenttrace statusline` and `agenttrace upstream` — it takes no flags;
-run `agenttrace mcp --help` for the on-disk help text.
+`agenttrace statusline` and `agenttrace upstream` — flags placed
+BEFORE the keyword are either honored (`-d/--dir` and the config
+family: `--config`, `--history-dir`, `--pricing-file`) or refused at
+exit 2, because a flag that cannot apply to a stdio server used to be
+accepted and silently dropped; run `agenttrace mcp --help` for the
+on-disk help text.
 
 ## Posture
 
@@ -16,7 +20,10 @@ contract (enforced in code, and pinned by
 - **Read-only.** The tools report on the locally discovered sessions;
   they never edit, delete, or send them anywhere. There is no second
   renderer — both tools render through the same discovery and pricing
-  stack as `agenttrace --overview`.
+  stack as `agenttrace --overview`, and the mcp lane resolves the SAME
+  layered configuration the CLI does (user/project `config.toml`,
+  `--config`, `--pricing-file`, `--history-dir`): a pricing override
+  moves the CLI's answer and the MCP answer equally (rm-781).
 - **No network.** The server opens no sockets and performs no registry
   or HTTP probes. Stdio is the only transport, and there is no
   `--fetch`-style opt-in: this command has no network mode at all.
@@ -65,7 +72,7 @@ error naming the cap, and the messages after it still answer.
 
 | Method | Answers |
 | --- | --- |
-| `initialize` | `serverInfo`, `capabilities.tools`, echoes the client's `protocolVersion` |
+| `initialize` | `serverInfo`, `capabilities.tools`, and the newest **mutually supported** `protocolVersion` of `2026-07-28`, `2025-11-25`, `2025-06-18` — negotiated, never echoed; an unknown or absent client version falls back to the server's newest with a one-line stderr disclosure (rm-780) |
 | `notifications/initialized` | silence (notifications are never answered) |
 | `ping` | `{}` |
 | `tools/list` | the two tools below |
@@ -73,19 +80,27 @@ error naming the cap, and the messages after it still answer.
 
 JSON-RPC batching is rejected (`-32600`), matching the current MCP
 spec revision. Malformed JSON answers `-32700`; unknown methods answer
-`-32601`; invalid tool parameters answer `-32602`. In `tools/call`, a
-`name` that does not name a tool and an `arguments` value that is not
-an object when present (a string/number/boolean/array) both answer
-`-32602` naming the violated constraint, and the tool does not execute
-— a client bug must not become an unintended run. Omitting `arguments`
-(or sending JSON `null`) keeps the spec-legal empty-object default.
-A corpus that
+`-32601`; invalid tool parameters answer `-32602`. The wire reader is
+disciplined (rm-782): a non-UTF-8 line answers `-32700` and the
+server keeps serving (the byte-level lane never dies on undecodable
+input), request ids outside String/Number/Null answer `-32600` with
+`id: null` instead of being echoed back, and a non-object `params`
+answers `-32602` instead of behaving like an absent value. In
+`tools/call`, a `name` that does not name a tool and an `arguments`
+value that is not an object when present (a
+string/number/boolean/array) both answer `-32602` naming the violated
+constraint, and the tool does not execute — a client bug must not
+become an unintended run. Omitting `arguments` (or sending JSON
+`null`) keeps the spec-legal empty-object default. A corpus that
 discovered no sessions for the requested window is **not** a protocol
-error: the call returns a tool result with `isError: true` carrying
-the same "No session files found" message the CLI prints, and the
-server keeps serving. The JSON-RPC error arms are the twin of the
-CLI's rc2 usage errors; `isError` results are the twin of its rc1
-report failures.
+error: the call returns a tool result with `isError: true` — a
+discovery miss ("No session files found", the same message the CLI
+prints) when no session files exist at all, and a filter miss
+("No sessions match the requested filters", naming the discovery
+count) when files exist but fall outside the window or filters
+(rm-781) — and the server keeps serving. The JSON-RPC error arms are
+the twin of the CLI's rc2 usage errors; `isError` results are the
+twin of its rc1 report failures.
 
 ## Tools
 
@@ -98,10 +113,11 @@ from the loader's census.
 
 | Parameter | Type | Values | Default |
 | --- | --- | --- | --- |
-| `range` | string | `today`, `7d`, `30d`, `all` | `all` |
+| `range` | string | `today`, `day`, `1d`, `7d`, `week`, `weekly`, `30d`, `month`, `monthly`, `all`, `""` | `all` |
 
 `today` is your local calendar day; `7d`/`30d` are rolling windows —
-the same semantics as the CLI's `--range`.
+the same semantics as the CLI's `--range`, and the schema publishes
+exactly the labels the parser enforces (rm-782).
 
 ### `by_model_breakdown`
 
@@ -111,7 +127,7 @@ Smaller answer, same discovery and pricing path.
 
 | Parameter | Type | Values | Default |
 | --- | --- | --- | --- |
-| `range` | string | `today`, `7d`, `30d`, `all` | `all` |
+| `range` | string | `today`, `day`, `1d`, `7d`, `week`, `weekly`, `30d`, `month`, `monthly`, `all`, `""` | `all` |
 
 ## A tool call, end to end
 
@@ -123,7 +139,10 @@ Smaller answer, same discovery and pricing path.
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"all"}}}
 ```
 
-Answers — note the notification gets no response line:
+Answers — note the notification gets no response line, and the
+negotiation answered `2025-06-18` because that is what BOTH sides
+speak (ask for `1999-99-99` and the answer is the server's newest,
+with a stderr disclosure):
 
 ```json
 {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"agenttrace","version":"…"},"instructions":"…"}}
@@ -145,6 +164,10 @@ These are unrelated and easy to confuse:
 
 ## Verification
 
-The end-to-end wire contract (handshake, both tools, every error arm,
-the empty-corpus `isError` path, rc0 on EOF) is pinned by
+The end-to-end wire contract (handshake and protocol-version
+negotiation, both tools, every error arm including hostile wire
+lines — non-UTF-8, over-cap, bad ids, non-object params/arguments —
+the empty-corpus and filter-miss `isError` paths, the honored/refused
+flag contract before the keyword, `-d` scoping and admission, and
+config-layer pricing parity with the CLI, rc0 on EOF) is pinned by
 `crates/agenttrace-cli/tests/mcp_server.rs`.
