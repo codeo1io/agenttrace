@@ -176,7 +176,7 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     if trimmed.is_empty() {
         bail!("empty session");
     }
-    let parsed_value = serde_json::from_str::<Value>(trimmed).ok();
+    let mut parsed_value = serde_json::from_str::<Value>(trimmed).ok();
     if let Some(value) = &parsed_value {
         if is_qwen_code_document(value) {
             let (events, qwen_skips) = parse_qwen_code_value(value)?;
@@ -345,9 +345,69 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
     if let Some(events) = parse_copilot_jsonl(&objs) {
         return finish(events);
     }
-    if let Ok(events) = serde_json::from_str::<Vec<Event>>(trimmed) {
+    // rm-860: a JSON-array doc carrying BOTH spellings of an Event
+    // field (`ModelUsed` + `model_used`, any rename+alias pair) trips
+    // serde's duplicate-field error and drops the whole array; when
+    // the strict parse fails, retry against pre-normalized elements
+    // under the disclosed canonical-winner rule (lib.rs
+    // `normalize_duplicate_field_spellings`). Docs without duplicate
+    // spellings never take the retry path.
+    let mut normalized_spellings = 0usize;
+    // rm-757 × rm-860 seam (integration of run 5eb82325): the array
+    // lane's usage disclosures are captured into a Vec up front because
+    // the rm-860 duplicate-spelling retry below consumes the array via
+    // `std::mem::take` — after the retry, `parsed_value` no longer holds
+    // the elements to classify. On the strict-parse path this is the
+    // original array; on the retry path it is re-captured from the
+    // normalized items (the canonical spellings the strict lane would
+    // have seen) just before the take.
+    let mut array_lane_disclosures: Vec<String> = parsed_value
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .flat_map(crate::unrecognized_usage_keys)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut array_events = serde_json::from_str::<Vec<Event>>(trimmed).ok();
+    if array_events.is_none() {
+        if let Some(items) = parsed_value.as_mut().and_then(Value::as_array_mut) {
+            // rm-860 × value-lane fallbacks (independent review of the
+            // combined tree, conflict case b51a087890464039a0a1e3a762c19f61):
+            // keep the pre-normalization array. An element fails the
+            // strict `Vec<Event>` parse for reasons a duplicate-spelling
+            // pass cannot fix (a wrong-typed `is_error`/`redacted` bool,
+            // a non-object element), and consuming the array via
+            // `std::mem::take` on that failing path would hand the
+            // value-based lanes below (`parse_gemini_value` /
+            // `parse_cline_value` array arms) an EMPTY array — stranding
+            // a doc those lanes would have parsed, regressing it to
+            // `unsupported session format`. The clone rides only the
+            // rare strict-failure path (docs that parse cleanly never
+            // get here), and the untouched array is restored when the
+            // retry still fails so the fallback lanes see exactly what
+            // they saw before rm-860.
+            let original_items = items.clone();
+            for item in items.iter_mut() {
+                normalized_spellings += crate::normalize_duplicate_field_spellings(item);
+            }
+            array_lane_disclosures = items
+                .iter()
+                .flat_map(crate::unrecognized_usage_keys)
+                .collect();
+            array_events =
+                serde_json::from_value(serde_json::Value::Array(std::mem::take(items))).ok();
+            if array_events.is_none() {
+                if let Some(value) = parsed_value.as_mut() {
+                    *value = serde_json::Value::Array(original_items);
+                }
+            }
+        }
+    }
+    if let Some(mut events) = array_events {
         if !events.is_empty() {
-            let mut events = events;
             for event in &mut events {
                 if event.source_tool.is_empty() {
                     event.source_tool = "generic".to_string();
@@ -361,14 +421,24 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             // tokens fell to the text estimator with no `usage_*`
             // entry anywhere in the JSON). Route the array's elements
             // through the SAME case-folded classifier (rm-756) and the
-            // SAME capped mint (rm-594 residual) before returning.
+            // SAME capped mint (rm-594 residual) before returning —
+            // the elements were captured into `array_lane_disclosures`
+            // above because the rm-860 retry consumes the array.
             let mut session = session_from_events(name, path, events)?;
-            if let Some(serde_json::Value::Array(elements)) = &parsed_value {
-                for element in elements {
-                    for disclosure in crate::unrecognized_usage_keys(element) {
-                        crate::mint_disclosure(&mut session.metrics.line_skips, disclosure, 1);
-                    }
-                }
+            for disclosure in array_lane_disclosures {
+                crate::mint_disclosure(&mut session.metrics.line_skips, disclosure, 1);
+            }
+            // rm-860: a duplicate-spelling doc that parsed under the
+            // canonical-winner retry is informational, not parse loss —
+            // the counter rides the NON-LOSS disclosure channel
+            // (`disclosure_counters`, rendered under "Disclosed facts",
+            // never degrading `data_health.confidence`).
+            if normalized_spellings > 0 {
+                *session
+                    .metrics
+                    .disclosure_counters
+                    .entry("duplicate_spelling_normalized".to_string())
+                    .or_insert(0) += normalized_spellings;
             }
             return Ok(session);
         }
@@ -3344,12 +3414,14 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
             "candidatesTokenCount",
         ],
     );
-    // Thinking tokens are billed at the output rate but reported
-    // separately from candidates/completion tokens (Gemini
-    // usageMetadata.thoughtsTokenCount and the OpenAI-compatible
-    // reasoning_tokens aliases); fold them into output and keep the
-    // breakdown for the audit (pass-9 CU-20).
-    let reasoning = first_number(
+    // rm-863: the thinking fold follows the matched key's producer
+    // semantics ([`ReasoningKeySemantics`]) — thoughtsTokenCount (the
+    // camelCase Gemini-style metadata this lane reads) is a SIBLING
+    // of candidatesTokenCount and still adds; the flat
+    // OpenAI-compatible spellings are a SUBSET inside
+    // completion_tokens and only record the breakdown (pass-9 CU-20
+    // added every alias blindly).
+    let reasoning_observation = first_reasoning_observation(
         obj,
         &[
             "thoughtsTokenCount",
@@ -3358,7 +3430,18 @@ fn qwen_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
             "reasoning_tokens",
         ],
     );
-    let output = output.saturating_add(reasoning);
+    let reasoning = reasoning_observation.map(|(_, value)| value).unwrap_or(0);
+    let output = match reasoning_observation {
+        Some((key, value))
+            if reasoning_key_semantics(key) == Some(ReasoningKeySemantics::Sibling) =>
+        {
+            output.saturating_add(value)
+        }
+        // SUBSET: seed the bucket only when no positive output-class
+        // member was reported (first_number collapses absent to 0).
+        Some((_, value)) if output == 0 => value,
+        _ => output,
+    };
     let cache_write = first_number(obj, &["cache_creation_input_tokens", "cacheWrite"]);
     if input > 0 {
         usage.insert("input_tokens".to_string(), input);
@@ -6238,32 +6321,24 @@ fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
             ],
         ),
     );
-    usage.insert(
-        "output_tokens".to_string(),
-        first_number(
-            obj,
-            &[
-                "candidatesTokenCount",
-                "outputTokenCount",
-                "outputTokens",
-                "output_tokens",
-                "completion_tokens",
-            ],
-        )
-        .saturating_add(first_number(
-            obj,
-            &[
-                "thoughtsTokenCount",
-                "thinkingTokenCount",
-                "thinking_tokens",
-                "reasoning_tokens",
-            ],
-        )),
+    let output_base = first_number(
+        obj,
+        &[
+            "candidatesTokenCount",
+            "outputTokenCount",
+            "outputTokens",
+            "output_tokens",
+            "completion_tokens",
+        ],
     );
-    // Thinking tokens are billed at the output rate but reported
-    // separately by the API (Gemini usageMetadata.thoughtsTokenCount);
-    // folded above, broken out here for the audit (pass-9 CU-20).
-    let reasoning = first_number(
+    // rm-863: per-key producer semantics replace the blanket additive
+    // fold (pass-9 CU-20 billed subset-shaped producers twice) —
+    // thoughtsTokenCount (the camelCase Gemini family this lane reads,
+    // candidates EXCLUDE thoughts) still adds; the flat
+    // OpenAI-compatible spellings are a breakdown INSIDE
+    // completion/output and never add, seeding the bucket only when
+    // the doc carries no positive output member.
+    let reasoning_observation = first_reasoning_observation(
         obj,
         &[
             "thoughtsTokenCount",
@@ -6272,7 +6347,19 @@ fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
             "reasoning_tokens",
         ],
     );
-    if reasoning > 0 {
+    let output = match reasoning_observation {
+        Some((key, value))
+            if reasoning_key_semantics(key) == Some(ReasoningKeySemantics::Sibling) =>
+        {
+            output_base.saturating_add(value)
+        }
+        Some((_, value)) if output_base == 0 => value,
+        _ => output_base,
+    };
+    usage.insert("output_tokens".to_string(), output);
+    // The matched span stays visible as its own reasoning_tokens
+    // breakdown for the audit.
+    if let Some((_, reasoning)) = reasoning_observation {
         usage.insert("reasoning_tokens".to_string(), reasoning);
     }
     usage.insert(
@@ -6720,6 +6807,81 @@ pub(crate) fn usage_key_is_consumed(key: &str) -> bool {
     USAGE_KEYS_CONSUMED.contains(&key)
 }
 
+/// The reasoning-token wire synonyms, in matcher priority order: the
+/// first key present with a positive number wins the fold (the same
+/// priority the pre-rm-863 blanket folds used).
+const REASONING_TOKEN_KEYS: [&str; 5] = [
+    "thoughtsTokenCount",
+    "thinkingTokenCount",
+    "thinking_tokens",
+    "reasoning_tokens",
+    // antigravity RPC name, ModelUsageStats field 9 (rm-720,
+    // codeburn #1655: thinking_output_tokens bills at the output
+    // rate like every other reasoning alias)
+    "reasoningTokens",
+];
+
+/// rm-863: producer semantics per reasoning-token wire key. The
+/// pre-rm-863 folds added EVERY alias to the output bucket ("billed
+/// at the output rate", pass-9 CU-20), which bills producers that
+/// already include the thinking span in their reported
+/// completion/output bucket TWICE. The wire names split into two
+/// families:
+///
+/// - [`ReasoningKeySemantics::Sibling`] — Gemini
+///   `usageMetadata.thoughtsTokenCount` (candidatesTokenCount
+///   EXCLUDES the thoughts span; pinned by the Gemini checkpoint
+///   discovery contract), the camelCase `*TokenCount` family with
+///   it, and antigravity `reasoningTokens` (ModelUsageStats field
+///   9, rm-720/codeburn #1655: reported output EXCLUDES thinking):
+///   the span is a bucket BESIDE the reported output — it is ADDED
+///   to `output_tokens` and kept as the `reasoning_tokens`
+///   breakdown.
+/// - [`ReasoningKeySemantics::Subset`] — the flat OpenAI-compatible
+///   spellings `reasoning_tokens`/`thinking_tokens`: the documented
+///   completion-token breakdown that gateways and agents (the
+///   hermes agent's own usage rows, research ef1ca6d9) mirror at the
+///   top level of the usage object. The breakdown is recorded
+///   WITHOUT adding to output — the contract rm-603 landed for Codex
+///   `reasoning_output_tokens`, extended to the flat spellings.
+///
+/// No fleet host carries a qwen/kimi journal with a nonzero flat
+/// thinking field today (census 2026-10-08, research ef1ca6d9), so
+/// the table is cited from producer documentation, not a corpus
+/// claim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReasoningKeySemantics {
+    /// Reported output EXCLUDES the thinking span: add it.
+    Sibling,
+    /// Reported output already CONTAINS the thinking span: never add.
+    Subset,
+}
+
+fn reasoning_key_semantics(key: &str) -> Option<ReasoningKeySemantics> {
+    match key {
+        "thoughtsTokenCount" | "thinkingTokenCount" | "reasoningTokens" => {
+            Some(ReasoningKeySemantics::Sibling)
+        }
+        "reasoning_tokens" | "thinking_tokens" => Some(ReasoningKeySemantics::Subset),
+        _ => None,
+    }
+}
+
+/// The first reasoning synonym present with a positive number,
+/// paired with the key that matched — its
+/// [`ReasoningKeySemantics`] decides how the fold treats it.
+fn first_reasoning_observation(
+    obj: &serde_json::Map<String, Value>,
+    keys: &[&'static str],
+) -> Option<(&'static str, i64)> {
+    keys.iter().find_map(|key| {
+        obj.get(*key)
+            .and_then(number_as_i64)
+            .filter(|value| *value > 0)
+            .map(|value| (*key, value))
+    })
+}
+
 fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, Vec<&'static str>) {
     let Some(obj) = value.as_object() else {
         return (None, Vec::new());
@@ -6801,29 +6963,31 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
             matched_keys.push(key);
         }
     }
-    // Thinking tokens ride the output rate but are reported separately
-    // (Gemini usageMetadata.thoughtsTokenCount and the OpenAI-compatible
-    // reasoning aliases); fold into output and keep the breakdown
-    // (pass-9 CU-20).
-    if let Some(reasoning) = [
-        "thoughtsTokenCount",
-        "thinkingTokenCount",
-        "thinking_tokens",
-        "reasoning_tokens",
-        // antigravity RPC name, ModelUsageStats field 9 (rm-720,
-        // codeburn #1655: thinking_output_tokens bills at the output
-        // rate like every other reasoning alias)
-        "reasoningTokens",
-    ]
-    .iter()
-    .find_map(|key| obj.get(*key))
-    .and_then(number_as_i64)
-    .filter(|value| *value > 0)
-    {
-        if let Some(output) = usage.get_mut("output_tokens") {
-            *output = output.saturating_add(reasoning);
+    // rm-863: the reasoning fold follows the matched key's producer
+    // semantics (see [`ReasoningKeySemantics`]) — a SIBLING alias
+    // (Gemini thoughtsTokenCount, antigravity reasoningTokens) is a
+    // bucket beside the reported output and still ADDS; a SUBSET
+    // alias (the flat OpenAI-compatible spellings — the documented
+    // breakdown INSIDE completion_tokens) records the breakdown
+    // WITHOUT adding, so subset-shaped producers stop being billed
+    // twice (pass-9 CU-20 added every alias blindly; the hermes
+    // agent's own usage rows were the live repro, research
+    // ef1ca6d9 PoC hermes-flat-reasoning.json: completion 400 +
+    // reasoning 150 must report out 400, not 550).
+    if let Some((key, reasoning)) = first_reasoning_observation(obj, &REASONING_TOKEN_KEYS) {
+        if reasoning_key_semantics(key) == Some(ReasoningKeySemantics::Sibling) {
+            if let Some(output) = usage.get_mut("output_tokens") {
+                *output = output.saturating_add(reasoning);
+            } else {
+                usage.insert("output_tokens".to_string(), reasoning);
+            }
         } else {
-            usage.insert("output_tokens".to_string(), reasoning);
+            // SUBSET: seed the output bucket only when the doc carries
+            // no output-class member at all — the reasoning span is a
+            // lower bound on the output it sits inside.
+            usage
+                .entry("output_tokens".to_string())
+                .or_insert(reasoning);
         }
         usage.insert("reasoning_tokens".to_string(), reasoning);
     }
@@ -8300,18 +8464,40 @@ mod tests {
     }
 
     #[test]
-    fn thinking_tokens_fold_into_output_and_break_out_at_every_usage_site() {
-        // CU-20: thoughtsTokenCount (Gemini), thinkingTokenCount and the
-        // OpenAI-compatible reasoning aliases are billed at the output
-        // rate, so they fold into output_tokens and are additionally
-        // reported as reasoning_tokens for the audit.
+    fn thinking_tokens_fold_by_producer_semantics_at_every_usage_site() {
+        // rm-863: the fold follows the matched key's producer
+        // semantics (`ReasoningKeySemantics`). The camelCase Gemini
+        // family (`thoughtsTokenCount`/`thinkingTokenCount`) and
+        // antigravity `reasoningTokens` are SIBLING buckets beside the
+        // reported output and still ADD; the flat OpenAI-compatible
+        // spellings (`reasoning_tokens`/`thinking_tokens`) are the
+        // documented breakdown INSIDE completion_tokens and only
+        // record the breakdown (pass-9 CU-20 added every alias
+        // blindly and billed subset-shaped producers twice — the
+        // hermes agent's own usage rows were the live repro, research
+        // ef1ca6d9 PoC: completion 400 + reasoning 150 must report
+        // out 400, not 550).
         let qwen = qwen_usage(Some(&serde_json::json!({
             "output_tokens": 10,
             "reasoning_tokens": 5
         })))
         .expect("qwen usage");
-        assert_eq!(qwen["output_tokens"], 15);
+        assert_eq!(
+            qwen["output_tokens"], 10,
+            "rm-863: flat reasoning_tokens is a SUBSET alias — no add"
+        );
         assert_eq!(qwen["reasoning_tokens"], 5);
+
+        let qwen_sibling = qwen_usage(Some(&serde_json::json!({
+            "output_tokens": 10,
+            "thoughtsTokenCount": 5
+        })))
+        .expect("qwen usage");
+        assert_eq!(
+            qwen_sibling["output_tokens"], 15,
+            "thoughtsTokenCount stays a SIBLING bucket and adds"
+        );
+        assert_eq!(qwen_sibling["reasoning_tokens"], 5);
 
         let gemini = gemini_usage(&serde_json::json!({
             "promptTokenCount": 100,
@@ -8329,8 +8515,34 @@ mod tests {
             "thinking_tokens": 3
         }))
         .expect("generic usage");
-        assert_eq!(generic["output_tokens"], 10);
+        assert_eq!(
+            generic["output_tokens"], 7,
+            "rm-863: flat thinking_tokens is a SUBSET alias — no add"
+        );
         assert_eq!(generic["reasoning_tokens"], 3);
+
+        let antigravity = usage_from_value(&serde_json::json!({
+            "prompt_tokens": 10,
+            "output_tokens": 7,
+            "reasoningTokens": 3
+        }))
+        .expect("antigravity-shaped usage");
+        assert_eq!(
+            antigravity["output_tokens"], 10,
+            "antigravity reasoningTokens stays a SIBLING bucket (rm-720, codeburn #1655)"
+        );
+        assert_eq!(antigravity["reasoning_tokens"], 3);
+
+        // A subset observation with NO output-class member seeds the
+        // output bucket — the span is a lower bound on the output it
+        // sits inside.
+        let subset_only = usage_from_value(&serde_json::json!({
+            "prompt_tokens": 10,
+            "reasoning_tokens": 4
+        }))
+        .expect("subset-only usage");
+        assert_eq!(subset_only["output_tokens"], 4);
+        assert_eq!(subset_only["reasoning_tokens"], 4);
 
         // Zero thinking tokens leave the map unchanged: corpora without
         // thinking models must not grow a spurious key.
@@ -8342,7 +8554,53 @@ mod tests {
         assert_eq!(bare["output_tokens"], 7);
         assert!(!bare.contains_key("reasoning_tokens"));
     }
+    #[test]
+    fn subset_seeding_is_pinned_at_the_present_but_zero_corner() {
+        // review b0446d6c F4: the SUBSET seeding seam is arm-shaped —
+        // the structured arms (qwen/gemini) read the output member
+        // through first_number, which collapses ABSENT to 0, so a
+        // PRESENT-BUT-ZERO output member is still seeded with the
+        // subset reasoning span; the generic arm folds through
+        // entry().or_insert, which seeds only when the doc recorded NO
+        // output-class member at all. Both keep the reported total a
+        // lower bound; this test pins the corner so any future arm
+        // alignment is a deliberate, disclosed change, not drift.
+        let qwen = qwen_usage(Some(&serde_json::json!({
+            "output_tokens": 0,
+            "reasoning_tokens": 5
+        })))
+        .expect("qwen usage");
+        assert_eq!(
+            qwen["output_tokens"], 5,
+            "F4: the structured arm seeds a present-but-zero output"
+        );
+        assert_eq!(qwen["reasoning_tokens"], 5);
 
+        let gemini = gemini_usage(&serde_json::json!({
+            "promptTokenCount": 100,
+            "candidatesTokenCount": 0,
+            "reasoning_tokens": 7
+        }))
+        .expect("gemini usage");
+        assert_eq!(
+            gemini["output_tokens"], 7,
+            "F4: the gemini arm seeds a present-but-zero candidates count"
+        );
+        assert_eq!(gemini["reasoning_tokens"], 7);
+
+        let generic = usage_from_value(&serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "reasoning_tokens": 4
+        }))
+        .expect("generic usage");
+        assert_eq!(
+            generic["output_tokens"], 0,
+            "F4: the generic arm's entry().or_insert leaves an explicitly \
+             reported zero output at 0"
+        );
+        assert_eq!(generic["reasoning_tokens"], 4);
+    }
     #[test]
     fn thinking_tokens_reach_the_session_metrics_breakdown() {
         // End to end through the Gemini checkpoint parser: the folded

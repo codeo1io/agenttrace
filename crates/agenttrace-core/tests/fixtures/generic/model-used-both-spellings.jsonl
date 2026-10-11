@@ -1,0 +1,2 @@
+{"role":"assistant","timestamp":"2026-10-01T10:00:00Z","ModelUsed":"claude-sonnet-4-5-20250929","model_used":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100,"output_tokens":50}}
+{"role":"user","timestamp":"2026-10-01T09:59:00Z","content":"hello"}

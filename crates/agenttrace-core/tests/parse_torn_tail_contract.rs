@@ -257,13 +257,15 @@ fn non_object_jsonl_line_is_disclosed_not_dropped() {
 
 #[test]
 fn doctor_folds_line_skips_into_journal_disclosures() {
-    // rm-526's doctor half: `line_skips` reaches --doctor's disclosures
-    // (the map the text report prints as "Disclosed facts" — renamed from
-    // "Journal disclosures" by the later-landed rm-538 lane, which moved the
-    // workbuddy basis counters onto the non-loss channel — and the JSON
-    // report exposes as `disclosures`) — previously only
-    // `disclosure_counters` were folded in, so parse failures were
-    // invisible to doctor entirely.
+    // rm-526's doctor half: `line_skips` reaches --doctor (previously
+    // only `disclosure_counters` were folded in, so parse failures were
+    // invisible to doctor entirely). rm-862 rebased the contract: the
+    // loss-tier channel lands in its own `dropped_lines` map and the
+    // text report prints it as "Dropped lines (parse loss)" — a
+    // doctor reader can tell a torn tail (tokens possibly missing)
+    // from a healthy informational disclosure (the "Disclosed facts
+    // (informational)" row, renamed from "Journal disclosures" by
+    // the rm-538 lane).
     let dir = std::env::temp_dir().join(format!("at-torn-tail-doctor-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("scratch dir");
@@ -280,9 +282,14 @@ fn doctor_folds_line_skips_into_journal_disclosures() {
     // The scratch dir holds only the torn fixture, so the top-level
     // aggregate is exactly its disclosure.
     assert_eq!(
-        report.disclosures.get("unparseable_line"),
+        report.dropped_lines.get("unparseable_line"),
         Some(&1),
-        "doctor aggregates the line-skips disclosure: {:?}",
+        "rm-862: doctor aggregates parse loss into the loss tier: {:?}",
+        report.dropped_lines
+    );
+    assert!(
+        !report.disclosures.contains_key("unparseable_line"),
+        "rm-862: parse loss no longer masquerades as a disclosed fact: {:?}",
         report.disclosures
     );
     assert!(
@@ -294,15 +301,12 @@ fn doctor_folds_line_skips_into_journal_disclosures() {
             .map(|entry| entry.name.as_str())
             .collect::<Vec<_>>()
     );
-    // And the user-visible render prints it in the Disclosed facts
-    // block (the same arm the pi counters use; the row was renamed
-    // from "Journal disclosures" by rm-538 after this contract was
-    // authored — rebased at integration).
+    // And the user-visible render prints it in the parse-loss row.
     let text = agenttrace_core::render_doctor_report(Some(&dir), false, "text")
         .expect("doctor text render");
     assert!(
-        text.contains("Disclosed facts:") && text.contains("unparseable_line=1"),
-        "text render shows the disclosure:\n{text}"
+        text.contains("Dropped lines (parse loss):") && text.contains("unparseable_line=1"),
+        "text render shows the parse-loss tier:\n{text}"
     );
 
     let _ = fs::remove_dir_all(&dir);

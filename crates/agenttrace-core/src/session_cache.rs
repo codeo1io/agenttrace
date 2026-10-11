@@ -5,7 +5,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 54;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 55;
+// Bumped 54 -> 55 (integration of run 5eb82325ebea, cycle-1 "intake
+// -> attribution -> disclosure truthfulness" batch — rm-863
+// reasoning-fold producer semantics LEAD + rm-860 duplicate-spelling
+// canonical-winner intake + rm-861 model-label authority + rm-862
+// doctor loss-tier vocabulary rider; conflict case
+// f642872bb8a143f6a4a4e62e2700ea37, candidate 24a941d @ base 5ed9ebc):
+// the batch's parser semantics move the served report for UNCHANGED
+// files, so a warm entry from any earlier format must not keep
+// serving the old totals (rm-230 convention). (a) rm-863 changes the
+// output total for any doc carrying a flat reasoning/thinking alias
+// (completion 400 + reasoning 150 now reports out 400, not 550) — a
+// warm entry would keep double-billing the span; (b) rm-860
+// un-drops both-spelling lines (`ModelUsed` + `model_used`), so
+// their usage and turns join totals that a warm entry recorded as
+// event_schema skips; (c) rm-861 re-labels sessions whose model
+// label came from a non-assistant row, moving spend between by_model
+// buckets. SEAM: the batch minted its bump as 38 -> 39 at its base
+// 5ed9ebc, re-based to 41 at implement over the then-live origin
+// ceiling 40, to 43 at the cycle-1 review fix (review b0446d6c F1)
+// and to 50 at the review-fix rebase over the moved in-flight wall
+// — this integration re-bases the rung onto this tree's
+// already-advanced ceiling 54 as 54 -> 55 per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c/a1c5cb6f
+// precedent), one invalidation either way. Entries regenerate once
+// on next scan.
 // Bumped 53 -> 54 (integration of run e944a060a640 cycle 1 "usage
 // truthfulness & honest ordering", conflict case 7762d54b — rm-619 +
 // rm-954 + rm-955, attempt 2ba22694): the opencode fold reported

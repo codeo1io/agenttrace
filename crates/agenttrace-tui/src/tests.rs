@@ -1631,6 +1631,30 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 55 (integration of run 5eb82325ebea,
+                // cycle-1 "intake -> attribution -> disclosure
+                // truthfulness" — rm-863 reasoning folds follow
+                // per-key producer semantics (the flat
+                // OpenAI-compatible reasoning_tokens/thinking_tokens
+                // spellings set the breakdown WITHOUT adding to
+                // output; thoughtsTokenCount and its camelCase family,
+                // plus antigravity reasoningTokens, still add), rm-860
+                // both-spelling lines parse under the disclosed
+                // canonical-winner rule, rm-861 the session model label
+                // is only writable by authoritative rows, and rm-862
+                // the doctor fold splits into a loss tier and an
+                // informational tier — a warm v54 entry would serve
+                // stale output totals, dropped-line masks and model
+                // labels for UNCHANGED files; minted 38 -> 39 at its
+                // base 5ed9ebc, re-based to 41 at implement over the
+                // then-live origin ceiling 40, to 43 by the cycle-1
+                // review fix, to 50 by the review-fix rebase (41 the
+                // ac14e52c format, 42 the rm-880/rm-406 journal-truth
+                // integration run 14954d7a, and 43/49 claimed in
+                // flight by sibling runs 33b7b7b5 / 2a5cdb9e), and
+                // here onto the advanced ceiling as 54 -> 55, one
+                // invalidation either way — conflict case
+                // f642872bb8a143f6a4a4e62e2700ea37);
                 // Schema 52 (integration of run 2d92ee95
                 // "session-cache store integrity" — rm-292
                 // schema-change restore lifecycle + rm-041 lossless

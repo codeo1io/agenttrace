@@ -29,14 +29,30 @@ pub struct DoctorReport {
     /// Parse-time journal disclosures aggregated over scanned sessions
     /// (rm-436/rm-437, pi-family journals): `pi_usage_entry:<kind>`,
     /// `pi_branches`, `pi_entry_skipped:<type>`,
-    /// `pi_message_role:<role>`, and — since rm-526 — the `line_skips`
-    /// channel (`unparseable_line`, `non_object_line`,
-    /// `codex_ignorable_line`, …): a torn tail now discloses here instead
-    /// of silently vanishing in a format parser. Journal facts the
-    /// accounting deliberately does not count, kept visible; empty for
-    /// corpora without such journals.
+    /// `pi_message_role:<role>`, and the other INFORMATIONAL
+    /// `disclosure_counters` (`kimi_usage_alias:…`,
+    /// `duplicate_spelling_normalized`,
+    /// `model_label_non_assistant_ignored`, …): journal facts the
+    /// accounting deliberately does not count, kept visible. Since
+    /// rm-862 this map no longer carries the `line_skips` channel —
+    /// real parse loss lives in [`Self::dropped_lines`] and renders as
+    /// its own "Dropped lines (parse loss)" row, so a reader can tell
+    /// a loss from a healthy disclosure. Empty for corpora without
+    /// such journals.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosures: BTreeMap<String, usize>,
+    /// rm-862: parse-loss counters (`metrics.line_skips`:
+    /// `unparseable_line`, `non_object_line`, `event_schema`,
+    /// `codex_ignorable_line`, …) aggregated over scanned sessions.
+    /// The rm-526 fold landed them under `disclosures`, rendering
+    /// next to informational counters under one "Disclosed facts"
+    /// line — a doctor reader could not tell a real loss from a
+    /// healthy disclosure. They now render as their own
+    /// "Dropped lines (parse loss)" row, mirroring the overview's
+    /// two-tier vocabulary (rm-862's doctor vocabulary map, see
+    /// docs/guides/governance-reports.md).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub dropped_lines: BTreeMap<String, usize>,
     /// On-disk size of `sessions.json`, zero when absent.
     pub cache_size_bytes: u64,
     /// The bounds `save_session_cache` enforces before serializing:
@@ -253,19 +269,23 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     } else {
         "auto-discovery"
     };
-    let mut project_decode = DoctorProjectDecodeReport::default();
-    let mut zero_usage = DoctorZeroUsageReport::default();
-    let mut disclosures = BTreeMap::new();
-    let directories = doctor_directories(
-        dir,
-        demo,
-        &files,
-        &sessions,
-        &sqlite_ingest,
-        &mut project_decode,
-        &mut zero_usage,
-        &mut disclosures,
-    );
+    // rm-862: parse loss aggregates separately from informational
+    // disclosures — see the `dropped_lines` field; the scan state
+    // carries the mutable reports through the directory walk.
+    let mut scan = DoctorScanState::default();
+    let directories = doctor_directories(dir, demo, &files, &sessions, &sqlite_ingest, &mut scan);
+    let DoctorScanState {
+        mut project_decode,
+        zero_usage,
+        disclosure_fold,
+        // scanned_sessions is consumed inside doctor_directories by the
+        // rm-904 linkage pass — nothing here needs the corpus again.
+        ..
+    } = scan;
+    let DoctorDisclosureFold {
+        mut disclosures,
+        dropped_lines,
+    } = disclosure_fold;
     // rm-512: the walk records per-project tallies; render them into the
     // deduplicated sample lines before the report leaves this function.
     project_decode.finalize_samples();
@@ -302,6 +322,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         project_decode,
         zero_usage,
         disclosures,
+        dropped_lines,
         directories,
         statusline: doctor_statusline_report(demo),
         pricing: format!(
@@ -631,58 +652,107 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
 // ingest report each added a parameter to a function that already carried
 // the decode/zero-usage/disclosure accumulators — bundled into a struct it
 // would mirror `DoctorInputs` one floor up, so the fleet-precedent allow
-// (discovery.rs `report_load_progress`, governance.rs `recommendation`) is
-// the smaller honest surface.
-#[allow(clippy::too_many_arguments)]
+// (discovery.rs `report_load_progress`, governance.rs `recommendation`)
+// was the smaller honest surface. The rm-862 `DoctorScanState` bundling
+// later took `doctor_directories` back to 7 parameters, so the allow went
+// inert on the struct and the cycle-1 review fix (b0446d6c F5) removed
+// it — the headroom is now real, not papered over.
+/// rm-862: the two doctor aggregate channels travel together —
+/// informational `disclosures` and loss-tier `dropped_lines` — so the
+/// fold helpers stay under clippy's `too_many_arguments` budget (the
+/// same bundling precedent rm-538 set with its CheckpointSnapshot
+/// alias; a third disclosure-shaped argument would have pushed
+/// `doctor_dir_report` to 8).
+#[derive(Default)]
+struct DoctorDisclosureFold {
+    disclosures: BTreeMap<String, usize>,
+    dropped_lines: BTreeMap<String, usize>,
+}
+
+impl DoctorDisclosureFold {
+    fn fold_session(&mut self, session: &Session) {
+        for (key, count) in &session.metrics.disclosure_counters {
+            *self.disclosures.entry(key.clone()).or_insert(0) += count;
+        }
+        for (key, count) in &session.metrics.line_skips {
+            *self.dropped_lines.entry(key.clone()).or_insert(0) += count;
+        }
+    }
+}
+
+/// rm-862: the mutable per-scan reports travel together through the
+/// directory walk (project decode, zero-usage, and the two-channel
+/// disclosure fold), keeping the fold helpers under clippy's
+/// `too_many_arguments` budget — the same bundling precedent rm-538
+/// set with its CheckpointSnapshot alias when a third disclosure-shaped
+/// argument would have pushed `doctor_dir_report` to 8.
+#[derive(Default)]
+struct DoctorScanState {
+    project_decode: DoctorProjectDecodeReport,
+    zero_usage: DoctorZeroUsageReport,
+    disclosure_fold: DoctorDisclosureFold,
+    // rm-367/rm-904 accumulator (folded into the rm-862 scan state at
+    // the integration of run 5eb82325, after both landed on this wall
+    // post-base): every session a directory report parses or a cache
+    // hit serves is retained here so the subagent linkage pass at the
+    // end of `doctor_directories` sees the whole scanned corpus.
+    scanned_sessions: Vec<Session>,
+}
+
 fn doctor_directories(
     dir: Option<&Path>,
     demo: bool,
     files: &[PathBuf],
     sessions: &[Session],
     sqlite_ingest: &SqliteIngestReport,
-    project_decode: &mut DoctorProjectDecodeReport,
-    zero_usage: &mut DoctorZeroUsageReport,
-    disclosures: &mut BTreeMap<String, usize>,
+    scan: &mut DoctorScanState,
 ) -> Vec<DoctorDirReport> {
     if demo {
         // rm-596 demo gate: enumerate no real root — both
         // `known_session_dirs()` and `doctor_sqlite_directories()` probe
         // the operator's home (paths, `is_dir()`/`is_file()` checks,
         // symlink targets). The bundled corpus is folded through the
-        // SAME two channels as the non-demo fold below —
+        // SAME two channels as the non-demo fold below — informational
         // `disclosure_counters` and, since rm-526, `line_skips` — so a
         // scanned session discloses identically regardless of backing
         // store and the demo report still exercises that aggregate; a
         // demo fixture with a torn tail must not silently vanish here.
+        // rm-862: the two channels land in separate maps (parse loss no
+        // longer masquerades as a disclosed fact).
         for session in sessions {
-            for (key, count) in &session.metrics.disclosure_counters {
-                *disclosures.entry(key.clone()).or_insert(0) += count;
-            }
-            for (key, count) in &session.metrics.line_skips {
-                *disclosures.entry(key.clone()).or_insert(0) += count;
-            }
+            scan.disclosure_fold.fold_session(session);
         }
         // rm-904: the bundled corpus runs through the same subagent
         // linkage pass as a real scan, so a demo report discloses an
         // orphaned subagent identically instead of silently dropping
-        // the grain the CLI lane discloses (0 → no key, clean).
-        disclose_unlinked_subagent_count(&mut sessions.to_vec(), disclosures);
+        // the grain the CLI lane discloses (0 → no key, clean). The
+        // count is informational, so it lands on the rm-862
+        // informational tier.
+        disclose_unlinked_subagent_count(
+            &mut sessions.to_vec(),
+            &mut scan.disclosure_fold.disclosures,
+        );
         return Vec::new();
     }
     let mut cache = load_session_cache();
-    let mut scanned_sessions: Vec<Session> = Vec::new();
     let mut dirs: Vec<DoctorDirReport> = Vec::new();
     if let Some(dir) = dir {
         let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let DoctorScanState {
+            project_decode,
+            zero_usage,
+            disclosure_fold,
+            scanned_sessions,
+        } = scan;
         dirs.push(doctor_dir_report(
             "custom",
             &abs,
             files,
             &mut cache,
-            &mut scanned_sessions,
+            scanned_sessions,
             project_decode,
             zero_usage,
-            disclosures,
+            disclosure_fold,
         ));
     } else {
         let mut count_by_root = BTreeMap::new();
@@ -708,10 +778,10 @@ fn doctor_directories(
                 &candidate.path,
                 &matching,
                 &mut cache,
-                &mut scanned_sessions,
-                project_decode,
-                zero_usage,
-                disclosures,
+                &mut scan.scanned_sessions,
+                &mut scan.project_decode,
+                &mut scan.zero_usage,
+                &mut scan.disclosure_fold,
             ));
         }
     }
@@ -730,9 +800,6 @@ fn doctor_directories(
     // counters in directly so every scanned session discloses
     // identically regardless of backing store.
     for session in sessions {
-        for (key, count) in &session.metrics.disclosure_counters {
-            *disclosures.entry(key.clone()).or_insert(0) += count;
-        }
         // rm-526: `line_skips` (unparseable_line, non_object_line,
         // event_schema, codex_unparseable_line, …) is a disclosure
         // channel too — doctor surfaced only disclosure_counters, so
@@ -741,17 +808,23 @@ fn doctor_directories(
         // codex_ignorable_line, codex_world_state — onto
         // disclosure_counters, so they reach this fold through the
         // loop above; true-loss counters stay on line_skips.)
-        for (key, count) in &session.metrics.line_skips {
-            *disclosures.entry(key.clone()).or_insert(0) += count;
-        }
+        // rm-862: the fold splits the channels — parse loss lands in
+        // its own loss-tier map so the render can label it as parse
+        // loss, not a disclosed fact.
+        scan.disclosure_fold.fold_session(session);
     }
     // rm-904: both lanes join the same subagent linkage pass the
     // loader runs (subagents::attribute_subagents, discovery.rs's
     // lane), so orphaned subagent transcripts disclose through
     // --doctor exactly as they do on every CLI report path
-    // (main.rs disclose_unlinked_subagents) — 0-count-clean.
-    scanned_sessions.extend(sessions.iter().cloned());
-    disclose_unlinked_subagent_count(&mut scanned_sessions, disclosures);
+    // (main.rs disclose_unlinked_subagents) — 0-count-clean. The
+    // count is informational, so it lands on the rm-862
+    // informational tier.
+    scan.scanned_sessions.extend(sessions.iter().cloned());
+    disclose_unlinked_subagent_count(
+        &mut scan.scanned_sessions,
+        &mut scan.disclosure_fold.disclosures,
+    );
     dirs
 }
 
@@ -780,7 +853,7 @@ fn doctor_dir_report(
     scanned_sessions: &mut Vec<Session>,
     project_decode: &mut DoctorProjectDecodeReport,
     zero_usage: &mut DoctorZeroUsageReport,
-    disclosures: &mut BTreeMap<String, usize>,
+    disclosures: &mut DoctorDisclosureFold,
 ) -> DoctorDirReport {
     let mut parsed = 0;
     let mut cache_hits = 0;
@@ -816,15 +889,11 @@ fn doctor_dir_report(
             // disclose identically — the counters round-trip through
             // the session cache (GoMetrics), so a warm doctor scan
             // cannot silently lose them.
-            for (key, count) in &session.metrics.disclosure_counters {
-                *disclosures.entry(key.clone()).or_insert(0) += count;
-            }
             // rm-526: same fold for line_skips — parse-failure and
             // drop disclosures (torn tails) reach --doctor through
             // this channel; they round-trip the cache the same way.
-            for (key, count) in &session.metrics.line_skips {
-                *disclosures.entry(key.clone()).or_insert(0) += count;
-            }
+            // rm-862: parse loss lands in the loss-tier map.
+            disclosures.fold_session(&session);
         }
     }
     DoctorDirReport {
@@ -1118,6 +1187,34 @@ fn doctor_report_text(report: &DoctorReport) -> String {
                 .collect::<String>()
         ));
     }
+    if !report.dropped_lines.is_empty() {
+        // rm-862: parse loss renders as its own tier. The rm-526 fold
+        // landed `line_skips` under "Disclosed facts", so a doctor
+        // reader could not tell `unparseable_line=1` (a torn tail,
+        // tokens possibly missing) from `kimi_usage_alias:…=1` (a
+        // healthy disclosure). Keys still route through the
+        // control-byte sanitizer (mirror of counts_cell in reports.rs);
+        // rm-594 residual: the same single-line bound the
+        // informational tier uses applies here too (first
+        // DISCLOSURE_RENDER_ENTRY_CAP entries plus an explicit count
+        // of what is held back).
+        let mut dropped_parts: Vec<String> = report
+            .dropped_lines
+            .iter()
+            .take(crate::parser::DISCLOSURE_RENDER_ENTRY_CAP)
+            .map(|(key, count)| format!("{}={count}", crate::parser::capped_disclosure_value(key)))
+            .collect();
+        if report.dropped_lines.len() > crate::parser::DISCLOSURE_RENDER_ENTRY_CAP {
+            dropped_parts.push(format!(
+                "+{} more distinct keys",
+                report.dropped_lines.len() - crate::parser::DISCLOSURE_RENDER_ENTRY_CAP
+            ));
+        }
+        out.push_str(&format!(
+            "Dropped lines (parse loss): {}\n",
+            dropped_parts.join(", ")
+        ));
+    }
     if !report.disclosures.is_empty() {
         // rm-595: disclosure keys route through the control-byte
         // sanitizer at render — mirror of counts_cell in reports.rs; a
@@ -1125,6 +1222,9 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         // rm-594 residual: the same single-line bound counts_cell
         // applies — first 40 entries plus an explicit count of what is
         // held back (the 4.6MB cardinality PoC rendered 2.15MB here).
+        // rm-862: informational only — parse loss moved to the
+        // "Dropped lines (parse loss)" row above, so everything here
+        // is a healthy disclosure.
         let mut parts: Vec<String> = report
             .disclosures
             .iter()
@@ -1137,7 +1237,10 @@ fn doctor_report_text(report: &DoctorReport) -> String {
                 report.disclosures.len() - crate::parser::DISCLOSURE_RENDER_ENTRY_CAP
             ));
         }
-        out.push_str(&format!("Disclosed facts: {}\n", parts.join(", ")));
+        out.push_str(&format!(
+            "Disclosed facts (informational): {}\n",
+            parts.join(", ")
+        ));
     }
     out.push_str("\nProviders:\n");
     for dir in &report.directories {
@@ -1637,12 +1740,15 @@ mod tests {
 
     #[test]
     fn demo_directory_lane_folds_every_disclosure_channel() {
-        // rm-596 × rm-526: the demo arm must fold the bundled corpus
-        // through BOTH disclosure channels — `disclosure_counters` and
-        // `line_skips` — exactly like the non-demo fold below it. The
-        // demo arm was authored before rm-526 landed, so a demo fixture
-        // carrying a torn tail would otherwise silently vanish from the
-        // demo doctor report (the rm-449 nothing-silent contract).
+        // rm-596 × rm-526 × rm-862: the demo arm must fold the bundled
+        // corpus through BOTH disclosure channels — informational
+        // `disclosure_counters` and loss-tier `line_skips` — exactly
+        // like the non-demo fold below it. The demo arm was authored
+        // before rm-526 landed, so a demo fixture carrying a torn tail
+        // would otherwise silently vanish from the demo doctor report
+        // (the rm-449 nothing-silent contract); since rm-862 the two
+        // channels land in SEPARATE maps so the render can label parse
+        // loss as parse loss.
         let mut session = session_at("", "demo://torn-tail.jsonl");
         session
             .metrics
@@ -1652,29 +1758,37 @@ mod tests {
             .metrics
             .line_skips
             .insert("unparseable_line".to_string(), 3);
-        let mut project_decode = DoctorProjectDecodeReport::default();
-        let mut zero_usage = DoctorZeroUsageReport::default();
-        let mut disclosures = BTreeMap::new();
+        let mut scan = DoctorScanState::default();
         let dirs = doctor_directories(
             None,
             true,
             &[],
             &[session],
             &SqliteIngestReport::default(),
-            &mut project_decode,
-            &mut zero_usage,
-            &mut disclosures,
+            &mut scan,
         );
         assert!(dirs.is_empty(), "demo enumerates no real root: {dirs:?}");
         assert_eq!(
-            disclosures.get("pi_usage_entry:session"),
+            scan.disclosure_fold
+                .disclosures
+                .get("pi_usage_entry:session"),
             Some(&2),
-            "disclosure_counters fold: {disclosures:?}"
+            "disclosure_counters fold: {:?}",
+            scan.disclosure_fold.disclosures
         );
         assert_eq!(
-            disclosures.get("unparseable_line"),
+            scan.disclosure_fold.dropped_lines.get("unparseable_line"),
             Some(&3),
-            "line_skips fold (rm-526 channel): {disclosures:?}"
+            "line_skips fold into the loss tier (rm-526 channel, rm-862 map): {:?}",
+            scan.disclosure_fold.dropped_lines
+        );
+        assert!(
+            !scan
+                .disclosure_fold
+                .disclosures
+                .contains_key("unparseable_line"),
+            "rm-862: parse loss must not masquerade as a disclosed fact: {:?}",
+            scan.disclosure_fold.disclosures
         );
     }
 }

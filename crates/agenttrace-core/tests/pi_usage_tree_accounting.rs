@@ -543,7 +543,10 @@ fn data_health_and_doctor_aggregate_disclosures() {
     );
     let text = render_doctor_report(Some(&dir), false, "text").expect("doctor text");
     assert!(
-        text.contains("Disclosed facts:")
+        // rm-862: informational disclosures render under their own
+        // label — parse loss moved to "Dropped lines (parse loss)" so
+        // a reader can tell the two channels apart.
+        text.contains("Disclosed facts (informational):")
             && text.contains("pi_branches=2")
             && text.contains("pi_usage_entry:cache_warm=1"),
         "text render shows the disclosures:\n{text}"

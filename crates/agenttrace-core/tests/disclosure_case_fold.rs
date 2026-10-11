@@ -219,9 +219,15 @@ fn disclosure_distinct_keys_are_capped_and_the_cap_discloses_itself() {
 
 #[test]
 fn single_line_renders_bound_the_disclosed_facts_row() {
-    // rm-594 residual render arm: doctor's "Disclosed facts" line (the
-    // 2.15MB single-line hazard) stays bounded and names what it holds
-    // back. Red on the unfixed tree.
+    // rm-594 residual render arm: doctor's single-line disclosure
+    // render (the 2.15MB hazard) stays bounded and names what it holds
+    // back. Red on the unfixed tree. rm-862 (run 5eb82325, landed on
+    // this wall after rm-594's arm was authored) rebased the surfaces:
+    // the cardinality counters ride `line_skips`, so they land in the
+    // loss-tier `dropped_lines` map and render under the
+    // "Dropped lines (parse loss)" row — the rm-594 bound and the
+    // held-back count follow the tier (BTreeMap ordering keeps
+    // `disclosure_keys_capped` inside the first rendered entries).
     let dir = std::env::temp_dir().join(format!("rm756-render-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("tempdir");
@@ -229,15 +235,19 @@ fn single_line_renders_bound_the_disclosed_facts_row() {
 
     let report = build_doctor_report(Some(&dir), false);
     assert!(
-        report.disclosures.contains_key("disclosure_keys_capped"),
-        "doctor folds the mint-side cap: {:?}",
-        report.disclosures.len()
+        report.dropped_lines.contains_key("disclosure_keys_capped"),
+        "doctor folds the mint-side cap into the loss tier: {:?}",
+        report.dropped_lines.len()
     );
     let text = render_doctor_report(Some(&dir), false, "text").expect("doctor text render");
     let disclosed_line = text
         .lines()
-        .find(|line| line.starts_with("Disclosed facts:"))
-        .expect("Disclosed facts row present");
+        .find(|line| line.starts_with("Dropped lines (parse loss):"))
+        .expect("Dropped lines (parse loss) row present");
+    assert!(
+        disclosed_line.contains("disclosure_keys_capped"),
+        "bounded render still shows the cap's own disclosure: {disclosed_line}"
+    );
     assert!(
         disclosed_line.contains("more distinct keys"),
         "bounded render names what it holds back: {disclosed_line}"
