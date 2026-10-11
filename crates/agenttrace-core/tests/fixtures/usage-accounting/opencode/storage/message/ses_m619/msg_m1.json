@@ -1,0 +1,1 @@
+{"id":"msg_m1","sessionID":"ses_m619","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","time":{"created":1764750002000,"completed":1764750004000},"tokens":{"input":10,"output":50,"reasoning":30}}
