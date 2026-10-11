@@ -29,6 +29,13 @@ const RECORDED: &str = concat!(
     r#"{"id": "b5", "timestamp": "2026-10-04T07:16:48.100Z", "type": "usage", "kind": "message", "provider": "anthropic", "model": "claude-sonnet-4-20250514", "usage": {"input": 500, "output": 1000, "cacheRead": 25000, "cacheWrite": 5000, "cost": {"total": 0.0075}}}"#,
 );
 
+/// The control: identical tokens, genuinely NO recorded dollars — no
+/// `type:"usage"` cost entry and (since rm-253's message arm, landed at
+/// case 38b020c7) no `message.usage.cost` object either: the message's
+/// usage block carries tokens only, so the stored estimate is pure
+/// catalog pricing. The arm with the cost object inside the assistant
+/// message is pinned separately in `pi_journal_contract` (recorded
+/// wins over catalog, $0.0075 vs the catalog total).
 const CATALOG_ONLY: &str = concat!(
     r#"{"id": "a1", "timestamp": "2026-10-04T07:16:46.634Z", "type": "session", "version": 3, "cwd": "/redacted/project"}"#,
     "\n",
@@ -36,7 +43,7 @@ const CATALOG_ONLY: &str = concat!(
     "\n",
     r#"{"id": "a3", "timestamp": "2026-10-04T07:16:47.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}], "timestamp": "2026-10-04T07:16:47.000Z"}, "type": "message"}"#,
     "\n",
-    r#"{"id": "a4", "timestamp": "2026-10-04T07:16:48.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "hi there"}], "timestamp": "2026-10-04T07:16:48.000Z", "usage": {"input": 500, "output": 1000, "cacheRead": 25000, "cacheWrite": 5000, "totalTokens": 31500, "cost": {"input": 0.0015, "output": 0.006, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0075}}, "model": "claude-sonnet-4-20250514"}, "type": "message"}"#,
+    r#"{"id": "a4", "timestamp": "2026-10-04T07:16:48.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "hi there"}], "timestamp": "2026-10-04T07:16:48.000Z", "usage": {"input": 500, "output": 1000, "cacheRead": 25000, "cacheWrite": 5000, "totalTokens": 31500}, "model": "claude-sonnet-4-20250514"}, "type": "message"}"#,
 );
 
 /// Scratch dir per call (atomic sequence, not `line!()`, which is

@@ -5,7 +5,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 59;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 60;
+// Bumped 59 -> 60 (integration of run e486dc1adb9b cycle 2 'pi journal
+// accounting truth, part 2', conflict case 38b020c7f8f1463fb56f21772d627068,
+// candidate d9b3333 @ base 1511547): the batch's two units both change
+// reported totals for UNCHANGED files — rm-253 makes the pi MESSAGE arm
+// pass `message.usage.cost.total` through as recorded cost (recorded
+// wins over catalog pricing; the block's tokens leave the catalog
+// formula — a journal recording $0.0075 was served catalog-billed at
+// $0.0165), and the rm-408 pi residual makes present-but-zero pi usage
+// blocks emit their events (recognized classes inserted with zeros per
+// the claude-family rm-408 contract, landing in zero_usage_events).
+// Warm v59 entries carry the pre-fix pi totals with matching
+// fingerprints, so nothing regenerates them until each source file
+// changes again (rm-230 convention: parser-semantics changes that
+// alter served totals bump the schema so cached sessions regenerate
+// under corrected accounting). SEAM: the batch minted its bump as
+// 24 -> 25 at its base 1511547 (long since absorbed by the ladder
+// below: 25 was rm-450, 26 rm-485, 27+ the integration rungs); this
+// integration re-bases the rung onto this tree's already-advanced
+// ceiling 59 as 59 -> 60 per the landed-rung-keeps-numeral convention
+// (c7c07e48/58fbbd6c/7762d54b precedent), one invalidation either
+// way. The rm-408 zero-insert gate was also re-merged with rm-618's
+// first-present alias rule (recognition follows the first present
+// numeric key of each alias pair, zeros now included). Entries
+// regenerate once on next scan.
 // Bumped 58 -> 59 (integration of run e5653f52 cycle 2 'usage-accounting
 // truth (upstream #312 port, fork-adjudicated)', conflict case
 // 963662941e3a40579e658a63f2b88da6, candidate 3ad47fd @ base 8991144):

@@ -1198,6 +1198,14 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
         assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
+        // v60 (integration of run e486dc1adb9b cycle 2 'pi journal
+        // accounting truth, part 2' — the pi MESSAGE arm passes
+        // `message.usage.cost.total` through as recorded cost (recorded
+        // wins over catalog pricing) and the rm-408 pi residual inserts
+        // recognized-but-zero usage classes so present-zero pi blocks
+        // emit and land in zero_usage_events; re-based off the
+        // campaign's 24 -> 25 bump onto the advanced ceiling as
+        // 59 -> 60);
         // v59 (integration of run e5653f52 cycle 2 — the #312
         // port's kimi arm survived its adjudication: `usage` XOR
         // `metadata.usage` instead of both, so kimi exports that
@@ -1428,9 +1436,11 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v59 — the kimi usage-XOR rung (run e5653f52,
-        // 58 -> 59, re-based off the campaign's own 27 -> 28 bump)
-        // above the rm-939, rm-520, rm-585/rm-730, rm-834/
+        // version (v60 — the pi recorded-cost message arm + present-zero
+        // pi rider rung (run e486dc1adb9b, 59 -> 60, re-based off the
+        // campaign's own 24 -> 25 bump) above the kimi usage-XOR rung
+        // (run e5653f52, 58 -> 59, re-based off the campaign's own
+        // 27 -> 28 bump) and the rm-939, rm-520, rm-585/rm-730, rm-834/
         // rm-694, rm-718/719/716, rm-754, rm-502, rm-720/rm-721,
         // rm-710, rm-616, usage-accounting-truthfulness,
         // rm-551, rm-538, rm-600, rm-529, rm-542,
