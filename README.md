@@ -180,7 +180,12 @@ not part of this census yet).
 Overview sections (`--overview` required): `# summary`, `# by_model`,
 `# by_provider`, `# by_task_type`. `-f csv` outside this composable set
 bails loudly (`csv format requires --overview or --sessions`) instead of
-silently rendering the text report.
+silently rendering the text report. CI visibility (rm-952): when GitHub
+Actions sets `GITHUB_STEP_SUMMARY`, `--overview` additionally appends the
+markdown render of the same report to that file (create-or-append, plain
+markdown, no-op when the variable is unset or empty) — so a workflow step
+running `agenttrace --overview` lands its per-run cost in the Actions
+summary UI with no extra flags, in any `-f` format.
 
 ### Local MCP server (rm-455)
 

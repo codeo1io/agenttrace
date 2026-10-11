@@ -22,6 +22,7 @@ agenttrace upstream status — offline view (remote-tracking refs 2h old)
     ...
   unported areas:   parser 2, ci/release 3, docs/testdata 1
   npm:              unknown (offline; agenttrace --fetch upstream) | running agenttrace v0.0.0-dev
+  opencode:         unknown (offline; agenttrace --fetch upstream)
 ```
 
 ## Offline by default
@@ -45,6 +46,16 @@ the published version against the running build. If the registry probe
 fails (no `curl`, offline, bad response) the report degrades to
 `unavailable (...)` instead of failing.
 
+The same flag probes the opencode vendor watch (rm-950): the npm
+channel the watch anchored on is retired, so the probe checks the old
+registry URL for its 404 and reads the latest release tag from the
+renamed home's releases API (`github.com/anomalyco/opencode`). The
+`opencode:` line renders the tag with an explicit
+`(npm channel retired; authority: anomalyco/opencode releases)` label
+when the old channel is confirmed dead — a retired channel is a state,
+not a probe failure — and reads
+`unknown (offline; agenttrace --fetch upstream)` until you opt in.
+
 Every `git` subprocess this command spawns runs under a stated
 deadline, mirroring the governance `git log` probe's bound (rm-543):
 local probes (rev-parse, merge-base, rev-list, diff, tag, log) are
@@ -58,8 +69,9 @@ as "not inside a git repository" — only a probe that actually ran and
 failed counts as a missing prerequisite.
 
 Every remote-derived free-form string — the remote URL, the last-sync
-commit subject, the unported commit subjects, and the registry-probed
-npm state — is sanitized at the render boundary (rm-979, minted
+commit subject, the unported commit subjects, the registry-probed npm
+state, and the releases-probed opencode state (rm-950) — is sanitized at
+the render boundary (rm-979, minted
 campaign-locally as rm-594 and rebound at integration): control bytes
 become `U+FFFD`, so a hostile upstream cannot carry an OSC-52
 clipboard write or a CSI sequence onto your terminal through this
@@ -93,12 +105,17 @@ treated as trailing arguments.
   "unported_commits": [ { "sha": "...", "subject": "...", "files": ["..."] } ],
   "unported_areas": { "parser": 2 },
   "refs_age_seconds": 7200,
-  "npm": { "package": "@zack78/agenttrace", "state": "...", "running_version": "0.0.0-dev" }
+  "npm": { "package": "@zack78/agenttrace", "state": "...", "opencode_state": "...", "running_version": "0.0.0-dev" }
 }
 ```
 
 Notes:
 
+- `npm.opencode_state` (rm-950) carries the opencode vendor-watch state
+  in the same append-only object: the releases tag with its
+  retired-channel label, or `unknown (offline; ...)` when not fetched.
+  It lives under `npm` because the watch grew out of the npm-distribution
+  probe lane; the schema is append-only, so the placement is frozen.
 - `ahead`/`behind` count commits between `HEAD` and the remote-tracking
   ref via the merge-base, exactly like `scripts/upstream-delta`.
 - `new_upstream_releases` lists upstream tags reachable from

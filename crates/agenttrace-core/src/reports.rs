@@ -2420,9 +2420,12 @@ fn fmt_duration_for_language(seconds: f64, language: ReportLanguage) -> String {
     match language {
         ReportLanguage::En => fmt_duration(seconds),
         ReportLanguage::Zh => {
-            if seconds < 60.0 {
+            // Same unit-carry discipline as fmt_duration (rm-953): never
+            // render at the next unit's boundary (no "60秒", no "60.0分钟").
+            let seconds = if seconds < 0.0 { 0.0 } else { seconds };
+            if seconds < 59.5 {
                 format!("{seconds:.0}秒")
-            } else if seconds < 3600.0 {
+            } else if seconds < 3597.0 {
                 format!("{:.1}分钟", seconds / 60.0)
             } else {
                 let hours = (seconds / 3600.0) as i64;
@@ -3689,6 +3692,30 @@ fn possible_cost_driver_note_strict(session: &Session) -> Option<String> {
 mod tests {
     use super::*;
     use crate::Metrics;
+
+    #[test]
+    fn fmt_duration_for_language_zh_never_renders_unit_boundaries() {
+        // rm-953 zh arm: same unit-carry discipline as the en formatter —
+        // never render at the next unit's boundary (no "60秒", no "60.0分钟").
+        assert_eq!(fmt_duration_for_language(-3.0, ReportLanguage::Zh), "0秒");
+        assert_eq!(fmt_duration_for_language(59.4, ReportLanguage::Zh), "59秒");
+        assert_eq!(
+            fmt_duration_for_language(59.6, ReportLanguage::Zh),
+            "1.0分钟"
+        );
+        assert_eq!(
+            fmt_duration_for_language(3594.0, ReportLanguage::Zh),
+            "59.9分钟"
+        );
+        assert_eq!(
+            fmt_duration_for_language(3599.8, ReportLanguage::Zh),
+            "0小时59分钟"
+        );
+        assert_eq!(
+            fmt_duration_for_language(3603.0, ReportLanguage::Zh),
+            "1小时0分钟"
+        );
+    }
 
     #[test]
     fn text_cell_sanitizes_terminal_control_bytes_from_every_payload_class() {

@@ -983,6 +983,33 @@ fn run() -> anyhow::Result<()> {
                 args.include_history,
             ),
         };
+        // rm-952 (cycle 3): CI step-summary surface — when GitHub Actions
+        // sets GITHUB_STEP_SUMMARY, append the overview (markdown form) to
+        // that file so per-run usage lands in the Actions summary UI with
+        // zero new flags. The payload is always the existing markdown
+        // renderer's output — never the format-lane `out` — so `-f json`
+        // runs still leave a readable summary. Create-or-append, plain
+        // markdown (ANSI-free), silent no-op when unset/empty or on an
+        // unwritable path (CI must not fail because a summary file moved).
+        if let Some(summary_path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+            if !summary_path.is_empty() {
+                let markdown = if matches!(args.format.as_str(), "markdown" | "md") {
+                    out.clone()
+                } else {
+                    report_overview_markdown_with_context(
+                        &overview,
+                        &sessions,
+                        &health,
+                        range,
+                        args.include_history,
+                    )
+                };
+                let path = summary_path.to_string_lossy().into_owned();
+                if let Err(err) = append_step_summary(&path, &markdown) {
+                    eprintln!("warning: could not append GITHUB_STEP_SUMMARY at {path}: {err}");
+                }
+            }
+        }
         let mut baseline_breaches = None;
         if let Some(baseline) = args.baseline.as_deref() {
             if args.format != "json" {
@@ -2562,17 +2589,25 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
         // row integrity (assess PoC: a crafted session name carried a raw
         // OSC-52 clipboard-write byte-for-byte into the --sessions TSV).
         // JSON output escapes control bytes losslessly and stays untouched.
+        // rm-540 arm (cycle 3): the same transcript-derived text cells now
+        // route through the CSV lane's `guard_formula` — a session whose
+        // file stem is `=SUM(9+9).jsonl` (or `+`/`-`/`@`/fullwidth-＠-headed)
+        // previously rode byte-for-byte into this TSV lane while the CSV
+        // lane guarded it, and TSV imports into spreadsheets just as
+        // happily (assess PoC: --sessions -d <poc-tsv> emitted
+        // `=HYPERLINK(...)` raw vs the guarded CSV `"'=2+5|cmd"`).
+        // Sanitize first (control bytes), then formula-guard the text.
         // rm-545: subagent rollups ride the TSV as their own columns so
         // one session's spawned work stays visible without double
         // counting — the columns are internally derived (not
         // transcript-derived), so no sanitization is owed here.
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
-            sanitize_line_segment(&session.name),
+            csv_export::guard_formula(&sanitize_line_segment(&session.name)),
             session.health,
             session_capability(session),
-            sanitize_line_segment(&session.metrics.source_tool),
-            sanitize_line_segment(&session.metrics.model_used),
+            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.source_tool)),
+            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.model_used)),
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,
@@ -2982,6 +3017,20 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// rm-952 (cycle 3): append the overview markdown to a CI step-summary
+/// file (GitHub Actions sets `$GITHUB_STEP_SUMMARY` per step). Split from
+/// the env read so the file-append contract is unit-testable without
+/// mutating process env in a parallel test runner. Create-or-append; the
+/// caller owns the "env set and non-empty" decision and any warning.
+fn append_step_summary(path: &str, markdown: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    write!(file, "\n## agenttrace overview\n\n{markdown}\n")
+}
+
 /// Test-visible Args base: every knob at its neutral default, with
 /// the non-zero CLI defaults real invocations carry (json format,
 /// limit 20, `recent`/`desc` ordering, `en`/`all`). Shared by the
@@ -3217,6 +3266,35 @@ mod tests {
         let mut whitespace = base();
         whitespace.search = Some("   ".to_string());
         assert!(!has_followup_action(&whitespace));
+    }
+
+    #[test]
+    fn append_step_summary_creates_and_appends_markdown() {
+        // rm-952: create-or-append contract, exercised without touching
+        // process env (the GITHUB_STEP_SUMMARY decision stays at the call
+        // site so parallel tests cannot race the environment).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "agenttrace-step-summary-test-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let path = path.to_str().unwrap().to_string();
+        append_step_summary(&path, "first render").expect("create+append");
+        append_step_summary(&path, "second render").expect("append");
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            contents.contains("## agenttrace overview\n\nfirst render\n"),
+            "payload missing: {contents}"
+        );
+        assert!(
+            contents.contains("second render"),
+            "append missing: {contents}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

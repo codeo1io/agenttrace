@@ -334,7 +334,8 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@zack78%2fagenttrace/
 
 /// One-line network disclosure for the `--fetch` path (rm-404). Lists every
 /// network touch the flag triggers, derived from the same constants the code
-/// uses, so the disclosure cannot drift from the behavior it describes.
+/// uses, so the disclosure cannot drift from the behavior it describes
+/// (rm-950 added the two opencode vendor-watch probes to this list).
 /// rm-979 review rider: the URL is remote-derived — a tracked repo's git
 /// config can carry hostile bytes — and stderr is a terminal render too, so
 /// it goes through the same control-byte sanitizer as the report body.
@@ -342,7 +343,7 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/@zack78%2fagenttrace/
 /// 3986 admits no control bytes), so the disclosure stays truthful.
 fn fetch_disclosure_line(remote_url: &str) -> String {
     format!(
-        "network: --fetch upstream is opt-in — `git fetch {remote_url}` plus one HTTPS request to {NPM_REGISTRY_URL} (see PRIVACY.md)",
+        "network: --fetch upstream is opt-in — `git fetch {remote_url}` plus three HTTPS metadata requests: {NPM_REGISTRY_URL} (published version), {OPENCODE_NPM_URL} and {OPENCODE_RELEASES_URL} (opencode vendor watch; see PRIVACY.md)",
         remote_url = sanitize_line_segment(remote_url)
     )
 }
@@ -375,6 +376,11 @@ pub struct UpstreamStatus {
     /// `registry@X` after a successful `--fetch` probe, `unavailable`
     /// when the probe failed, `unknown (offline)` otherwise.
     pub npm_state: String,
+    /// opencode vendor-watch channel state (rm-950, cycle 3): the release
+    /// tag from the anomalyco/opencode releases API, with an explicit
+    /// `npm channel retired` label once the registry probe 404s — a dead
+    /// channel is a state, not a probe failure.
+    pub opencode_state: String,
 }
 
 /// Entry point for the `agenttrace upstream` host command. Returns the
@@ -481,6 +487,15 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         "unknown (offline; agenttrace --fetch upstream)".to_string()
     };
 
+    // rm-950: the opencode vendor watch anchors on the releases API of the
+    // renamed home (anomalyco/opencode) and reports the retired npm channel
+    // explicitly rather than as a probe failure.
+    let opencode_state = if fetch {
+        opencode_channel_state()
+    } else {
+        "unknown (offline; agenttrace --fetch upstream)".to_string()
+    };
+
     Ok(UpstreamStatus {
         remote,
         ref_name,
@@ -499,6 +514,7 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         refs_age_seconds: refs_age_seconds(&tracking),
         fetched: fetch,
         npm_state,
+        opencode_state,
     })
 }
 
@@ -674,9 +690,11 @@ fn mtime_age(path: &std::path::Path) -> Option<u64> {
 /// size-declaring endpoints (exit 63).
 const NPM_REGISTRY_MAX_BYTES: u64 = 256 * 1024;
 
-/// rm-052: why an npm registry probe produced no version. These stay
-/// distinct so `agenttrace --fetch upstream` no longer labels an absent
-/// probe tool the same as a registry failure.
+/// rm-052: why a curl probe in this module produced no body — the npm
+/// registry probe (published version) and the opencode vendor watch
+/// (rm-950) share these. They stay distinct so `agenttrace --fetch
+/// upstream` no longer labels an absent probe tool the same as a probe
+/// failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NpmProbeFailure {
     /// curl was not found on PATH — the only spawn error that means the
@@ -753,25 +771,26 @@ fn read_capped<R: Read>(mut reader: R, cap: u64) -> std::io::Result<(Vec<u8>, bo
     }
 }
 
-/// npm registry probe behind `--fetch` only. Degrades to an `Err` label
-/// (never fails the report) when curl is absent or the registry answers
-/// badly — with the failure cause kept distinct (rm-052) and the body
-/// read byte-bounded at OUR end of the pipe: stdout is piped and read
-/// through `read_capped`, and the subprocess tree is killed the moment
-/// it pushes past the ceiling (curl's `--max-filesize` alone does NOT
-/// bound size-less responses — review ff418327 F2; exit 63 remains the
-/// early-abort signal for size-declaring endpoints).
-fn npm_registry_version() -> Result<String, NpmProbeFailure> {
+/// rm-052 discipline for every curl probe in this file (the npm registry
+/// probe and rm-950's opencode vendor watch): null stdin, piped stdout
+/// read through `read_capped` at OUR end of the pipe (a hostile or
+/// MITM'd endpoint cannot grow agenttrace's memory), process-group
+/// ownership (rm-583) so the byte-ceiling kill takes the whole
+/// subprocess tree down in one signal, `--max-filesize`'s exit 63
+/// mapped to `ResponseOverflow` alongside the capped read (curl
+/// 7.81.0 honors `--max-filesize` only for size-declaring responses —
+/// review ff418327 F2), and only a NotFound spawn meaning "curl is
+/// not installed". `args` must carry the wall bound (`--max-time`)
+/// and, when the body is wanted, a `--max-filesize` matching `cap`.
+fn curl_output_bounded(args: &[String], cap: u64) -> Result<Vec<u8>, NpmProbeFailure> {
     let mut command = Command::new("curl");
     command
-        .args(npm_registry_curl_args())
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        // stderr is deliberately null: the probe labels by exit code and
+        // stderr is deliberately null: probes label by exit code and
         // body, never by curl's stderr text.
         .stderr(Stdio::null());
-    // rm-583 discipline: own process group so the overflow kill takes
-    // the whole subprocess tree down in one signal.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -787,9 +806,7 @@ fn npm_registry_version() -> Result<String, NpmProbeFailure> {
         }
     })?;
     let (body, exceeded) = match child.stdout.take() {
-        Some(pipe) => {
-            read_capped(pipe, NPM_REGISTRY_MAX_BYTES).map_err(|_| NpmProbeFailure::ProbeFailed)?
-        }
+        Some(pipe) => read_capped(pipe, cap).map_err(|_| NpmProbeFailure::ProbeFailed)?,
         // Unreachable with Stdio::piped above; fail as a probe failure,
         // never panic the report.
         None => return Err(NpmProbeFailure::ProbeFailed),
@@ -808,7 +825,116 @@ fn npm_registry_version() -> Result<String, NpmProbeFailure> {
     if !status.success() {
         return Err(NpmProbeFailure::ProbeFailed);
     }
+    Ok(body)
+}
+
+/// npm registry probe behind `--fetch` only. Degrades to an `Err` label
+/// (never fails the report) when curl is absent or the registry answers
+/// badly — with the failure cause kept distinct (rm-052) and the body
+/// read byte-bounded at OUR end of the pipe via the shared
+/// `curl_output_bounded` runner (`--max-filesize` surfaces as curl exit
+/// 63, mapped to ResponseOverflow; the capped read catches the
+/// size-less responses curl's flag cannot see).
+fn npm_registry_version() -> Result<String, NpmProbeFailure> {
+    let body = curl_output_bounded(&npm_registry_curl_args(), NPM_REGISTRY_MAX_BYTES)?;
     parse_npm_registry_version(&String::from_utf8_lossy(&body)).ok_or(NpmProbeFailure::Unparseable)
+}
+
+/// opencode vendor-watch authority (rm-950, cycle 3). The npm channel the
+/// watch originally anchored on is retired (registry.npmjs.org/opencode and
+/// /@opencode-ai/opencode both 404); the releases API of the renamed home,
+/// github.com/anomalyco/opencode, is the authority for latest.
+const OPENCODE_RELEASES_URL: &str =
+    "https://api.github.com/repos/anomalyco/opencode/releases/latest";
+const OPENCODE_NPM_URL: &str = "https://registry.npmjs.org/opencode";
+
+/// Ceiling for the opencode releases-API read (rm-950), the sibling bound
+/// of NPM_REGISTRY_MAX_BYTES: a `releases/latest` document is a few KB, and
+/// the ceiling is enforced on OUR side of the pipe through the shared
+/// `curl_output_bounded` runner, so a hostile or MITM'd endpoint cannot
+/// grow agenttrace's memory through the vendor-watch probe.
+const OPENCODE_RELEASES_MAX_BYTES: u64 = 256 * 1024;
+
+/// curl argv for the opencode releases probe, split out so tests can pin
+/// the bounding flags without shelling out (same pin style as
+/// `npm_registry_curl_args`, rm-052).
+fn opencode_releases_curl_args(url: &str) -> Vec<String> {
+    [
+        "-fsSL".to_string(),
+        "--max-time".to_string(),
+        "15".to_string(),
+        "--max-filesize".to_string(),
+        OPENCODE_RELEASES_MAX_BYTES.to_string(),
+        url.to_string(),
+    ]
+    .into()
+}
+
+/// HTTP status of `url` via curl, `None` when curl is absent or the
+/// request itself fails (offline). A 404 here means "channel retired",
+/// not "probe broke". Runs under the shared rm-052 discipline: the body
+/// goes to `/dev/null`, so the piped stdout is the `%{http_code}` render
+/// only — still read through `read_capped` at OUR end of the pipe, never
+/// an unbounded `.output()` capture.
+fn http_status_via_curl(url: &str) -> Option<u32> {
+    let args: Vec<String> = [
+        "-sSL",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "--max-time",
+        "15",
+        url,
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let body = curl_output_bounded(&args, NPM_REGISTRY_MAX_BYTES).ok()?;
+    String::from_utf8_lossy(&body).trim().parse::<u32>().ok()
+}
+
+/// `tag_name` from a GitHub releases/latest JSON body.
+fn parse_release_tag(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    value.get("tag_name")?.as_str().map(str::to_string)
+}
+
+/// Pure classification so the retired-channel contract is testable
+/// offline: `Some(404)` from the npm registry + a live tag from the
+/// releases API renders `tag (npm channel retired; authority:
+/// anomalyco/opencode releases)` — never a bare failure.
+fn classify_opencode_channel(registry_status: Option<u32>, release_tag: Option<&str>) -> String {
+    let retired = registry_status == Some(404);
+    match (retired, release_tag) {
+        (true, Some(tag)) => {
+            format!("{tag} (npm channel retired; authority: anomalyco/opencode releases)")
+        }
+        (true, None) => "channel retired; releases authority unreachable (network?)".to_string(),
+        (false, Some(tag)) => tag.to_string(),
+        (false, None) => "unknown (offline; agenttrace --fetch upstream)".to_string(),
+    }
+}
+
+fn opencode_channel_state() -> String {
+    classify_opencode_channel(
+        http_status_via_curl(OPENCODE_NPM_URL),
+        github_latest_release_tag(OPENCODE_RELEASES_URL).as_deref(),
+    )
+}
+
+fn github_latest_release_tag(url: &str) -> Option<String> {
+    // rm-052 discipline via the shared runner: wall bound, byte cap on
+    // OUR side of the pipe, process-group kill on overflow — a raw
+    // `.output()` here would re-open the unbounded-body lane the npm
+    // probe closed (the probes were originally written against a tree
+    // before that discipline landed; integration re-binds them to it).
+    let body = curl_output_bounded(
+        &opencode_releases_curl_args(url),
+        OPENCODE_RELEASES_MAX_BYTES,
+    )
+    .ok()?;
+    parse_release_tag(&String::from_utf8_lossy(&body))
 }
 
 fn age_phrase(seconds: Option<u64>) -> String {
@@ -827,8 +953,10 @@ impl UpstreamStatus {
     /// landed rm-594 is the journal-derived counter-key cap row):
     /// every free-form string that originates
     /// OUTSIDE this machine — the remote URL, the merge-base subject,
-    /// each unported commit subject, and the registry-probed npm
-    /// state — passes through `sanitize_line_segment` at this render
+    /// each unported commit subject, and the registry-probed npm state
+    /// (plus rm-950's releases-probed opencode state — its tag comes
+    /// from an HTTP JSON body, not a git ref, so it is exactly the
+    /// class this boundary exists for) — passes through `sanitize_line_segment` at this render
     /// boundary like every other hostile-bytes text sink in the CLI
     /// (rm-034/rm-383 family: control bytes become U+FFFD, so a
     /// hostile upstream commit cannot carry an OSC-52 clipboard write
@@ -916,6 +1044,14 @@ impl UpstreamStatus {
             agenttrace_core::VERSION,
             npm_state = sanitize_line_segment(&self.npm_state)
         ));
+        // rm-950: the vendor-watch state joins the same render boundary
+        // discipline — its tag is remote-derived (releases JSON), so it
+        // sanitizes like npm_state rather than riding raw onto the
+        // terminal (rm-979 family).
+        out.push_str(&format!(
+            "  opencode:         {}\n",
+            sanitize_line_segment(&self.opencode_state)
+        ));
         out
     }
 
@@ -950,6 +1086,7 @@ impl UpstreamStatus {
             "npm": {
                 "package": NPM_PACKAGE,
                 "state": self.npm_state,
+                "opencode_state": self.opencode_state,
                 "running_version": agenttrace_core::VERSION,
             },
         });
@@ -959,6 +1096,69 @@ impl UpstreamStatus {
 
 fn short(sha: &str, len: usize) -> String {
     sha.chars().take(len).collect()
+}
+
+#[cfg(test)]
+mod opencode_channel_tests {
+    use super::{classify_opencode_channel, opencode_releases_curl_args, parse_release_tag};
+
+    #[test]
+    fn opencode_releases_probe_args_are_time_and_byte_bounded() {
+        // rm-052 parity pin: the vendor-watch releases probe rides the
+        // same bounding discipline as the npm registry probe — 15s wall,
+        // 256 KiB `--max-filesize` early abort, and (pinned by the shared
+        // `curl_output_bounded` runner its argv feeds) a capped read on
+        // OUR side of the pipe with a process-group kill on overflow.
+        let args = opencode_releases_curl_args(super::OPENCODE_RELEASES_URL);
+        assert_eq!(args[0], "-fsSL");
+        assert_eq!(args[1], "--max-time");
+        assert_eq!(args[2], "15");
+        assert_eq!(args[3], "--max-filesize");
+        assert_eq!(args[4], "262144", "256 KiB byte ceiling");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(super::OPENCODE_RELEASES_URL)
+        );
+    }
+
+    #[test]
+    fn parse_release_tag_reads_tag_name() {
+        let body = r#"{"tag_name": "v1.18.35", "name": "v1.18.35"}"#;
+        assert_eq!(parse_release_tag(body).as_deref(), Some("v1.18.35"));
+        assert_eq!(parse_release_tag("{\"name\": \"no tag\"}"), None);
+        assert_eq!(parse_release_tag("not json"), None);
+        assert_eq!(parse_release_tag(""), None);
+    }
+
+    #[test]
+    fn retired_channel_renders_as_state_not_failure() {
+        // rm-950 contract: a 404 registry is "retired", and when the
+        // releases authority answers, the tag leads.
+        assert_eq!(
+            classify_opencode_channel(Some(404), Some("v1.18.35")),
+            "v1.18.35 (npm channel retired; authority: anomalyco/opencode releases)"
+        );
+        assert_eq!(
+            classify_opencode_channel(Some(404), None),
+            "channel retired; releases authority unreachable (network?)"
+        );
+    }
+
+    #[test]
+    fn live_or_absent_registry_renders_plainly() {
+        assert_eq!(
+            classify_opencode_channel(Some(200), Some("v1.18.35")),
+            "v1.18.35"
+        );
+        assert_eq!(
+            classify_opencode_channel(None, Some("v1.18.35")),
+            "v1.18.35"
+        );
+        assert_eq!(
+            classify_opencode_channel(None, None),
+            "unknown (offline; agenttrace --fetch upstream)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1385,6 +1585,8 @@ mod tests {
             refs_age_seconds: Some(3_600),
             fetched: false,
             npm_state: "unknown (offline; agenttrace --fetch upstream)".to_string(),
+            opencode_state:
+                "v1.18.35 (npm channel retired; authority: anomalyco/opencode releases)".to_string(),
         }
     }
 
@@ -1519,6 +1721,21 @@ mod tests {
             "PRIVACY.md must name the npm registry probe URL {NPM_REGISTRY_URL}"
         );
 
+        // rm-950: the opencode vendor-watch probes are network touches of
+        // the same flag — PRIVACY.md must name both of their URLs too.
+        assert!(
+            privacy.contains(OPENCODE_NPM_URL),
+            "PRIVACY.md must name the opencode registry probe URL {OPENCODE_NPM_URL}"
+        );
+        assert!(
+            privacy.contains(OPENCODE_RELEASES_URL),
+            "PRIVACY.md must name the opencode releases authority URL {OPENCODE_RELEASES_URL}"
+        );
+        assert!(
+            !privacy.contains("one HTTPS request"),
+            "PRIVACY.md must not under-count the --fetch upstream HTTPS touches"
+        );
+
         // The git fetch touch and its trigger flag.
         assert!(
             privacy.contains("git fetch") && privacy.contains("--fetch upstream"),
@@ -1543,6 +1760,16 @@ mod tests {
         assert!(
             line.contains(NPM_REGISTRY_URL),
             "disclosure must name the npm probe URL"
+        );
+        // rm-950: the vendor-watch probes ride the same opt-in flag, so
+        // the disclosure names them too — every network touch, always.
+        assert!(
+            line.contains(OPENCODE_NPM_URL) && line.contains(OPENCODE_RELEASES_URL),
+            "disclosure must name both opencode vendor-watch probe URLs"
+        );
+        assert!(
+            !line.contains("one HTTPS request"),
+            "disclosure must not under-count the --fetch HTTPS requests"
         );
         assert!(
             line.contains("PRIVACY.md"),

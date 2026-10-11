@@ -261,6 +261,88 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
+/// rm-540 arm (cycle 3): the default-text `--sessions` lane renders
+/// tab-separated rows whose transcript-derived cells (name from the
+/// file stem, source tool, model) previously rode byte-for-byte — a
+/// journal named `=SUM(9+9).jsonl` imported straight into a
+/// spreadsheet as a live formula while the CSV lane guarded the same
+/// cell (`"'=2+5|cmd"`). The TSV lane now routes those three cells
+/// through the same `guard_formula`; this is the lane-parity pin:
+/// whichever of the two lanes a machine consumer imports, the cell
+/// is inert.
+#[test]
+fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
+    let tmp = tempdir("output-safety-formula");
+    let corpus = tmp.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    let hostile_stems = [
+        "=SUM(9+9)",
+        "+SUM(A1:A9)",
+        "@HYPERLINK(evil.example)",
+        "-2+5|cmd",
+        "\u{ff1d}1+1",    // fullwidth equals
+        "\u{ff20}SUM(9)", // fullwidth commercial at
+    ];
+    for (i, stem) in hostile_stems.iter().enumerate() {
+        // Bare stem: the session NAME is the file stem, and a formula
+        // only executes when an introducer leads the CELL — the
+        // interesting case is the stem itself leading.
+        let file = corpus.join(format!("{stem}.jsonl"));
+        fs::write(
+            &file,
+            format!(
+                r#"{{"type": "assistant", "uuid": "a1", "timestamp": "2026-10-0{i}T10:00:05Z", "message": {{"role": "assistant", "model": "=2+5|cmd", "content": [{{"type": "text", "text": "done"}}], "usage": {{"input_tokens": 10, "output_tokens": 5}}}}}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+    let home = tmp.join("home");
+    fs::create_dir_all(home.join(".cache")).unwrap();
+
+    let stdout = run_cell(
+        &corpus,
+        &home,
+        &Cell {
+            report: "--sessions",
+            format: "text",
+        },
+    );
+    let text = String::from_utf8_lossy(&stdout);
+    // Transcript-derived text columns in the sessions TSV: name (0),
+    // source tool (3), model (4) — the cells guard_formula wraps.
+    let mut failures = Vec::new();
+    for line in text.lines().skip(1) {
+        let cells: Vec<&str> = line.split('\t').collect();
+        for col in [0usize, 3, 4] {
+            let Some(cell) = cells.get(col) else { continue };
+            let introducer = ["=", "+", "-", "@", "\u{ff1d}", "\u{ff20}"]
+                .iter()
+                .any(|p| cell.starts_with(p));
+            if introducer && !cell.starts_with('\'') {
+                failures.push(format!("col {col} cell {cell:?} unguarded"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "default-text TSV lane emitted unguarded formula cells (rm-540 arm):\n  {}",
+        failures.join("\n  ")
+    );
+    // And the guard actually fired: every hostile stem shows up
+    // apostrophe-prefixed in the name column, never row-leading raw.
+    for stem in &hostile_stems {
+        assert!(
+            text.contains(&format!("'{stem}")),
+            "hostile stem {stem:?} missing its formula guard in the TSV lane"
+        );
+        assert!(
+            !text.contains(&format!("\n{stem}\t")),
+            "hostile stem {stem:?} rode raw (row-leading) into the TSV lane"
+        );
+    }
+}
+
 #[test]
 fn tsv_is_a_sessions_scoped_cli_value_with_a_named_guard_elsewhere() {
     // Review fix lineage: rm-625 F4 pinned the THEN-real contract (clap
