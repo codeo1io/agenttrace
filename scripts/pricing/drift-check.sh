@@ -117,8 +117,34 @@ def kept(catalog):
 # litellm_provider, max_input_tokens when int>0, deprecation_date when set). Comparing anything
 # else (e.g. max_output_tokens, which the builder drops) produced 2,802 phantom diffs — diagnosed
 # 2026-10-05 against the real bundle; see the cycle-1 record.
+# rm-164: the tier-rate families the builder pins join the comparison — flex (rm-610),
+# priority, ultrafast, and the long-context above-272k family (base + tier cross variants) —
+# so a live tier-rate change (e.g. an ultrafast repricing) surfaces here instead of passing
+# unseen. The builder writes these only when positive, and absent-or-zero compares as
+# 0.0 == 0.0 on both sides, matching update-snapshot.sh's TIER_FIELDS verbatim.
 COST_FIELDS = ["input_cost_per_token", "output_cost_per_token",
-               "cache_creation_input_token_cost", "cache_read_input_token_cost"]
+               "cache_creation_input_token_cost", "cache_read_input_token_cost",
+               "input_cost_per_token_flex", "output_cost_per_token_flex",
+               "cache_creation_input_token_cost_flex", "cache_read_input_token_cost_flex",
+               "input_cost_per_token_priority", "output_cost_per_token_priority",
+               "cache_creation_input_token_cost_priority", "cache_read_input_token_cost_priority",
+               "input_cost_per_token_ultrafast", "output_cost_per_token_ultrafast",
+               "cache_creation_input_token_cost_ultrafast", "cache_read_input_token_cost_ultrafast",
+               "input_cost_per_token_above_272k_tokens", "output_cost_per_token_above_272k_tokens",
+               "cache_creation_input_token_cost_above_272k_tokens",
+               "cache_read_input_token_cost_above_272k_tokens",
+               "input_cost_per_token_above_272k_tokens_flex",
+               "output_cost_per_token_above_272k_tokens_flex",
+               "cache_creation_input_token_cost_above_272k_tokens_flex",
+               "cache_read_input_token_cost_above_272k_tokens_flex",
+               "input_cost_per_token_above_272k_tokens_priority",
+               "output_cost_per_token_above_272k_tokens_priority",
+               "cache_creation_input_token_cost_above_272k_tokens_priority",
+               "cache_read_input_token_cost_above_272k_tokens_priority",
+               "input_cost_per_token_above_272k_tokens_ultrafast",
+               "output_cost_per_token_above_272k_tokens_ultrafast",
+               "cache_creation_input_token_cost_above_272k_tokens_ultrafast",
+               "cache_read_input_token_cost_above_272k_tokens_ultrafast"]
 
 try:
     live_kept, bundle_kept = kept(live), kept(bundle)

@@ -99,6 +99,32 @@ RATE_FIELDS = (
     "cache_read_input_token_cost",
 )
 
+# rm-164: the tier/long-context field families the bundle carries —
+# flex (rm-610) plus priority, ultrafast, and the above-272k family
+# (base and tier cross variants; the Rust side holds the base family
+# as representation-only slots until the per-call prompt-size unit
+# lands). Mirrored by drift-check.sh's COST_FIELDS — keep the two
+# lists identical, or a live tier-rate change passes the drift gate
+# unseen.
+TIER_FIELDS = tuple(
+    base + suffix
+    for base in (
+        "input_cost_per_token",
+        "output_cost_per_token",
+        "cache_creation_input_token_cost",
+        "cache_read_input_token_cost",
+    )
+    for suffix in (
+        "_flex",
+        "_priority",
+        "_ultrafast",
+        "_above_272k_tokens",
+        "_above_272k_tokens_flex",
+        "_above_272k_tokens_priority",
+        "_above_272k_tokens_ultrafast",
+    )
+)
+
 
 def trim(data):
     # Same trim as always: chat-mode entries with at least one nonzero
@@ -151,19 +177,21 @@ def trim(data):
         deprecation = value.get("deprecation_date")
         if isinstance(deprecation, str) and deprecation.strip():
             entry["deprecation_date"] = deprecation.strip()
-        # Flex-tier rates ride along when the source carries them (rm-610,
-        # run 36c9140f). Zero/absent values are omitted so "carries flex
-        # pricing" stays greppable — a flex turn of a row without them
-        # bills at the standard rates above.
-        for flex_field in (
-            "input_cost_per_token_flex",
-            "output_cost_per_token_flex",
-            "cache_creation_input_token_cost_flex",
-            "cache_read_input_token_cost_flex",
-        ):
-            flex = value.get(flex_field)
-            if isinstance(flex, (int, float)) and flex > 0:
-                entry[flex_field] = flex
+        # Tier-rate families ride along when the source carries them
+        # (rm-610 flex, run 36c9140f; rm-164 priority/ultrafast and
+        # the long-context above-272k family with its tier cross
+        # variants). Zero/absent values are omitted so "carries
+        # <tier> pricing" stays greppable — a tier turn of a row
+        # without its rates bills at the standard rates above and the
+        # coverage audit discloses it as fallback
+        # (pricing::has_specific_tier_price). The `*_batches` and
+        # above_100k/200k/1hr families stay out: no consumer can
+        # select them until the rm-164 per-call prompt-size unit
+        # lands (named in the row, deliberately absent here).
+        for tier_field in TIER_FIELDS:
+            rate = value.get(tier_field)
+            if isinstance(rate, (int, float)) and rate > 0:
+                entry[tier_field] = rate
         keep[key] = entry
     return keep
 
@@ -302,6 +330,22 @@ print(
     f"{len(window_mutations)} window-only-changed | {len(retained)} retained-by-union | "
     f"{honored} manual drop(s)"
 )
+# rm-164: tier-coverage census — how many bundled rows carry each
+# tier family's input rate, pre-refresh vs post, so a family silently
+# vanishing (or newly landing) shows in the refresh log the operator
+# reads before committing.
+for label, field in (
+    ("flex", "input_cost_per_token_flex"),
+    ("priority", "input_cost_per_token_priority"),
+    ("ultrafast", "input_cost_per_token_ultrafast"),
+    ("above_272k", "input_cost_per_token_above_272k_tokens"),
+):
+    def carries(rows, key):
+        rate = rows.get(key, {}).get(field)
+        return isinstance(rate, (int, float)) and rate > 0
+    pre = sum(1 for k in prior if carries(prior, k))
+    post = sum(1 for k in merged if carries(merged, k))
+    print(f"tier coverage {label}: {pre} -> {post} models")
 if adds:
     sample = ", ".join(adds[:8])
     print(f"added (first 8): {sample}")

@@ -8,7 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture_dir(tag: &str, lines: &[String]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("at-csv-{tag}"));
+    // Unique per process+thread: a fixed /tmp path races sibling fleet test
+    // binaries — concurrent csv_export instances interleaved fixture writes
+    // and remove_dir_all between the compared runs of the byte-determinism
+    // test (observed during run 431f165a full_tests, 2026-10-12).
+    let dir = std::env::temp_dir().join(format!(
+        "at-csv-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     fs::create_dir_all(&dir).expect("mkdir fixture dir");
     fs::write(dir.join("session.jsonl"), lines.join("\n") + "\n").expect("write fixture");
     dir

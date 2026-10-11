@@ -2371,9 +2371,10 @@ fn render_test_match_json() -> anyhow::Result<String> {
         .iter()
         .map(|model| {
             let price = lookup_price(model);
-            // rm-610: flex-tier rates disclosed per row (null when the
-            // row carries none — flex turns then bill at the standard
-            // rates above).
+            // rm-610/rm-164: flex/priority/ultrafast tier rates
+            // disclosed per row (null when the row carries none —
+            // such turns bill at the standard rates above, disclosed
+            // as fallback coverage by the pricing audit).
             serde_json::json!({
                 "model": model,
                 "input_per_million": price.input,
@@ -2384,6 +2385,14 @@ fn render_test_match_json() -> anyhow::Result<String> {
                 "flex_output_per_million": price.output_flex,
                 "flex_cache_write_per_million": price.cw_flex,
                 "flex_cache_read_per_million": price.cr_flex,
+                "priority_input_per_million": price.input_priority,
+                "priority_output_per_million": price.output_priority,
+                "priority_cache_write_per_million": price.cw_priority,
+                "priority_cache_read_per_million": price.cr_priority,
+                "ultrafast_input_per_million": price.input_ultrafast,
+                "ultrafast_output_per_million": price.output_ultrafast,
+                "ultrafast_cache_write_per_million": price.cw_ultrafast,
+                "ultrafast_cache_read_per_million": price.cr_ultrafast,
             })
         })
         .collect();

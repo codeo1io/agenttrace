@@ -60,8 +60,9 @@ pub use insights::{
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
-    list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
+    has_specific_tier_price, list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path,
+    pricing_source, pricing_source_for, render_model_pricing_list, render_test_match,
+    update_pricing, Price,
 };
 pub use reports::{
     add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
@@ -1861,6 +1862,25 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         || (!usage_models.is_empty()
             && session_model_is_real
             && !usage_models.iter().any(|usage_model| usage_model == model));
+    // rm-164 review fix (2026-10-13, dossier F3): a single-tier
+    // session whose tier the model's row cannot price bills the
+    // standard row — count that billing decision on the non-loss
+    // disclosure channel so audits disclose the fallback instead of
+    // claiming an exact catalog match. Multi-model sessions price per
+    // block regardless of the tier set, so the per-block loop below
+    // counts each block's fallback itself and this arm stays silent.
+    if !usage_blocks_multi_model {
+        if let Some(tier) = session_service_tier.as_deref() {
+            if pricing::has_specific_price(model)
+                && !pricing::has_specific_tier_price(model, Some(tier))
+            {
+                *metrics
+                    .disclosure_counters
+                    .entry(format!("tier_fallback:{tier}"))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
     // rm-406 (dated 2026-10-07 arm): per-model attribution for the
     // multi-model session — each usage block's tokens and per-block
     // cost land on the model that produced them (the advisor-model
@@ -1938,6 +1958,24 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 // flex-disclosing turns use the row's flex slots.
                 pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
             };
+            // rm-164 review fix (2026-10-13, dossier F3): the tiered
+            // lookup silently bills the standard row when the model's
+            // row lacks this block's tier (an unrecognized tier
+            // string, or a family the row does not carry) — count it
+            // so the audit discloses the tier fallback on the mixed
+            // path too and never claims per-tier exactness.
+            if !event.model_used.is_empty() && event.model_used != "unknown" {
+                if let Some(tier) = event.service_tier.as_deref() {
+                    if pricing::has_specific_price(&event.model_used)
+                        && !pricing::has_specific_tier_price(&event.model_used, Some(tier))
+                    {
+                        *metrics
+                            .disclosure_counters
+                            .entry(format!("tier_fallback:{tier}"))
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
             let block_cost = event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
                 / 1e6
                 * block_price.input

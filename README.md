@@ -248,6 +248,11 @@ Details and the determinism contract: [docs/guides/usage-card.md](docs/guides/us
 # By default this audits every matching session; audited_sessions /
 # total_sessions in the JSON (and "(auditing N of M sessions)" in text)
 # disclose the coverage. Bound it explicitly with --sample N.
+# Turns that ran on a service tier (flex, priority, ultrafast) are
+# repriced on that tier's rates; an unrecognized service_tier is
+# disclosed as a pricing fallback, never as exact (review fix
+# f0118b8c: per-model audit rows also carry a structured
+# `service_tier` field when the row priced on a single tier).
 agenttrace --audit --range 30d -f json
 # agenttrace --audit --sample 500 -f json
 
@@ -459,7 +464,7 @@ fails when the README table drifts from the binary's actual flag count
 | Need | agenttrace gives you |
 | --- | --- |
 | Historical spend review | Sessions grouped across projects, agents, and models with Today/7d/30d/All ranges |
-| Data confidence | Report scope, per-source coverage, parse skips, cache hits, unknown sources/models, pricing fallbacks, and latest observed session |
+| Data confidence | Report scope, per-source coverage, parse skips, cache hits, unknown sources/models, pricing fallbacks (including unrecognized `service_tier`s — tier-priced turns are never reported as exact), and latest observed session |
 | Cost audit and action plan | Token component rates, pricing source/status, estimated cost confidence, and prioritized, evidence-backed remediation suggestions |
 | Governance trends | Canonical project grouping, observed MCP invocation governance, cross-session context/cache/read-write trends, and read-only Git delivery correlation |
 | Honest capability levels | `Detailed`, `Aggregate`, or `Limited` per session so missing event-level evidence is never presented as a complete trace |
