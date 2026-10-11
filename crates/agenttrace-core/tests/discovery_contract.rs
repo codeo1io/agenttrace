@@ -1,7 +1,7 @@
 use agenttrace_core::SESSION_CACHE_SCHEMA_VERSION;
 use agenttrace_core::{
     build_doctor_report, collect_session_files, data_health, data_health_scoped,
-    find_session_files, load_sessions_from_dir, load_sessions_with_options,
+    find_session_files, known_session_dirs, load_sessions_from_dir, load_sessions_with_options,
     load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
     session_cache_path, session_capability, total_tokens, LoadOptions,
 };
@@ -661,6 +661,52 @@ fn rust_parses_antigravity_cli_transcript() {
     assert_eq!(parsed.metrics.tool_calls_total, 1);
     assert_eq!(parsed.metrics.tool_calls_ok, 1);
     assert_eq!(parsed.metrics.reasoning_blocks, 1);
+    assert_eq!(parsed.metrics.session_start, "2026-05-19T19:33:40Z");
+    assert_eq!(parsed.metrics.session_end, "2026-05-19T19:33:42Z");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rust_parses_antigravity_acp_transcript_under_its_default_root() {
+    // rm-966: ACP clients (agy_acp_server) write the antigravity
+    // schema under ~/.gemini/antigravity-acp/conversations (ccusage
+    // #1856, shipped v20.0.29); discovery registers that root and the
+    // parser labels it antigravity_acp, distinct from antigravity-cli.
+    let known = known_session_dirs();
+    let acp = known
+        .iter()
+        .find(|dir| {
+            dir.path
+                .components()
+                .any(|c| c.as_os_str() == "antigravity-acp")
+        })
+        .expect("antigravity-acp default root registered");
+    assert_eq!(acp.name, "Antigravity ACP conversations");
+    assert!(acp
+        .path
+        .components()
+        .any(|c| c.as_os_str() == "conversations"));
+    assert!(known
+        .iter()
+        .any(|dir| dir.name == "Antigravity CLI conversations"));
+
+    let root = temp_root("agenttrace-rust-antigravity-acp");
+    let dir = root.join("antigravity-acp").join("conversations");
+    fs::create_dir_all(&dir).expect("create antigravity-acp temp dir");
+    let path = dir.join("transcript.jsonl");
+    fs::write(
+        &path,
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:33:40Z","content":"inspect"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:33:41Z","thinking":"check","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"a.rs"}}]}
+{"step_index":2,"source":"MODEL","type":"VIEW_FILE","status":"DONE","created_at":"2026-05-19T19:33:42Z","content":"ok"}
+"#,
+    )
+    .expect("write antigravity-acp transcript");
+
+    let parsed = parse_file(&path).expect("parse antigravity-acp transcript");
+    assert_eq!(parsed.metrics.source_tool, "antigravity_acp");
+    assert_eq!(parsed.metrics.tool_calls_total, 1);
     assert_eq!(parsed.metrics.session_start, "2026-05-19T19:33:40Z");
     assert_eq!(parsed.metrics.session_end, "2026-05-19T19:33:42Z");
 

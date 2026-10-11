@@ -103,11 +103,6 @@
 - acceptance: codex output excludes the reasoning double-add per upstream #312 semantics (port the removal, keep the rm-162 saturating discipline on the remaining sums); reasoning tokens stay visible wherever reports surface them (separate counter or disclosed inclusion — never silently dropped); golden codex fixture red-first on a reasoning-carrying rollout; full suite green
 - evidence: campaign-recorded in agenttrace ROADMAP.md
 
-### pi journal: compaction/branch_summary usage is silently dropped (handled-but-partial accounting)
-- id: `rm-939` | track: reliability | priority: 88.0 | status: in_progress
-- acceptance: compaction/branch_summary usage folded into session metrics (tokens in/out, cache read/write, upstream cost when reported) with a named disclosure counter (e.g. pi_compaction_usage_counted) surfaced in metrics disclosures; a sentinel fixture (compaction usage 38000 in / 900 out / $0.0123) pinned green end-to-end; PREVENTION: a pi writer-surface contract test enumerating all 13 dist session-manager event types (session/label/text/usage/thinking_level_change/session_info/model_change/message/custom_message/custom/context_edit/compaction/branch_summary) asserting each is either fully accounted or pi_entry_skipped-disclosed — per-field silent drops fail CI (research C1 folded here)
-- evidence: campaign-recorded in agenttrace ROADMAP.md
-
 ### Saturate token accumulation (i64 overflow panics debug builds, silently corrupts release)
 - id: `rm-046` | track: reliability | priority: 87.0 | status: in_progress
 - acceptance: every token-map merge site (add_usage, add_usage_value, add_opencode_tokens) uses saturating or checked arithmetic; an adversarial fixture with two i64::MAX inputs parses without panic in debug builds and reports clamped totals with an explicit saturation marker in cost provenance; release cost math on the same fixture stays bounded and flagged; regression test token_accumulation_saturates_not_wraps pins the fixture
@@ -301,6 +296,11 @@
 ### rm-911
 - id: `rm-911` | track: reliability | priority: 80.0 | status: in_progress
 - acceptance: the card's daily series is computed from cache-SURVIVING data — either serialize timestamps into the session cache (SESSION_CACHE_SCHEMA_VERSION bump + stale-cache invalidation + warm fixture re-stamped in the same unit, rm-230 convention; re-verify the live origin/master schema ceiling at every gate — it moves) or bucket per-session start/end dates with an explicit disclosure when intra-session day splits are lost; a golden cold-vs-warm test renders the SAME corpus twice (fresh cache, then warm) and asserts byte-identical SVG; the warm path is covered for the markdown/html/csv lanes too or proven timestamps-free; the live PoC corpus is preserved as a fixture
+- evidence: campaign-recorded in agenttrace ROADMAP.md
+
+### Antigravity ACP conversations are undiscoverable — ~/.gemini/antigravity-acp missing from the default roots
+- id: `rm-966` | track: reliability | priority: 80.0 | status: candidate
+- acceptance: (1) `~/.gemini/antigravity-acp/conversations` is registered as a default antigravity root (KnownSessionDir sibling of the antigravity-cli brain/conversations rows at discovery.rs:113-125) and parses through the existing gen_metadata/steps lane — ACP clients (agy_acp_server) write the same schema (ccusage #1856, shipped in v20.0.29 on 2026-10-10; porting reference: ccusage paths.rs default-roots test); (2) `--doctor` lists the new root; (3) a real-shape ACP fixture corpus under that path reports sessions/models end-to-end with a source label distinct from antigravity-cli; (4) README/antigravity docs list the path; (5) upstream radar #236 (Gemini→Antigravity migration) keeps this lane moving — the row cites the shipped-competitor evidence at implement time (research C1)
 - evidence: campaign-recorded in agenttrace ROADMAP.md
 
 ### Refactor 3 high-complexity function(s)
@@ -1122,6 +1122,11 @@
 - acceptance: recorded from agenttrace ROADMAP.md by campaign ingest
 - evidence: campaign-recorded in agenttrace ROADMAP.md
 
+### Port the upstream #306 calendar/blocks flags dropped by the v0.10.1 adoption (--daily/--weekly/--monthly/--tz/--blocks)
+- id: `rm-967` | track: reliability | priority: 60.0 | status: candidate
+- acceptance: (1) per-record `Metrics.usage_points` stored as compact `[ts, tokens, cost]` triples (upstream PR #306 shape; sessions without per-turn usage contribute one record at session start — documented fallback) with SESSION_CACHE_SCHEMA_VERSION bumped to the next FREE fleet rung under a live census at implement time (rungs 53-56 are fleet-claimed: 53 double-claimed by this lineage's 5c00696 vs the absent e944a060a640 branch, 54 integrations, 55 run-8937be8e, 56 worktree run-5a04ae3b — take ≥57) and the full same-unit sweep (const+ladder, oracle fn+assert+message, sweep-doc sites); (2) `--daily`/`--weekly` (ISO Monday)/`--monthly` bucket each record by its own timestamp; `--tz <IANA>` governs day boundaries; 5-hour `--blocks` mirrors the Claude plan window (community-pain evidence: ccusage#483/#146/#778, codeburn#425, CCUM#106/#121, cited in the upstream PR #306 body); (3) README.md:172 stops citing the nonexistent `--since` — rm-087's absolute-time `--since/--until` either lands on the same plumbing in one unit or README is corrected to `--range` in the same unit; (4) the CHANGELOG.md v0.10.0 backfill row advertising #306's `--daily/--weekly/--monthly with --tz, and 5-hour --blocks` gains a fork-divergence annotation matching whatever ships (the docs-truth gap closes both ways); (5) porting source is in-repo: the upstream 13-file implementation sits on the a9c18c4^2 side of the adoption merge (PR merged 2026-10-04) — port deliberately against the fork's current arg surface, never merge wholesale; (6) `--help` + docs-gate rows updated; golden tests pin a corpus crossing UTC-midnight and a week boundary under a non-UTC `--tz`; composes with rm-911 (same timestamps-in-cache data plane — one schema bump may serve both; record the decision in-row at implement) and rm-165's timezone-truthful resets (research C3)
+- evidence: campaign-recorded in agenttrace ROADMAP.md
+
 ### Shareable usage summary card export (deterministic SVG / single-file markdown)
 - id: `rm-841` | track: reliability | priority: 59.0 | status: candidate
 - acceptance: `agenttrace card -o usage.svg` (and/or `--format markdown`) renders a deterministic single-file summary (period, tokens, cost, top project/model) from the existing reports.rs/pricing surfaces; fully offline (no network path added); a golden-file test pins the SVG skeleton; README documents the flag
@@ -1741,5 +1746,6 @@
 - `rm-778` Journal-derived cwd drives an unbounded O(n²) ancestor walk — cheap hostile-journal DoS, warm cache included — done
 - `rm-779` --project filter is an undocumented case-insensitive substring over id+display_name+root — done
 - `rm-831` Antigravity fold arithmetic is not hostile-value safe — plain += wraps and negatives ride unfiltered — done
+- `rm-939` pi journal: compaction/branch_summary usage is silently dropped (handled-but-partial accounting) — done
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->

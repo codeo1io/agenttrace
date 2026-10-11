@@ -11,9 +11,9 @@ use agenttrace_core::{
     report_overview_markdown_with_context, report_overview_svg_with_context,
     report_overview_text_with_context, report_search_json, report_search_text,
     report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
-    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
-    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
-    VERSION,
+    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, usage_blocks, usage_by_period,
+    usage_tz_label, waste_report_json, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage,
+    Session, SvgCardTheme, TimeRange, UsageBlock, UsageBucket, UsagePeriod, UsageTz, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -300,6 +300,27 @@ struct Args {
     /// retained-history analysis).
     #[arg(long = "include-history")]
     include_history: bool,
+
+    /// rm-967 (upstream #306 port): calendar and 5-hour-block usage
+    /// reports. Exactly one period flag may be given; `--tz` selects
+    /// the day-boundary timezone (local, UTC, or fixed +HH:MM).
+    #[arg(long, help = "Group usage by calendar day")]
+    daily: bool,
+    #[arg(long, help = "Group usage by ISO week (weeks start Monday)")]
+    weekly: bool,
+    #[arg(long, help = "Group usage by calendar month")]
+    monthly: bool,
+    #[arg(
+        long,
+        help = "Group usage into 5-hour blocks (approximate provider windows)"
+    )]
+    blocks: bool,
+    #[arg(
+        long = "tz",
+        value_name = "TZ",
+        help = "Day-boundary timezone for --daily/--weekly/--monthly/--blocks: local, UTC, or fixed +HH:MM"
+    )]
+    usage_tz: Option<String>,
 }
 
 fn main() {
@@ -395,7 +416,12 @@ fn run() -> anyhow::Result<()> {
             || args.recommend
             || args.mcp_governance
             || args.context_trends
-            || args.delivery_evidence)
+            || args.delivery_evidence
+            // rm-967: the calendar/block renderers carry markdown/md
+            // table arms; html would silently fall back to plain text
+            // (rm-576 doctrine) so it stays governance-only.
+            || ((args.daily || args.weekly || args.monthly || args.blocks)
+                && matches!(args.format.as_str(), "markdown" | "md")))
     {
         bail!("markdown and html formats require --overview or a governance report action");
     }
@@ -410,14 +436,23 @@ fn run() -> anyhow::Result<()> {
     if args.format == "svg" && !args.overview {
         bail!("svg format requires --overview (the usage card renders the overview aggregation)");
     }
-    // rm-409 (review fix): csv's composable set is exactly --overview and
-    // --sessions (the README column contract); every other report shape
+    // rm-409 (review fix): csv's composable set is exactly --overview,
+    // --sessions, and the rm-967 calendar/block reports (bucket and
+    // block rows are plain tabular data — the README column contract
+    // extends with the bucket/block columns); every other report shape
     // renders text/json, so `-f csv` on them previously fell through to a
     // silent TEXT render — the same incoherence the guard above exists to
     // prevent for markdown/html. Bail loudly instead (--latest, <path>,
     // --doctor, --diagnostics, and the governance actions included).
-    if args.format == "csv" && !(args.overview || args.sessions) {
-        bail!("csv format requires --overview or --sessions");
+    if args.format == "csv"
+        && !(args.overview
+            || args.sessions
+            || args.daily
+            || args.weekly
+            || args.monthly
+            || args.blocks)
+    {
+        bail!("csv format requires --overview, --sessions, or a usage report (--daily/--weekly/--monthly/--blocks)");
     }
     // rm-937: `-f tsv` is the explicit spelling of the --sessions
     // table — that action's default text lane already renders TSV, but
@@ -817,6 +852,41 @@ fn run() -> anyhow::Result<()> {
     let sessions = prepare_cli_view(sessions, &args)?;
     if sessions.is_empty() {
         bail!("No sessions match the requested filters");
+    }
+
+    // rm-967: calendar and 5-hour-block usage reports (upstream #306
+    // port). Sessions here are already range-filtered and sorted by
+    // the shared load path; the rollups read Metrics.usage_points
+    // (single session-start point fallback for aggregate lanes — the
+    // fallback count is disclosed in the report footer).
+    if args.daily || args.weekly || args.monthly || args.blocks {
+        let tz = match args.usage_tz.as_deref() {
+            Some(value) => UsageTz::parse(value).ok_or_else(|| {
+                anyhow::anyhow!("--tz must be local, UTC, or a fixed +HH:MM offset")
+            })?,
+            None => UsageTz::Local,
+        };
+        let fallback = sessions
+            .iter()
+            .filter(|session| session.metrics.usage_points.is_empty())
+            .count();
+        let out = if args.blocks {
+            let blocks = usage_blocks(&sessions, chrono::Utc::now(), tz);
+            render_usage_blocks(&blocks, tz, fallback, sessions.len(), &args.format)
+        } else {
+            let period = if args.daily {
+                UsagePeriod::Day
+            } else if args.weekly {
+                UsagePeriod::Week
+            } else {
+                UsagePeriod::Month
+            };
+            let buckets = usage_by_period(&sessions, period, tz);
+            render_usage_buckets(&buckets, period, tz, fallback, sessions.len(), &args.format)
+        };
+        write_output(&args.output, &(out.clone() + "\n"))?;
+        write_stdout(&out)?;
+        return Ok(());
     }
 
     if args.sessions || args.diagnostics || args.inspect.is_some() {
@@ -1428,6 +1498,7 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--baseline-max-cost-delta-pct"
             | "--baseline-max-token-delta-pct"
             | "--lang"
+            | "--tz"
             | "--range"
             | "--project"
             | "--source"
@@ -2327,6 +2398,157 @@ fn matches_number(value: f64, filter: &str) -> bool {
     matches_numeric_filter(value, filter)
 }
 
+fn render_usage_buckets(
+    buckets: &[UsageBucket],
+    period: UsagePeriod,
+    tz: UsageTz,
+    fallback: usize,
+    total_sessions: usize,
+    format: &str,
+) -> String {
+    let label = usage_tz_label(tz, chrono::Utc::now());
+    let footer = format!(
+        "{} of {} sessions report session-level usage only (session-start fallback).",
+        fallback, total_sessions
+    );
+    match format {
+        "json" => serde_json::to_string(buckets).unwrap_or_default(),
+        "csv" | "tsv" => {
+            let sep = if format == "tsv" { '\t' } else { ',' };
+            let mut rows = vec![format!("period{sep}sessions{sep}tokens{sep}cost")];
+            for bucket in buckets {
+                rows.push(format!(
+                    "{}{sep}{}{sep}{}{sep}{:.4}",
+                    bucket.period, bucket.sessions, bucket.tokens, bucket.cost
+                ));
+            }
+            rows.join("\n")
+        }
+        "markdown" | "md" => {
+            let mut out = format!(
+                "## Usage by {} (timezone {})\n\n| {} | sessions | tokens | cost |\n|---|---:|---:|---:|\n",
+                period.as_str(),
+                label,
+                period.as_str()
+            );
+            for bucket in buckets {
+                out.push_str(&format!(
+                    "| {} | {} | {} | ${:.4} |\n",
+                    bucket.period, bucket.sessions, bucket.tokens, bucket.cost
+                ));
+            }
+            format!("{out}\n{footer}\n")
+        }
+        _ => {
+            let mut out = format!(
+                "Usage by {} (timezone {})\n\n{:<12} {:>10} {:>14} {:>12}\n",
+                period.as_str(),
+                label,
+                period.as_str(),
+                "sessions",
+                "tokens",
+                "cost"
+            );
+            for bucket in buckets {
+                out.push_str(&format!(
+                    "{:<12} {:>10} {:>14} {:>12.4}\n",
+                    bucket.period, bucket.sessions, bucket.tokens, bucket.cost
+                ));
+            }
+            format!("{out}\n{footer}\n")
+        }
+    }
+}
+
+fn render_usage_blocks(
+    blocks: &[UsageBlock],
+    tz: UsageTz,
+    fallback: usize,
+    total_sessions: usize,
+    format: &str,
+) -> String {
+    let label = usage_tz_label(tz, chrono::Utc::now());
+    let footer = format!(
+        "Blocks approximate provider rate windows from local logs; they are estimates, not server-side accounting. {} of {} sessions report session-level usage only (session-start fallback).",
+        fallback, total_sessions
+    );
+    match format {
+        "json" => serde_json::to_string(blocks).unwrap_or_default(),
+        "csv" | "tsv" => {
+            let sep = if format == "tsv" { '\t' } else { ',' };
+            let mut rows = vec![format!(
+                "start{sep}end{sep}active{sep}sessions{sep}tokens{sep}cost{sep}tokens_per_minute{sep}cost_per_hour{sep}projected_tokens{sep}projected_cost"
+            )];
+            for block in blocks {
+                rows.push(format!(
+                    "{}{sep}{}{sep}{}{sep}{}{sep}{}{sep}{:.4}{sep}{:.1}{sep}{:.4}{sep}{}{sep}{:.4}",
+                    block.start,
+                    block.end,
+                    block.active,
+                    block.sessions,
+                    block.tokens,
+                    block.cost,
+                    block.tokens_per_minute,
+                    block.cost_per_hour,
+                    block.projected_tokens,
+                    block.projected_cost
+                ));
+            }
+            rows.join("\n")
+        }
+        "markdown" | "md" => {
+            let mut out = format!(
+                "## Usage blocks — 5 hours (timezone {})\n\n| start | end | active | sessions | tokens | cost | tok/min | $/h | proj. tokens | proj. cost |\n|---|---|---|---:|---:|---:|---:|---:|---:|---:|\n",
+                label
+            );
+            for block in blocks {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | ${:.4} | {:.1} | {:.4} | {} | ${:.4} |\n",
+                    block.start,
+                    block.end,
+                    if block.active { "yes" } else { "no" },
+                    block.sessions,
+                    block.tokens,
+                    block.cost,
+                    block.tokens_per_minute,
+                    block.cost_per_hour,
+                    block.projected_tokens,
+                    block.projected_cost
+                ));
+            }
+            format!("{out}\n{footer}\n")
+        }
+        _ => {
+            let mut out = format!(
+                "Usage blocks — 5 hours (timezone {})\n\n{:<28} {:>28} {:>7} {:>9} {:>12} {:>10} {:>9} {:>9}\n",
+                label,
+                "start",
+                "end",
+                "active",
+                "sessions",
+                "tokens",
+                "cost",
+                "tok/min",
+                "$/h"
+            );
+            for block in blocks {
+                out.push_str(&format!(
+                    "{:<28} {:>28} {:>7} {:>9} {:>12} {:>10.4} {:>9.1} {:>9.4}\n",
+                    block.start,
+                    block.end,
+                    if block.active { "yes" } else { "no" },
+                    block.sessions,
+                    block.tokens,
+                    block.cost,
+                    block.tokens_per_minute,
+                    block.cost_per_hour
+                ));
+            }
+            format!("{out}\n{footer}\n")
+        }
+    }
+}
+
 fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> String {
     // rm-798: --limit is a DISPLAY cap, and a capped machine format
     // must never read as the whole corpus: the json arm wraps the rows
@@ -2476,6 +2698,10 @@ fn has_session_action(args: &Args) -> bool {
         || args.inspect.is_some()
         || args.waste
         || args.baseline.is_some()
+        || args.daily
+        || args.weekly
+        || args.monthly
+        || args.blocks
         || args
             .search
             .as_deref()
@@ -2543,6 +2769,19 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
     if args.fetch && args.path.as_deref() != Some("upstream") {
         bail!("--fetch applies only to the upstream command: agenttrace --fetch upstream");
     }
+    // rm-967: reject --tz without a calendar/block report flag, and
+    // malformed offsets, with the accepted forms in the message.
+    let wants_usage_report = args.daily || args.weekly || args.monthly || args.blocks;
+    if args.usage_tz.is_some() && !wants_usage_report {
+        bail!("--tz applies only to --daily/--weekly/--monthly/--blocks");
+    }
+    if let Some(value) = args.usage_tz.as_deref() {
+        if UsageTz::parse(value).is_none() {
+            bail!(
+                "--tz must be local, UTC, or a fixed offset (+HH:MM, -HH:MM, +HHMM, or +HH); got {value}"
+            );
+        }
+    }
     // rm-341: --baseline gates --overview -f json; --compare never reads
     // it. Rejecting the pair up front replaces two errors that used to
     // contradict each other ("--baseline requires --overview -f json"
@@ -2563,6 +2802,10 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
         args.overview,
         args.sessions,
         args.diagnostics || args.inspect.is_some(),
+        args.daily,
+        args.weekly,
+        args.monthly,
+        args.blocks,
         args.waste,
         args.doctor,
         args.list_models,
@@ -2755,6 +2998,11 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
     Args {
         path: None,
         format: "json".to_string(),
+        daily: false,
+        weekly: false,
+        monthly: false,
+        blocks: false,
+        usage_tz: None,
         // rm-576: every test args literal carries the SVG card theme
         // default (the flag's clap default); the helper is the single
         // construction site since the test_args refactor.
@@ -2939,6 +3187,32 @@ mod tests {
             ("--budget", {
                 let mut a = base();
                 a.budget = true;
+                a
+            }),
+            ("--daily", {
+                let mut a = base();
+                a.daily = true;
+                a
+            }),
+            ("--weekly", {
+                let mut a = base();
+                a.weekly = true;
+                a
+            }),
+            ("--monthly", {
+                let mut a = base();
+                a.monthly = true;
+                a
+            }),
+            ("--blocks", {
+                let mut a = base();
+                a.blocks = true;
+                a
+            }),
+            ("--daily --tz +08:00", {
+                let mut a = base();
+                a.daily = true;
+                a.usage_tz = Some("+08:00".to_string());
                 a
             }),
         ];
@@ -4451,5 +4725,33 @@ mod tests {
         admit_session_path(&good).expect("symlink to a regular file is admitted");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_report_flags_validate() {
+        // rm-967: --tz requires a usage report and must be a usable
+        // offset form; period flags conflict with each other.
+        let base = |extra: &[&str]| {
+            let mut argv = vec!["agenttrace"];
+            argv.extend_from_slice(extra);
+            Args::parse_from(argv)
+        };
+        let tz_alone = base(&["--tz", "+08:00"]);
+        assert!(validate_primary_action(&tz_alone)
+            .unwrap_err()
+            .to_string()
+            .contains("--tz applies only to"));
+        let tz_bad = base(&["--daily", "--tz", "Asia/Shanghai"]);
+        assert!(validate_primary_action(&tz_bad)
+            .unwrap_err()
+            .to_string()
+            .contains("--tz must be local, UTC"));
+        let both = base(&["--daily", "--weekly"]);
+        assert!(validate_primary_action(&both)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one report action"));
+        let ok = base(&["--daily", "--tz", "+08:00"]);
+        validate_primary_action(&ok).expect("--daily --tz +08:00 is valid");
     }
 }

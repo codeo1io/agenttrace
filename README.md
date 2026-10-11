@@ -169,7 +169,7 @@ agenttrace --overview -f csv
 ```
 
 Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session`.
-The `subagents`/`subagent_cost` columns mirror the TSV's SUBAGENTS/SUBAGENT_COST rollup columns and `parent_session` names the parent transcript on subagent rows (empty otherwise), so no format hides the subagent picture another format shows. Rollups are corpus-scope: they reflect every child in the loaded corpus, not only rows surviving the active view filters (`--since`/`--project` etc.). When `--limit` drops rows, the table ends with a `# truncated: showing N of M matching sessions (--limit L)` marker row — a capped statement never reads as the whole corpus. In the same position, `--sessions -f json` wraps the rows as `{matched_sessions, returned_sessions, truncated, limit, sessions: [...]}` instead of a bare array, so a `jq '.sessions | length'` consumer can always tell a capped list from the corpus (and `jq '. | length' == 5` becomes an error, not a silent 5).
+The `subagents`/`subagent_cost` columns mirror the TSV's SUBAGENTS/SUBAGENT_COST rollup columns and `parent_session` names the parent transcript on subagent rows (empty otherwise), so no format hides the subagent picture another format shows. Rollups are corpus-scope: they reflect every child in the loaded corpus, not only rows surviving the active view filters (`--range`/`--project` etc.; rm-967 adds the calendar/block usage reports `--daily`/`--weekly`/`--monthly`/`--blocks`, with `--tz local|UTC|+HH:MM` governing day boundaries — absolute-time `--since`/`--until` scoping is still a roadmap item, rm-087). When `--limit` drops rows, the table ends with a `# truncated: showing N of M matching sessions (--limit L)` marker row — a capped statement never reads as the whole corpus. In the same position, `--sessions -f json` wraps the rows as `{matched_sessions, returned_sessions, truncated, limit, sessions: [...]}` instead of a bare array, so a `jq '.sessions | length'` consumer can always tell a capped list from the corpus (and `jq '. | length' == 5` becomes an error, not a silent 5).
 `zero_usage_events` carries the rm-408 disclosure: transcripts that
 REPORT `{input_tokens: 0, output_tokens: 0, …}` are counted as measured
 zeros and flagged `zero_usage_reported` in provenance instead of reading
@@ -406,6 +406,11 @@ fails when the README table drifts from the binary's actual flag count
 | `--pricing-file <PATH>` |  | Override the pricing override file: highest precedence, then the config files, then `AGENTTRACE_PRICING_FILE` (rm-384) |
 | `--weekly-budget <USD>` |  | Weekly spend budget in USD for `--statusline-report` and `--budget`: highest precedence, then config `weekly_budget_usd` (rm-385) |
 | `--budget` |  | Show the weekly budget window-burn view: per-day spend from the statusline journal against the resolved weekly budget; the window is the trailing 7 CALENDAR days ending today — stale journals disclose instead of verdicting (rm-385, rm-917) |
+| `--daily` |  | Group usage by calendar day (rm-967, upstream #306 port): reads per-record `usage_points`, sessions without per-record usage fall back to one session-start point (disclosed in the footer) |
+| `--weekly` |  | Group usage by ISO week, weeks starting Monday (rm-967) |
+| `--monthly` |  | Group usage by calendar month (rm-967) |
+| `--blocks` |  | Group usage into 5-hour blocks approximating provider rate windows, with active-block rate projection — estimates from local logs, not server-side accounting (rm-967) |
+| `--tz <TZ>` |  | Day boundary timezone for `--daily`/`--weekly`/`--monthly`/`--blocks`: `local`, `UTC`, or a fixed offset `+HH:MM`/`+HHMM`/`+HH` (use `--tz=-HH:MM` for negative offsets; IANA names are not supported) (rm-967) |
 | `--version` |  | Print the version banner and exit 0; wins over action validation |
 | `--demo` |  | Use the built-in demo corpus instead of discovered agent homes (stable epoch-anchored sessions) |
 | `--doctor` |  | Run environment self-checks (config paths, cache consistency, agent homes) and exit non-zero on failure |

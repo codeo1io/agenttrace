@@ -122,6 +122,18 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
                 .join("antigravity-cli")
                 .join("conversations"),
         },
+        // rm-966: ACP clients (agy_acp_server) write the same
+        // gen_metadata/steps schema under their own root (ccusage #1856,
+        // shipped v20.0.29); the parser relabels these files'
+        // source_tool to antigravity_acp after the shared antigravity
+        // parse (parser::parse_file).
+        KnownSessionDir {
+            name: "Antigravity ACP conversations".to_string(),
+            path: home
+                .join(".gemini")
+                .join("antigravity-acp")
+                .join("conversations"),
+        },
         KnownSessionDir {
             name: "Claude Code transcripts".to_string(),
             path: env_home("CLAUDE_CONFIG_DIR", home.join(".claude")).join("transcripts"),

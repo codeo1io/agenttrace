@@ -1,11 +1,24 @@
-use crate::{Anomaly, Diagnostics, Metrics, Session, ToolWarning};
+use crate::{Anomaly, Diagnostics, Metrics, Session, ToolWarning, UsagePoint};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 53;
+// Schema ladder (most recent first):
+// 53: rm-939 pi compaction/branch_summary usage fold (this lineage)
+// 54: fleet integrations (b171537d / ca6d6ad2)
+// 55: run-8937be8e copilot OTel reconcile
+// 56: run-5a04ae3b additive reasoning fold
+// 57-64: fleet integration rungs — live census 2026-10-11: committed
+//        const 64 in run-c7173c078c22 / run-d932c0c2afee / run-feb16bba31d6;
+//        nothing at 65 anywhere in the fleet worktrees, canonical
+//        origin/master (53), or `git log --all -S'= 65'`.
+// 65: rm-967 Metrics.usage_points [ts, tokens, cost] per-record
+//     calendar series (upstream #306 port). Rung 65 chosen over the
+//     stale ≥57 estimate in the pre-census fleet pin; census evidence
+//     recorded in the cycle record.
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
 // Bumped 52 -> 53 (integration of run 4ffc4fbb2e9c, conflict case
 // a1c5cb6f54f34484bd2b404fc90d99a0, candidate fa1d831 — the run's
 // rm-939 'pi journal: compaction/branch_summary usage is silently
@@ -929,6 +942,13 @@ struct GoMetrics {
     session_start: String,
     #[serde(default, rename = "SessionEnd")]
     session_end: String,
+    /// rm-967 (schema 65): per-record usage series as compact
+    /// [ts, tokens, cost] triples (Metrics.usage_points, upstream
+    /// #306 port). Defaulted so pre-existing cache rows deserialize
+    /// unchanged; omitted from serialization when empty so lanes
+    /// without timestamped records keep their prior byte shape.
+    #[serde(default, rename = "UsagePoints", skip_serializing_if = "Vec::is_empty")]
+    usage_points: Vec<(i64, i64, f64)>,
     #[serde(default, rename = "NaiveUtcStamps")]
     naive_utc_stamps: usize,
     #[serde(default, rename = "DurationSec")]
@@ -2774,6 +2794,11 @@ impl GoMetrics {
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
+            usage_points: metrics
+                .usage_points
+                .iter()
+                .map(|point| (point.ts, point.tokens, point.cost))
+                .collect(),
             naive_utc_stamps: metrics.naive_utc_stamps,
             duration_sec: metrics.duration_sec,
             cost_estimated: metrics.cost_estimated,
@@ -2824,6 +2849,15 @@ impl GoMetrics {
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,
+            usage_points: self
+                .usage_points
+                .iter()
+                .map(|(ts, tokens, cost)| UsagePoint {
+                    ts: *ts,
+                    tokens: *tokens,
+                    cost: *cost,
+                })
+                .collect(),
             naive_utc_stamps: self.naive_utc_stamps,
             duration_sec: self.duration_sec,
             cost_estimated: self.cost_estimated,

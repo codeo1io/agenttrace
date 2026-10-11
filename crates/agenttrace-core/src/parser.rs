@@ -28,7 +28,19 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
-    parse_session_bytes(raw, &path_text, &name)
+    let mut session = parse_session_bytes(raw, &path_text, &name)?;
+    // rm-966: ACP clients (agy_acp_server) write the antigravity
+    // schema under ~/.gemini/antigravity-acp/conversations; detection
+    // is content-shaped and cannot see the path, so relabel post-parse
+    // to keep the source distinct from antigravity-cli files.
+    if path
+        .components()
+        .any(|c| c.as_os_str() == "antigravity-acp")
+        && session.metrics.source_tool == "antigravity_cli"
+    {
+        session.metrics.source_tool = "antigravity_acp".to_string();
+    }
+    Ok(session)
 }
 
 /// Decode + parse one session stream (rm-503): the shared tail of

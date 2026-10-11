@@ -4,6 +4,20 @@
 
 ### Added
 
+- cli/core: `--daily`/`--weekly` (ISO Monday)/`--monthly`/`--blocks` usage
+  reports with `--tz` day boundaries (local, UTC, or fixed +HH:MM),
+  ported from upstream #306 (rm-967, run 5488904df7ec cycle 1). Usage
+  records are cached as `Metrics.usage_points` `[ts, tokens, cost]`
+  triples (session cache schema 65, live-fleet-censused); sessions
+  whose lane reports no per-record usage fall back to a single
+  session-start point, disclosed in the report footer. README's view
+  filters row now cites `--range` (it previously cited a nonexistent
+  `--since`).
+- discovery: `~/.gemini/antigravity-acp/conversations` is now a default
+  root (rm-966, ccusage #1856 parity, shipped v20.0.29); ACP journals
+  report under the `antigravity_acp` source label, distinct from
+  antigravity-cli.
+
 - The session cache entry bound is configurable and disclosed (rm-298 residual capacity arm, run 3e6e5de0 cycle 1): `session_cache_entries` in the config file outranks `AGENTTRACE_SESSION_CACHE_ENTRIES` (parse-fail ignored, best-effort like every AGENTTRACE_*), both clamp to the 1..=1,000,000 band (default 20,000 unchanged; no schema bump rides this arm — the cache shape is untouched and SESSION_CACHE_SCHEMA_VERSION stays at its landed ceiling, 41 after this integration's rm-520 rebase), and `--doctor` reports the effective bound, where it came from (`default|config file|env`), and how many sessions the last scan re-parsed (release probe on the 25,889-file corpus: 20000/default/19414). The `--config` disclosure shows the same clamped effective value and annotates `clamped from <raw>` when the configured value was out of band.
 - Local read-only MCP server: `agenttrace mcp` speaks newline-delimited JSON-RPC 2.0 over stdio (initialize, ping, tools/list, tools/call; notifications stay silent; malformed JSON, unknown methods, bad tool params, and batch requests answer the spec error arms -32700/-32600/-32601/-32602) so a coding agent can ask about its own token usage from inside the session that burned it. Two read-only tools render the SAME locally discovered sessions the CLI reports on — `usage_overview` (the `--overview -f json` document) and `by_model_breakdown` (the `by_model` rollup) — with the CLI's `today|7d|30d|all` range windows; a discovered-but-empty corpus is a tool-level `isError` result, the twin of the CLI's rc1 bail, and the server keeps serving. The server opens no sockets, performs no network probes, and writes nothing outside the agenttrace session cache; it serves until stdin closes (host disconnect is a clean exit 0). Hand-rolled JSON-RPC — no new dependencies (the SDK-vs-hand-rolled decision is recorded in the rm-455 lane). Keyword host-command wiring lands with the rm-505 help/guard routes; guide at docs/guides/mcp-server.md with registration snippets and a tool-call transcript; e2e wire contract pinned by tests/mcp_server.rs (rm-455, run 90f54faf cycle 3).
 

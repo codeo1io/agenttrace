@@ -16,6 +16,7 @@ mod session_cache;
 mod sqlite_sessions;
 mod statusline;
 mod subagents;
+pub mod usage;
 mod waste;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -95,6 +96,10 @@ pub use statusline::{
     StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
 };
 pub use subagents::attribute_subagents;
+pub use usage::{
+    session_points, usage_blocks, usage_by_period, usage_tz_label, UsageBlock, UsageBucket,
+    UsagePeriod, UsagePoint, UsageTz,
+};
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language,
     waste_report_json, WasteReport,
@@ -462,6 +467,15 @@ pub struct Metrics {
     pub source_tool: String,
     pub session_start: String,
     pub session_end: String,
+    /// rm-967: per-record usage series for calendar and 5-hour-block
+    /// rollups, ported from upstream #306. Filled only by lanes whose
+    /// journals timestamp their usage records; readers fall back to a
+    /// session-start point (usage::session_points) when empty. The
+    /// warm cache carries it as GoMetrics.UsagePoints (schema 65);
+    /// report JSON keeps it out (surfaces consume the bucketed
+    /// rollups, and the raw series would bloat every report).
+    #[serde(skip)]
+    pub usage_points: Vec<UsagePoint>,
     /// Event timestamps accepted by the lenient naive-ISO arm and
     /// reinterpreted as UTC (no offset in the source log; rm-502).
     /// Zero unless the session's log carried naive stamps.
@@ -1332,6 +1346,37 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         .find(|event| !event.source_tool.is_empty())
         .map(|event| event.source_tool.clone());
 
+    // rm-967: per-record usage series for the calendar/5-hour-block
+    // rollups (upstream #306 port). Points are buffered raw and priced
+    // once after the loop, using the same upstream-cost-or-catalog rule
+    // as the session formula: a record carrying an upstream cost
+    // contributes exactly that cost, everything else is priced at the
+    // catalog rate of the model that produced the record (rm-438's
+    // per-block rule, so a switched session's calendar buckets do not
+    // inherit the session-model mispricing the session formula itself
+    // avoids). Sessions without any timestamped usage record keep an
+    // empty series and fall back to a single session-start point at
+    // read time (usage::session_points).
+    struct PendingPoint {
+        ts: i64,
+        tokens_input: i64,
+        tokens_output: i64,
+        tokens_reasoning: i64,
+        tokens_cache_w: i64,
+        tokens_cache_r: i64,
+        recorded_cost: Option<f64>,
+        model: String,
+    }
+    let mut pending_points: Vec<PendingPoint> = Vec::new();
+    let last_model = |event: &Event| -> String {
+        if event.model_used.is_empty() || event.model_used == "unknown" {
+            model.to_string()
+        } else {
+            event.model_used.clone()
+        }
+    };
+    let mut last_ts: Option<i64> = None;
+
     for event in events {
         if metrics.source_tool.is_empty()
             && !event.source_tool.is_empty()
@@ -1346,6 +1391,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             if matches!(form, TimestampForm::NaiveUtc) {
                 metrics.naive_utc_stamps += 1;
             }
+            last_ts = Some(ts.timestamp());
         }
 
         // Usage values arrive from untrusted session logs; clamp negatives
@@ -1391,6 +1437,23 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 .saturating_add(usage_tokens("cache_read_input_tokens"));
             if !event.model_used.is_empty() && event.model_used != "unknown" {
                 usage_models.insert(event.model_used.clone());
+            }
+            // rm-967: this conversation line IS a timestamped usage
+            // record for the generic (serde-origin) lane — buffer a
+            // calendar point for it.
+            if let Some(ts) = last_ts {
+                pending_points.push(PendingPoint {
+                    ts,
+                    tokens_input: usage_tokens("input_tokens"),
+                    tokens_output: usage_tokens("output_tokens"),
+                    tokens_reasoning: usage_tokens("reasoning_tokens"),
+                    tokens_cache_w: usage_tokens("cache_creation_input_tokens"),
+                    tokens_cache_r: usage_tokens("cache_read_input_tokens"),
+                    recorded_cost: event
+                        .recorded_cost_usd
+                        .filter(|cost| cost.is_finite() && *cost >= 0.0),
+                    model: last_model(event),
+                });
             }
         }
         // rm-616 disclosure: a conversation line that REPORTS usage but
@@ -1484,6 +1547,28 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                         .saturating_add(usage_tokens("cache_creation_input_tokens"));
                     upstream_priced_cache_r = upstream_priced_cache_r
                         .saturating_add(usage_tokens("cache_read_input_tokens"));
+                }
+                // rm-967: meta events are the native families' usage
+                // records — buffer a calendar point whenever the event
+                // carries token classes or an upstream cost (cost-only
+                // records contribute a zero-token point so their cost
+                // still lands in the right bucket).
+                let recorded = event
+                    .recorded_cost_usd
+                    .filter(|cost| cost.is_finite() && *cost >= 0.0);
+                if let Some(ts) = last_ts {
+                    if !event.usage.is_empty() || recorded.is_some() {
+                        pending_points.push(PendingPoint {
+                            ts,
+                            tokens_input: usage_tokens("input_tokens"),
+                            tokens_output: usage_tokens("output_tokens"),
+                            tokens_reasoning: usage_tokens("reasoning_tokens"),
+                            tokens_cache_w: usage_tokens("cache_creation_input_tokens"),
+                            tokens_cache_r: usage_tokens("cache_read_input_tokens"),
+                            recorded_cost: recorded,
+                            model: last_model(event),
+                        });
+                    }
                 }
                 // rm-485: fold cost-only credit attribution with max
                 // semantics — repeated snapshots never double-count.
@@ -1652,6 +1737,44 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         || (!usage_models.is_empty()
             && session_model_is_real
             && !usage_models.iter().any(|usage_model| usage_model == model));
+
+    // rm-967: price the buffered per-record points once, after the
+    // multi-model decision, with the same upstream-cost-or-catalog
+    // rule as the session formula above (per-record model rate under
+    // rm-438's switched-session rule; a record that carries an
+    // upstream cost contributes exactly that cost).
+    metrics.usage_points = pending_points
+        .into_iter()
+        .map(|point| {
+            let tokens = point
+                .tokens_input
+                .saturating_add(point.tokens_output)
+                .saturating_add(point.tokens_reasoning)
+                .saturating_add(point.tokens_cache_w)
+                .saturating_add(point.tokens_cache_r);
+            let cost = match point.recorded_cost {
+                Some(cost) => cost,
+                None => {
+                    let rate = if usage_blocks_multi_model {
+                        pricing::lookup_price(&point.model)
+                    } else {
+                        pricing::lookup_price(model)
+                    };
+                    round4(
+                        (point.tokens_input as f64 / 1_000_000.0) * rate.input
+                            + (point.tokens_output as f64 / 1_000_000.0) * rate.output
+                            + (point.tokens_cache_w as f64 / 1_000_000.0) * rate.cw
+                            + (point.tokens_cache_r as f64 / 1_000_000.0) * rate.cr,
+                    )
+                }
+            };
+            UsagePoint {
+                ts: point.ts,
+                tokens,
+                cost,
+            }
+        })
+        .collect();
     // rm-406 (dated 2026-10-07 arm): per-model attribution for the
     // multi-model session — each usage block's tokens and per-block
     // cost land on the model that produced them (the advisor-model

@@ -293,11 +293,11 @@ fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
     for (args, needle) in [
         (
             &["--latest", "-f", "csv"][..],
-            "csv format requires --overview or --sessions",
+            "csv format requires --overview",
         ),
         (
             &["--doctor", "-f", "csv"][..],
-            "csv format requires --overview or --sessions",
+            "csv format requires --overview",
         ),
         (
             &["--latest", "-f", "markdown"][..],
@@ -334,6 +334,38 @@ fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
         assert!(
             stderr.contains(needle),
             "expected `{needle}` in stderr, got: {stderr}"
+        );
+    }
+
+    // rm-967 positive arm: the calendar/block reports DO render csv
+    // (period,sessions,tokens,cost), so the gate admits them — the
+    // rejection above is scoped to actions without a csv renderer.
+    {
+        let sandbox = std::env::temp_dir().join(format!(
+            "at-csv-sandbox-{}-{:?}-daily",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let cache = sandbox.join("cache");
+        fs::create_dir_all(&cache).expect("create sandbox cache dir");
+        let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .env("HOME", &sandbox)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+            .args(["--daily", "-f", "csv", "--tz", "UTC"])
+            .arg("-d")
+            .arg(&dir)
+            .output()
+            .expect("run agenttrace CLI");
+        assert!(
+            output.status.success(),
+            "--daily -f csv should render, got: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+        assert!(
+            stdout.starts_with("period,sessions,tokens,cost"),
+            "expected csv header, got: {stdout}"
         );
     }
     fs::remove_dir_all(dir).ok();
