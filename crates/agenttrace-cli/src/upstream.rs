@@ -41,6 +41,14 @@ use std::time::{Duration, Instant, SystemTime};
 /// operation — never a silent partial report and never a hang.
 const UPSTREAM_GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// rm-052's git lane — the sibling bound of NPM_REGISTRY_MAX_BYTES. A
+/// hostile or MITM'd remote relays unbounded sideband ("remote:")
+/// text through git's pipes, so the drains are byte-bounded at OUR end
+/// of the pipe and the subprocess tree is killed the moment it pushes
+/// past the ceiling — the same discipline the pricing probe applies to
+/// a hostile registry. Probe-sized by design: rev-parse and ls-remote
+/// emit bytes, not kilobytes.
+const UPSTREAM_GIT_MAX_BYTES: u64 = 256 * 1024;
 
 /// Why a bounded subprocess did not produce its output. `Timeout` is
 /// distinguished from `Failed`/`Spawn` so the fail-fast prerequisite
@@ -55,6 +63,12 @@ enum GitRunError {
     /// bound (its drains were abandoned, bytes unrecoverable). `op` is
     /// the human-named operation (e.g. `git fetch upstream --quiet`).
     Timeout { op: String, bound: Duration },
+    /// rm-052's git lane: the child pushed more than `cap_bytes` through
+    /// one of its pipes. The tree was killed the moment the drain saw the
+    /// overrun and the excess bytes were never buffered — a remote that
+    /// floods the sideband channel cannot grow agenttrace's memory, only
+    /// fail the upstream report loudly.
+    OverCap { op: String, cap_bytes: u64 },
     /// The child ran to completion and exited non-zero.
     Failed { op: String, message: String },
     /// The child could not be spawned at all (e.g. no git on PATH).
@@ -69,6 +83,13 @@ impl std::fmt::Display for GitRunError {
                     f,
                     "{op} timed out after {}s and its output was not recovered",
                     bound.as_secs()
+                )
+            }
+            GitRunError::OverCap { op, cap_bytes } => {
+                write!(
+                    f,
+                    "{op} pushed more than {cap_bytes} bytes through its pipes and was \
+                     killed (UPSTREAM_GIT_MAX_BYTES)"
                 )
             }
             GitRunError::Failed { op, message } => write!(f, "{op} failed: {message}"),
@@ -103,6 +124,7 @@ fn run_bounded(
     program: &str,
     args: &[&str],
     bound: Duration,
+    max_bytes: u64,
 ) -> Result<(std::process::ExitStatus, String, String), GitRunError> {
     let op = format!("{program} {}", args.join(" "));
     let mut command = Command::new(program);
@@ -123,12 +145,38 @@ fn run_bounded(
         op: op.clone(),
         message: err.to_string(),
     })?;
-    let stdout = spawn_drain(child.stdout.take());
-    let stderr = spawn_drain(child.stderr.take());
+    let mut stdout_rx = spawn_drain(child.stdout.take(), max_bytes);
+    let mut stderr_rx = spawn_drain(child.stderr.take(), max_bytes);
     let deadline = Instant::now() + bound;
+    // rm-052: completed-but-under-cap outcomes consumed by the in-loop
+    // check are stashed so the post-loop recv never blocks on an already
+    // drained pipe.
+    let mut stdout_stash: Option<DrainOutcome> = None;
+    let mut stderr_stash: Option<DrainOutcome> = None;
     let status = loop {
         if let Ok(Some(status)) = child.try_wait() {
             break status;
+        }
+        // rm-052: the npm probe's discipline — the tree is killed the
+        // moment a drain sees the overrun, not after the child's natural
+        // exit. A finished-under-cap drain parks its bytes in the stash.
+        for (rx, stash) in [
+            (&mut stdout_rx, &mut stdout_stash),
+            (&mut stderr_rx, &mut stderr_stash),
+        ] {
+            if stash.is_none() {
+                if let Ok(outcome) = rx.try_recv() {
+                    if outcome.exceeded {
+                        kill_process_tree(&mut child);
+                        let _ = child.wait();
+                        return Err(GitRunError::OverCap {
+                            op,
+                            cap_bytes: max_bytes,
+                        });
+                    }
+                    *stash = Some(outcome);
+                }
+            }
         }
         if Instant::now() >= deadline {
             // rm-583: the deadline contract outranks drain-thread hygiene,
@@ -151,10 +199,24 @@ fn run_bounded(
     // pipe write-end, so the drains get only the remainder of the bound
     // — the old unbounded joins blocked here for as long as the helper
     // kept the pipe open (25,106 ms on a 10 s bound in the assess PoC).
-    let stdout = recv_drain_bounded(stdout, deadline);
-    let stderr = recv_drain_bounded(stderr, deadline);
+    let stdout = match stdout_stash {
+        Some(outcome) => Ok(outcome),
+        None => recv_drain_bounded(stdout_rx, deadline),
+    };
+    let stderr = match stderr_stash {
+        Some(outcome) => Ok(outcome),
+        None => recv_drain_bounded(stderr_rx, deadline),
+    };
     let (stdout, stderr) = match (stdout, stderr) {
-        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        (Ok(stdout), Ok(stderr)) => {
+            if stdout.exceeded || stderr.exceeded {
+                return Err(GitRunError::OverCap {
+                    op,
+                    cap_bytes: max_bytes,
+                });
+            }
+            (stdout.bytes, stderr.bytes)
+        }
         _ => {
             // The helper's bytes are unrecoverable within the bound: the
             // drains are abandoned (each dies when its pipe finally EOFs
@@ -202,16 +264,46 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn spawn_drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+/// One drain's outcome. `exceeded` means the writer pushed past the byte
+/// ceiling: `bytes` holds what was read up to (and at most one chunk
+/// past) the cap, and the caller must treat the overrun as terminal.
+struct DrainOutcome {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn spawn_drain<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    cap: u64,
+) -> std::sync::mpsc::Receiver<DrainOutcome> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
+        let mut exceeded = false;
         if let Some(mut stream) = pipe {
-            let _ = stream.read_to_end(&mut bytes);
+            // rm-052: chunked reads, never read_to_end — the drain stops
+            // buffering at the cap so a flooding writer cannot grow this
+            // Vec unboundedly, and the send is abandonable exactly as
+            // before (a dropped receiver lets this thread die when its
+            // pipe finally EOFs or with the process).
+            let mut chunk = vec![0u8; 16 * 1024];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if bytes.len() as u64 > cap {
+                            exceeded = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         // On an abandoned drain the receiver is gone — the send errors
         // and this thread exits as soon as its pipe finally EOFs.
-        let _ = tx.send(bytes);
+        let _ = tx.send(DrainOutcome { bytes, exceeded });
     });
     rx
 }
@@ -219,10 +311,10 @@ fn spawn_drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Re
 /// Bounded drain join (rm-731): the reader's bytes if they arrive before
 /// the run's deadline, `Err` otherwise — the reader thread is abandoned
 /// on `Err`, mirroring the rm-583 timeout arm's dropped joins.
-fn recv_drain_bounded(
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+fn recv_drain_bounded<T>(
+    rx: std::sync::mpsc::Receiver<T>,
     deadline: Instant,
-) -> Result<Vec<u8>, std::sync::mpsc::RecvTimeoutError> {
+) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
     let now = Instant::now();
     let wait = if deadline > now {
         deadline - now
@@ -409,7 +501,9 @@ fn fetch_remote(remote: &str) -> anyhow::Result<()> {
     // fetch (hung remote, stale mount) hung the whole CLI. It now runs
     // under UPSTREAM_FETCH_TIMEOUT; a timeout is terminal and names the
     // deadline, the operation, and the remote.
-    match run_bounded("git", &["fetch", remote, "--quiet"], UPSTREAM_FETCH_TIMEOUT) {
+    match run_bounded("git", &["fetch", remote, "--quiet"], UPSTREAM_FETCH_TIMEOUT,
+        UPSTREAM_GIT_MAX_BYTES,
+    ) {
         Ok(_) => Ok(()),
         Err(GitRunError::Timeout { op, bound }) => bail!(
             "{op} timed out after {}s (UPSTREAM_FETCH_TIMEOUT): the fetch's output \
@@ -425,7 +519,7 @@ fn fetch_remote(remote: &str) -> anyhow::Result<()> {
 /// errors carry the command and a stderr snippet so a failed probe is
 /// diagnosable from the report, and a timeout names its deadline.
 fn git_bounded(args: &[&str]) -> Result<String, GitRunError> {
-    let (_, stdout, _) = run_bounded("git", args, UPSTREAM_GIT_TIMEOUT)?;
+    let (_, stdout, _) = run_bounded("git", args, UPSTREAM_GIT_TIMEOUT, UPSTREAM_GIT_MAX_BYTES)?;
     Ok(stdout.trim_end().to_string())
 }
 
@@ -931,6 +1025,74 @@ mod tests {
         // docs/guides/upstream-status.md in the same commit.
         assert_eq!(UPSTREAM_GIT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(UPSTREAM_FETCH_TIMEOUT, Duration::from_secs(30));
+        // rm-052's git lane: the byte ceiling is contract, not tuning —
+        // the sibling of NPM_REGISTRY_MAX_BYTES (both 256 KiB, both
+        // enforced our-side of the pipe).
+        assert_eq!(UPSTREAM_GIT_MAX_BYTES, 256 * 1024);
+    }
+
+    #[test]
+    fn run_bounded_kills_a_child_pushing_past_the_byte_cap() {
+        // rm-052's git lane: a writer that floods a pipe past the byte
+        // ceiling is killed and surfaced as a named OverCap — the drain
+        // stops buffering at the cap instead of reading to EOF, so a
+        // hostile remote relaying unbounded sideband text cannot grow
+        // agenttrace's memory, only fail the report loudly. 1 MiB of
+        // zeros against a 4 KiB cap: the child blocks on the pipe once
+        // the drain stops reading, the in-loop check sees the overrun,
+        // and the tree is killed well inside the deadline.
+        let started = Instant::now();
+        let result = run_bounded(
+            "sh",
+            &["-c", "head -c 1048576 /dev/zero; sleep 30"],
+            Duration::from_secs(30),
+            4 * 1024,
+        );
+        match result {
+            Err(GitRunError::OverCap { op, cap_bytes }) => {
+                assert!(op.contains("head"), "over-cap names the operation: {op}");
+                assert_eq!(cap_bytes, 4 * 1024);
+            }
+            other => panic!("expected OverCap, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the byte cap, not the child's lifetime, bounds the wait"
+        );
+    }
+
+    #[test]
+    fn run_bounded_returns_output_under_the_byte_cap() {
+        // rm-052: the cap must never disturb the happy path — a probe-
+        // sized output drains whole and reaches the caller untouched.
+        let result = run_bounded(
+            "sh",
+            &["-c", "printf probe-ok"],
+            UPSTREAM_GIT_TIMEOUT,
+            UPSTREAM_GIT_MAX_BYTES,
+        );
+        let (_, stdout, _) = result.expect("probe under the cap must succeed");
+        assert_eq!(stdout, "probe-ok");
+    }
+
+    #[test]
+    fn run_bounded_surfaces_a_stderr_overrun_as_over_cap() {
+        // rm-052: the sideband channel is the real vector (git relays
+        // "remote:" text on stderr) — an over-cap stderr alone is
+        // terminal even when the child later exits successfully.
+        let result = run_bounded(
+            "sh",
+            &["-c", "head -c 1048576 /dev/zero >&2; printf ok"],
+            Duration::from_secs(30),
+            4 * 1024,
+        );
+        match result {
+            Err(GitRunError::OverCap { op, cap_bytes }) => {
+                assert!(op.contains("head"), "over-cap names the operation: {op}");
+                assert_eq!(cap_bytes, 4 * 1024);
+            }
+            other => panic!("expected OverCap, got {other:?}"),
+        }
     }
 
     #[test]
@@ -939,7 +1101,12 @@ mod tests {
         // named Timeout — never a hang. `sleep 5` under a 300ms bound
         // must return well before the child's natural lifetime.
         let started = Instant::now();
-        let result = run_bounded("sleep", &["5"], Duration::from_millis(300));
+        let result = run_bounded(
+            "sleep",
+            &["5"],
+            Duration::from_millis(300),
+            UPSTREAM_GIT_MAX_BYTES,
+        );
         match result {
             Err(GitRunError::Timeout { op, bound }) => {
                 assert!(op.contains("sleep"), "timeout names the operation: {op}");
@@ -969,6 +1136,7 @@ mod tests {
             "sh",
             &["-c", "sleep 10 & sleep 10"],
             Duration::from_millis(300),
+            UPSTREAM_GIT_MAX_BYTES,
         );
         assert!(
             matches!(result, Err(GitRunError::Timeout { .. })),
@@ -995,6 +1163,7 @@ mod tests {
             "sh",
             &["-c", "setsid sleep 10 & sleep 10"],
             Duration::from_millis(300),
+            UPSTREAM_GIT_MAX_BYTES,
         );
         assert!(
             matches!(result, Err(GitRunError::Timeout { .. })),
@@ -1019,6 +1188,7 @@ mod tests {
             "sh",
             &["-c", "sleep 30 & exec sleep 30"],
             Duration::from_secs(1),
+            UPSTREAM_GIT_MAX_BYTES,
         );
         match result {
             Err(GitRunError::Timeout { op, bound }) => {
@@ -1049,6 +1219,7 @@ mod tests {
             "sh",
             &["-c", "echo probe-ok; sleep 60 & exec true"],
             Duration::from_secs(1),
+            UPSTREAM_GIT_MAX_BYTES,
         );
         match result {
             Err(GitRunError::Timeout { op, bound }) => {
@@ -1066,8 +1237,13 @@ mod tests {
 
     #[test]
     fn run_bounded_returns_output_for_a_fast_child() {
-        let (_, stdout, _) = run_bounded("git", &["--version"], UPSTREAM_GIT_TIMEOUT)
-            .expect("git --version runs inside the bound");
+        let (_, stdout, _) = run_bounded(
+            "git",
+            &["--version"],
+            UPSTREAM_GIT_TIMEOUT,
+            UPSTREAM_GIT_MAX_BYTES,
+        )
+        .expect("git --version runs inside the bound");
         assert!(
             stdout.contains("git version"),
             "stdout is drained intact: {stdout}"
@@ -1083,6 +1259,7 @@ mod tests {
             "git",
             &["rev-parse", "--verify", "agenttrace-no-such-ref"],
             UPSTREAM_GIT_TIMEOUT,
+            UPSTREAM_GIT_MAX_BYTES,
         ) {
             Err(GitRunError::Failed { op, message }) => {
                 assert!(
@@ -1101,6 +1278,7 @@ mod tests {
             "agenttrace-definitely-absent-binary",
             &["--version"],
             UPSTREAM_GIT_TIMEOUT,
+            UPSTREAM_GIT_MAX_BYTES,
         ) {
             Err(GitRunError::Spawn { op, message }) => {
                 assert!(op.contains("agenttrace-definitely-absent-binary"));

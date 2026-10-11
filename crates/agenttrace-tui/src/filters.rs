@@ -376,9 +376,31 @@ pub(super) fn status_width(width: u16) -> usize {
     }
 }
 
+/// rm-933 slice 2: the interactive display boundary. Session names
+/// derive from the first real user request (core's pinned rule) and
+/// flow into cells raw — ratatui-core only drops Cc control characters
+/// (buffer.rs), so the directional Cf set rides into the terminal where
+/// the emulator's bidi algorithm reorders ADJACENT column text (the
+/// name can visually swallow the neighboring cost/model columns). The
+/// export lanes already neutralize this class (`is_bidi_format_control`,
+/// the landed slice); the TUI applies the same predicate at its
+/// width-shaping helpers (`short`/`pad_display_width`) and the raw
+/// render sites, so every untrusted string that reaches a cell passes
+/// here. The set is deliberately the DIRECTIONAL subset — zero-width,
+/// so width math is unchanged; the non-directional Cf widening
+/// (U+FEFF & friends) is this row's still-open arm.
+pub(super) fn sanitize_display(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !agenttrace_core::is_bidi_format_control(*ch))
+        .collect()
+}
+
 pub(super) fn short(value: &str, max: usize) -> String {
     use unicode_width::UnicodeWidthChar;
 
+    let sanitized = sanitize_display(value);
+    let value = sanitized.as_str();
     if unicode_width::UnicodeWidthStr::width(value) <= max {
         return value.to_string();
     }
@@ -426,4 +448,61 @@ pub(super) fn terminal_safe_report(text: &str) -> String {
             _ => ch,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_display_strips_the_directional_cf_set() {
+        // rm-933 slice 2: every directional Cf char in the landed
+        // predicate's set is dropped at the TUI display boundary — the
+        // same neutralization the export lanes already apply (the
+        // landed slice), now extended to the interactive cells.
+        for ch in [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            let hostile = format!("a{ch}b");
+            assert_eq!(
+                sanitize_display(&hostile),
+                "ab",
+                "U+{:04X} must be stripped",
+                ch as u32
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_display_keeps_honest_text_verbatim() {
+        // Honest text — including wide CJK, emoji, and ordinary
+        // punctuation — passes untouched. The predicate is the
+        // directional Cf set only (see is_bidi_format_control's doc).
+        let honest = "会議 cost-model $1.23 — naïve résumé ✅";
+        assert_eq!(sanitize_display(honest), honest);
+    }
+
+    #[test]
+    fn sanitize_display_is_width_neutral() {
+        // The directional Cf set is zero-width, so stripping it cannot
+        // change display width — the width math in short() and
+        // pad_display_width() is untouched by the boundary filter.
+        let hostile = "ab\u{202E}cd\u{2066}ef";
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(sanitize_display(hostile).as_str()),
+            unicode_width::UnicodeWidthStr::width(hostile)
+        );
+    }
+
+    #[test]
+    fn short_strips_bidi_before_width_shaping() {
+        // rm-933 slice 2: short() is the choke point for the table/name
+        // lanes — an RLO buried in a session name must not survive into
+        // the truncated cell (where it would let the tail of the name
+        // visually swallow the adjacent cost column).
+        let hostile = "ok\u{202E}evil-name";
+        assert!(!short(hostile, 56).contains('\u{202E}'));
+        assert_eq!(short(hostile, 56), "okevil-name");
+    }
 }

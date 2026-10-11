@@ -1099,7 +1099,7 @@ fn context_preview(session: &Session, language: Language) -> String {
     format!(
         "{}\n{}\n\n{}         {}\n{}                {}\n{}     {}\n{}        {}\n{}       {}\n{}    {}\n{}           {}\n\n{}\n{}\n\n{}\n{}",
         text(language, "Context filling up", "上下文快满了"),
-        session.name,
+        sanitize_display(&session.name),
         text(language, "used", "已用"),
         format_context_pct(value.utilization_pct),
         text(language, "risk", "风险"),
@@ -1139,7 +1139,7 @@ fn storage_preview(session: &Session, language: Language) -> String {
     format!(
         "{}\n{}\n\n{}  {}\n{}  {}\n\n{}\n{}\n\n{}\n{}\n\n{}\n{}",
         text(language, "On this machine", "在这台电脑上"),
-        session.name,
+        sanitize_display(&session.name),
         text(language, "Size", "大小"),
         format_bytes(size),
         text(language, "Last changed", "上次改动"),
@@ -1205,7 +1205,7 @@ fn cost_preview(session: &Session, language: Language) -> String {
         .unwrap_or_else(|| unavailable.to_string());
     [
         text(language, "Estimated spend", "估算花费").to_string(),
-        session.name.clone(),
+        sanitize_display(&session.name),
         String::new(),
         audit
             .estimated_cost_usd
@@ -1351,7 +1351,7 @@ fn tools_preview(session: &Session, language: Language) -> String {
     format!(
         "{}\n{}\n\n{}       {}\n{}   {}\n{}      {}\n{} {}\n\n{}\n{}\n\n{}\n{}",
         text(language, "Tool trouble", "工具出问题"),
-        session.name,
+        sanitize_display(&session.name),
         text(language, "calls", "调用次数"),
         session.metrics.tool_calls_total,
         text(language, "succeeded", "成功"),

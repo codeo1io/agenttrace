@@ -295,12 +295,17 @@ fn render_status_line(payload: &Value) -> String {
 /// markdown/HTML renderers apply their own escaping before this class
 /// applies. Printable CSI/OSC tails may legitimately survive — only the
 /// control bytes themselves (ESC, BEL, …) are neutralized.
-/// rm-936: Unicode bidi/format controls (general category Cf) that reorder
-/// or disguise adjacent rendered text. `char::is_control()` matches only
-/// category Cc, so these rode raw through every export lane before this
-/// predicate existed: the embedding/override initiators and pops
-/// (U+202A-202E), the left/right marks (U+200E-200F), the isolate initiators
-/// and pops (U+2066-2069), and the Arabic letter mark (U+061C).
+/// rm-936: Unicode bidi/format controls (general category Cf) that
+/// REORDER adjacent rendered text — the DIRECTIONAL subset of the
+/// category. `char::is_control()` matches only category Cc, so these
+/// rode raw through every export lane before this predicate existed:
+/// the embedding/override initiators and pops (U+202A-202E), the
+/// left/right marks (U+200E-200F), the isolate initiators and pops
+/// (U+2066-2069), and the Arabic letter mark (U+061C). The
+/// NON-directional Cf members (U+FEFF, U+2060, U+00AD, U+180E) do not
+/// reorder anything and are deliberately OUT of this predicate's set —
+/// the display/hiding tricks they enable are a separate, still-open
+/// lane on this row.
 pub fn is_bidi_format_control(c: char) -> bool {
     matches!(
         c,
