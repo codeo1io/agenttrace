@@ -69,7 +69,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 37 and the SQLite snapshot is schema 8; the
+The session cache is schema 38 and the SQLite snapshot is schema 8; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -143,7 +143,12 @@ with a disclosed synthetic fallback and a serialized `cost_basis`
 field on `LoopCost` — instead of pricing-independent constants
 (rm-754 of run bbde21568cd4, landed at its base 1c5edd1 as 32 → 33,
 re-based at integration onto the advanced ceiling as 36 → 37) — so
-cached sessions regenerate with priced loop costs; the SQLite snapshot to 7
+cached sessions regenerate with priced loop costs, and to 38 when
+cache-aware pricing entered the loop-cost arm itself (cache_creation×cw +
+cache_read×cr folded at the per-block oracle, baseline-adjusted loop waste
+beyond each run's first two calls, the inclusive cache-hit-rate basis)
+(rm-842/rm-843/rm-846 of run d932c0c2afee cycle 1, landed at its base
+bfa7ff9 as 37 → 38); the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, and to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548). Older versions are discarded and

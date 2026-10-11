@@ -250,15 +250,27 @@ pub fn waste_report_json(report: &WasteReport) -> String {
 }
 
 fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
-    let hit_rate = if metrics.tokens_input > 0 {
-        metrics.tokens_cache_r as f64 / metrics.tokens_input as f64 * 100.0
+    // rm-846: session metrics fold input, cache_w and cache_r as
+    // SEPARATE classes (lib.rs), and Claude-style journals record
+    // input cache-EXCLUSIVE, so cache_r/input routinely rendered
+    // 500-10000% and the >=80 ladder rated "excellent" trivially.
+    // The hit rate is the share of input-side mass served from cache
+    // -- inclusive denominator, <= 100 by construction.
+    let input_side = metrics
+        .tokens_input
+        .saturating_add(metrics.tokens_cache_w)
+        .saturating_add(metrics.tokens_cache_r);
+    let hit_rate = if input_side > 0 {
+        metrics.tokens_cache_r as f64 / input_side as f64 * 100.0
     } else {
         0.0
     };
-    let wasted_tokens = metrics
-        .tokens_input
-        .saturating_sub(metrics.tokens_cache_r)
-        .max(0);
+    // The uncached residual is the fresh input mass: misses genuinely
+    // pay it at the full input rate; cached reads are never waste.
+    // (The old input - cache_r subtraction subtracted reads from a
+    // cache-exclusive input class -- two different masses -- and
+    // clamped to 0 exactly where waste was largest.)
+    let wasted_tokens = metrics.tokens_input;
     let price = pricing::lookup_price(&metrics.model_used);
     let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
     let (rating, suggestion) = if hit_rate >= 80.0 {
@@ -284,7 +296,9 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
     };
     CacheEfficiency {
         cache_read_tokens: metrics.tokens_cache_r,
-        total_input_tokens: metrics.tokens_input,
+        // Inclusive input-side mass, so the report pair stays
+        // self-consistent: hit_rate = cache_read / total_input x 100.
+        total_input_tokens: input_side,
         hit_rate,
         wasted_cost,
         rating,
@@ -710,5 +724,43 @@ mod tests {
         let rendered = render_waste_report_with_language(&session, ReportLanguage::En);
         assert!(rendered.contains("allocated share of session cost"));
         assert!(rendered.contains("75% of session"));
+    }
+
+    #[test]
+    fn cache_hit_rate_stays_within_100_on_cache_dominant_sessions() {
+        // rm-846: Claude-style journals record input cache-EXCLUSIVE,
+        // so a cache-dominant session (100k fresh vs 900k reads)
+        // rendered hit_rate_percent = 900% and rated "excellent" on
+        // the >=80 ladder. The inclusive basis is <= 100 by
+        // construction, and the report pair stays self-consistent
+        // (hit_rate = cache_read / total_input x 100).
+        let metrics = Metrics {
+            model_used: "claude-haiku-4-5".to_string(),
+            tokens_input: 100_000,
+            tokens_cache_w: 50_000,
+            tokens_cache_r: 900_000,
+            ..Default::default()
+        };
+        let ce = analyze_cache_efficiency(&metrics);
+        assert!(
+            (ce.hit_rate - 900_000.0 / 1_050_000.0 * 100.0).abs() < 1e-9,
+            "inclusive basis: {}",
+            ce.hit_rate
+        );
+        assert!(ce.hit_rate <= 100.0);
+        assert_eq!(ce.cache_read_tokens, 900_000);
+        assert_eq!(ce.total_input_tokens, 1_050_000);
+        // wasted = the uncached residual (fresh input) at the full
+        // input rate; the old input - cache_r subtraction clamped to 0
+        // exactly where the misses were largest.
+        let price = crate::pricing::lookup_price("claude-haiku-4-5");
+        assert!(
+            (ce.wasted_cost - round4(100_000.0 / 1e6 * price.input)).abs() < 1e-9,
+            "wasted dollars price the fresh input mass: {}",
+            ce.wasted_cost
+        );
+        // 85.7% still rates excellent -- the ladder keeps its meaning
+        // on the corrected scale.
+        assert_eq!(ce.rating, "excellent");
     }
 }

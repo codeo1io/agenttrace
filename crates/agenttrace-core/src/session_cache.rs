@@ -5,7 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 37;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 38;
+// Bumped 37 -> 38 (run d932c0c2afee cycle 1, "priced loop & cache
+// reporting truthfulness", rm-842/rm-843): the priced loop-cost arm
+// now folds cache_creation x cw and cache_read x cr exactly like the
+// per-block oracle (a cache-only event keeps the Priced basis
+// instead of flipping the whole session to the synthetic
+// constants), and the composition measures baseline-adjusted waste
+// (calls 3..=N of ALL runs; the whole-max-run tool arm is dropped).
+// The cached loop-cost dollar figures change for UNCHANGED source
+// files, so the cache invalidates once (the rm-230 convention; the
+// same move rm-754 made for its 36 -> 37). Entries regenerate once
+// on next scan.
 // Bumped 36 -> 37 (integration of run bbde21568cd4, "honest numbers",
 // rm-754; conflict case 615546e27c2b4f2d86e02b511f23ddd1): loop
 // costs are now priced from the session's own model rates x the
@@ -1045,11 +1056,21 @@ pub fn load_cached_sessions_from_cache(
         .chain(cache.entries.keys())
         .map(PathBuf::from)
         .collect::<BTreeSet<_>>();
-    let sessions = paths
+    let mut sessions = paths
         .into_iter()
         .filter(|path| dir.is_none_or(|dir| path.starts_with(dir)))
         .filter_map(|path| cached_session(&path, cache))
-        .collect();
+        .collect::<Vec<Session>>();
+    // rm-844: the cached shape deliberately carries zeros for the
+    // subagent rollups (rm-545 re-derives them after every load), and
+    // the cold path re-derives at discovery.rs -- but this warm path
+    // used to hand the sessions back WITHOUT re-attributing, so a
+    // warm start (TUI app.rs new_loading) rendered
+    // subagent_count / subagent_cost / subagent_tokens as 0 until the
+    // background reload landed. Mirror the cold path and roll the
+    // children into their parents right here (upstream #307 fixed the
+    // identical hole); the cache shape itself stays untouched.
+    crate::subagents::attribute_subagents(&mut sessions);
     if cache.is_dirty() {
         let _ = save_session_cache(cache);
     }
@@ -3346,5 +3367,82 @@ mod tests {
             mode & 0o777
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn warm_cache_load_attributes_subagent_rollups() {
+        // rm-844 red-first: load_cached_sessions_from_cache used to
+        // collect() the cached sessions without re-deriving the
+        // subagent rollups, so a warm TUI start rendered
+        // subagent_count / subagent_cost / subagent_tokens as 0 until
+        // the background reload finished. The cached shape stores
+        // zeros for those fields by design (rm-545); the warm path
+        // now mirrors discovery.rs and re-attributes on load.
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-warm-attr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let corpus = root.join("proj");
+        fs::create_dir_all(corpus.join("abc/subagents")).expect("mkdir");
+        let parent_path = corpus.join("abc.jsonl");
+        let child_path = corpus.join("abc/subagents/agent-a1.jsonl");
+        fs::write(&parent_path, "{\"x\":1}\n").expect("parent file");
+        fs::write(&child_path, "{\"x\":1}\n").expect("child file");
+
+        let session_at = |path: &Path, name: &str| Session {
+            name: name.to_string(),
+            path: path.to_string_lossy().to_string(),
+            cwd: String::new(),
+            metrics: crate::Metrics {
+                source_tool: "hermes_jsonl".to_string(),
+                model_used: "claude-haiku-4-5".to_string(),
+                cost_estimated: if name == "agent-a1" { 0.5 } else { 0.0 },
+                tokens_input: if name == "agent-a1" { 40_000 } else { 0 },
+                ..Default::default()
+            },
+            anomalies: Vec::new(),
+            health: 91,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let parent = session_at(&parent_path, "abc");
+        let child = session_at(&child_path, "agent-a1");
+
+        let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        let mut cache = load_session_cache();
+        store_session(&parent_path, &parent, &mut cache).expect("store parent");
+        store_session(&child_path, &child, &mut cache).expect("store child");
+        // warm load: cache alone, no discovery pass, no parse
+        let sessions = load_cached_sessions_from_cache(None, &mut cache);
+        match prior {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        let parent_key = parent_path.to_string_lossy().to_string();
+        let parent_loaded = sessions
+            .iter()
+            .find(|s| s.path == parent_key)
+            .expect("parent served warm");
+        assert_eq!(
+            parent_loaded.metrics.subagent_count, 1,
+            "rm-844: warm loads must re-derive the subagent rollups"
+        );
+        assert!((parent_loaded.metrics.subagent_cost - 0.5).abs() < 1e-9);
+        assert_eq!(
+            parent_loaded.metrics.subagent_tokens,
+            crate::total_tokens(&child),
+            "tokens roll up from the child transcript"
+        );
+        let child_key = child_path.to_string_lossy().to_string();
+        let child_loaded = sessions
+            .iter()
+            .find(|s| s.path == child_key)
+            .expect("child served warm");
+        assert_eq!(
+            child_loaded.metrics.parent_session, parent_key,
+            "the child records its parent on the warm path too"
+        );
     }
 }

@@ -8,6 +8,49 @@
 
 ### Fixed
 
+- Priced loop-cost dollars carry every token class and stop double-counting retries
+  (rm-842/rm-843, run d932c0c2afee cycle 1): the priced loop-cost arm now folds
+  cache_creation x cw and cache_read x cr exactly like the per-block pricing oracle,
+  and its None gate fires only when all four token classes are zero -- a cache-only
+  event is real priced money and keeps the session on the Priced basis instead of
+  flipping the whole LoopCostBasis to the constant synthetic estimate. The composition
+  now measures BASELINE-ADJUSTED waste: every qualifying tool run contributes the
+  priced cost of its calls beyond the first two (calls 3..=N of ALL runs); the
+  whole-max-run tool arm is dropped, so the longest run's retried calls are no longer
+  counted twice while non-max runs contributed nothing (the six-call golden re-pins
+  from 10x to 4x of a call's cost, and a two-call retry run now reads $0 -- baseline
+  behavior, not waste). tool_loop_cost stays serialized for JSON stability and now
+  always reads 0. The session-cache schema bumped 37 -> 38 (one invalidation, the
+  rm-230 convention): the cached loop-cost dollar figures change for unchanged source
+  files, and a warm pre-batch cache would otherwise keep serving the old numbers.
+- Cache hit-rate reports the share of input-side mass served from cache (rm-846, run
+  d932c0c2afee cycle 1): hit_rate_percent = cache_read / (input + cache_write +
+  cache_read) x 100 -- <= 100 by construction. Claude-style journals record input
+  cache-exclusive, so cache_read/input routinely rendered 500-10000% and the >=80
+  ladder rated "excellent" trivially. In the waste report total_input_tokens now
+  carries the inclusive input-side mass so hit_rate_percent = cache_read_tokens /
+  total_input_tokens x 100 holds as a pair, and wasted_tokens is the fresh input
+  mass priced at the full input rate (the old input - cache_read subtraction clamped
+  to 0 exactly where the misses were largest; cached reads are never waste). The
+  json semantic change is disclosed here per the rm-544 machine-contract precedent.
+- The TUI loop-analysis line names its cost basis (rm-847, run d932c0c2afee cycle 1):
+  the line carries basis=priced|synthetic -- the same values the serialized
+  cost_basis field and the governance advice use -- and a synthetic-basis figure
+  renders an explicit (estimate) marker on the dollars, so a constant-derived number
+  never wears a plain $ label on screen (scope note, review 807669279: the rendering
+  helper is currently compiled only for the test build -- the presentation module
+  is #[cfg(test)]-gated at app.rs:1848 and the production loop view shows loop
+  counts, not dollars -- so the basis-named line and its (estimate) marker are
+  pinned by the tui suite for the loop view to adopt when it renders dollars;
+  the serialized cost_basis field and the governance advice labels are production
+  surfaces today).
+- Warm-cache starts attribute subagent rollups (rm-844, run d932c0c2afee cycle 1):
+  load_cached_sessions_from_cache now re-derives the subagent links after collecting
+  the cached sessions, mirroring the discovery path (upstream #307 fixed the identical
+  hole). The cached shape still stores zeros for the rollups by design (rm-545), so a
+  warm TUI start renders real subagent_count / subagent_cost / subagent_tokens
+  immediately instead of zeros until the background reload lands.
+
 - Antigravity sessions report real usage and price the standalone model (rm-720, run
   3ec6cec08fb9 cycle 2): both antigravity lanes (trajectory + jsonl) now fold per-message
   usage blocks (input/output tokens, cache reads) and resolve the model id, priced via
