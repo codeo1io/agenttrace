@@ -286,7 +286,7 @@ fn hermes_state_db_path(home: &Path) -> PathBuf {
     home.join(".hermes").join("state.db")
 }
 
-fn hermes_state_db_paths(home: &Path) -> Vec<PathBuf> {
+pub(crate) fn hermes_state_db_paths(home: &Path) -> Vec<PathBuf> {
     let mut paths = vec![hermes_state_db_path(home)];
     if let Ok(entries) = std::fs::read_dir(home.join(".hermes").join("profiles")) {
         let mut profiles = entries
@@ -311,7 +311,7 @@ fn opencode_db_path(home: &Path) -> PathBuf {
         .join("opencode.db")
 }
 
-fn opencode_db_paths(home: &Path) -> Vec<PathBuf> {
+pub(crate) fn opencode_db_paths(home: &Path) -> Vec<PathBuf> {
     let primary = opencode_db_path(home);
     let Some(dir) = primary.parent() else {
         return vec![primary];

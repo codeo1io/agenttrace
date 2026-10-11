@@ -29,7 +29,7 @@
 //!   and a corpus whose sessions fall outside the requested window
 //!   reports a filter miss, not a discovery miss (rm-781).
 
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -957,4 +957,272 @@ fn config_layer_prices_the_mcp_tools_identically_to_the_cli() {
     let _ = std::fs::remove_dir_all(home_cli.parent().expect("root"));
     let _ = std::fs::remove_dir_all(home_plain.parent().expect("root"));
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+// ---------------------------------------------------------------------------
+// rm-1039 / rm-840 residual / rm-781 — the MCP service-truth batch:
+// one corpus load per process, argument honesty, ordering parity.
+// ---------------------------------------------------------------------------
+
+/// Spawn an INTERACTIVE server session (rm-1039): requests go out one
+/// at a time and each response is read as it arrives, so a test can
+/// mutate the corpus BETWEEN calls of one live process — the
+/// reuse/reload contract is only observable across that boundary.
+/// Environment hygiene mirrors [`mcp_session_raw`]; stderr is
+/// discarded so a chatty child can never block on a full pipe.
+struct McpStream {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    reader: BufReader<std::process::ChildStdout>,
+}
+
+impl McpStream {
+    fn spawn(home: &Path, cache: &Path, argv: &[&str]) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(argv)
+            .env("HOME", home)
+            .env("AGENTTRACE_SESSION_CACHE_DIR", cache)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("AGENTTRACE_PRICING_FILE")
+            .env_remove("AGENTTRACE_HISTORY_DIR")
+            .current_dir(home.parent().expect("seeded root"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn agenttrace");
+        let stdin = child.stdin.take().expect("stdin piped");
+        let reader = BufReader::new(child.stdout.take().expect("stdout piped"));
+        Self {
+            child,
+            stdin,
+            reader,
+        }
+    }
+
+    /// One `tools/call` round trip: the server is strictly
+    /// line-sequential and flushes per response, so exactly one line
+    /// comes back per request.
+    fn call(&mut self, id: u64, tool: &str, arguments: &str) -> Value {
+        writeln!(
+            self.stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":{arguments}}}}}"
+        )
+        .expect("write request");
+        self.stdin.flush().expect("flush request");
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("read response");
+        assert!(!line.trim().is_empty(), "every request answers");
+        serde_json::from_str(line.trim()).expect("response line is JSON")
+    }
+
+    fn finish(mut self) -> Option<i32> {
+        drop(self.stdin);
+        self.child.wait().expect("server exits on stdin EOF").code()
+    }
+}
+
+fn result_text(response: &Value) -> String {
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content")
+        .to_string()
+}
+
+/// rm-840 residual arm: the tools' `inputSchema` publishes
+/// `"additionalProperties": false`, so the server must REFUSE — not
+/// silently ignore — argument keys it does not know. A typo'd `rang`
+/// used to execute the default `all` window with no error on the
+/// wire, and a stray corpus-naming key (`root`) could trigger an
+/// unintended auto-discovery run over the real agent home.
+#[test]
+fn unknown_argument_keys_are_refused_as_invalid_params() {
+    let (home, cache) = seed_home("unknown-args", true);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"usage_overview","arguments":{"root":"/tmp"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"rang":"today"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"usage_overview","arguments":{"range":"all","extra":true}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"usage_overview","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(4, responses.len(), "every request answers: {responses:?}");
+    for (index, unknown) in [(0usize, "root"), (1, "rang"), (2, "extra")] {
+        let response = &responses[index];
+        assert_eq!(
+            -32602, response["error"]["code"],
+            "case `{unknown}` refuses: {response}"
+        );
+        let message = response["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(&format!("`{unknown}`")),
+            "the message names the unknown key: {message}"
+        );
+        assert!(
+            message.contains("(known arguments: `range`)"),
+            "the message names the known set: {message}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "no result rides along with a refusal: {response}"
+        );
+    }
+    // Control arm: a known key still executes the tool.
+    assert_eq!(
+        Value::Bool(false),
+        responses[3]["result"]["isError"],
+        "a known argument still executes: {}",
+        responses[3]
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+/// rm-781 (ordering parity): on a cost TIE the CLI's `by_model`
+/// section orders by sessions desc — the tie corpus (model `aaa`: 1
+/// session, model `zzz`: 3 sessions, equal $0 cost) renders
+/// `[zzz, aaa]` under `--overview -f json`, while this server's
+/// pre-fix copy sorted by name and rendered `[aaa, zzz]`. The tool
+/// now renders through the overview's own group comparator, so both
+/// lanes carry identical rows.
+#[test]
+fn by_model_rows_match_the_cli_overview_on_a_cost_tie() {
+    let (home, cache) = seed_home("ordering-parity", false);
+    let sessions = home.join(".hermes").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    let tie_line = |model: &str, timestamp: &str| {
+        format!("{{\"role\":\"user\",\"content\":\"tie\",\"timestamp\":\"{timestamp}\",\"ModelUsed\":\"{model}\",\"SourceTool\":\"generic\"}}\n")
+    };
+    std::fs::write(
+        sessions.join("tie-aaa-1.jsonl"),
+        tie_line("aaa", "2025-01-01T10:00:00Z"),
+    )
+    .expect("aaa transcript");
+    for minute in 1..=3 {
+        std::fs::write(
+            sessions.join(format!("tie-zzz-{minute}.jsonl")),
+            tie_line("zzz", &format!("2025-01-01T10:0{minute}:00Z")),
+        )
+        .expect("zzz transcript");
+    }
+
+    // CLI lane: the overview document's `by_model` rows.
+    let (code, stdout, _stderr) = cli_run(
+        &home,
+        &cache,
+        &["--overview", "-f", "json", "--range", "all"],
+    );
+    assert_eq!(Some(0), code, "CLI overview must succeed");
+    let cli_rows = serde_json::from_str::<Value>(&stdout).expect("overview json")["by_model"]
+        .as_array()
+        .expect("by_model array")
+        .clone();
+
+    // MCP lane: the same corpus, the same window.
+    let request = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, request);
+    assert_eq!(Some(0), code);
+    let mcp_rows = text_payload(&responses[0])["by_model"]
+        .as_array()
+        .expect("by_model array")
+        .clone();
+
+    let names = |rows: &[Value]| -> Vec<String> {
+        rows.iter()
+            .map(|row| row["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+    assert_eq!(
+        vec!["zzz".to_string(), "aaa".to_string()],
+        names(&cli_rows),
+        "the CLI tie-breaks equal cost by sessions desc: {cli_rows:?}"
+    );
+    assert_eq!(
+        cli_rows, mcp_rows,
+        "the tool renders the SAME rows as the CLI document (rm-781 parity): {mcp_rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+/// rm-1039 (one load per process): a quiet corpus is served from one
+/// in-process load — byte-identical answers — while a MUTATED corpus
+/// (a transcript added, then all removed) reloads and reports fresh
+/// numbers, ending back at the CLI's discovery-miss tool error.
+/// Requires [`McpStream`]: the corpus changes BETWEEN calls of one
+/// live process.
+#[test]
+fn one_load_per_process_reuses_quiet_and_reloads_on_mutation() {
+    let (home, cache) = seed_home("corpus-reuse", true);
+    let sessions = home.join(".hermes").join("sessions");
+    let arguments = r#"{"range":"all"}"#;
+    let mut server = McpStream::spawn(&home, &cache, &["mcp"]);
+    let total_sessions = |text: &str| -> u64 {
+        serde_json::from_str::<Value>(text).expect("payload json")["total_sessions"]
+            .as_u64()
+            .expect("total_sessions is a number")
+    };
+
+    let first = server.call(1, "by_model_breakdown", arguments);
+    assert_eq!(
+        Value::Bool(false),
+        first["result"]["isError"],
+        "the fixture corpus reports: {first}"
+    );
+    let first_text = result_text(&first);
+    assert_eq!(
+        1,
+        total_sessions(&first_text),
+        "one fixture session: {first_text}"
+    );
+
+    // Quiet corpus: the identical second call reuses the load and
+    // answers byte-identically.
+    let second = server.call(2, "by_model_breakdown", arguments);
+    assert_eq!(
+        first_text,
+        result_text(&second),
+        "a quiet corpus reuses the in-process load"
+    );
+
+    // Addition: a second transcript must invalidate the entry and
+    // serve fresh numbers.
+    std::fs::copy(
+        generated_fixture("detailed-tool-steps.jsonl"),
+        sessions.join("second.jsonl"),
+    )
+    .expect("seed second transcript");
+    let third = server.call(3, "by_model_breakdown", arguments);
+    let third_text = result_text(&third);
+    assert_eq!(
+        2,
+        total_sessions(&third_text),
+        "an added transcript reloads and reports: {third_text}"
+    );
+
+    // Removal: every transcript gone — the discovery-miss tool error,
+    // not a stale report.
+    std::fs::remove_file(sessions.join("demo.jsonl")).expect("remove demo");
+    std::fs::remove_file(sessions.join("second.jsonl")).expect("remove second");
+    let fourth = server.call(4, "by_model_breakdown", arguments);
+    assert_eq!(
+        Value::Bool(true),
+        fourth["result"]["isError"],
+        "an emptied corpus is a tool error, not silence: {fourth}"
+    );
+    assert!(
+        result_text(&fourth).contains("No session files found"),
+        "the CLI's discovery-miss wording: {}",
+        result_text(&fourth)
+    );
+
+    assert_eq!(Some(0), server.finish());
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
