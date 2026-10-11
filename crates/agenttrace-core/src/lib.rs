@@ -1,3 +1,4 @@
+mod cursor_store;
 mod demo;
 mod diagnostics;
 mod discovery;
@@ -23,6 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use cursor_store::{cursor_chats_root, cursor_state_vscdb_paths};
 pub use demo::{demo_sessions, DEMO_REPORT_EPOCH};
 pub use diagnostics::{
     attention_priority, attention_rank, fix_suggestions, inspect_first, inspect_reason,

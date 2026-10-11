@@ -225,6 +225,14 @@ pub fn load_sqlite_backed_sessions_reported(
         let loaded = load_opencode_sqlite_sessions(&path, since, &mut report);
         extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &path);
     }
+    // rm-1004: Cursor's live sqlite stores join the same union — the
+    // globalStorage `state.vscdb` and the `~/.cursor/chats` store.db
+    // files, read-only, deduped by the same (source_tool,
+    // session_key) identity, disclosed through the same report.
+    for path in crate::cursor_store::cursor_store_paths(&home) {
+        let loaded = crate::cursor_store::load_cursor_store_sessions(&path, since, &mut report);
+        extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &path);
+    }
     (sessions, report)
 }
 
@@ -234,7 +242,7 @@ pub fn load_sqlite_backed_sessions_reported(
 /// The key is the rm-790 per-row source key — globally unique per
 /// session row within a family — so a byte-identical backup db
 /// contributes zero new identities and is recorded whole.
-fn extend_deduped(
+pub(crate) fn extend_deduped(
     sessions: &mut Vec<Session>,
     report: &mut SqliteIngestReport,
     seen: &mut HashSet<(String, String)>,
@@ -276,6 +284,19 @@ pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
         .iter()
         .any(|path| sqlite_file_exists(path))
         && is_opencode_storage_root(dir)
+    {
+        return true;
+    }
+    // rm-1004: Cursor's IDE live store carries the authoritative
+    // chat copies (with per-bubble usage) that `~/.cursor/projects`
+    // transcripts re-emit. Existence alone is NOT enough — every
+    // Cursor install ships a state.vscdb — so the gate proves the
+    // store actually carries chat rows before transcripts may be
+    // skipped (codeburn `ide-composer-skip-v1` rationale). An
+    // explicit `-d ~/.cursor/projects` still counts transcripts: this
+    // skip only applies to the default walk.
+    if crate::cursor_store::cursor_store_covers_transcripts(&home)
+        && clean_path(dir) == clean_path(&home.join(".cursor").join("projects"))
     {
         return true;
     }
@@ -338,7 +359,7 @@ fn opencode_db_paths(home: &Path) -> Vec<PathBuf> {
     ordered
 }
 
-fn sqlite_file_exists(path: &Path) -> bool {
+pub(crate) fn sqlite_file_exists(path: &Path) -> bool {
     path.is_file()
 }
 
@@ -350,7 +371,7 @@ fn sqlite_file_exists(path: &Path) -> bool {
 /// no longer caches — instead of caching "no data".
 const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_sqlite_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -638,7 +659,7 @@ fn apply_opencode_stored_totals(agg: &mut SqliteSessionAgg) {
     }
 }
 
-fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Session> {
+pub(crate) fn filter_since(sessions: Vec<Session>, since: Option<DateTime<Utc>>) -> Vec<Session> {
     sessions
         .into_iter()
         .filter(|session| session_within_since(session, since))

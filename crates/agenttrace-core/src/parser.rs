@@ -46,19 +46,59 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
             label
         );
     }
-    // Codex ≥0.152 stores rollouts as zstd frames (magic 28 B5 2F FD,
-    // upstream PR #41357); they are no longer plain JSONL. Name the
-    // format instead of failing with a generic "not valid UTF-8"
-    // (pass-7 research, candidate 44 minimum).
+    // rm-1005: Codex ≥0.152 stores rollouts as zstd frames (magic
+    // 28 B5 2F FD, upstream PR #41357); they are no longer plain
+    // JSONL. The body now decodes IN-PROCESS via ruzstd (pure Rust —
+    // no C toolchain, so the static-build story holds), bounded by
+    // [`MAX_ZSTD_DECODED_BYTES`] so a hostile archive cannot balloon
+    // memory. A frame that fails to decode surfaces as a parse
+    // failure the rm-835 LoadReport discloses (never a crash, never
+    // a silent skip). Discovery keeps `.zst` out of the default walk
+    // (`is_session_file_name` still gates on .jsonl/.json — upstream
+    // has not flipped that default either), so this arm serves the
+    // stdin lane (`parse_stdin_bytes` → same decode) and any future
+    // explicit-file path; a `-d` scan root is a directory and never
+    // reaches it.
     if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        bail!(
-            "session file {} is zstd-compressed (Codex rollout format); decompress it to JSONL first (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-            label
-        );
+        let decoded = decode_zstd_session(&raw, label)?;
+        let raw = String::from_utf8(decoded).with_context(|| {
+            format!("read session file {} (zstd body is not valid UTF-8)", label)
+        })?;
+        return parse_raw_session(name, label, &raw);
     }
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
     parse_raw_session(name, label, &raw)
+}
+
+/// Largest zstd body this parser will inflate in memory (rm-1005).
+/// Matches the 256 MiB archive bound the codex port wave pinned; a
+/// frame that inflates past it fails closed with a named error
+/// instead of exhausting memory.
+const MAX_ZSTD_DECODED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Inflate one zstd-framed session body in-process (rm-1005).
+/// `label` names the source in every failure message so the rm-835
+/// LoadReport can disclose exactly which file refused to decode.
+fn decode_zstd_session(raw: &[u8], label: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(std::io::Cursor::new(raw))
+        .with_context(|| format!("decode zstd session file {label} (corrupt frame header)"))?;
+    let mut out = Vec::new();
+    // take()+1 turns the cap into an overflow detector: a body at or
+    // under the cap reads fully, one byte over reads partially and is
+    // rejected by the length check below.
+    let mut bounded = (&mut decoder).take(MAX_ZSTD_DECODED_BYTES as u64 + 1);
+    bounded.read_to_end(&mut out).with_context(|| {
+        format!("decode zstd session file {label} (corrupt or truncated frame)")
+    })?;
+    if out.len() > MAX_ZSTD_DECODED_BYTES {
+        bail!(
+            "session file {label} inflates past the {} MiB zstd cap",
+            MAX_ZSTD_DECODED_BYTES / (1024 * 1024)
+        );
+    }
+    Ok(out)
 }
 
 /// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):
@@ -5617,7 +5657,10 @@ fn add_cursor_composers(value: Option<&Value>, events: &mut Vec<Event>) {
     }
 }
 
-fn cursor_composer_message_events(composer: &Map<String, Value>, fallback_ts: &str) -> Vec<Event> {
+pub(crate) fn cursor_composer_message_events(
+    composer: &Map<String, Value>,
+    fallback_ts: &str,
+) -> Vec<Event> {
     let mut messages = Vec::new();
     if let Some(conversation) = composer.get("conversation").and_then(Value::as_object) {
         messages.extend(cursor_array(conversation.get("messages")));
@@ -6509,7 +6552,7 @@ fn cline_role(role: &str) -> String {
     }
 }
 
-fn cursor_timestamp(value: Option<&Value>) -> String {
+pub(crate) fn cursor_timestamp(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.to_string(),
         Some(Value::Number(number)) => {

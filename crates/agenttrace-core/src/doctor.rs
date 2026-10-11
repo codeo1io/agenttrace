@@ -989,7 +989,85 @@ fn doctor_sqlite_directories(
             failure_samples,
         });
     }
+    dirs.extend(doctor_cursor_store_dirs(sessions, ingest, &home));
     dirs
+}
+
+/// rm-1004: the Cursor live stores are a FAMILY of databases — the
+/// `state.vscdb` candidates plus every `~/.cursor/chats/**/store.db` —
+/// so they report as one aggregate row: sessions parsed under the
+/// `cursor` source_tool, failures summed across every store that
+/// refused to open or decode, each named in the samples. A row
+/// appears only when at least one store exists or something parsed,
+/// keeping Cursor-less machines free of noise the way the single-db
+/// lanes' `!exists && parsed == 0` skip does.
+fn doctor_cursor_store_dirs(
+    sessions: &[Session],
+    ingest: &SqliteIngestReport,
+    home: &Path,
+) -> Vec<DoctorDirReport> {
+    let parsed = sessions
+        .iter()
+        .filter(|session| session.metrics.source_tool == "cursor")
+        .count();
+    let chats_root = crate::cursor_store::cursor_chats_root(home);
+    let primary = crate::cursor_store::cursor_state_vscdb_paths(home)
+        .into_iter()
+        .find(|path| path.is_file())
+        .or_else(|| {
+            ingest
+                .unreadable
+                .iter()
+                .find(|db| db.source == "cursor")
+                .map(|db| db.path.clone())
+        });
+    // Representative path: the covered state.vscdb, else the first
+    // unreadable store (so a broken machine still gets a pointer),
+    // else the chats root even when absent.
+    let exists = primary.as_ref().is_some_and(|path| path.is_file()) || chats_root.is_dir();
+    if parsed == 0 && !exists {
+        return Vec::new();
+    }
+    let path = primary.unwrap_or(chats_root);
+    let unreadable: Vec<_> = ingest
+        .unreadable
+        .iter()
+        .filter(|db| db.source == "cursor")
+        .collect();
+    let dropped: usize = ingest
+        .dropped_rows
+        .iter()
+        .filter(|db| db.source == "cursor")
+        .map(|entry| entry.dropped)
+        .sum();
+    let failed = unreadable.len() + dropped;
+    let mut failure_samples = Vec::new();
+    for db in unreadable {
+        failure_samples.push(format!("{}: unreadable: {}", db.path.display(), db.reason));
+    }
+    for entry in ingest
+        .dropped_rows
+        .iter()
+        .filter(|db| db.source == "cursor")
+    {
+        failure_samples.push(format!(
+            "{}: {} row(s) failed to decode (e.g. {})",
+            entry.path.display(),
+            entry.dropped,
+            entry.sample
+        ));
+    }
+    vec![DoctorDirReport {
+        name: "Cursor (live stores)".to_string(),
+        path: path.to_string_lossy().to_string(),
+        exists,
+        files: parsed + failed,
+        parsed,
+        failed,
+        cache_hits: 0,
+        symlink_target: symlink_target_of(&path),
+        failure_samples,
+    }]
 }
 
 /// rm-858: POSIX single-quote a path for interpolation into a shell command
