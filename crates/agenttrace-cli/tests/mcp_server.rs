@@ -612,6 +612,53 @@ fn oversized_line_is_refused_and_stays_framed() {
 }
 
 #[test]
+fn overlong_line_terminated_by_eof_is_refused_not_silently_dropped() {
+    // rm-921 residual, pinned on the rm-782 byte-level reader: an
+    // over-cap line with NO trailing newline — sized so the
+    // cap-crossing accumulate is the stream's last act and clears the
+    // buffer — must still be refused at EOF. `read_wire_line`'s EOF
+    // arm consults `oversized` BEFORE `line.is_empty()`; testing
+    // emptiness first (the pre-fix order this run's rider closed)
+    // made the refusal indistinguishable from clean EOF: the host got
+    // silence and exit 0 for a message it could not know was dropped.
+    // The refusal keeps the landed rm-923 contract: -32600 naming the
+    // transport cap.
+    let (home, cache) = seed_home("overlong-eof", false);
+    let mut sized = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}".to_string();
+    while sized.len() < 1024 * 1024 + 1 {
+        sized.push('x');
+    }
+    sized.truncate(1024 * 1024 + 1);
+    let (code, responses, _stderr) = mcp_session(&home, &cache, &sized);
+    assert_eq!(
+        Some(0),
+        code,
+        "EOF after an overlong line still exits clean: {_stderr}"
+    );
+    assert_eq!(
+        1,
+        responses.len(),
+        "the EOF-terminated overlong line is refused, not swallowed: {responses:?}"
+    );
+    let refused = responses[0]
+        .get("error")
+        .unwrap_or_else(|| panic!("the refusal is a JSON-RPC error: {responses:?}"));
+    assert_eq!(
+        Some(-32600),
+        refused["code"].as_i64(),
+        "the landed rm-923 refusal contract: {refused}"
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .expect("error message")
+            .contains("transport cap"),
+        "the refusal names the bound: {refused}"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
 fn invalid_request_shapes_answer_spec_errors() {
     // rm-782 (assess F5b/F6a): ids outside String|Number|Null answer
     // -32600 with id null instead of being echoed back; non-object

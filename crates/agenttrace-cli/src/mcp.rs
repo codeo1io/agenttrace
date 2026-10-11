@@ -236,7 +236,12 @@ fn read_wire_line(reader: &mut impl BufRead) -> io::Result<WireLine> {
             if available.is_empty() {
                 // EOF: the host closed stdin. A pending final line
                 // without a trailing newline is still a line; a pending
-                // oversized drain is still oversized.
+                // oversized drain is still oversized (rm-921: the
+                // oversized flag must be consulted BEFORE emptiness or
+                // a cap-crossing unterminated final line reads as clean
+                // EOF and the host gets silence for a message it could
+                // not know was dropped — pinned by the EOF-edge test in
+                // tests/mcp_server.rs).
                 return Ok(if oversized {
                     WireLine::Oversized
                 } else if line.is_empty() {

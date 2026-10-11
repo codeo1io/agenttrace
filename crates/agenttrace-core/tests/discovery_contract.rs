@@ -4218,3 +4218,98 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
     });
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn antigravity_sibling_roots_are_discovered_and_disclosed() {
+    // rm-947: the ecosystem-default antigravity root family (ccusage
+    // paths.rs DEFAULT_ANTIGRAVITY_ROOTS): .gemini/antigravity,
+    // .gemini/antigravity-ide, .gemini/antigravity-backup, and
+    // .config/antigravity each carry a `conversations/` store next to
+    // the already-scanned antigravity-cli root. Before the family lane,
+    // sidecar conversations under every sibling root were silently
+    // missed by default discovery — the exact failure mode ccusage #1851
+    // reported for antigravity-acp.
+    let home = std::env::temp_dir().join(format!(
+        "agenttrace-rust-antigravity-family-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&home);
+    // Real wire shape (agy-reader types.go): user input lives under
+    // `userInput.userResponse`, planner output under `plannerResponse`.
+    // The sidecar must not only be discovered — it must parse on the
+    // antigravity_cli lane, or the family lane would re-create the
+    // swallow it exists to close (found-but-failed is disclosure, not
+    // coverage).
+    let sidecar = serde_json::json!({
+        "trajectoryId": "11111111-2222-3333-4444-555555555555",
+        "trajectoryType": "CORTEX_TRAJECTORY_TYPE_MAIN",
+        "steps": [
+            {
+                "type": "CORTEX_STEP_TYPE_USER_INPUT",
+                "status": "COMPLETED",
+                "metadata": {"createdAt": "2026-10-10T10:00:00Z"},
+                "userInput": {"userResponse": "inspect"}
+            },
+            {
+                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                "status": "COMPLETED",
+                "metadata": {"createdAt": "2026-10-10T10:00:05Z"},
+                "plannerResponse": {
+                    "response": "checking",
+                    "thinking": "verify the family lane"
+                }
+            }
+        ]
+    })
+    .to_string();
+    let roots = [
+        ".gemini/antigravity/conversations",
+        ".gemini/antigravity-ide/conversations",
+        ".gemini/antigravity-backup/conversations",
+        ".config/antigravity/conversations",
+    ];
+    let mut planted = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        let dir = home.join(root);
+        fs::create_dir_all(&dir).expect("create sibling conversations dir");
+        let path = dir.join(format!("conv-{index}.trajectory.json"));
+        fs::write(&path, &sidecar).expect("write trajectory sidecar");
+        planted.push(path);
+    }
+    with_home(&home, || {
+        let files = find_session_files(None);
+        for path in &planted {
+            assert!(
+                files.contains(path),
+                "sibling-root sidecar missed by default discovery: {} (found: {files:?})",
+                path.display()
+            );
+        }
+        let parsed = parse_file(&planted[0]).expect("sibling-root sidecar parses");
+        assert_eq!(
+            parsed.metrics.source_tool, "antigravity_cli",
+            "the sidecar rides the antigravity parser lane, not a fallback"
+        );
+        assert!(
+            parsed.metrics.user_messages >= 1,
+            "user input survives the family lane: {:?}",
+            parsed.metrics
+        );
+        let report = build_doctor_report(None, false);
+        for root in &roots {
+            let disclosed = report.directories.iter().any(|dir| {
+                dir.path.ends_with(root) && dir.exists && dir.files >= 1 && dir.parsed >= 1
+            });
+            assert!(
+                disclosed,
+                "doctor must disclose the sibling root as scanned AND parsed: {root} (dirs: {:?})",
+                report
+                    .directories
+                    .iter()
+                    .map(|dir| dir.path.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+    });
+    let _ = fs::remove_dir_all(&home);
+}
