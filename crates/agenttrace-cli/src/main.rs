@@ -205,7 +205,8 @@ struct Args {
     #[arg(long = "fail-on-critical")]
     fail_on_critical: bool,
     /// CI gate: exit non-zero when the tool failure rate exceeds this
-    /// fraction (0.0-1.0).
+    /// percent (0.0-100.0, the same scale the report prints — `15`
+    /// means 15%, and `0.5` means half a percent, rm-1032).
     #[arg(long = "max-tool-fail-rate")]
     max_tool_fail_rate: Option<f64>,
     /// Load a healthy-baseline summary JSON (path or id) to compare
@@ -2360,6 +2361,7 @@ fn render_test_match_json() -> anyhow::Result<String> {
         "vertex_ai/claude-opus-4-5@20251101",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "openai/gpt-4.1",
+        "gpt-5.6",
         "gpt-4.1-mini-2025-04-14",
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
@@ -2370,12 +2372,19 @@ fn render_test_match_json() -> anyhow::Result<String> {
         .iter()
         .map(|model| {
             let price = lookup_price(model);
+            // rm-610: flex-tier rates disclosed per row (null when the
+            // row carries none — flex turns then bill at the standard
+            // rates above).
             serde_json::json!({
                 "model": model,
                 "input_per_million": price.input,
                 "output_per_million": price.output,
                 "cache_write_per_million": price.cw,
                 "cache_read_per_million": price.cr,
+                "flex_input_per_million": price.input_flex,
+                "flex_output_per_million": price.output_flex,
+                "flex_cache_write_per_million": price.cw_flex,
+                "flex_cache_read_per_million": price.cr_flex,
             })
         })
         .collect();
@@ -4726,8 +4735,43 @@ mod tests {
         assert!(validate_gate_thresholds(&args).is_err());
         args.max_tool_fail_rate = Some(101.0);
         assert!(validate_gate_thresholds(&args).is_err());
+        args.max_tool_fail_rate = Some(-1.0);
+        assert!(validate_gate_thresholds(&args).is_err());
         args.max_tool_fail_rate = Some(100.0);
         assert!(validate_gate_thresholds(&args).is_ok());
+        args.max_tool_fail_rate = Some(0.0);
+        assert!(validate_gate_thresholds(&args).is_ok());
+        args.max_tool_fail_rate = Some(0.5);
+        assert!(
+            validate_gate_thresholds(&args).is_ok(),
+            "rm-1032: 0.5 is a VALID half-a-percent threshold, not an invalid 50% — \
+             the validator is percent-scaled and the help must say so"
+        );
+    }
+
+    #[test]
+    fn max_tool_fail_rate_help_documents_the_percent_scale() {
+        // rm-1032 red-first pin: the flag's machine contract is percent
+        // (validator 0.0..=100.0, gate comparison, "{:.1}%" evidence
+        // lines) — the help once claimed "fraction (0.0-1.0)", which
+        // made a 50%-meaning 0.5 gate at half a percent. The help must
+        // document the percent scale and must never claim a fraction.
+        use clap::CommandFactory;
+        let help = Args::command()
+            .get_arguments()
+            .find(|arg| arg.get_id() == "max_tool_fail_rate")
+            .expect("--max-tool-fail-rate exists")
+            .get_help()
+            .expect("a declared flag carries help text")
+            .to_string();
+        assert!(
+            help.contains("percent"),
+            "help must document the percent scale: {help}"
+        );
+        assert!(
+            !help.contains("fraction"),
+            "help must not claim a fraction scale: {help}"
+        );
     }
 
     fn write_compare_session(path: &std::path::Path, idx: usize) {

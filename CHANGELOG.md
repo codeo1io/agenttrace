@@ -4,6 +4,38 @@
 
 ### Fixed
 
+- Adoption-regression truthfulness re-land + red-gate repair (run
+  a68ac27ee6d64d18a3f7b6a9228df91f cycle 1, base e4e6d3c — the
+  a9c18c4 'adopt upstream v0.10.1' stitch's descendant): the fork's
+  Codex Flex/length-tier pricing machinery, SKU alias-chain hop budget
+  (chain7/chain9 fixtures), pricing-overrides chain tests, and flex
+  catalog rows are re-landed from the pre-adoption tree 82e23b9
+  (rm-927/rm-924/rm-1028/rm-1029) — the stitch had dropped
+  lookup_price_tiered/apply_codex_sku_aliases/flex slots and replaced
+  the snapshot wholesale, so every codex Flex session repriced at the
+  non-flex tier and aliased SKUs double-resolved; the bundled pricing
+  snapshot is restored to the fork's superset (identical model rows,
+  flex rows re-added). Kimi usage double-mirror fixed: parse_kimi_value
+  no longer counts BOTH the top-level usage object and the
+  metadata.usage mirror (rm-1027's original e5653f52 rung re-landed;
+  session cache bumped to schema 59 so warm v58 entries regenerate).
+  `--max-tool-fail-rate` help now documents the percent scale the
+  validator, gate comparison, and `{:.1}%` evidence lines actually use
+  (rm-1032 — the old 'fraction (0.0-1.0)' help invited a 50%-meaning
+  0.5 that gates at half a percent; README flag cell synced, both
+  edges pinned). scripts/ci/check-install-runtime.sh derives its
+  expected pinned ref from install.sh's own REF= line instead of
+  carrying a v0.9.0 literal (rm-1030 — the stitch moved the pin to
+  v0.10.1 and every CI push ran the install lane red while local runs
+  were green; scoped-HOME gate now rc0). Upstream #317 port: README
+  pin-advice refresh (copy-pasteable AGENTTRACE_VERSION one-liners,
+  zh-CN mirror) and install.ps1 param env fallback
+  (AGENTTRACE_VERSION/AGENTTRACE_INSTALL_DIR, same names as
+  install.sh — always the active path under `irm | iex`). Pinned
+  rm-451: a non-parsing root of single-object debug dumps contributes
+  zero sessions and never echoes its payload. rm-879 README
+  pricing-override example verified live ($3.00 exact on a 1M/1M
+  corpus, 'user override' disclosed).
 - Session cache bumped to schema 58 (from 57; run 57c491338818 minted
   the bump as 52 above its base 15a8da8's ceiling 42 — this
   integration re-bases the rung onto the advanced wall per the

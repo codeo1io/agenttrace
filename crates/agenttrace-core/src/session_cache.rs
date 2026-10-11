@@ -5,7 +5,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 58;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 59;
+// Bumped 58 -> 59 (run a68ac27ee6d64d18a3f7b6a9228df91f cycle 1 batch
+// 'adoption-regression truthfulness re-land + red-gate repair'; base
+// e4e6d3c, the a9c18c4 'adopt upstream v0.10.1' stitch's descendant):
+// the kimi usage double-mirror XOR fix re-landed from the
+// pre-adoption tree 82e23b9 (where the same rung was minted as 27 ->
+// 28 by run e5653f52 cycle 2 at base 8991144 and re-based then as
+// 58 -> 59 — identical invalidation, so this re-land keeps the same
+// next rung). parse_kimi_value counted BOTH doc["usage"] and
+// doc["metadata"]["usage"] when a journal mirrored the same usage
+// object at both sites, silently doubling kimi totals; the fix takes
+// one source (top-level preferred, metadata fallback). A warm v58
+// entry keeps serving the doubled totals on untouched files — this
+// const is the regeneration trigger (rm-230 convention: parser-
+// semantics changes that alter the served report bump the schema so
+// cached sessions regenerate). The same batch's codex Flex/length-
+// tier pricing re-land (rm-927/rm-924) needs no rung of its own: the
+// catalog identity digest now covers the providers map and the flex
+// slots (rm-1029), and that digest is part of the freshness key, so
+// every warm entry re-prices on first scan anyway.
 // Bumped 57 -> 58 (integration of run 57c491338818 cycle 1 'the
 // report pipeline must not lie by structure' — the rm-300 U1 id-less
 // fold-key namespace arm (parser.rs ToolResultFoldKey) + the rm-439
@@ -1078,6 +1097,12 @@ struct GoMetrics {
     gaps_sec: Vec<f64>,
     #[serde(default, rename = "ModelUsed")]
     model_used: String,
+    /// rm-610: the service tier the session's usage blocks agreed on.
+    /// Defaulted so pre-existing cache rows deserialize unchanged (they
+    /// are re-priced anyway — the catalog-identity stamp changed when
+    /// the flex slots joined the digest, rm-613).
+    #[serde(default, rename = "ServiceTier")]
+    service_tier: Option<String>,
     #[serde(default, rename = "SourceTool")]
     source_tool: String,
     #[serde(default, rename = "SessionStart")]
@@ -2955,6 +2980,7 @@ impl GoMetrics {
             tokens_cache_r: metrics.tokens_cache_r,
             gaps_sec: metrics.gaps_sec.clone(),
             model_used: metrics.model_used.clone(),
+            service_tier: metrics.service_tier.clone(),
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
@@ -3005,6 +3031,7 @@ impl GoMetrics {
             timestamps: Vec::new(),
             gaps_sec: self.gaps_sec,
             model_used: self.model_used,
+            service_tier: self.service_tier,
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,
