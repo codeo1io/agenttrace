@@ -14,7 +14,54 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 /// values have already been summed.
 type ParseCounters = Vec<(String, i64)>;
 
+/// rm-451: default per-file admission bound for transcript parses.
+/// `parse_file` used to `std::fs::read` every discovered file whole,
+/// so one oversized rollout blew first-scan memory (the PoC that
+/// minted the row measured a 454 MB file costing 4,142 MB RSS, 9.1x,
+/// with the walk's parallel parse workers amplifying it). Real
+/// transcripts sit in the tens of MiB, so 256 MiB is far above every
+/// legitimate corpus member and far below the sizes that hurt: files
+/// past it are skipped whole — loudly, never a crash — instead of
+/// read. Stated as a constant so doctor, the loader and the
+/// explicit-path lanes all quote the same number; runs that
+/// genuinely need a bigger file pass `--max-session-file-bytes`
+/// (0 disables the bound).
+pub const DEFAULT_MAX_SESSION_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// rm-451 admission predicate, shared by the loader walk, the doctor
+/// scan and `parse_file_with_bound` so all three agree on which files
+/// are over the bound. Returns the file's size when it should be
+/// admission-skipped (over `max_bytes`; `max_bytes == 0` disables the
+/// bound), `None` when it passes admission. Stat-only: callers must
+/// not read the file before this returns `None`.
+pub fn file_over_admission_bound(path: &Path, max_bytes: u64) -> Option<u64> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.is_file() && meta.len() > max_bytes {
+        Some(meta.len())
+    } else {
+        None
+    }
+}
+
+fn admission_mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
+    parse_file_with_bound(path, DEFAULT_MAX_SESSION_FILE_BYTES)
+}
+
+/// rm-451: `parse_file` with an explicit per-file admission bound
+/// (`max_bytes == 0` disables it). The gate runs on `fs::metadata`
+/// BEFORE the read, so an over-bound file never costs parse memory;
+/// the error carries the loud skip vocabulary (size, bound, and the
+/// flag that lifts it) instead of a parse failure. Directories (cline
+/// task dirs) and their metadata sidecars stay outside the bound —
+/// it is a per-file transcript gate.
+pub fn parse_file_with_bound(path: &Path, max_bytes: u64) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
     }
@@ -24,6 +71,18 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
                 return Ok(session);
             }
         }
+    }
+    if let Some(len) = file_over_admission_bound(path, max_bytes) {
+        bail!(
+            "session file {} is {} bytes ({}), over the per-file admission bound of {} bytes ({}); \
+             skipped without reading it - raise or disable the bound with \
+             --max-session-file-bytes BYTES (0 = unlimited)",
+            path.display(),
+            len,
+            admission_mib(len),
+            max_bytes,
+            admission_mib(max_bytes)
+        );
     }
     let raw =
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;

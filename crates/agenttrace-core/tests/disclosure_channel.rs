@@ -393,3 +393,94 @@ fn codex_structural_counters_render_as_disclosed_facts_not_dropped_lines() {
         "the report arm agrees confidence is high:\n{text}"
     );
 }
+
+/// rm-451 (cycle-4 admission & automation batch, run 3d480e26): a
+/// whole-file admission skip rides the INFORMATIONAL tier — it is a
+/// policy exclusion (the file was never read), not parse loss. The
+/// counterfactual pin: the same corpus with genuine parse loss keeps
+/// degrading, so the two channels stay distinguishable.
+#[test]
+fn admission_skip_rides_informational_tier_not_loss_tier() {
+    use agenttrace_core::{build_doctor_report, DEFAULT_MAX_SESSION_FILE_BYTES};
+    use std::fs::File;
+    use std::sync::{Mutex, OnceLock};
+
+    const PLANTED_SESSION: &str = concat!(
+        "{\"role\":\"session_meta\",\"timestamp\":\"2026-10-01T09:00:00Z\",\"ModelUsed\":\"claude-sonnet-4-5\"}\n",
+        "{\"role\":\"meta\",\"ModelUsed\":\"claude-sonnet-4-5\",\"Usage\":{\"input_tokens\":120,\"output_tokens\":30}}\n",
+    );
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let home = std::env::temp_dir().join(format!(
+        "rm538-rm451-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&home).expect("sandbox home");
+    let corpus = home.join("projects").join("home-agent-rm451");
+    fs::create_dir_all(&corpus).expect("corpus dir");
+    fs::write(corpus.join("good.jsonl"), PLANTED_SESSION).expect("plant session");
+    // Parse loss for the counterfactual: a session-shaped file whose
+    // tail is torn (truncated mid-line) — the loss tier must see it.
+    fs::write(
+        corpus.join("torn.jsonl"),
+        concat!(
+            "{\"role\":\"session_meta\",\"timestamp\":\"2026-10-01T10:00:00Z\",\"ModelUsed\":\"claude-sonnet-4-5\"}\n",
+            "{\"role\":\"meta\",\"ModelUsed\":\"claude-sonnet-4-5\",\"Usage\":{\"input_toke",
+        ),
+    )
+    .expect("plant torn session");
+    File::create(corpus.join("oversize.jsonl"))
+        .expect("create oversize")
+        .set_len(DEFAULT_MAX_SESSION_FILE_BYTES + 1)
+        .expect("sparse length");
+
+    let previous_home = std::env::var_os("HOME");
+    let previous_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_doctor_report(Some(&home), false)
+    }));
+    std::env::set_var("HOME", previous_home.unwrap_or_default());
+    match previous_cache {
+        Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+        None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+    }
+    let report = result.expect("doctor ran");
+    assert_eq!(
+        report.admission_skips, 1,
+        "the over-bound file is one admission skip"
+    );
+    assert!(
+        !report.dropped_lines.is_empty(),
+        "counterfactual: the genuinely-torn file keeps the loss tier firing"
+    );
+    // The informational tier carries the exclusion; the loss tier must
+    // not. The torn file degrades at the SESSION level (line_skips),
+    // not the doctor's dropped_lines aggregate — pinned loosely so
+    // this test owns only the admission-channel contract.
+    assert_eq!(
+        report
+            .disclosures
+            .get("admission_oversize_skipped")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "informational key carries the admission count"
+    );
+    assert!(
+        !report
+            .dropped_lines
+            .contains_key("admission_oversize_skipped"),
+        "the admission skip never rides the parse-loss tier"
+    );
+    let _ = fs::remove_dir_all(&home);
+}

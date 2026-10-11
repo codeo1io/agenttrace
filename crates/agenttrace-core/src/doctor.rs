@@ -107,6 +107,16 @@ pub struct DoctorReport {
     /// database reads cleanly.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
+    /// rm-451: session files refused whole at the per-file admission
+    /// bound (over `parser::DEFAULT_MAX_SESSION_FILE_BYTES`) — skipped
+    /// without reading, so neither parsed nor failed. Renders as its
+    /// own "Admission-bound skips" row plus an
+    /// `admission_oversize_skipped` informational key.
+    pub admission_skips: usize,
+    /// rm-451: first over-bound paths (path, bytes, bound) as
+    /// ready-to-print samples, capped like failure_samples.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub admission_skip_samples: Vec<String>,
     pub recommendations: Vec<String>,
 }
 
@@ -135,6 +145,14 @@ pub struct DoctorDirReport {
     pub symlink_target: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failure_samples: Vec<String>,
+    /// rm-451: files this directory refused at the per-file admission
+    /// bound — skipped whole, never read, so neither parsed nor
+    /// failed here.
+    pub admission_skips: usize,
+    /// rm-451: first over-bound paths (path, bytes, bound) as
+    /// ready-to-print samples, capped like failure_samples.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub admission_skip_samples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -262,6 +280,20 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     let entry_bound = crate::session_cache::effective_session_cache_entries();
     let entry_bound_source = crate::session_cache::session_cache_entries_source();
     let reparsed_this_scan = files.len().saturating_sub(cached_valid);
+    // rm-451: files refused at the admission bound are neither cache
+    // hits nor parses — subtract them or `reparsed_this_scan` counts
+    // skips the scan never paid.
+    let admission_pre_skips = files
+        .iter()
+        .filter(|f| {
+            crate::parser::file_over_admission_bound(
+                f,
+                crate::parser::DEFAULT_MAX_SESSION_FILE_BYTES,
+            )
+            .is_some()
+        })
+        .count();
+    let reparsed_this_scan = reparsed_this_scan.saturating_sub(admission_pre_skips);
     let mode = if demo {
         "demo sessions"
     } else if dir.is_some() {
@@ -299,6 +331,21 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             opencode_fork_excluded_total,
         );
     }
+    // rm-451: whole-file admission skips aggregate from the provider
+    // directory reports (the authoritative count — doctor_dir_report
+    // gated them out of parsed/failed) and ride the informational
+    // tier with the same key the loader's stderr note quotes. A
+    // policy exclusion with its own render row below, not parse loss
+    // (the file was never read); 0-count-clean.
+    let admission_skips: usize = directories.iter().map(|dir| dir.admission_skips).sum();
+    let admission_skip_samples: Vec<String> = directories
+        .iter()
+        .flat_map(|dir| dir.admission_skip_samples.iter().cloned())
+        .take(3)
+        .collect();
+    if admission_skips > 0 {
+        disclosures.insert("admission_oversize_skipped".to_string(), admission_skips);
+    }
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -332,6 +379,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
         ) + &doctor_deprecation_suffix(),
         sqlite_read_failures: sqlite_ingest.unreadable,
+        admission_skips,
+        admission_skip_samples,
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
@@ -858,7 +907,32 @@ fn doctor_dir_report(
     let mut parsed = 0;
     let mut cache_hits = 0;
     let mut failure_samples = Vec::new();
+    // rm-451: admission skips are a whole-file exclusion, counted
+    // before cache and parse below.
+    let mut admission_skips = 0;
+    let mut admission_skip_samples = Vec::new();
     for file in files {
+        // rm-451: the admission bound applies before cache and parse —
+        // an over-bound file is not corpus. The doctor lane quotes
+        // the DEFAULT constant (it has no --max-session-file-bytes of
+        // its own), so doctor and a default-flag loader run agree;
+        // skipped files are not parse failures, never reach
+        // failure_samples, and are not counted in `failed`.
+        if let Some(len) = crate::parser::file_over_admission_bound(
+            file,
+            crate::parser::DEFAULT_MAX_SESSION_FILE_BYTES,
+        ) {
+            admission_skips += 1;
+            if admission_skip_samples.len() < 3 {
+                admission_skip_samples.push(format!(
+                    "{} ({} bytes, over the {}-byte bound)",
+                    file.display(),
+                    len,
+                    crate::parser::DEFAULT_MAX_SESSION_FILE_BYTES
+                ));
+            }
+            continue;
+        }
         // Keep the parsed session where the decode disclosure (rm-381) can
         // see it; the parse accounting below is unchanged.
         let session = if let Some(session) = cached_session(file, cache) {
@@ -902,10 +976,15 @@ fn doctor_dir_report(
         exists: path.is_dir(),
         files: files.len(),
         parsed,
-        failed: files.len().saturating_sub(parsed),
+        failed: files
+            .len()
+            .saturating_sub(parsed)
+            .saturating_sub(admission_skips),
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,
+        admission_skips,
+        admission_skip_samples,
     }
 }
 
@@ -987,6 +1066,10 @@ fn doctor_sqlite_directories(
             cache_hits: 0,
             symlink_target: symlink_target_of(&path),
             failure_samples,
+            // rm-451: no file lane runs for SQLite-backed providers,
+            // so no admission skips exist here.
+            admission_skips: 0,
+            admission_skip_samples: Vec::new(),
         });
     }
     dirs
@@ -1214,6 +1297,19 @@ fn doctor_report_text(report: &DoctorReport) -> String {
             "Dropped lines (parse loss): {}\n",
             dropped_parts.join(", ")
         ));
+    }
+    if report.admission_skips > 0 {
+        // rm-451: its own labeled row, not parse loss and not an
+        // anonymous informational key — a whole-file exclusion with
+        // the bound and the first samples named.
+        out.push_str(&format!(
+            "Admission-bound skips: {} file(s) over {} MiB skipped whole without reading (rm-451)\n",
+            report.admission_skips,
+            crate::parser::DEFAULT_MAX_SESSION_FILE_BYTES / (1024 * 1024)
+        ));
+        for sample in report.admission_skip_samples.iter().take(3) {
+            out.push_str(&format!("  - {sample}\n"));
+        }
     }
     if !report.disclosures.is_empty() {
         // rm-595: disclosure keys route through the control-byte

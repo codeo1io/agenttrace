@@ -179,3 +179,67 @@ fn doctor_discloses_orphaned_subagents_zero_count_clean() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+/// rm-451 (cycle-4 admission & automation batch, run 3d480e26): the
+/// doctor counts whole-file admission skips on their own row and key
+/// without counting them as failures — pre-fix, `failed: files -
+/// parsed` silently billed the skip as a broken file and
+/// `reparsed_this_scan` billed it as a parse the scan paid.
+#[test]
+fn doctor_counts_admission_skips_without_counting_failures() {
+    let home = temp_home("rm451");
+    with_home(&home, || {
+        let root = std::env::temp_dir().join(format!("at-rm451-hon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("projects").join("home-agent-rm451");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(project.join("session.jsonl"), PLANTED_SESSION).expect("plant session");
+        fs::File::create(project.join("oversize.jsonl"))
+            .expect("create oversize file")
+            .set_len(agenttrace_core::DEFAULT_MAX_SESSION_FILE_BYTES + 1)
+            .expect("set sparse length");
+        let report = build_doctor_report(Some(&root), false);
+        assert_eq!(
+            report.admission_skips, 1,
+            "over-bound file counted exactly once"
+        );
+        assert!(
+            report
+                .admission_skip_samples
+                .iter()
+                .any(|s| s.contains("oversize.jsonl")),
+            "samples name the file: {:?}",
+            report.admission_skip_samples
+        );
+        let dir = report
+            .directories
+            .iter()
+            .find(|d| d.admission_skips == 1)
+            .expect("the provider dir row carries the skip");
+        assert_eq!(dir.parsed, 1, "the good session parsed");
+        assert_eq!(
+            dir.failed, 0,
+            "an admission skip is not a failure (pre-fix: files - parsed billed it)"
+        );
+        assert!(
+            dir.failure_samples.is_empty(),
+            "no failure sample for a skip"
+        );
+        assert_eq!(report.session_files, 2);
+        assert_eq!(
+            report.reparsed_this_scan, 1,
+            "the scan paid one parse, not two (skip excluded)"
+        );
+        let text = render_doctor_report(Some(&root), false, "text").unwrap();
+        assert!(
+            text.contains("Admission-bound skips: 1 file(s)"),
+            "own row:\n{}",
+            text.lines().take(40).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            text.contains("admission_oversize_skipped=1"),
+            "informational key: {text}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    });
+}
