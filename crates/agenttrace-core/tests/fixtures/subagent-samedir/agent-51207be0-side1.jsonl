@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-10-06T11:00:20Z","cwd":"/work/ci-fixes","sessionId":"51207be0-1a2b-4c3d-9e8f-aabbccddeeff","isSidechain":true,"message":{"role":"user","content":"sidechain task"}}
+{"type":"assistant","timestamp":"2026-10-06T11:00:30Z","cwd":"/work/ci-fixes","sessionId":"51207be0-1a2b-4c3d-9e8f-aabbccddeeff","isSidechain":true,"message":{"role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":200,"output_tokens":100}}}

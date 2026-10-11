@@ -5,6 +5,16 @@
 //! the acceptance trait is the STANDALONE totals staying identical to
 //! a run without subagents).
 //!
+//! rm-487 (escalated arm, same-directory layout): Claude Code 2.x
+//! parks sidechains NEXT TO the parent — `agent-*.jsonl` beside
+//! `<uuid>.jsonl`, no `subagents/` directory at all (this host: 0
+//! `subagents/` directories vs 220 same-dir `isSidechain`
+//! sidechains across 7 projects). The parent identity is recorded
+//! inside the transcript: the journal `sessionId` equals the parent
+//! file's stem. The rm-545 rule owns `subagents/` children; this
+//! rule owns same-directory ones, and only links when the named
+//! parent is part of the loaded corpus — no invented edges.
+//!
 //! rm-797: the parent is resolved through the SAME same-file identity
 //! the discovery walk dedups on (rm-597 `SameFileIdentity`) — dev/inode
 //! on Unix, canonicalized path elsewhere — so a parent reachable under
@@ -24,10 +34,20 @@
 //! corpus (orphaned subagents — moved transcripts, partial copies) are
 //! no longer silently dropped: the count is returned so callers can
 //! disclose it while the child keeps rendering as a standalone row.
+//!
+//! rm-787: preserved-history rows keep the rollups persisted with
+//! their record instead of being recomputed — their synthetic
+//! `history:{id}` paths can never re-join the real-path index, so
+//! recomputing would silently zero them and the `--include-history`
+//! view would contradict the live view on the same corpus. Discovery
+//! therefore attributes BEFORE `preserve_derived_history` (records
+//! carry the rollups the live view showed) and again after the
+//! history merge for live rows.
 
 use crate::discovery::{same_file_identity, SameFileIdentity};
 use crate::{total_tokens, Session};
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 
 /// Returns the parent transcript path for a Claude Code subagent
@@ -66,6 +86,56 @@ fn link_key(path: &str) -> LinkKey {
     }
 }
 
+/// rm-487 (same-directory layout): resolve the parent of a sidechain
+/// transcript parked NEXT TO its parent — `agent-*.jsonl` beside
+/// `<uuid>.jsonl` — by the journal `sessionId` the transcript records
+/// (which names the parent file's stem). Only applies outside
+/// `subagents/` directories: the rm-545 rule owns those. Any failure
+/// (missing/unreadable file, no `sessionId`, a hostile id carrying
+/// path separators) leaves the child unlinked rather than inventing an
+/// edge.
+fn same_dir_parent_transcript_path(path: &str) -> Option<String> {
+    let file_path = Path::new(path);
+    let name = file_path.file_name()?.to_str()?;
+    if !(name.starts_with("agent-") && name.ends_with(".jsonl")) {
+        return None;
+    }
+    let dir = file_path.parent()?;
+    if dir.file_name()?.to_str()? == "subagents" {
+        return None;
+    }
+    let id = journal_session_id(file_path)?;
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return None;
+    }
+    Some(format!("{}.jsonl", dir.join(id).to_string_lossy()))
+}
+
+/// Reads the journal `sessionId` out of the first transcript entries
+/// that carry one (bounded — 16 lines — so a huge journal costs one
+/// buffer, not a full parse). Parse shape failures return `None`.
+fn journal_session_id(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(16) {
+        let Ok(line) = line else {
+            return None;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(id) = value.get("sessionId").and_then(|id| id.as_str()) {
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Rolls subagent cost and tokens up into their parent session.
 ///
 /// Subagent sessions stay in the list (so fleet totals still count each
@@ -75,11 +145,15 @@ fn link_key(path: &str) -> LinkKey {
 /// re-running on already attributed sessions recomputes the links from
 /// scratch, and a child whose parent is absent keeps no stale link.
 ///
-/// Two linkage arms:
+/// Linkage arms:
 /// - rm-545: Claude Code subagent transcripts resolve their parent by
 ///   transcript path (`<session>/subagents/agent-*.jsonl`) — keyed by
 ///   the same-file identity (rm-797), with exact-path matching as the
 ///   fallback for paths that do not resolve on disk.
+/// - rm-487: same-directory sidechains (`agent-*.jsonl` parked beside
+///   their parent `<uuid>.jsonl`) resolve the parent by journal
+///   `sessionId` == parent file stem; only a parent present in the
+///   loaded corpus links, everything else stays unlinked.
 /// - rm-791: sqlite-backed children (opencode `parent_id`) resolve their
 ///   parent by source row key (`Metrics::session_key`) inside the same
 ///   source database — those sessions share one `path` (the DB file),
@@ -113,7 +187,14 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
     let mut unlinked = 0usize;
     let mut links = Vec::new();
     for (child, session) in sessions.iter().enumerate() {
-        let Some(parent_path) = parent_transcript_path(&session.path) else {
+        // The rm-545 `subagents/` rule first; the rm-487 same-dir
+        // rule only for agent-*.jsonl files outside `subagents/`
+        // directories (a missing/unreadable journal, a hostile id or
+        // an absent parent leaves the child unlinked, never
+        // invented).
+        let Some(parent_path) = parent_transcript_path(&session.path)
+            .or_else(|| same_dir_parent_transcript_path(&session.path))
+        else {
             continue;
         };
         match index.get(&link_key(&parent_path)) {
@@ -125,6 +206,15 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
         }
     }
     for session in sessions.iter_mut() {
+        // rm-787: preserved-history rows keep the rollups persisted with
+        // their record — they were attributed while their transcripts
+        // were live, and the synthetic `history:{id}` path can never
+        // re-join the real-path index, so recomputing here would
+        // silently zero them (the `--include-history` view used to
+        // contradict the live view on the same corpus).
+        if session.path.starts_with("history:") {
+            continue;
+        }
         session.metrics.subagent_count = 0;
         session.metrics.subagent_cost = 0.0;
         session.metrics.subagent_tokens = 0;
@@ -397,5 +487,123 @@ mod tests {
         );
         std::fs::remove_dir_all(root).ok();
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Scratch journal root that is UNIQUE to the test that creates
+    /// it (pid + tag + process-wide sequence counter) and removes only
+    /// its own dir on Drop (the host temp cleaner is not assumed).
+    /// Pre-review, ONE pid-keyed dir was shared across the parallel
+    /// unit tests and every Drop `remove_dir_all`'d the whole shared
+    /// dir — deleting journals out from under the other tests — a
+    /// reproduced ~2% suite flake (independent_review 355e05af, fixed
+    /// at review fix b45f8690). Unique dirs make the cross-test
+    /// deletion race impossible by construction.
+    struct Scratch(std::path::PathBuf);
+    static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Scratch(std::env::temp_dir().join(format!(
+                "agenttrace-subagents-{}-{tag}-{seq}",
+                std::process::id()
+            )))
+        }
+        /// Writes one journal under this test's dir; a nested name
+        /// (e.g. `subagents/agent-n.jsonl`) creates its subdirs.
+        fn file(&self, name: &str, first_line: &str) -> String {
+            std::fs::create_dir_all(&self.0).ok();
+            let path = self.0.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(&path, format!("{first_line}\n")).ok();
+            path.to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolves_same_dir_parent_from_journal_session_id() {
+        let scratch = Scratch::new("resolve");
+        let child = scratch.file(
+            "agent-side1.jsonl",
+            r#"{"type":"user","sessionId":"51207be0-aaaa-bbbb-cccc-dddddddddddd","cwd":"/w"}"#,
+        );
+        let dir = std::path::Path::new(&child)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            same_dir_parent_transcript_path(&child).as_deref(),
+            Some(format!("{dir}/51207be0-aaaa-bbbb-cccc-dddddddddddd.jsonl").as_str())
+        );
+
+        // No sessionId anywhere -> unlinked, not invented.
+        let bare = scratch.file("agent-bare.jsonl", r#"{"type":"user","cwd":"/w"}"#);
+        assert_eq!(same_dir_parent_transcript_path(&bare), None);
+
+        // Hostile ids carrying path material -> unlinked.
+        let hostile = scratch.file("agent-evil.jsonl", r#"{"sessionId":"../../etc/passwd"}"#);
+        assert_eq!(same_dir_parent_transcript_path(&hostile), None);
+
+        // The rm-545 rule owns subagents/ children: no fallback there.
+        let nested = scratch.file(
+            "subagents/agent-n.jsonl",
+            r#"{"sessionId":"51207be0-aaaa-bbbb-cccc-dddddddddddd"}"#,
+        );
+        assert_eq!(same_dir_parent_transcript_path(&nested), None);
+    }
+
+    #[test]
+    fn links_same_dir_sidechain_to_its_parent() {
+        let scratch = Scratch::new("link");
+        let parent = scratch.file("51207be0-aaaa-bbbb-cccc-dddddddddddd.jsonl", "{}");
+        let child = scratch.file(
+            "agent-of-51207be0.jsonl",
+            r#"{"type":"assistant","sessionId":"51207be0-aaaa-bbbb-cccc-dddddddddddd"}"#,
+        );
+        let unrelated = scratch.file("other.jsonl", "{}");
+        let mut sessions = vec![
+            session(&parent, 0.01, 10),
+            session(&child, 0.0021, 7),
+            session(&unrelated, 1.0, 100),
+        ];
+        attribute_subagents(&mut sessions);
+        assert_eq!(sessions[0].metrics.subagent_count, 1);
+        assert!((sessions[0].metrics.subagent_cost - 0.0021).abs() < 1e-12);
+        assert_eq!(sessions[1].metrics.parent_session, parent);
+        assert_eq!(sessions[2].metrics.subagent_count, 0);
+
+        // A sidechain whose journal names a parent that is not loaded
+        // stays unlinked.
+        let mut lone = vec![session(&child, 0.0021, 7)];
+        attribute_subagents(&mut lone);
+        assert!(lone[0].metrics.parent_session.is_empty());
+    }
+
+    #[test]
+    fn preserved_history_rows_keep_their_persisted_rollups() {
+        let live = session("/p/live.jsonl", 1.0, 100);
+        let mut preserved = session("history:34235f4412345678", 0.0, 0);
+        preserved.name = "history-34235f44".to_string();
+        preserved.metrics.subagent_count = 2;
+        preserved.metrics.subagent_cost = 0.0053;
+        preserved.metrics.subagent_tokens = 91;
+        preserved.metrics.parent_session = "/gone/p1-1111.jsonl".to_string();
+        let mut sessions = vec![live, preserved];
+        attribute_subagents(&mut sessions);
+        // rm-787: the preserved row is not recomputed (its synthetic path
+        // can never re-join the index) — the persisted rollups survive.
+        assert_eq!(sessions[1].metrics.subagent_count, 2);
+        assert!((sessions[1].metrics.subagent_cost - 0.0053).abs() < 1e-12);
+        assert_eq!(sessions[1].metrics.subagent_tokens, 91);
+        assert_eq!(sessions[1].metrics.parent_session, "/gone/p1-1111.jsonl");
+        // Live rows still recompute from scratch.
+        assert_eq!(sessions[0].metrics.subagent_count, 0);
     }
 }

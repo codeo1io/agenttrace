@@ -477,16 +477,26 @@ pub fn load_sessions_with_progress_from_cache_mode(
         opencode_fork_excluded += sqlite_ingest.fork_excluded;
     }
     if options.preserve_history {
+        // rm-787: attribute BEFORE preserving so the derived record
+        // carries the subagent rollups the live view showed. The
+        // post-merge attribution below used to be the only one, so
+        // every record persisted zero rollups.
+        crate::subagents::attribute_subagents(&mut sessions);
         let _ = preserve_derived_history(&sessions);
     }
     if options.include_history {
         merge_preserved_history(&mut sessions);
     }
     // rm-545: link Claude Code subagent transcripts to the session that
-    // spawned them AFTER the history merge (so both freshly parsed and
-    // preserved sessions take part) and BEFORE range/filters (so every
-    // view sees the linked shape). Cached parents get re-attributed on
-    // every load; the cache schema stays untouched.
+    // spawned them AFTER the history merge and BEFORE range/filters (so
+    // every view sees the linked shape). Cached parents get re-attributed
+    // on every load; the cache schema stays untouched. rm-787 made this
+    // honest for preserved rows: they join the list already carrying the
+    // rollups persisted with their record (their synthetic `history:{id}`
+    // paths cannot join the real-path index, so attribution recomputes
+    // live rows only and leaves preserved rows verbatim) — and rm-487's
+    // same-directory rule resolves the sidechain layout Claude Code 2.x
+    // actually writes on this host.
     // rm-799: the call returns the orphan count (children whose parent
     // transcript is absent from the loaded corpus) for disclosure.
     let unlinked_subagents = crate::subagents::attribute_subagents(&mut sessions);

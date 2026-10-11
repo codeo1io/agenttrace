@@ -14,6 +14,15 @@ use agenttrace_core::{
     load_sessions_with_progress_from_cache, total_tokens, LoadOptions, Session, SessionCache,
 };
 
+/// Serializes tests that mutate the process-global AGENTTRACE_HISTORY_DIR
+/// across this binary's parallel lanes (same shape as the in-crate
+/// `test_env::lock_env`). Today the retention test is the only
+/// history-touching test and is safe even unlocked — the other five load
+/// with both history flags false (LoadOptions::default) — but a second
+/// history test would race the save/restore at scope end; the lock makes
+/// that future safe instead of latent (independent_review 355e05af).
+static HISTORY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn corpus() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/subagent-corpus")
 }
@@ -27,17 +36,27 @@ fn load() -> Vec<Session> {
 }
 
 fn load_with_report() -> (agenttrace_core::LoadReport, Vec<Session>) {
+    load_with_report_at(&corpus(), &LoadOptions::default())
+}
+
+fn load_dir(dir: &std::path::Path) -> Vec<Session> {
+    load_with_report_at(dir, &LoadOptions::default()).1
+}
+
+fn load_with_options(dir: &std::path::Path, options: &LoadOptions) -> Vec<Session> {
+    load_with_report_at(dir, options).1
+}
+
+fn load_with_report_at(
+    dir: &std::path::Path,
+    options: &LoadOptions,
+) -> (agenttrace_core::LoadReport, Vec<Session>) {
     let mut cache = SessionCache::default();
-    let report = load_sessions_with_progress_from_cache(
-        Some(&corpus()),
-        &LoadOptions::default(),
-        &mut cache,
-        |_| {},
-    );
+    let report = load_sessions_with_progress_from_cache(Some(dir), options, &mut cache, |_| {});
     assert!(
-        report.sessions.len() >= 6,
-        "corpus must fully discover (parent, 2 children, grandchild, unrelated, orphan): {}",
-        report.sessions.len()
+        !report.sessions.is_empty(),
+        "dir {} must discover at least one session",
+        dir.display()
     );
     (report.clone(), report.sessions)
 }
@@ -197,4 +216,134 @@ fn tsv_session_list_carries_the_subagent_columns() {
         stderr.contains("1 subagent transcript(s) have no parent session"),
         "unlinked subagent disclosure on stderr, got: {stderr}"
     );
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create target dir");
+    for entry in std::fs::read_dir(from).expect("read source dir") {
+        let entry = entry.expect("dir entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+#[test]
+fn links_same_dir_sidechains_by_journal_session_id() {
+    // rm-487 escalated arm (rider to rm-787): Claude Code 2.x parks
+    // sidechains NEXT TO their parent — `agent-*.jsonl` beside
+    // `<uuid>.jsonl`, no `subagents/` directory at all — and the
+    // journal `sessionId` names the parent file's stem. That is the
+    // layout this host actually writes (220 same-dir sidechains across
+    // 7 projects, 0 `subagents/` directories, so the rm-545 path rule
+    // links nothing there; join key proven live on
+    // -work-ci-fixes-glmplus). The fixture mirrors the live shape,
+    // `isSidechain` markers included.
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/subagent-samedir");
+    let sessions = load_dir(&dir);
+    assert!(sessions.len() >= 3, "fixture must fully discover");
+    let parent = by_suffix(&sessions, "51207be0-1a2b-4c3d-9e8f-aabbccddeeff.jsonl");
+    let side = by_suffix(&sessions, "agent-51207be0-side1.jsonl");
+    assert_eq!(
+        side.metrics.parent_session, parent.path,
+        "same-dir sidechain must name the parent its journal sessionId spells"
+    );
+    assert_eq!(parent.metrics.subagent_count, 1);
+    assert!((parent.metrics.subagent_cost - side.metrics.cost_estimated).abs() < 1e-9);
+    // The parent's own metrics never absorb the child (no-double-count).
+    assert_eq!(parent.metrics.cost_estimated, 0.0105);
+    // A sidechain naming a parent that is not loaded stays unlinked,
+    // never invented.
+    let lonely = by_suffix(&sessions, "agent-9f9f9f9f-lonely.jsonl");
+    assert!(lonely.metrics.parent_session.is_empty());
+    assert_eq!(lonely.metrics.subagent_count, 0);
+}
+
+#[test]
+fn preserved_history_rows_keep_their_subagent_rollups() {
+    // rm-787 regression, the assess-13095ad3 PoC end to end through the
+    // real pipeline: with every transcript live, --preserve-history
+    // renders the parent `research x` with SUBAGENTS=2 / 0.0053; once
+    // the parent transcript is gone (fresh cache), --include-history
+    // used to restore it as `history-xxxx ... 0 0.0000` — the preserved
+    // record carried no rollups and the synthetic `history:{id}` path
+    // can never re-join the real-path attribution index, so the
+    // retention view contradicted the live view on the same corpus.
+    // The rollups must travel with the record.
+    let root = std::env::temp_dir().join(format!("agenttrace-rm787-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let full = root.join("full");
+    copy_dir(&corpus(), &full);
+    let pruned = root.join("pruned");
+    copy_dir(&corpus(), &pruned);
+    std::fs::remove_file(pruned.join("p1-1111.jsonl"))
+        .expect("remove the parent transcript (retention scenario)");
+
+    // Serialize the process-global history env mutation (see the
+    // HISTORY_ENV_LOCK doc above).
+    let _history_env_guard = HISTORY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prior_history = std::env::var_os("AGENTTRACE_HISTORY_DIR");
+    std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+
+    // Phase 1 — every transcript live: preserve WITH the rollups the
+    // live view showed. This is the red-first pin for the pre-preserve
+    // attribution: without it, the record stored zeros here.
+    let preserve = LoadOptions {
+        preserve_history: true,
+        ..LoadOptions::default()
+    };
+    let live = load_with_options(&full, &preserve);
+    let parent = by_suffix(&live, "p1-1111.jsonl");
+    assert_eq!(parent.metrics.subagent_count, 2);
+    let live_rollup = parent.metrics.subagent_cost;
+    assert!(
+        (live_rollup - 0.0053).abs() < 1e-9,
+        "pinned PoC rollup cost"
+    );
+
+    // Phase 2 — parent transcript gone, fresh cache: the restored row
+    // keeps the preserved rollups instead of rendering zeros.
+    let include = LoadOptions {
+        include_history: true,
+        ..LoadOptions::default()
+    };
+    let restored = load_with_options(&pruned, &include);
+    let history: Vec<&Session> = restored
+        .iter()
+        .filter(|session| session.path.starts_with("history:"))
+        .collect();
+    assert_eq!(
+        history.len(),
+        1,
+        "exactly the deleted parent restores; the still-live children dedupe by identity"
+    );
+    let row = history[0];
+    assert!(row.name.starts_with("history-"));
+    assert_eq!(
+        row.metrics.subagent_count, 2,
+        "preserved rollup count must survive the retention round-trip"
+    );
+    assert!((row.metrics.subagent_cost - live_rollup).abs() < 1e-12);
+
+    // Live rows still recompute from scratch: the orphaned children
+    // link to nothing, and agent-a1 keeps its grandchild rollup.
+    let a1 = by_suffix(&restored, "agent-a1.jsonl");
+    assert_eq!(a1.metrics.subagent_count, 1);
+    assert!(by_suffix(&restored, "agent-a2.jsonl")
+        .metrics
+        .parent_session
+        .is_empty());
+
+    match prior_history {
+        Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
+        None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

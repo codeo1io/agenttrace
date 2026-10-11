@@ -1918,10 +1918,11 @@ mod tests {
         // The cache location is env-derived, so the test isolates it
         // (and restores on exit). It takes the SHARED test_env lock,
         // not a private static: per-module locks let any other
-        // env-mutating test re-point AGENTTRACE_SESSION_CACHE_DIR
-        // mid-flight, which would write this test's hand-poisoned
-        // snapshot into the other test's cache root and fail the
-        // "poisoned snapshot is in place" pin non-deterministically —
+        // env-mutating test (pricing/session-cache/statusline) re-point
+        // or remove AGENTTRACE_SESSION_CACHE_DIR mid-window, resolving
+        // session_cache_path() to the REAL host cache (where a real
+        // opencode-sqlite.json snapshot lives) — a latent full-suite
+        // flake caught while stress-revalidating review fix b45f8690 —
         // the exact re-pointing class `test_env` documents and closes.
         struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for EnvRestore {
