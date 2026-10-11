@@ -497,3 +497,67 @@ fn all_unparseable_dir_with_colliding_output_keeps_the_parse_bail() {
     );
     std::fs::remove_dir_all(&scratch).ok();
 }
+
+// ---------------------------------------------------------------------------
+// rm-988 (cycle 2, run b5affead): blank `--search` must fail loudly.
+// The assess PoC (attempt 296eaf2c, 2026-10-12) showed `--search ''`
+// and whitespace-only queries exiting 0 with
+// `{"query":"","count":0,"results":[]}` — a shell-quoting accident
+// (an empty $QUERY variable) silently looked like "nothing found".
+// The rejection now fires at the same early-validation site as
+// `--sample must be at least 1`, in the same one-clause dialect, and
+// names --search so the user sees which flag is wrong.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn blank_search_is_rejected_loudly() {
+    for query in ["", "   ", "\t"] {
+        let scratch = std::env::temp_dir().join(format!(
+            "agenttrace-rm988-blank-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let (code, _stdout, stderr) = run_isolated(
+            &["--demo", "--overview", "--search", query, "-f", "json"],
+            &scratch,
+        );
+        assert_ne!(
+            code, 0,
+            "blank --search {query:?} must exit non-zero, not silently match nothing"
+        );
+        assert!(
+            stderr.contains("--search"),
+            "the error must name --search in the limit-dialect, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panic"),
+            "the rejection must be a normal error, not a panic: {stderr}"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+}
+
+#[test]
+fn nonempty_search_keeps_working_after_the_rejection() {
+    // Parity arm: a real query against the demo corpus still exits 0
+    // and returns matches — the rejection cannot have swallowed the
+    // search lane itself. "healthy" matches the demo session name
+    // 01-healthy-ship (search_session_evidence matches on name).
+    let scratch = std::env::temp_dir().join(format!(
+        "agenttrace-rm988-live-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let (code, stdout, _stderr) =
+        run_isolated(&["--demo", "--search", "healthy", "-f", "json"], &scratch);
+    assert_eq!(code, 0, "a real query must keep working");
+    assert!(
+        stdout.contains("\"count\":"),
+        "the search JSON contract must stay intact, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("healthy"),
+        "the matched session must appear in the results, got: {stdout}"
+    );
+    std::fs::remove_dir_all(&scratch).ok();
+}

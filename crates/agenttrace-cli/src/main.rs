@@ -2987,6 +2987,22 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     if args.search_limit == 0 {
         bail!("--search-limit must be at least 1");
     }
+    // rm-988 (cycle 2, run b5affead): a blank or whitespace-only
+    // --search is a quoting accident (an empty $QUERY shell variable),
+    // not a query — it used to exit 0 with
+    // `{"query":"","count":0,"results":[]}`, silently reading as
+    // "nothing found" (assess PoC 296eaf2c: --demo --overview
+    // --search '' -f json, rc 0). The library guard still matches
+    // NOTHING on a blank query (search.rs pins that), but the user
+    // cannot distinguish "no match" from "no query" — reject it here
+    // in the same dialect as the limit guards above.
+    if args
+        .search
+        .as_deref()
+        .is_some_and(|query| query.trim().is_empty())
+    {
+        bail!("--search must not be blank: pass a query or drop the flag");
+    }
     if args.limit == 0 {
         bail!("--limit must be at least 1");
     }
