@@ -377,7 +377,13 @@ the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
 variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
 discloses the bound actually in force, which layer supplied it, and how
 many session files the last scan re-parsed from source instead of the
-cache. Cache files are written owner-only (`0600` on Unix) and
+cache. Whole-file transcript reads are also bounded: a single session
+journal larger than 2 GiB is skipped with a loud stderr disclosure
+(naming the file, its size, and the cap) instead of stalling the parse
+— raise or lower the bound with the `AGENTTRACE_MAX_TRANSCRIPT_BYTES`
+environment variable (a plain byte count, e.g. `268435456`; anything that is not a
+plain positive byte count — including human sizes like `1MiB` — is ignored and the
+2 GiB default applies, and every refusal names the cap actually in force). Cache files are written owner-only (`0600` on Unix) and
 compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
 load reclaims if a crash leaves one behind (see PRIVACY.md). The command
 never fails the host — bad or empty input still
@@ -430,7 +436,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--search-limit <SEARCH_LIMIT>` | `20` | Cap the number of `--search` hits reported (default 20) |
 | `--fail-under-health <FAIL_UNDER_HEALTH>` | `0` | CI gate: exit non-zero when corpus health drops below this score (0 disables the gate) |
 | `--fail-on-critical` |  | CI gate: exit non-zero when any critical-severity finding exists |
-| `--max-tool-fail-rate <MAX_TOOL_FAIL_RATE>` |  | CI gate: exit non-zero when the tool failure rate exceeds this fraction (0.0-1.0) |
+| `--max-tool-fail-rate <MAX_TOOL_FAIL_RATE>` |  | CI gate: exit non-zero when the tool failure rate exceeds this percent (0.0-100.0) |
 | `--baseline <BASELINE>` |  | Load a healthy-baseline summary JSON (path or id) to compare `--compare` runs against |
 | `--baseline-max-duration-delta-pct <BASELINE_MAX_DURATION_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session duration drift, in percent |
 | `--baseline-max-cost-delta-pct <BASELINE_MAX_COST_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session cost drift, in percent |

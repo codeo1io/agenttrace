@@ -55,9 +55,16 @@ RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/late
 SRC_URL="${AGENTTRACE_SOURCE_URL:-https://github.com/${REPO}.git}"
 
 # — download —
+# rm-1002: --proto-redir =https pins redirect targets to TLS. The
+# classic curl downgrade is an https response handing the download to
+# http://, which `-fL` alone would follow (the npm installer's
+# resolveRedirectTarget refuses the same hop). file:// stubs used by
+# offline tests pass untouched: --proto-redir constrains only
+# redirect TARGETS, and the initial URL scheme is governed by
+# --proto (default: https, http).
 echo "⬇️  Downloading agenttrace (${OS}/${ARCH})..."
 TMP=$(mktemp)
-if ! curl -fsSL -o "$TMP" "$RELEASE_URL"; then
+if ! curl -fsSL --proto-redir =https -o "$TMP" "$RELEASE_URL"; then
   rm -f "$TMP"
   echo "❌ No binary found for ${OS}/${ARCH}"
   echo "   Build from source: git clone https://github.com/${REPO}.git && cd agenttrace && cargo build --release -p agenttrace"

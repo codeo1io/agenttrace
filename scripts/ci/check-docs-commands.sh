@@ -43,6 +43,8 @@ for path in "$out_dir"/docs/*.json; do
 done
 
 set +e
+# rm-1001: --max-tool-fail-rate is a PERCENT (15 = 15%); the demo corpus
+# tool-fail rate is exactly 60.0%, so this documented gate must exit 2.
 "$bin" --demo --overview \
   --fail-under-health 80 \
   --fail-on-critical \

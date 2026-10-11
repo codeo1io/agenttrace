@@ -46,9 +46,18 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $DEST = Join-Path $InstallDir $BIN
 
 # Download
+# rm-1002: redirect transport hardening. Invoke-WebRequest follows
+# redirects by default (5 hops is the explicit bound here) but — unlike
+# the curl --proto-redir arm in install.sh and the resolveRedirectTarget
+# arm in npm/scripts/install.js — has no one-flag "redirect targets must
+# stay on https" switch; scheme-pinning the final hop here needs a
+# version-sensitive HttpClient hook that this script cannot test in CI
+# (no PowerShell lane runs it). Residual gap documented here on purpose:
+# the checksum gate below (rm-005, parity with release.yml .sha256
+# sidecars) is the tamper check of record for this lane.
 $tmp = [System.IO.Path]::GetTempFileName()
 try {
-    Invoke-WebRequest -Uri $url -OutFile $tmp
+    Invoke-WebRequest -Uri $url -OutFile $tmp -MaximumRedirection 5
     $size = (Get-Item $tmp).Length
     Write-Host "   Binary size: $size bytes"
 

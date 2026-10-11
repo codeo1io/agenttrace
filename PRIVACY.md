@@ -6,7 +6,7 @@ Generated reports are written only to the output path you request with `-o`. Rev
 
 ## What agenttrace writes on disk
 
-Parsing and reporting persist derived data on this machine. The cache artifacts live under `~/.cache/agenttrace` (`XDG_CACHE_HOME` relocates that root — absolute paths only: the XDG Base Directory spec leaves a relative value undefined, so a relative `XDG_CACHE_HOME` is ignored and the `~/.cache` default is used, rather than creating a cache under whatever directory the tool happens to run from; the session cache, the SQLite snapshots, and the statusline journal additionally honor `AGENTTRACE_SESSION_CACHE_DIR`):
+Parsing and reporting persist derived data on this machine. Whole-file transcript reads are capped at 2 GiB per file (a plain byte count in `AGENTTRACE_MAX_TRANSCRIPT_BYTES` overrides it — anything that is not a plain positive byte count, including human sizes like `1MiB`, is ignored and the 2 GiB default applies): a larger transcript is skipped and disclosed — named with its size and the active cap — never silently read into memory. The cache artifacts live under `~/.cache/agenttrace` (`XDG_CACHE_HOME` relocates that root — absolute paths only: the XDG Base Directory spec leaves a relative value undefined, so a relative `XDG_CACHE_HOME` is ignored and the `~/.cache` default is used, rather than creating a cache under whatever directory the tool happens to run from; the session cache, the SQLite snapshots, and the statusline journal additionally honor `AGENTTRACE_SESSION_CACHE_DIR`):
 
 | Artifact | What it holds | Purge |
 | --- | --- | --- |

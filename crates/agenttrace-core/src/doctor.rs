@@ -135,6 +135,13 @@ pub struct DoctorDirReport {
     pub symlink_target: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failure_samples: Vec<String>,
+    /// rm-1003: transcripts skipped for exceeding the byte cap
+    /// (`AGENTTRACE_MAX_TRANSCRIPT_BYTES`, default 2 GiB) — counted
+    /// apart from `failed` so a budget skip never reads as a parse
+    /// failure in the doctor's tables either.
+    pub oversized: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub oversized_samples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -858,6 +865,11 @@ fn doctor_dir_report(
     let mut parsed = 0;
     let mut cache_hits = 0;
     let mut failure_samples = Vec::new();
+    // rm-1003: transcripts skipped for exceeding the byte cap — a
+    // budget skip with its own counter and samples, never counted as
+    // `failed` (the doctor must not call a budget skip corruption).
+    let mut oversized = 0;
+    let mut oversized_samples = Vec::new();
     for file in files {
         // Keep the parsed session where the decode disclosure (rm-381) can
         // see it; the parse accounting below is unchanged.
@@ -865,19 +877,33 @@ fn doctor_dir_report(
             cache_hits += 1;
             parsed += 1;
             Some(session)
-        } else if let Ok(session) = parse_file(file) {
-            parsed += 1;
-            // rm-367 stage (a): persist the fresh parse so an
-            // immediate --doctor rerun reuses it — the loader lane's
-            // discovery.rs:382 pattern. The reuse shows up on the
-            // NEXT run (cache_hits / cached_valid), not this one.
-            let _ = store_session(file, &session, cache);
-            Some(session)
         } else {
-            if failure_samples.len() < 3 {
-                failure_samples.push(file.to_string_lossy().to_string());
+            match parse_file(file) {
+                Ok(session) => {
+                    parsed += 1;
+                    // rm-367 stage (a): persist the fresh parse so an
+                    // immediate --doctor rerun reuses it — the loader lane's
+                    // discovery.rs:382 pattern. The reuse shows up on the
+                    // NEXT run (cache_hits / cached_valid), not this one.
+                    let _ = store_session(file, &session, cache);
+                    Some(session)
+                }
+                Err(error) => {
+                    // rm-1003: route over-cap refusals to the budget-skip
+                    // counters; anything else keeps the rm-835 failure
+                    // sample channel.
+                    let message = format!("{error:#}");
+                    if crate::parser::is_transcript_cap_error(&message) {
+                        oversized += 1;
+                        if oversized_samples.len() < 3 {
+                            oversized_samples.push(format!("{} ({})", file.display(), message));
+                        }
+                    } else if failure_samples.len() < 3 {
+                        failure_samples.push(file.to_string_lossy().to_string());
+                    }
+                    None
+                }
             }
-            None
         };
         if let Some(session) = session {
             // rm-904: the session is retained (post-folds) for the
@@ -902,10 +928,12 @@ fn doctor_dir_report(
         exists: path.is_dir(),
         files: files.len(),
         parsed,
-        failed: files.len().saturating_sub(parsed),
+        failed: files.len().saturating_sub(parsed + oversized),
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,
+        oversized,
+        oversized_samples,
     }
 }
 
@@ -987,6 +1015,11 @@ fn doctor_sqlite_directories(
             cache_hits: 0,
             symlink_target: symlink_target_of(&path),
             failure_samples,
+            // rm-1003: the sqlite lane reads databases through its own
+            // bounded ingest, not parse_file — no transcript cap applies
+            // here (0-count-clean: no key serialized when empty).
+            oversized: 0,
+            oversized_samples: Vec::new(),
         });
     }
     dirs
@@ -1250,11 +1283,28 @@ fn doctor_report_text(report: &DoctorReport) -> String {
             None => String::new(),
         };
         out.push_str(&format!(
-            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}\n",
-            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
+            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}{}\n",
+            dir.name,
+            status,
+            dir.files,
+            dir.parsed,
+            dir.failed,
+            dir.cache_hits,
+            dir.path,
+            symlink,
+            if dir.oversized > 0 {
+                format!(" oversized={}", dir.oversized)
+            } else {
+                String::new()
+            }
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));
+        }
+        // rm-1003: budget skips get their own sample lines, never the
+        // "failed:" prefix (a skipped transcript is not corruption).
+        for sample in &dir.oversized_samples {
+            out.push_str(&format!("    skipped over byte cap: {sample}\n"));
         }
     }
     out.push_str("\nRecommendations:\n");

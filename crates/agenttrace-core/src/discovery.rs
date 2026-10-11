@@ -66,6 +66,21 @@ pub struct LoadReport {
     /// `--overview -d dir -o dir/bad.jsonl` silently overwrites the
     /// unparseable input (a `.orig` twin is not a recovery path).
     pub parse_failure_paths: Vec<PathBuf>,
+    /// rm-1003: discovered transcripts SKIPPED for exceeding the byte
+    /// cap (`AGENTTRACE_MAX_TRANSCRIPT_BYTES`, default 2 GiB). Counted
+    /// apart from `parse_failures` so a budget skip never reads as
+    /// corruption; still inside `skipped` (the file produced no
+    /// session).
+    pub oversized_skips: usize,
+    /// rm-1003: the first over-cap refusal's message, in discovery
+    /// order — path, size, active cap, and the override knob — for the
+    /// CLI's stderr disclosure line.
+    pub first_oversized_skip: Option<String>,
+    /// rm-1003: every skipped-over-cap path, in discovery order. The
+    /// -o membership check treats them like attempted parse failures
+    /// (rm-912 rationale): overwriting one would destroy the user's
+    /// only copy of a transcript too big to load.
+    pub oversized_paths: Vec<PathBuf>,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -393,6 +408,10 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // LoadReport so the CLI can say what actually happened.
     let mut parse_failures = 0usize;
     let mut first_parse_failure: Option<String> = None;
+    // rm-1003: over-cap refusals counted apart from parse failures.
+    let mut oversized_skips = 0usize;
+    let mut first_oversized_skip: Option<String> = None;
+    let mut oversized_paths: Vec<PathBuf> = Vec::new();
     // rm-912: attempted-but-failed paths in discovery order, for the
     // CLI's -o membership check (see LoadReport::parse_failure_paths).
     let mut parse_failure_paths: Vec<PathBuf> = Vec::new();
@@ -427,16 +446,35 @@ pub fn load_sessions_with_progress_from_cache_mode(
                     }
                     (None, _) => {
                         skipped += 1;
-                        // rm-835: keep the first failure's parser message
-                        // (discovery order) for the LoadReport.
-                        if first_parse_failure.is_none() {
-                            first_parse_failure = failure;
+                        // rm-1003: an over-cap refusal is a budget
+                        // skip, not corruption — route it to its own
+                        // counters (message carries path + size +
+                        // active cap + override knob) and keep it OUT
+                        // of parse_failures so the advisory never calls
+                        // a skipped transcript corrupt.
+                        if failure
+                            .as_deref()
+                            .is_some_and(crate::parser::is_transcript_cap_error)
+                        {
+                            oversized_skips += 1;
+                            if first_oversized_skip.is_none() {
+                                first_oversized_skip = failure;
+                            }
+                            // rm-912 rationale: -o must still refuse to
+                            // overwrite it.
+                            oversized_paths.push(files[next].clone());
+                        } else {
+                            // rm-835: keep the first failure's parser message
+                            // (discovery order) for the LoadReport.
+                            if first_parse_failure.is_none() {
+                                first_parse_failure = failure;
+                            }
+                            // rm-912: the loader ATTEMPTED this path — it
+                            // joins the -o refusal set even though no
+                            // session was produced from it.
+                            parse_failure_paths.push(files[next].clone());
+                            parse_failures += 1;
                         }
-                        // rm-912: the loader ATTEMPTED this path — it
-                        // joins the -o refusal set even though no
-                        // session was produced from it.
-                        parse_failure_paths.push(files[next].clone());
-                        parse_failures += 1;
                     }
                 }
                 report_load_progress(
@@ -538,6 +576,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
+        oversized_skips,
+        first_oversized_skip,
+        oversized_paths,
         unlinked_subagents,
     }
 }

@@ -147,6 +147,8 @@ cmp -s "$out_dir/agenttrace-demo-dark.svg" "$out_dir/agenttrace-demo-dark-2.svg"
   || fail "svg card must be byte-deterministic for a fixed corpus+theme"
 
 set +e
+# rm-1001: --max-tool-fail-rate is a PERCENT (15 = 15%); the demo corpus
+# tool-fail rate is exactly 60.0%, so this documented gate must exit 2.
 "$bin" --demo --overview -f json \
   --fail-under-health 80 \
   --fail-on-critical \

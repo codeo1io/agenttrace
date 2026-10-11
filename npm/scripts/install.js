@@ -21,6 +21,15 @@ const REPOSITORY = "luoyuctl/agenttrace";
 const ARCHITECTURES = { x64: "amd64", arm64: "arm64" };
 const PLATFORMS = { darwin: "darwin", linux: "linux", win32: "windows" };
 
+// rm-1002: hard ceiling for one downloaded release asset. The npm
+// cache directory is a hostile place for unbounded streams: without
+// this cap the abort-before-checksum property did not exist — a
+// hostile or corrupt asset could stream unbounded bytes to disk
+// BEFORE the sha256 comparison ever ran. 128 MiB dwarfs the ~15 MiB
+// binaries the release publishes.
+const MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
+
 function fail(message) {
 	throw new Error(`agenttrace installation failed: ${message}`);
 }
@@ -37,9 +46,29 @@ function getAssetName() {
 	}`;
 }
 
-function download(url, destination, redirects = 0) {
+// rm-1002: redirect targets must stay on TLS. The old resolver
+// followed ANY scheme — an https hop could hand the download to
+// `http://` (or any scheme node can name) and the download would
+// follow it. Pure validation: returns the resolved absolute URL, or
+// throws before any bytes move.
+function resolveRedirectTarget(location, current) {
+	const target = new URL(location, current);
+	if (target.protocol !== "https:") {
+		throw new Error(
+			`agenttrace installation failed: unsupported scheme ${target.protocol} in redirect ${target.href}`,
+		);
+	}
+	return target;
+}
+
+function download(
+	url,
+	destination,
+	redirects = 0,
+	{ request = get, maxBytes = MAX_DOWNLOAD_BYTES } = {},
+) {
 	return new Promise((resolve, reject) => {
-		get(
+		request(
 			url,
 			{
 				headers: {
@@ -53,10 +82,30 @@ function download(url, destination, redirects = 0) {
 					response.statusCode >= 300 &&
 					response.statusCode < 400 &&
 					location &&
-					redirects < 5
+					redirects < MAX_REDIRECTS
 				) {
 					response.resume();
-					resolve(download(new URL(location, url), destination, redirects + 1));
+					// rm-1002: scheme-pinned redirect following - the target
+					// must stay on https, whatever the Location header says.
+					let target;
+					try {
+						target = resolveRedirectTarget(location, url);
+					} catch (error) {
+						reject(error);
+						return;
+					}
+					resolve(
+						download(target, destination, redirects + 1, { request, maxBytes }),
+					);
+					return;
+				}
+				if (response.statusCode >= 300 && response.statusCode < 400) {
+					response.resume();
+					reject(
+						new Error(
+							`redirect loop or missing Location at ${url} (after ${redirects} redirects)`,
+						),
+					);
 					return;
 				}
 				if (response.statusCode !== 200) {
@@ -64,9 +113,41 @@ function download(url, destination, redirects = 0) {
 					reject(new Error(`download returned HTTP ${response.statusCode}`));
 					return;
 				}
+				// rm-1002: count bytes to disk - content-length AND streamed
+				// bodies both cross the cap. Over cap: destroy the socket,
+				// remove the partial file, refuse. The abort fires BEFORE
+				// the checksum comparison ever sees the file (previously
+				// the pipeline streamed unbounded bytes into the npm cache).
+				const declaredLength = Number(response.headers["content-length"]);
+				if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+					response.destroy();
+					rmSync(destination, { force: true });
+					reject(
+						new Error(
+							`release asset declares ${declaredLength} bytes, over the ${maxBytes}-byte cap`,
+						),
+					);
+					return;
+				}
+				let received = 0;
+				response.on("data", (chunk) => {
+					received += chunk.length;
+					if (received > maxBytes) {
+							response.destroy(
+								new Error(
+									`release asset exceeds the ${maxBytes}-byte cap mid-stream (byte cap breached)`,
+								),
+						);
+					}
+				});
 				pipeline(response, createWriteStream(destination)).then(
 					resolve,
-					reject,
+					(error) => {
+						rmSync(destination, { force: true });
+						const reason =
+							error && error.message ? error.message : "stream closed";
+						reject(new Error(`byte cap or stream failure: ${reason}`));
+					},
 				);
 			},
 		).on("error", reject);
@@ -129,7 +210,19 @@ async function main() {
 	}
 }
 
-main().catch((error) => {
-	console.error(error.message);
-	process.exit(1);
-});
+module.exports = {
+	download,
+	resolveRedirectTarget,
+	MAX_DOWNLOAD_BYTES,
+	MAX_REDIRECTS,
+};
+
+// Script-first: postinstall still runs this file directly. The
+// module guard keeps `require("./scripts/install.js")` (the offline
+// tests in test/install-transport.test.js, rm-1002) side-effect free.
+if (require.main === module) {
+	main().catch((error) => {
+		console.error(error.message);
+		process.exit(1);
+	});
+}

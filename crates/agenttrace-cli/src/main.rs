@@ -205,7 +205,7 @@ struct Args {
     #[arg(long = "fail-on-critical")]
     fail_on_critical: bool,
     /// CI gate: exit non-zero when the tool failure rate exceeds this
-    /// fraction (0.0-1.0).
+    /// percent (0.0-100.0).
     #[arg(long = "max-tool-fail-rate")]
     max_tool_fail_rate: Option<f64>,
     /// Load a healthy-baseline summary JSON (path or id) to compare
@@ -1959,17 +1959,49 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                 first
             );
         }
+        // rm-1003: the all-skipped story — every discovered transcript
+        // was over the byte cap — must not fall through to the generic
+        // "filters" bail (that would read as a filter miss, hiding the
+        // budget skip and the AGENTTRACE_MAX_TRANSCRIPT_BYTES knob).
+        if report.oversized_skips > 0 {
+            if report.oversized_skips == report.discovered {
+                bail!(
+                    "No sessions parsed: all {} discovered transcripts skipped over the byte cap (first: {})",
+                    report.discovered,
+                    report.first_oversized_skip.as_deref().unwrap_or("unknown")
+                );
+            }
+            bail!(
+                "No sessions match the requested filters ({} of {} discovered transcripts skipped over the byte cap; first: {})",
+                report.oversized_skips,
+                report.discovered,
+                report.first_oversized_skip.as_deref().unwrap_or("unknown")
+            );
+        }
         bail!("No sessions match the requested filters");
     }
     if let Some(advisory) = parse_failure_advisory(&report) {
         eprintln!("agenttrace: warning: {advisory}");
     }
+    // rm-1003: one stderr line for cap skips — the skipped corpus must
+    // stay visible without poisoning the parse-failure advisory
+    // (budget skip != corruption). 0-count-clean: nothing at 0.
+    if report.oversized_skips > 0 {
+        eprintln!(
+            "agenttrace: warning: {} transcript(s) skipped over the byte cap (first: {})",
+            report.oversized_skips,
+            report.first_oversized_skip.as_deref().unwrap_or("unknown")
+        );
+    }
     // rm-534: discovery/-d-walk arm of the input-journal membership
     // check (`-o <name>.jsonl` colliding with any journal a walk
     // admitted) — loud BEFORE any bytes are staged. rm-912: the walk
     // lane also contributes its attempted-but-unparseable journals —
-    // overwriting one would destroy the user's only copy.
-    ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
+    // overwriting one would destroy the user's only copy. rm-1003:
+    // skipped-over-cap paths join the refusal set for the same reason.
+    let mut attempted = report.parse_failure_paths.clone();
+    attempted.extend(report.oversized_paths.iter().cloned());
+    ensure_output_is_not_an_input(args, &sessions, &attempted)?;
     Ok((sessions, Some(report)))
 }
 
@@ -4736,6 +4768,68 @@ mod tests {
         assert!(validate_gate_thresholds(&args).is_err());
         args.max_tool_fail_rate = Some(100.0);
         assert!(validate_gate_thresholds(&args).is_ok());
+    }
+
+    #[test]
+    fn max_tool_fail_rate_states_and_enforces_one_unit() {
+        // rm-1001: the clap help and README promised a FRACTION
+        // (0.0-1.0) while evaluate_overview_gate compares a PERCENT —
+        // a user passing 0.7 for "70%" armed a 0.7% gate. The flag's
+        // ONE unit is percent (0.0-100.0): the help text, the README
+        // flag table, and the gate arithmetic must all state it, and
+        // out-of-range values are rejected at parse time (the
+        // governance test above). The zh-CN README does not document
+        // this flag (0 hits), so it carries no stale unit to fix.
+        use clap::CommandFactory;
+
+        let help = Args::command().render_help().to_string();
+        assert!(
+            help.contains("--max-tool-fail-rate"),
+            "help must document the flag, got:\n{help}"
+        );
+        assert!(
+            help.contains("percent (0.0-100.0)"),
+            "help must state the percent unit, got:\n{help}"
+        );
+        assert!(
+            !help.contains("fraction (0.0-1.0)"),
+            "the fraction contract is retired, got:\n{help}"
+        );
+
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+                .expect("read README");
+        assert!(
+            readme.contains("exceeds this percent (0.0-100.0)"),
+            "README flag table must state the same percent unit as help"
+        );
+        assert!(
+            !readme.contains("fraction (0.0-1.0)"),
+            "README fraction contract is retired"
+        );
+
+        // Gate arithmetic under percent semantics, pinned against the
+        // demo corpus (tool-fail rate exactly 60.0%: 2 ok / 3 failed
+        // tool calls). 1.5 is NOT "150%" — it is 1.5% and must fail a
+        // 60% corpus loudly; 70.0 is 70% and must pass it.
+        let sessions = demo_sessions().expect("demo sessions");
+        let overview = compute_overview(&sessions);
+        assert!(
+            !evaluate_overview_gate(&overview, &sessions, 0, false, Some(1.5)).is_empty(),
+            "1.5 (percent) must fail the 60.0% demo corpus"
+        );
+        assert!(
+            !evaluate_overview_gate(&overview, &sessions, 0, false, Some(0.7)).is_empty(),
+            "0.7 (percent) must fail the 60.0% demo corpus"
+        );
+        assert!(
+            evaluate_overview_gate(&overview, &sessions, 0, false, Some(70.0)).is_empty(),
+            "70.0 (percent) must pass the 60.0% demo corpus"
+        );
+        assert!(
+            (agenttrace_core::tool_fail_rate(&sessions) - 60.0).abs() < 1e-9,
+            "demo corpus tool-fail rate must be exactly 60%"
+        );
     }
 
     fn write_compare_session(path: &std::path::Path, idx: usize) {

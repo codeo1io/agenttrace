@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::{HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 type TokenUsage = BTreeMap<String, i64>;
@@ -13,6 +14,47 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 /// #316): clamp facts the aggregator cannot re-derive once the clamped
 /// values have already been summed.
 type ParseCounters = Vec<(String, i64)>;
+
+/// rm-1003: hard ceiling for one whole-file transcript read. Before
+/// this cap, `parse_file` slurped any size with an unbounded
+/// `fs::read`, so a multi-GB rollout silently stalled every lane that
+/// touched it — reports, cache build, and the doctor — while the
+/// process quietly filled memory. 2 GiB keeps every real transcript
+/// (the live corpus tops out near 200 MiB) while capping the stall;
+/// `AGENTTRACE_MAX_TRANSCRIPT_BYTES` overrides it (the override is
+/// honored exactly when it parses to a positive u64 — anything else
+/// falls back to this default, and the refusal message always names
+/// the ACTIVE cap, so a silently-ignored override cannot hide).
+pub const DEFAULT_TRANSCRIPT_BYTE_CAP: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Sentinel embedded in every over-cap refusal; discovery and the
+/// doctor route on it to count a budget skip apart from a parse
+/// failure (a transcript too big to read is not corruption).
+pub(crate) const TRANSCRIPT_CAP_SENTINEL: &str = "over the transcript cap";
+
+/// Active transcript byte cap (see [`DEFAULT_TRANSCRIPT_BYTE_CAP`]).
+pub fn transcript_byte_cap() -> u64 {
+    std::env::var_os("AGENTTRACE_MAX_TRANSCRIPT_BYTES")
+        .and_then(|raw| raw.to_str().and_then(|raw| raw.parse::<u64>().ok()))
+        .filter(|parsed| *parsed > 0)
+        .unwrap_or(DEFAULT_TRANSCRIPT_BYTE_CAP)
+}
+
+/// True when a parse-failure message is an over-cap refusal (the
+/// [`TRANSCRIPT_CAP_SENTINEL`] is pinned by tests).
+pub fn is_transcript_cap_error(message: &str) -> bool {
+    message.contains(TRANSCRIPT_CAP_SENTINEL)
+}
+
+fn oversize_transcript_error(path: &Path, len: u64, cap: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "session file {} is {:.1} MiB, {} (active cap {:.1} MiB; set AGENTTRACE_MAX_TRANSCRIPT_BYTES to raise it; skipped)",
+        path.display(),
+        len as f64 / 1_048_576.0,
+        TRANSCRIPT_CAP_SENTINEL,
+        cap as f64 / 1_048_576.0
+    )
+}
 
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
@@ -25,8 +67,25 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
             }
         }
     }
-    let raw =
-        std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
+    // rm-1003: bound the whole-file read. The stat check skips cheaply
+    // without allocating; `take(cap + 1)` bounds the read itself, so a
+    // file that grows between stat and read still cannot push more
+    // than cap+1 bytes into memory (cap+1 read => refused here).
+    let cap = transcript_byte_cap();
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > cap {
+            return Err(oversize_transcript_error(path, meta.len(), cap));
+        }
+    }
+    let mut raw = Vec::new();
+    file.take(cap + 1)
+        .read_to_end(&mut raw)
+        .with_context(|| format!("read session file {}", path.display()))?;
+    if raw.len() as u64 > cap {
+        return Err(oversize_transcript_error(path, raw.len() as u64, cap));
+    }
     let name = session_name(path);
     let path_text = path.to_string_lossy().to_string();
     parse_session_bytes(raw, &path_text, &name)
