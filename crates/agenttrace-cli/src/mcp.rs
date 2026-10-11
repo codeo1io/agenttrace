@@ -153,7 +153,15 @@ pub fn serve(root: Option<&Path>) -> anyhow::Result<()> {
                     &error_response(
                         None,
                         CODE_INVALID_REQUEST,
-                        "Invalid Request: message line exceeds the 1048576-byte transport cap and was discarded",
+                        // rm-987: the byte figure derives from the cap
+                        // const above — raising MCP_INPUT_MAX_BYTES can
+                        // never leave the refusal naming a stale number
+                        // (the wire bytes are identical to the old
+                        // literal at the current 1 MiB cap).
+                        &format!(
+                            "Invalid Request: message line exceeds the {}-byte transport cap and was discarded",
+                            MCP_INPUT_MAX_BYTES
+                        ),
                     ),
                 )?;
                 continue;
@@ -681,13 +689,21 @@ fn by_model_breakdown(root: Option<&Path>, range: TimeRange) -> Result<Value, (i
             })
         })
         .collect();
-    // Cost-descending, name-tie-broken — the ordering the overview's
-    // own `by_model` section uses.
+    // rm-987: the EXACT `group_items(by_model, agent_display=false)`
+    // ordering the CLI's `--overview -f json` by_model array uses
+    // (agenttrace-core reports.rs): cost desc → sessions desc → name
+    // asc. The previous comparator stopped at cost→name, so a cost tie
+    // with differing session counts ordered this tool differently
+    // from the CLI on the same corpus (assess F3 PoC: zeta-model ×2 vs
+    // alpha-model ×1 at cost 0.0). Parity is pinned by
+    // `by_model_breakdown_orders_ties_like_the_cli_overview`.
     models.sort_by(|a, b| {
         let cost = |value: &Value| value["cost"].as_f64().unwrap_or(0.0);
+        let sessions = |value: &Value| value["sessions"].as_u64().unwrap_or(0);
         cost(b)
             .partial_cmp(&cost(a))
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| sessions(b).cmp(&sessions(a)))
             .then_with(|| {
                 let name = |value: &Value| value["name"].as_str().unwrap_or("").to_string();
                 name(a).cmp(&name(b))
