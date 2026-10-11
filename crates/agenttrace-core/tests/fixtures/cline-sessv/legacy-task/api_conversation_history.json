@@ -1,0 +1,20 @@
+[
+  {
+    "role": "user",
+    "ts": 1760123400000,
+    "content": [{ "type": "text", "text": "draft the migration plan" }]
+  },
+  {
+    "role": "assistant",
+    "ts": 1760123415000,
+    "content": [{ "type": "text", "text": "Here is the migration plan." }]
+  },
+  {
+    "role": "assistant",
+    "ts": 1760123428000,
+    "content": [
+      { "type": "thinking", "thinking": "check the index first" },
+      { "type": "text", "text": "The index is safe to drop after the backfill." }
+    ]
+  }
+]

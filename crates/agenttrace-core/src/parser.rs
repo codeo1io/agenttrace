@@ -91,6 +91,29 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
             append_cline_event(&mut events, &mut seen, event);
         }
     }
+    // rm-1032: the sess-v storage generation keeps the task-dir shape
+    // but stores the transcript as `<dir-name>.messages.json` with
+    // per-assistant-message usage metrics (ccusage PR #1642). Usage
+    // rides meta events (the native-family fold counts `meta` usage;
+    // conversation roles with usage would fall to
+    // `usage_present_not_counted`), and the generation stays visible
+    // through the `cline_generation:sess-v` disclosure counter so the
+    // doctor census can tell the two storage generations apart.
+    if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
+        if let Some(raw) = read_json_value(&dir.join(format!("{name}.messages.json"))) {
+            for mut event in parse_cline_sessv_messages(&raw) {
+                // The sess-v body is its own dedup domain: usage events
+                // are key-identical (empty content, same-millisecond
+                // timestamps) and the append_cline_event key would
+                // erase real usage, so each metrics-bearing message is
+                // counted exactly once, directly.
+                if event.model_used.is_empty() {
+                    event.model_used = "unknown".to_string();
+                }
+                events.push(event);
+            }
+        }
+    }
     if events.is_empty() {
         bail!("cline: no parseable events in {}", dir.display());
     }
@@ -7498,10 +7521,17 @@ fn non_empty(events: Vec<Event>) -> Option<Vec<Event>> {
 }
 
 fn is_cline_task_file(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some("api_conversation_history.json" | "ui_messages.json" | "task_metadata.json")
-    )
+    // rm-1032: the sess-v generation's transcript body (`<id>.messages.json`)
+    // routes through its parent dir like the legacy task-dir members.
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            matches!(
+                name,
+                "api_conversation_history.json" | "ui_messages.json" | "task_metadata.json"
+            ) || name.ends_with(".messages.json")
+        })
+        .unwrap_or(false)
 }
 
 fn read_json_value(path: &Path) -> Option<Value> {
@@ -7577,6 +7607,102 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
     events
 }
 
+/// rm-1032: parse a Cline sess-v transcript (`<id>.messages.json`,
+/// ccusage PR #1642): `{"sessionId": …, "messages": [{"role": …,
+/// "ts": <epoch ms>, "modelInfo": {"id": …}, "metrics":
+/// {"inputTokens", "outputTokens", "cacheReadTokens",
+/// "cacheWriteTokens", "cost"}}]}`.
+///
+/// Each metrics-bearing assistant message becomes one `meta` usage
+/// event — the native-family fold counts `meta`/`session_meta` usage,
+/// while conversation roles with usage would fall to
+/// `usage_present_not_counted`. Messages without a model id or without
+/// token usage are skipped, exactly like the reference loader
+/// (they are not usage-bearing turns). `metrics.cost` is a recorded
+/// cost and stays unconsumed (rm-253 deferral family): every message
+/// carrying one discloses it through
+/// `cline_recorded_cost_deferred` so an estimate never masquerades as
+/// the extension's own number. The storage generation is disclosed
+/// per message through `cline_generation:sess-v` (acceptance b/d).
+fn parse_cline_sessv_messages(value: &Value) -> Vec<Event> {
+    let messages: &[Value] = match value {
+        Value::Array(items) => items,
+        Value::Object(obj) => obj
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        _ => &[],
+    };
+    let mut events = Vec::new();
+    for message in messages {
+        let Some(message) = message.as_object() else {
+            continue;
+        };
+        let model = message
+            .get("modelInfo")
+            .and_then(|model| model.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if model.is_empty() {
+            continue;
+        }
+        let metrics = message
+            .get("metrics")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let token = |key: &str| {
+            metrics
+                .get(key)
+                .and_then(Value::as_i64)
+                .map(|tokens| tokens.max(0))
+                .unwrap_or(0)
+        };
+        let input = token("inputTokens");
+        let output = token("outputTokens");
+        let cache_read = token("cacheReadTokens");
+        let cache_write = token("cacheWriteTokens");
+        if input == 0 && output == 0 && cache_read == 0 && cache_write == 0 {
+            continue;
+        }
+        let ts = cline_timestamp(
+            first_value(message, &["ts", "timestamp", "createdAt", "created_at"])
+                .unwrap_or(&Value::Null),
+        );
+        let recorded_cost = metrics.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+        let mut disclosure_counters = BTreeMap::new();
+        disclosure_counters.insert("cline_generation:sess-v".to_string(), 1);
+        if recorded_cost > 0.0 {
+            disclosure_counters.insert("cline_recorded_cost_deferred".to_string(), 1);
+        }
+        let mut usage = BTreeMap::new();
+        if input > 0 {
+            usage.insert("input_tokens".to_string(), input);
+        }
+        if output > 0 {
+            usage.insert("output_tokens".to_string(), output);
+        }
+        if cache_read > 0 {
+            usage.insert("cache_read_input_tokens".to_string(), cache_read);
+        }
+        if cache_write > 0 {
+            usage.insert("cache_creation_input_tokens".to_string(), cache_write);
+        }
+        events.push(Event {
+            role: "meta".to_string(),
+            content: String::new(),
+            timestamp: ts,
+            model_used: model.to_string(),
+            source_tool: "cline".to_string(),
+            usage,
+            disclosure_counters,
+            ..Event::default()
+        });
+    }
+    events
+}
+
 fn append_cline_event(events: &mut Vec<Event>, seen: &mut BTreeSet<String>, mut event: Event) {
     if event.source_tool.is_empty() {
         event.source_tool = "cline".to_string();
@@ -7587,6 +7713,12 @@ fn append_cline_event(events: &mut Vec<Event>, seen: &mut BTreeSet<String>, mut 
     if event.role.is_empty() {
         return;
     }
+    // rm-1032: tag the legacy task-dir generation so the census can
+    // count it beside `cline_generation:sess-v` (rm-1032 acceptance d).
+    *event
+        .disclosure_counters
+        .entry("cline_generation:task-dir".to_string())
+        .or_insert(0) += 1;
     let key = cline_event_key(&event);
     if seen.insert(key) {
         events.push(event);

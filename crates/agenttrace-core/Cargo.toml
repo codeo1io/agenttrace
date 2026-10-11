@@ -20,3 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+# rm-1031: the claude-science lane tests synthesize metadata databases
+# at test time (the sqlite fixtures stay textual this way — rm-542
+# discipline). Same crate the lane itself uses: no new dependency.
+rusqlite.workspace = true

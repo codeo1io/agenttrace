@@ -2,6 +2,8 @@ mod demo;
 mod diagnostics;
 mod discovery;
 mod doctor;
+// rm-1031: Claude Science (beta) metadata-database corpus lane.
+mod claude_science;
 mod filters;
 mod governance;
 mod history;

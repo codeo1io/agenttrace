@@ -949,6 +949,14 @@ fn doctor_sqlite_directories(
                 .join("opencode")
                 .join("opencode.db"),
         ),
+        // rm-1031: the Claude Science census row — `exists` follows the
+        // canonical home database; sessions loaded from any of the
+        // lane's databases (XDG roots, org dbs) count into this row.
+        (
+            "claude_science_db",
+            "Claude Science (DB)",
+            crate::claude_science::claude_science_primary_db(&home),
+        ),
     ];
     let mut dirs = Vec::new();
     for (tool, name, path) in candidates {

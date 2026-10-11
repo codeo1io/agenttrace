@@ -120,7 +120,12 @@ pub struct SqliteDroppedRows {
 }
 
 impl SqliteIngestReport {
-    fn absorb(&mut self, path: &Path, source: &'static str, failures: SqliteFileFailures) {
+    pub(crate) fn absorb(
+        &mut self,
+        path: &Path,
+        source: &'static str,
+        failures: SqliteFileFailures,
+    ) {
         if let Some(reason) = failures.unreadable {
             self.unreadable.push(SqliteUnreadableDb {
                 path: path.to_path_buf(),
@@ -143,14 +148,14 @@ impl SqliteIngestReport {
 
 /// Failures of one database file during a load pass.
 #[derive(Debug, Default, Clone)]
-struct SqliteFileFailures {
-    unreadable: Option<String>,
-    dropped: usize,
-    dropped_sample: Option<String>,
+pub(crate) struct SqliteFileFailures {
+    pub(crate) unreadable: Option<String>,
+    pub(crate) dropped: usize,
+    pub(crate) dropped_sample: Option<String>,
 }
 
 impl SqliteFileFailures {
-    fn record_dropped(&mut self, error: &rusqlite::Error) {
+    pub(crate) fn record_dropped(&mut self, error: &rusqlite::Error) {
         self.dropped += 1;
         if self.dropped_sample.is_none() {
             self.dropped_sample = Some(error.to_string());
@@ -225,6 +230,31 @@ pub fn load_sqlite_backed_sessions_reported(
         let loaded = load_opencode_sqlite_sessions(&path, since, &mut report);
         extend_deduped(&mut sessions, &mut report, &mut seen, loaded, &path);
     }
+    // rm-1031: the Claude Science (beta) desktop app's metadata
+    // databases join the same union — same dedup identity, same
+    // per-file failure report (SELECT-only lane; see claude_science.rs).
+    // The loader itself spans several databases, so duplicates fold
+    // into one union-level attribution.
+    let claude_science =
+        crate::claude_science::load_claude_science_sessions_reported(&home, since, &mut report);
+    let mut claude_science_duplicates = 0usize;
+    for session in claude_science {
+        let key = (
+            session.metrics.source_tool.clone(),
+            session.metrics.session_key.clone(),
+        );
+        if seen.insert(key) {
+            sessions.push(session);
+        } else {
+            claude_science_duplicates += 1;
+        }
+    }
+    if claude_science_duplicates > 0 {
+        report.duplicate_dbs.push(SqliteDuplicateDb {
+            path: "claude-science (union)".to_string(),
+            duplicate_sessions: claude_science_duplicates,
+        });
+    }
     (sessions, report)
 }
 
@@ -276,6 +306,16 @@ pub fn skip_sqlite_backed_file_dir(dir: &Path) -> bool {
         .iter()
         .any(|path| sqlite_file_exists(path))
         && is_opencode_storage_root(dir)
+    {
+        return true;
+    }
+    // rm-1031: the Claude Science homes are SQLite-backed territory —
+    // once any of the lane's databases exists, the file walk stays out
+    // (the opencode storage precedent).
+    if crate::claude_science::is_claude_science_root(&clean_path(dir), &home)
+        && crate::claude_science::claude_science_db_paths(&home)
+            .iter()
+            .any(|path| sqlite_file_exists(path))
     {
         return true;
     }
@@ -338,7 +378,7 @@ fn opencode_db_paths(home: &Path) -> Vec<PathBuf> {
     ordered
 }
 
-fn sqlite_file_exists(path: &Path) -> bool {
+pub(crate) fn sqlite_file_exists(path: &Path) -> bool {
     path.is_file()
 }
 
@@ -1295,7 +1335,7 @@ fn token_cost_raw(input: i64, output: i64, cache_write: i64, cache_read: i64, mo
     token_cost(input, output, cache_write, cache_read, model, None)
 }
 
-fn unix_seconds_rfc3339(value: f64) -> String {
+pub(crate) fn unix_seconds_rfc3339(value: f64) -> String {
     if value <= 0.0 {
         return String::new();
     }
@@ -1316,7 +1356,7 @@ fn string(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("")
 }
 
-fn sqlite_has_column(db: &Connection, table: &str, column: &str) -> bool {
+pub(crate) fn sqlite_has_column(db: &Connection, table: &str, column: &str) -> bool {
     db.prepare(&format!("pragma table_info({table})"))
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get::<_, String>(1))
