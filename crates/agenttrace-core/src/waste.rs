@@ -36,6 +36,35 @@ pub struct StuckPattern {
     severity: &'static str,
 }
 
+/// rm-857: what `total_wasted_cost` is made of. The mixed total
+/// always decomposed into three components — priced mass (token
+/// counts x catalog rates: cache waste and loop cost recorded
+/// `Priced`), a constant-derived synthetic loop estimate, and the
+/// bloat surcharge (bloat_score > 50 adds 5% of the session estimate
+/// as a heuristic penalty — never measured spend). The surcharge was
+/// hidden inside the total until this breakdown landed; the three
+/// fields sum to `total_wasted_cost` so the number itself is
+/// unchanged — disclosure-only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WastedCostBreakdown {
+    pub priced: f64,
+    pub synthetic_loop: f64,
+    pub bloat_surcharge: f64,
+}
+
+impl WastedCostBreakdown {
+    pub fn total(&self) -> f64 {
+        self.priced + self.synthetic_loop + self.bloat_surcharge
+    }
+
+    /// Non-priced dollars are the ones the text report must mark —
+    /// priced-only sessions render byte-identical to the pre-rm-857
+    /// layout (the same discipline the loop markers follow).
+    pub fn has_nonpriced(&self) -> bool {
+        self.synthetic_loop > 0.0 || self.bloat_surcharge > 0.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WasteReport {
     cache: CacheEfficiency,
@@ -45,6 +74,11 @@ pub struct WasteReport {
     waste_level: &'static str,
     total_wasted: f64,
     loop_percent: f64,
+    /// rm-857: the priced/synthetic/surcharge decomposition of
+    /// `total_wasted`. Additive to the `agenttrace.waste.v1` schema —
+    /// the same additive-field, no-version-bump decision the basis
+    /// field recorded (existing keys are unchanged).
+    wasted_breakdown: WastedCostBreakdown,
     /// rm-857: `priced` (token mass x event rates) or `synthetic`
     /// (constant-derived estimate) — the basis contract LoopCost.cost_basis
     /// lands on the diagnostics surface, propagated to every waste surface.
@@ -90,10 +124,27 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
     let loop_cost = session.diagnostics.loop_cost.total_loop_cost;
     let loop_basis = session.diagnostics.loop_cost.cost_basis;
     let loop_percent = loop_waste_percent(loop_cost, session.metrics.cost_estimated);
-    let mut total_wasted = cache.wasted_cost + loop_cost;
-    if bloat.bloat_score > 50 {
-        total_wasted += session.metrics.cost_estimated * 0.05;
-    }
+    // rm-857: the surcharge is disclosed as its own component now —
+    // the total keeps its exact historical value (priced + synthetic
+    // + surcharge), but the decomposition makes the hidden 5% bloat
+    // penalty visible on every surface.
+    let bloat_surcharge = if bloat.bloat_score > 50 {
+        session.metrics.cost_estimated * 0.05
+    } else {
+        0.0
+    };
+    let (priced_loop, synthetic_loop) = match loop_basis {
+        LoopCostBasis::Priced => (loop_cost, 0.0),
+        LoopCostBasis::Synthetic => (0.0, loop_cost),
+    };
+    let wasted_breakdown = WastedCostBreakdown {
+        priced: cache.wasted_cost + priced_loop,
+        synthetic_loop,
+        bloat_surcharge,
+    };
+    // rm-857: the total keeps its exact historical value — it now
+    // derives from the disclosed components instead of hiding one.
+    let total_wasted = wasted_breakdown.total();
 
     let mut score = match cache.rating {
         "none" => 20.0,
@@ -130,38 +181,32 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         _ => "green",
     };
     let synthetic_loop_disclosure = loop_basis == LoopCostBasis::Synthetic && loop_cost > 0.0;
+    // rm-857: the headline dollar folds in the 5% bloat penalty
+    // whenever bloat_score > 50 — the summary tag names it so the
+    // total never reads as pure measured waste.
+    let mut disclosure_tags = String::new();
+    if synthetic_loop_disclosure {
+        disclosure_tags.push_str(" (loop portion is a synthetic estimate)");
+    }
+    if bloat_surcharge > 0.0 {
+        disclosure_tags.push_str(", incl. 5% bloat surcharge");
+    }
     let summary = match waste_level {
         "green" => "efficient session - no significant waste".to_string(),
         "yellow" => format!(
             "minor waste - cache {:.0}% hit, room for optimization{}",
-            cache.hit_rate,
-            if synthetic_loop_disclosure {
-                " (loop portion is a synthetic estimate)"
-            } else {
-                ""
-            }
+            cache.hit_rate, disclosure_tags
         ),
         "orange" => format!(
             "wasting ${:.2}: loops {:.0}%, tools {:.1}/turn{}",
-            total_wasted,
-            loop_percent,
-            bloat.tools_per_turn,
-            if synthetic_loop_disclosure {
-                " (synthetic estimate)"
-            } else {
-                ""
-            }
+            total_wasted, loop_percent, bloat.tools_per_turn, disclosure_tags
         ),
         "red" => format!(
             "severe waste ${:.2}: loops {:.0}%, {} stuck, no cache{}",
             total_wasted,
             loop_percent,
             stuck.len(),
-            if synthetic_loop_disclosure {
-                " (synthetic estimate)"
-            } else {
-                ""
-            }
+            disclosure_tags
         ),
         _ => String::new(),
     };
@@ -204,6 +249,7 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         waste_level,
         total_wasted,
         loop_percent,
+        wasted_breakdown,
         loop_cost_basis: loop_basis,
         session_cost: session.metrics.cost_estimated.max(0.0),
         summary,
@@ -236,6 +282,16 @@ pub fn waste_report_json(report: &WasteReport) -> String {
         "waste_score": report.waste_score,
         "waste_level": report.waste_level,
         "total_wasted_cost": round4(report.total_wasted),
+        // rm-857: the priced/synthetic/surcharge decomposition of
+        // total_wasted_cost — additive field, no version bump (the
+        // same decision loop_cost_basis recorded). The three sum to
+        // the total; bloat_surcharge is the previously-undisclosed
+        // 5% heuristic penalty.
+        "total_wasted_breakdown": {
+            "priced": round4(report.wasted_breakdown.priced),
+            "synthetic_loop": round4(report.wasted_breakdown.synthetic_loop),
+            "bloat_surcharge": round4(report.wasted_breakdown.bloat_surcharge),
+        },
         "loop_waste_percent": (report.loop_percent * 10.0).round() / 10.0,
         "loop_cost_basis": if report.loop_cost_basis == LoopCostBasis::Synthetic {
             "synthetic"
@@ -412,6 +468,21 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         t(language, "Wasted", "浪费成本"),
         format_cost(report.total_wasted)
     ));
+    if report.wasted_breakdown.has_nonpriced() {
+        // rm-857: the mixed total decomposes into priced + synthetic +
+        // surcharge — priced-only sessions render byte-identical to
+        // the pre-rm-857 layout (the loop-marker discipline).
+        out.push_str(&format!(
+            "  {}: {} {} + {} {} + {} {}\n",
+            t(language, "Waste basis", "浪费构成"),
+            format_cost(report.wasted_breakdown.priced),
+            t(language, "priced", "定价"),
+            format_cost(report.wasted_breakdown.synthetic_loop),
+            t(language, "synthetic", "合成"),
+            format_cost(report.wasted_breakdown.bloat_surcharge),
+            t(language, "bloat surcharge", "膨胀附加费"),
+        ));
+    }
     if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
         out.push_str(&format!(
             "  {}: {}\n",
@@ -525,37 +596,40 @@ fn waste_summary(report: &WasteReport, language: ReportLanguage) -> String {
     if language == ReportLanguage::En {
         return report.summary.clone();
     }
+    // rm-857: zh mirrors the EN disclosure tags — the synthetic loop
+    // share and the 5% bloat surcharge are both named so the headline
+    // dollar never reads as pure measured waste.
+    let synthetic_tag =
+        if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
+            "（循环部分为合成估算）"
+        } else {
+            ""
+        };
+    let surcharge_tag = if report.wasted_breakdown.bloat_surcharge > 0.0 {
+        "，含 5% 膨胀附加费"
+    } else {
+        ""
+    };
     match report.waste_level {
         "green" => "会话效率良好，未发现明显浪费".to_string(),
         "yellow" => format!(
-            "轻微浪费：缓存命中率 {:.0}%，仍有优化空间{}",
-            report.cache.hit_rate,
-            if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
-                "（循环部分为合成估算）"
-            } else {
-                ""
-            }
+            "轻微浪费：缓存命中率 {:.0}%，仍有优化空间{}{}",
+            report.cache.hit_rate, synthetic_tag, surcharge_tag
         ),
         "orange" => format!(
-            "浪费 ${:.2}：循环 {:.0}%，每轮工具调用 {:.1} 次{}",
+            "浪费 ${:.2}：循环 {:.0}%，每轮工具调用 {:.1} 次{}{}",
             report.total_wasted,
             report.loop_percent,
             report.bloat.tools_per_turn,
-            if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
-                "（循环部分为合成估算）"
-            } else {
-                ""
-            }
+            synthetic_tag,
+            surcharge_tag
         ),
         _ => format!(
-            "严重浪费 ${:.2}：{} 个卡住信号，且未有效使用缓存{}",
+            "严重浪费 ${:.2}：{} 个卡住信号，且未有效使用缓存{}{}",
             report.total_wasted,
             report.stuck.len(),
-            if report.loop_cost_basis == LoopCostBasis::Synthetic && report.loop_percent > 0.0 {
-                "（循环部分为合成估算）"
-            } else {
-                ""
-            }
+            synthetic_tag,
+            surcharge_tag
         ),
     }
 }
@@ -934,6 +1008,162 @@ mod loop_cost_basis_disclosure_tests {
         assert!(
             !zh.contains("合成估算"),
             "loopless zh text must stay unmarked: {zh}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bloat_surcharge_disclosure_tests {
+    //! rm-857 surcharge arm: `total_wasted` has always folded in a
+    //! hidden 5% bloat surcharge (bloat_score > 50 adds 5% of the
+    //! session estimate as a penalty). Every dollar figure the waste
+    //! surface renders or serializes must carry the basis contract
+    //! rm-754 landed on governance advice: the mixed total decomposes
+    //! into priced + synthetic + surcharge lines.
+
+    use super::*;
+    use crate::diagnostics::{Diagnostics, LoopCost};
+    use std::collections::BTreeMap;
+
+    fn bloated_session() -> Session {
+        Session {
+            name: String::from("bloat-surcharge-probe"),
+            path: String::from("/tmp/bloat-surcharge-probe.jsonl"),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                assistant_turns: 10,
+                tool_calls_total: 60,
+                cost_estimated: 2.0,
+                tool_usage: BTreeMap::from([("bash".to_string(), 60)]),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics {
+                loop_cost: LoopCost {
+                    cost_basis: LoopCostBasis::Synthetic,
+                    total_loop_cost: 0.9,
+                    retry_events: 4,
+                    retry_cost: 0.0,
+                    tool_loop_cost: 0.0,
+                    loop_groups: 1,
+                    loop_type: String::from("identical"),
+                    turns: 5,
+                },
+                ..Diagnostics::default()
+            },
+        }
+    }
+
+    fn priced_only_session() -> Session {
+        Session {
+            name: String::from("priced-only-probe"),
+            path: String::from("/tmp/priced-only-probe.jsonl"),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                assistant_turns: 10,
+                tool_calls_total: 5,
+                cost_estimated: 1.0,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics {
+                loop_cost: LoopCost {
+                    cost_basis: LoopCostBasis::Priced,
+                    total_loop_cost: 0.4,
+                    retry_events: 1,
+                    retry_cost: 0.0,
+                    tool_loop_cost: 0.0,
+                    loop_groups: 1,
+                    loop_type: String::from("identical"),
+                    turns: 2,
+                },
+                ..Diagnostics::default()
+            },
+        }
+    }
+
+    #[test]
+    fn waste_json_decomposes_the_bloat_surcharge() {
+        let report = compute_waste_report(&bloated_session());
+        assert!(
+            report.bloat.bloat_score > 50,
+            "fixture must trigger the surcharge (score {})",
+            report.bloat.bloat_score
+        );
+        let json = waste_report_json(&report);
+        assert!(json.contains("total_wasted_breakdown"), "rm-857: {json}");
+        assert!(json.contains("bloat_surcharge"), "rm-857: {json}");
+    }
+
+    #[test]
+    fn breakdown_carries_the_exact_historical_total() {
+        let report = compute_waste_report(&bloated_session());
+        let breakdown = report.wasted_breakdown;
+        // surcharge = 5% of the session estimate (2.0 * 0.05), loop
+        // dollars are synthetic, cache waste is priced.
+        assert!(
+            (breakdown.bloat_surcharge - 0.10).abs() < 1e-9,
+            "{breakdown:?}"
+        );
+        assert!(
+            (breakdown.synthetic_loop - 0.90).abs() < 1e-9,
+            "{breakdown:?}"
+        );
+        assert!(
+            (breakdown.priced - report.cache.wasted_cost).abs() < 1e-9,
+            "{breakdown:?}"
+        );
+        // the historical formula: cache waste + loop + surcharge
+        let historical = report.cache.wasted_cost + 0.9 + 0.10;
+        assert!(
+            (report.total_wasted - historical).abs() < 1e-9,
+            "rate numbers unchanged — disclosure only: {} vs {historical}",
+            report.total_wasted
+        );
+        assert!((breakdown.total() - report.total_wasted).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summary_names_the_surcharge() {
+        let report = compute_waste_report(&bloated_session());
+        assert!(
+            report.summary.contains("5% bloat surcharge"),
+            "rm-857: {}",
+            report.summary
+        );
+        let priced = compute_waste_report(&priced_only_session());
+        assert!(!priced.summary.contains("surcharge"));
+    }
+
+    #[test]
+    fn waste_text_discloses_the_bloat_surcharge_line() {
+        let report = compute_waste_report(&bloated_session());
+        let en = waste_report_text(&report, ReportLanguage::En);
+        assert!(en.contains("bloat surcharge"), "rm-857: {en}");
+        let zh = waste_report_text(&report, ReportLanguage::Zh);
+        assert!(zh.contains("膨胀附加费"), "rm-857: {zh}");
+    }
+
+    #[test]
+    fn priced_only_sessions_stay_unmarked_in_text() {
+        // byte-stability discipline: a priced-only, surcharge-free
+        // session renders exactly the pre-rm-857 text.
+        let report = compute_waste_report(&priced_only_session());
+        let en = waste_report_text(&report, ReportLanguage::En);
+        assert!(
+            !en.contains("Waste basis"),
+            "priced-only text must stay unmarked: {en}"
+        );
+        let zh = waste_report_text(&report, ReportLanguage::Zh);
+        assert!(
+            !zh.contains("浪费构成"),
+            "priced-only zh text must stay unmarked: {zh}"
         );
     }
 }

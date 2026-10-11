@@ -180,6 +180,29 @@ jobs:
             manifest.version = process.env.RELEASE_VERSION;
             fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
           '
+          # rm-211: ship the release checksums INSIDE the npm package —
+          # the registry tarball hash then transitively pins the binary
+          # hashes (an integrity channel independent of the github
+          # download host), and the installer cross-checks the two.
+          node -e '
+            const fs = require("fs");
+            const files = fs.readdirSync("dist").filter((f) => f.endsWith(".sha256"));
+            const pinned = {};
+            for (const file of files) {
+              const [digest, asset] = fs.readFileSync(`dist/${file}`, "utf8").trim().split(/\s+/);
+              if (!asset || !/^[0-9a-f]{64}$/i.test(digest)) {
+                throw new Error(`malformed sha256 line in dist/${file}`);
+              }
+              pinned[asset] = digest.toLowerCase();
+            }
+            if (Object.keys(pinned).length === 0) {
+              throw new Error("no .sha256 artifacts found in dist/");
+            }
+            fs.writeFileSync(
+              "npm/scripts/pinned-checksums.json",
+              `${JSON.stringify(pinned, null, 2)}\n`,
+            );
+          '
           cd npm
           npm pack --pack-destination ../dist
 

@@ -460,7 +460,8 @@ The waste report scores the newest matching session for cache
 efficiency, tool-call bloat, retry-loop spend, and stuck patterns. In
 JSON it carries the same verdicts the text banner does, as data (schema
 `agenttrace.waste.v1`): `waste_score` (0–100), `waste_level`,
-`total_wasted_cost`, `loop_waste_percent`, `loop_cost_basis`,
+`total_wasted_cost`, `total_wasted_breakdown`, `loop_waste_percent`,
+`loop_cost_basis`,
 `session_cost`, `cache`
 (`rating`, `hit_rate_percent`, `cache_read_tokens`,
 `total_input_tokens`, `wasted_cost`, `suggestion`), `tool_bloat`
@@ -477,6 +478,23 @@ diagnostics surface lands via `LoopCost.cost_basis`. When the basis is
 `synthetic`, `summary`, `top_actions[]`, and the text views mark the
 loop portion as a synthetic estimate so no constant-derived dollar ever
 reads as a measured one.
+
+`total_wasted_breakdown` decomposes `total_wasted_cost` by basis
+(rm-857): `priced` is token mass priced at catalog rates (cache waste
+plus loop cost recorded `Priced`), `synthetic_loop` is the
+constant-derived loop estimate, and `bloat_surcharge` is a heuristic
+penalty, never measured spend — when `tool_bloat.bloat_score` exceeds
+50, the waste report adds 5% of `session_cost` to the total, and that
+surcharge was folded into `total_wasted_cost` silently before this
+key existed. The three components sum exactly to
+`total_wasted_cost`; the field is additive to the schema (the same
+additive-field, no-version-bump decision `loop_cost_basis` recorded).
+The text report mirrors the decomposition as a `Waste basis:` line
+whenever a non-priced component exists — priced-only sessions render
+byte-identical to the earlier layout — the headline `summary` names
+the surcharge (`incl. 5% bloat surcharge`), and the TUI
+loop-analysis lines carry the same basis marker the CLI governance
+advice emits.
 
 The format matrix is consistent across report actions: `-f json` is
 honored everywhere the format guard admits it (the waste report
