@@ -17,7 +17,11 @@ const { createHash } = require("node:crypto");
 const { verifyRuntime } = require("./verify-runtime");
 
 const PACKAGE_VERSION = require("../package.json").version;
-const REPOSITORY = "luoyuctl/agenttrace";
+// rm-195: the release workflow's "Pack npm launcher" step rewrites the
+// default to the publishing repository before `npm pack`, so a fork
+// publish can never point installers at another owner's binaries; the
+// env override lets an operator pin a repository explicitly.
+const REPOSITORY = process.env.AGENTTRACE_INSTALL_REPOSITORY || "luoyuctl/agenttrace";
 const ARCHITECTURES = { x64: "amd64", arm64: "arm64" };
 const PLATFORMS = { darwin: "darwin", linux: "linux", win32: "windows" };
 

@@ -180,6 +180,26 @@ jobs:
             manifest.version = process.env.RELEASE_VERSION;
             fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`);
           '
+          # rm-195: the packed launcher must download from THIS
+          # repository's releases, never silently point installers at
+          # another owner's binaries. The in-tree default stays pinned
+          # to the upstream channel (see check-release-surfaces.sh);
+          # the pack step rewrites it to the publishing repository.
+          # shellcheck disable=SC2016
+          node -e '
+            const fs = require("fs");
+            const file = "npm/scripts/install.js";
+            const source = fs.readFileSync(file, "utf8");
+            const hook = /(const REPOSITORY = process\.env\.AGENTTRACE_INSTALL_REPOSITORY \|\| ")[^"]*(")/;
+            if (!hook.test(source)) {
+              console.error("install.js lost the AGENTTRACE_INSTALL_REPOSITORY override hook (rm-195)");
+              process.exit(1);
+            }
+            fs.writeFileSync(
+              file,
+              source.replace(hook, `$1${process.env.GITHUB_REPOSITORY}$2`),
+            );
+          '
           cd npm
           npm pack --pack-destination ../dist
 
@@ -187,13 +207,25 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          test -n "$NODE_AUTH_TOKEN" || {
-            echo "NPM_TOKEN is required to publish the npm package." >&2
-            exit 1
-          }
+          # rm-195: the npm lane is upstream-bound (@zack78/agenttrace is
+          # upstream's npm identity). Without fork-owned credentials it is
+          # DISABLED with a loud skip — never a red run, never a silent
+          # no-op. Manual path: fork-owned npm scope + NPM_TOKEN secret,
+          # then this guard passes on its own.
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::warning::rm-195: NPM_TOKEN is not configured on ${GITHUB_REPOSITORY}."
+            echo "::warning::rm-195: npm publish lane disabled with a loud skip — no @zack78/agenttrace artifact was published from this repository."
+            {
+              echo "### npm publish skipped (rm-195)"
+              echo "NPM_TOKEN is absent on \`${GITHUB_REPOSITORY}\`; the upstream-bound npm lane is disabled with a loud skip. Manual path: create fork-owned npm credentials and scope, then re-tag."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "AGENTTRACE_NPM_PUBLISH=disabled-no-token" >> "$GITHUB_ENV"
+            exit 0
+          fi
           npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
 
       - name: Publish npm launcher
+        if: env.AGENTTRACE_NPM_PUBLISH != 'disabled-no-token'
         run: |
           version="${GITHUB_REF_NAME#v}"
           if npm view "@zack78/agenttrace@${version}" version >/dev/null 2>&1; then
@@ -213,6 +245,20 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          # rm-195: the tap lane is upstream-bound (luoyuctl/homebrew-tap
+          # is upstream's tap). Without fork-owned credentials it is
+          # DISABLED with a loud skip — never a red run, never a silent
+          # no-op. Manual path: fork-owned tap repository + token, then
+          # this guard passes on its own.
+          if [ -z "${HOMEBREW_TAP_TOKEN:-}" ]; then
+            echo "::warning::rm-195: HOMEBREW_TAP_TOKEN is not configured on ${GITHUB_REPOSITORY}."
+            echo "::warning::rm-195: Homebrew publish lane disabled with a loud skip — luoyuctl/homebrew-tap was not modified from this repository."
+            {
+              echo "### Homebrew publish skipped (rm-195)"
+              echo "HOMEBREW_TAP_TOKEN is absent on \`${GITHUB_REPOSITORY}\`; the upstream-bound tap lane is disabled with a loud skip. Manual path: create a fork-owned tap repository and token, then re-tag."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           scripts/release/publish-homebrew.sh \
             "$GITHUB_REF_NAME" \
             channel-dist/homebrew/Formula/agenttrace.rb

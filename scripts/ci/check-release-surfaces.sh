@@ -64,6 +64,76 @@ grep -q "Publish npm launcher" .github/workflows/release.yml ||
 grep -q "Publish Homebrew Formula" .github/workflows/release.yml ||
 	fail "release workflow must publish the Homebrew Formula"
 
+# rm-195 — fork release-channel identity. Every GitHub distribution
+# lane must name the SAME owner; install.sh's REPO is the one
+# expected-owner source. Seeded-fixture proof: flip any lane's owner
+# in a copy of the tree and this block fails (the pre-rm-195 gate
+# passed exactly such a tree).
+expected_owner="$(sed -nE 's|^REPO="([^/]+)/agenttrace"$|\1|p' install.sh)"
+[[ -n "$expected_owner" ]] ||
+	fail "install.sh must pin REPO as the expected-owner source"
+
+lane_owner() {
+	local file="$1" program="$2" label="$3" owners owner
+	owners="$(sed -nE "$program" "$file")"
+	[[ -n "$owners" ]] ||
+		fail "lane identity unreadable in $file ($label): owner pattern drifted"
+	while IFS= read -r owner; do
+		[[ "$owner" = "$expected_owner" ]] ||
+			fail "lane identity mismatch: $file ($label) names owner '$owner' but install.sh pins '$expected_owner'"
+	done <<<"$owners"
+}
+
+lane_owner npm/scripts/install.js \
+	's#.*AGENTTRACE_INSTALL_REPOSITORY[^"]*"([^/]+)/agenttrace".*#\1#p' \
+	"npm launcher download repository"
+# The sed program must match a literal $REPO in install.ps1.
+# shellcheck disable=SC2016
+lane_owner install.ps1 \
+	's|^\$REPO = "([^/]+)/agenttrace"$|\1|p' \
+	"PowerShell installer repository"
+lane_owner install.cmd \
+	's|.*raw\.githubusercontent\.com/([^/]+)/agenttrace/.*|\1|p' \
+	"CMD installer fetch URL"
+lane_owner scripts/release/render-channels.sh \
+	's|^repo="([^/]+)/agenttrace"$|\1|p' \
+	"channel renderer repository"
+lane_owner scripts/release/publish-homebrew.sh \
+	's|.*github\.com/([^/]+)/homebrew-tap\.git.*|\1|p' \
+	"homebrew tap push remote"
+lane_owner homebrew/Formula/agenttrace.rb \
+	's|.*homepage "https://github\.com/([^/]+)/agenttrace".*|\1|p' \
+	"homebrew formula homepage"
+
+# Every agenttrace repository URL in the READMEs (badges and install
+# one-liners) must carry the expected owner too.
+readme_lanes="$(grep -ohE \
+	'((github\.com)|(codecov\.io/gh)|(raw\.githubusercontent\.com)|(img\.shields\.io/github/v/release))/[^/]+/agenttrace' \
+	README.md README.zh-CN.md)"
+[[ -n "$readme_lanes" ]] ||
+	fail "README lane-URL inventory is empty: owner pattern drifted"
+while IFS= read -r lane; do
+	owner="${lane%/*}"
+	owner="${owner##*/}"
+	[[ "$owner" = "$expected_owner" ]] ||
+		fail "lane identity mismatch: README URL owner '$owner' != install.sh owner '$expected_owner' ($lane)"
+done <<<"$readme_lanes"
+
+# rm-195 decision pinning: the upstream-bound publish lanes must stay
+# disable-with-loud-skip (never a red run, never a silent no-op) and
+# the pack step must rewrite the launcher's download repository to the
+# publishing repository.
+grep -q "AGENTTRACE_INSTALL_REPOSITORY" .github/workflows/release.yml ||
+	fail "release workflow must rewrite the npm launcher download repository (rm-195)"
+grep -q "AGENTTRACE_NPM_PUBLISH" .github/workflows/release.yml ||
+	fail "npm publish lane must keep its NPM_TOKEN loud-skip guard (rm-195)"
+grep -q "npm publish lane disabled with a loud skip" .github/workflows/release.yml ||
+	fail "npm publish lane must disclose its loud-skip disable via a workflow warning (rm-195)"
+grep -q "Homebrew publish lane disabled with a loud skip" .github/workflows/release.yml ||
+	fail "homebrew publish lane must disclose its loud-skip disable via a workflow warning (rm-195)"
+grep -q "### Fork release channels" README.md ||
+	fail "README must disclose the fork release-channel decision (rm-195)"
+
 for target in \
 	x86_64-unknown-linux-gnu \
 	aarch64-unknown-linux-gnu \

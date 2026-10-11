@@ -87,6 +87,17 @@ PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). Set
 `AGENTTRACE_VERSION=v0.9.1` (or `-Version v0.9.1` in PowerShell) to pin a
 release.
 
+### Fork release channels
+
+This repository is a fork. The install one-liners and package-manager
+entries on this page point at the upstream release channels: `luoyuctl`
+GitHub releases, the `@zack78/agenttrace` npm package, and the
+`luoyuctl/tap` Homebrew tap. Release CI here publishes GitHub release
+assets to this fork and skips the npm and Homebrew publish lanes with a
+loud workflow warning while no fork-owned credentials exist, so no lane
+publishes under another owner's identity (decision recorded as `rm-195`
+in `ROADMAP.md`).
+
 Package managers:
 
 ```bash
