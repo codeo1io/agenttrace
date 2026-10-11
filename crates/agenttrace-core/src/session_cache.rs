@@ -5,7 +5,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 53;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 54;
+// Bumped 53 -> 54 (integration of run e944a060a640 cycle 1 "usage
+// truthfulness & honest ordering", conflict case 7762d54b — rm-619 +
+// rm-954 + rm-955, attempt 2ba22694): the opencode fold reported
+// `message_had_usage` for ANY `tokens` object, so a message carrying
+// only reasoning (or only unknown keys) suppressed the step-finish
+// part rescue and the session served zero usage (twin PoC: 0
+// tokens/$0.0000 vs control 100/50/$0.0011); the sqlite
+// earliest-user-text rank (rm-954) and the statusline latest-state
+// pick (rm-955) are render-side and ride the same rung for cycle
+// coherence. Same keys, same persisted shape: the VALUES move, so a
+// warm v53 cache keeps serving the zeroed totals on a cache hit
+// (rm-230 convention: parser-semantics changes that alter the
+// served report bump the schema so cached sessions regenerate).
+// SEAM: the batch minted its bump as 51 -> 53 at its own census
+// ceiling (this tree held the landed 51, sibling worktree
+// run-57c491338818 an uncommitted 52) BEFORE run 4ffc4fbb's
+// integration landed its own 52 -> 53 rung above the same advanced
+// ceiling — two independent parser-semantics mints claiming one
+// rung while both trees were uncommitted, the exact class of cases
+// c7c07e48/58fbbd6c. Per that convention the landed rung keeps its
+// numeral and this integration re-bases the batch's rung onto the
+// advanced ceiling as 53 -> 54, one invalidation either way (a
+// warm v53 entry written by a post-4ffc4fbb build still carries
+// the zeroed twin totals and regenerates once). Entries regenerate
+// once on next scan.
 // Bumped 52 -> 53 (integration of run 4ffc4fbb2e9c, conflict case
 // a1c5cb6f54f34484bd2b404fc90d99a0, candidate fa1d831 — the run's
 // rm-939 'pi journal: compaction/branch_summary usage is silently
@@ -71,6 +96,9 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 53;
 // never landed) so every warm entry written before rm-618/rm-619/
 // rm-251 corrected the served totals regenerates.
 // Entries regenerate once on next scan.
+// (The run's own 51 -> 53 ladder rung re-based at this integration
+// onto the advanced ceiling as 53 -> 54 — see the top rung above;
+// conflict case 7762d54b, one invalidation either way.)
 // Bumped 45 -> 46 (integration landing of run 33b7b7b5, conflict
 // case 58fbbd6c — the run's rung re-based a THIRD time, and the
 // first moved by a sibling claim rather than a landed ceiling: the

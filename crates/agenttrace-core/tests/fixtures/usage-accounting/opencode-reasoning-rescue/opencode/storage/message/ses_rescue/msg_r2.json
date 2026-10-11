@@ -1,0 +1,11 @@
+{
+  "id": "msg_r2",
+  "sessionID": "ses_rescue",
+  "role": "assistant",
+  "time": {
+    "created": 1764750002000
+  },
+  "tokens": {
+    "future_unknown_key": 5
+  }
+}

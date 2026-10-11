@@ -1,0 +1,8 @@
+{
+  "id": "part_r2_finish",
+  "type": "step-finish",
+  "tokens": {
+    "input": 7,
+    "output": 8
+  }
+}

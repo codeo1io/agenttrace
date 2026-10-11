@@ -99,6 +99,47 @@ fn adversarial_sqlite_u64_max_input_saturates_instead_of_wrapping() {
 }
 
 #[test]
+fn opencode_part_selection_ranks_wrong_typed_time_after_numerics() {
+    // rm-954: the earliest-user-text selection claimed SQLite ASC
+    // semantics but degraded wrong-typed time_created values into the
+    // NULL bucket — ranking them BEFORE every numeric, the exact
+    // opposite of SQLite, which orders NULL first and TEXT/BLOB after
+    // all numerics. A TEXT time_created must never win the name over a
+    // later numeric part.
+    let root = temp_root("agenttrace-opencode-asc-rank");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (id text primary key, title text, time_created integer, time_updated integer);
+        create table message (id text, session_id text, data text);
+        create table part (id text, session_id text, message_id text, time_created, time_updated, data text);
+        insert into session values ('ses_asc', 'New session - 2026-08-10T01:13:33.266Z', 1764750000000, 1764750004000);
+        insert into message values ('msg1', 'ses_asc', '{"id":"msg1","role":"user"}');
+        insert into part values ('p_numeric', 'ses_asc', 'msg1', 2000, 2000, '{"type":"text","text":"numeric part must win the name"}');
+        insert into part values ('p_wrong_typed', 'ses_asc', 'msg1', '2020-01-01T00:00:00Z', 0, '{"type":"text","text":"wrong typed text must lose"}');
+        "#,
+    )
+    .expect("seed asc-rank opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].name, "numeric part must win the name",
+            "SQLite ASC ranks wrong-typed (TEXT) time_created after every numeric; the pre-fix fold ranked it before them"
+        );
+    });
+}
+
+#[test]
 fn opencode_stored_session_totals_preferred_with_delta() {
     // CU-2 (candidate 8, totals scope): when the upstream session row
     // records authoritative totals (cost + the five token columns), those

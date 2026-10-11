@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 53 and the SQLite snapshot is schema 10; the
+The session cache is schema 54 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -291,7 +291,16 @@ of run 4ffc4fbb, minted campaign-locally as rm-543 and double-minted
 as the campaign-local rm-551 — renumbered at integration since the
 landed rm-551 is the Copilot per-model fold; the batch's own
 27 → 28 bump re-based onto the advanced ceiling as 52 → 53, one
-invalidation either way); the SQLite snapshot to 7
+invalidation either way), and to 54 when opencode message-level
+reasoning-only tokens stopped suppressing the step-finish usage rescue
+(run e944a060a640 cycle 1, rm-619 + rm-954 + rm-955: a message whose
+`tokens` object carries only reasoning or only unknown keys no longer
+hides the part lane's billing totals — a warm v53 entry still serves
+zero usage for such a session; the batch minted 53 above the fleet
+census ceiling over the then-landed 51 with sibling run-57c491338818
+holding the uncommitted 52, and this integration re-bases that rung
+onto the advanced ceiling as 53 → 54, one invalidation either way) —
+so cached sessions regenerate under the rescued totals; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane
