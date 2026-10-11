@@ -1170,6 +1170,14 @@ pub struct StatuslineBudgetSeries {
     /// calendar window — excluded from `daily`/`total` and disclosed
     /// by the budget views so a stale journal is visible, not silent.
     pub excluded_older_days: usize,
+    /// rm-727: distinct sampled UTC days strictly AFTER today —
+    /// future-dated captures (clock skew, a hostile journal) already
+    /// bill into no window under the rm-917 today-bounded calendar
+    /// anchor; this counter makes that exclusion VISIBLE instead of
+    /// silent, so a $999 future capture cannot vanish without trace
+    /// (the live PoC shape this row pins: a 2026-12-25 capture used
+    /// to drop silently while the window kept only real days).
+    pub excluded_future_days: usize,
 }
 
 pub fn statusline_budget_series(
@@ -1235,19 +1243,29 @@ pub fn statusline_budget_series(
     // (superseding the rider's read that `days == 0` anchors a
     // one-day window; no test pinned that edge either way).
     let today = now.date_naive();
-    if days == 0 {
-        return StatuslineBudgetSeries {
-            daily: Vec::new(),
-            total: 0.0,
-            excluded_older_days: daily.len(),
-        };
-    }
     let window_start = today - Duration::days(days as i64 - 1);
     let by_day: BTreeMap<chrono::NaiveDate, f64> = daily
         .into_iter()
         .filter_map(|(day, spend)| Some((day.parse::<chrono::NaiveDate>().ok()?, spend)))
         .collect();
+    use std::ops::Bound::Excluded;
     let excluded_older_days = by_day.range(..window_start).count();
+    // rm-727: days strictly after today are the future-dated
+    // captures the today-bounded window already excludes — count them
+    // for disclosure (both arms render this next to the older-days
+    // line; see the struct docs for why visibility, not billing, is
+    // the fix).
+    let excluded_future_days = by_day
+        .range((Excluded(today), std::ops::Bound::Unbounded))
+        .count();
+    if days == 0 {
+        return StatuslineBudgetSeries {
+            daily: Vec::new(),
+            total: 0.0,
+            excluded_older_days,
+            excluded_future_days,
+        };
+    }
     let any_in_window = by_day.range(window_start..=today).next().is_some();
     let window: Vec<(String, f64)> = if any_in_window {
         // Zero-fill the calendar days inside the window so gaps are
@@ -1277,6 +1295,7 @@ pub fn statusline_budget_series(
         daily: window,
         total,
         excluded_older_days,
+        excluded_future_days,
     }
 }
 
@@ -1314,6 +1333,10 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "spend_7d_usd": series.total,
             // rm-917: stale sampled days the calendar window excluded.
             "excluded_older_days": series.excluded_older_days,
+            // rm-727: future-dated captures the today-bounded window
+            // excluded (clock skew, hostile journals) — same
+            // disclosure discipline as the older-days counter.
+            "excluded_future_days": series.excluded_future_days,
         });
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
@@ -1345,6 +1368,20 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "  ({} older day{} outside the window not counted)\n",
             series.excluded_older_days,
             if series.excluded_older_days == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    // rm-727: future-dated captures the today-bounded window already
+    // excludes — disclosed so they cannot vanish silently (a hostile
+    // journal's $999 tomorrow is excluded AND visible, not just gone).
+    if series.excluded_future_days > 0 {
+        out.push_str(&format!(
+            "  ({} future-dated day{} outside the window not counted)\n",
+            series.excluded_future_days,
+            if series.excluded_future_days == 1 {
                 ""
             } else {
                 "s"
@@ -1608,6 +1645,11 @@ mod tests {
         // $99.00 stays outside both the 7-day and the full-journal
         // sums under the today-bounded window.
         captures.push(budget_capture("F", day(1) + 50, 99.00));
+        // rm-727: a far-future capture — the row's 2026-12-25 recipe
+        // shape, clock skew by months or a hostile journal — is
+        // excluded the same way and must surface in the SAME counter,
+        // not only tomorrow's adjacency.
+        captures.push(budget_capture("X", day(80), 5.00));
         let series = statusline_budget_series(&captures, 7, now);
         // Calendar week [now-6d .. now]: day -8 is a counter RESET
         // (its 0.25 sample sits below day -9's 3.50 cumulative, so its
@@ -1621,12 +1663,19 @@ mod tests {
         // calendar window (-10, -9, -8, -7) are excluded and
         // disclosed, not billed.
         assert_eq!(series.excluded_older_days, 4, "{series:?}");
+        // rm-727: BOTH future-dated captures (tomorrow's $99, review
+        // 95d74221 F8, and the far-future 5.00) were ALREADY excluded
+        // from every window — now their exclusion is disclosed
+        // instead of silent, in both the 7-day and the full-journal
+        // series.
+        assert_eq!(series.excluded_future_days, 2, "{series:?}");
         // The full-journal variant still sums all the burn: day -8
         // contributes 0 (the reset), so only the SEVEN tail days burn
         // 0.25 — 2.00 + 1.50 + 1.00 + 7×0.25 = 6.25 (tomorrow's $99
         // future capture excluded by the upper bound; rm-917
         // zero-fills the 20 unsampled in-window days).
         let full = statusline_budget_series(&captures, 30, now);
+        assert_eq!(full.excluded_future_days, 2, "{full:?}");
         assert!(
             (full.total - (2.00 + 1.50 + 1.00 + 7.0 * 0.25)).abs() < 1e-9,
             "{full:?}"

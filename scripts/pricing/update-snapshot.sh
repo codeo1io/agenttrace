@@ -88,6 +88,7 @@ fi
 python3 - "$tmp" "$out" "$date" "$drops" <<'EOF'
 import json
 import os
+import re
 import sys
 
 src, dst, date, drops_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -97,6 +98,22 @@ RATE_FIELDS = (
     "output_cost_per_token",
     "cache_creation_input_token_cost",
     "cache_read_input_token_cost",
+)
+
+# rm-164: non-flex tier families and standard long-context bands the
+# refresh carries alongside the dedicated flex loop below. Band × tier
+# composites (…_above_272k_tokens_priority and friends) match NEITHER
+# pattern and are deliberately not carried: `Price::bands` does not
+# ingest them, so vendoring them would be dead weight.
+TIER_FAMILY_FIELD = re.compile(
+    r"^(input_cost_per_token|output_cost_per_token|"
+    r"cache_creation_input_token_cost|cache_read_input_token_cost)"
+    r"_(flex|priority|ultrafast|balanced|batches)$"
+)
+BAND_FIELD = re.compile(
+    r"^(input_cost_per_token|output_cost_per_token|"
+    r"cache_creation_input_token_cost|cache_read_input_token_cost)"
+    r"_above_\d+k_tokens$"
 )
 
 
@@ -164,6 +181,16 @@ def trim(data):
             flex = value.get(flex_field)
             if isinstance(flex, (int, float)) and flex > 0:
                 entry[flex_field] = flex
+        # rm-164: priority / ultrafast / balanced / batches families and
+        # standard `…_above_<N>k_tokens` long-context bands ride along
+        # under the same positive-numeric filter (the Rust ingestion
+        # re-filters for finiteness at convert time, and skips a family
+        # whose input+output are not both present).
+        for field_name, field_value in value.items():
+            if not isinstance(field_value, (int, float)) or not field_value > 0:
+                continue
+            if TIER_FAMILY_FIELD.match(field_name) or BAND_FIELD.match(field_name):
+                entry[field_name] = field_value
         keep[key] = entry
     return keep
 

@@ -17,7 +17,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-12";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -81,6 +81,39 @@ pub struct Price {
     pub cw_flex: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cr_flex: Option<f64>,
+    /// Non-flex service-tier rate families (rm-164): priority,
+    /// ultrafast, balanced and batches quartets, keyed by lowercase
+    /// tier name. Flex keeps its dedicated quartet above (rm-610 API
+    /// and snapshot compatibility); these families apply the same
+    /// way — a `service_tier` turn on a row that carries the family
+    /// bills at its rates, a row without the family bills at the
+    /// standard rates (never zero).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tiers: BTreeMap<String, TierRates>,
+    /// Long-context band rates keyed by the input-token threshold the
+    /// band activates above (LiteLLM `*_above_<N>k_tokens`, rm-164):
+    /// when a turn's prompt magnitude (input + cache write + cache
+    /// read) exceeds the threshold, the band rates apply to the whole
+    /// request — the published long-context semantics (OpenAI
+    /// 272k+ on gpt-6.1, Gemini 200k+). Band × tier composites
+    /// (`*_above_272k_tokens_priority` and friends) are NOT ingested;
+    /// a tiered long-context turn falls back to tier rates.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bands: BTreeMap<u64, TierRates>,
+}
+
+/// One service-tier or long-context-band rate family (rm-164), in
+/// $/M. `input`/`output` are required for the family to apply at all;
+/// cache slots are optional and fall back to the row's standard
+/// rates — the same Option shape as the flex quartet's slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TierRates {
+    pub input: f64,
+    pub output: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,10 +152,11 @@ struct LiteLlmModel {
     max_input_tokens: Option<u64>,
     #[serde(default, rename = "deprecation_date")]
     deprecation_date: Option<String>,
-    // Flex-tier rates (rm-610). LiteLLM also publishes
-    // `*_above_272k_tokens_flex` variants (long-context flex tiers);
-    // they are deliberately NOT ingested — the fork has no
-    // long-context tier extraction to pair them with.
+    // Flex-tier rates (rm-610). The flex family keeps dedicated
+    // fields (public API and snapshot compatibility); the `flex`-family
+    // long-context composites (`*_above_272k_tokens_flex`) remain
+    // deliberately NOT ingested — band × tier composites are out of
+    // scope (see `Price::bands`).
     #[serde(default, rename = "input_cost_per_token_flex")]
     input_cost_flex: Option<f64>,
     #[serde(default, rename = "output_cost_per_token_flex")]
@@ -131,6 +165,13 @@ struct LiteLlmModel {
     cache_write_cost_flex: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost_flex")]
     cache_read_cost_flex: Option<f64>,
+    // rm-164 catch-all: every LiteLLM field the dedicated fields above
+    // do not name lands here, so the non-flex tier families
+    // (priority/ultrafast/balanced/batches) and the long-context
+    // bands can be extracted without enumerating vendor fields — and
+    // without breaking when LiteLLM adds or renames one upstream.
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 pub fn lookup_price(model: &str) -> Price {
@@ -145,19 +186,99 @@ pub fn lookup_price(model: &str) -> Price {
 /// "priority", ...) bills at the standard rates. A model without
 /// flex rates bills flex turns at the standard rates: that is the
 /// published behavior (codeburn #1642), not a guess.
+///
+/// rm-164: the non-flex families the row actually carries
+/// (priority / ultrafast / balanced / batches) now bill at their own
+/// rates instead of the standard ones — a priority turn of gpt-6.1-sol
+/// billed at the standard row was a silent 2× under-price. Wire
+/// aliases: the singular `"batch"` answers the `batches` family;
+/// unknown tier names still bill at the standard rates (never zero).
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
     let model = resolve_alias(model, &catalog.aliases);
     let mut price = lookup_price_in(&model, &catalog.entries);
-    if service_tier == Some("flex") {
-        if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
-            price.input = input;
-            price.output = output;
-            if let Some(cw) = price.cw_flex {
-                price.cw = cw;
+    let tier = service_tier
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .map(|tier| tier.to_ascii_lowercase());
+    match tier.as_deref() {
+        Some("flex") => {
+            if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
+                price.input = input;
+                price.output = output;
+                if let Some(cw) = price.cw_flex {
+                    price.cw = cw;
+                }
+                if let Some(cr) = price.cr_flex {
+                    price.cr = cr;
+                }
             }
-            if let Some(cr) = price.cr_flex {
-                price.cr = cr;
+        }
+        // rm-164: `batch` is the OpenAI wire spelling of the
+        // `batches` rate family.
+        Some("batch") | Some("batches") => {
+            apply_tier_family(&mut price, "batches");
+        }
+        Some(family) => apply_tier_family(&mut price, family),
+        None => {}
+    }
+    price
+}
+
+/// Apply a non-flex rate family to a resolved price (rm-164): the
+/// family's input/output replace the standard rates, its cache
+/// slots override only when present. A row without the family — or a
+/// hostile family with a non-finite value (already filtered at
+/// ingest) — keeps the standard rates.
+fn apply_tier_family(price: &mut Price, family: &str) {
+    if let Some(rates) = price.tiers.get(family) {
+        price.input = rates.input;
+        price.output = rates.output;
+        if let Some(cw) = rates.cw {
+            price.cw = cw;
+        }
+        if let Some(cr) = rates.cr {
+            price.cr = cr;
+        }
+    }
+}
+
+/// rm-164: tier resolution plus long-context band selection. When
+/// the turn's prompt magnitude (input + cache write + cache read)
+/// exceeds a published band threshold, the band rates override the
+/// standard rates for the whole request — the published long-context
+/// semantics (OpenAI >272k on gpt-6.1, Gemini >200k). A turn that ran
+/// on a tier the row carries keeps the TIER rates instead: LiteLLM
+/// publishes band × tier composites (`…_above_272k_tokens_priority`)
+/// that this fork does not ingest, and of the two single-factor
+/// fallbacks the tier is the larger published factor in every
+/// wire-reachable case (ultrafast is 6× where the band is 2×) — so
+/// tier rates are the nearer published rate. Band cache slots fall
+/// back to the standard rates when the band does not carry them.
+pub fn lookup_price_banded(model: &str, service_tier: Option<&str>, prompt_tokens: i64) -> Price {
+    let mut price = lookup_price_tiered(model, service_tier);
+    if prompt_tokens > 0 {
+        let tier = service_tier
+            .map(str::trim)
+            .filter(|tier| !tier.is_empty())
+            .map(|tier| tier.to_ascii_lowercase());
+        let tier_applied = match tier.as_deref() {
+            Some("flex") => price.input_flex.is_some() && price.output_flex.is_some(),
+            Some("batch") | Some("batches") => price.tiers.contains_key("batches"),
+            Some(family) => price.tiers.contains_key(family),
+            None => false,
+        };
+        if !tier_applied {
+            let magnitude = prompt_tokens.unsigned_abs();
+            if let Some((_, band)) = price.bands.range(..magnitude).next_back() {
+                price.input = band.input;
+                price.output = band.output;
+                if let Some(cw) = band.cw {
+                    price.cw = cw;
+                }
+                if let Some(cr) = band.cr {
+                    price.cr = cr;
+                }
             }
         }
     }
@@ -339,7 +460,8 @@ pub fn catalog_identity() -> &'static str {
 }
 
 /// Digest of every catalog fact that can change a cost or an
-/// attribution: rate values (standard AND flex, rm-610), context
+/// attribution: rate values (standard AND flex, rm-610), the
+/// non-flex tier families and long-context bands (rm-164), context
 /// windows, deprecation dates, alias rows, and provider labels
 /// (rm-613). Only `source` and `reference_date` are excluded — they
 /// describe where the data came from, not what it prices. The session
@@ -374,6 +496,37 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
             hash = fnv1a(&[flex.is_some() as u8], hash);
             if let Some(value) = flex {
                 hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+            }
+        }
+        // rm-164: the non-flex tier families and long-context bands
+        // are pricing facts the digest must fold too — a snapshot
+        // refresh that changes ONLY an ultrafast rate (the live drift
+        // shape this batch fixed) must reprice warm caches. BTreeMap
+        // order is deterministic, and empty maps hash nothing, so a
+        // row without families/bands keeps its pre-rm-164 identity
+        // bytes.
+        for (family, rates) in &price.tiers {
+            hash = fnv1a(family.as_bytes(), hash);
+            for value in [rates.input, rates.output] {
+                hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+            }
+            for slot in [rates.cw, rates.cr] {
+                hash = fnv1a(&[slot.is_some() as u8], hash);
+                if let Some(value) = slot {
+                    hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+                }
+            }
+        }
+        for (threshold, band) in &price.bands {
+            hash = fnv1a(&threshold.to_le_bytes(), hash);
+            for value in [band.input, band.output] {
+                hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+            }
+            for slot in [band.cw, band.cr] {
+                hash = fnv1a(&[slot.is_some() as u8], hash);
+                if let Some(value) = slot {
+                    hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+                }
             }
         }
     }
@@ -609,6 +762,7 @@ pub fn render_test_match() -> String {
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "openai/gpt-4.1",
         "gpt-5.6",
+        "gpt-6.1-sol",
         "gpt-4.1-mini-2025-04-14",
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
@@ -633,6 +787,29 @@ pub fn render_test_match() -> String {
                 p.cr_flex.unwrap_or(p.cr)
             ));
         }
+        // rm-164: disclose the non-flex tier families and long-context
+        // bands the row carries — same probe-surface discipline: the
+        // rate a priority/ultrafast/balanced/batches turn or a
+        // >threshold prompt bills at is answerable from this probe
+        // (absent families bill at the standard rates above).
+        for (family, rates) in &p.tiers {
+            out.push_str(&format!(
+                "      {family:<9} in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+                rates.input,
+                rates.output,
+                rates.cw.unwrap_or(p.cw),
+                rates.cr.unwrap_or(p.cr)
+            ));
+        }
+        for (threshold, band) in &p.bands {
+            out.push_str(&format!(
+                "      band >{threshold:<6} in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+                band.input,
+                band.output,
+                band.cw.unwrap_or(p.cw),
+                band.cr.unwrap_or(p.cr)
+            ));
+        }
     }
     out
 }
@@ -645,7 +822,14 @@ pub(crate) fn token_cost(
     model: &str,
     service_tier: Option<&str>,
 ) -> f64 {
-    let price = lookup_price_tiered(model, service_tier);
+    // rm-164: band selection keys on the prompt magnitude (input +
+    // both cache legs), the size the published long-context bands
+    // are defined against.
+    let price = lookup_price_banded(
+        model,
+        service_tier,
+        input.saturating_add(cache_write).saturating_add(cache_read),
+    );
     round4(
         input as f64 / 1e6 * price.input
             + output as f64 / 1e6 * price.output
@@ -1137,6 +1321,72 @@ fn flex_slot(rate: Option<f64>) -> Option<f64> {
         .filter(|scaled| scaled.is_finite())
 }
 
+/// Non-flex tier families ingested from the flattened LiteLLM fields
+/// (rm-164). The map key is the rate class; `"batches"` also answers
+/// the singular `"batch"` wire name (OpenAI response `service_tier`
+/// uses the singular while LiteLLM's field suffix is plural).
+const TIER_FAMILIES: [&str; 4] = ["priority", "ultrafast", "balanced", "batches"];
+
+/// Flattened per-token rate -> per-million slot, with the same
+/// absent/zero/negative/non-finite/overflow filter `flex_slot`
+/// applies (rm-610 discipline): a hostile catalog value cannot
+/// survive as inf or leak a zero as "this tier is free".
+fn extra_slot(extra: &BTreeMap<String, serde_json::Value>, name: &str) -> Option<f64> {
+    let rate = extra.get(name)?.as_f64()?;
+    flex_slot(Some(rate))
+}
+
+/// Build one rate family from the flattened LiteLLM fields under a
+/// shared `suffix` ("_priority" for tiers, "_above_272k_tokens" for
+/// bands). Input AND output must both survive the filter for the
+/// family to apply at all (matches the flex quartet contract).
+fn tier_family_rates(
+    extra: &BTreeMap<String, serde_json::Value>,
+    suffix: &str,
+) -> Option<TierRates> {
+    Some(TierRates {
+        input: extra_slot(extra, &format!("input_cost_per_token{suffix}"))?,
+        output: extra_slot(extra, &format!("output_cost_per_token{suffix}"))?,
+        cw: extra_slot(extra, &format!("cache_creation_input_token_cost{suffix}")),
+        cr: extra_slot(extra, &format!("cache_read_input_token_cost{suffix}")),
+    })
+}
+
+/// Long-context band rates (rm-164): every `…_above_<N>k_tokens`
+/// threshold the flattened fields carry, keyed by `<N>*1000` tokens.
+/// Only standard bands are collected — tier-suffixed composites
+/// (`…_above_272k_tokens_priority`) are skipped by construction:
+/// the threshold scan matches the bare suffix exactly.
+fn band_rates(extra: &BTreeMap<String, serde_json::Value>) -> BTreeMap<u64, TierRates> {
+    let mut bands = BTreeMap::new();
+    for name in extra.keys() {
+        let Some(rest) = name.strip_prefix("input_cost_per_token_above_") else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix("k_tokens") else {
+            continue;
+        };
+        let Ok(thousands) = digits.parse::<u64>() else {
+            continue;
+        };
+        if let Some(rates) = tier_family_rates(extra, &format!("_above_{digits}k_tokens")) {
+            bands.insert(thousands * 1_000, rates);
+        }
+    }
+    bands
+}
+
+/// Non-flex tier families present on a row (rm-164).
+fn non_flex_tier_rates(extra: &BTreeMap<String, serde_json::Value>) -> BTreeMap<String, TierRates> {
+    let mut tiers = BTreeMap::new();
+    for family in TIER_FAMILIES {
+        if let Some(rates) = tier_family_rates(extra, &format!("_{family}")) {
+            tiers.insert(family.to_string(), rates);
+        }
+    }
+    tiers
+}
+
 fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
     let Ok(Value::Object(source)) = serde_json::from_slice::<Value>(raw) else {
         return ConvertedCatalog {
@@ -1177,6 +1427,11 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             // is free". `flex_slot` filters after scaling so a hostile
             // near-f64-max per-token flex cost cannot survive as inf.
             input_flex: flex_slot(model.input_cost_flex),
+            // Non-flex tier families and long-context bands (rm-164):
+            // extracted from the flattened catch-all with the same
+            // scale-and-filter discipline as the flex quartet.
+            tiers: non_flex_tier_rates(&model.extra),
+            bands: band_rates(&model.extra),
             output_flex: flex_slot(model.output_cost_flex),
             cw_flex: flex_slot(model.cache_write_cost_flex),
             cr_flex: flex_slot(model.cache_read_cost_flex),
@@ -2637,10 +2892,14 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The 1M-window class was rm-231's motivating case; LiteLLM
+        // re-published claude-sonnet-4-5 at 200k in the 2026-10-12
+        // refresh (upstream data drift — live wins for shared keys
+        // under the refresh contract). rm-164's refresh notes record
+        // the change for rm-231 watchers.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 
@@ -3007,12 +3266,21 @@ mod tests {
         // Codeburn #1642 published numbers for GPT-5.6: flex is half.
         assert_eq!((flex.input, flex.output), (2.0, 10.0));
         assert!(near(flex.cw, 2.5) && near(flex.cr, 0.2));
-        for tier in ["default", "priority", "fast", "scale", "garbage"] {
+        // rm-164: gpt-5.6 carries a priority family (published 2× on
+        // every slot) — a priority turn bills at its rates, not at the
+        // standard ones (the silent 2× under-price this fixed).
+        let priority = lookup_price_tiered("gpt-5.6", Some("priority"));
+        assert_eq!((priority.input, priority.output), (8.0, 40.0));
+        assert!(near(priority.cw, 10.0) && near(priority.cr, 0.8));
+        // Every tier the row does NOT carry — wire names that are
+        // real for other vendors (kimi `fast`, gemini `scale`) but
+        // absent on this row — still bills at the standard rates.
+        for tier in ["default", "fast", "scale", "garbage"] {
             let priced = lookup_price_tiered("gpt-5.6", Some(tier));
             assert_eq!(
                 (priced.input, priced.output),
                 (4.0, 20.0),
-                "tier {tier} is not flex"
+                "tier {tier} is not carried by this row"
             );
         }
         // A model without flex slots bills flex at standard rates.
@@ -3112,9 +3380,35 @@ mod tests {
 
     #[test]
     fn token_cost_applies_the_tier() {
-        // 1M input, nothing else: $2 at flex, $4 at standard.
+        // 100k input (below every published band): $0.40 standard,
+        // $0.20 flex, $0.80 priority (rm-164).
+        assert_eq!(token_cost(100_000, 0, 0, 0, "gpt-5.6", Some("flex")), 0.2);
+        assert_eq!(token_cost(100_000, 0, 0, 0, "gpt-5.6", None), 0.4);
+        assert_eq!(
+            token_cost(100_000, 0, 0, 0, "gpt-5.6", Some("priority")),
+            0.8
+        );
+        // rm-164: 1M input crosses gpt-5.6's above_272k band, so a
+        // tier-less request bills at the band rate ($8/M) — while a
+        // turn on a tier the row carries keeps the tier rates (band ×
+        // tier composites are not ingested; the tier is the larger
+        // published factor).
+        assert_eq!(token_cost(1_000_000, 0, 0, 0, "gpt-5.6", None), 8.0);
         assert_eq!(token_cost(1_000_000, 0, 0, 0, "gpt-5.6", Some("flex")), 2.0);
-        assert_eq!(token_cost(1_000_000, 0, 0, 0, "gpt-5.6", None), 4.0);
+        // Discriminating arm: priority input coincides with the band
+        // input (both $8/M) but priority output ($40/M) is not the
+        // band output ($30/M) — this pins that the TIER won, not the
+        // band, on a carried tier's long turn.
+        assert_eq!(
+            token_cost(0, 1_000_000, 0, 0, "gpt-5.6", Some("priority")),
+            40.0
+        );
+        // The band keys on the full prompt magnitude: 200k fresh
+        // input + 100k cache read crosses the 272k threshold, so both
+        // legs bill at the band rates ($8/M in, $0.80/M read).
+        assert_eq!(token_cost(200_000, 0, 0, 100_000, "gpt-5.6", None), 1.68);
+        // ... while 272k exactly does not (the band activates above).
+        assert_eq!(token_cost(272_000, 0, 0, 0, "gpt-5.6", None), 1.088);
     }
 
     #[test]
@@ -3216,6 +3510,64 @@ mod tests {
         assert_ne!(
             base, provider_flip,
             "a rate-identical provider flip changes attribution and must change the digest (rm-613)"
+        );
+    }
+
+    // --- rm-164: catalog identity covers tier families and bands -------
+
+    #[test]
+    fn catalog_identity_covers_tier_families_and_bands() {
+        fn catalog_with(price: Price) -> PricingCatalog {
+            PricingCatalog {
+                entries: BTreeMap::from([("m".to_string(), price)]),
+                aliases: BTreeMap::new(),
+                source: "test".to_string(),
+                providers: BTreeMap::new(),
+                reference_date: None,
+            }
+        }
+        fn rates(input: f64, output: f64) -> TierRates {
+            TierRates {
+                input,
+                output,
+                cw: None,
+                cr: None,
+            }
+        }
+        let plain = catalog_identity_of(&catalog_with(Price {
+            input: 1.0,
+            output: 2.0,
+            ..Price::default()
+        }));
+        let gained_tier = catalog_identity_of(&catalog_with(Price {
+            input: 1.0,
+            output: 2.0,
+            tiers: BTreeMap::from([("ultrafast".to_string(), rates(12.0, 60.0))]),
+            ..Price::default()
+        }));
+        let changed_tier = catalog_identity_of(&catalog_with(Price {
+            input: 1.0,
+            output: 2.0,
+            tiers: BTreeMap::from([("ultrafast".to_string(), rates(12.5, 60.0))]),
+            ..Price::default()
+        }));
+        let gained_band = catalog_identity_of(&catalog_with(Price {
+            input: 1.0,
+            output: 2.0,
+            bands: BTreeMap::from([(272_000u64, rates(4.0, 15.0))]),
+            ..Price::default()
+        }));
+        assert_ne!(
+            plain, gained_tier,
+            "gaining an ultrafast family must reprice the cache"
+        );
+        assert_ne!(
+            gained_tier, changed_tier,
+            "a refresh that changes ONLY an ultrafast rate must reprice warm caches (the live drift shape)"
+        );
+        assert_ne!(
+            plain, gained_band,
+            "gaining a long-context band must reprice the cache"
         );
     }
 }

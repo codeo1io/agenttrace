@@ -2361,6 +2361,7 @@ fn render_test_match_json() -> anyhow::Result<String> {
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "openai/gpt-4.1",
         "gpt-5.6",
+        "gpt-6.1-sol",
         "gpt-4.1-mini-2025-04-14",
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
@@ -2384,6 +2385,12 @@ fn render_test_match_json() -> anyhow::Result<String> {
                 "flex_output_per_million": price.output_flex,
                 "flex_cache_write_per_million": price.cw_flex,
                 "flex_cache_read_per_million": price.cr_flex,
+                // rm-164: the non-flex tier families and long-context
+                // bands the row carries — same probe-surface parity as
+                // the flex quartet ({} when the row carries none: such
+                // turns bill at the standard rates above).
+                "tiers": price.tiers,
+                "bands": price.bands,
             })
         })
         .collect();

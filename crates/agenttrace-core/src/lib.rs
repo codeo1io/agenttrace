@@ -60,8 +60,9 @@ pub use insights::{
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
-    list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
+    list_pricing, lookup_price, lookup_price_banded, lookup_price_tiered, pricing_cache_path,
+    pricing_source, pricing_source_for, render_model_pricing_list, render_test_match,
+    update_pricing, Price, TierRates,
 };
 pub use reports::{
     add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
@@ -1805,6 +1806,14 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
         Some(tier) => pricing::lookup_price_tiered(model, Some(tier.as_str())),
         None => price.clone(),
     };
+    // rm-164: rows with published long-context bands need the
+    // per-block path too — bands key on each turn's prompt magnitude,
+    // so a session aggregate would reprice every turn at whichever
+    // rate the SUM crosses (a one-band-crossing turn in a 40-turn
+    // session would band the other 39). Band-less rows keep the
+    // aggregate fast path, whose exact numbers the flex contract
+    // pins.
+    let model_has_bands = !catalog_price.bands.is_empty();
     // rm-610: record the billed tier on the metrics so every consumer
     // that re-prices from (model, tokens) — the governance audit's
     // "current rates" recompute, waste's unpriced-input cost — bills
@@ -1872,7 +1881,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let mut model_attribution: BTreeMap<String, ModelAttribution> = BTreeMap::new();
     // rm-610: one model on several tiers prices per usage block too —
     // same per-block arm, tier-aware rates (see the loop below).
-    let token_priced = if usage_blocks_multi_model || usage_blocks_multi_tier {
+    // rm-164: ... and so does a row with long-context bands, at any
+    // tier mix (see `model_has_bands` above).
+    let token_priced = if usage_blocks_multi_model || usage_blocks_multi_tier || model_has_bands {
         // Recorded costs were accumulated into upstream_cost_usd above;
         // start from them and add per-block catalog pricing for the rest.
         let mut per_block_cost = metrics.upstream_cost_usd;
@@ -1931,40 +1942,44 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 entry.cost_usd = round4(entry.cost_usd + event.recorded_cost_usd.unwrap_or(0.0));
                 continue;
             }
+            let block_input = event.usage.get("input_tokens").copied().unwrap_or(0).max(0);
+            let block_output = event
+                .usage
+                .get("output_tokens")
+                .copied()
+                .unwrap_or(0)
+                .max(0);
+            let block_cw = event
+                .usage
+                .get("cache_creation_input_tokens")
+                .copied()
+                .unwrap_or(0)
+                .max(0);
+            let block_cr = event
+                .usage
+                .get("cache_read_input_tokens")
+                .copied()
+                .unwrap_or(0)
+                .max(0);
             let block_price = if event.model_used.is_empty() || event.model_used == "unknown" {
                 price.clone()
             } else {
                 // rm-610: price the tier the turn actually ran on —
                 // flex-disclosing turns use the row's flex slots.
-                pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
+                // rm-164: a prompt past a published long-context
+                // band threshold bills at the band rates.
+                pricing::lookup_price_banded(
+                    &event.model_used,
+                    event.service_tier.as_deref(),
+                    block_input
+                        .saturating_add(block_cw)
+                        .saturating_add(block_cr),
+                )
             };
-            let block_cost = event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
-                / 1e6
-                * block_price.input
-                + event
-                    .usage
-                    .get("output_tokens")
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as f64
-                    / 1e6
-                    * block_price.output
-                + event
-                    .usage
-                    .get("cache_creation_input_tokens")
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as f64
-                    / 1e6
-                    * block_price.cw
-                + event
-                    .usage
-                    .get("cache_read_input_tokens")
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as f64
-                    / 1e6
-                    * block_price.cr;
+            let block_cost = block_input as f64 / 1e6 * block_price.input
+                + block_output as f64 / 1e6 * block_price.output
+                + block_cw as f64 / 1e6 * block_price.cw
+                + block_cr as f64 / 1e6 * block_price.cr;
             per_block_cost += block_cost;
             entry.cost_usd = round4(entry.cost_usd + block_cost);
         }
@@ -2034,6 +2049,20 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             "mixed service tiers (priced per usage block)"
         }
         .to_string();
+    } else if model_has_bands {
+        // rm-164: one tier, but the row publishes long-context bands —
+        // each block priced at the band threshold its own prompt
+        // magnitude crosses. Say so instead of presenting a
+        // single-rate estimate over a banded row.
+        let mut label = if metrics.upstream_cost_usd > 0.0 {
+            "long-context bands (priced per usage block) + recorded cost".to_string()
+        } else {
+            "long-context bands (priced per usage block)".to_string()
+        };
+        if let Some(tier) = &session_service_tier {
+            label.push_str(&format!("; service_tier: {tier}"));
+        }
+        metrics.provenance.pricing_source = label;
     } else if let Some(tier) = &session_service_tier {
         // rm-610: the whole session ran one tier that is not the
         // standard row — the cost carries the tier it billed on.

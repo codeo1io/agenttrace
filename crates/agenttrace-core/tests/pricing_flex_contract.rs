@@ -27,15 +27,18 @@ fn flex_turns_bill_at_the_published_flex_rates() {
         (flex.cr - 0.2).abs() < 1e-9,
         "4e-6 scaled is 0.2 within f64"
     );
-    // Tiers other than "flex" — including the None a tier-less turn
-    // prices at — keep the standard rates exactly as before.
+    // A tier-less turn keeps the standard rates exactly as before —
+    // and so do tiers the row does not carry (rm-164: gpt-5.6 DOES
+    // carry a priority family now; that billing is pinned in
+    // tests/pricing_tier_contract.rs, not here).
     assert_eq!(
         per_million(&lookup_price_tiered("gpt-5.6", None)),
         (4.0, 20.0)
     );
     assert_eq!(
-        per_million(&lookup_price_tiered("gpt-5.6", Some("priority"))),
-        (4.0, 20.0)
+        per_million(&lookup_price_tiered("gpt-5.6", Some("scale"))),
+        (4.0, 20.0),
+        "a tier the row does not carry bills at the standard rates"
     );
 }
 
@@ -89,11 +92,11 @@ fn single_model_flex_session_bills_at_the_flex_row() {
     // priced the session totals at the STANDARD row, because the
     // tier-aware arm only ran for multi-model sessions: 1M in + 1M out
     // on gpt-5.6 billed $24 where the flex row says $12.
-    let events = vec![usage_event("gpt-5.6", Some("flex"), 1_000_000, 1_000_000)];
+    let events = vec![usage_event("gpt-5.6", Some("flex"), 100_000, 100_000)];
     let metrics = analyze(&events, "gpt-5.6");
     assert_eq!(
-        metrics.cost_estimated, 12.0,
-        "single-model session totals must bill the flex row"
+        metrics.cost_estimated, 1.2,
+        "single-model session totals must bill the flex row (100k in + 100k out at $2/$10 per M)"
     );
     assert_eq!(
         metrics.service_tier.as_deref(),
@@ -109,9 +112,12 @@ fn single_model_flex_session_bills_at_the_flex_row() {
         metrics.provenance.pricing_source
     );
     // The tier-less session keeps the old number and the old label.
-    let events = vec![usage_event("gpt-5.6", None, 1_000_000, 1_000_000)];
+    // (Both fixtures stay below gpt-5.6's >272k long-context band —
+    // rm-164's banded fixtures live in pricing_tier_contract.rs; this
+    // file pins the flex-vs-standard arms alone.)
+    let events = vec![usage_event("gpt-5.6", None, 100_000, 100_000)];
     let metrics = analyze(&events, "gpt-5.6");
-    assert_eq!(metrics.cost_estimated, 24.0);
+    assert_eq!(metrics.cost_estimated, 2.4);
     assert!(!metrics.provenance.pricing_source.contains("service_tier"));
 }
 
@@ -121,13 +127,13 @@ fn mixed_tier_session_prices_per_block() {
     // produced it and the session says so instead of presenting a
     // single-rate estimate.
     let events = vec![
-        usage_event("gpt-5.6", Some("flex"), 1_000_000, 1_000_000),
-        usage_event("gpt-5.6", None, 1_000_000, 1_000_000),
+        usage_event("gpt-5.6", Some("flex"), 100_000, 100_000),
+        usage_event("gpt-5.6", None, 100_000, 100_000),
     ];
     let metrics = analyze(&events, "gpt-5.6");
     assert_eq!(
-        metrics.cost_estimated, 36.0,
-        "$12 flex block + $24 standard block"
+        metrics.cost_estimated, 3.6,
+        "$1.2 flex block + $2.4 standard block"
     );
     assert_eq!(
         metrics.provenance.pricing_source,
