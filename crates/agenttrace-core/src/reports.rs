@@ -3650,6 +3650,72 @@ fn guard_formula_cell(value: &str) -> String {
     }
 }
 
+/// rm-988: guards a transcript-derived TEXT segment whose hostile value
+/// rides behind a mint-side label — the governance evidence composites
+/// (`session={name}`, governance.rs:807/:830/:847/:894) and the search
+/// match items (`name: {value}`, search.rs) place the value in the
+/// SECOND half of the string, so `guard_formula_cell` (which judges the
+/// first character of the whole cell) never fires on them:
+/// `session==HYPERLINK(evil.example)` starts with `s`. Split ONCE at the
+/// first `=` (the evidence shape) or `: ` (the match-item shape) whose
+/// prefix is a non-empty, introducer-free label, and guard the value
+/// half with `guard_formula_cell`; everything else falls through to the
+/// whole-cell guard. One delimiter deep on purpose: every mint shape
+/// embeds the name at the first boundary, and going deeper would rebuild
+/// cell semantics mid-string. The numeric exemption, introducer set
+/// (fullwidth included), and leading-`'` marker are `guard_formula_cell`'s
+/// arm for arm — the plain governance/search lanes and the landed
+/// sessions/CSV/TSV lanes now agree on the same escape. Like that guard,
+/// the false-positive cost (an apostrophe on a benign `-` bullet riding
+/// a label) is accepted: guarding is the safe direction.
+pub fn guard_formula_text(value: &str) -> String {
+    // Candidate boundaries: the first `=` whose prefix is a plain
+    // label (the evidence-composite shape), and the first `: ` whose
+    // prefix is a plain label (the match-item shape). When both fire
+    // (`name: =EVIL` carries the introducer `=` inside the value half)
+    // the EARLIEST boundary owns the split.
+    let equals = value
+        .find('=')
+        .filter(|&at| is_plain_label(&value[..at]))
+        .map(|at| at + 1);
+    let colon = value
+        .find(": ")
+        .filter(|&at| is_plain_label(&value[..at]))
+        .map(|at| at + 2);
+    let boundary = match (equals, colon) {
+        (Some(equals_at), Some(colon_at)) => Some(equals_at.min(colon_at)),
+        (only, None) | (None, only) => only,
+    };
+    match boundary {
+        Some(value_at) => {
+            let (label, rest) = value.split_at(value_at);
+            format!("{label}{}", guard_formula_cell(rest))
+        }
+        None => guard_formula_cell(value),
+    }
+}
+
+/// The label half of a `label=value` / `label: value` composite: a
+/// non-empty prefix whose first non-whitespace character is no formula
+/// introducer. An empty or introducer-leading prefix means the
+/// introducer IS the cell head (`=HYPERLINK...`, `=cmd|...`) and the
+/// whole-cell guard owns the string instead.
+fn is_plain_label(prefix: &str) -> bool {
+    prefix
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|first| {
+            !matches!(
+                first,
+                '=' | '+' | '@' | '-'
+                    | '\u{FF1D}' // FULLWIDTH EQUALS SIGN
+                    | '\u{FF0B}' // FULLWIDTH PLUS SIGN
+                    | '\u{FF20}' // FULLWIDTH COMMERCIAL AT
+                    | '\u{FF0D}' // FULLWIDTH HYPHEN-MINUS
+            )
+        })
+}
+
 fn markdown_cell(value: &str) -> String {
     guard_formula_cell(value)
         .replace('&', "&amp;")
@@ -4041,5 +4107,45 @@ mod tests {
         assert!(cell.contains("workbuddy_input_basis:zeroed_suspected_mismatch=1"));
         assert!(cell.contains("upstream luoyuctl/agenttrace#310"));
         assert!(cell.contains("cache-inclusive"));
+    }
+}
+
+#[cfg(test)]
+mod guard_formula_text_tests {
+    use super::guard_formula_text;
+
+    #[test]
+    fn guards_bare_values_and_label_composites_arm_for_arm() {
+        // rm-988: the segmented guard. Bare hostile cells keep the
+        // whole-cell behavior; mint composites (`session={name}`,
+        // `name: {value}`) guard the VALUE half so the label prefix
+        // can no longer mask the introducer; benign composites and the
+        // numeric exemption stay unmangled.
+        let hostile = "=HYPERLINK(evil.example)";
+        assert_eq!(guard_formula_text(hostile), format!("'{hostile}"));
+        assert_eq!(guard_formula_text("+SUM(A1:A9)"), "'+SUM(A1:A9)");
+        assert_eq!(guard_formula_text("\u{FF1D}1+1"), "'\u{FF1D}1+1");
+        // Evidence composites (governance.rs mint shapes).
+        assert_eq!(
+            guard_formula_text(&format!("session={hostile}")),
+            format!("session='{hostile}")
+        );
+        assert_eq!(
+            guard_formula_text("loop_cost=$0.0142 (synthetic-estimate)"),
+            "loop_cost=$0.0142 (synthetic-estimate)"
+        );
+        assert_eq!(guard_formula_text("failed_calls=3"), "failed_calls=3");
+        assert_eq!(guard_formula_text("utilization=95.0%"), "utilization=95.0%");
+        // Search match items (`label: value` mint shape).
+        assert_eq!(
+            guard_formula_text(&format!("name: {hostile}")),
+            format!("name: '{hostile}")
+        );
+        assert_eq!(guard_formula_text("tool: Bash"), "tool: Bash");
+        // The whole-cell numeric exemption still applies to the value
+        // half of a composite (a `-42.5` delta stays a bare value).
+        assert_eq!(guard_formula_text("delta=-42.5"), "delta=-42.5");
+        // An empty prefix is not a label: the introducer owns the cell.
+        assert_eq!(guard_formula_text("=cmd|' calc'!A0"), "'=cmd|' calc'!A0");
     }
 }

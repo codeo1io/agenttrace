@@ -332,6 +332,22 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
             ));
         }
     };
+    // rm-782 (member arm): JSON-RPC 2.0 also requires the `jsonrpc`
+    // member to be exactly the string "2.0" — a request without it (or
+    // carrying any other shape: wrong value, wrong type) used to be
+    // answered like a well-formed request, so junk with a plausible id
+    // still drove dispatch. Answer -32600 beside the id-class guard,
+    // echoing the decoded id; the server stays up for the next line.
+    let jsonrpc_valid = object
+        .get("jsonrpc")
+        .is_some_and(|value| value.as_str() == Some("2.0"));
+    if !jsonrpc_valid {
+        return Some(error_response(
+            id,
+            CODE_INVALID_REQUEST,
+            "Invalid Request: `jsonrpc` must be the string \"2.0\"",
+        ));
+    }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
         // No method: a request is invalid, a notification is ignorable.
         // (`id.as_ref()?` silences a notification here without moving it.)

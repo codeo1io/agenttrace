@@ -1431,7 +1431,17 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
         // journal-derived strings (e.g. mcp_server_name inferred from a
         // crafted tool name) through this leaf; control bytes must not
         // reach the terminal (same contract as the TSV/search renderers).
-        serde_json::Value::String(value) => sanitize_line_segment(value),
+        serde_json::Value::String(value) => {
+            // rm-988: the plain governance lane's string leaf is where a
+            // transcript-derived `=HYPERLINK(...)` session name rode raw
+            // into --delivery-evidence records and --recommend evidence
+            // strings (assess PoC, run 0e3b248f4dac). Control bytes die in
+            // the sanitizer first, then the label-aware formula guard
+            // fires — same leading-apostrophe convention as the landed
+            // sessions/CSV/TSV lanes. The JSON and markdown-fenced lanes
+            // render this same Value losslessly and are untouched.
+            agenttrace_core::guard_formula_text(&sanitize_line_segment(value))
+        }
         _ => value.to_string(),
     }
 }
@@ -4984,5 +4994,74 @@ mod tests {
         overview.overview = true;
         overview.include_history = true;
         assert!(validate_history_applicability(&overview).is_ok());
+    }
+
+    #[test]
+    fn governance_text_lane_guards_formulas_json_and_markdown_stay_lossless() {
+        // rm-988: the last raw governance text arms — `--delivery-evidence`
+        // session records (bare `session:` value) and `--recommend`
+        // evidence strings (the `session={name}` composite minted in
+        // governance.rs) — rode a `=HYPERLINK(...)` session name
+        // byte-for-byte into the plain lane (assess PoC, run
+        // 0e3b248f4dac, dossier 271ff08b). render_plain_value's string
+        // leaf must guard with the sessions lane's leading-apostrophe
+        // convention (label-aware, so the composite's value half is
+        // judged); the JSON and markdown-fenced lanes stay lossless.
+        let hostile = "=HYPERLINK(evil.example)";
+        let delivery = serde_json::json!({
+            "methodology": "probe",
+            "summary": {"strong": 0, "medium": 0, "weak": 0, "non_code": 0, "none": 1},
+            "sessions": [{
+                "session": hostile,
+                "project": "proj",
+                "level": "none",
+                "evidence": ["no write, Git, publish, or tool evidence observed"],
+                "confidence": "low",
+            }],
+        });
+        let plain = render_governance_report(&delivery, "text").unwrap();
+        assert!(
+            plain.contains(&format!("session: '{hostile}")),
+            "delivery record must guard the bare session value:\n{plain}"
+        );
+        assert!(
+            !plain.contains(&format!("session: {hostile}")),
+            "a raw formula must not ride the delivery record:\n{plain}"
+        );
+
+        let recommend = serde_json::json!({
+            "recommendations": [{
+                "id": "slow-tool",
+                "severity": "medium",
+                "category": "latency",
+                "title": "Bound slow tool execution",
+                "evidence": [
+                    format!("session={hostile}"),
+                    "tool=Bash p95=1.0s unmatched=1".to_string(),
+                ],
+            }],
+        });
+        let plain = render_governance_report(&recommend, "text").unwrap();
+        assert!(
+            plain.contains(&format!("session='{hostile}")),
+            "recommend evidence must guard the value half after `session=`:\n{plain}"
+        );
+        assert!(
+            !plain.contains(&format!("session={hostile}")),
+            "a raw formula must not ride the recommend evidence:\n{plain}"
+        );
+        // Benign composites stay unmangled: the guard fires on the
+        // value half's introducer, never on the label delimiter.
+        assert!(plain.contains("tool=Bash p95=1.0s unmatched=1"));
+
+        // Lossless lanes: JSON serialization and the markdown-fenced
+        // block keep the raw name — byte-identical output by design.
+        let json = render_governance_report(&delivery, "json").unwrap();
+        assert!(json.contains(hostile), "JSON lane stays lossless:\n{json}");
+        let markdown = render_governance_report(&delivery, "markdown").unwrap();
+        assert!(
+            markdown.contains(hostile),
+            "markdown-fenced lane stays lossless:\n{markdown}"
+        );
     }
 }

@@ -557,3 +557,133 @@ fn rm936_bidi_format_controls_neutralized_across_every_lane() {
         }
     }
 }
+
+/// rm-988 (cycle 3, run 0e3b248f4dac): the governance and search text
+/// lanes were the last raw spreadsheet-formula arms — the rm-540/rm-545
+/// sessions guard covered `--sessions` text/TSV/CSV, but
+/// `--delivery-evidence` session records, `--recommend` evidence
+/// strings (`session={name}` composites), and `--search`'s match header
+/// plus `name:` detail rode a `=HYPERLINK(...)`-named journal
+/// byte-for-byte (assess PoC, dossier 271ff08b). This is the live
+/// binary pin for all three arms at once: hostile stems come out
+/// apostrophe-guarded in every plain lane, while the JSON and
+/// markdown-fenced lanes stay lossless (byte-identical by design) and
+/// the already-guarded sessions lane does not regress.
+#[test]
+fn governance_and_search_text_lanes_guard_formulas() {
+    let tmp = tempdir("output-safety-gov");
+    let corpus = tmp.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    let hyperlink = "=HYPERLINK(evil.example)";
+    let pipe = "=cmd|' calc'!A0";
+    // Session names come from the first user message (the assess PoC
+    // shape: the formula rides the message content; the hostile stems
+    // double-cover the stem-derived naming path). The hyperlink journal
+    // carries an assistant tool_use with NO matching tool_result, so the
+    // latency diagnostics mint an unmatched row and `--recommend` emits
+    // a `session={name}` evidence composite for this session.
+    fs::write(
+        corpus.join(format!("{hyperlink}.jsonl")),
+        format!(
+            r#"{{"type": "user", "uuid": "u1", "timestamp": "2026-10-01T10:00:00Z", "message": {{"role": "user", "content": "{hyperlink}"}}, "cwd": "/tmp/at-rm988-poc"}}
+{{"type": "assistant", "uuid": "a1", "timestamp": "2026-10-01T10:00:05Z", "message": {{"role": "assistant", "model": "claude-sonnet-4-5", "content": [{{"type": "tool_use", "id": "t1", "name": "Bash", "input": {{"command": "echo hi"}}}}], "usage": {{"input_tokens": 10, "output_tokens": 5}}}}}}
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        corpus.join(format!("{pipe}.jsonl")),
+        format!(
+            r#"{{"type": "user", "uuid": "u1", "timestamp": "2026-10-02T10:00:00Z", "message": {{"role": "user", "content": "{pipe}"}}, "cwd": "/tmp/at-rm988-poc"}}
+{{"type": "assistant", "uuid": "a1", "timestamp": "2026-10-02T10:00:05Z", "message": {{"role": "assistant", "model": "claude-sonnet-4-5", "content": [{{"type": "text", "text": "done"}}], "usage": {{"input_tokens": 10, "output_tokens": 5}}}}}}
+"#
+        ),
+    )
+    .unwrap();
+    let home = tmp.join("home");
+    fs::create_dir_all(home.join(".cache")).unwrap();
+    let run = |argv: &[&str]| -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .arg("-d")
+            .arg(&corpus)
+            .args(argv)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .output()
+            .expect("agenttrace runs");
+        assert!(
+            out.status.success(),
+            "{} failed: {}",
+            argv.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // Delivery evidence: the bare `session:` record value.
+    let delivery = run(&["--delivery-evidence", "-f", "text"]);
+    assert!(
+        delivery.contains(&format!("session: '{hyperlink}")),
+        "delivery record must guard the session cell:\n{delivery}"
+    );
+    assert!(
+        !delivery.contains(&format!("session: {hyperlink}")),
+        "a raw formula must not ride the delivery record:\n{delivery}"
+    );
+
+    // Recommendations: the `session={name}` evidence composite.
+    let recommend = run(&["--recommend", "-f", "text"]);
+    assert!(
+        recommend.contains(&format!("session='{hyperlink}")),
+        "recommend evidence must guard the value half:\n{recommend}"
+    );
+    assert!(
+        !recommend.contains(&format!("session={hyperlink}")),
+        "a raw formula must not ride the recommend evidence:\n{recommend}"
+    );
+
+    // Search: the match header cell plus the `name:` detail line.
+    let search = run(&["--search", "evil", "-f", "text"]);
+    assert!(
+        search.contains(&format!("'{hyperlink}")),
+        "search header must guard the name cell:\n{search}"
+    );
+    assert!(
+        search.contains(&format!("name: '{hyperlink}")),
+        "search detail must guard the value half:\n{search}"
+    );
+    assert!(
+        !search.contains(&format!("\n{hyperlink}")),
+        "a raw formula must not lead the search header:\n{search}"
+    );
+    assert!(
+        !search.contains(&format!("name: {hyperlink}")),
+        "a raw formula must not ride the search detail:\n{search}"
+    );
+
+    // Lossless lanes: JSON and markdown-fenced output keep the raw
+    // stems (serde escapes control bytes; introducers are not them).
+    let delivery_json = run(&["--delivery-evidence", "-f", "json"]);
+    assert!(
+        delivery_json.contains(hyperlink),
+        "JSON lane stays lossless:\n{delivery_json}"
+    );
+    let recommend_md = run(&["--recommend", "-f", "markdown"]);
+    assert!(
+        recommend_md.contains(&format!("session={hyperlink}")),
+        "markdown-fenced lane stays lossless:\n{recommend_md}"
+    );
+
+    // Regression: the already-guarded sessions text lane.
+    let sessions = run(&["--sessions", "-f", "text"]);
+    assert!(
+        sessions.contains(&format!("'{hyperlink}")),
+        "sessions lane lost its guard:\n{sessions}"
+    );
+    assert!(
+        sessions.contains(&format!("'{pipe}")),
+        "sessions lane lost its guard (pipe stem):\n{sessions}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
