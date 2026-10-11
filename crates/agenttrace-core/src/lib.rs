@@ -60,8 +60,8 @@ pub use insights::{
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
-    list_pricing, lookup_price, pricing_cache_path, pricing_source, pricing_source_for,
-    render_model_pricing_list, render_test_match, update_pricing,
+    list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
+    pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
 };
 pub use reports::{
     add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
@@ -196,6 +196,20 @@ pub struct Event {
         deserialize_with = "deserialize_string"
     )]
     pub model_used: String,
+    /// rm-610: the service tier the turn ran on, when the source
+    /// journal discloses it (codex rollouts carry it as
+    /// `payload.thread_settings.service_tier`, e.g. "flex" or
+    /// "priority"). Flex turns price at the catalog row's flex slots
+    /// (`Price::input_flex` ...). Absent on every other family and on
+    /// turns whose journal is silent; `skip` keeps serialized events
+    /// byte-identical to pre-rm-610 output.
+    #[serde(
+        default,
+        rename = "ServiceTier",
+        alias = "service_tier",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_tier: Option<String>,
     /// rm-485: cost-only credit attribution in USD. Carried by meta events
     /// whose adapter truth is a session-wide credit counter (Copilot's
     /// `totalNanoAiu`, 1 AIU = 1 AI credit = $0.01) rather than tokens the
@@ -511,6 +525,14 @@ pub struct Metrics {
     pub timestamps: Vec<DateTime<Utc>>,
     pub gaps_sec: Vec<f64>,
     pub model_used: String,
+    /// rm-610: the service tier the session's usage blocks all agree on
+    /// (codex `thread_settings.service_tier`, e.g. "flex"). `None` when
+    /// the journal is silent or the tiers mix — exactly the value the
+    /// totals were billed on; consumed by the audit/waste recomputes and
+    /// persisted by the session cache so warm hits replay tier-priced
+    /// costs. `skip` keeps tier-less output byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub source_tool: String,
     pub session_start: String,
     pub session_end: String,
@@ -1454,6 +1476,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // which models produced usage blocks, and which token classes
     // already carry an upstream-recorded cost.
     let mut usage_models: BTreeSet<String> = BTreeSet::new();
+    let mut usage_tiers: BTreeSet<Option<String>> = BTreeSet::new();
     let mut upstream_priced_input = 0i64;
     let mut upstream_priced_output = 0i64;
     let mut upstream_priced_cache_w = 0i64;
@@ -1604,6 +1627,10 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     if !event.model_used.is_empty() && event.model_used != "unknown" {
                         usage_models.insert(event.model_used.clone());
                     }
+                    // rm-610: every usage block also records the tier its
+                    // turn ran on, so the cost formula below can bill the
+                    // session on the tier it actually used.
+                    usage_tiers.insert(event.service_tier.clone());
                     // Workbuddy basis disclosure (upstream #310): the
                     // workbuddy lane subtracts cache_read_input_tokens from
                     // input_tokens assuming a cache-INCLUSIVE input basis.
@@ -1764,6 +1791,25 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             metrics.source_tool = fallback;
         }
     }
+    // rm-610: a single-model session still bills on the tier its turns
+    // ran on. All usage events agreeing on one tier (the codex flex
+    // case) prices the session totals at that tier's row; a tier mix
+    // falls through to per-block pricing exactly like a model mix.
+    let usage_blocks_multi_tier = usage_tiers.len() > 1;
+    let session_service_tier = if usage_tiers.len() == 1 {
+        usage_tiers.iter().next().cloned().flatten()
+    } else {
+        None
+    };
+    let catalog_price = match &session_service_tier {
+        Some(tier) => pricing::lookup_price_tiered(model, Some(tier.as_str())),
+        None => price.clone(),
+    };
+    // rm-610: record the billed tier on the metrics so every consumer
+    // that re-prices from (model, tokens) — the governance audit's
+    // "current rates" recompute, waste's unpriced-input cost — bills
+    // the tier the session actually ran on instead of the standard row.
+    metrics.service_tier = session_service_tier.clone();
     // rm-436: tokens whose cost the source journal recorded (pi
     // `type:"usage"` entries carrying `usage.cost.total`) were already
     // added to the class totals above for visibility; exclude them from
@@ -1771,19 +1817,20 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // recorded value, instead of being estimated at the session
     // model's rate on top of the recorded cost.
     let catalog_cost = round4(
-        metrics.tokens_input.saturating_sub(upstream_priced_input) as f64 / 1e6 * price.input
+        metrics.tokens_input.saturating_sub(upstream_priced_input) as f64 / 1e6
+            * catalog_price.input
             + metrics.tokens_output.saturating_sub(upstream_priced_output) as f64 / 1e6
-                * price.output
+                * catalog_price.output
             + metrics
                 .tokens_cache_w
                 .saturating_sub(upstream_priced_cache_w) as f64
                 / 1e6
-                * price.cw
+                * catalog_price.cw
             + metrics
                 .tokens_cache_r
                 .saturating_sub(upstream_priced_cache_r) as f64
                 / 1e6
-                * price.cr,
+                * catalog_price.cr,
     );
     // rm-520: persist which token classes the journal priced upstream
     // so audits can reproduce the stored estimate on the same basis
@@ -1823,7 +1870,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // serialized metrics shape is byte-identical to the pre-rm-406
     // form.
     let mut model_attribution: BTreeMap<String, ModelAttribution> = BTreeMap::new();
-    let token_priced = if usage_blocks_multi_model {
+    // rm-610: one model on several tiers prices per usage block too —
+    // same per-block arm, tier-aware rates (see the loop below).
+    let token_priced = if usage_blocks_multi_model || usage_blocks_multi_tier {
         // Recorded costs were accumulated into upstream_cost_usd above;
         // start from them and add per-block catalog pricing for the rest.
         let mut per_block_cost = metrics.upstream_cost_usd;
@@ -1885,7 +1934,9 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             let block_price = if event.model_used.is_empty() || event.model_used == "unknown" {
                 price.clone()
             } else {
-                pricing::lookup_price(&event.model_used)
+                // rm-610: price the tier the turn actually ran on —
+                // flex-disclosing turns use the row's flex slots.
+                pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
             };
             let block_cost = event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
                 / 1e6
@@ -1950,7 +2001,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     .contains(&i64::MAX)
     {
         "calculated_from_tokens_clamped"
-    } else if usage_blocks_multi_model {
+    } else if usage_blocks_multi_model || usage_blocks_multi_tier {
         "calculated_per_message_tokens"
     } else if metrics.upstream_cost_usd > 0.0 {
         "calculated_from_tokens_with_recorded_cost"
@@ -1971,6 +2022,31 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             format!("multiple models ({PER_BLOCK_PRICING_MARKER}) + recorded cost")
         } else {
             format!("multiple models ({PER_BLOCK_PRICING_MARKER})")
+        }
+        .to_string();
+    } else if usage_blocks_multi_tier {
+        // rm-610: one model, several tiers — the session priced each
+        // block on the tier that produced it, and says so instead of
+        // presenting a single-rate estimate.
+        metrics.provenance.pricing_source = if metrics.upstream_cost_usd > 0.0 {
+            "mixed service tiers (priced per usage block) + recorded cost"
+        } else {
+            "mixed service tiers (priced per usage block)"
+        }
+        .to_string();
+    } else if let Some(tier) = &session_service_tier {
+        // rm-610: the whole session ran one tier that is not the
+        // standard row — the cost carries the tier it billed on.
+        metrics.provenance.pricing_source = if metrics.upstream_cost_usd > 0.0 {
+            format!(
+                "{} + recorded cost; service_tier: {}",
+                metrics.provenance.pricing_source, tier
+            )
+        } else {
+            format!(
+                "{}; service_tier: {}",
+                metrics.provenance.pricing_source, tier
+            )
         };
     } else if metrics.upstream_cost_usd > 0.0 {
         metrics.provenance.pricing_source =
