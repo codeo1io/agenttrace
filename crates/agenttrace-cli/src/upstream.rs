@@ -276,6 +276,11 @@ pub struct UpstreamStatus {
     /// `registry@X` after a successful `--fetch` probe, `unavailable`
     /// when the probe failed, `unknown (offline)` otherwise.
     pub npm_state: String,
+    /// opencode vendor-watch channel state (rm-950, cycle 3): the release
+    /// tag from the anomalyco/opencode releases API, with an explicit
+    /// `npm channel retired` label once the registry probe 404s — a dead
+    /// channel is a state, not a probe failure.
+    pub opencode_state: String,
 }
 
 /// Entry point for the `agenttrace upstream` host command. Returns the
@@ -385,6 +390,15 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         "unknown (offline; agenttrace --fetch upstream)".to_string()
     };
 
+    // rm-950: the opencode vendor watch anchors on the releases API of the
+    // renamed home (anomalyco/opencode) and reports the retired npm channel
+    // explicitly rather than as a probe failure.
+    let opencode_state = if fetch {
+        opencode_channel_state()
+    } else {
+        "unknown (offline; agenttrace --fetch upstream)".to_string()
+    };
+
     Ok(UpstreamStatus {
         remote,
         ref_name,
@@ -403,6 +417,7 @@ fn collect_status(fetch: bool) -> anyhow::Result<UpstreamStatus> {
         refs_age_seconds: refs_age_seconds(&tracking),
         fetched: fetch,
         npm_state,
+        opencode_state,
     })
 }
 
@@ -557,6 +572,80 @@ fn npm_registry_version() -> Option<String> {
     body.get("version")?.as_str().map(str::to_string)
 }
 
+/// opencode vendor-watch authority (rm-950, cycle 3). The npm channel the
+/// watch originally anchored on is retired (registry.npmjs.org/opencode and
+/// /@opencode-ai/opencode both 404); the releases API of the renamed home,
+/// github.com/anomalyco/opencode, is the authority for latest.
+const OPENCODE_RELEASES_URL: &str =
+    "https://api.github.com/repos/anomalyco/opencode/releases/latest";
+const OPENCODE_NPM_URL: &str = "https://registry.npmjs.org/opencode";
+
+/// HTTP status of `url` via curl, `None` when curl is absent or the
+/// request itself fails (offline). A 404 here means "channel retired",
+/// not "probe broke".
+fn http_status_via_curl(url: &str) -> Option<u32> {
+    let output = Command::new("curl")
+        .args([
+            "-sSL",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "15",
+            url,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// `tag_name` from a GitHub releases/latest JSON body.
+fn parse_release_tag(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    value.get("tag_name")?.as_str().map(str::to_string)
+}
+
+/// Pure classification so the retired-channel contract is testable
+/// offline: `Some(404)` from the npm registry + a live tag from the
+/// releases API renders `tag (npm channel retired; authority:
+/// anomalyco/opencode releases)` — never a bare failure.
+fn classify_opencode_channel(registry_status: Option<u32>, release_tag: Option<&str>) -> String {
+    let retired = registry_status == Some(404);
+    match (retired, release_tag) {
+        (true, Some(tag)) => {
+            format!("{tag} (npm channel retired; authority: anomalyco/opencode releases)")
+        }
+        (true, None) => "channel retired; releases authority unreachable (network?)".to_string(),
+        (false, Some(tag)) => tag.to_string(),
+        (false, None) => "unknown (offline; agenttrace --fetch upstream)".to_string(),
+    }
+}
+
+fn opencode_channel_state() -> String {
+    classify_opencode_channel(
+        http_status_via_curl(OPENCODE_NPM_URL),
+        github_latest_release_tag(OPENCODE_RELEASES_URL).as_deref(),
+    )
+}
+
+fn github_latest_release_tag(url: &str) -> Option<String> {
+    let output = Command::new("curl")
+        .args(["-fsSL", "--max-time", "15", url])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_release_tag(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn age_phrase(seconds: Option<u64>) -> String {
     match seconds {
         None => "unknown age".to_string(),
@@ -641,6 +730,7 @@ impl UpstreamStatus {
             agenttrace_core::VERSION,
             npm_state = self.npm_state
         ));
+        out.push_str(&format!("  opencode:         {}\n", self.opencode_state));
         out
     }
 
@@ -675,6 +765,7 @@ impl UpstreamStatus {
             "npm": {
                 "package": NPM_PACKAGE,
                 "state": self.npm_state,
+                "opencode_state": self.opencode_state,
                 "running_version": agenttrace_core::VERSION,
             },
         });
@@ -684,6 +775,50 @@ impl UpstreamStatus {
 
 fn short(sha: &str, len: usize) -> String {
     sha.chars().take(len).collect()
+}
+
+#[cfg(test)]
+mod opencode_channel_tests {
+    use super::{classify_opencode_channel, parse_release_tag};
+
+    #[test]
+    fn parse_release_tag_reads_tag_name() {
+        let body = r#"{"tag_name": "v1.18.35", "name": "v1.18.35"}"#;
+        assert_eq!(parse_release_tag(body).as_deref(), Some("v1.18.35"));
+        assert_eq!(parse_release_tag("{\"name\": \"no tag\"}"), None);
+        assert_eq!(parse_release_tag("not json"), None);
+        assert_eq!(parse_release_tag(""), None);
+    }
+
+    #[test]
+    fn retired_channel_renders_as_state_not_failure() {
+        // rm-950 contract: a 404 registry is "retired", and when the
+        // releases authority answers, the tag leads.
+        assert_eq!(
+            classify_opencode_channel(Some(404), Some("v1.18.35")),
+            "v1.18.35 (npm channel retired; authority: anomalyco/opencode releases)"
+        );
+        assert_eq!(
+            classify_opencode_channel(Some(404), None),
+            "channel retired; releases authority unreachable (network?)"
+        );
+    }
+
+    #[test]
+    fn live_or_absent_registry_renders_plainly() {
+        assert_eq!(
+            classify_opencode_channel(Some(200), Some("v1.18.35")),
+            "v1.18.35"
+        );
+        assert_eq!(
+            classify_opencode_channel(None, Some("v1.18.35")),
+            "v1.18.35"
+        );
+        assert_eq!(
+            classify_opencode_channel(None, None),
+            "unknown (offline; agenttrace --fetch upstream)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -948,6 +1083,8 @@ mod tests {
             refs_age_seconds: Some(3_600),
             fetched: false,
             npm_state: "unknown (offline; agenttrace --fetch upstream)".to_string(),
+            opencode_state:
+                "v1.18.35 (npm channel retired; authority: anomalyco/opencode releases)".to_string(),
         }
     }
 

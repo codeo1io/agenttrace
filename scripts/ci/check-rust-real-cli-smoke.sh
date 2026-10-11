@@ -66,19 +66,43 @@ run_capture search-snapshot -d "$snapshot_dir" --search "$query" -f json
 run_capture compare-snapshot -d "$snapshot_dir" --compare -f json
 run_capture waste-snapshot -d "$snapshot_dir" --waste
 
+# rm-952 (cycle 3, landed by review fix fb86baf6): CI step-summary dogfood
+# leg - a real overview run with GITHUB_STEP_SUMMARY set must render the
+# existing overview markdown into the summary file while stdout stays pure
+# JSON (the arm is additive-only; agentic purity holds with it on, not just
+# off). stderr may carry ordinary discovery parse warnings from the sampled
+# corpus (same as the overview-snapshot leg); the step-summary arm's own
+# failure path would print "failed to append GitHub step summary" - THAT is
+# pinned absent here.
+step_summary="$out_dir/step-summary.md"
+step_summary_status=0
+env AGENTTRACE_SESSION_CACHE_DIR="$out_dir/cache-step-summary" \
+  GITHUB_STEP_SUMMARY="$step_summary" \
+  "$bin" --overview -d "$snapshot_dir" -f json \
+  >"$out_dir/step-summary.out" 2>"$out_dir/step-summary.err" \
+  || step_summary_status=$?
+printf "%s\n" "$step_summary_status" >"$out_dir/step-summary.status"
+
 for name in \
   doctor-default doctor-snapshot overview-snapshot \
-  latest-snapshot search-snapshot compare-snapshot waste-snapshot
+  latest-snapshot search-snapshot compare-snapshot waste-snapshot step-summary
 do
   expect_status "$name" 0
 done
 
-for name in doctor-default doctor-snapshot overview-snapshot latest-snapshot search-snapshot compare-snapshot; do
+for name in doctor-default doctor-snapshot overview-snapshot latest-snapshot search-snapshot compare-snapshot step-summary; do
   require_json "$out_dir/$name.out"
 done
 
 grep -q "Waste Analysis" "$out_dir/waste-snapshot.out" \
   || fail "waste report should include Waste Analysis"
+
+[[ -s "$step_summary" ]] \
+  || fail "GITHUB_STEP_SUMMARY run should render a non-empty step summary"
+grep -q "^# agenttrace overview" "$step_summary" \
+  || fail "step summary should carry the overview render heading"
+! grep -q "failed to append GitHub step summary" "$out_dir/step-summary.err" \
+  || fail "step-summary arm reported an append failure on stderr"
 
 node - "$out_dir" "$copied" <<'NODE'
 const fs = require("fs");

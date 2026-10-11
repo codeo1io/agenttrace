@@ -231,7 +231,7 @@ fn csv_cell(raw: &str) -> String {
 /// numerics such as `" -1.5"` — parsed on the trimmed cell, since
 /// `f64::from_str` itself rejects surrounding whitespace) are exempt
 /// so numeric columns still import as values.
-fn guard_formula(raw: &str) -> String {
+pub(crate) fn guard_formula(raw: &str) -> String {
     let looks_numeric = raw.trim().parse::<f64>().is_ok();
     if looks_numeric {
         return raw.to_string();

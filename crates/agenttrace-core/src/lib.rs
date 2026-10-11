@@ -2155,23 +2155,92 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             model_entry.cost += session.metrics.cost_estimated;
         }
 
+        // rm-949 (cycle 3): the per-model attribution costs are priced
+        // independently of the session's billed `cost_estimated` (per-block
+        // catalog pricing with per-add round4, recorded-cost seeds, credit
+        // floors), so raw sums drifted away from the billed total and broke
+        // sum(by_model.cost) == total_cost for machine consumers summing
+        // agenttrace.overview.v1 buckets (assess PoC: billed 0.0002 vs
+        // attribution Σ 0.0004). Distribute the billed total across the
+        // buckets proportionally: the attribution proportions survive,
+        // and the sum is the billed total exactly, by construction.
+        // The apportionment runs in integer 4-dp units via the
+        // largest-remainder method, so every bucket is exact at the
+        // precision every lane renders (json/csv/markdown all print
+        // costs at 4 dp) — the invariant holds in raw f64 AND as
+        // rendered, which the naive proportional division broke
+        // (0.0002 total vs rendered buckets summing 0.0003).
+        //
         // rm-406 (dated 2026-10-07 arm): the session-level by_model
         // bucket above is the headline split (multi-model sessions
         // collapse under "multiple"); additionally credit each
-        // producing model with its own session's spend so an advisor
-        // turn (or a mid-session model switch) lands on the model that
-        // actually burned the tokens instead of vanishing. `sessions`
-        // in an attribution bucket counts sessions that USED the
-        // model — a multi-model session therefore appears in more than
-        // one bucket (by_task_type, by contrast, assigns each session
-        // exactly one bucket and never overlaps).
-        for (attributed_model, attribution) in &session.metrics.model_attribution {
-            let entry = overview
-                .by_model
-                .entry(attributed_model.clone())
-                .or_default();
-            entry.sessions += 1;
-            entry.cost += attribution.cost_usd;
+        // producing model with its own share of the session's spend so
+        // an advisor turn (or a mid-session model switch) lands on the
+        // model that actually burned the tokens instead of vanishing.
+        // `sessions` in an attribution bucket counts sessions that USED
+        // the model — a multi-model session therefore appears in more
+        // than one bucket (by_task_type, by contrast, assigns each
+        // session exactly one bucket and never overlaps).
+        let attributed_total: f64 = session
+            .metrics
+            .model_attribution
+            .values()
+            .map(|attribution| attribution.cost_usd)
+            .sum();
+        if attributed_total > 0.0 {
+            let scale = 1.0e4_f64;
+            let total_units = (session.metrics.cost_estimated * scale).round() as i64;
+            let attribution_items: Vec<_> = session.metrics.model_attribution.iter().collect();
+            let mut shares: Vec<i64> = Vec::with_capacity(attribution_items.len());
+            let mut remainders: Vec<(usize, f64)> = Vec::with_capacity(attribution_items.len());
+            let mut allocated: i64 = 0;
+            for (idx, (_, attribution)) in attribution_items.iter().enumerate() {
+                let exact = attribution.cost_usd / attributed_total * total_units as f64;
+                let floor = exact.floor() as i64;
+                shares.push(floor);
+                allocated += floor;
+                remainders.push((idx, exact - floor as f64));
+            }
+            let mut leftover = total_units - allocated;
+            // Largest remainder first; ties break on attribution weight
+            // (bigger share wins the extra unit) then model name — both
+            // independent of the map's iteration order (HashMap order is
+            // per-process), so the split is deterministic across runs.
+            remainders.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(
+                        attribution_items[b.0]
+                            .1
+                            .cost_usd
+                            .partial_cmp(&attribution_items[a.0].1.cost_usd)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                    .then(attribution_items[a.0].0.cmp(attribution_items[b.0].0))
+            });
+            let mut ri = 0;
+            while leftover > 0 && !remainders.is_empty() {
+                let (idx, _) = remainders[ri % remainders.len()];
+                shares[idx] += 1;
+                leftover -= 1;
+                ri += 1;
+            }
+            for ((attributed_model, _), units) in attribution_items.iter().zip(&shares) {
+                let entry = overview
+                    .by_model
+                    .entry((*attributed_model).clone())
+                    .or_default();
+                entry.sessions += 1;
+                entry.cost += *units as f64 / scale;
+            }
+        } else {
+            for attributed_model in session.metrics.model_attribution.keys() {
+                let entry = overview
+                    .by_model
+                    .entry(attributed_model.clone())
+                    .or_default();
+                entry.sessions += 1;
+            }
         }
 
         // rm-245: attribution dimensions. The provider comes from the
@@ -2387,6 +2456,14 @@ fn is_zero_f64(value: &f64) -> bool {
     *value == 0.0
 }
 
+/// rm-949 rounding discipline: `round4` defines the 4-decimal quantum every
+/// cost lane reports through - half-away-from-zero on the scaled integer,
+/// with a 1e-9 epsilon that absorbs f64 representation noise so values
+/// already at the quantum never re-round. The by_model attribution
+/// apportionment (build_overview's rm-949 block) works in integer units of
+/// this quantum via largest-remainder, so every bucket is exact at the
+/// precision every lane renders and sum(by_model.cost) equals the billed
+/// total by construction, not by luck.
 pub fn round4(value: f64) -> f64 {
     let scaled = value * 10000.0;
     let rounded = if scaled.fract().abs() >= 0.5 - 1e-9 {
@@ -2400,9 +2477,14 @@ pub fn round4(value: f64) -> f64 {
 pub(crate) use pricing::token_cost;
 
 pub fn fmt_duration(seconds: f64) -> String {
-    if seconds < 60.0 {
-        format!("{:.0}s", seconds)
-    } else if seconds < 3600.0 {
+    // Unit-carry discipline (rm-953): a rendered value must never sit at the
+    // next unit's boundary — no "60s", no "60.0m". Promote to the next unit
+    // when the rounded render would reach it (59.5s renders "1.0m", 3597s
+    // renders "0h 59m" rather than "60.0m").
+    let seconds = if seconds < 0.0 { 0.0 } else { seconds };
+    if seconds < 59.5 {
+        format!("{seconds:.0}s")
+    } else if seconds < 3597.0 {
         format!("{:.1}m", seconds / 60.0)
     } else {
         let hours = (seconds / 3600.0) as i64;
@@ -3294,6 +3376,23 @@ mod tests {
         assert_eq!(fmt_duration(40.0), "40s");
         assert_eq!(fmt_duration(90.0), "1.5m");
         assert_eq!(fmt_duration(6180.0), "1h 43m");
+    }
+
+    #[test]
+    fn fmt_duration_never_renders_unit_boundaries() {
+        // rm-953: the rendered value must never round up onto the next
+        // unit's boundary (no "60s", no "60.0m"); promote instead.
+        assert_eq!(fmt_duration(-3.0), "0s");
+        assert_eq!(fmt_duration(0.4), "0s");
+        assert_eq!(fmt_duration(59.4), "59s");
+        assert_eq!(fmt_duration(59.6), "1.0m");
+        assert_eq!(fmt_duration(59.5), "1.0m");
+        assert_eq!(fmt_duration(3594.0), "59.9m"); // 59.9 minutes exactly
+        assert_eq!(fmt_duration(3596.9), "59.9m"); // just under the hour
+        assert_eq!(fmt_duration(3597.0), "0h 59m"); // would render "60.0m"
+        assert_eq!(fmt_duration(3599.8), "0h 59m"); // the reported case
+        assert_eq!(fmt_duration(3600.0), "1h 0m");
+        assert_eq!(fmt_duration(3603.0), "1h 0m"); // 60.05 minutes
     }
 
     #[test]
