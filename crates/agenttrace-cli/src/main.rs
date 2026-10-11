@@ -470,6 +470,7 @@ fn run() -> anyhow::Result<()> {
         write_stdout
     };
 
+    let mut executed = ExecutedSideEffects::default();
     if args.clear_cache {
         agenttrace_core::clear_session_cache()?;
         announce("Session cache cleared.\n")?;
@@ -477,8 +478,13 @@ fn run() -> anyhow::Result<()> {
         // action must never be silently dropped by the clear-and-exit —
         // this guard and --update-pricing's below consult the ONE
         // shared action-introspection helper, not a hand-maintained
-        // subset that drifts as arms are added.
-        if !has_followup_action(&args) {
+        // subset that drifts as arms are added. rm-301 residual
+        // (2026-10-11 assess F2): mark this arm done BEFORE the guard
+        // consults the helper, so a co-requested --update-pricing
+        // still registers as owed (either CLI order — dispatch order
+        // is fixed).
+        executed.clear_cache = true;
+        if !has_followup_action(&args, &executed) {
             return Ok(());
         }
     }
@@ -495,7 +501,11 @@ fn run() -> anyhow::Result<()> {
             "Cache saved: {}\n",
             pricing_cache_path().display()
         ))?;
-        if !has_followup_action(&args) {
+        // rm-301 residual (2026-10-11 assess F2): same executed-marking
+        // as the clear-cache arm above — by this point clear_cache has
+        // already run if it was requested, so its bit is set too.
+        executed.update_pricing = true;
+        if !has_followup_action(&args, &executed) {
             return Ok(());
         }
     }
@@ -2412,8 +2422,29 @@ fn render_diagnostics(
 /// exits and the interactive fallback must appear here, and the unit
 /// matrix in `mod tests` pins the full flag set so a new action arm
 /// cannot be registered on one guard and not the other.
-fn has_followup_action(args: &Args) -> bool {
-    has_session_action(args)
+///
+/// rm-301 residual (2026-10-11, this run's assess F2): the helper also
+/// used to omit the side-effect flags THEMSELVES, so
+/// `--clear-cache --update-pricing` — either CLI order, dispatch
+/// order is fixed — dropped the second action: whichever guard ran
+/// first saw "no follow-up" and exited 0 without running the other
+/// side effect (live red: `--clear-cache --update-pricing` printed
+/// only "Session cache cleared."). A side-effect flag now registers
+/// as a follow-up for exactly as long as its own arm has NOT
+/// executed: each arm marks itself done in `executed` before
+/// consulting the guard, so the co-requested side effect still owes
+/// the user its run while a lone side effect keeps its
+/// clear-and-exit contract.
+#[derive(Default)]
+struct ExecutedSideEffects {
+    clear_cache: bool,
+    update_pricing: bool,
+}
+
+fn has_followup_action(args: &Args, executed: &ExecutedSideEffects) -> bool {
+    (!executed.clear_cache && args.clear_cache)
+        || (!executed.update_pricing && args.update_pricing)
+        || has_session_action(args)
         || args.list_models
         || args.test_match
         || args.doctor
@@ -2797,14 +2828,15 @@ mod tests {
         // swallow matrix is network-bound (it downloads the LiteLLM
         // table), so both halves are pinned here at the shared
         // predicate: every action arm `run()` dispatches must register,
-        // and the side-effect flags themselves must not.
+        // and the side-effect flags must register ONLY while their own
+        // arm has not executed (rm-301 residual, 2026-10-11).
         let base = || {
             let mut args = test_args(None);
             args.compare = false;
             args
         };
         assert!(
-            !has_followup_action(&base()),
+            !has_followup_action(&base(), &ExecutedSideEffects::default()),
             "no action flag: the side-effect exits keep their clear-and-exit contract"
         );
         let variants: Vec<(&str, Args)> = vec![
@@ -2911,31 +2943,78 @@ mod tests {
         ];
         for (flag, args) in &variants {
             assert!(
-                has_followup_action(args),
+                has_followup_action(args, &ExecutedSideEffects::default()),
                 "{flag} must count as a follow-up action for BOTH side-effect guards"
             );
         }
-        for (flag, args) in [
-            ("--clear-cache", {
-                let mut a = base();
-                a.clear_cache = true;
-                a
-            }),
-            ("--update-pricing", {
-                let mut a = base();
-                a.update_pricing = true;
-                a
-            }),
-        ] {
-            assert!(
-                !has_followup_action(&args),
-                "{flag} is a side effect, not a follow-up action"
-            );
-        }
+        // rm-301 residual (2026-10-11 assess F2): a side-effect flag
+        // registers as a follow-up for exactly as long as its own arm
+        // has NOT executed — the both-orders contract (the e2e
+        // --update-pricing half stays network-bound, so the pair
+        // semantics are pinned here at the shared predicate).
+        let alone_clear = {
+            let mut a = base();
+            a.clear_cache = true;
+            a
+        };
+        let alone_update = {
+            let mut a = base();
+            a.update_pricing = true;
+            a
+        };
+        let both = {
+            let mut a = base();
+            a.clear_cache = true;
+            a.update_pricing = true;
+            a
+        };
+        assert!(
+            !has_followup_action(
+                &alone_clear,
+                &ExecutedSideEffects {
+                    clear_cache: true,
+                    ..Default::default()
+                }
+            ),
+            "--clear-cache alone keeps its clear-and-exit contract"
+        );
+        assert!(
+            !has_followup_action(
+                &alone_update,
+                &ExecutedSideEffects {
+                    update_pricing: true,
+                    ..Default::default()
+                }
+            ),
+            "--update-pricing alone keeps its clear-and-exit contract"
+        );
+        assert!(
+            has_followup_action(
+                &both,
+                &ExecutedSideEffects {
+                    clear_cache: true,
+                    ..Default::default()
+                }
+            ),
+            "clear-cache's guard must see the co-requested --update-pricing as still owed"
+        );
+        assert!(
+            !has_followup_action(
+                &both,
+                &ExecutedSideEffects {
+                    clear_cache: true,
+                    update_pricing: true
+                }
+            ),
+            "after both side effects ran, neither is owed: the final guard exits"
+        );
         // The search lane keeps the shared non-empty rule.
         let mut whitespace = base();
         whitespace.search = Some("   ".to_string());
-        assert!(!has_followup_action(&whitespace));
+        assert!(!has_followup_action(
+            &whitespace,
+            &ExecutedSideEffects::default()
+        ));
     }
 
     #[test]

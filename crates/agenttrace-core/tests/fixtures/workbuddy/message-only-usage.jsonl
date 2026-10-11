@@ -1,0 +1,1 @@
+{"type":"message","role":"user","content":[{"type":"text","text":"status check"}],"sessionId":"wb-msg-only","cwd":"/tmp/proj","message":{"role":"user","usage":{"input_tokens":100,"output_tokens":10}}}

@@ -136,6 +136,57 @@ fn tool_result_reemission_counts_once_per_message_and_use() {
     );
 }
 
+/// rm-251 id-less arm (2026-10-11, ccusage #1837's inflation class):
+/// scrubbed exports strip `message.id` but keep the top-level
+/// `requestId`, which is the response's stable identity. With no id,
+/// the fold used to count EVERY emission — a streamed response's
+/// content-block snapshots each carried usage, inflating tokens and
+/// turns 2-3x. The requestId fallback folds re-emissions of one
+/// response into the last snapshot (rm-601 max-per-class semantics,
+/// same as the with-id golden above).
+#[test]
+fn claude_idless_requestid_stream_folds_to_one_response() {
+    let session = parse_fixture(&["usage-accounting", "claude-idless-requestid-stream.jsonl"]);
+    let m = &session.metrics;
+    assert_eq!(
+        m.assistant_turns, 1,
+        "one requestId = one response = one turn, re-emissions are not turns"
+    );
+    assert_eq!(
+        m.tokens_input, 30,
+        "last snapshot wins (max-per-class), not 10+20+30=60"
+    );
+    assert_eq!(m.tokens_output, 20, "last snapshot wins, not 5+10+20=35");
+    assert_eq!(
+        m.session_end, "2026-10-01T11:00:07Z",
+        "the last emission carries the session's true end"
+    );
+    assert_eq!(m.duration_sec, 7.0);
+    assert!(
+        session.anomalies.is_empty(),
+        "re-emissions must not manufacture anomalies: {:?}",
+        session.anomalies
+    );
+}
+
+/// rm-251 id-less arm boundary: requestId identifies a RESPONSE, not a
+/// session — two distinct requestIds in one session are two responses
+/// and must both count (fold per key, never across keys).
+#[test]
+fn claude_idless_distinct_requestids_count_independently() {
+    let session = parse_fixture(&[
+        "usage-accounting",
+        "claude-idless-distinct-requestids.jsonl",
+    ]);
+    let m = &session.metrics;
+    assert_eq!(m.assistant_turns, 2, "two requestIds = two responses");
+    assert_eq!(
+        m.tokens_input, 109,
+        "10 + 99: per-key snapshots sum across keys"
+    );
+    assert_eq!(m.tokens_output, 14, "5 + 9");
+}
+
 /// rm-834 arm B: usage-only re-emissions (no content blocks) used to
 /// leave session_end/duration frozen at the FIRST snapshot, so the
 /// landed claude-stream-growing fixture reported duration 5.0 /
