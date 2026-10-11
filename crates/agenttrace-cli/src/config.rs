@@ -84,7 +84,9 @@ const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd, sess
 /// `XDG_CONFIG_HOME=` joined an empty base into the *relative*
 /// `agenttrace/config.toml`, which then resolved against whatever
 /// directory the CLI was launched from (a `--doctor` probe printed
-/// that relative path).
+/// that relative path). A relative `XDG_CONFIG_HOME` is ignored for
+/// the same spec reason (rm-248): only absolute values relocate the
+/// root, so the config tree never depends on the working directory.
 pub fn user_config_path() -> Option<PathBuf> {
     resolve_user_config_path(
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
@@ -102,6 +104,10 @@ fn resolve_user_config_path(
     let base = xdg_config_home
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        // rm-248: the XDG Base Directory Specification says a relative
+        // $XDG_CONFIG_HOME is ignored as if unset — a cwd-relative
+        // `.config` must not silently become the config root.
+        .filter(|path| path.is_absolute())
         .or_else(|| {
             home.filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".config"))
@@ -654,6 +660,14 @@ mod tests {
                 Some(OsStr::new("/home")),
                 Some(PathBuf::from("/home/.config/agenttrace/config.toml")),
             ),
+            // A RELATIVE XDG base is likewise ignored per spec
+            // (rm-248) → the HOME fallback applies instead of a
+            // cwd-relative config root.
+            (
+                Some(OsStr::new("rel-config")),
+                Some(OsStr::new("/home")),
+                Some(PathBuf::from("/home/.config/agenttrace/config.toml")),
+            ),
             // No XDG at all → the documented HOME fallback.
             (
                 None,
@@ -1008,5 +1022,47 @@ mod tests {
         assert_eq!(file.history_dir, Some(PathBuf::from("/h")));
         assert_eq!(file.pricing_file, Some(PathBuf::from("/p.json")));
         assert_eq!(file.weekly_budget_usd, Some(12.5));
+    }
+}
+
+#[test]
+fn user_config_path_ignores_relative_xdg_config_home() {
+    // rm-248: the XDG Base Directory Specification says a relative
+    // $XDG_CONFIG_HOME is ignored as if unset. Before this guard a
+    // cwd-relative value (`.config`) silently became the config root,
+    // so `cd relcfg && agenttrace` loaded a different config tree
+    // depending on the working directory.
+    static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = XDG_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let saved_home = std::env::var_os("HOME");
+    let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", "/home/agenttrace-rm248");
+    std::env::remove_var("XDG_CONFIG_HOME");
+
+    // Relative value → ignored, default root wins.
+    std::env::set_var("XDG_CONFIG_HOME", ".config");
+    assert_eq!(
+        user_config_path().as_deref(),
+        Some(std::path::Path::new(
+            "/home/agenttrace-rm248/.config/agenttrace/config.toml"
+        ))
+    );
+
+    // Absolute value → honored.
+    std::env::set_var("XDG_CONFIG_HOME", "/xdg/abs");
+    assert_eq!(
+        user_config_path().as_deref(),
+        Some(std::path::Path::new("/xdg/abs/agenttrace/config.toml"))
+    );
+
+    match saved_xdg {
+        Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+    match saved_home {
+        Some(value) => std::env::set_var("HOME", value),
+        None => std::env::remove_var("HOME"),
     }
 }

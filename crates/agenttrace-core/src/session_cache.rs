@@ -5,7 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 55;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 56;
+// Bumped 55 -> 56 (integration of run 32f3b7a1 cycle 3, rm-726
+// 'magnitude-clamp disclosure + implausible-magnitude anomaly
+// class', batch 'honest magnitudes, honest paths'; conflict case
+// 2107fcf36cfa40b389723e98a9059636, candidate 4a13e1f @ base
+// e9e8fd9): number_as_i64 clamps (u64 payloads above i64::MAX,
+// saturating f64s, numeric strings) now count on the
+// magnitude_clamped:* disclosure family, analyze() adds the
+// negative-to-zero and above-plausibility-bound censuses, and
+// detect_anomalies grows the high-severity implausible_magnitude
+// class — the served report changes for UNCHANGED files (a hostile
+// {input_tokens: 1e19} journal now discloses its clamp count beside
+// the cost total and drops below HEALTH 100 instead of rendering a
+// clean $42.7T), so a warm v55 cache keeps serving the pre-
+// disclosure report with matching fingerprints: no re-parse, no
+// self-heal (rm-230 convention: report-changing parser/disclosure
+// semantics bump the schema so cached sessions regenerate). SEAM:
+// the batch minted its bump as 32 -> 33 at its base e9e8fd9; this
+// integration re-bases the rung onto this tree's already-advanced
+// ceiling 55 as 55 -> 56 per the landed-rung-keeps-numeral
+// convention (c7c07e48/58fbbd6c/a1c5cb6f precedent), one
+// invalidation either way. Entries regenerate once on next scan.
 // Bumped 54 -> 55 (integration of run 5eb82325ebea, cycle-1 "intake
 // -> attribution -> disclosure truthfulness" batch — rm-863
 // reasoning-fold producer semantics LEAD + rm-860 duplicate-spelling

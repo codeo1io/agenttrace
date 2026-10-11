@@ -1771,7 +1771,11 @@ fn workbuddy_usage(entry: &Map<String, Value>) -> Option<(TokenUsage, bool)> {
     // asymmetry is deliberate: a block carrying nothing but a negative
     // count is corrupt in its entirety, so "never a measurement" is
     // the honest verdict; consolidating it into the user-facing
-    // documented-limits surface is rider work on rm-833.
+    // documented-limits surface is rider work on rm-833. (Since the
+    // conflict-606aefa4 reconciliation the refusal itself is disclosed:
+    // usage_from_value_with_keys counts every refused class on the
+    // magnitude_clamped:negative_to_zero census, so the corrupt block
+    // is an implausible_magnitude anomaly, not a silent absence.)
     if !usage.contains_key("input_tokens") {
         let refused_negative_input = raw_usage
             .and_then(Value::as_object)
@@ -6415,6 +6419,50 @@ fn first_present(obj: &Map<String, Value>, keys: &[&str]) -> i64 {
         .unwrap_or(0)
 }
 
+// rm-726: `number_as_i64` clamps magnitudes that cannot fit i64 (u64
+// payloads above i64::MAX, saturating f64s) onto the i64 bounds so a
+// hostile journal cannot wrap totals — but a silent clamp is silent
+// cost truth ($42.7T rendered as a clean, anomaly-free run). Count
+// every clamp on this thread-local census; `session_from_events`
+// drains it onto Metrics.disclosure_counters so the run reports how
+// many values were clamped and detect_anomalies flags them.
+thread_local! {
+    static MAGNITUDE_CLAMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // rm-726 x rm-831 reconciliation (conflict 606aefa4): rm-831 landed
+    // AFTER rm-726 was authored and refuses NEGATIVE token counts at
+    // intake ("corrupt journal data, never a real measurement"), so
+    // the values no longer ride the fold for the aggregator's
+    // `.max(0)` clamps to zero — which silently emptied rm-726's
+    // negative_to_zero census. The refusal is the clamp fact now:
+    // count each refused usage class here and drain it onto the SAME
+    // disclosure key, keeping rm-831's "never rides the fold"
+    // semantics while restoring rm-726's "never silently" guarantee
+    // (the implausible_magnitude anomaly still fires off the
+    // disclosure channel).
+    static NEGATIVE_USAGE_REFUSALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_magnitude_clamp() {
+    MAGNITUDE_CLAMPS.with(|census| census.set(census.get().saturating_add(1)));
+}
+
+fn note_negative_usage_refusal() {
+    NEGATIVE_USAGE_REFUSALS.with(|census| census.set(census.get().saturating_add(1)));
+}
+
+/// rm-726: take (and reset) the current thread's parse-scope count of
+/// usage classes refused outright by the rm-831 sign gate (every
+/// present numeric key of the class was negative).
+pub(crate) fn take_negative_usage_refusal_count() -> u64 {
+    NEGATIVE_USAGE_REFUSALS.with(|census| census.replace(0))
+}
+
+/// rm-726: take (and reset) the current thread's parse-scope count of
+/// magnitude clamps performed by `number_as_i64`.
+pub(crate) fn take_magnitude_clamp_count() -> u64 {
+    MAGNITUDE_CLAMPS.with(|census| census.replace(0))
+}
+
 pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Number(number) => number.as_i64().or_else(|| {
@@ -6423,7 +6471,13 @@ pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
                 // Clamp instead of wrapping: u64 values above i64::MAX
                 // previously cast to a negative i64 through `as i64`,
                 // letting corrupt logs flip token totals negative.
-                .map(|n| n.min(i64::MAX as u64) as i64)
+                .map(|n| {
+                    // rm-726: the clamp itself is a disclosure fact.
+                    if n > i64::MAX as u64 {
+                        note_magnitude_clamp();
+                    }
+                    n.min(i64::MAX as u64) as i64
+                })
                 .or_else(|| {
                     number
                         .as_f64()
@@ -6431,7 +6485,17 @@ pub(crate) fn number_as_i64(value: &Value) -> Option<i64> {
                         // magnitudes (e.g. 1e300) land on the i64 bounds
                         // instead of wrapping; downstream aggregation is
                         // saturating as well.
-                        .map(|n| n as i64)
+                        .map(|n| {
+                            // rm-726: i64::MAX as f64 rounds up to 2^63,
+                            // so `>= 2^63` saturates; i64::MIN as f64 is
+                            // exact, so only strictly smaller values
+                            // clamp at the low bound. Counted either way.
+                            if n >= 9_223_372_036_854_775_808.0 || n < -9_223_372_036_854_775_808.0
+                            {
+                                note_magnitude_clamp();
+                            }
+                            n as i64
+                        })
                 })
         }),
         Value::String(text) => numeric_string_as_i64(text),
@@ -6452,7 +6516,14 @@ fn numeric_string_as_i64(text: &str) -> Option<i64> {
     }
     // `as` casts from f64 to i64 saturate, mirroring the Number arm for
     // magnitudes beyond i64::MAX.
-    trimmed.parse::<f64>().ok().map(|value| value as i64)
+    trimmed.parse::<f64>().ok().map(|value| {
+        // rm-726: string-encoded floats clamp through the same census
+        // as the Number arm ("1e300" above i64::MAX).
+        if value >= 9_223_372_036_854_775_808.0 || value < -9_223_372_036_854_775_808.0 {
+            note_magnitude_clamp();
+        }
+        value as i64
+    })
 }
 
 fn boolish(value: Option<&Value>) -> bool {
@@ -6949,18 +7020,26 @@ fn usage_from_value_with_keys(value: &Value) -> (Option<BTreeMap<String, i64>>, 
         // carrying real data. Zeros are KEPT: rm-408's
         // client-reported-zero population attaches through explicit
         // zero inserts (usage_is_all_zero).
-        if let Some((key, value)) = keys
+        //
+        // rm-726 rider on the gate (conflict 606aefa4): when the gate
+        // refuses the WHOLE class (no alias rescues it) the class is
+        // counted on the negative_to_zero census, so the refusal is a
+        // disclosed implausible-magnitude fact instead of a silent
+        // absence. An alias-rescued negative never survives anywhere,
+        // so it is NOT a clamp fact.
+        let present: Vec<(&str, i64)> = keys
             .iter()
             .filter_map(|key| {
                 obj.get(*key)
                     .and_then(number_as_i64)
-                    .filter(|value| *value >= 0)
                     .map(|value| (*key, value))
             })
-            .next()
-        {
+            .collect();
+        if let Some(&(key, value)) = present.iter().find(|(_, value)| *value >= 0) {
             usage.insert(target.to_string(), value);
             matched_keys.push(key);
+        } else if present.iter().any(|(_, value)| *value < 0) {
+            note_negative_usage_refusal();
         }
     }
     // rm-863: the reasoning fold follows the matched key's producer
@@ -9790,4 +9869,52 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         drop(_env);
     }
+}
+
+#[test]
+fn number_as_i64_counts_magnitude_clamps_on_the_disclosure_census() {
+    // rm-726: u64 payloads above i64::MAX and saturating f64s land on
+    // the i64 bounds — silently before this. Every clamp must land on
+    // the thread-local census that session_from_events drains onto
+    // Metrics.disclosure_counters (magnitude_clamped:above_i64).
+    let _ = take_magnitude_clamp_count(); // reset for this thread
+
+    // In-range values never count.
+    assert_eq!(
+        number_as_i64(&serde_json::json!(1_000_000_000_000i64)),
+        Some(1_000_000_000_000)
+    );
+    assert_eq!(number_as_i64(&serde_json::json!(-5000)), Some(-5000));
+    assert_eq!(
+        number_as_i64(&serde_json::json!(1e18)),
+        Some(1_000_000_000_000_000_000)
+    );
+    assert_eq!(take_magnitude_clamp_count(), 0);
+
+    // u64 above i64::MAX clamps onto i64::MAX, counted.
+    assert_eq!(
+        number_as_i64(&serde_json::json!(10_000_000_000_000_000_000u64)),
+        Some(i64::MAX)
+    );
+    assert_eq!(take_magnitude_clamp_count(), 1);
+
+    // Saturating f64s (positive and negative) count too; the negative
+    // bound saturates at i64::MIN.
+    assert_eq!(number_as_i64(&serde_json::json!(1e300)), Some(i64::MAX));
+    assert_eq!(take_magnitude_clamp_count(), 1);
+    assert_eq!(number_as_i64(&serde_json::json!(-1e300)), Some(i64::MIN));
+    assert_eq!(take_magnitude_clamp_count(), 1);
+
+    // Numeric strings coerce through the same census.
+    assert_eq!(number_as_i64(&serde_json::json!("1e300")), Some(i64::MAX));
+    assert_eq!(take_magnitude_clamp_count(), 1);
+
+    // In-range floats and strings do not count (1.0 truncation is not
+    // a magnitude clamp; 1e12 is huge but fits i64).
+    assert_eq!(number_as_i64(&serde_json::json!(1.5)), Some(1));
+    assert_eq!(
+        number_as_i64(&serde_json::json!("9007199254740993")),
+        Some(9_007_199_254_740_993i64)
+    );
+    assert_eq!(take_magnitude_clamp_count(), 0);
 }

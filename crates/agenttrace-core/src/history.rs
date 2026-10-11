@@ -35,6 +35,11 @@ pub fn history_path() -> PathBuf {
     }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
+        // rm-248: per the XDG Base Directory Specification, a relative
+        // $XDG_DATA_HOME is ignored as if unset — a cwd-relative
+        // `.local/share` must not silently become the history artifact
+        // location the PRIVACY artifact table describes.
+        .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
         .unwrap_or_else(std::env::temp_dir);
     base.join("agenttrace").join("history.json")
@@ -728,4 +733,27 @@ mod tests {
         drop(_env);
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn history_path_ignores_relative_xdg_data_home() {
+    // rm-248: same XDG rule for the history root — a relative
+    // $XDG_DATA_HOME is ignored as if unset, so a cwd-relative
+    // `.local/share` can never become the history artifact location
+    // the PRIVACY artifact table describes.
+    let _env = crate::test_env::lock_env();
+    std::env::remove_var("AGENTTRACE_HISTORY_DIR");
+    std::env::set_var("HOME", "/home/agenttrace-rm248");
+
+    std::env::set_var("XDG_DATA_HOME", ".local/share");
+    assert_eq!(
+        history_path(),
+        std::path::PathBuf::from("/home/agenttrace-rm248/.local/share/agenttrace/history.json")
+    );
+
+    std::env::set_var("XDG_DATA_HOME", "/xdg/data");
+    assert_eq!(
+        history_path(),
+        std::path::PathBuf::from("/xdg/data/agenttrace/history.json")
+    );
 }

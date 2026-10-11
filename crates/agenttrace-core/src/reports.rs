@@ -1491,9 +1491,19 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
         critical_pct
     ));
     out.push_str(&format!(
-        "  💰 Total estimated cost:      {}\n\n",
+        "  💰 Total estimated cost:      {}\n",
         format_cost(overview.total_cost)
     ));
+    // rm-726: disclose the magnitude-clamp census beside the total —
+    // clamped values are priced at the i64 bounds, and the line beside
+    // the money must say so instead of implying clean arithmetic.
+    if overview.clamped_values > 0 {
+        out.push_str(&format!(
+            "  ⚠️  Clamped values:           {} (implausible magnitudes priced at bounds — run --diagnostics)\n",
+            overview.clamped_values
+        ));
+    }
+    out.push('\n');
 
     let timelines = overview_incident_timelines(&ordered, 3);
     if !timelines.is_empty() {
@@ -2300,6 +2310,7 @@ fn anomaly_type_label_for_language(kind: &str, language: ReportLanguage) -> Stri
             "shallow_thinking" => "推理过浅".to_string(),
             "redacted" | "redaction" => "推理脱敏".to_string(),
             "no_tools" => "未使用工具".to_string(),
+            "implausible_magnitude" => "量级不可信".to_string(),
             other => other.replace('_', " "),
         };
     }
@@ -2310,6 +2321,7 @@ fn anomaly_type_label_for_language(kind: &str, language: ReportLanguage) -> Stri
         "shallow_thinking" => "shallow thinking".to_string(),
         "redacted" | "redaction" => "redacted thinking".to_string(),
         "no_tools" => "no tools".to_string(),
+        "implausible_magnitude" => "implausible magnitude".to_string(),
         other => other.replace('_', " "),
     }
 }

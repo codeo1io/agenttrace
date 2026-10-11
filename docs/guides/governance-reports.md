@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 55 and the SQLite snapshot is schema 10; the
+The session cache is schema 56 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -326,9 +326,21 @@ fix, and to 50 by the review-fix rebase (41 — the ac14e52c integration
 flight by sibling runs 33b7b7b5 / 2a5cdb9e), and re-based at this
 integration onto the advanced ceiling as 54 → 55, one invalidation
 either way (run 5eb82325ebea cycle 1, conflict case
-f642872bb8a143f6a4a4e62e2700ea37) — so cached sessions regenerate under
-the corrected reasoning totals, intake, attribution and disclosure
-tiers; the SQLite snapshot to 7
+f642872bb8a143f6a4a4e62e2700ea37), and to 56 when magnitude clamps
+stopped being silent and implausible token magnitudes began flagging as
+anomalies (run 32f3b7a1 cycle 3, rm-726: the parser's
+`number_as_i64` clamps — u64 payloads above i64::MAX, saturating
+floats, numeric strings — now count on the `magnitude_clamped:*`
+disclosure family, the clamp count prints beside the `--overview` cost
+total and rides `--audit` as `CostAudit.clamped_values`, and totals at
+or above the 1e12 plausibility bound flag a high-severity
+`implausible_magnitude` anomaly instead of rendering a clean $42.7T
+with HEALTH 100; minted at the batch's base e9e8fd9 as 32 → 33 and
+re-based at this integration onto the advanced ceiling as 55 → 56,
+one invalidation either way, conflict case
+2107fcf36cfa40b389723e98a9059636) — so cached sessions regenerate under
+the corrected reasoning totals, intake, attribution, disclosure
+tiers and the clamp census; the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

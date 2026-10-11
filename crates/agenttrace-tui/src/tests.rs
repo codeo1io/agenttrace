@@ -1631,6 +1631,14 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 56 (integration of run 32f3b7a1 cycle 3,
+                // rm-726 magnitude-clamp disclosure: the
+                // magnitude_clamped:* counters and the
+                // implausible_magnitude anomaly class change the
+                // served report for unchanged files; minted 32 -> 33
+                // at base e9e8fd9, re-based onto this tree's advanced
+                // ceiling as 55 -> 56 per the
+                // landed-rung-keeps-numeral convention);
                 // Schema 55 (integration of run 5eb82325ebea,
                 // cycle-1 "intake -> attribution -> disclosure
                 // truthfulness" — rm-863 reasoning folds follow

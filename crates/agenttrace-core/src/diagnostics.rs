@@ -458,6 +458,12 @@ pub fn fix_suggestions(session: &Session) -> Vec<FixSuggestion> {
                 "Inspect concrete artifacts instead of relying on chat-only reasoning.",
                 "no_tools",
             ),
+            "implausible_magnitude" => (
+                "Verify the token counts",
+                "Implausible magnitudes were clamped or flagged before pricing.",
+                "Check the source journal for corrupted or hostile usage values; totals price the clamped bounds, not the recorded magnitudes.",
+                "data_quality",
+            ),
             _ => continue,
         };
         fixes.push(FixSuggestion {
@@ -1145,7 +1151,7 @@ fn hash(value: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ToolCall;
+    use crate::{Anomaly, ToolCall};
 
     #[test]
     fn detects_loop_latency_large_params_and_stuck_signals() {
@@ -1854,5 +1860,33 @@ mod tests {
         let call_cost =
             200_000.0 / 1_000_000.0 * price.input + 50_000.0 / 1_000_000.0 * price.output;
         assert!((lc.tool_loop_cost - 6.0 * call_cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fix_suggestions_cover_implausible_magnitude() {
+        // rm-726: the new anomaly class needs a fix suggestion so --doctor
+        // never surfaces an undiagnosed finding.
+        let session = Session {
+            name: "corrupt".to_string(),
+            path: String::new(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics::default(),
+            anomalies: vec![Anomaly {
+                kind: "implausible_magnitude".to_string(),
+                severity: "high".to_string(),
+                detail: "1 value(s) clamped at the i64 bounds".to_string(),
+            }],
+            health: 70,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let fixes = fix_suggestions(&session);
+        assert!(
+            fixes
+                .iter()
+                .any(|fix| fix.category == "data_quality" && fix.title.contains("token counts")),
+            "implausible_magnitude must carry a fix suggestion: {fixes:?}"
+        );
     }
 }
