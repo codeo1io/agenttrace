@@ -9918,3 +9918,74 @@ fn number_as_i64_counts_magnitude_clamps_on_the_disclosure_census() {
     );
     assert_eq!(take_magnitude_clamp_count(), 0);
 }
+
+#[test]
+fn magnitude_clamp_census_is_session_scoped_across_sequential_parses() {
+    // rm-987 probe pin (run 6e476825 cycle 1): the clamp census is
+    // THREAD-LOCAL and the drain sits inside session_from_events —
+    // the same call stack that parsed the events (discovery workers
+    // run parse_file → session_from_events in one stack). The
+    // cross-session-accumulation hypothesis — session 1's clamps
+    // leaking into session 2's disclosure when both parse on ONE
+    // thread in order — was probed live with the real binary under
+    // `taskset -c 0` (single worker, largest-first order) and
+    // multi-worker: the clamped session reports exactly its own
+    // magnitude_clamped:above_i64, the clean session parsed after it
+    // reports none, and parse-FAILURE files leave no residue (every
+    // clamp site — usage extraction, cache metrics, copilot attrs —
+    // runs on lines that became events, and every eventful file
+    // drains). This pin holds the line: parse clamped-then-clean on
+    // THIS thread and assert per-session scoping stays exact.
+    let _ = take_magnitude_clamp_count(); // reset for this thread
+    let dir = std::env::temp_dir().join(format!(
+        "at-clamp-scope-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let clamped = dir.join("aaa-clamped.jsonl");
+    std::fs::write(
+        &clamped,
+        r#"{"type": "user", "uuid": "u1", "timestamp": "2026-10-01T10:00:00Z", "message": {"role": "user", "content": "clamped"}, "cwd": "/tmp"}
+{"type": "assistant", "uuid": "a1", "timestamp": "2026-10-01T10:00:05Z", "message": {"role": "assistant", "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "done"}], "usage": {"input_tokens": 9223372036854775808, "output_tokens": 5}}}
+"#,
+    )
+    .unwrap();
+    let clean = dir.join("zzz-clean.jsonl");
+    std::fs::write(
+        &clean,
+        r#"{"type": "user", "uuid": "u1", "timestamp": "2026-10-02T10:00:00Z", "message": {"role": "user", "content": "clean"}, "cwd": "/tmp"}
+{"type": "assistant", "uuid": "a1", "timestamp": "2026-10-02T10:00:05Z", "message": {"role": "assistant", "model": "claude-sonnet-4-5", "content": [{"type": "text", "text": "done"}], "usage": {"input_tokens": 10, "output_tokens": 5}}}
+"#,
+    )
+    .unwrap();
+
+    // Clamped first, clean second — SAME thread, in order: the exact
+    // topology where accumulation would surface if the drain ever
+    // moved out of session_from_events or a skip lane appeared.
+    let first = parse_file(&clamped).expect("clamped fixture parses");
+    assert_eq!(
+        first
+            .metrics
+            .disclosure_counters
+            .get("magnitude_clamped:above_i64"),
+        Some(&1),
+        "clamped session must disclose its own clamp"
+    );
+    let second = parse_file(&clean).expect("clean fixture parses");
+    assert_eq!(
+        second
+            .metrics
+            .disclosure_counters
+            .get("magnitude_clamped:above_i64"),
+        None,
+        "clean session parsed after a clamped one on the same thread must NOT inherit its clamps"
+    );
+    // And the thread census is left drained — a third session starts
+    // from zero, not from anyone's residue.
+    assert_eq!(take_magnitude_clamp_count(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}

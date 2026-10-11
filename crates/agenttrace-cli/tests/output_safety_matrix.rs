@@ -261,6 +261,96 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
+/// rm-540 TSV/default-text arm (run 6e476825 cycle 1; ported from the
+/// landed 33eddd4 shape): the default-text `--sessions` lane renders
+/// tab-separated rows whose transcript-derived cells (session name
+/// from the first user turn, source tool, model) previously rode
+/// byte-for-byte — a session named `=cmd|pwn` imported straight into
+/// a spreadsheet as a live formula while the CSV lane guarded the same
+/// cell (`'=2+5|cmd`). The default lane now routes those cells through
+/// the same `guard_formula`; this is the lane-parity pin: whichever of
+/// the two lanes a machine consumer imports, the cell is inert.
+#[test]
+fn default_text_lane_guards_spreadsheet_formulas_like_csv() {
+    let tmp = tempdir("output-safety-formula");
+    let corpus = tmp.join("corpus");
+    fs::create_dir_all(&corpus).unwrap();
+    // Hostile payloads ride BOTH name surfaces this lineage has: the
+    // first-user-turn content (what the sessions table renders as the
+    // name here) and the file stem (what older lineages rendered) — the
+    // pin must hold whichever derivation feeds the cell.
+    let hostile_stems = [
+        "=cmd|pwn",
+        "@SUM(1,2)*3|evil",
+        "+SUM(A1:A9)",
+        "-2+5|cmd",
+        "\u{ff1d}1+1",    // fullwidth equals
+        "\u{ff20}SUM(9)", // fullwidth commercial at
+        "benign-session",
+    ];
+    for (i, stem) in hostile_stems.iter().enumerate() {
+        let file = corpus.join(format!("{stem}.jsonl"));
+        fs::write(
+            &file,
+            format!(
+                r#"{{"type": "user", "uuid": "u1", "timestamp": "2026-10-0{i}T10:00:00Z", "message": {{"role": "user", "content": "{stem}"}}, "cwd": "/tmp/at-matrix"}}
+{{"type": "assistant", "uuid": "a1", "timestamp": "2026-10-0{i}T10:00:05Z", "message": {{"role": "assistant", "model": "=2+5|cmd", "content": [{{"type": "text", "text": "done"}}], "usage": {{"input_tokens": 10, "output_tokens": 5}}}}}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+    let home = tmp.join("home");
+    fs::create_dir_all(home.join(".cache")).unwrap();
+
+    let stdout = run_cell(
+        &corpus,
+        &home,
+        &Cell {
+            report: "--sessions",
+            format: "text",
+        },
+    );
+    let text = String::from_utf8_lossy(&stdout);
+    // Transcript-derived text columns in the sessions TSV: name (0),
+    // source tool (3), model (4) — the cells guard_formula wraps.
+    let mut failures = Vec::new();
+    for line in text.lines().skip(1) {
+        let cells: Vec<&str> = line.split('\t').collect();
+        for col in [0usize, 3, 4] {
+            let Some(cell) = cells.get(col) else { continue };
+            let introducer = ["=", "+", "-", "@", "\u{ff1d}", "\u{ff20}"]
+                .iter()
+                .any(|p| cell.starts_with(p));
+            if introducer && !cell.starts_with('\'') {
+                failures.push(format!("col {col} cell {cell:?} unguarded"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "default-text TSV lane emitted unguarded formula cells (rm-540 arm):\n  {}",
+        failures.join("\n  ")
+    );
+    // And the guard actually fired: every hostile payload shows up
+    // apostrophe-prefixed somewhere in its row, never raw.
+    for stem in &hostile_stems[..6] {
+        assert!(
+            text.contains(&format!("'{stem}")),
+            "hostile payload {stem:?} missing its formula guard in the TSV lane"
+        );
+        assert!(
+            !text.contains(&format!("\n{stem}\t")) && !text.contains(&format!("\t{stem}\t")),
+            "hostile payload {stem:?} rode raw into the TSV lane"
+        );
+    }
+    // Benign cells stay bare — the guard is not a blanket prefix.
+    assert!(
+        text.contains("\nbenign-session\t"),
+        "benign session name must stay unguarded (numeric/word cells import as values)"
+    );
+}
+
 #[test]
 fn tsv_is_a_sessions_scoped_cli_value_with_a_named_guard_elsewhere() {
     // Review fix lineage: rm-625 F4 pinned the THEN-real contract (clap
