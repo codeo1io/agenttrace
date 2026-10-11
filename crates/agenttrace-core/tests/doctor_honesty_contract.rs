@@ -18,6 +18,24 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// Serializes HOME/XDG/AGENTTRACE_SESSION_CACHE_DIR pinning within this
 /// test binary (pi_family_discovery.rs pattern; the catch-unwind keeps a
 /// failing assertion from poisoning the lock).
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. Every env mutation in this file routes through these
+// helpers while holding this file's `lock_env()` twin below — the single-threaded proof stated once
+// (mirroring core's test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+    key: K,
+    value: V,
+) {
+    // SAFETY: caller holds `lock_env()` for the whole mutation window.
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn lock_env() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     match LOCK.get_or_init(|| Mutex::new(())).lock() {
@@ -28,8 +46,8 @@ fn lock_env() -> MutexGuard<'static, ()> {
 
 fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
     match previous {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+        Some(value) => set_var_guarded(key, value),
+        None => remove_var_guarded(key),
     }
 }
 
@@ -41,11 +59,11 @@ fn with_home(home: &Path, f: impl FnOnce()) {
         let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
         let previous_xdg_data = std::env::var_os("XDG_DATA_HOME");
         let previous_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("HOME", home);
-        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"));
+        set_var_guarded("HOME", home);
+        set_var_guarded("XDG_CONFIG_HOME", home.join(".config"));
+        set_var_guarded("XDG_CACHE_HOME", home.join(".cache"));
+        set_var_guarded("XDG_DATA_HOME", home.join(".local/share"));
+        set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore_env("HOME", previous_home);
         restore_env("XDG_CONFIG_HOME", previous_xdg_config);

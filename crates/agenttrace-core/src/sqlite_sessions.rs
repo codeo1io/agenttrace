@@ -1670,8 +1670,8 @@ mod tests {
             fn drop(&mut self) {
                 for (key, value) in self.0.iter() {
                     match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
+                        Some(value) => crate::test_env::set_var_guarded(key, value),
+                        None => crate::test_env::remove_var_guarded(key),
                     }
                 }
             }
@@ -1693,7 +1693,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("agenttrace-rm753-poison-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("tempdir");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let path = opencode_hostile_fixture(&root);
 
         // (a) hostile load through the snapshot-caching entry point:
@@ -1745,7 +1745,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("tempdir");
         let cache = root.join("cache");
         std::fs::create_dir_all(&cache).expect("cache dir");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &cache);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &cache);
         let snapshot = cache.join("hermes-sqlite.json");
         let path = root.join("state.db");
         std::fs::write(&path, b"SQLite format 3\x00corrupted-bytes").expect("write corrupt db");
@@ -1782,8 +1782,8 @@ mod tests {
         let mut repaired_report = SqliteIngestReport::default();
         let repaired = load_hermes_sqlite_sessions(&path, None, &mut repaired_report);
         match previous_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(&root);

@@ -7,17 +7,54 @@ param(
     [string]$InstallDir = "$env:LOCALAPPDATA\agenttrace"
 )
 
+# rm-550: README.md documents AGENTTRACE_VERSION as the environment pin,
+# but this installer never read it -- an env-pinned install silently
+# fetched latest. Precedence, identical to install.sh: an explicit
+# -Version argument > AGENTTRACE_VERSION env > latest. Checking
+# $PSBoundParameters (not $Version -eq "latest") keeps an explicit
+# `-Version latest` an explicit latest.
+if (-not $PSBoundParameters.ContainsKey('Version') -and $env:AGENTTRACE_VERSION) {
+    $Version = $env:AGENTTRACE_VERSION
+    Write-Host "📌 Version pinned by AGENTTRACE_VERSION=$Version (pass -Version to override)." -ForegroundColor Cyan
+}
+
 $REPO = "luoyuctl/agenttrace"
 $BIN = "agenttrace.exe"
 
 # Detect architecture
-$ARCH = switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
-    "X64"   { "amd64" }
-    "Arm64" { "arm64" }
-    default { throw "Unsupported architecture: $_" }
+# rm-550 (upstream #314): one resolver with a machine-env fallback.
+# Reading [RuntimeInformation]::ProcessArchitecture directly failed in
+# two field shapes: PSReadLine 2.0 shadows RuntimeInformation in
+# interactive PS 5.1 (the try/catch below), and a 32-bit shell on 64-bit
+# Windows reports X86 -- which used to hit the hard `Unsupported
+# architecture` throw. PROCESSOR_ARCHITEW6432 is set exactly in that
+# 32-bit-on-64-bit case and carries the real machine architecture;
+# PROCESSOR_ARCHITECTURE is the last resort. AMD64/ARM64 are the env
+# spellings, X64/Arm64 the enum spellings.
+function Resolve-AgenttraceArch {
+    $reported = $null
+    try {
+        $reported = [string][System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
+    } catch {
+        $reported = $null
+    }
+    if ($reported -eq "X64") { return "amd64" }
+    if ($reported -eq "Arm64") { return "arm64" }
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    switch ($arch) {
+        "AMD64" { return "amd64" }
+        "ARM64" { return "arm64" }
+        default { throw "Unsupported architecture: $arch" }
+    }
 }
 
-Write-Host "🔍 Fetching latest release..." -ForegroundColor Cyan
+$ARCH = Resolve-AgenttraceArch
+
+if ($Version -eq "latest") {
+    Write-Host "🔍 Fetching latest release..." -ForegroundColor Cyan
+} else {
+    Write-Host "🔍 Fetching release $Version..." -ForegroundColor Cyan
+}
 
 if ($Version -eq "latest") {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$REPO/releases/latest"

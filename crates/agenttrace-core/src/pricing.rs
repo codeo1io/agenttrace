@@ -1934,16 +1934,16 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp cache dir");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
-        std::env::set_var("HOME", &dir);
+        crate::test_env::set_var_guarded("XDG_CACHE_HOME", &dir);
+        crate::test_env::set_var_guarded("HOME", &dir);
         let result = body();
         match prior_xdg {
-            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
+            Some(value) => crate::test_env::set_var_guarded("XDG_CACHE_HOME", value),
+            None => crate::test_env::remove_var_guarded("XDG_CACHE_HOME"),
         }
         match prior_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => crate::test_env::set_var_guarded("HOME", value),
+            None => crate::test_env::remove_var_guarded("HOME"),
         }
         let _ = std::fs::remove_dir_all(&dir);
         result
@@ -2231,11 +2231,11 @@ mod tests {
 
         let _env = crate::test_env::lock_env();
         let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
-        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", &override_file);
         let override_models = apply_pricing_overrides(&mut catalog);
         match prior_file {
-            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
-            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_PRICING_FILE"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(root);
@@ -2666,11 +2666,11 @@ mod tests {
 
         let _env = crate::test_env::lock_env();
         let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
-        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", &override_file);
         let override_models = apply_pricing_overrides(&mut catalog);
         match prior_file {
-            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
-            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_PRICING_FILE"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(root);

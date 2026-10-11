@@ -2032,16 +2032,36 @@ fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: 
 /// pin into an exclusive section instead.
 static SESSION_CACHE_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. The only env mutations in this module go through these
+// helpers while holding SESSION_CACHE_DIR_TEST_LOCK above (the
+// single-threaded proof stated once, mirroring core's
+// test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+    key: K,
+    value: V,
+) {
+    // SAFETY: caller holds SESSION_CACHE_DIR_TEST_LOCK for the whole
+    // mutation window (see the comment above).
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn with_session_cache_dir_for_test(cache_dir: &std::path::Path, run: impl FnOnce()) {
     let _guard = SESSION_CACHE_DIR_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-    std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache_dir);
+    set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", cache_dir);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
     match previous {
-        Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-        None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        Some(value) => set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+        None => remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
     }
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);

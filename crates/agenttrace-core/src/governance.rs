@@ -1922,14 +1922,14 @@ mod tests {
         std::fs::set_permissions(shim_dir.join("git"), std::fs::Permissions::from_mode(0o755))
             .expect("chmod git shim");
         let previous_path = std::env::var_os("PATH");
-        std::env::set_var(
+        crate::test_env::set_var_guarded(
             "PATH",
             format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
         );
         let started = std::time::Instant::now();
         let commits = git_commits(root.to_str().expect("utf-8 root"));
         if let Some(path) = previous_path {
-            std::env::set_var("PATH", path);
+            crate::test_env::set_var_guarded("PATH", path);
         }
         assert!(
             commits.is_none(),

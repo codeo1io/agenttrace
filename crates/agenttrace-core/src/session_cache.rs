@@ -3707,21 +3707,21 @@ mod tests {
         // knob is None in every table any current test installs, so
         // the env arm below is what this assert pins.
         let _env = crate::test_env::lock_env();
-        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES");
         assert_eq!(effective_session_cache_entries(), MAX_SESSION_CACHE_ENTRIES);
         assert_eq!(session_cache_entries_source(), "default");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
         assert_eq!(effective_session_cache_entries(), 1_500);
         assert_eq!(session_cache_entries_source(), "env");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "999999999");
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES", "999999999");
         assert_eq!(
             effective_session_cache_entries(),
             MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES
         );
         // An unparseable knob leaves the default in charge.
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "many");
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES", "many");
         assert_eq!(effective_session_cache_entries(), MAX_SESSION_CACHE_ENTRIES);
-        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES");
     }
 
     #[test]
@@ -3731,7 +3731,7 @@ mod tests {
         // smaller value, a save evicts down to it. This is the
         // eviction arm the doctor's `entries<=N` line discloses.
         let _env = crate::test_env::lock_env();
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "2");
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES", "2");
         let root = std::env::temp_dir().join(format!(
             "agenttrace-configured-bound-{}-{:?}",
             std::process::id(),
@@ -3793,7 +3793,7 @@ mod tests {
                 .contains_key(&cache_key(Path::new(&stamps[3]))),
             "the newest sources survive"
         );
-        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES");
         let _ = fs::remove_dir_all(root);
     }
     #[test]
@@ -4377,7 +4377,7 @@ mod tests {
         // (pricing, statusline) mutate the same variables.
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         write_journal(false);
         let cache = load_session_cache();
         assert_eq!(
@@ -4391,8 +4391,8 @@ mod tests {
         let cache = load_session_cache();
         assert_eq!(cache.dirs.len(), 1, "current-version listings survive");
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -4449,7 +4449,7 @@ mod tests {
         // the live pricing catalog for its identity stamp.
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         // The identity read here is whatever the process's active
         // catalog computes; the test only needs internal consistency
@@ -4486,8 +4486,8 @@ mod tests {
         );
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -4523,7 +4523,7 @@ mod tests {
         // (pricing, statusline) mutate the same variables.
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let cache_doc = root.join("sessions.json");
         let mut cache = load_session_cache();
         store_session(&journal, &session, &mut cache).expect("store session");
@@ -4560,8 +4560,8 @@ mod tests {
         );
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -4616,8 +4616,8 @@ mod tests {
         let _env = crate::test_env::lock_env();
         let previous_cache_root = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
         let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
-        std::env::set_var("XDG_CACHE_HOME", root.join("xdg-cache"));
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("XDG_CACHE_HOME", root.join("xdg-cache"));
         let live: Vec<PathBuf> = cache_artifact_paths();
         for path in &live {
             fs::create_dir_all(path.parent().expect("artifact parent"))
@@ -4650,12 +4650,12 @@ mod tests {
         clear_session_cache().expect("second clear is a no-op");
 
         match previous_cache_root {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         match previous_xdg_cache {
-            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
+            Some(value) => crate::test_env::set_var_guarded("XDG_CACHE_HOME", value),
+            None => crate::test_env::remove_var_guarded("XDG_CACHE_HOME"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -4997,7 +4997,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         // A journal already carrying a full ledger (eight records),
         // then one more schema flip: the oldest record drops, the new
@@ -5073,8 +5073,8 @@ mod tests {
         );
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -5103,7 +5103,7 @@ mod tests {
         fs::write(&journal, b"{}").expect("write journal");
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         // Populate a store at the CURRENT schema and CURRENT catalog.
         let mut cache = load_session_cache();
@@ -5197,9 +5197,9 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         if let Some(prior) = prior_cache {
-            std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", prior);
+            crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", prior);
         } else {
-            std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+            crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR");
         }
     }
 
@@ -5227,7 +5227,7 @@ mod tests {
         fs::write(&journal, b"{}").expect("write journal");
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         // Populate a store at the CURRENT schema: one entry + one
         // live listing for a real directory.
@@ -5319,8 +5319,8 @@ mod tests {
         );
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -5351,7 +5351,7 @@ mod tests {
         fs::write(&journal, b"{}").expect("write journal");
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         let mut cache = load_session_cache();
         store_dir_listing(&corpus, std::slice::from_ref(&journal), &[], &mut cache)
@@ -5394,8 +5394,8 @@ mod tests {
         assert_eq!(served.name, "raw name");
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -5429,7 +5429,7 @@ mod tests {
         fs::write(&journal, b"{}").expect("write journal");
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         // Seed the store exactly as a pre-upgrade binary would have:
         // older schema, the last lossy-member walk lane, lossy member
@@ -5481,8 +5481,8 @@ mod tests {
         assert_eq!(listing.files, vec![journal.clone()]);
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -5508,7 +5508,7 @@ mod tests {
         fs::write(&journal, b"{}").expect("write journal");
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         let rewrite_listing = |mod_time: i64, dir_size: serde_json::Value| {
             let mut cache = load_session_cache();
@@ -5548,8 +5548,8 @@ mod tests {
         );
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -5570,7 +5570,7 @@ mod tests {
         fs::create_dir_all(&corpus).expect("create corpus dir");
         let _env = crate::test_env::lock_env();
         let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
 
         // Seed the on-disk store with one entry.
         let seed_file = corpus.join("seed.jsonl");
@@ -5644,8 +5644,8 @@ mod tests {
         }
 
         match prior_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);

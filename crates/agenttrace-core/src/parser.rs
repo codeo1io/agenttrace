@@ -9749,7 +9749,7 @@ mod tests {
         // the cache first).
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("TZ");
-        std::env::set_var("TZ", "America/New_York");
+        crate::test_env::set_var_guarded("TZ", "America/New_York");
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         // Fall-back repeat hour (2026-11-01 01:30 happens twice: EDT
         // -04:00 at 05:30Z, then EST -05:00 at 06:30Z). chrono 0.4.45's
@@ -9784,8 +9784,8 @@ mod tests {
         // Unparseable input stays empty (pre-existing behavior).
         assert_eq!(aider_time("not a timestamp"), "");
         match prior {
-            Some(value) => std::env::set_var("TZ", value),
-            None => std::env::remove_var("TZ"),
+            Some(value) => crate::test_env::set_var_guarded("TZ", value),
+            None => crate::test_env::remove_var_guarded("TZ"),
         }
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         drop(_env);

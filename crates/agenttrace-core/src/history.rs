@@ -404,7 +404,7 @@ mod tests {
         // lock (the default path is the user's real history file).
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
-        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_HISTORY_DIR", &root);
         let session = Session {
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
@@ -429,8 +429,8 @@ mod tests {
             mode & 0o777
         );
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_HISTORY_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_HISTORY_DIR"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(root);
@@ -562,7 +562,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create temp dir");
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
-        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_HISTORY_DIR", &root);
 
         let sqlite_session = |row: &str, input: i64| Session {
             name: format!("proj-{row}"),
@@ -632,8 +632,8 @@ mod tests {
         );
 
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_HISTORY_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_HISTORY_DIR"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(&root);
@@ -653,7 +653,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create temp dir");
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
-        std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_HISTORY_DIR", &root);
 
         let session = Session {
             name: "legacy row".to_string(),
@@ -722,8 +722,8 @@ mod tests {
         );
 
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_HISTORY_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_HISTORY_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_HISTORY_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_HISTORY_DIR"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(root);

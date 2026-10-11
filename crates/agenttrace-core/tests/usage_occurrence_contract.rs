@@ -50,6 +50,24 @@ fn fixture(rel: &str) -> PathBuf {
 /// already seen pre-compaction). Truth: 2700 input / 900 output. The
 /// pre-rm-711 value-dedup dropped the whole post-compaction window
 /// because its rebased total collided with window 1 (reported 2000).
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. Every env mutation in this file routes through these
+// helpers — this file's only env-touching test is the sole mutator in this binary — the single-threaded proof stated once
+// (mirroring core's test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+    key: K,
+    value: V,
+) {
+    // SAFETY: the only env-touching test in this binary performs the mutation (other test binaries are separate processes).
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 #[test]
 fn codex_post_compaction_revisit_counts_fresh_last_usage() {
     let session = parse_file(&fixture("codex-revisit/rollout-2026-10-06T05-00-00.jsonl"))
@@ -124,7 +142,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_55_invalidates_v32() {
     // this binary; other test binaries are separate processes).
     let cache_dir = root.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &cache_dir);
+    set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &cache_dir);
 
     // Cold leg: empty cache, parse, store, save.
     let mut cache: SessionCache = load_session_cache();
@@ -167,7 +185,7 @@ fn warm_cache_replays_cold_disclosure_and_schema_55_invalidates_v32() {
         "rm-710: a schema-32 entry must not be served at the live schema ceiling (52 at this tree — the session-cache store-integrity integration, run 2d92ee95, re-based its 24 → 26 bump onto the advanced 51 ceiling; every warm entry written before this integration regenerates once)"
     );
 
-    std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+    remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR");
     let _ = fs::remove_dir_all(&root);
 }
 

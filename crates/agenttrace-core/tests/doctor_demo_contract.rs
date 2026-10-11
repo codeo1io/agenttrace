@@ -25,6 +25,24 @@ fn planted_corpus(marker: &str) -> std::path::PathBuf {
 /// the session cache — this control arm must never reach the operator's
 /// real cache, so the lane runs under a sandboxed home (the
 /// pi_family_discovery `with_home` pattern).
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. Every env mutation in this file routes through these
+// helpers while holding `with_sandboxed_home`'s static env lock — the single-threaded proof stated once
+// (mirroring core's test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+    key: K,
+    value: V,
+) {
+    // SAFETY: caller holds with_sandboxed_home's static LOCK for the whole mutation window.
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn with_sandboxed_home(f: impl FnOnce()) {
     use std::sync::{Mutex, OnceLock};
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -34,8 +52,8 @@ fn with_sandboxed_home(f: impl FnOnce()) {
     };
     fn restore(key: &str, previous: Option<std::ffi::OsString>) {
         match previous {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+            Some(value) => set_var_guarded(key, value),
+            None => remove_var_guarded(key),
         }
     }
     let result = {
@@ -46,11 +64,11 @@ fn with_sandboxed_home(f: impl FnOnce()) {
         let previous_cache = std::env::var_os("XDG_CACHE_HOME");
         let previous_data = std::env::var_os("XDG_DATA_HOME");
         let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("HOME", &home);
-        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"));
+        set_var_guarded("HOME", &home);
+        set_var_guarded("XDG_CONFIG_HOME", home.join(".config"));
+        set_var_guarded("XDG_CACHE_HOME", home.join(".cache"));
+        set_var_guarded("XDG_DATA_HOME", home.join(".local/share"));
+        set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore("HOME", previous_home);
         restore("XDG_CONFIG_HOME", previous_config);

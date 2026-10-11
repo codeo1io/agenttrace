@@ -1431,7 +1431,7 @@ mod tests {
         // mode is hermetic (no host walk, zero session files), so the
         // waste arm reads zero here; the knob arms are the report's.
         let _env = crate::test_env::lock_env();
-        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES");
         let report = build_doctor_report(None, true);
         assert_eq!(
             report.cache_entry_bound,
@@ -1449,13 +1449,13 @@ mod tests {
             "{text}"
         );
 
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
         let report = build_doctor_report(None, true);
         assert_eq!(report.cache_entry_bound, 1_500);
         assert_eq!(report.cache_entry_bound_source, "env");
         assert!(report.cache_limits.contains("entries<=1500"));
         assert!(doctor_report_text(&report).contains("entry bound from env"));
-        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES");
     }
 
     #[test]

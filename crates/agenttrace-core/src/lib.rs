@@ -2934,6 +2934,33 @@ pub(crate) mod test_env {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+
+    /// rm-981 (edition 2024): `std::env::set_var` is `unsafe` because
+    /// another thread may be reading the process environment while we
+    /// mutate it. Test-scope callers route env mutations through these
+    /// two helpers so the safety proof is stated once, here, instead of
+    /// inline at every site: every caller mutates env only while
+    /// holding `lock_env()` (this crate's one shared env mutex) across
+    /// its whole mutation window, so no other thread of this test
+    /// binary can be touching the environment at the same time.
+    /// Production code has no set_var/remove_var caller — under
+    /// edition 2024 that is a hard compile error, not a convention.
+    pub(crate) fn set_var_guarded<
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    >(
+        key: K,
+        value: V,
+    ) {
+        // SAFETY: caller holds `lock_env()` for the mutation window (or
+        // the test binary is single-threaded); see the doc above.
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    pub(crate) fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+        // SAFETY: same contract as `set_var_guarded`.
+        unsafe { std::env::remove_var(key) }
+    }
 }
 
 #[cfg(test)]

@@ -2692,7 +2692,7 @@ fn with_session_cache(cache: &std::path::Path, f: impl FnOnce()) {
     let result = {
         let _guard = lock_env();
         let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", cache);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
         result
@@ -2714,11 +2714,11 @@ fn with_home_and_cache(home: &std::path::Path, cache: &std::path::Path, f: impl 
         let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
         let previous_xdg_data = std::env::var_os("XDG_DATA_HOME");
         let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("HOME", home);
-        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        set_var_guarded("HOME", home);
+        set_var_guarded("XDG_CONFIG_HOME", home.join(".config"));
+        set_var_guarded("XDG_CACHE_HOME", home.join(".cache"));
+        set_var_guarded("XDG_DATA_HOME", home.join(".local/share"));
+        set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", cache);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore_env("HOME", previous_home);
         restore_env("XDG_CONFIG_HOME", previous_xdg_config);
@@ -2738,9 +2738,9 @@ fn escape_json_pointer(path: &std::path::Path) -> String {
 
 fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
     if let Some(value) = previous {
-        std::env::set_var(key, value);
+        set_var_guarded(key, value);
     } else {
-        std::env::remove_var(key);
+        remove_var_guarded(key);
     }
 }
 
@@ -2786,6 +2786,24 @@ fn env_lock() -> &'static Mutex<()> {
 /// Acquire the shared env lock. Poisoning is tolerated on purpose: a
 /// poisoned mutex must fail only the test that panicked, not every test
 /// that still needs the lock (see with_home_and_cache).
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. Every env mutation in this file routes through these
+// helpers while holding this file's `lock_env()` twin below — the single-threaded proof stated once
+// (mirroring core's test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+    key: K,
+    value: V,
+) {
+    // SAFETY: caller holds `lock_env()` for the whole mutation window.
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     match env_lock().lock() {
         Ok(guard) => guard,
