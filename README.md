@@ -382,6 +382,47 @@ exits 0 with a one-line fallback. Review what was captured with
 [docs/guides/statusline-capture.md](docs/guides/statusline-capture.md) for the
 schema and retention details.
 
+## Discovered session roots
+
+By default `agenttrace` auto-discovers session journals under your home
+directory. This is the complete set of roots it scans — `--doctor`
+reports which ones exist on your machine, and `-d/--dir` replaces
+auto-discovery with an explicit corpus:
+
+| Source | Default root |
+|---|---|
+| Hermes Agent | `~/.hermes/sessions` |
+| Codex CLI | `$CODEX_HOME/sessions` (default `~/.codex/sessions`) |
+| Codex CLI archived | `$CODEX_HOME/archived_sessions` (default `~/.codex/archived_sessions`) |
+| Gemini CLI | `~/.gemini/tmp` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/brain` |
+| Antigravity CLI conversations | `~/.gemini/antigravity-cli/conversations` |
+| Antigravity conversations | `~/.gemini/antigravity/conversations` |
+| Antigravity IDE conversations | `~/.gemini/antigravity-ide/conversations` |
+| Antigravity backup conversations | `~/.gemini/antigravity-backup/conversations` |
+| Antigravity config conversations | `$XDG_CONFIG_HOME/antigravity/conversations` (default `~/.config/antigravity/conversations`) |
+| Claude Code | `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`) |
+| Claude Code transcripts | `$CLAUDE_CONFIG_DIR/transcripts` (default `~/.claude/transcripts`) |
+| Qwen Code | `~/.qwen/projects` |
+| WorkBuddy | `~/.workbuddy/projects` |
+| Cursor | `~/.cursor/projects` |
+| GitHub Copilot CLI | `~/.copilot/session-state` |
+| GitHub Copilot CLI OTEL | `~/.copilot/otel` |
+| Kimi CLI | `~/.kimi/sessions` |
+| OpenCode | `$OPENCODE_DATA_DIR` / `$XDG_DATA_HOME/opencode/storage` (default `~/.local/share/opencode/storage`) |
+| OpenCode macOS | `~/Library/Application Support/opencode/storage` |
+| Cline | `$XDG_CONFIG_HOME/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` (default `~/.config/Code/...`) |
+| Pi | `~/.pi` — `agent/sessions`, `sessions`, and any child directory carrying a `sessions/` directory |
+| Pi XDG | `~/.config/pi` — same layout as `~/.pi` |
+| Oh My Pi | `~/.omp` — same layout as `~/.pi` |
+| Senpi | `~/.senpi` — same layout as `~/.pi` |
+| Omo | `~/.omo` — same layout as `~/.pi` |
+
+Aider is the one cwd-scoped source: `agenttrace` reads
+`.aider.chat.history.md` from the working directory when it exists. The
+`check-docs-commands` CI gate fails when this table drifts from the
+roots the binary actually scans.
+
 ## CLI flag reference
 
 Every option `agenttrace` accepts, with its default and purpose. This

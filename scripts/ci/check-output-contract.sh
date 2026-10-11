@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 fail() {
   echo "check-output-contract: $*" >&2
   exit 1
 }
+
+# rm-377 (cycle 2): the binary default must be the repo's own release
+# build, not /tmp/agenttrace — /tmp persists across sessions on the CI
+# fleet and a days-old binary silently answered gate runs (observed
+# 2026-10-03; fixed for check-docs-commands.sh by rm-369, this gate kept
+# the stale default). AGENTTRACE_BIN still overrides for A/B against a
+# pinned build.
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 
 require_file() {
   local path="$1"
@@ -20,7 +29,8 @@ require_json() {
     || fail "invalid JSON: $path"
 }
 
-[[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
+[[ -x "$bin" ]] ||
+  fail "agenttrace binary is not executable: $bin (build with: cargo build --release; or set AGENTTRACE_BIN)"
 mkdir -p "$out_dir"
 
 "$bin" --doctor -f json >"$out_dir/doctor.json"
