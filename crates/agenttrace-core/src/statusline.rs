@@ -120,6 +120,7 @@ fn user_cache_dir() -> PathBuf {
     resolve_user_cache_dir(
         std::env::var_os("HOME").as_deref(),
         std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        cfg!(target_os = "macos"),
     )
 }
 
@@ -138,23 +139,35 @@ fn user_cache_dir() -> PathBuf {
 fn resolve_user_cache_dir(
     home: Option<&std::ffi::OsStr>,
     xdg_cache_home: Option<&std::ffi::OsStr>,
+    macos_default: bool,
 ) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = home.filter(|value| !value.is_empty()) {
-            return PathBuf::from(home).join("Library").join("Caches");
-        }
-    }
     // rm-248: the XDG Base Directory spec only defines ABSOLUTE
     // $XDG_CACHE_HOME values; a relative one is treated as unset and
     // falls through to the HOME-based default instead of scattering a
     // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
     // agenttrace --overview` wrote ./rel-cache/agenttrace from a
     // scratch cwd).
+    //
+    // rm-994: the absolute-XDG check runs BEFORE the macOS arm — an
+    // explicitly set absolute $XDG_CACHE_HOME is an operator
+    // instruction, honored on every OS (the doctor demo contract
+    // plants its cache outside the planted home; the macOS arm used
+    // to win and disclose ~/Library/Caches paths). The platform flag
+    // is a PARAMETER (the caller passes cfg!(target_os = "macos"),
+    // compile-time) so the macOS ladder is unit-pinnable on every
+    // build host — a cfg! literal inside the core would be dead code
+    // on Linux and the reorder untestable there. Same ladder as
+    // doctor.rs / session_cache.rs / pricing.rs.
     if let Some(cache) = xdg_cache_home
         .filter(|value| !value.is_empty())
         .filter(|value| std::path::Path::new(value).is_absolute())
     {
         return PathBuf::from(cache);
+    }
+    if macos_default {
+        if let Some(home) = home.filter(|value| !value.is_empty()) {
+            return PathBuf::from(home).join("Library").join("Caches");
+        }
     }
     if let Some(home) = home.filter(|value| !value.is_empty()) {
         return PathBuf::from(home).join(".cache");
@@ -1653,22 +1666,25 @@ mod tests {
         use std::ffi::OsStr;
         let empty = Some(OsStr::new(""));
         // Both empty: the temp-dir fallback — always absolute.
-        let both_empty = resolve_user_cache_dir(empty, empty);
+        let both_empty = resolve_user_cache_dir(empty, empty, false);
         assert!(both_empty.is_absolute(), "{both_empty:?}");
         // Empty HOME with a set XDG override: the override wins.
         assert_eq!(
-            resolve_user_cache_dir(empty, Some(OsStr::new("/xdg-cache"))),
+            resolve_user_cache_dir(empty, Some(OsStr::new("/xdg-cache")), false),
             PathBuf::from("/xdg-cache")
         );
         // Unset both: the same ladder end.
-        assert_eq!(resolve_user_cache_dir(None, None), std::env::temp_dir());
+        assert_eq!(
+            resolve_user_cache_dir(None, None, false),
+            std::env::temp_dir()
+        );
         #[cfg(not(target_os = "macos"))]
         {
             // Set HOME with an empty XDG value: the spec default
             // `$HOME/.cache`, not the RELATIVE `.cache` the empty
             // value used to produce.
             assert_eq!(
-                resolve_user_cache_dir(Some(OsStr::new("/home/at-test")), empty),
+                resolve_user_cache_dir(Some(OsStr::new("/home/at-test")), empty, false),
                 PathBuf::from("/home/at-test").join(".cache")
             );
             // rm-248: a RELATIVE XDG_CACHE_HOME is treated as unset —
@@ -1680,13 +1696,56 @@ mod tests {
             assert_eq!(
                 resolve_user_cache_dir(
                     Some(OsStr::new("/home/at-test")),
-                    Some(OsStr::new("rel-cache"))
+                    Some(OsStr::new("rel-cache")),
+                    false
                 ),
                 PathBuf::from("/home/at-test").join(".cache")
             );
-            let relative_only = resolve_user_cache_dir(empty, Some(OsStr::new("rel-cache")));
+            let relative_only = resolve_user_cache_dir(empty, Some(OsStr::new("rel-cache")), false);
             assert!(relative_only.is_absolute(), "{relative_only:?}");
         }
+    }
+
+    #[test]
+    fn user_cache_dir_honors_absolute_xdg_on_the_macos_ladder() {
+        // rm-994: an ABSOLUTE $XDG_CACHE_HOME is an operator
+        // instruction and must win over the macOS ~/Library/Caches
+        // default at EVERY cache-path resolver. The reorder is pinned
+        // here through the parameterized platform flag — with a cfg!
+        // literal inside the core this arm would be dead code on Linux
+        // and the macOS runner would be the only pin (the
+        // `doctor_demo_discloses_no_operator_home_paths` contract in
+        // agenttrace-cli is that binary-level pin; this is the unit
+        // one, in the same ladder doctor.rs / session_cache.rs /
+        // pricing.rs inline).
+        use std::ffi::OsStr;
+        let home = Some(OsStr::new("/Users/at-test"));
+        let library = PathBuf::from("/Users/at-test")
+            .join("Library")
+            .join("Caches");
+        // The reorder itself: absolute XDG beats the macOS default.
+        assert_eq!(
+            resolve_user_cache_dir(home, Some(OsStr::new("/xdg-cache")), true),
+            PathBuf::from("/xdg-cache")
+        );
+        // A relative XDG value is unset per spec (rm-248): the macOS
+        // default still applies — the reorder must not demote the
+        // Library/Caches default to a Linux-style ~/.cache.
+        assert_eq!(
+            resolve_user_cache_dir(home, Some(OsStr::new("rel-cache")), true),
+            library
+        );
+        // No XDG at all: the macOS default.
+        assert_eq!(resolve_user_cache_dir(home, None, true), library);
+        // Empty XDG behaves exactly like unset.
+        assert_eq!(
+            resolve_user_cache_dir(home, Some(OsStr::new("")), true),
+            library
+        );
+        // No HOME on the macOS ladder: the temp-dir fallback, never a
+        // RELATIVE Library/Caches joined against the CWD.
+        let no_home = resolve_user_cache_dir(None, Some(OsStr::new("rel-cache")), true);
+        assert!(no_home.is_absolute(), "{no_home:?}");
     }
 
     #[test]
