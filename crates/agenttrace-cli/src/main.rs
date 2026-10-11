@@ -974,6 +974,15 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                 path.display()
             );
         }
+        if path.exists() {
+            // rm-212: exists but neither a regular file nor a directory
+            // — a FIFO, socket, or device node. Name the real reason
+            // instead of the misleading not-exist wording.
+            bail!(
+                "Error loading {}: positional path exists but is not a regular file",
+                path.display()
+            );
+        }
         bail!("session path does not exist: {}", path.display());
     }
     let dir = args.dir.as_deref().map(PathBuf::from);

@@ -190,3 +190,35 @@ fn csv_outside_its_composable_set_bails_like_the_markdown_guard() {
     }
     fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn overview_csv_strips_osc_bytes_from_group_keys() {
+    // rm-506 (run d6432dd5, assess 8ee739a8 F1): the overview csv lane
+    // rendered transcript-derived group keys raw — a model id carrying
+    // an OSC title escape produced an `ESC]0;pwned-titleBELvis…` group
+    // row via `--overview -f csv` on the release binary. End-to-end
+    // through the CLI here; the guard-set and group-map unit tests
+    // live in `src/csv_export.rs`.
+    // JSON-escaped OSC/BEL/CSI (raw control bytes are invalid inside a
+    // JSON string); the parser decodes them to real control bytes, so
+    // the group key reaches the csv lane carrying the hostile sequence.
+    const OSC_MODEL: &str = "\\u001b]0;pwned-title\\u0007vis\\u001b[31mred";
+    let dir = fixture_dir(
+        "overview-osc",
+        &[
+            user_line("check the billing please"),
+            assistant_line(ALL_ZERO, OSC_MODEL),
+        ],
+    );
+    let out = run_csv(&dir, &["--overview", "-f", "csv"]);
+
+    assert!(
+        !out.contains('\u{1b}') && !out.contains('\u{7}'),
+        "OSC/BEL must not reach the overview csv output"
+    );
+    assert!(
+        out.contains('\u{FFFD}'),
+        "stripped control bytes are disclosed as U+FFFD"
+    );
+    fs::remove_dir_all(dir).ok();
+}

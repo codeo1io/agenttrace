@@ -2953,3 +2953,100 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[test]
+fn special_files_that_pass_name_admission_never_reach_the_parse_path() {
+    // rm-212 (run d6432dd5, assess 8ee739a8 F2): walk admission was
+    // name-only, so a planted FIFO hung every scan (`timeout 10 …
+    // --overview -f json` → rc124, zero output) and a /dev/zero
+    // symlink read unbounded. Name-admitted non-regular files must be
+    // skipped by BOTH walkers before the parse path — and a warm
+    // journal written by the pre-gate walker (walk version 3) must
+    // not keep offering them either; that stale-listing hazard is what
+    // the DIR_LISTING_WALK_VERSION 3→4 bump retires.
+    let root = temp_root("agenttrace-special-file-admission");
+    fs::create_dir_all(root.join("agent")).expect("create agent dir");
+    fs::create_dir_all(root.join("sessions")).expect("create sessions dir");
+    let session_path = root.join("sessions/session.jsonl");
+    fs::write(&session_path, SAMPLE_JSONL).expect("write session");
+
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+    let socket_path = root.join("agent/evil-socket.jsonl");
+    UnixListener::bind(&socket_path).expect("bind socket");
+    let device_path = root.join("agent/zero.jsonl");
+    symlink("/dev/zero", &device_path).expect("symlink /dev/zero");
+
+    with_session_cache(&root.join("cache"), || {
+        // Cold walk: admission is type-aware.
+        let cold = find_session_files(Some(&root));
+        assert!(
+            cold.contains(&session_path),
+            "the real session still walks in: {cold:?}"
+        );
+        assert!(
+            !cold.contains(&socket_path),
+            "a unix socket must not be admitted as a session file: {cold:?}"
+        );
+        assert!(
+            !cold.contains(&device_path),
+            "a device symlink must not be admitted as a session file: {cold:?}"
+        );
+
+        // Warm-cache load lane: parsing must complete and see only the
+        // real session — never hang on (or stream from) the specials.
+        let loaded = load_sessions_from_dir(Some(&root));
+        assert_eq!(loaded.len(), 1, "only the real session parses: {loaded:?}");
+
+        // Stale warm journal naming the special files, in the shape a
+        // pre-gate (walk version 3) binary writes: the version bump is
+        // the only invalidation that retires those listings.
+        let journal = session_cache_path();
+        let raw = fs::read_to_string(&journal).expect("read primed journal");
+        let mut doc: Value = serde_json::from_str(&raw).expect("journal json");
+        doc["dir_listing_version"] = serde_json::json!(3);
+        let agent_dir = root.join("agent");
+        let dirs = doc
+            .get_mut("dirs")
+            .and_then(Value::as_object_mut)
+            .expect("dirs member");
+        dirs.insert(
+            agent_dir.to_string_lossy().to_string(),
+            serde_json::json!({
+                "mod_time": file_mod_time_nanos_for_test(
+                    &fs::metadata(&agent_dir).expect("agent dir metadata")
+                ),
+                "files": [
+                    socket_path.to_string_lossy().to_string(),
+                    device_path.to_string_lossy().to_string(),
+                ],
+                "dirs": [],
+            }),
+        );
+        fs::write(
+            &journal,
+            serde_json::to_string(&doc).expect("serialize rewound journal"),
+        )
+        .expect("write rewound journal");
+
+        let replayed = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        assert_eq!(
+            replayed.sessions.len(),
+            1,
+            "the special files must not parse as sessions"
+        );
+        let reread =
+            serde_json::from_str::<Value>(&fs::read_to_string(&journal).expect("reread journal"))
+                .expect("journal json");
+        assert_ne!(
+            reread
+                .pointer("/dir_listing_version")
+                .and_then(Value::as_i64),
+            Some(3),
+            "the journal must be rewritten at the post-gate walk version"
+        );
+    });
+
+    let _ = fs::remove_dir_all(root);
+}

@@ -965,6 +965,8 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
 
     out.push_str("  ── By Task Type ──\n");
     for (task_type, group) in &overview.by_task_type {
+        // rm-506: transcript-derived group key, sanitized at render entry.
+        let task_type = sanitize_line_segment(task_type);
         out.push_str(&format!(
             "    {:<15} {:>4} Sessions  {:>8}  in {:>9}  out {}\n",
             task_type,
@@ -2565,12 +2567,17 @@ fn overview_text_agent_groups(
     items
 }
 
+/// rm-506: the text lane's group rows print transcript-derived keys —
+/// sanitized here, at the collection choke point both `By Model` and
+/// `By Provider` iterate, so no text row can bypass the control-byte
+/// sanitizer. The `Overview` maps themselves stay raw: the JSON lane is
+/// lossless by policy (rm-383) and sanitizes nothing.
 fn overview_text_model_groups(
     groups: &BTreeMap<String, GroupOverview>,
 ) -> Vec<(String, GroupOverview)> {
     let mut items: Vec<_> = groups
         .iter()
-        .map(|(name, group)| (name.clone(), group.clone()))
+        .map(|(name, group)| (sanitize_line_segment(name), group.clone()))
         .collect();
     items.sort_by(|a, b| b.1.cost.partial_cmp(&a.1.cost).unwrap_or(Ordering::Equal));
     items
@@ -2622,7 +2629,7 @@ fn report_html_code_list(values: &[String]) -> String {
 
 fn html_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
+    for ch in strip_terminal_control(value).chars() {
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -2804,8 +2811,28 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 /// Merge note: the control-byte sanitizer family (fc197c5e's lane) must run
 /// BEFORE the entity escape at merge time — control bytes first, then
 /// printable HTML — so both byte classes die in one pass.
-fn markdown_cell(value: &str) -> String {
+/// rm-506: terminal-control bytes are neutralized at every render entry
+/// of the human-readable lanes — transcript-derived strings (group keys,
+/// model columns, anomaly text) can carry OSC/CSI/SGR sequences that
+/// reprogram a terminal rendering the report. Matching the landed
+/// `sanitize_line_segment` set (rm-383), every control byte becomes
+/// U+FFFD; newline is preserved here because table cells own their
+/// structural mappings (`<br>`) for it.
+fn strip_terminal_control(value: &str) -> String {
     value
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' {
+                '\u{FFFD}'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn markdown_cell(value: &str) -> String {
+    strip_terminal_control(value)
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

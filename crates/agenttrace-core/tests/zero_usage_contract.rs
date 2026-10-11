@@ -205,3 +205,47 @@ fn with_session_cache_dir(cache: &std::path::Path, f: impl FnOnce()) {
         None => std::env::remove_var(key),
     }
 }
+
+#[test]
+fn negative_usage_is_clamped_with_disclosure_not_clean_zero() {
+    // rm-408 negative arm (run d6432dd5, assess 8ee739a8 F4): a hostile
+    // or buggy transcript reporting negative token usage read back as a
+    // clean zero-spend session — `analyze` clamps each usage key with
+    // `.max(0)` and nothing disclosed the clamping. The negative arm
+    // extends the landed disclosure taxonomy additively: the clamped
+    // event count joins the provenance string; the shipped
+    // `zero_usage_reported` / `calculated_from_tokens_clamped` markers
+    // keep their meanings.
+    const NEGATIVE_USAGE: &str = r#"{"input_tokens":-500,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#;
+    let path = fixture(
+        "negative",
+        &[user_line(), assistant_line("5", Some(NEGATIVE_USAGE))],
+    );
+    let session: Session = parse_file(&path).expect("claude transcript parses");
+    assert_eq!(
+        session.metrics.tokens_input, 0,
+        "negative input tokens clamp to zero, never below"
+    );
+    assert!(
+        session
+            .metrics
+            .provenance
+            .tokens
+            .contains("negative_usage_clamped:1"),
+        "the clamped events are disclosed on the provenance string: got {}",
+        session.metrics.provenance.tokens
+    );
+    assert!(
+        session
+            .metrics
+            .provenance
+            .tokens
+            .starts_with("reported_by_agent"),
+        "the base provenance marker is unchanged: got {}",
+        session.metrics.provenance.tokens
+    );
+    assert_eq!(
+        session.metrics.zero_usage_events, 0,
+        "a negative block is a clamped block, not a zero-usage block"
+    );
+}

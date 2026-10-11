@@ -592,6 +592,9 @@ fn walk_session_files_cached(
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
             continue;
         }
+        if !is_admitted_regular_file(&path) {
+            continue;
+        }
         files.push(path);
     }
     files.sort();
@@ -653,8 +656,24 @@ fn walk_session_files(
         if is_open_code_storage_path(&path) && !is_open_code_storage_session_file(&path) {
             continue;
         }
+        if !is_admitted_regular_file(&path) {
+            continue;
+        }
         items.push((path, entry_mod_time(&entry)));
     }
+}
+
+/// rm-212: name admission is not type admission. A path whose name
+/// looks like a session file but is not a REGULAR file — a planted
+/// FIFO (the assess `8ee739a8` F2 PoC hung every scan on one), a unix
+/// socket, or a device symlink like `/dev/zero` — must never reach the
+/// parse path: opening it blocks forever or streams unbounded bytes.
+/// Regular files only; every other file type (and unreadable metadata)
+/// is skipped silently, exactly like the other admission gates.
+fn is_admitted_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
 }
 
 fn sort_paths_by_mod_time(paths: Vec<PathBuf>) -> Vec<PathBuf> {
