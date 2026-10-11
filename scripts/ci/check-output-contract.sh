@@ -23,7 +23,15 @@ require_json() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir"
 
-"$bin" --doctor -f json >"$out_dir/doctor.json"
+# rm-994 (run cebf20d5 cycle 2, batch "trusted instruments"): this
+# leg used to run doctor with default discovery — a walk of the
+# operator's REAL corpus homes — so the gate hung to its 600s timeout
+# on any populated host while CI stayed green only because its env
+# pins kept $HOME empty. The leg now runs doctor against the bundled
+# demo corpus (the rm-596 demo gate short-circuits every
+# host-derived discovery lane before any filesystem walk), so the
+# doctor output contract is checked hermetically on every host.
+"$bin" --demo --doctor -f json >"$out_dir/doctor.json"
 require_file "$out_dir/doctor.json"
 require_json "$out_dir/doctor.json"
 

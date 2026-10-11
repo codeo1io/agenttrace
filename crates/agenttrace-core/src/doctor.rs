@@ -81,6 +81,14 @@ pub struct DoctorReport {
     /// changes alike). `None` when the journal has never recorded one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_invalidation_note: Option<String>,
+    /// rm-996 disclosure: the journal's `transcript_shrunk` ledger
+    /// summarized for humans — in-place transcript truncations (e.g.
+    /// Claude Code's CLAUDE_CODE_TRANSCRIPT_LOCAL_GC) that lowered a
+    /// warm session's totals, recorded at the cache refresh seam so
+    /// the drop is annotated instead of silent. `None` when the
+    /// journal has never recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_shrunk_note: Option<String>,
     pub sessions: usize,
     pub session_files: usize,
     /// rm-607 disclosure: sibling sqlite databases (outside the
@@ -143,6 +151,11 @@ struct SessionCacheReport {
     entries: BTreeMap<String, CacheEntryHeader>,
     dirs: usize,
     invalidation_note: Option<String>,
+    /// rm-996: the persisted `transcript_shrunk` ledger summarized for
+    /// humans — how many in-place transcript shrinks the journal
+    /// records and the newest record verbatim. `None` when the journal
+    /// has never recorded one.
+    transcript_shrunk_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +213,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
                 entries: BTreeMap::new(),
                 dirs: 0,
                 invalidation_note: None,
+                transcript_shrunk_note: None,
             },
             cache_size_bytes: 0,
             files: Vec::new(),
@@ -316,6 +330,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_entry_bound_source: entry_bound_source.to_string(),
         reparsed_this_scan,
         cache_invalidation_note: cache.invalidation_note.clone(),
+        transcript_shrunk_note: cache.transcript_shrunk_note.clone(),
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
@@ -1137,6 +1152,9 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     if let Some(note) = &report.cache_invalidation_note {
         out.push_str(&format!("  cache disclosure: {note}\n"));
     }
+    if let Some(note) = &report.transcript_shrunk_note {
+        out.push_str(&format!("  cache shrink disclosure: {note}\n"));
+    }
     let statusline_state = if report.statusline.exists {
         format!(
             "{} captures, {} distinct sessions, {} bytes",
@@ -1312,11 +1330,31 @@ fn load_session_cache_report() -> SessionCacheReport {
                     .unwrap_or_else(|_| "<unserializable record>".to_string())
             )
         });
+    // rm-996 (run cebf20d5 cycle 2, batch "trusted instruments"):
+    // surface the persisted shrink ledger the same way — a transcript
+    // re-parsed with FEWER events than the cached entry it replaced
+    // (the CLAUDE_CODE_TRANSCRIPT_LOCAL_GC strict-prefix rewrite)
+    // lowers every total on the warm report, and `--doctor` now names
+    // it instead of the shrink staying visible only by opening the
+    // journal by hand.
+    let transcript_shrunk_note = doc
+        .get("transcript_shrunk")
+        .and_then(Value::as_array)
+        .filter(|records| !records.is_empty())
+        .map(|records| {
+            format!(
+                "{} transcript shrink observation(s) recorded (a cached transcript re-parsed with fewer events — in-place journal truncation, e.g. Claude Code local GC; the session is annotated, never silently lowered); newest: {}",
+                records.len(),
+                serde_json::to_string(&records[records.len() - 1])
+                    .unwrap_or_else(|_| "<unserializable record>".to_string())
+            )
+        });
     SessionCacheReport {
         path,
         entries,
         dirs,
         invalidation_note,
+        transcript_shrunk_note,
     }
 }
 

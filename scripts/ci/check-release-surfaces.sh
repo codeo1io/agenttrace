@@ -127,3 +127,22 @@ fi
 npm_version="$(node -p "require('./npm/package.json').version")"
 [[ "$npm_version" = "0.0.0-release" ]] ||
 	fail "npm package must keep the release-version placeholder outside release CI"
+
+# rm-1000 (run cebf20d5 cycle 2, batch "trusted instruments"):
+# example/ref divergence arm. install.sh's pinned REF is the release
+# the installer actually downloads; the README install examples pin
+# the same release by name. The two had drifted (README showed
+# v0.9.1 while install.sh shipped v0.10.1), and nothing failed until
+# a user copied the example onto a tag the install script no longer
+# fetched. Pin them together: every version literal on the README
+# AGENTTRACE_VERSION lines (both languages, env and PowerShell forms)
+# must equal the installer's default REF.
+install_ref="$(sed -nE 's/^REF="\$\{AGENTTRACE_SOURCE_REF:-(v[0-9]+\.[0-9]+\.[0-9]+)\}"$/\1/p' install.sh | head -1)"
+[[ -n "$install_ref" ]] ||
+	fail "could not extract the pinned default ref from install.sh (REF= pattern moved?)"
+for readme in README.md README.zh-CN.md; do
+	while IFS= read -r pinned; do
+		[[ "$pinned" == "$install_ref" ]] ||
+			fail "$readme pins '$pinned' but install.sh defaults to '$install_ref' — the install example must match the shipped ref"
+	done < <(grep -oE '(AGENTTRACE_VERSION=|-Version )v[0-9]+\.[0-9]+\.[0-9]+' "$readme" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+done
