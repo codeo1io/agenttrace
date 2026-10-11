@@ -1183,19 +1183,42 @@ fn rust_messages_json_without_roles_falls_back_to_codex_cli() {
 fn rust_writes_and_reuses_go_compatible_session_cache() {
     let root = temp_root("agenttrace-rust-session-cache");
     let home = root.join("home");
-    let sessions_dir = home.join("sessions");
+    // rm-1010: the corpus sits under a KNOWN session dir (~/.hermes/
+    // sessions inside the pinned home) so the GLOBAL load lane (dir
+    // None) — the only lane the session cache is scoped to — writes
+    // and reuses the Go-compatible cache below. The dir-scoped lane
+    // still parses the same journal but must consult and rewrite NO
+    // cache (pinned first, and again in
+    // dir_scope_cache_isolation_contract).
+    let sessions_dir = home.join(".hermes").join("sessions");
     let cache_dir = home.join("cache");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     let session_path = sessions_dir.join("session.jsonl");
     fs::write(&session_path, SAMPLE_JSONL).expect("write session");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        // rm-1010 dir-scoped lane: cold parse, zero consults, and the
+        // cache file is never created.
+        let scoped = load_sessions_with_options(Some(&sessions_dir), &LoadOptions::default());
+        assert_eq!(
+            scoped.cache_hits, 0,
+            "dir-scoped cold load must parse from source"
+        );
+        assert_eq!(scoped.sessions.len(), 1);
+        assert_eq!(scoped.sessions[0].metrics.source_tool, "hermes_jsonl");
+        let cache_path = session_cache_path();
+        assert_eq!(cache_path, cache_dir.join("sessions.json"));
+        assert!(
+            !cache_path.exists(),
+            "rm-1010: a dir-scoped load must not create the session cache"
+        );
+
+        // Global lane (the cache's own corpus): writes the
+        // Go-compatible cache this test pins.
+        let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].metrics.source_tool, "hermes_jsonl");
 
-        let cache_path = session_cache_path();
-        assert_eq!(cache_path, cache_dir.join("sessions.json"));
         let raw = fs::read_to_string(&cache_path).expect("read written cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // v41 (integration of run ac14e52c, rm-520 'audit cost
@@ -1289,13 +1312,24 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
             Some(1)
         );
 
+        // rm-1010 flips the doctor side: a dir-scoped report must NOT
+        // describe the operator-visible index (consulting it would
+        // disclose operator state under a -d report and honor poisoned
+        // foreign entries) — it discloses the scope instead. The
+        // GLOBAL report (dir None) still describes the index the
+        // doctor actually consults (rm-834/rm-694, CU-22 bounds).
+        let before = fs::read(&cache_path).expect("snapshot cache before scoped doctor");
         let doctor = build_doctor_report(Some(&sessions_dir), false);
-        assert_eq!(doctor.cache_entries, 1);
-        assert_eq!(doctor.cached_valid, 1);
-        // CU-22: --doctor discloses the cache's on-disk size and the hard
-        // bounds save_session_cache enforces, so operators can tell an
-        // entry-count eviction from a byte-ceiling one.
-        assert!(doctor.cache_size_bytes > 0, "cache file exists on disk");
+        assert_eq!(
+            doctor.cache_entries, 0,
+            "rm-1010: scoped doctor consults no cache"
+        );
+        assert_eq!(doctor.cached_valid, 0);
+        assert_eq!(doctor.cache_size_bytes, 0);
+        assert_eq!(
+            doctor.cache_scope_note.as_deref(),
+            Some("cache out of scope: -d/--dir scans consult and rewrite no session cache")
+        );
         assert!(
             doctor.cache_limits.contains("entries<=20000"),
             "entry bound disclosed: {}",
@@ -1306,17 +1340,33 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
             "byte bound disclosed: {}",
             doctor.cache_limits
         );
+        assert_eq!(
+            fs::read(&cache_path).expect("snapshot cache after scoped doctor"),
+            before,
+            "rm-1010: a dir-scoped doctor run must leave the cache byte-identical"
+        );
         let rendered = agenttrace_core::render_doctor_report(Some(&sessions_dir), false, "text")
             .expect("render doctor report");
         assert!(
             rendered.contains("hard bounds"),
             "text doctor output names the bounds: {rendered}"
         );
+        let global_doctor = build_doctor_report(None, false);
+        assert_eq!(
+            global_doctor.cache_entries, 1,
+            "global doctor still consults the index"
+        );
+        assert_eq!(global_doctor.cached_valid, 1);
+        assert!(
+            global_doctor.cache_size_bytes > 0,
+            "cache file exists on disk"
+        );
+        assert!(global_doctor.cache_scope_note.is_none());
 
         fs::write(&session_path, "not a session\n").expect("invalidate session cache entry");
-        let after_stale = load_sessions_from_dir(Some(&sessions_dir));
+        let after_stale = load_sessions_from_dir(None);
         assert!(after_stale.is_empty());
-        let doctor = build_doctor_report(Some(&sessions_dir), false);
+        let doctor = build_doctor_report(None, false);
         assert_eq!(doctor.cached_valid, 0);
     });
 
@@ -1325,20 +1375,24 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
 
 #[test]
 fn rust_reports_monotonic_load_progress_and_real_cache_hits() {
+    // rm-1010: the reuse lane runs GLOBAL loads (dir None) over a
+    // corpus planted under a known session dir — the only lane the
+    // session cache serves. Dir-scoped loads always take the parse
+    // arm (pinned by dir_scope_cache_isolation_contract).
     let root = temp_root("agenttrace-rust-load-progress");
-    let sessions_dir = root.join("sessions");
-    let cache_dir = root.join("cache");
+    let home = root.join("home");
+    let sessions_dir = home.join(".hermes").join("sessions");
+    let cache_dir = home.join("cache");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     fs::write(sessions_dir.join("a.jsonl"), SAMPLE_JSONL).expect("write session a");
     fs::write(sessions_dir.join("b.jsonl"), SAMPLE_JSONL).expect("write session b");
     fs::write(sessions_dir.join("bad.jsonl"), "not a session\n").expect("write bad session");
 
-    with_session_cache(&cache_dir, || {
+    with_home_and_cache(&home, &cache_dir, || {
         let mut first = Vec::new();
-        let report =
-            load_sessions_with_progress(Some(&sessions_dir), &LoadOptions::default(), |progress| {
-                first.push(progress)
-            });
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |progress| {
+            first.push(progress)
+        });
         assert_eq!(report.discovered, 3);
         assert_eq!(report.parsed, 2);
         assert_eq!(report.skipped, 1);
@@ -1350,10 +1404,9 @@ fn rust_reports_monotonic_load_progress_and_real_cache_hits() {
         assert_eq!(first.last().map(|item| item.skipped), Some(1));
 
         let mut second = Vec::new();
-        let report =
-            load_sessions_with_progress(Some(&sessions_dir), &LoadOptions::default(), |progress| {
-                second.push(progress)
-            });
+        let report = load_sessions_with_progress(None, &LoadOptions::default(), |progress| {
+            second.push(progress)
+        });
         assert_eq!(report.cache_hits, 2);
         assert_eq!(second.last().map(|item| item.cache_hits), Some(2));
         assert_eq!(
@@ -1388,7 +1441,7 @@ fn rust_skips_claude_workflow_definitions() {
 fn rust_refreshes_cache_entries_from_old_schema_version() {
     let root = temp_root("agenttrace-rust-session-cache-old-schema");
     let home = root.join("home");
-    let sessions_dir = home.join("sessions");
+    let sessions_dir = home.join(".hermes").join("sessions");
     let cache_dir = home.join("cache");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     fs::create_dir_all(&cache_dir).expect("create cache dir");
@@ -1409,7 +1462,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
     .expect("write old schema cache");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "Inspect billing export.");
         assert_eq!(sessions[0].metrics.source_tool, "hermes_jsonl");
@@ -1449,7 +1502,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
 fn rust_refreshes_cache_entries_missing_tool_arg_usage() {
     let root = temp_root("agenttrace-rust-session-cache-tool-args");
     let home = root.join("home");
-    let sessions_dir = home.join("sessions");
+    let sessions_dir = home.join(".hermes").join("sessions");
     let cache_dir = home.join("cache");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     fs::create_dir_all(&cache_dir).expect("create cache dir");
@@ -1470,7 +1523,7 @@ fn rust_refreshes_cache_entries_missing_tool_arg_usage() {
     .expect("write old cache");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "Inspect billing export.");
         assert_eq!(
@@ -1502,7 +1555,7 @@ fn rust_refreshes_cache_entries_missing_tool_arg_usage() {
 fn rust_refreshes_cache_entries_with_empty_source_tool() {
     let root = temp_root("agenttrace-rust-session-cache-empty-source");
     let home = root.join("home");
-    let sessions_dir = home.join("sessions");
+    let sessions_dir = home.join(".hermes").join("sessions");
     let cache_dir = home.join("cache");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     fs::create_dir_all(&cache_dir).expect("create cache dir");
@@ -1527,7 +1580,7 @@ fn rust_refreshes_cache_entries_with_empty_source_tool() {
     .expect("write old empty-source cache");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "meta-only");
         assert_eq!(sessions[0].metrics.source_tool, "generic");
@@ -1552,7 +1605,7 @@ fn rust_refreshes_cache_entries_with_empty_source_tool() {
 fn rust_writes_and_refreshes_go_compatible_directory_cache() {
     let root = temp_root("agenttrace-rust-dir-cache");
     let home = root.join("home");
-    let sessions_dir = home.join("sessions");
+    let sessions_dir = home.join(".hermes").join("sessions");
     let nested = sessions_dir.join("nested");
     let cache_dir = home.join("cache");
     fs::create_dir_all(&nested).expect("create nested session dir");
@@ -1560,7 +1613,7 @@ fn rust_writes_and_refreshes_go_compatible_directory_cache() {
     fs::write(&first_path, SAMPLE_JSONL).expect("write first session");
 
     with_home_and_cache(&home, &cache_dir, || {
-        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1);
 
         let cache_path = session_cache_path();
@@ -1582,14 +1635,17 @@ fn rust_writes_and_refreshes_go_compatible_directory_cache() {
             Some(first_path.to_string_lossy().as_ref())
         );
 
-        let doctor = build_doctor_report(Some(&sessions_dir), false);
+        // rm-1010: the doctor's cached-dir-listing count describes the
+        // index the GLOBAL doctor consults; a dir-scoped report skips
+        // the cache entirely.
+        let doctor = build_doctor_report(None, false);
         assert_eq!(doctor.cache_dirs, 2);
 
         let second_path = nested.join("second.jsonl");
         fs::write(&second_path, SAMPLE_JSONL).expect("write second session");
         bump_dir_mtime(&nested);
         bump_dir_mtime(&sessions_dir);
-        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 2);
         assert!(sessions
             .iter()
@@ -1598,7 +1654,7 @@ fn rust_writes_and_refreshes_go_compatible_directory_cache() {
         fs::remove_file(&first_path).expect("remove stale cached session file");
         bump_dir_mtime(&nested);
         bump_dir_mtime(&sessions_dir);
-        let sessions = load_sessions_from_dir(Some(&sessions_dir));
+        let sessions = load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].path, second_path.to_string_lossy());
     });
@@ -2925,9 +2981,12 @@ fn cache_dead_paths_are_persisted_away_across_runs() {
     // Pass-8 F8-3 end to end: after the source file disappears, the
     // next cached load prunes the entry and the re-saved snapshot no
     // longer carries the dead path (the operator snapshot had 761 of
-    // 1,487 entries dead and growing every day).
+    // 1,487 entries dead and growing every day). rm-1010: the prune
+    // lane runs GLOBAL loads (dir None) over a corpus planted under a
+    // known session dir — the only lane the session cache serves.
     let root = temp_root("agenttrace-cache-prune");
-    let sessions = root.join("sessions");
+    let home = root.join("home");
+    let sessions = home.join(".hermes").join("sessions");
     fs::create_dir_all(&sessions).expect("create sessions dir");
     let body = r#"{"role":"session_meta","timestamp":"2026-09-01T10:00:00Z","ModelUsed":"claude-sonnet-4"}
 {"role":"user","content":"work","timestamp":"2026-09-01T10:00:00Z"}
@@ -2937,8 +2996,8 @@ fn cache_dead_paths_are_persisted_away_across_runs() {
     let drop_path = sessions.join("drop.jsonl");
     fs::write(&keep, body).expect("write keep");
     fs::write(&drop_path, body).expect("write drop");
-    with_session_cache(&root.join("cache"), || {
-        let first = load_sessions_with_options(Some(&sessions), &LoadOptions::default());
+    with_home_and_cache(&home, &root.join("cache"), || {
+        let first = load_sessions_with_options(None, &LoadOptions::default());
         assert_eq!(first.sessions.len(), 2, "both sessions parse");
         let snapshot = root.join("cache").join("sessions.json");
         assert!(snapshot.exists(), "cache snapshot exists after first run");
@@ -2949,7 +3008,7 @@ fn cache_dead_paths_are_persisted_away_across_runs() {
         );
 
         fs::remove_file(&drop_path).expect("delete source file");
-        let second = load_sessions_with_options(Some(&sessions), &LoadOptions::default());
+        let second = load_sessions_with_options(None, &LoadOptions::default());
         assert_eq!(second.sessions.len(), 1, "only the surviving file parses");
         let after = fs::read_to_string(&snapshot).expect("re-read snapshot");
         assert!(
@@ -3515,31 +3574,37 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
     // cached replay in `walk_session_files_cached` extends `listing.files`
     // verbatim, so a journal written by the pre-blocklist walker keeps
     // offering npm/package manifests to the loading lane as candidate
-    // session files (doctor's own walk is uncached, but `-d` loads and
-    // `--overview` ride the cached finder). The session-cache schema
-    // version cannot retire those listings — schema 22 already shipped
-    // with the pre-blocklist walker — so the listing walk version is the
-    // only invalidation. Pin both halves: a stale (v2) listing that names
-    // a manifest is not replayed, and the journal is rewritten at the
-    // current walk version.
+    // session files (doctor's own walk is uncached, but global loads and
+    // `--overview` ride the cached finder; rm-1010 keeps dir-scoped
+    // `-d` loads off the cache entirely, so the warm-replay lane here
+    // runs GLOBAL loads over a corpus planted under a known session
+    // dir). The session-cache schema version cannot retire those
+    // listings — schema 22 already shipped with the pre-blocklist
+    // walker — so the listing walk version is the only invalidation.
+    // Pin both halves: a stale (v2) listing that names a manifest is
+    // not replayed, and the journal is rewritten at the current walk
+    // version.
     let root = temp_root("agenttrace-manifest-warm-cache");
-    fs::create_dir_all(root.join("agent")).expect("create agent dir");
-    fs::create_dir_all(root.join("sessions")).expect("create sessions dir");
-    // Placed directly under `agent/`: the pre-blocklist walker stored this
-    // file in `agent`'s own listing (`.json` suffix, no skip rule), which
-    // is the same row `-d ~/.pi --doctor` rendered as a parse failure.
-    let manifest_path = root.join("agent/package-lock.json");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".hermes").join("sessions").join("agent"))
+        .expect("create agent dir");
+    let sessions_root = home.join(".hermes").join("sessions");
+    // Placed directly under `sessions/agent/`: the pre-blocklist walker
+    // stored this file in that listing (`.json` suffix, no skip rule),
+    // which is the same row `-d ~/.pi --doctor` rendered as a parse
+    // failure.
+    let manifest_path = sessions_root.join("agent/package-lock.json");
     fs::write(&manifest_path, "{}").expect("write package-lock");
-    let session_path = root.join("sessions/session.jsonl");
+    let session_path = sessions_root.join("session.jsonl");
     fs::write(&session_path, SAMPLE_JSONL).expect("write session");
 
-    with_session_cache(&root.join("cache"), || {
+    with_home_and_cache(&home, &root.join("cache"), || {
         // Prime a warm journal through the loading lane (the plain walk
         // never reads listings; loads persist them) so the doc carries
         // the live schema version and real, manifest-free listings.
-        let primed = load_sessions_from_dir(Some(&root));
+        let primed = load_sessions_from_dir(None);
         assert_eq!(primed.len(), 1, "one real session parsed: {primed:?}");
-        let primed_files = find_session_files(Some(&root));
+        let primed_files = find_session_files(None);
         assert!(
             !primed_files
                 .iter()
@@ -3554,7 +3619,7 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
         let raw = fs::read_to_string(&journal).expect("read primed journal");
         let mut doc: Value = serde_json::from_str(&raw).expect("journal json");
         doc["dir_listing_version"] = serde_json::json!(2);
-        let agent_dir = root.join("agent");
+        let agent_dir = sessions_root.join("agent");
         let dirs = doc
             .get_mut("dirs")
             .and_then(Value::as_object_mut)
@@ -3575,7 +3640,7 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
         )
         .expect("write rewound journal");
 
-        let replayed = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        let replayed = load_sessions_with_options(None, &LoadOptions::default());
         assert_eq!(
             replayed.sessions.len(),
             1,
@@ -3584,7 +3649,7 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
         assert_eq!(
             replayed.discovered, 1,
             "a warm listing written by the pre-blocklist walker must not keep offering npm manifests as session candidates (discovered {}): {:?}",
-            replayed.discovered, find_session_files(Some(&root))
+            replayed.discovered, find_session_files(None)
         );
         assert_eq!(
             replayed.skipped, 0,
@@ -4127,21 +4192,26 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
     // CURRENT-version journal that names a fifo must still be filtered
     // by the replay's file-kind re-validation — the version bump alone
     // cannot defend against a fifo created after a valid walk.
+    // rm-1010: the warm-replay lane runs GLOBAL loads (dir None) over a
+    // corpus planted under a known session dir inside the pinned home
+    // — the only lane the session cache serves.
     let root = generated_fixture("warm-replay-file-kind");
     let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("create fixture root");
-    std::fs::write(root.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
-    let fifo_path = root.join("evil.jsonl");
+    let home = root.join("home");
+    let sessions_root = home.join(".hermes").join("sessions");
+    std::fs::create_dir_all(&sessions_root).expect("create fixture root");
+    std::fs::write(sessions_root.join("real.jsonl"), SAMPLE_JSONL).expect("write real session");
+    let fifo_path = sessions_root.join("evil.jsonl");
     let status = std::process::Command::new("mkfifo")
         .arg(&fifo_path)
         .status()
         .expect("mkfifo available");
     assert!(status.success(), "mkfifo failed");
 
-    with_session_cache(&root.join("cache"), || {
+    with_home_and_cache(&home, &root.join("cache"), || {
         // Prime a warm journal: the cold walk filters the fifo, so the
         // stored listing names only the regular file.
-        let primed = load_sessions_from_dir(Some(&root));
+        let primed = load_sessions_from_dir(None);
         assert_eq!(primed.len(), 1, "one real session parsed: {primed:?}");
 
         let journal = session_cache_path();
@@ -4150,13 +4220,13 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
             let mut doc: Value = serde_json::from_str(&raw).expect("journal json");
             doc["dir_listing_version"] = serde_json::json!(version);
             doc["dirs"].as_object_mut().expect("dirs member").insert(
-                root.to_string_lossy().to_string(),
+                sessions_root.to_string_lossy().to_string(),
                 serde_json::json!({
                     "mod_time": file_mod_time_nanos_for_test(
-                        &std::fs::metadata(&root).expect("root metadata")
+                        &std::fs::metadata(&sessions_root).expect("root metadata")
                     ),
                     "files": [
-                        root.join("real.jsonl").to_string_lossy().to_string(),
+                        sessions_root.join("real.jsonl").to_string_lossy().to_string(),
                         fifo_path.to_string_lossy().to_string(),
                     ],
                     "dirs": [],
@@ -4176,7 +4246,7 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
         // and the load below wedges on the parser's blocking open.
         plant(3);
         let stale_started = std::time::Instant::now();
-        let stale = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        let stale = load_sessions_with_options(None, &LoadOptions::default());
         assert_eq!(
             stale.sessions.len(),
             1,
@@ -4196,7 +4266,7 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
         // keeps it from the parser's blocking open.
         plant(4);
         let current_started = std::time::Instant::now();
-        let replayed = load_sessions_with_options(Some(&root), &LoadOptions::default());
+        let replayed = load_sessions_with_options(None, &LoadOptions::default());
         assert_eq!(
             replayed.sessions.len(),
             1,
@@ -4213,7 +4283,7 @@ fn warm_replay_revalidates_file_kind_for_stored_listings() {
             current_started.elapsed()
         );
 
-        let files = find_session_files(Some(&root));
+        let files = find_session_files(None);
         assert_eq!(files.len(), 1, "cold path unaffected: {files:?}");
     });
     let _ = std::fs::remove_dir_all(&root);

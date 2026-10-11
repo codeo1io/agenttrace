@@ -81,7 +81,7 @@ pub use session_cache::{
     cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
     load_cached_sessions_from_cache, load_session_cache, save_session_cache,
     session_cache_entries_source, session_cache_path, store_session, SessionCache,
-    MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
+    MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_BYTES, MAX_SESSION_CACHE_ENTRIES,
     MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION,
 };
 pub use sqlite_sessions::{

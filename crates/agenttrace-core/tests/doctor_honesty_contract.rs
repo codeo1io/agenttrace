@@ -73,6 +73,19 @@ fn subagent_corpus() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/subagent-corpus")
 }
 
+fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).expect("create corpus dir");
+    for entry in fs::read_dir(src).expect("read corpus dir") {
+        let entry = entry.expect("corpus entry");
+        let target = dst.join(entry.file_name());
+        if entry.file_type().expect("corpus entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("copy corpus file");
+        }
+    }
+}
+
 const PLANTED_SESSION: &str = concat!(
     "{\"role\":\"session_meta\",\"timestamp\":\"2026-05-01T09:00:00Z\",\"ModelUsed\":\"claude-sonnet-4-5\"}\n",
     "{\"role\":\"meta\",\"ModelUsed\":\"claude-sonnet-4-5\",\"Usage\":{\"input_tokens\":120,\"output_tokens\":30}}\n",
@@ -96,8 +109,15 @@ fn doctor_persists_fresh_parses_for_the_immediate_rerun() {
     // session on every run.
     let home = temp_home("persist");
     with_home(&home, || {
-        let corpus = subagent_corpus();
-        let cold = build_doctor_report(Some(&corpus), false);
+        // rm-1010 scopes stage (a) persistence to the cache's own
+        // corpus: the corpus is planted under a known session dir
+        // inside the pinned home and the persistence lane runs GLOBAL
+        // discovery (dir None). A dir-scoped (`-d`) run must consult
+        // and rewrite NO cache — that side of the contract is pinned
+        // by dir_scope_cache_isolation_contract.
+        let corpus = home.join(".hermes").join("sessions");
+        copy_tree(&subagent_corpus(), &corpus);
+        let cold = build_doctor_report(None, false);
         assert!(cold.session_files >= 6, "fixture corpus must be walked");
         let cold_hits: usize = cold.directories.iter().map(|d| d.cache_hits).sum();
         assert_eq!(
@@ -120,7 +140,7 @@ fn doctor_persists_fresh_parses_for_the_immediate_rerun() {
             "persisted session cache must be non-empty"
         );
 
-        let warm = build_doctor_report(Some(&corpus), false);
+        let warm = build_doctor_report(None, false);
         let warm_hits: usize = warm.directories.iter().map(|d| d.cache_hits).sum();
         assert!(
             warm_hits >= 6,

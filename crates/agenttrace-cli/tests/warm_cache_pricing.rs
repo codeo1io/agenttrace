@@ -42,13 +42,19 @@ struct Run {
 }
 
 fn run_agenttrace(root: &Path, override_path: Option<&Path>) -> Run {
+    // rm-1010: session-cache banking (and therefore warm replay and
+    // warm re-pricing) is a GLOBAL-lane behavior — dir-scoped `-d`
+    // runs consult and rewrite no cache. The corpus lives under the
+    // Hermes known session root inside the sandbox home, so the same
+    // `--diagnostics` invocation with NO `-d` scans it as the global
+    // corpus and every warm leg below is a genuine cache replay.
     let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
     command
-        .args(["-d", "corpus", "--diagnostics", "-f", "json"])
+        .args(["--diagnostics", "-f", "json"])
         .current_dir(root)
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("AGENTTRACE_SESSION_CACHE_DIR", root.join("cache/sess"))
-        .env("HOME", root);
+        .env("HOME", root.join("home"));
     match override_path {
         Some(path) => command.env("AGENTTRACE_PRICING_FILE", path),
         None => command.env_remove("AGENTTRACE_PRICING_FILE"),
@@ -84,7 +90,7 @@ fn unique_root(label: &str) -> PathBuf {
             .expect("clock")
             .as_nanos()
     ));
-    fs::create_dir_all(root.join("corpus")).expect("create corpus dir");
+    fs::create_dir_all(root.join("home/.hermes/sessions")).expect("create corpus dir");
     fs::create_dir_all(root.join("cache/sess")).expect("create cache dir");
     root
 }
@@ -92,7 +98,7 @@ fn unique_root(label: &str) -> PathBuf {
 #[test]
 fn warm_cache_reprices_when_the_pricing_catalog_changes() {
     let root = unique_root("swap");
-    let journal = root.join("corpus/journal.jsonl");
+    let journal = root.join("home/.hermes/sessions/journal.jsonl");
     fs::write(&journal, fixture_journal()).expect("write fixture journal");
     let override_path = root.join("override.json");
     fs::write(&override_path, override_file()).expect("write override file");
@@ -149,7 +155,7 @@ fn warm_cache_reprices_when_the_override_file_content_changes() {
     // override re-prices warm sessions without any touch to the session
     // artifacts, the env shape, or the file's mtime/size.
     let root = unique_root("edit");
-    let journal = root.join("corpus/journal.jsonl");
+    let journal = root.join("home/.hermes/sessions/journal.jsonl");
     fs::write(&journal, fixture_journal()).expect("write fixture journal");
     let override_path = root.join("override.json");
     // 40x rates first: 40.0 + 80.0 = 120.0.
@@ -197,7 +203,7 @@ fn warm_cache_preserves_the_flex_service_tier_on_hits() {
     // "current rates" recompute stays tier-aware instead of claiming
     // the session costs double and flagging drift.
     let root = unique_root("flex");
-    let journal = root.join("corpus/flex.jsonl");
+    let journal = root.join("home/.hermes/sessions/flex.jsonl");
     fs::write(&journal, fixture_codex_flex_journal()).expect("write codex flex journal");
 
     let cold = run_agenttrace(&root, None);
@@ -220,11 +226,11 @@ fn warm_cache_preserves_the_flex_service_tier_on_hits() {
     // The overview's cost audit agrees with itself: the "current"
     // estimate is the flex row, and no drift note fires.
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
-        .args(["-d", "corpus", "--overview", "-f", "json"])
+        .args(["--overview", "-f", "json"])
         .current_dir(&root)
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("AGENTTRACE_SESSION_CACHE_DIR", root.join("cache/sess"))
-        .env("HOME", &root)
+        .env("HOME", root.join("home"))
         .env_remove("AGENTTRACE_PRICING_FILE")
         .output()
         .expect("run agenttrace --overview");

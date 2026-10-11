@@ -6,6 +6,7 @@ Use this index to find the document that matches your role and task.
 
 - [CI integration](guides/ci-integration.md) — generate reports and enforce local session-health gates in CI.
 - [Governance reports](guides/governance-reports.md) — interpret cost, recommendation, MCP, context, and delivery-evidence reports.
+- [Usage basis and pricing lanes](guides/usage-basis.md) — what counts as usage, how standard vs `flex` service tiers bill, and where the applied lane is disclosed.
 - [Statusline capture](guides/statusline-capture.md) — capture subscription limits and prompt-cache analytics from the Claude Code statusline hook.
 - [Cursor import](guides/cursor-import.md) — export the supported Cursor workspace data shape.
 - [Codex plugin](guides/codex-plugin.md) — use AgentTrace through its Codex plugin and skill.

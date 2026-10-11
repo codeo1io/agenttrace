@@ -106,6 +106,29 @@ fn qwen_multi_result_usage_accumulates_per_turn() {
 /// — that is the class of pre-rm-526 v32-era entries replaying hidden
 /// skips at confidence "high", and of v32 totals undercounted by the
 /// pre-rm-711 parsers.
+// rm-1010 hermeticity: serialize + panic-safe pin of the cache dir
+// override, restoring the PREVIOUS value on the way out — the env is
+// process-global, cargo runs this binary's tests on parallel threads,
+// and a failed assertion must not leak the pin into later cache-
+// touching code.
+fn with_session_cache_env(cache: &std::path::Path, f: impl FnOnce()) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let result = {
+        let _guard = LOCK.lock().unwrap();
+        let previous = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match previous {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        result
+    };
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 #[test]
 fn warm_cache_replays_cold_disclosure_and_schema_58_invalidates_v32() {
     assert_eq!(
@@ -120,54 +143,54 @@ fn warm_cache_replays_cold_disclosure_and_schema_58_invalidates_v32() {
     let journal = root.join("torn-session.jsonl");
     fs::write(&journal, torn_claude_journal()).unwrap();
 
-    // Point the cache at an isolated dir (the only env-touching test in
-    // this binary; other test binaries are separate processes).
+    // Point the cache at an isolated dir (rm-1010: serialized and
+    // panic-safe so the suite can never assert against — or leak into —
+    // real operator cache state).
     let cache_dir = root.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &cache_dir);
+    with_session_cache_env(&cache_dir, || {
+        // Cold leg: empty cache, parse, store, save.
+        let mut cache: SessionCache = load_session_cache();
+        assert!(
+            cached_session(&journal, &mut cache).is_none(),
+            "cold: no entry yet"
+        );
+        let cold = parse_file(&journal).expect("torn claude journal parses");
+        assert_eq!(
+            cold.metrics.line_skips.get("unparseable_line"),
+            Some(&1),
+            "cold parse must disclose the torn tail"
+        );
+        store_session(&journal, &cold, &mut cache).expect("store_session");
+        save_session_cache(&mut cache).expect("save_session_cache");
 
-    // Cold leg: empty cache, parse, store, save.
-    let mut cache: SessionCache = load_session_cache();
-    assert!(
-        cached_session(&journal, &mut cache).is_none(),
-        "cold: no entry yet"
-    );
-    let cold = parse_file(&journal).expect("torn claude journal parses");
-    assert_eq!(
-        cold.metrics.line_skips.get("unparseable_line"),
-        Some(&1),
-        "cold parse must disclose the torn tail"
-    );
-    store_session(&journal, &cold, &mut cache).expect("store_session");
-    save_session_cache(&mut cache).expect("save_session_cache");
+        // Warm leg: fresh load from disk, entry served, disclosure equal.
+        let mut warm_cache = load_session_cache();
+        let warm =
+            cached_session(&journal, &mut warm_cache).expect("warm hit at the current schema");
+        assert_eq!(warm.metrics.line_skips, cold.metrics.line_skips);
+        assert_eq!(warm.metrics.tokens_input, cold.metrics.tokens_input);
+        let cold_health = data_health(std::slice::from_ref(&cold), 1, 0);
+        let warm_health = data_health(&[warm], 1, 1);
+        assert_eq!(cold_health.confidence, warm_health.confidence);
+        assert_eq!(
+            warm_health.confidence, "low",
+            "the torn tail must degrade confidence on the warm path too"
+        );
 
-    // Warm leg: fresh load from disk, entry served, disclosure equal.
-    let mut warm_cache = load_session_cache();
-    let warm = cached_session(&journal, &mut warm_cache).expect("warm hit at the current schema");
-    assert_eq!(warm.metrics.line_skips, cold.metrics.line_skips);
-    assert_eq!(warm.metrics.tokens_input, cold.metrics.tokens_input);
-    let cold_health = data_health(std::slice::from_ref(&cold), 1, 0);
-    let warm_health = data_health(&[warm], 1, 1);
-    assert_eq!(cold_health.confidence, warm_health.confidence);
-    assert_eq!(
-        warm_health.confidence, "low",
-        "the torn tail must degrade confidence on the warm path too"
-    );
-
-    // Stale-schema leg: degrade the persisted file to schema 32 (what a
-    // pre-bump cache looks like) — it must not be served at 58.
-    let cache_file = session_cache_path();
-    let raw = fs::read_to_string(&cache_file).expect("cache file exists");
-    let mut degraded: Value = serde_json::from_str(&raw).expect("cache file is JSON");
-    degraded["schema_version"] = Value::from(32);
-    fs::write(&cache_file, serde_json::to_string(&degraded).unwrap()).unwrap();
-    let mut stale_cache: SessionCache = load_session_cache();
-    assert!(
+        // Stale-schema leg: degrade the persisted file to schema 32 (what a
+        // pre-bump cache looks like) — it must not be served at 58.
+        let cache_file = session_cache_path();
+        let raw = fs::read_to_string(&cache_file).expect("cache file exists");
+        let mut degraded: Value = serde_json::from_str(&raw).expect("cache file is JSON");
+        degraded["schema_version"] = Value::from(32);
+        fs::write(&cache_file, serde_json::to_string(&degraded).unwrap()).unwrap();
+        let mut stale_cache: SessionCache = load_session_cache();
+        assert!(
         cached_session(&journal, &mut stale_cache).is_none(),
         "rm-710: a schema-32 entry must not be served at the live schema ceiling (58 at this tree — the id-less fold-key namespace integration, run 57c491338818, re-based its 42 → 52 census mint onto the advanced 57 ceiling per the landed-rung-keeps-numeral convention; every warm entry written before this integration regenerates once)"
     );
-
-    std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+    });
     let _ = fs::remove_dir_all(&root);
 }
 

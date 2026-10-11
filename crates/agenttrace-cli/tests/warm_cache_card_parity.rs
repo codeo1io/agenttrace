@@ -42,15 +42,21 @@ fn unique_root() -> PathBuf {
             .expect("clock")
             .as_nanos()
     ));
-    fs::create_dir_all(root.join("corpus")).expect("create corpus dir");
+    fs::create_dir_all(root.join("home/.claude/projects/fixture")).expect("create corpus dir");
     root
 }
 
 fn run_overview(root: &Path, format: &str) -> String {
+    // rm-1010: session-cache banking (and therefore warm replay) is a
+    // GLOBAL-lane behavior — dir-scoped `-d` runs consult and rewrite
+    // no cache. The corpus lives under a known session root inside the
+    // sandbox home (`~/.claude/projects`), so the same `--overview`
+    // invocation with NO `-d` scans it as the global corpus and the
+    // warm leg below is a genuine cache replay exactly as before.
     let output = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
-        .args(["--overview", "-d", "corpus", "-f", format])
+        .args(["--overview", "-f", format])
         .current_dir(root)
-        .env("HOME", root)
+        .env("HOME", root.join("home"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("AGENTTRACE_SESSION_CACHE_DIR", root.join("cache/sess"))
         .output()
@@ -65,13 +71,14 @@ fn run_overview(root: &Path, format: &str) -> String {
 }
 
 fn seed_corpus(root: &Path) {
+    let corpus = root.join("home/.claude/projects/fixture");
     fs::write(
-        root.join("corpus/a.jsonl"),
+        corpus.join("a.jsonl"),
         journal("s-early", "2026-10-04", "0.02"),
     )
     .expect("write early journal");
     fs::write(
-        root.join("corpus/b.jsonl"),
+        corpus.join("b.jsonl"),
         journal("s-late", "2026-10-06", "0.01"),
     )
     .expect("write late journal");

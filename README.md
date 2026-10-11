@@ -374,8 +374,15 @@ payload to a local journal (`~/.cache/agenttrace/statusline.jsonl`, capped at
 relocate it). The parsed-session cache is bounded by entries and
 bytes; raise or lower the entry bound with `session_cache_entries` in
 the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
-variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
-discloses the bound actually in force, which layer supplied it, and how
+variable (both clamped to [1, 1,000,000], default 20,000; hard 64 MiB byte
+ceiling) — `--doctor` and the knobs disclosure render the effective
+pair when the knob is unset:
+
+```text
+session_cache_entries: unset → 20000 entries / 64 MiB byte cap (default)
+```
+
+with the layer that supplied a set value named beside it, plus how
 many session files the last scan re-parsed from source instead of the
 cache. Cache files are written owner-only (`0600` on Unix) and
 compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
@@ -474,6 +481,7 @@ fails when the README table drifts from the binary's actual flag count
 
 - Documentation index: [docs/README.md](docs/README.md)
 - CI setup: [docs/guides/ci-integration.md](docs/guides/ci-integration.md)
+- Usage basis and pricing lanes: [docs/guides/usage-basis.md](docs/guides/usage-basis.md)
 - Governance reports: [docs/guides/governance-reports.md](docs/guides/governance-reports.md)
 - Cursor import: [docs/guides/cursor-import.md](docs/guides/cursor-import.md)
 - Parser guide: [docs/guides/parser-guide.md](docs/guides/parser-guide.md)

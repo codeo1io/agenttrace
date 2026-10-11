@@ -1,7 +1,7 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
     load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
-    SqliteIngestReport, VERSION,
+    SessionCache, SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -81,6 +81,13 @@ pub struct DoctorReport {
     /// changes alike). `None` when the journal has never recorded one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_invalidation_note: Option<String>,
+    /// rm-1010: set when this scan ran with an explicit `-d/--dir`
+    /// scope. The parsed-session cache indexes the HOME-rooted
+    /// corpus, not the scanned directory, so such runs consult and
+    /// rewrite no cache; the report says so instead of rendering
+    /// zeroed counts as if the operator's cache were empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_scope_note: Option<String>,
     pub sessions: usize,
     pub session_files: usize,
     /// rm-607 disclosure: sibling sqlite databases (outside the
@@ -175,6 +182,7 @@ pub fn render_doctor_report(
 struct DoctorDiscovery {
     cache: SessionCacheReport,
     cache_size_bytes: u64,
+    cache_scope_note: Option<String>,
     files: Vec<PathBuf>,
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
@@ -202,16 +210,44 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
                 invalidation_note: None,
             },
             cache_size_bytes: 0,
+            cache_scope_note: None,
             files: Vec::new(),
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
         };
     }
-    let cache = load_session_cache_report();
-    let cache_size_bytes = std::fs::metadata(&cache.path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    // rm-1010: a `-d` scan analyses a directory the global session
+    // cache was never scoped to. Consulting it would serve stale
+    // operator state for foreign paths (a poisoned entry keyed at a
+    // path inside `-d` was honored pre-fix) and disclose the
+    // operator's global cache state under a dir-scoped report, so the
+    // cache file is neither read nor statted here — the report
+    // discloses the scope instead of rendering zeroed counts as if
+    // the operator's cache were empty. The cache belongs to the
+    // HOME-rooted corpus only (dir None), where nothing changes.
+    let cache_scope_note = if dir.is_some() {
+        Some("cache out of scope: -d/--dir scans consult and rewrite no session cache".to_string())
+    } else {
+        None
+    };
+    let cache = if dir.is_some() {
+        SessionCacheReport {
+            path: session_cache_path(),
+            entries: BTreeMap::new(),
+            dirs: 0,
+            invalidation_note: None,
+        }
+    } else {
+        load_session_cache_report()
+    };
+    let cache_size_bytes = if dir.is_some() {
+        0
+    } else {
+        std::fs::metadata(&cache.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
     let (files, opencode_fork_excluded) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
@@ -239,6 +275,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     DoctorDiscovery {
         cache,
         cache_size_bytes,
+        cache_scope_note,
         files,
         sessions,
         sqlite_ingest,
@@ -250,6 +287,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     let DoctorDiscovery {
         cache,
         cache_size_bytes,
+        cache_scope_note,
         files,
         sessions,
         sqlite_ingest,
@@ -316,6 +354,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_entry_bound_source: entry_bound_source.to_string(),
         reparsed_this_scan,
         cache_invalidation_note: cache.invalidation_note.clone(),
+        cache_scope_note,
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
@@ -734,7 +773,22 @@ fn doctor_directories(
         );
         return Vec::new();
     }
-    let mut cache = load_session_cache();
+    // rm-1010: a dir-scoped doctor run analyses a corpus the global
+    // session cache was never scoped to, so it runs on a scratch
+    // in-memory cache (within-run parse memoization only) and never
+    // loads or saves the operator's index: consults there would honor
+    // stale/poisoned entries keyed at foreign paths, and the dirty
+    // save would evict the operator's entries by banking fixture
+    // parses over them (the assess F3 PoC: a `doctor -d /tmp/...` run
+    // rewrote a 30,769-entry operator index). Global runs (dir None)
+    // keep the warm-cache behavior exactly as before (rm-367 stage
+    // (a) still holds on the lane it was minted for).
+    let cache_scope_is_global = dir.is_none();
+    let mut cache = if cache_scope_is_global {
+        load_session_cache()
+    } else {
+        SessionCache::default()
+    };
     let mut dirs: Vec<DoctorDirReport> = Vec::new();
     if let Some(dir) = dir {
         let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -790,8 +844,10 @@ fn doctor_directories(
     // discovery.rs save pattern) — before this the doctor READ the
     // cache but never wrote it, so every rerun re-parsed every
     // session from source. Stages b-d (finder-level reuse of the
-    // walk itself) stay open on the row.
-    if cache.is_dirty() {
+    // walk itself) stay open on the row. rm-1010 scopes the persist:
+    // only the cache's own corpus (global runs, dir None) is saved;
+    // a dir-scoped run's scratch cache is dropped with the report.
+    if cache_scope_is_global && cache.is_dirty() {
         let _ = save_session_cache(&mut cache);
     }
     dirs.extend(doctor_sqlite_directories(sessions, sqlite_ingest));
@@ -1136,6 +1192,12 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     ));
     if let Some(note) = &report.cache_invalidation_note {
         out.push_str(&format!("  cache disclosure: {note}\n"));
+    }
+    // rm-1010: dir-scoped scans render zeroed cache counts by
+    // construction (no cache was consulted); this note says why, so a
+    // -d report cannot read as "the operator's cache is empty".
+    if let Some(note) = &report.cache_scope_note {
+        out.push_str(&format!("  cache scope: {note}\n"));
     }
     let statusline_state = if report.statusline.exists {
         format!(

@@ -1832,7 +1832,15 @@ fn load_sessions_for_tui(
     on_progress: impl FnMut(LoadProgress),
 ) -> anyhow::Result<(bool, LoadReport)> {
     if force {
-        clear_session_cache()?;
+        // rm-1010: the force-reload purge clears the operator's
+        // global cache only on the cache's own lane. A dir-scoped
+        // load consults and rewrites no cache, so purging the
+        // operator's store on a scoped force-reload would be exactly
+        // the operator-state damage rm-1010 forbids — the scoped load
+        // already runs on a fresh scratch cache (nothing to clear).
+        if dir.trim().is_empty() {
+            clear_session_cache()?;
+        }
     }
     let load_dir = if dir.trim().is_empty() {
         None

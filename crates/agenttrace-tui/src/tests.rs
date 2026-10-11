@@ -1919,8 +1919,14 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
         ));
         assert_eq!(app.load_state.processed, 1);
         assert_eq!(app.load_state.parsed, 1);
-        assert_eq!(app.load_state.cache_hits, 1);
-        assert_eq!(app.sessions[0].name, "cached");
+        // rm-1010: this load is dir-scoped (the TUI was pointed at one
+        // sessions dir), so the load phase consults no cache — the
+        // session comes from the source parse ("fresh" on disk), not
+        // the banked "cached" entry. The warm-start view above still
+        // shows the operator's own cached entry instantly (read-only,
+        // same-path); the authoritative load never trusts it.
+        assert_eq!(app.load_state.cache_hits, 0);
+        assert_eq!(app.sessions[0].name, "fresh");
         let progressed = loading_status_lines(&app)
             .iter()
             .map(|line| format!("{line:?}"))
@@ -1929,11 +1935,11 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
         assert!(progressed.contains("100%"));
         wait_for_pending_load(&mut app);
         assert_eq!(app.sessions.len(), 1);
-        assert_eq!(app.sessions[0].name, "cached");
+        assert_eq!(app.sessions[0].name, "fresh");
         assert_eq!(app.load_state.phase, LoadPhase::Ready);
         assert_eq!(app.load_state.parsed, 1);
         assert!(load_summary_line(&app).contains("loaded 1 sessions"));
-        assert!(load_summary_line(&app).contains("1 cache hits"));
+        assert!(load_summary_line(&app).contains("0 cache hits"));
         assert!(load_summary_line(&app).contains("hermes_jsonl:1"));
         assert!(cache_path.is_file());
 
@@ -1958,9 +1964,18 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
         wait_for_pending_load(&mut app);
         assert_eq!(app.sessions.len(), 1);
         assert_eq!(app.sessions[0].name, "fresh");
-        let refreshed_cache = fs::read_to_string(&cache_path).expect("read refreshed cache");
-        assert!(refreshed_cache.contains(r#""Name":"fresh""#));
-        assert!(!refreshed_cache.contains(r#""Name":"cached""#));
+        // rm-1010: this TUI load is dir-scoped, so the force reload
+        // neither consults nor rewrites the operator's global cache:
+        // the on-disk file keeps the planted entry byte-for-byte (the
+        // purge is global-lane only now) and the served session is
+        // the fresh source parse, not the banked "cached" one.
+        let refreshed_cache =
+            fs::read_to_string(&cache_path).expect("read cache after scoped force reload");
+        assert!(
+            refreshed_cache.contains(r#""Name":"cached""#),
+            "a dir-scoped force reload must leave the operator cache untouched"
+        );
+        assert!(!refreshed_cache.contains(r#""Name":"fresh""#));
         assert!(app.status.starts_with("force reloaded 1 sessions"));
     });
 

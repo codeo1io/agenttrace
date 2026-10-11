@@ -333,7 +333,20 @@ pub fn load_sessions_with_progress(
     options: &LoadOptions,
     on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
-    let mut cache = load_session_cache();
+    // rm-1010: the global session cache indexes the HOME-rooted
+    // corpus. A dir-scoped load analyses a foreign corpus the cache
+    // was never scoped to — consulting it would serve stale operator
+    // state for paths inside `-d` (a poisoned entry keyed there was
+    // honored pre-fix) and banking parses would evict the operator's
+    // entries. Dir-scoped loads run on a scratch in-memory cache
+    // (within-run memoization only, never saved — see the save gate
+    // in load_sessions_with_progress_from_cache_mode); global loads
+    // (dir None) keep the warm-cache behavior exactly as before.
+    let mut cache = if dir.is_some() {
+        SessionCache::default()
+    } else {
+        load_session_cache()
+    };
     load_sessions_with_progress_from_cache(dir, options, &mut cache, on_progress)
 }
 
@@ -353,6 +366,20 @@ pub fn load_sessions_with_progress_from_cache_mode(
     emit_progress_sessions: bool,
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
+    // rm-1010: dir-scoped loads never consult the operator's global
+    // index. Callers may hand in a cache they preloaded from the
+    // global store (the TUI does); for a foreign corpus its entries
+    // are stale operator state (a poisoned entry keyed at a path
+    // inside the dir was honored pre-fix), so the load runs against
+    // an empty scratch cache instead — within-run memoization only,
+    // never consulted from disk and never saved (save gate below).
+    // Global loads (dir None) consult and bank exactly as before.
+    let mut scoped_scratch = SessionCache::default();
+    let cache: &mut SessionCache = if dir.is_some() {
+        &mut scoped_scratch
+    } else {
+        cache
+    };
     let mut sessions = Vec::new();
     let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
@@ -459,7 +486,14 @@ pub fn load_sessions_with_progress_from_cache_mode(
         }
     });
     let live_parsed = sessions.len();
-    if cache.is_dirty() {
+    // rm-1010: only the cache's own corpus persists. Dir-scoped runs
+    // arrive here with a scratch in-memory cache (load_sessions_with_progress)
+    // or a caller-owned one narrowed to a foreign corpus (the TUI's
+    // dir filter); saving either would bank foreign-corpus parses
+    // into the operator's global index and evict the operator's
+    // entries. Global runs (dir None) keep the rm-367 stage (a)
+    // persist-and-reuse behavior exactly as before.
+    if dir.is_none() && cache.is_dirty() {
         let _ = save_session_cache(cache);
     }
     let mut sqlite_ingest = crate::sqlite_sessions::SqliteIngestReport::default();

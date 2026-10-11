@@ -127,7 +127,11 @@ fn stale_schema_22_cache_cannot_mask_the_disclosure() {
 
     let root = std::env::temp_dir().join("at-zero-usage-stale-v22");
     let _ = fs::remove_dir_all(&root);
-    let sessions_dir = root.join("sessions");
+    // rm-1010: the schema guard runs on the GLOBAL lane (dir None) —
+    // the only lane the cache serves. Corpus under a known session
+    // dir inside the pinned home; the stale cache file stays at
+    // root/sessions.json via AGENTTRACE_SESSION_CACHE_DIR.
+    let sessions_dir = root.join(".hermes").join("sessions");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     let session_path = sessions_dir.join("session.jsonl");
     fs::write(
@@ -169,8 +173,8 @@ fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     });
     fs::write(root.join("sessions.json"), cache.to_string()).expect("write stale v22 cache");
 
-    with_session_cache_dir(&root, || {
-        let sessions = agenttrace_core::load_sessions_from_dir(Some(&sessions_dir));
+    with_pinned_home(&root, || {
+        let sessions = agenttrace_core::load_sessions_from_dir(None);
         assert_eq!(sessions.len(), 1, "one session discovered");
         assert_eq!(
             sessions[0].metrics.zero_usage_events, 1,
@@ -195,13 +199,47 @@ fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     let _ = fs::remove_dir_all(&root);
 }
 
-fn with_session_cache_dir(cache: &std::path::Path, f: impl FnOnce()) {
-    let key = "AGENTTRACE_SESSION_CACHE_DIR";
-    let previous = std::env::var_os(key);
-    std::env::set_var(key, cache);
-    f();
-    match previous {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+// rm-1010: retired when the stale-schema guard moved onto the
+// global lane with a fully pinned home; kept out to keep the binary
+// free of unused helpers (clippy -D dead_code).
+/// rm-1010 hermeticity: serialize + panic-safe pin of the HOME/XDG
+/// bases and both cache knobs, restoring PREVIOUS values on the way
+/// out — the pattern doctor_honesty_contract's with_home established,
+/// extended to every env var cache scoping reads.
+fn with_pinned_home(home: &std::path::Path, f: impl FnOnce()) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let result = {
+        let _guard = LOCK.lock().unwrap();
+        let mut previous: Vec<(&'static str, Option<std::ffi::OsString>)> = vec![
+            ("HOME", std::env::var_os("HOME")),
+            ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
+            ("XDG_CACHE_HOME", std::env::var_os("XDG_CACHE_HOME")),
+            ("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME")),
+            (
+                "AGENTTRACE_SESSION_CACHE_DIR",
+                std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR"),
+            ),
+            (
+                "AGENTTRACE_SESSION_CACHE_ENTRIES",
+                std::env::var_os("AGENTTRACE_SESSION_CACHE_ENTRIES"),
+            ),
+        ];
+        std::env::set_var("HOME", home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", home);
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (key, value) in previous.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        result
+    };
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
     }
 }

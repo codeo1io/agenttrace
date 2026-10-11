@@ -509,6 +509,35 @@ fn session_cache_entries_effective(config: &ResolvedConfig) -> Option<(usize, us
 pub fn disclosure_json(config: &ResolvedConfig) -> String {
     let session_cache_knob = session_cache_entries_effective(config);
     let knob = |key: &str, value: serde_json::Value, source: &str| serde_json::json!({ "key": key, "value": value, "source": source });
+    // rm-1012: the session_cache_entries knob never resolves to
+    // "nothing" — when unset, the bound in force is the core default
+    // pair. Carry it as an additive `default` object beside `value`
+    // (set/unset semantics unchanged) so a bare `"value": null`
+    // cannot read as "unbounded" or "off". The bytes bound is a hard
+    // cap (not knob-settable), disclosed here beside the entries
+    // default exactly as --doctor renders it.
+    let session_cache_default = serde_json::json!({
+        "entries": agenttrace_core::MAX_SESSION_CACHE_ENTRIES,
+        "bytes": agenttrace_core::MAX_SESSION_CACHE_BYTES,
+    });
+    let session_cache_knob_value = session_cache_knob
+        .map(|(effective, _)| serde_json::Value::from(effective))
+        .unwrap_or(serde_json::Value::Null);
+    let session_cache_knob_source = match session_cache_knob {
+        Some((effective, raw)) if effective != raw => {
+            format!("{}, clamped from {raw}", config.sources[3].1)
+        }
+        _ => config.sources[3].1.to_string(),
+    };
+    let session_cache_entries_disclosure = {
+        let mut entry = knob(
+            "session_cache_entries",
+            session_cache_knob_value,
+            &session_cache_knob_source,
+        );
+        entry["default"] = session_cache_default.clone();
+        entry
+    };
     let doc = serde_json::json!({
         "layers": config.layers.iter().map(|layer| serde_json::json!({
             "name": layer.name,
@@ -544,19 +573,7 @@ pub fn disclosure_json(config: &ResolvedConfig) -> String {
                 config.weekly_budget.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
                 config.sources[2].1,
             ),
-            knob(
-                "session_cache_entries",
-                session_cache_knob
-                    .map(|(effective, _)| serde_json::Value::from(effective))
-                    .unwrap_or(serde_json::Value::Null),
-                match session_cache_knob {
-                    Some((effective, raw)) if effective != raw => {
-                        format!("{}, clamped from {raw}", config.sources[3].1)
-                    }
-                    _ => config.sources[3].1.to_string(),
-                }
-                .as_str(),
-            ),
+            session_cache_entries_disclosure,
         ],
     });
     serde_json::to_string_pretty(&doc).unwrap_or_default()
@@ -623,7 +640,17 @@ pub fn disclosure_text(config: &ResolvedConfig) -> String {
             config.sources[3].0,
             session_cache_knob
                 .map(|(effective, _)| effective.to_string())
-                .unwrap_or_else(|| "(unset)".to_string()),
+                // rm-1012: unset never means "no bound" — render the
+                // effective defaults the resolver applies (the entry
+                // bound plus the hard byte cap) instead of a bare
+                // "(unset)" that hides both numbers.
+                .unwrap_or_else(|| {
+                    format!(
+                        "unset → {} entries / {} MiB byte cap",
+                        agenttrace_core::MAX_SESSION_CACHE_ENTRIES,
+                        agenttrace_core::MAX_SESSION_CACHE_BYTES / (1024 * 1024),
+                    )
+                }),
             session_cache_source.as_str(),
         ),
     ];
@@ -858,6 +885,100 @@ mod tests {
         };
         assert!(!disclosure_json(&in_range).contains("clamped"));
         assert!(disclosure_text(&in_range).contains("session_cache_entries: 20000 (config file)"));
+    }
+
+    #[test]
+    fn unset_session_cache_entries_discloses_effective_defaults() {
+        // rm-1012: the knob never resolves to "nothing". When unset,
+        // the text disclosure renders the effective default pair (the
+        // entry bound plus the hard byte cap the resolver enforces)
+        // instead of a bare "(unset)" that hides both numbers, and the
+        // JSON carries the pair additively beside "value": null (the
+        // set/unset semantics of "value" are unchanged). Pinned against
+        // the core constants so a default change breaks here first,
+        // and against the README quote so docs match the rendered
+        // string byte-for-byte.
+        let unset = ResolvedConfig {
+            layers: vec![],
+            absent: vec![],
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            session_cache_entries: None,
+            env_history_dir: None,
+            env_pricing_file: None,
+            env_session_cache_entries: None,
+            sources: [
+                ("history_dir", "default"),
+                ("pricing_file", "default"),
+                ("weekly_budget", "default"),
+                ("session_cache_entries", "default"),
+            ],
+        };
+        let default_line = format!(
+            "session_cache_entries: unset → {} entries / {} MiB byte cap (default)",
+            agenttrace_core::MAX_SESSION_CACHE_ENTRIES,
+            agenttrace_core::MAX_SESSION_CACHE_BYTES / (1024 * 1024),
+        );
+        let text = disclosure_text(&unset);
+        assert!(
+            text.contains(&default_line),
+            "text must render the effective default pair: {text}"
+        );
+        assert!(
+            !text.contains("session_cache_entries: (unset)"),
+            "the cache knob must never render a bare unset: {text}"
+        );
+
+        let json = disclosure_json(&unset);
+        let flat_json: String = json.split_whitespace().collect();
+        assert!(
+            flat_json.contains("\"key\":\"session_cache_entries\",\"value\":null"),
+            "set/unset semantics of value are unchanged: {json}"
+        );
+        assert!(
+            flat_json.contains(&format!(
+                "\"default\":{{\"entries\":{},\"bytes\":{}}}",
+                agenttrace_core::MAX_SESSION_CACHE_ENTRIES,
+                agenttrace_core::MAX_SESSION_CACHE_BYTES
+            )),
+            "json carries the effective default pair additively: {json}"
+        );
+
+        // A set knob renders exactly as before (no default pair noise).
+        let set = ResolvedConfig {
+            layers: vec![],
+            absent: vec![],
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            session_cache_entries: Some(30_000),
+            env_history_dir: None,
+            env_pricing_file: None,
+            env_session_cache_entries: None,
+            sources: [
+                ("history_dir", "default"),
+                ("pricing_file", "default"),
+                ("weekly_budget", "default"),
+                ("session_cache_entries", "config file"),
+            ],
+        };
+        assert!(disclosure_text(&set).contains("session_cache_entries: 30000 (config file)"));
+        assert!(!disclosure_text(&set).contains("unset →"));
+        // The additive default pair documents the fallback in the set
+        // case too; "value" carries the set knob.
+        assert!(
+            disclosure_json(&set).contains("\"value\":30000")
+                || disclosure_json(&set).contains("\"value\": 30000")
+        );
+        assert!(disclosure_json(&set).contains("\"default\":"));
+
+        // README quotes the rendered default line byte-for-byte.
+        let readme = include_str!("../../../README.md");
+        assert!(
+            readme.contains(&default_line),
+            "README must quote the rendered default line: {default_line}"
+        );
     }
 
     #[test]
