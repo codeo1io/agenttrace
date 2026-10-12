@@ -1,5 +1,6 @@
 use crate::{parse_jsonl_session, session_from_events, Event, Session, ToolCall};
 use anyhow::{bail, Context};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -430,6 +431,13 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         usage: BTreeMap<String, i64>,
     }
     let mut per_model: BTreeMap<String, CopilotModelSnapshot> = BTreeMap::new();
+    // rm-956 arm 2: every cumulative usage snapshot per model, keyed by
+    // (model, timestamp). The per_model fold keeps only the LATEST
+    // snapshot per model, but the cross-root reconcile
+    // (copilot_reconcile) needs the full interval history to find the
+    // boundary where the OTel export takes over the accounting.
+    let mut copilot_intervals: BTreeMap<(String, String), CopilotShutdownInterval> =
+        BTreeMap::new();
     // rm-721 / codeburn #1651: VS Code agent-host journals (workspace.yaml
     // client_name: vscode-agent-host; Copilot CLI 1.0.8x writes the same
     // shape) interleave entry types the counting rules do not fold —
@@ -570,6 +578,28 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             // (a resume re-emits the cumulative snapshot),
                             // so an out-of-order earlier line cannot
                             // overwrite a fresher one.
+                            // rm-956 arm 2: every snapshot is ALSO an
+                            // interval boundary for the cross-root
+                            // reconcile, keyed by its own (model,
+                            // timestamp) — the per-model stale rule
+                            // governs which one feeds the totals, but
+                            // the history is what the OTel replacement
+                            // walk compares against.
+                            copilot_intervals.insert(
+                                (model.clone(), timestamp.clone()),
+                                CopilotShutdownInterval {
+                                    model: model.clone(),
+                                    usage: usage.clone(),
+                                    requests_count: metric
+                                        .get("requests")
+                                        .and_then(|value| value.get("count"))
+                                        .and_then(Value::as_i64)
+                                        .unwrap_or(0),
+                                    timestamp_ns: crate::parse_ts(&timestamp)
+                                        .and_then(|stamp| stamp.timestamp_nanos_opt())
+                                        .unwrap_or(0),
+                                },
+                            );
                             let stale = per_model
                                 .get(model)
                                 .map(|seen| later_rfc3339(&seen.timestamp, &timestamp) != timestamp)
@@ -636,6 +666,25 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                             // rm-555: same later-record-per-model rule as the
                             // shutdown arm — a stale replayed checkpoint line
                             // cannot overwrite a fresher snapshot.
+                            // rm-956 arm 2: same interval recording as the
+                            // shutdown arm — checkpoints are the only
+                            // snapshots a killed session ever wrote, so
+                            // they carry the boundary history alone.
+                            copilot_intervals.insert(
+                                (model.clone(), timestamp.clone()),
+                                CopilotShutdownInterval {
+                                    model: model.clone(),
+                                    usage: usage.clone(),
+                                    requests_count: metric
+                                        .get("requests")
+                                        .and_then(|value| value.get("count"))
+                                        .and_then(Value::as_i64)
+                                        .unwrap_or(0),
+                                    timestamp_ns: crate::parse_ts(&timestamp)
+                                        .and_then(|stamp| stamp.timestamp_nanos_opt())
+                                        .unwrap_or(0),
+                                },
+                            );
                             let stale = per_model
                                 .get(model)
                                 .map(|seen| later_rfc3339(&seen.timestamp, &timestamp) != timestamp)
@@ -717,6 +766,23 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 ..Event::default()
             },
         );
+    }
+    // rm-956 arm 2: one marker per cumulative snapshot (sorted by the
+    // (model, timestamp) key). session_from_events harvests and strips
+    // these before analyze runs, so they never move events_total or
+    // duration — they exist so the post-load reconcile pass can compare
+    // the session-state snapshots against the OTel export of the same
+    // conversation and de-double the overlap (ccusage #1858).
+    for interval in copilot_intervals.values() {
+        if let Ok(fact) = serde_json::to_string(interval) {
+            events.push(Event {
+                role: "copilot_shutdown_snapshot".to_string(),
+                content: fact,
+                model_used: interval.model.clone(),
+                source_tool: "copilot_cli".to_string(),
+                ..Event::default()
+            });
+        }
     }
     let mut latest_usage_timestamp = String::new();
     for snapshot in per_model.values() {
@@ -4941,11 +5007,48 @@ fn claude_user_content_events(
     }
 }
 
+/// rm-956 arm 2: one deduped Copilot OTel chat call, recorded from the
+/// kept `chat.completion` spans so the post-assembly pass
+/// (`reconcile_copilot_cross_root`) can reconcile the OTel export
+/// against the session-state snapshots of the same conversation.
+/// `conversation_id` is the `gen_ai.conversation.id`-class attribute
+/// (the join key — the session-state events directory of the same
+/// conversation is named by that id), `usage` is the rm-600 delta-basis
+/// map, and `timestamp_ns` is the span's `startTimeUnixNano`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CopilotOtelCall {
+    pub conversation_id: String,
+    pub model: String,
+    pub usage: BTreeMap<String, i64>,
+    pub timestamp_ns: i64,
+}
+
+/// rm-956 arm 2: one session-state cumulative usage snapshot (shutdown
+/// or usage checkpoint) per model, recorded for the same cross-root
+/// reconcile pass. Snapshots are CUMULATIVE counters (a resume re-emits
+/// them), `requests_count` is the `modelMetrics.requests.count` the
+/// newer CLI emits (0 = the record carried no count, which the
+/// reconcile treats as incomparable), and `usage` is the rm-600
+/// delta-basis cumulative total at that snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CopilotShutdownInterval {
+    pub model: String,
+    pub usage: BTreeMap<String, i64>,
+    pub requests_count: i64,
+    pub timestamp_ns: i64,
+}
+
 fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     let mut saw_copilot = false;
-    for span in objs.iter() {
+    // rm-956 arm 1 (ccusage #1857/#1858): re-exported chat spans are
+    // dropped BEFORE any accounting runs, so an export that re-ships a
+    // response under a new trace/span pair counts exactly once. The
+    // pre-pass mirrors this loop's sticky-model walk so the dedupe key
+    // matches the model the span is actually billed under.
+    let repeated = repeated_copilot_chat_spans(objs);
+    for (span_index, span) in objs.iter().enumerate() {
         let name = string(span.get("name")).unwrap_or("");
         if name.is_empty() || !span.contains_key("traceId") {
             continue;
@@ -4958,6 +5061,13 @@ fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         let usage = copilot_usage(span);
         match name {
             "chat.completion" => {
+                // rm-956 arm 1: a re-export of an already-counted
+                // response (same response id + model + usage under a
+                // new trace/span pair) — neither its usage nor its
+                // content may count again.
+                if repeated.contains(&span_index) {
+                    continue;
+                }
                 let content = copilot_span_content(span);
                 if !content.is_empty() {
                     events.push(Event {
@@ -4970,6 +5080,32 @@ fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     });
                 }
                 if usage_has_values(&usage) {
+                    // rm-956 arm 2: carry the call fact for the
+                    // cross-root reconcile pass. The marker is
+                    // harvested and stripped by session_from_events
+                    // before analyze runs, so it never moves the
+                    // session's own accounting.
+                    if let Some(conversation_id) = copilot_conversation_id(span) {
+                        let timestamp_ns = span
+                            .get("startTimeUnixNano")
+                            .and_then(Value::as_u64)
+                            .map(|ns| ns.min(i64::MAX as u64) as i64)
+                            .unwrap_or(0);
+                        if let Ok(fact) = serde_json::to_string(&CopilotOtelCall {
+                            conversation_id,
+                            model: model.clone(),
+                            usage: usage.clone(),
+                            timestamp_ns,
+                        }) {
+                            events.push(Event {
+                                role: "copilot_otel_call".to_string(),
+                                content: fact,
+                                model_used: model.clone(),
+                                source_tool: "copilot_cli".to_string(),
+                                ..Event::default()
+                            });
+                        }
+                    }
                     events.push(Event {
                         role: "meta".to_string(),
                         usage,
@@ -5025,6 +5161,132 @@ fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     } else {
         None
     }
+}
+
+/// rm-956 arm 1 (ccusage #1857/#1858): indices of re-exported
+/// `chat.completion` spans. A Copilot re-export repeats the SAME
+/// response (identical response id, model and usage) under a NEW
+/// trace/span pair, and the VS Code re-export flow observed in the wild
+/// double- or triple-counts every exported session (ccusage #1857:
+/// 2–3× inflation). Key = (response id, model, normalized usage
+/// tuple) — the response id alone is insufficient because turn-level
+/// spans legitimately share one response id across calls with
+/// different usage. Earliest `startTimeUnixNano` wins and file order
+/// breaks ties; a span with no `gen_ai.response.id` is never deduped
+/// (there is nothing stable to key on).
+/// One indexed OTel chat span as seen by the arm-1 pre-pass: span
+/// start time, optional `gen_ai.response.id`, the sticky model it is
+/// billed under, its normalized usage tuple and its file index.
+struct CopilotChatCandidate {
+    ts: u64,
+    response_id: Option<String>,
+    model: String,
+    usage: [i64; 4],
+    index: usize,
+}
+
+fn repeated_copilot_chat_spans(objs: &[JsonObject]) -> BTreeSet<usize> {
+    let mut sticky_model = "unknown".to_string();
+    let mut candidates: Vec<CopilotChatCandidate> = Vec::new();
+    for (index, span) in objs.iter().enumerate() {
+        let name = string(span.get("name")).unwrap_or("");
+        if name.is_empty() || !span.contains_key("traceId") {
+            continue;
+        }
+        if let Some(next_model) = copilot_string_attr(span, "gen_ai.request.model") {
+            sticky_model = next_model;
+        }
+        if name != "chat.completion" {
+            continue;
+        }
+        let usage = copilot_usage(span);
+        if !usage_has_values(&usage) {
+            continue;
+        }
+        candidates.push(CopilotChatCandidate {
+            // Review 23701305 F4: a span with no startTimeUnixNano
+            // timestamps as u64::MAX ("no evidence of earliness") so
+            // it never evicts a timestamped export from the kept
+            // slot; among timestamp-less repeats file order keeps
+            // the first. The value feeds only the swap comparison
+            // below (the call fact keeps its own 0 for a kept
+            // timestamp-less span).
+            ts: span
+                .get("startTimeUnixNano")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
+            response_id: copilot_string_attr(span, "gen_ai.response.id"),
+            model: sticky_model.clone(),
+            usage: copilot_usage_tuple(&usage),
+            index,
+        });
+    }
+    let mut kept: BTreeMap<(String, String, [i64; 4]), usize> = BTreeMap::new();
+    let mut repeated = BTreeSet::new();
+    for candidate in &candidates {
+        let Some(response_id) = &candidate.response_id else {
+            continue;
+        };
+        let key = (
+            response_id.clone(),
+            candidate.model.clone(),
+            candidate.usage,
+        );
+        match kept.get(&key).copied() {
+            Some(kept_index) => {
+                // ccusage #1858 keeps the EARLIEST export; a later
+                // candidate carrying an earlier timestamp swaps in.
+                // A MAX timestamp (span without startTimeUnixNano,
+                // see above) is never earlier, so a timestamped
+                // repeat always displaces a timestamp-less kept
+                // span — the export with the real window position
+                // is the one that survives.
+                if candidate.ts < candidates[kept_index].ts {
+                    repeated.insert(kept_index);
+                    kept.insert(key, candidate.index);
+                } else {
+                    repeated.insert(candidate.index);
+                }
+            }
+            None => {
+                kept.insert(key, candidate.index);
+            }
+        }
+    }
+    repeated
+}
+
+/// The dedupe key's usage component: the four rm-600-normalized token
+/// classes in a fixed order (`input_tokens` is already on the delta
+/// basis after `copilot_usage`).
+fn copilot_usage_tuple(usage: &BTreeMap<String, i64>) -> [i64; 4] {
+    [
+        usage.get("input_tokens").copied().unwrap_or(0),
+        usage.get("output_tokens").copied().unwrap_or(0),
+        usage
+            .get("cache_creation_input_tokens")
+            .copied()
+            .unwrap_or(0),
+        usage.get("cache_read_input_tokens").copied().unwrap_or(0),
+    ]
+}
+
+/// rm-956 arm 2: the span-level conversation join key. Priority order
+/// mirrors ccusage's session-attribute resolution — the conversation id
+/// the CLI writes into `gen_ai.conversation.id` also names the
+/// session-state events directory, so the reconcile can pair the two
+/// roots of the same conversation. Spans carrying none of the four
+/// stay unpaired (their usage keeps counting on the OTel session,
+/// exactly as before this pass existed).
+fn copilot_conversation_id(span: &JsonObject) -> Option<String> {
+    [
+        "gen_ai.conversation.id",
+        "copilot_chat.session_id",
+        "copilot_chat.chat_session_id",
+        "session.id",
+    ]
+    .into_iter()
+    .find_map(|key| copilot_string_attr(span, key))
 }
 
 fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {

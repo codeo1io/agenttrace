@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 51 and the SQLite snapshot is schema 10; the
+The session cache is schema 55 and the SQLite snapshot is schema 10; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -263,7 +263,19 @@ deterministically via `earliest()` instead of degrading to an empty
 session_start (rm-899; run 33b7b7b5 cycle 1 — minted 43 above its
 base's ceiling 41, re-based twice at review-fix as origin landed 43
 (fabd9fb8) and then 44 (fb1addd56503), landing here as 45, the lowest
-rung unique above the ceiling); the SQLite snapshot to 7
+rung unique above the ceiling), and to 55 when Copilot exports stopped
+double-counting re-exported chat spans (the same response re-shipped
+under a new trace/span pair counts once, keyed response id + model +
+usage with the earliest export winning) and the two roots of one
+Copilot conversation — `session-state` snapshots and `otel` exports —
+began reconciling per (conversation, model) with disclosure instead of
+each counting the covered calls twice (rm-956, run 8937be8e cycle 2;
+minted at the fleet census ceiling over uncommitted sibling rungs 52,
+53 and 54, so 55 lands as the lowest rung unique above them — rungs
+46 through 54 belong to sibling integrations and uncommitted fleet
+worktrees, one invalidation either way per the rm-230 convention; the
+persisted metrics also gained the reconcile's fact vectors, so a warm
+v51 entry still serves the double-counted totals); the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7
 entries cannot silently under-disclose (rm-548 — whose sqlite-lane

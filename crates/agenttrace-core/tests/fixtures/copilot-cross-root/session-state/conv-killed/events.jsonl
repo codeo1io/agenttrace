@@ -1,0 +1,3 @@
+{"type":"session.start","timestamp":"2026-10-09T10:00:00Z","data":{"context":{"cwd":"/tmp/demo"}}}
+{"type":"user.message","timestamp":"2026-10-09T10:00:01Z","data":{"content":"hello"}}
+{"type":"session.usage_checkpoint","timestamp":"2026-10-09T10:00:45Z","data":{"modelMetrics":{"gpt-4.1":{"usage":{"input_tokens":100,"output_tokens":20},"requests":{"count":1}}}}}

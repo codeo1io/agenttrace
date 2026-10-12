@@ -1,0 +1,2 @@
+{"type": "session.start", "timestamp": "2026-10-09T09:59:00Z", "data": {"context": {"cwd": "/tmp/demo-split"}}}
+{"type": "session.usage_checkpoint", "timestamp": "2026-10-09T09:59:50Z", "data": {"modelMetrics": {"gpt-4.1": {"usage": {"input_tokens": 100, "output_tokens": 20}, "requests": {"count": 1}}}}}

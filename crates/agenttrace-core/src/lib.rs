@@ -1,3 +1,4 @@
+mod copilot_reconcile;
 mod demo;
 mod diagnostics;
 mod discovery;
@@ -36,6 +37,7 @@ pub use filters::{
     NumericFilterOp,
 };
 
+pub use copilot_reconcile::reconcile_copilot_cross_root;
 pub use discovery::{
     collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
     load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
@@ -58,7 +60,9 @@ pub use insights::{
     SessionComparison, SourceScope, TimeRange,
 };
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
-pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
+pub use parser::{
+    parse_file, parse_raw_session, parse_stdin_bytes, CopilotOtelCall, CopilotShutdownInterval,
+};
 pub use pricing::{
     list_pricing, lookup_price, pricing_cache_path, pricing_source, pricing_source_for,
     render_model_pricing_list, render_test_match, update_pricing,
@@ -572,6 +576,22 @@ pub struct Metrics {
     /// multi-model session appears in more than one bucket.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub model_attribution: BTreeMap<String, ModelAttribution>,
+    /// rm-956 arm 2: deduped Copilot OTel chat calls (one per kept
+    /// `chat.completion` span with usage), harvested from
+    /// `copilot_otel_call` marker events at session assembly. Consumed
+    /// by the post-assembly pass [`reconcile_copilot_cross_root`],
+    /// which pairs them with the session-state snapshots of the same
+    /// conversation. Empty for every non-Copilot session, so the
+    /// serialized shape of everything else is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copilot_otel_calls: Vec<CopilotOtelCall>,
+    /// rm-956 arm 2: Copilot session-state cumulative snapshots
+    /// (shutdown or usage checkpoint, one per model per timestamp)
+    /// harvested from `copilot_shutdown_snapshot` marker events.
+    /// Cumulative counters, not deltas; `requests_count` 0 = the
+    /// record carried no count (incomparable for the reconcile walk).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copilot_shutdown_intervals: Vec<CopilotShutdownInterval>,
     pub provenance: MetricProvenance,
     /// rm-545: subagent transcripts attributed to this session. Kept
     /// SEPARATE from the totals above so fleet rollups still count each
@@ -1061,6 +1081,45 @@ pub fn session_from_events(
     path: &str,
     mut events: Vec<Event>,
 ) -> anyhow::Result<Session> {
+    // rm-956 arm 2: harvest the Copilot cross-root reconcile facts off
+    // their dedicated marker events and STRIP the markers before any
+    // other consumer runs — analyze never sees them (no events_total,
+    // duration or provenance movement), diagnostics and the display
+    // name never see them either. Only our own copilot lanes mint these
+    // roles with `source_tool: "copilot_cli"`; a hostile journal
+    // replaying the role through the generic lane is filtered here, so
+    // the worst a foreign journal can do is not participate in the
+    // reconcile (it can never inject facts into another session).
+    let mut copilot_otel_calls: Vec<CopilotOtelCall> = Vec::new();
+    let mut copilot_shutdown_intervals: Vec<CopilotShutdownInterval> = Vec::new();
+    if events.iter().any(|event| {
+        event.source_tool == "copilot_cli"
+            && (event.role == "copilot_otel_call" || event.role == "copilot_shutdown_snapshot")
+    }) {
+        events.retain(|event| {
+            if event.source_tool != "copilot_cli" {
+                return true;
+            }
+            match event.role.as_str() {
+                "copilot_otel_call" => {
+                    if let Ok(call) = serde_json::from_str::<CopilotOtelCall>(event.content.trim())
+                    {
+                        copilot_otel_calls.push(call);
+                    }
+                    false
+                }
+                "copilot_shutdown_snapshot" => {
+                    if let Ok(interval) =
+                        serde_json::from_str::<CopilotShutdownInterval>(event.content.trim())
+                    {
+                        copilot_shutdown_intervals.push(interval);
+                    }
+                    false
+                }
+                _ => true,
+            }
+        });
+    }
     // rm-778: last-line containment at the ONE choke point every
     // format passes through — including the generic Vec<Event> lane
     // and deserialized journals, which never touch the five capped
@@ -1102,6 +1161,12 @@ pub fn session_from_events(
         }
     }
     let mut metrics = analyze(&events, &model);
+    // rm-956 arm 2: the harvested reconcile facts ride the metrics so
+    // they survive the session cache round-trip (GoSession/GoMetrics
+    // mirror both vectors) for the post-load pass; they hold no
+    // accounting of their own.
+    metrics.copilot_otel_calls = copilot_otel_calls;
+    metrics.copilot_shutdown_intervals = copilot_shutdown_intervals;
     // rm-408 disclosure (arm a): count present-but-zero usage blocks at
     // the one choke point every format passes through, and flag them in
     // the provenance string so no surface reports clean zeros silently.

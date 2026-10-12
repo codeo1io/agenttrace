@@ -1,0 +1,2 @@
+{"name":"session.start","traceId":"99999999999999999999999999999999","spanId":"2b2b2b2b2b2b2b2b","startTimeUnixNano":1791540000000000000,"attributes":{"gen_ai.request.model":"gpt-4.1"}}
+{"name":"chat.completion","traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0","spanId":"3c3c3c3c3c3c3c3c","startTimeUnixNano":1791540006000000000,"attributes":{"gen_ai.request.model":"gpt-4.1","gen_ai.response.id":"resp-unpaired-1","gen_ai.usage.input_tokens":70,"gen_ai.usage.output_tokens":7},"content":"orphan export"}

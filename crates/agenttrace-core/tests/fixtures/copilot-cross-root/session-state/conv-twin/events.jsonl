@@ -1,0 +1,5 @@
+{"type":"session.start","timestamp":"2026-10-09T10:00:00Z","data":{"context":{"cwd":"/tmp/demo"}}}
+{"type":"user.message","timestamp":"2026-10-09T10:00:01Z","data":{"content":"hello"}}
+{"type":"assistant.message","timestamp":"2026-10-09T10:00:02Z","data":{"content":"hi there"}}
+{"type":"session.usage_checkpoint","timestamp":"2026-10-09T10:00:05Z","data":{"modelMetrics":{"gpt-4.1":{"usage":{"input_tokens":100,"output_tokens":20},"requests":{"count":1}}}}}
+{"type":"session.shutdown","timestamp":"2026-10-09T10:00:30Z","data":{"modelMetrics":{"gpt-4.1":{"usage":{"input_tokens":200,"output_tokens":40},"requests":{"count":2}}},"totalNanoAiu":4000000}}

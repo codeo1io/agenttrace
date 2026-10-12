@@ -455,6 +455,17 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // rm-799: the call returns the orphan count (children whose parent
     // transcript is absent from the loaded corpus) for disclosure.
     let unlinked_subagents = crate::subagents::attribute_subagents(&mut sessions);
+    // rm-956 arm 2: cross-root Copilot reconcile rides the same
+    // post-assembly seam — after every session (fresh and cached) is
+    // on the list, before range/filters, so every view sees the
+    // reconciled accounting. The pass pairs Copilot OTel sessions with
+    // the session-state sessions of the same conversation id and
+    // de-doubles the covered overlap; non-Copilot sessions are
+    // untouched by construction. Facts ride the session cache
+    // (GoMetrics mirrors them), so cached reloads reproduce the pass
+    // and its consumption is idempotent.
+    let _reconciled_sessions =
+        crate::copilot_reconcile::reconcile_copilot_cross_root(&mut sessions);
     sessions.retain(|session| {
         // Sessions with an unknown start time stay visible (unknown-time
         // bucket, N7) instead of being silently dropped from ranged views;

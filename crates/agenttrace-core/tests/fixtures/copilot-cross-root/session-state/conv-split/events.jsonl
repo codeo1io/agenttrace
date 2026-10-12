@@ -1,0 +1,3 @@
+{"type": "session.start", "timestamp": "2026-10-09T10:00:00Z", "data": {"context": {"cwd": "/tmp/demo-split"}}}
+{"type": "user.message", "timestamp": "2026-10-09T10:00:01Z", "data": {"content": "split this conversation across journals"}}
+{"type": "session.usage_checkpoint", "timestamp": "2026-10-09T10:00:45Z", "data": {"modelMetrics": {"gpt-4.1": {"usage": {"input_tokens": 200, "output_tokens": 40}, "requests": {"count": 2}}}}}
