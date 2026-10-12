@@ -521,7 +521,9 @@ fn pricing_source_for_catalog(
 }
 
 pub fn pricing_cache_path() -> PathBuf {
-    user_cache_dir().join("agenttrace").join("pricing.json")
+    crate::cache_root::user_cache_dir()
+        .join("agenttrace")
+        .join("pricing.json")
 }
 
 pub fn update_pricing() -> anyhow::Result<usize> {
@@ -1941,29 +1943,6 @@ fn write_pricing_header(out: &mut String, name_width: usize) {
         width = name_width
     ));
     out.push_str(&format!("  {}\n", "-".repeat(name_width + 24)));
-}
-
-fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
-    }
-    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
-    // $XDG_CACHE_HOME values; a relative one is treated as unset and
-    // falls through to the HOME-based default instead of scattering a
-    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
-    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
-    // scratch cwd).
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() && cache.is_absolute() {
-            return cache;
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".cache");
-    }
-    std::env::temp_dir()
 }
 
 #[cfg(test)]

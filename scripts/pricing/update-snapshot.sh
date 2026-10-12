@@ -81,7 +81,10 @@ if [[ -n "$src" ]]; then
     cp -- "$src" "$tmp"
     echo "refresh source: captured file $src (offline refresh)"
 else
-    curl -fsSL "$url" -o "$tmp"
+    # rm-901: same fetch time bound as the pricing-drift workflow arm
+    # (pricing-drift.yml) and drift-check.sh — a hung live fetch must
+    # fail, not stall the refresh forever.
+    curl -fsSL --max-time 60 "$url" -o "$tmp"
     echo "refresh source: $url (live fetch)"
 fi
 

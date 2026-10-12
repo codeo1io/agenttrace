@@ -1249,7 +1249,9 @@ pub fn session_cache_path() -> PathBuf {
             return dir.join("sessions.json");
         }
     }
-    user_cache_dir().join("agenttrace").join("sessions.json")
+    crate::cache_root::user_cache_dir()
+        .join("agenttrace")
+        .join("sessions.json")
 }
 
 /// Every at-rest artifact `--clear-cache` removes (rm-086), built
@@ -3114,29 +3116,6 @@ impl GoAnomaly {
     }
 }
 
-fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
-    }
-    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
-    // $XDG_CACHE_HOME values; a relative one is treated as unset and
-    // falls through to the HOME-based default instead of scattering a
-    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
-    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
-    // scratch cwd).
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() && cache.is_absolute() {
-            return cache;
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".cache");
-    }
-    std::env::temp_dir()
-}
-
 fn cache_key(path: &Path) -> String {
     if let Some(text) = path.to_str() {
         return text.to_string();
@@ -4991,9 +4970,10 @@ mod tests {
         // `XDG_CACHE_HOME=rel-cache agenttrace --overview` wrote
         // ./rel-cache/agenttrace from a scratch cwd). Pinned through
         // the public constructors of every module that reads the
-        // variable — session_cache, pricing, statusline; doctor's
-        // user_cache_dir() copy is byte-identical and exercised by the
-        // --doctor binary probe recorded on the row.
+        // variable — session_cache, pricing, statusline; doctor
+        // resolves through the same shared cache_root::user_cache_dir
+        // since the rm-1018 consolidation, exercised by the --doctor
+        // binary probe recorded on the row.
         let _env = crate::test_env::lock_env();
         let prior_home = std::env::var_os("HOME");
         let prior_xdg = std::env::var_os("XDG_CACHE_HOME");
