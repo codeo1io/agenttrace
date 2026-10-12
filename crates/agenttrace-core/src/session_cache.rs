@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 60;
 // Bumped 59 -> 60 (integration of run e486dc1adb9b cycle 2 'pi journal
@@ -839,6 +840,148 @@ pub const MIN_CONFIGURED_SESSION_CACHE_ENTRIES: usize = 1;
 /// requests clamp down to this and `--doctor` discloses the effective
 /// value that actually governs eviction.
 pub const MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES: usize = 1_000_000;
+
+/// rm-967 (lever b): the inclusive floor for a CONFIGURED byte bound.
+/// Below one MiB the serialized document frame — keys, punctuation,
+/// the dirs map, per-entry headers — crowds the entries themselves
+/// out of the bound, and the byte ceiling silently degrades into a
+/// count-of-two cache. Smaller requests are REJECTED rather than
+/// honored (see [`MAX_CONFIGURABLE_SESSION_CACHE_BYTES`]), so
+/// `--doctor` never reports a bound that behaves like a different
+/// one.
+pub const MIN_CONFIGURED_SESSION_CACHE_BYTES: usize = 1024 * 1024;
+
+/// rm-967 (lever b): the inclusive ceiling for a CONFIGURED byte
+/// bound. The bound exists to keep the serialized document — written
+/// whole with `serde_json::to_string`, read whole with `from_str` —
+/// within the memory the process agreed to; past one GiB the document
+/// itself dominates that budget, and the count bound
+/// ([`MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES`]) is the right lever
+/// instead. Unlike the entry knob (which clamps), an out-of-range
+/// byte request is IGNORED with a one-time stderr warning and the
+/// default stays in force: a silently clamped request would report a
+/// bound the operator never asked for, and a clamped 0 would quietly
+/// zero the cache — the exact failure mode the guards exist to make
+/// audible.
+pub const MAX_CONFIGURABLE_SESSION_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// rm-967 (lever b): resolve the effective serialized-byte ceiling.
+/// Same precedence chain as the entry knob — config-table value >
+/// `AGENTTRACE_CACHE_BYTES` env > the 64 MiB
+/// [`MAX_SESSION_CACHE_BYTES`] default. A table (config-file) value
+/// is clamped defensively (the CLI validates config values loudly at
+/// parse time, so only a programmatic install can arrive out of
+/// range); an env value must parse as a whole number of bytes inside
+/// `[MIN_CONFIGURED_SESSION_CACHE_BYTES,
+/// MAX_CONFIGURABLE_SESSION_CACHE_BYTES]`, and anything else is
+/// ignored, leaving the default in charge (env knobs are best-effort,
+/// like every other `AGENTTRACE_*`). A lowered bound evicts on the
+/// NEXT save, not at load — the loaded snapshot is read-only until
+/// the writer runs.
+fn resolve_session_cache_bytes(table: Option<usize>, env: Option<&str>) -> usize {
+    match table {
+        Some(value) => value.clamp(
+            MIN_CONFIGURED_SESSION_CACHE_BYTES,
+            MAX_CONFIGURABLE_SESSION_CACHE_BYTES,
+        ),
+        None => match env.and_then(|raw| raw.trim().parse::<usize>().ok()) {
+            Some(value)
+                if (MIN_CONFIGURED_SESSION_CACHE_BYTES..=MAX_CONFIGURABLE_SESSION_CACHE_BYTES)
+                    .contains(&value) =>
+            {
+                value
+            }
+            _ => MAX_SESSION_CACHE_BYTES,
+        },
+    }
+}
+
+/// The rejection note for the most recent (first, in a process
+/// lifetime) ignored `AGENTTRACE_CACHE_BYTES` value — `None` until a
+/// knob has been rejected. Test-observable stand-in for the stderr
+/// warning, which fires once per process.
+static CACHE_BYTES_KNOB_REJECT: OnceLock<String> = OnceLock::new();
+
+fn warn_rejected_cache_bytes_knob(raw: &str) {
+    let note = format!(
+        "agenttrace: AGENTTRACE_CACHE_BYTES ignored: {raw}: must be a whole number of bytes \
+         between {MIN_CONFIGURED_SESSION_CACHE_BYTES} and {MAX_CONFIGURABLE_SESSION_CACHE_BYTES} \
+         (leaving the {MAX_SESSION_CACHE_BYTES}-byte default in force)"
+    );
+    // Once-per-process parity with the pricing-override warning: the
+    // resolver runs on every save and every doctor build, and a knob
+    // that is rejected stays rejected.
+    if CACHE_BYTES_KNOB_REJECT.set(note).is_ok() {
+        eprintln!("{}", CACHE_BYTES_KNOB_REJECT.get().expect("just set"));
+    }
+}
+
+/// The rejection note recorded for an ignored `AGENTTRACE_CACHE_BYTES`
+/// value, if any — the test-observable twin of the one-time stderr
+/// warning (`--doctor`'s `cache_byte_bound_source` already shows only
+/// the layer that won).
+pub fn cache_bytes_knob_rejection() -> Option<&'static str> {
+    CACHE_BYTES_KNOB_REJECT.get().map(String::as_str)
+}
+
+/// The serialized-byte ceiling `save_session_cache` enforces for THIS
+/// process (rm-967 lever b): the default const, or the configured
+/// knob (config file > env) inside the legal range.
+pub fn effective_session_cache_bytes() -> usize {
+    let table = crate::runtime_config::get().session_cache_bytes;
+    let env = std::env::var("AGENTTRACE_CACHE_BYTES").ok();
+    if table.is_none() {
+        if let Some(raw) = env.as_deref() {
+            let legal = raw
+                .trim()
+                .parse::<usize>()
+                .map(|value| {
+                    (MIN_CONFIGURED_SESSION_CACHE_BYTES..=MAX_CONFIGURABLE_SESSION_CACHE_BYTES)
+                        .contains(&value)
+                })
+                .unwrap_or(false);
+            if !legal {
+                warn_rejected_cache_bytes_knob(raw);
+            }
+        }
+    }
+    resolve_session_cache_bytes(table, env.as_deref())
+}
+
+/// Which layer supplied the effective byte bound — for `--doctor`'s
+/// disclosure (`"config file"` / `"env"` / `"default"`). A rejected
+/// env knob reports `"default"`: the knob never took effect.
+pub fn session_cache_bytes_source() -> &'static str {
+    if crate::runtime_config::get().session_cache_bytes.is_some() {
+        "config file"
+    } else if std::env::var("AGENTTRACE_CACHE_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|value| {
+            (MIN_CONFIGURED_SESSION_CACHE_BYTES..=MAX_CONFIGURABLE_SESSION_CACHE_BYTES)
+                .contains(&value)
+        })
+        .unwrap_or(false)
+    {
+        "env"
+    } else {
+        "default"
+    }
+}
+
+/// The dirs-block budget that rides the effective byte bound (rm-967
+/// lever b): one eighth of the ceiling in force, so listing memory
+/// scales with the knob exactly as the default's
+/// [`MAX_SESSION_CACHE_DIR_BYTES`] scales with
+/// [`MAX_SESSION_CACHE_BYTES`].
+pub fn effective_session_cache_dir_bytes() -> usize {
+    // The default path keeps the named const so the two stay visibly
+    // tied; an override applies its own one-eighth share.
+    match effective_session_cache_bytes() {
+        MAX_SESSION_CACHE_BYTES => MAX_SESSION_CACHE_DIR_BYTES,
+        bytes => bytes / 8,
+    }
+}
 
 /// Resolve the effective entry bound (rm-298 capacity arm). The
 /// config-table value (installed by the CLI from the layered config)
@@ -2765,14 +2908,21 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
         // knob, rm-298 capacity arm) the oldest-fingerprint entries are
         // dropped (pass-8 F8-3); the dirs map keeps its own count and byte
         // budgets (rm-298); and the serialized document is capped at
-        // MAX_SESSION_CACHE_BYTES over every byte this function writes —
-        // keys, punctuation, top-level fields, invalidation records, and
-        // dirs included (pass-9 CU-22; byte-true rm-298). The bounds run
-        // over the merged state so they hold for the document actually
-        // written.
+        // the EFFECTIVE byte ceiling over every byte this function
+        // writes — keys, punctuation, top-level fields, invalidation
+        // records, and dirs included (pass-9 CU-22; byte-true rm-298;
+        // rm-967 lever b: `session_cache_bytes`/
+        // `AGENTTRACE_CACHE_BYTES` swap the const for the knob, and the
+        // dirs byte budget rides the effective bound as one eighth of
+        // it). The bounds run over the merged state so they hold for
+        // the document actually written.
         enforce_entry_bound(cache, effective_session_cache_entries());
-        enforce_dirs_bound(cache, MAX_SESSION_CACHE_DIRS, MAX_SESSION_CACHE_DIR_BYTES);
-        enforce_byte_bound(cache, MAX_SESSION_CACHE_BYTES);
+        enforce_dirs_bound(
+            cache,
+            MAX_SESSION_CACHE_DIRS,
+            effective_session_cache_dir_bytes(),
+        );
+        enforce_byte_bound(cache, effective_session_cache_bytes());
         let mut doc = Map::new();
         doc.insert(
             "schema_version".to_string(),
@@ -4002,6 +4152,173 @@ mod tests {
         std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "many");
         assert_eq!(effective_session_cache_entries(), MAX_SESSION_CACHE_ENTRIES);
         std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+    }
+
+    #[test]
+    fn byte_bound_knob_reads_env_with_reject_guards() {
+        // rm-967 lever (b): AGENTTRACE_CACHE_BYTES overrides the 64 MiB
+        // serialized-byte ceiling. Unlike the entry knob (which clamps
+        // into its legal range) an illegal byte request is IGNORED with
+        // a one-time stderr warning: a silently clamped request would
+        // report a bound the operator never asked for, and a clamped 0
+        // would quietly zero the cache. The live red pin for the whole
+        // arm: the pristine --doctor JSON carries no cache_byte_bound
+        // field at all (live-pre/doctor-pre-cold.json, this session).
+        let _env = crate::test_env::lock_env();
+        std::env::remove_var("AGENTTRACE_CACHE_BYTES");
+        assert_eq!(effective_session_cache_bytes(), MAX_SESSION_CACHE_BYTES);
+        assert_eq!(session_cache_bytes_source(), "default");
+        // The dirs block keeps its one-eighth share of the ceiling
+        // under an override, so listing memory scales with the knob.
+        assert_eq!(
+            effective_session_cache_dir_bytes(),
+            MAX_SESSION_CACHE_DIR_BYTES
+        );
+
+        std::env::set_var("AGENTTRACE_CACHE_BYTES", "268435456");
+        assert_eq!(effective_session_cache_bytes(), 256 * 1024 * 1024);
+        assert_eq!(session_cache_bytes_source(), "env");
+        assert_eq!(effective_session_cache_dir_bytes(), 32 * 1024 * 1024);
+
+        // Surrounding whitespace parses (parity with the entry knob).
+        std::env::set_var("AGENTTRACE_CACHE_BYTES", "  268435456 ");
+        assert_eq!(effective_session_cache_bytes(), 256 * 1024 * 1024);
+
+        // Both range edges are honored...
+        std::env::set_var("AGENTTRACE_CACHE_BYTES", "1048576");
+        assert_eq!(
+            effective_session_cache_bytes(),
+            MIN_CONFIGURED_SESSION_CACHE_BYTES
+        );
+        std::env::set_var("AGENTTRACE_CACHE_BYTES", "1073741824");
+        assert_eq!(
+            effective_session_cache_bytes(),
+            MAX_CONFIGURABLE_SESSION_CACHE_BYTES
+        );
+
+        // ...and every illegal shape is ignored, never clamped.
+        for raw in ["0", "abc", "1048575", "1073741825", "-268435456", "12.5"] {
+            std::env::set_var("AGENTTRACE_CACHE_BYTES", raw);
+            assert_eq!(
+                effective_session_cache_bytes(),
+                MAX_SESSION_CACHE_BYTES,
+                "{raw} must fall back to the default, not clamp"
+            );
+            assert_eq!(session_cache_bytes_source(), "default", "{raw}");
+        }
+
+        // The rejection was recorded — the stderr warning fires once
+        // per process — so no ignored knob passes silently.
+        let note = cache_bytes_knob_rejection().expect("rejection recorded");
+        assert!(note.contains("AGENTTRACE_CACHE_BYTES"), "{note}");
+
+        // Precedence parity with the entry knob: the runtime-config
+        // table (the config-file layer) outranks the environment, and
+        // a table value outside the range is clamped defensively — the
+        // CLI validates config values loudly at parse time, so a value
+        // reaching this table out of range can only come from a
+        // programmatic install.
+        assert_eq!(
+            resolve_session_cache_bytes(Some(524_288_000), Some("268435456")),
+            524_288_000
+        );
+        assert_eq!(
+            resolve_session_cache_bytes(Some(0), Some("1048576")),
+            MIN_CONFIGURED_SESSION_CACHE_BYTES
+        );
+        assert_eq!(
+            resolve_session_cache_bytes(Some(2_147_483_648), None),
+            MAX_CONFIGURABLE_SESSION_CACHE_BYTES
+        );
+        std::env::remove_var("AGENTTRACE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn byte_bound_override_governs_save_time_eviction() {
+        // rm-967 lever (b) acceptance: the override is honored by
+        // admission+eviction — save_session_cache enforces the
+        // EFFECTIVE byte bound, not the compile-time const, for both
+        // the entry document and the dirs block (whose one-eighth
+        // budget follows the override). Fails if save reads
+        // MAX_SESSION_CACHE_BYTES directly.
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("AGENTTRACE_CACHE_BYTES", "1048576");
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-configured-bytes-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let mut cache = SessionCache {
+            path: root.join("sessions.json"),
+            ..SessionCache::default()
+        };
+        // Four entries whose serialized CWD strings alone (~300 KB
+        // each) push the document past the 1 MiB override; the oldest
+        // sources must drop at save time.
+        for i in 0..4u64 {
+            let file = root
+                .join(format!("session-{i}.jsonl"))
+                .to_string_lossy()
+                .to_string();
+            fs::write(&file, b"session").expect("write source file");
+            let stamp =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000 + i);
+            let handle = fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open for mtime");
+            handle.set_modified(stamp).expect("deterministic mtime");
+            drop(handle);
+            let session = Session {
+                name: format!("session-{i}"),
+                path: file.clone(),
+                cwd: "p".repeat(300 * 1024),
+                metrics: Metrics::default(),
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: Diagnostics::default(),
+                branch: String::new(),
+            };
+            store_session(Path::new(&file), &session, &mut cache).expect("store entry");
+        }
+        assert_eq!(cache.entry_count(), 4);
+        // One dir listing whose serialized form alone (~170 KB of file
+        // names) exceeds the 128 KiB dirs budget the 1 MiB override
+        // implies — the whole listing must drop at save time, while it
+        // would survive under the 8 MiB default budget.
+        let children: Vec<PathBuf> = (0..6000)
+            .map(|i| root.join(format!("child-{i:06}-with-a-little-name-padding.jsonl")))
+            .collect();
+        store_dir_listing(&root, &children, &[], &mut cache).expect("store dir listing");
+        assert_eq!(cache.dirs.len(), 1);
+
+        save_session_cache(&mut cache).expect("save under the 1 MiB override");
+
+        assert!(
+            cache.entry_count() < 4,
+            "the 1 MiB override — not the 64 MiB const — governs eviction"
+        );
+        let raw = fs::read_to_string(root.join("sessions.json")).expect("read back");
+        assert!(
+            raw.len() <= 1_048_576,
+            "written doc is {} bytes, the override demands <= 1048576",
+            raw.len()
+        );
+        let doc: Value = serde_json::from_str(&raw).expect("doc parses");
+        let surviving_dirs = doc
+            .get("dirs")
+            .and_then(Value::as_object)
+            .map(|dirs| dirs.len())
+            .unwrap_or(0);
+        assert_eq!(
+            surviving_dirs, 0,
+            "the dirs block honors the override's one-eighth budget"
+        );
+        std::env::remove_var("AGENTTRACE_CACHE_BYTES");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -32,6 +32,12 @@ pub struct RuntimeConfigOverrides {
     /// clamped by `session_cache::resolve_session_cache_entries` —
     /// an out-of-range or unparseable knob never reaches the bound.
     pub session_cache_entries: Option<usize>,
+    /// Session-cache serialized-byte bound (rm-967 lever b);
+    /// overrides `AGENTTRACE_CACHE_BYTES`. The CLI validates config
+    /// values loudly at parse time; `session_cache::
+    /// resolve_session_cache_bytes` still clamps defensively, since
+    /// a programmatic install can arrive out of range.
+    pub session_cache_bytes: Option<usize>,
 }
 
 static OVERRIDES: OnceLock<RuntimeConfigOverrides> = OnceLock::new();
@@ -87,11 +93,13 @@ mod tests {
             history_dir: Some(PathBuf::from("/first-history")),
             pricing_file: Some(PathBuf::from("/first-pricing.json")),
             session_cache_entries: None,
+            session_cache_bytes: None,
         };
         let second = RuntimeConfigOverrides {
             history_dir: Some(PathBuf::from("/second-history")),
             pricing_file: None,
             session_cache_entries: Some(1),
+            session_cache_bytes: Some(268_435_456),
         };
         let first_installed = set(first);
         let before = get();
