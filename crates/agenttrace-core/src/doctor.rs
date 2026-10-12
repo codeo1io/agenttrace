@@ -10,6 +10,20 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// rm-1073: one observed model id with no exact catalog row.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DoctorCatalogGap {
+    /// the id exactly as observed in the session metrics
+    pub model_id: String,
+    /// how it priced: `"minor-segment drop"`, `"built-in variant"`,
+    /// or `"default rate"`
+    pub matched_via: String,
+    /// the sibling or built-in key it actually billed on; `None`
+    /// only for the default rate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
     pub version: String,
@@ -100,6 +114,19 @@ pub struct DoctorReport {
     /// snapshot's date, model count, and age, so reports can disclose
     /// how current the prices behind `cost_estimated` are.
     pub pricing: String,
+    /// rm-1073 disclosure: distinct model ids observed in the scanned
+    /// sessions that have no exact catalog row — priced via a
+    /// minor-segment drop onto a sibling's row (`matched_key` names
+    /// the sibling; the droppable minors are ≤3-char digit-leading
+    /// segments and "pro", so a digit point release bills on the
+    /// prior release), a built-in legacy variant, or the default
+    /// rate (live case: `gpt-6.1-sol-fast`, referenced by opencode
+    /// v2.0.27, present in no catalog, not droppable). Without this
+    /// census a heuristic match or a default rate reads as catalog
+    /// truth. Empty (omitted from JSON) when every observed id
+    /// resolved to its own row or an alias of one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub catalog_gaps: Vec<DoctorCatalogGap>,
     /// rm-734 riding the landed rm-753 ingest report: sqlite session
     /// databases that exist but could not be read — the doctor's job
     /// is to name them (path + lane + reason) with a repair
@@ -299,6 +326,43 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             opencode_fork_excluded_total,
         );
     }
+    // rm-1073: catalog-gap census over the observed model ids. Every
+    // distinct non-empty `metrics.model_used` from the scanned
+    // sessions, priced through its disclosure provenance; only ids
+    // with no exact catalog row survive, and the census names the
+    // sibling or fallback each one billed on instead of letting a
+    // minor-segment drop present a different model's row as catalog
+    // truth.
+    let mut observed_models: Vec<&str> = sessions
+        .iter()
+        .map(|session| session.metrics.model_used.as_str())
+        .filter(|model| !model.is_empty() && *model != "unknown")
+        .collect();
+    observed_models.sort_unstable();
+    observed_models.dedup();
+    let catalog_gaps = observed_models
+        .iter()
+        .filter_map(|model| match crate::pricing::pricing_match_via(model) {
+            crate::pricing::PricingMatchVia::Exact | crate::pricing::PricingMatchVia::Alias(_) => {
+                None
+            }
+            crate::pricing::PricingMatchVia::MinorDrop(key) => Some(DoctorCatalogGap {
+                model_id: (*model).to_string(),
+                matched_via: "minor-segment drop".to_string(),
+                matched_key: Some(key),
+            }),
+            crate::pricing::PricingMatchVia::Builtin(key) => Some(DoctorCatalogGap {
+                model_id: (*model).to_string(),
+                matched_via: "built-in variant".to_string(),
+                matched_key: Some(key),
+            }),
+            crate::pricing::PricingMatchVia::Default => Some(DoctorCatalogGap {
+                model_id: (*model).to_string(),
+                matched_via: "default rate".to_string(),
+                matched_key: None,
+            }),
+        })
+        .collect();
     let mut report = DoctorReport {
         version: VERSION.to_string(),
         mode: mode.to_string(),
@@ -325,6 +389,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         dropped_lines,
         directories,
         statusline: doctor_statusline_report(demo),
+        catalog_gaps,
         pricing: format!(
             "LiteLLM snapshot {} (bundled, {} models, {})",
             crate::pricing::bundled_snapshot_date(),
@@ -1150,6 +1215,24 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.statusline.path, statusline_state
     ));
     out.push_str(&format!("Pricing snapshot: {}\n", report.pricing));
+    // rm-1073: sibling-fallback / default-rate disclosure — ids
+    // observed in sessions with no exact catalog row, with the
+    // sibling or fallback each one billed on named.
+    if !report.catalog_gaps.is_empty() {
+        out.push_str(&format!(
+            "Pricing catalog gaps ({} observed model id(s) with no exact catalog row):\n",
+            report.catalog_gaps.len()
+        ));
+        for gap in &report.catalog_gaps {
+            match &gap.matched_key {
+                Some(key) => out.push_str(&format!(
+                    "  {} priced as {} ({})\n",
+                    gap.model_id, key, gap.matched_via
+                )),
+                None => out.push_str(&format!("  {} ({})\n", gap.model_id, gap.matched_via)),
+            }
+        }
+    }
     for failure in &report.sqlite_read_failures {
         out.push_str(&format!(
             "Sqlite session source unreadable: {} ({}) — {}\n",
@@ -1403,6 +1486,30 @@ fn is_under(path: &Path, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_text_discloses_catalog_gaps() {
+        // rm-1073: a sibling-fallback gap renders with the sibling
+        // named; a default-rate gap names the rate; an empty census
+        // stays out of the report entirely.
+        let mut report = DoctorReport::default();
+        report.catalog_gaps.push(DoctorCatalogGap {
+            model_id: "gpt-6.1-sol-fast".to_string(),
+            matched_via: "minor-segment drop".to_string(),
+            matched_key: Some("gpt-6.1-sol".to_string()),
+        });
+        report.catalog_gaps.push(DoctorCatalogGap {
+            model_id: "mystery-model-x".to_string(),
+            matched_via: "default rate".to_string(),
+            matched_key: None,
+        });
+        let text = doctor_report_text(&report);
+        assert!(text.contains("Pricing catalog gaps"));
+        assert!(text.contains("gpt-6.1-sol-fast priced as gpt-6.1-sol (minor-segment drop)"));
+        assert!(text.contains("mystery-model-x (default rate)"));
+        let empty = doctor_report_text(&DoctorReport::default());
+        assert!(!empty.contains("Pricing catalog gaps"));
+    }
 
     fn session_at(cwd: &str, path: &str) -> Session {
         Session {

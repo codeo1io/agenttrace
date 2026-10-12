@@ -1105,6 +1105,59 @@ fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
     Ok(())
 }
 
+/// rm-1073: how a model id resolved to the price row it bills on.
+/// `match_variants` drops a trailing minor segment (≤3 chars,
+/// digit-leading or "pro") as provider-suffix drift heuristics, and
+/// that can land on a DIFFERENT model's row — e.g. a digit point
+/// release (`anthropic.claude-sonnet-5-2`) bills on the prior
+/// release's row when its own row does not exist yet. Ids the
+/// heuristics cannot place (`gpt-6.1-sol-fast`: referenced by
+/// opencode v2.0.27, present in no catalog, and "fast" is not a
+/// droppable minor) silently bill on the built-in default rate.
+/// This provenance lets disclosure surfaces name both states
+/// instead of presenting a heuristic match as catalog truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PricingMatchVia {
+    /// the id itself (normalized, alias-resolved) is a catalog key
+    Exact,
+    /// an alias row rewrote the id before the catalog hit (the
+    /// rewritten key is carried)
+    Alias(String),
+    /// a minor-segment drop landed on a sibling's row (the sibling
+    /// key is carried): priced, but as an ESTIMATE of a model whose
+    /// own row does not exist
+    MinorDrop(String),
+    /// no catalog row: a built-in legacy variant matched (carried)
+    Builtin(String),
+    /// no row anywhere: the built-in default rate
+    Default,
+}
+
+/// rm-1073: disclosure-grade provenance for a model id's price — the
+/// companion of `pricing_source_for`, which describes the RATE;
+/// this describes the MATCH. `Default` and `MinorDrop` are the two
+/// states consumers must never present as catalog truth.
+pub fn pricing_match_via(model: &str) -> PricingMatchVia {
+    let catalog = pricing_catalog();
+    let normalized = normalize_model(model);
+    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    if resolved != normalized {
+        return PricingMatchVia::Alias(resolved);
+    }
+    if let Some(key) = matching_catalog_key(&resolved, &catalog.entries) {
+        if key == resolved || key == model {
+            return PricingMatchVia::Exact;
+        }
+        return PricingMatchVia::MinorDrop(key);
+    }
+    for variant in match_variants(&resolved) {
+        if builtin_pricing().contains_key(&variant) {
+            return PricingMatchVia::Builtin(variant);
+        }
+    }
+    PricingMatchVia::Default
+}
+
 fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
     let mut current = normalize_model(model);
     for _ in 0..8 {
@@ -1970,6 +2023,41 @@ fn user_cache_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn pricing_match_via_pins_sibling_fallback_and_exact() {
+        // rm-1073: a digit point release whose own row does not
+        // exist bills on the prior release's row via the minor-segment
+        // drop — and must SAY so, not present the sibling's row as
+        // catalog truth.
+        assert_eq!(
+            pricing_match_via("anthropic.claude-sonnet-5-2"),
+            PricingMatchVia::MinorDrop("anthropic.claude-sonnet-5".to_string())
+        );
+        // the prior release itself is an exact row
+        assert_eq!(
+            pricing_match_via("anthropic.claude-sonnet-5"),
+            PricingMatchVia::Exact
+        );
+        // case drift still resolves to the id's own row
+        assert_eq!(
+            pricing_match_via("ANTHROPIC.CLAUDE-SONNET-5"),
+            PricingMatchVia::Exact
+        );
+        // gpt-6.1-sol-fast is referenced by opencode v2.0.27 and
+        // exists in no catalog (vendored 2026-10-08 snapshot, 3131
+        // entries; live 4061); "fast" is not a droppable minor, so it
+        // bills on the built-in default rate — disclosed, not silent.
+        assert_eq!(
+            pricing_match_via("gpt-6.1-sol-fast"),
+            PricingMatchVia::Default
+        );
+        // nothing matches anywhere: the default rate
+        assert_eq!(
+            pricing_match_via("not-a-catalog-model-zq9"),
+            PricingMatchVia::Default
+        );
+    }
 
     #[test]
     fn pricing_download_cap_rejects_oversized_bodies() {
