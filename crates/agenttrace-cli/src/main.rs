@@ -2562,17 +2562,26 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
         // row integrity (assess PoC: a crafted session name carried a raw
         // OSC-52 clipboard-write byte-for-byte into the --sessions TSV).
         // JSON output escapes control bytes losslessly and stays untouched.
+        // rm-540 TSV arm (run 6e476825 cycle 1, ported from the landed
+        // 33eddd4 shape): the same transcript-derived text cells now
+        // route through the CSV lane's `guard_formula` — a session named
+        // `=cmd|pwn` (or `+`/`-`/`@`/fullwidth-＠-headed) previously rode
+        // byte-for-byte into this default-text/TSV lane while the CSV lane
+        // guarded it, and TSV imports into spreadsheets just as happily
+        // (assess PoC F1: --sessions emitted `=cmd|pwn`/
+        // `@SUM(1,2)*3|evil` raw vs the guarded CSV `'=2+5|cmd`).
+        // Sanitize first (control bytes), then formula-guard the text.
         // rm-545: subagent rollups ride the TSV as their own columns so
         // one session's spawned work stays visible without double
         // counting — the columns are internally derived (not
         // transcript-derived), so no sanitization is owed here.
         format!(
             "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{:.4}",
-            sanitize_line_segment(&session.name),
+            csv_export::guard_formula(&sanitize_line_segment(&session.name)),
             session.health,
             session_capability(session),
-            sanitize_line_segment(&session.metrics.source_tool),
-            sanitize_line_segment(&session.metrics.model_used),
+            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.source_tool)),
+            csv_export::guard_formula(&sanitize_line_segment(&session.metrics.model_used)),
             session.metrics.cost_estimated,
             total_tokens(session),
             session.metrics.tool_calls_fail,

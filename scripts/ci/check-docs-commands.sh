@@ -158,6 +158,27 @@ blank_docs=$(printf '%s\n' "$help_text" | awk '
 [[ "$blank_docs" -eq 0 ]] \
   || fail "$blank_docs flag(s) render a blank --help description; every Args field needs a doc comment"
 
+# rm-986 (run 6e476825 cycle 1): README PROSE flag sweep. The flag-table
+# lockstep above only pins TABLE rows; backticked `--flags` in prose were
+# unchecked, so a phantom flag survived every gate as user-facing guidance
+# (observed live: README told readers to filter with `--since`, a flag the
+# binary has never taken — the real surface is `--range`; the flag-table
+# row was always correct, only the prose lied). Every backticked long
+# flag in README prose must exist in --help of the binary this gate ran
+# against — prose and table now drift together or not at all.
+while IFS= read -r prose_flag; do
+  [[ -n "$prose_flag" ]] || continue
+  # Quote ERE metacharacters defensively (same discipline as the
+  # skills sweep above) so no token can turn the pattern invalid.
+  prose_ere=$(printf '%s' "$prose_flag" | sed -e 's/[][\\.*^$(){}?+|]/\\&/g')
+  # here-string, not a pipe: grep -q exits on first match and would
+  # close the read end mid-write (SIGPIPE under pipefail — the same
+  # trap the skills sweep documents).
+  if ! grep -qE -- "(^|[[:space:]])${prose_ere}([[:space:]=,]|$)" <<<"$help_text"; then
+    fail "README prose mentions flag $prose_flag, which is missing from --help (phantom flag — fix the prose or the flag)"
+  fi
+done < <(grep -oE '`--[a-zA-Z0-9][a-zA-Z0-9_-]*`' README.md | tr -d '`' | sort -u)
+
 # rm-455: the MCP server guide must exist and pin the local-truth
 # posture truthfully — read-only, stdio-only, no network — the same
 # one-truth rule the other guides carry. The guide must also keep the

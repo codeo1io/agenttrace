@@ -3008,26 +3008,14 @@ impl GoAnomaly {
 }
 
 fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
-    }
-    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
-    // $XDG_CACHE_HOME values; a relative one is treated as unset and
-    // falls through to the HOME-based default instead of scattering a
-    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
-    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
-    // scratch cwd).
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() && cache.is_absolute() {
-            return cache;
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".cache");
-    }
-    std::env::temp_dir()
+    // rm-985 (run 6e476825 cycle 1): the four byte-identical
+    // `user_cache_dir()` copies collapsed into the ONE guarded
+    // resolver (`crate::cache_root`, the statusline model) — this
+    // copy's missing empty-HOME filter is what let `HOME=` write the
+    // RELATIVE ./.cache/agenttrace/sessions.json from the assess
+    // PoC. Kept as a one-line delegate so in-file call sites and the
+    // existing env-pinned tests keep their shape.
+    crate::cache_root::user_cache_dir()
 }
 
 fn cache_key(path: &Path) -> String {
@@ -4941,6 +4929,67 @@ mod tests {
         }
         drop(_env);
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn empty_home_env_yields_absolute_cache_roots_everywhere() {
+        // rm-985 (run 6e476825 cycle 1): the assess PoC — `cd <scratch>
+        // && HOME= XDG_CACHE_HOME= agenttrace --overview` — created the
+        // RELATIVE ./.cache/agenttrace/sessions.json because three of
+        // the four `user_cache_dir()` copies treated a set-but-empty
+        // HOME as set. The resolver now lives once in
+        // `crate::cache_root` (the statusline model) and every
+        // artifact-root constructor routes through it: under an
+        // empty-HOME environment ALL of them must resolve absolutely
+        // (the temp-dir ladder end), and none may fall out under the
+        // CWD. Pinned through the public constructors of all four
+        // former copy-owners.
+        let _env = crate::test_env::lock_env();
+        let prior_home = std::env::var_os("HOME");
+        let prior_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prior_cache_root = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("HOME", "");
+        std::env::set_var("XDG_CACHE_HOME", "");
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        let cwd = std::env::current_dir().expect("cwd");
+        for (name, path) in [
+            ("session_cache", session_cache_path()),
+            ("pricing", crate::pricing::pricing_cache_path()),
+            ("statusline", crate::statusline::statusline_capture_path()),
+            ("doctor", crate::doctor::session_cache_path()),
+        ] {
+            assert!(
+                path.is_absolute(),
+                "{name} cache root must stay absolute under HOME=/XDG_CACHE_HOME=, got {}",
+                path.display()
+            );
+            assert_eq!(
+                path,
+                std::env::temp_dir()
+                    .join("agenttrace")
+                    .join(path.file_name().expect("artifact file name")),
+                "{name} must land on the temp-dir ladder end, got {}",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(&cwd),
+                "{name} must never resolve under the CWD, got {}",
+                path.display()
+            );
+        }
+
+        match prior_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_xdg {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prior_cache_root {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
     }
 
     #[test]
