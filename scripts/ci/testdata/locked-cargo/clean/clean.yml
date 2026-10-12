@@ -1,0 +1,25 @@
+# rm-210 self-test: clean corpus (*.yml half). Every executing
+# dependency-resolving verb carries --locked or --frozen; the wrapped
+# `cargo test` + `--locked` shape below is the OLD scanner's false
+# positive — joined, the invocation carries the flag, so it must stay
+# clean now that continuations are resolved.
+name: clean
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked -p agenttrace-core
+      - run: cargo +1.89 check --locked -p agenttrace-core
+      - run: cargo build --locked --release -p agenttrace
+      - run: cargo tree --locked
+      - run: cargo fetch --frozen
+      - run: |
+          cargo test \
+            --locked \
+            -p agenttrace-core
+      - run: cargo llvm-cov --locked -p agenttrace-core
+      # Commented-out invocations do not execute — never flagged:
+      # cargo test -p agenttrace-core

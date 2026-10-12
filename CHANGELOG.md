@@ -41,6 +41,8 @@
   output; the landed rm-608 `-d` validation still guards the `--dir`
   arm — a typo'd or file-valued `--dir` stays rc2, never a healthy
   report).
+- The otel_export test battery's fixture tmpdirs are unique per call (rm-1058): `fixture_dir()` baked `line!()` — a process constant, evaluated inside the helper — into one shared dir per process, so parallel tests writing identical fixture names raced in each other's O_TRUNC window and panicked as "empty session" (three live full-suite flakes in one week); the dir now derives pid + atomic sequence exactly like the subagents `Scratch` precedent, no lock, and a new test pins that concurrent callers receive distinct paths.
+- `check-locked-cargo.sh` closes its three recorded blind spots (rm-210): `*.yaml` is scanned alongside `*.yml`, backslash-wrapped invocations are joined into one logical line before matching (a wrapped `cargo \` + `test` can no longer hide the verb, and a wrapped `cargo test \` + `--locked` no longer false-trips), and every core dependency-resolving cargo verb is gated (bench/build/check/clippy/doc/fetch/fix/install/run/rustc/test/tree; `--frozen` accepted as `--locked`-equivalent; the exempt set — fmt, explicit `update`/`add`/`rm`, external subcommands — documented in the header); a bundled `--self-test` runs synthetic clean/violation fixtures outside `.github/workflows/`, including the wrapped-yaml violation the old scanner structurally could never see.
 
 ### Added
 
