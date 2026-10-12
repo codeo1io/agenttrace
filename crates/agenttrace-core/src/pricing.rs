@@ -1227,6 +1227,78 @@ fn provider_priority(provider: &str) -> i32 {
     }
 }
 
+/// rm-794: strip a trailing effort-tier suffix from a wire model id.
+/// `claude-sonnet-5-5-high` → `claude-sonnet-5-5`. The suffix set is
+/// the statusline effort vocabulary (low..max) plus `-thinking`, the
+/// reasoning-tier marker Anthropic gateways emit (tokscale #1425
+/// inventory). Only lookup candidates are affected; the id itself is
+/// never rewritten for display.
+fn effort_stripped(normalized: &str) -> String {
+    for suffix in ["-minimal", "-low", "-medium", "-high", "-thinking", "-max"] {
+        if let Some(stripped) = normalized.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+    normalized.to_string()
+}
+
+/// rm-794: push generative lookup candidates for one model base —
+/// digit-flanked dotted minors (5.5 → 5-5) and Anthropic word-order
+/// ids (claude-5-5-sonnet → claude-sonnet-5-5, deepinfra-style
+/// claude-4-opus → claude-opus-4 included). Every candidate is used
+/// only if a catalog entry exists for it.
+fn push_generation_variant(variants: &mut Vec<String>, base: &str) {
+    let dashed = digit_dotted_to_dashed(base);
+    if dashed != base {
+        variants.push(dashed.clone());
+    }
+    if let Some(reordered) = reorder_claude_word_order(&dashed) {
+        variants.push(reordered);
+    }
+}
+
+/// Replace dots flanked by digits with dashes so dotted generation
+/// minors match their dashed catalog twins: only `5.5`-style
+/// separators move; display decimals elsewhere are untouched.
+fn digit_dotted_to_dashed(model: &str) -> String {
+    let chars: Vec<char> = model.chars().collect();
+    let mut out = String::with_capacity(model.len());
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '.'
+            && i > 0
+            && i + 1 < chars.len()
+            && chars[i - 1].is_ascii_digit()
+            && chars[i + 1].is_ascii_digit()
+        {
+            out.push('-');
+        } else {
+            out.push(*c);
+        }
+    }
+    out
+}
+
+/// `claude-5-5-sonnet` → `claude-sonnet-5-5`: some providers ship
+/// generation-first ids while the catalog keys class-first. Only ids
+/// whose last segment IS the class token move, and never twice.
+fn reorder_claude_word_order(model: &str) -> Option<String> {
+    let rest = model.strip_prefix("claude-")?;
+    for class in ["sonnet", "opus", "haiku"] {
+        let suffix = format!("-{class}");
+        if let Some(middle) = rest.strip_suffix(&suffix) {
+            if middle.contains(class) {
+                return None;
+            }
+            let middle = middle.trim_matches('-');
+            if middle.is_empty() {
+                return None;
+            }
+            return Some(format!("claude-{class}-{middle}"));
+        }
+    }
+    None
+}
+
 fn match_variants(raw: &str) -> Vec<String> {
     let normalized = normalize_model(raw);
     let mut variants = vec![raw.to_string(), normalized.clone()];
@@ -1243,6 +1315,22 @@ fn match_variants(raw: &str) -> Vec<String> {
             }
         }
     }
+    // rm-794: Claude generation wire forms — effort-tier suffixes
+    // (-minimal/-low/-medium/-high/-thinking/-max), dotted minors
+    // (claude-sonnet-5.5), and provider word-order (claude-5-5-sonnet)
+    // must resolve to the family entry instead of silently pricing at
+    // the default rate (live PoC 2026-10-13: 4 of 7 wire shapes cost
+    // +50% via the 3/15 default). Variants are additive lookup
+    // candidates only — the display name is never rewritten — and a
+    // candidate is used only when a catalog entry actually exists for
+    // it, so unknown families keep falling through to the disclosed
+    // default exactly as before.
+    let stripped = effort_stripped(&normalized);
+    if stripped != normalized {
+        variants.push(stripped.clone());
+        push_generation_variant(&mut variants, &stripped);
+    }
+    push_generation_variant(&mut variants, &normalized);
     if normalized.contains("deepseek") {
         if normalized.contains("v3") || normalized.contains("chat") {
             variants.push("deepseek-chat".to_string());
@@ -3131,6 +3219,121 @@ mod tests {
             (prices["m"].input_flex, prices["m"].output_flex),
             (Some(0.5), Some(0.25)),
             "override flex slots are accepted when finite and positive"
+        );
+    }
+
+    #[test]
+    fn claude_generation_wire_forms_resolve_to_family_pricing() {
+        // rm-794: live PoC 2026-10-13 — effort-suffixed, dotted-minor,
+        // and word-order 5.5 ids fell through to the 3/15 default
+        // (+50% over the family entry). Every wire shape must now
+        // resolve to the exact family entry via the generative arms.
+        let mut catalog = PricingCatalog {
+            entries: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        catalog.entries.insert(
+            "claude-sonnet-5-5".to_string(),
+            Price {
+                input: 2.0,
+                output: 10.0,
+                ..Price::default()
+            },
+        );
+        catalog.entries.insert(
+            "claude-opus-5-5".to_string(),
+            Price {
+                input: 4.0,
+                output: 20.0,
+                ..Price::default()
+            },
+        );
+        let sonnet = lookup_price_in("claude-sonnet-5-5", &catalog.entries);
+        let opus = lookup_price_in("claude-opus-5-5", &catalog.entries);
+        for wire in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "claude-sonnet-5-5-high",
+            "claude-sonnet-5-5-low",
+            "claude-sonnet-5-5-medium",
+            "claude-sonnet-5.5-medium",
+            "claude-sonnet-5-5-thinking",
+            "anthropic/claude-sonnet-5-5",
+            "anthropic/claude-5-5-sonnet",
+        ] {
+            let resolved = lookup_price_in(wire, &catalog.entries);
+            assert_eq!(
+                (resolved.input, resolved.output),
+                (sonnet.input, sonnet.output),
+                "wire form {wire} must price as the sonnet-5-5 family entry"
+            );
+        }
+        for wire in ["claude-opus-5-5-high", "claude-opus-5.5-thinking"] {
+            let resolved = lookup_price_in(wire, &catalog.entries);
+            assert_eq!(
+                (resolved.input, resolved.output),
+                (opus.input, opus.output),
+                "wire form {wire} must price as the opus-5-5 family entry"
+            );
+        }
+        // Families must never cross-resolve through the new arms.
+        assert_ne!(
+            lookup_price_in("claude-opus-5-5-high", &catalog.entries).input,
+            sonnet.input,
+            "opus effort forms must not cross onto the sonnet entry"
+        );
+        // Unknown generations keep the disclosed default — the arms
+        // widen lookups only where an entry exists.
+        assert_eq!(
+            lookup_price_in("claude-sonnet-9-9-high", &catalog.entries).input,
+            3.0,
+            "an absent family entry must keep the disclosed default rate"
+        );
+        assert_eq!(
+            lookup_price_in("claude-9-9-sonnet", &catalog.entries).output,
+            15.0,
+            "an absent word-order entry must keep the disclosed default rate"
+        );
+    }
+
+    #[test]
+    fn generation_variant_helpers_shape_ids_correctly() {
+        // rm-794 unit probes for the three generative helpers.
+        assert_eq!(
+            effort_stripped("claude-sonnet-5-5-high"),
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(effort_stripped("claude-sonnet-5-5"), "claude-sonnet-5-5");
+        assert_eq!(
+            effort_stripped("claude-sonnet-5-5-max"),
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(
+            digit_dotted_to_dashed("claude-sonnet-5.5"),
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(digit_dotted_to_dashed("gpt-4.1-mini"), "gpt-4-1-mini");
+        assert_eq!(
+            digit_dotted_to_dashed("model.a.1"),
+            "model.a.1",
+            "only digit-flanked dots move"
+        );
+        assert_eq!(
+            reorder_claude_word_order("claude-5-5-sonnet").as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            reorder_claude_word_order("claude-4-opus").as_deref(),
+            Some("claude-opus-4")
+        );
+        assert_eq!(reorder_claude_word_order("claude-sonnet-5-5"), None);
+        assert_eq!(
+            reorder_claude_word_order("gpt-5-5-sonnet"),
+            None,
+            "claude-family only"
         );
     }
 

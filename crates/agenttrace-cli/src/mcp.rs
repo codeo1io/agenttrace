@@ -397,7 +397,11 @@ fn initialize_result(params: Value) -> Result<Value, (i64, String)> {
         Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
         unsupported => {
             // stdout is protocol-only; the disclosure rides stderr.
-            eprintln!(
+            // rm-780: a write to a host-closed stderr must not panic the
+            // server on its own disclosure path — swallow the error and
+            // keep serving the newest supported revision either way.
+            let _ = writeln!(
+                io::stderr(),
                 "agenttrace mcp: client requested protocol version {}, which this \
                  server does not speak; answering with its newest supported revision \
                  {} (supported: {})",

@@ -370,9 +370,9 @@ For public demo, report, or release-surface checks, run the reusable gates from 
 
 ```bash
 scripts/ci/check-rust-release-local.sh
-AGENTTRACE_BIN=/tmp/agenttrace scripts/ci/check-output-contract.sh
-AGENTTRACE_BIN=/tmp/agenttrace scripts/ci/check-deterministic-output.sh
-AGENTTRACE_BIN=/tmp/agenttrace scripts/ci/check-report-semantics.sh
+scripts/ci/check-output-contract.sh
+scripts/ci/check-deterministic-output.sh
+scripts/ci/check-report-semantics.sh
 scripts/ci/check-release-surfaces.sh
 ```
 

@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
+# Cycle 3 (rm-369 extension): fall back to the repo-root release
+# binary instead of /tmp/agenttrace — a shared /tmp path can hold a
+# days-old binary or, on this fleet, a directory that passes [[ -x ]]
+# and then fails at exec; either way the gate silently stops testing
+# this tree. AGENTTRACE_BIN still wins when set (CI exports it
+# job-wide).
+repo_root="$(git rev-parse --show-toplevel)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 fail() {
@@ -23,7 +30,13 @@ require_json() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir"
 
-"$bin" --doctor -f json >"$out_dir/doctor.json"
+# Cycle 3 (rm-444 extension): scope the doctor probe to the checked-in
+# fixture corpus. An unscoped `--doctor` walks the invoking operator's
+# real HOME — measured 11m15.947s of gate wall on this fleet — making
+# the gate both slow and operator-dependent, while adding nothing the
+# contract assertions below need.
+fixture_dir="$repo_root/crates/agenttrace-core/tests/fixtures/pi-oh-my-pi"
+"$bin" --doctor -d "$fixture_dir" -f json >"$out_dir/doctor.json"
 require_file "$out_dir/doctor.json"
 require_json "$out_dir/doctor.json"
 
