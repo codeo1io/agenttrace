@@ -119,6 +119,12 @@ pub struct DoctorStatuslineReport {
     pub bytes: u64,
 }
 
+/// rm-440: serde helper for 0-count-clean disclosure fields — the
+/// key appears only when there is something to disclose.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorDirReport {
     pub name: String,
@@ -127,6 +133,15 @@ pub struct DoctorDirReport {
     pub files: usize,
     pub parsed: usize,
     pub failed: usize,
+    /// rm-440: discovered session files of zero bytes — the same
+    /// disclosed class the data_health lane reports. The parser
+    /// never ran on them, so they are not parse failures; the key
+    /// appears only when there is something to disclose (0-count-
+    /// clean, healthy corpora serialize identically).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub empty: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub empty_samples: Vec<String>,
     pub cache_hits: usize,
     /// Present when the provider directory is itself a symlink, so the
     /// doctor names the link it follows instead of implying a plain
@@ -858,7 +873,21 @@ fn doctor_dir_report(
     let mut parsed = 0;
     let mut cache_hits = 0;
     let mut failure_samples = Vec::new();
+    // rm-440: 0-byte session files are their own disclosed class.
+    // The parser never ran on them, so counting them as failures
+    // said nothing about parser coverage — the same file is
+    // "skipped" in the data_health lane, and the two views now agree
+    // on one "empty" class.
+    let mut empty = 0;
+    let mut empty_samples = Vec::new();
     for file in files {
+        if crate::parser::is_empty_session_file(file) {
+            empty += 1;
+            if empty_samples.len() < 3 {
+                empty_samples.push(file.to_string_lossy().to_string());
+            }
+            continue;
+        }
         // Keep the parsed session where the decode disclosure (rm-381) can
         // see it; the parse accounting below is unchanged.
         let session = if let Some(session) = cached_session(file, cache) {
@@ -902,7 +931,9 @@ fn doctor_dir_report(
         exists: path.is_dir(),
         files: files.len(),
         parsed,
-        failed: files.len().saturating_sub(parsed),
+        failed: files.len().saturating_sub(parsed + empty),
+        empty,
+        empty_samples,
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,
@@ -984,6 +1015,10 @@ fn doctor_sqlite_directories(
             files: parsed + failed,
             parsed,
             failed,
+            // rm-440: the sqlite lane reports databases, not files on
+            // disk — the empty-file class cannot occur here.
+            empty: 0,
+            empty_samples: Vec::new(),
             cache_hits: 0,
             symlink_target: symlink_target_of(&path),
             failure_samples,
@@ -1134,6 +1169,10 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first; entry bound from {})\n",
         report.cache_size_bytes, report.cache_limits, report.cache_entry_bound_source
     ));
+    out.push_str(&format!(
+        "  fingerprint: stat (mtime-ns, size) plus head/tail content probe ({} KiB each end); same-size in-place rewrites re-parse (rm-1060)\n",
+        crate::session_cache::CONTENT_PROBE_WINDOW / 1024
+    ));
     if let Some(note) = &report.cache_invalidation_note {
         out.push_str(&format!("  cache disclosure: {note}\n"));
     }
@@ -1249,12 +1288,22 @@ fn doctor_report_text(report: &DoctorReport) -> String {
             Some(target) => format!(" (symlink -> {target})"),
             None => String::new(),
         };
+        // rm-440: `empty` rides the row only when there is something
+        // to disclose; `failed` no longer includes 0-byte files.
+        let empty_note = if dir.empty > 0 {
+            format!(" empty={:<5}", dir.empty)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}\n",
+            "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5}{empty_note}cache={:<5} {}{}\n",
             dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));
+        }
+        for sample in &dir.empty_samples {
+            out.push_str(&format!("    empty: {sample}\n"));
         }
     }
     out.push_str("\nRecommendations:\n");

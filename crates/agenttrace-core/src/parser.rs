@@ -14,6 +14,16 @@ type JsonlProbe = fn(&[JsonObject]) -> Option<Vec<Event>>;
 /// values have already been summed.
 type ParseCounters = Vec<(String, i64)>;
 
+/// rm-440: true when the session file exists but holds zero bytes.
+/// Empty files are their own disclosed class in doctor and
+/// data_health — they are not parse failures (the parser never ran
+/// on them) and must not enter failure samples.
+pub(crate) fn is_empty_session_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(false)
+}
+
 pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
