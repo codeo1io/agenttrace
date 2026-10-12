@@ -330,7 +330,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             crate::pricing::bundled_snapshot_date(),
             crate::pricing::bundled_snapshot_model_count(),
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
-        ) + &doctor_deprecation_suffix(),
+        ) + &doctor_deprecation_suffix()
+            + &doctor_unmodeled_cost_suffix(),
         sqlite_read_failures: sqlite_ingest.unreadable,
         recommendations: Vec::new(),
     };
@@ -597,6 +598,22 @@ fn doctor_deprecation_suffix() -> String {
         }
         None => format!("; {count} priced models past vendor deprecation"),
     }
+}
+
+/// rm-1059: disclosure suffix for bundled-snapshot entries that bill
+/// a cost-field class the token costing does not model. Empty while
+/// the bundled snapshot carries no such classes (byte-identical
+/// doctor output); becomes live the moment a snapshot refresh does.
+fn doctor_unmodeled_cost_suffix() -> String {
+    let census = crate::pricing::bundled_unmodeled_census();
+    if census.is_empty() {
+        return String::new();
+    }
+    let models: usize = census.values().sum();
+    let families = census.keys().copied().collect::<Vec<_>>().join(", ");
+    format!(
+        "; {models} model entries carry unmodeled cost-field classes ({families}) — those dimensions are excluded from session totals"
+    )
 }
 
 fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {

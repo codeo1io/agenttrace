@@ -36,6 +36,13 @@ pub struct PricingCoverage {
     pub priced_sessions: usize,
     pub fallback_priced_sessions: usize,
     pub unpriced_or_unknown_sessions: usize,
+    /// Sessions with an exact catalog row whose entry ALSO carries
+    /// unmodeled cost-field classes (rm-1059): token totals exact,
+    /// other billed dimensions read $0 — counted so the exclusion is
+    /// disclosed, never silent. Skipped while zero so json bytes do
+    /// not move for catalogs without such classes.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub unmodeled_cost_class_sessions: usize,
     pub exact_pricing_pct: f64,
     pub confidence: String,
 }
@@ -470,6 +477,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         } else if pricing::has_specific_price(&model) {
             row.specific += 1;
             coverage.priced_sessions += 1;
+            // rm-1059: exact token rates, but the row also bills a
+            // dimension the costing does not model — disclose it.
+            if !pricing::unmodeled_cost_classes(&model).is_empty() {
+                coverage.unmodeled_cost_class_sessions += 1;
+            }
         } else {
             row.fallback += 1;
             coverage.fallback_priced_sessions += 1;

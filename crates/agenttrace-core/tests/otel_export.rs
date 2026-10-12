@@ -10,7 +10,30 @@ use agenttrace_core::{parse_file, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("at-otel-test-{}-{}", std::process::id(), line!()))
+    // rm-1058: every call must get its OWN directory. The old tag baked
+    // `line!()` into the name, so every call of this helper resolved
+    // the same path — two tests writing the same export filename
+    // (e.g. the claude-a sessions written at :70/:71 and :259/:260)
+    // raced under cargo's default parallel runner and turned the
+    // suite red nondeterministically (fleet stress: 1/15 red, then 14
+    // green on an identical binary). pid separates test binaries, the
+    // boot-time nanosecond stamp separates process generations on pid
+    // reuse, and the atomic sequence separates calls within one
+    // process.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static FIXTURE_SEQ: AtomicU32 = AtomicU32::new(0);
+    static BOOT_NANOS: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let boot = *BOOT_NANOS.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    });
+    std::env::temp_dir().join(format!(
+        "at-otel-test-{pid}-{boot:x}-{seq}",
+        pid = std::process::id()
+    ))
 }
 
 fn write_session(file: &str, body: &str) -> PathBuf {
