@@ -911,3 +911,162 @@ fn config_layer_prices_the_mcp_tools_identically_to_the_cli() {
     let _ = std::fs::remove_dir_all(home_plain.parent().expect("root"));
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+#[test]
+fn by_model_breakdown_orders_tied_costs_like_the_cli_section() {
+    // rm-974: `by_model_breakdown` documents itself as the `by_model`
+    // rollup of the same overview computation, but the two surfaces
+    // broke cost ties differently — the CLI section sorts
+    // sessions-descending before the name tie-break (reports.rs
+    // `group_items`) while the MCP tool sorted name-only. With
+    // equal-cost models (three zeta-model sessions and one
+    // alpha-model session, all priced $0.0000 by the snapshot — the
+    // assess A1 live PoC shape), the CLI answered [zeta, alpha] and
+    // the tool answered [alpha, zeta]. The tool now applies the
+    // CLI's own comparator, and this golden fixture pins the two
+    // surfaces to the same rows in the same order, byte-for-byte.
+    let (home, cache) = seed_home("rm974-parity", false);
+    let sessions_dir = home.join(".hermes").join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("create sessions home");
+    let write_session = |file: &str, model: &str, prompt: &str, stamp: &str| {
+        let body = format!(
+            "{{\"role\":\"user\",\"content\":\"{prompt}\",\"timestamp\":\"{stamp}\",\"ModelUsed\":\"{model}\",\"SourceTool\":\"generic\"}}\n\
+             {{\"role\":\"assistant\",\"content\":\"ok {prompt}\",\"timestamp\":\"{stamp}\",\"ModelUsed\":\"{model}\",\"SourceTool\":\"generic\"}}\n",
+            prompt = prompt,
+            stamp = stamp,
+            model = model
+        );
+        std::fs::write(sessions_dir.join(file), body).expect("write session file");
+    };
+    // Content is kept tiny so every session prices to $0.0000 after
+    // rounding — the exact live-PoC shape (content-derived token
+    // estimates on longer prompts would push per-session cost to
+    // 0.0001 and un-tie the fixture).
+    write_session("zeta-a.jsonl", "zeta-model", "za", "2025-01-01T00:00:00Z");
+    write_session("zeta-b.jsonl", "zeta-model", "zb", "2025-01-01T00:01:00Z");
+    write_session("zeta-c.jsonl", "zeta-model", "zc", "2025-01-01T00:02:00Z");
+    write_session("alpha-a.jsonl", "alpha-model", "aa", "2025-01-01T00:03:00Z");
+
+    // CLI leg: the overview's own by_model section.
+    let (code, stdout, _stderr) = cli_run(&home, &cache, &["--overview", "-f", "json"]);
+    assert_eq!(Some(0), code, "CLI overview must render: {stdout}");
+    let cli_rows = serde_json::from_str::<Value>(&stdout).expect("overview json")["by_model"]
+        .as_array()
+        .expect("cli by_model array")
+        .clone();
+
+    // MCP leg: the tool that mirrors that section.
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(1, responses.len());
+    assert_eq!(false, responses[0]["result"]["isError"]);
+    let mcp_rows = text_payload(&responses[0])["by_model"]
+        .as_array()
+        .expect("mcp by_model array")
+        .clone();
+
+    // The fixture must genuinely exercise the divergence: equal
+    // costs, unequal session counts (name-asc and sessions-desc
+    // disagree on this corpus).
+    let row = |rows: &[Value], name: &str| {
+        rows.iter()
+            .find(|row| row["name"] == name)
+            .unwrap_or_else(|| panic!("model {name} missing: {rows:?}"))
+            .clone()
+    };
+    assert_eq!(
+        row(&cli_rows, "alpha-model")["cost"],
+        row(&cli_rows, "zeta-model")["cost"],
+        "fixture must tie the costs"
+    );
+    assert_eq!(
+        3,
+        row(&cli_rows, "zeta-model")["sessions"]
+            .as_u64()
+            .expect("sessions")
+    );
+    assert_eq!(
+        1,
+        row(&cli_rows, "alpha-model")["sessions"]
+            .as_u64()
+            .expect("sessions")
+    );
+
+    // Golden parity: ids+positions (and every field) identical.
+    assert_eq!(
+        cli_rows, mcp_rows,
+        "by_model_breakdown must mirror the CLI by_model section row-for-row, in order"
+    );
+    let names: Vec<&str> = cli_rows
+        .iter()
+        .map(|row| row["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["zeta-model", "alpha-model"],
+        "cost ties break sessions-descending, then name — the comparator \
+         the CLI's own by_model section uses (reports.rs group_items)"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn jsonrpc_member_violations_answer_invalid_request() {
+    // rm-976: JSON-RPC 2.0 requires a `jsonrpc` member of exactly
+    // "2.0" (string); MCP 2025-06-18 pins the same. The server used
+    // to answer requests whose member was absent, wrongly typed, or
+    // wrongly valued as if the envelope were valid — the same
+    // spec-honesty gap the batching arm already closes. Each arm now
+    // answers -32600 naming the member (id null: an envelope-violating
+    // message cannot be trusted to carry an id), and the well-formed
+    // control afterwards proves conforming hosts are unchanged.
+    let (home, cache) = seed_home("jsonrpc-member", false);
+    let requests = concat!(
+        r#"{"id":1,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"1.0","id":2,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":2.0,"id":3,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":null,"id":4,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "a refusal script still exits rc0 on EOF");
+    assert_eq!(5, responses.len(), "one response per request line");
+    for response in responses.iter().take(4) {
+        assert_eq!(
+            Some(-32600),
+            response["error"]["code"].as_i64(),
+            "every jsonrpc violation is an invalid request: {response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("jsonrpc"),
+            "the refusal names the member: {response}"
+        );
+        assert_eq!(
+            serde_json::json!(null),
+            response["id"],
+            "envelope violations answer id null, never an echo: {response}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "the request must not execute: {response}"
+        );
+    }
+    assert!(
+        responses[4]["result"].is_object(),
+        "well-formed requests are unchanged: {:?}",
+        responses[4]
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}

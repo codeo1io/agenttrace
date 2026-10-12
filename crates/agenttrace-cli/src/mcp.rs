@@ -61,7 +61,7 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use agenttrace_core::{
-    compute_overview, data_health_scoped, load_sessions_with_options,
+    compare_by_model_rows, compute_overview, data_health_scoped, load_sessions_with_options,
     report_overview_json_with_context, LoadOptions, LoadReport, TimeRange,
 };
 use chrono::Utc;
@@ -97,6 +97,21 @@ const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "202
 /// Value chosen at implement time and recorded here per the lanes
 /// above: raise it only with a reason.
 const MCP_INPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+
+/// rm-976: the over-cap refusal message, its numeral DERIVED from
+/// [`MCP_INPUT_MAX_BYTES`] at format time — raising the constant must
+/// never leave the message naming a cap the reader no longer enforces
+/// (this module's negative assertions pin strings, so a drifting
+/// message fails them). Pinned against the constant by
+/// `oversized_refusal_message_derives_from_the_constant`; the wire
+/// contract itself (code, id null, message shape) is landed rm-923's
+/// and unchanged — the rendered bytes are identical.
+fn oversized_line_refusal_message() -> String {
+    format!(
+        "Invalid Request: message line exceeds the {}-byte transport cap and was discarded",
+        MCP_INPUT_MAX_BYTES
+    )
+}
 
 /// The `range` labels [`TimeRange::parse`] actually enforces
 /// (agenttrace-core insights.rs) — the tools' `inputSchema` enum and
@@ -148,13 +163,10 @@ pub fn serve(root: Option<&Path>) -> anyhow::Result<()> {
                 // `null`: the discarded message could not be trusted
                 // to carry an id) instead of buffering host-chosen
                 // bytes.
+                let refusal = oversized_line_refusal_message();
                 emit(
                     &mut stdout,
-                    &error_response(
-                        None,
-                        CODE_INVALID_REQUEST,
-                        "Invalid Request: message line exceeds the 1048576-byte transport cap and was discarded",
-                    ),
+                    &error_response(None, CODE_INVALID_REQUEST, &refusal),
                 )?;
                 continue;
             }
@@ -310,6 +322,20 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
             "Invalid Request: expected a JSON-RPC 2.0 object",
         ));
     };
+    // rm-976: JSON-RPC 2.0 requires a `jsonrpc` member of exactly
+    // "2.0", and MCP 2025-06-18 pins the same. Absent, non-string, or
+    // wrongly valued members used to be answered as if the envelope
+    // were valid — the same spec-discipline gap the batching arm
+    // closes above. The envelope is invalid, so the answer carries
+    // id null (the message cannot be trusted to carry one),
+    // batching-arm style; well-formed requests are unaffected.
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(error_response(
+            None,
+            CODE_INVALID_REQUEST,
+            "Invalid Request: `jsonrpc` must be exactly \"2.0\"",
+        ));
+    }
     // rm-782: JSON-RPC 2.0 restricts request ids to String | Number |
     // Null. Anything else used to be cloned and echoed verbatim
     // (`id: [1,2]` came back as `id: [1,2]`); the spec's answer for a
@@ -676,18 +702,17 @@ fn by_model_breakdown(root: Option<&Path>, range: TimeRange) -> Result<Value, (i
             })
         })
         .collect();
-    // Cost-descending, name-tie-broken — the ordering the overview's
-    // own `by_model` section uses.
-    models.sort_by(|a, b| {
-        let cost = |value: &Value| value["cost"].as_f64().unwrap_or(0.0);
-        cost(b)
-            .partial_cmp(&cost(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                let name = |value: &Value| value["name"].as_str().unwrap_or("").to_string();
-                name(a).cmp(&name(b))
-            })
-    });
+    // rm-974: the SAME comparator the overview's own `by_model`
+    // section uses (`compare_by_model_rows`, agenttrace-core
+    // reports.rs) — cost-descending, then sessions-descending, then
+    // name — applied to the identical `{name, sessions, cost}` rows
+    // before serialization, so the tool's answer is order-identical
+    // to the section it mirrors. The pre-fix sort broke cost ties by
+    // name only, diverging from the CLI whenever equal-cost models
+    // had different session counts (the assess A1 alpha/zeta $0.0000
+    // live PoC: CLI [zeta, alpha] vs tool [alpha, zeta]). Ordering
+    // only — no cost number changes.
+    models.sort_by(compare_by_model_rows);
     let body = json!({
         "range": range.label(),
         "total_sessions": overview.total_sessions,
@@ -724,4 +749,25 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> String {
         json!({ "code": code, "message": message }),
     );
     Value::Object(object).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rm-976: the refusal's numeral is derived from
+    /// [`MCP_INPUT_MAX_BYTES`] at format time — this pins the rendered
+    /// string against the constant so a cap change can never
+    /// desynchronize the message from the cap the reader enforces
+    /// (the wire arms in tests/mcp_server.rs pin the rendered bytes
+    /// end to end).
+    #[test]
+    fn oversized_refusal_message_derives_from_the_constant() {
+        let message = oversized_line_refusal_message();
+        assert!(
+            message.contains(&format!("the {}-byte transport cap", MCP_INPUT_MAX_BYTES)),
+            "the numeral must render MCP_INPUT_MAX_BYTES ({}): {message}",
+            MCP_INPUT_MAX_BYTES
+        );
+    }
 }

@@ -140,6 +140,129 @@ fn opencode_part_selection_ranks_wrong_typed_time_after_numerics() {
 }
 
 #[test]
+fn opencode_part_selection_ranks_fractional_real_by_magnitude() {
+    // rm-975: REAL time_created values must compare by magnitude with
+    // their fraction intact — SQLite ASC ranks 1.2 < 1.8. The pre-fix
+    // rank truncated both REALs to the same i64 (1), so the selection
+    // fell to the rowid tie-break and named the 1.8 part (inserted
+    // first) instead of the true minimum 1.2 (inserted second).
+    let root = temp_root("agenttrace-opencode-asc-frac-real");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (id text primary key, title text, time_created integer, time_updated integer);
+        create table message (id text, session_id text, data text);
+        create table part (id text, session_id text, message_id text, time_created, time_updated, data text);
+        insert into session values ('ses_frac', 'New session - 2026-08-10T01:13:33.266Z', 1764750000000, 1764750004000);
+        insert into message values ('msg1', 'ses_frac', '{"id":"msg1","role":"user"}');
+        insert into part values ('p_frac_late', 'ses_frac', 'msg1', 1.8, 1.8, '{"type":"text","text":"fractional 1.8 part must lose"}');
+        insert into part values ('p_frac_early', 'ses_frac', 'msg1', 1.2, 1.2, '{"type":"text","text":"fractional 1.2 part must win the name"}');
+        "#,
+    )
+    .expect("seed frac-real opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].name, "fractional 1.2 part must win the name",
+            "SQLite ASC compares REAL by magnitude (1.2 < 1.8); the i64-truncating rank \
+             tied them and let the rowid tie-break pick the later-magnitude part"
+        );
+    });
+}
+
+#[test]
+fn opencode_part_selection_ranks_numeric_text_lexically() {
+    // rm-975: TEXT time_created values rank lexically inside the TEXT
+    // class — SQLite's BINARY collation orders "10" < "9". The
+    // pre-fix rank parsed numeric-looking TEXT into the numeric class
+    // (9 < 10), so the "9" part won the name; SQLite picks "10".
+    let root = temp_root("agenttrace-opencode-asc-numeric-text");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (id text primary key, title text, time_created integer, time_updated integer);
+        create table message (id text, session_id text, data text);
+        create table part (id text, session_id text, message_id text, time_created, time_updated, data text);
+        insert into session values ('ses_lex', 'New session - 2026-08-10T01:13:33.266Z', 1764750000000, 1764750004000);
+        insert into message values ('msg1', 'ses_lex', '{"id":"msg1","role":"user"}');
+        insert into part values ('p_text_nine', 'ses_lex', 'msg1', '9', '9', '{"type":"text","text":"numeric text nine must lose"}');
+        insert into part values ('p_text_ten', 'ses_lex', 'msg1', '10', '10', '{"type":"text","text":"numeric text ten must win the name"}');
+        "#,
+    )
+    .expect("seed numeric-text opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].name, "numeric text ten must win the name",
+            "SQLite ASC keeps TEXT in the text class where BINARY collation orders \
+             \"10\" < \"9\"; parsing numeric TEXT into the numeric class inverted it"
+        );
+    });
+}
+
+#[test]
+fn opencode_part_selection_all_integer_ordering_is_unchanged() {
+    // rm-975 no-change golden: an all-INTEGER part table (the
+    // overwhelming real corpus) selects the same earliest part as
+    // always — minimum time_created, rowid breaking exact ties. The
+    // rank rewrite must not move this behavior by a byte.
+    let root = temp_root("agenttrace-opencode-asc-integer-golden");
+    let home = root.join("home");
+    let db_path = home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    let db = Connection::open(&db_path).expect("open opencode db");
+    db.execute_batch(
+        r#"
+        create table session (id text primary key, title text, time_created integer, time_updated integer);
+        create table message (id text, session_id text, data text);
+        create table part (id text, session_id text, message_id text, time_created, time_updated, data text);
+        insert into session values ('ses_int', 'New session - 2026-08-10T01:13:33.266Z', 1764750000000, 1764750004000);
+        insert into message values ('msg1', 'ses_int', '{"id":"msg1","role":"user"}');
+        insert into part values ('p_three', 'ses_int', 'msg1', 3000, 3000, '{"type":"text","text":"integer 3000 must lose"}');
+        insert into part values ('p_min', 'ses_int', 'msg1', 1000, 1000, '{"type":"text","text":"integer 1000 rowid tie-break winner"}');
+        insert into part values ('p_two', 'ses_int', 'msg1', 2000, 2000, '{"type":"text","text":"integer 2000 must lose"}');
+        insert into part values ('p_min_dup', 'ses_int', 'msg1', 1000, 1000, '{"type":"text","text":"integer 1000 duplicate must lose to the lower rowid"}');
+        "#,
+    )
+    .expect("seed all-integer opencode db");
+    drop(db);
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].name, "integer 1000 rowid tie-break winner",
+            "all-INTEGER corpora: minimum time_created wins, exact ties break by \
+             rowid — byte-identical to the pre-rm-975 selection"
+        );
+    });
+}
+
+#[test]
 fn opencode_stored_session_totals_preferred_with_delta() {
     // CU-2 (candidate 8, totals scope): when the upstream session row
     // records authoritative totals (cost + the five token columns), those

@@ -51,6 +51,22 @@ fn write(dir: &Path, rel: &str, content: &str) {
 fn run_cli(cwd: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
     command.args(args).current_dir(cwd);
+    // Discovery ceiling: the CLI locates the repository via a `git
+    // rev-parse --show-toplevel` subprocess, which otherwise walks up
+    // past the fixture. `std::env::temp_dir()` is NOT guaranteed to sit
+    // outside a git repository — under the delegate harness TMPDIR lives
+    // inside a git-tracked spool (~/.hermes), and the plain-dir scenarios
+    // then "found" the spool repo instead of failing with the intended
+    // not-inside-a-repository hint. Ceil at the fixture dir: every
+    // repository scenario keeps its `.git` in cwd itself, so discovery
+    // is unaffected, while plain-dir scenarios stop at the fixture.
+    // Ceil at the fixture's parent: git stats cwd/.git first, then
+    // refuses to chdir UP INTO a ceiling dir — so repository scenarios
+    // (`.git` in cwd itself) are unaffected while plain-dir scenarios
+    // stop before reaching whatever repo may enclose temp_dir().
+    if let Some(parent) = cwd.parent() {
+        command.env("GIT_CEILING_DIRECTORIES", parent);
+    }
     for (key, value) in GIT_ENV {
         command.env(key, value);
     }
