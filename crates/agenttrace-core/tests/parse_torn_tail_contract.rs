@@ -144,7 +144,10 @@ fn codex_fast_path_torn_tail_discloses_through_line_skips() {
         torn.metrics.line_skips
     );
     assert!(
-        !torn.metrics.disclosure_counters.contains_key("codex_unparseable_line"),
+        !torn
+            .metrics
+            .disclosure_counters
+            .contains_key("codex_unparseable_line"),
         "a torn drop is real loss, not an assumption: it must not ride the rm-730 disclosure channel"
     );
     // The torn line carried the session's final cumulative usage

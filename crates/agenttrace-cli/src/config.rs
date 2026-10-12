@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 
 /// The knobs a configuration file may set. All optional: absent keys
 /// leave lower layers in charge.

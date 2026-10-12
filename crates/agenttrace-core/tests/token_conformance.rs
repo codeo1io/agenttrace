@@ -103,18 +103,18 @@ fn conformance_pack_manifest_is_internally_consistent() {
 
         // rm-053 acceptance: imports must stay verbatim copies of the
         // landed rm-046 corpus — never regenerated in place.
-        if let Some(origin) = case["verbatim_of"].as_str() {
-            if origin.starts_with("testdata/") {
-                let origin_path = pack_root().join("../../").join(origin);
-                let imported = fs::read(pack_root().join(fixture)).expect("imported fixture");
-                let original = fs::read(&origin_path)
-                    .unwrap_or_else(|error| panic!("{id}: origin {origin}: {error}"));
-                assert_eq!(
-                    imported, original,
-                    "{id}: import of {origin} must stay byte-identical; regenerate the copy, \
+        if let Some(origin) = case["verbatim_of"].as_str()
+            && origin.starts_with("testdata/")
+        {
+            let origin_path = pack_root().join("../../").join(origin);
+            let imported = fs::read(pack_root().join(fixture)).expect("imported fixture");
+            let original = fs::read(&origin_path)
+                .unwrap_or_else(|error| panic!("{id}: origin {origin}: {error}"));
+            assert_eq!(
+                imported, original,
+                "{id}: import of {origin} must stay byte-identical; regenerate the copy, \
                      never the corpus"
-                );
-            }
+            );
         }
     }
 

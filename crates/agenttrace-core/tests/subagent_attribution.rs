@@ -11,7 +11,7 @@
 //! ordinary.
 
 use agenttrace_core::{
-    load_sessions_with_progress_from_cache, total_tokens, LoadOptions, Session, SessionCache,
+    LoadOptions, Session, SessionCache, load_sessions_with_progress_from_cache, total_tokens,
 };
 
 fn corpus() -> std::path::PathBuf {

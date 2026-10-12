@@ -164,18 +164,18 @@ fn run_bounded(
             (&mut stdout_rx, &mut stdout_stash),
             (&mut stderr_rx, &mut stderr_stash),
         ] {
-            if stash.is_none() {
-                if let Ok(outcome) = rx.try_recv() {
-                    if outcome.exceeded {
-                        kill_process_tree(&mut child);
-                        let _ = child.wait();
-                        return Err(GitRunError::OverCap {
-                            op,
-                            cap_bytes: max_bytes,
-                        });
-                    }
-                    *stash = Some(outcome);
+            if stash.is_none()
+                && let Ok(outcome) = rx.try_recv()
+            {
+                if outcome.exceeded {
+                    kill_process_tree(&mut child);
+                    let _ = child.wait();
+                    return Err(GitRunError::OverCap {
+                        op,
+                        cap_bytes: max_bytes,
+                    });
                 }
+                *stash = Some(outcome);
             }
         }
         if Instant::now() >= deadline {
@@ -501,7 +501,10 @@ fn fetch_remote(remote: &str) -> anyhow::Result<()> {
     // fetch (hung remote, stale mount) hung the whole CLI. It now runs
     // under UPSTREAM_FETCH_TIMEOUT; a timeout is terminal and names the
     // deadline, the operation, and the remote.
-    match run_bounded("git", &["fetch", remote, "--quiet"], UPSTREAM_FETCH_TIMEOUT,
+    match run_bounded(
+        "git",
+        &["fetch", remote, "--quiet"],
+        UPSTREAM_FETCH_TIMEOUT,
         UPSTREAM_GIT_MAX_BYTES,
     ) {
         Ok(_) => Ok(()),
@@ -1007,12 +1010,16 @@ mod tests {
             NpmProbeFailure::ToolAbsent.label(),
             "unavailable (probe tooling absent: curl not on PATH)"
         );
-        assert!(NpmProbeFailure::ProbeFailed
-            .label()
-            .contains("network or HTTP error"));
-        assert!(NpmProbeFailure::ResponseOverflow
-            .label()
-            .contains("byte cap"));
+        assert!(
+            NpmProbeFailure::ProbeFailed
+                .label()
+                .contains("network or HTTP error")
+        );
+        assert!(
+            NpmProbeFailure::ResponseOverflow
+                .label()
+                .contains("byte cap")
+        );
     }
 
     #[test]

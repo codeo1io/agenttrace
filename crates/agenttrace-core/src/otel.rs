@@ -539,13 +539,16 @@ mod tests {
         // Trace ids are 32 lowercase hex chars; span ids 16.
         let trace = trace_id_from_identity(path, name);
         assert_eq!(trace.len(), 32);
-        assert!(trace
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            trace
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         let span = span_id_from_identity(path, name, 42);
         assert_eq!(span.len(), 16);
-        assert!(span
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            span.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 }

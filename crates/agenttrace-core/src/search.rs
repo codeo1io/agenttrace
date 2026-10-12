@@ -1,7 +1,7 @@
 use crate::reports::{json_float, json_string};
 use crate::{
-    canonical_sessions, format_cost, format_tokens, highest_authority_for_metrics, round4,
-    total_tokens, SearchResult, Session, VERSION,
+    SearchResult, Session, VERSION, canonical_sessions, format_cost, format_tokens,
+    highest_authority_for_metrics, round4, total_tokens,
 };
 use std::collections::BTreeSet;
 

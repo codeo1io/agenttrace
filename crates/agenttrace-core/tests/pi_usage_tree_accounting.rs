@@ -18,9 +18,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agenttrace_core::{
-    build_doctor_report, compute_overview, cost_audit, data_health, lookup_price, parse_file,
-    render_doctor_report, report_overview_markdown_with_context, round4, session_cost_audit,
-    Session, TimeRange,
+    Session, TimeRange, build_doctor_report, compute_overview, cost_audit, data_health,
+    lookup_price, parse_file, render_doctor_report, report_overview_markdown_with_context, round4,
+    session_cost_audit,
 };
 
 /// A pi v3 journal whose cache-warm usage entry was invisible before
@@ -902,11 +902,13 @@ fn audit_labels_per_block_multi_model_sessions_exactly() {
     // pre-fix behavior on the assess PoC F2 corpus, pi-pi-v3).
     let session = parsed("model-change.jsonl", MODEL_CHANGE);
     assert_eq!(session.metrics.model_used, "multiple");
-    assert!(session
-        .metrics
-        .provenance
-        .pricing_source
-        .contains("priced per usage block"));
+    assert!(
+        session
+            .metrics
+            .provenance
+            .pricing_source
+            .contains("priced per usage block")
+    );
     let audit = session_cost_audit(&session);
     assert_eq!(
         audit.pricing_note,
@@ -1055,9 +1057,11 @@ fn compaction_without_usage_folds_nothing() {
         "assistant-content text-estimate, pre-existing absent-usage path"
     );
     assert_eq!(metrics.upstream_cost_usd, 0.0);
-    assert!(!metrics
-        .disclosure_counters
-        .keys()
-        .any(|k| k.starts_with("pi_compaction_usage_counted")));
+    assert!(
+        !metrics
+            .disclosure_counters
+            .keys()
+            .any(|k| k.starts_with("pi_compaction_usage_counted"))
+    );
     assert_eq!(metrics.assistant_turns, 1, "the summary still lands");
 }

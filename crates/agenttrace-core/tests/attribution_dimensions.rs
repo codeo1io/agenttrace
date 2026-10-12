@@ -7,8 +7,8 @@
 // the JSON, text, markdown and html surfaces.
 
 use agenttrace_core::{
-    compute_overview, demo_sessions, infer_task_type, report_overview_html, report_overview_json,
-    report_overview_markdown, report_overview_text, Metrics, Session,
+    Metrics, Session, compute_overview, demo_sessions, infer_task_type, report_overview_html,
+    report_overview_json, report_overview_markdown, report_overview_text,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;

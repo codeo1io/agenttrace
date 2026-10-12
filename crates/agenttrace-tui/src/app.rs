@@ -3,20 +3,20 @@
 use std::io::IsTerminal;
 
 use agenttrace_core::{
-    attention_priority, attention_rank, average_health, canonical_sessions, clear_session_cache,
-    compute_overview, compute_overview_iter, context_trends, cost_audit, data_health,
-    delivery_evidence_with_git, format_cost, format_tokens, inspect_first, inspect_reason,
-    load_cached_sessions_from_cache, load_session_cache, load_sessions_with_progress,
-    load_sessions_with_progress_from_cache_mode, mcp_governance, needs_attention, project_name,
-    recommendations, resolve_project, session_capability, session_cost_audit,
-    session_matches_time_range, total_tokens, ContextTrend, CostAudit, DataHealth,
-    DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
-    ProjectIdentity, Recommendation, ReportLanguage, Session, SessionCache, TimeRange,
+    ContextTrend, CostAudit, DataHealth, DeliveryEvidence, LoadOptions, LoadProgress, LoadReport,
+    McpGovernance, Overview, ProjectIdentity, Recommendation, ReportLanguage, Session,
+    SessionCache, TimeRange, attention_priority, attention_rank, average_health,
+    canonical_sessions, clear_session_cache, compute_overview, compute_overview_iter,
+    context_trends, cost_audit, data_health, delivery_evidence_with_git, format_cost,
+    format_tokens, inspect_first, inspect_reason, load_cached_sessions_from_cache,
+    load_session_cache, load_sessions_with_progress, load_sessions_with_progress_from_cache_mode,
+    mcp_governance, needs_attention, project_name, recommendations, resolve_project,
+    session_capability, session_cost_audit, session_matches_time_range, total_tokens,
 };
 #[cfg(test)]
 use agenttrace_core::{
-    fix_suggestions, predict_cost_anomaly, render_waste_report_with_language,
-    report_compare_with_language, report_text_with_language, VERSION,
+    VERSION, fix_suggestions, predict_cost_anomaly, render_waste_report_with_language,
+    report_compare_with_language, report_text_with_language,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 #[cfg(test)]
@@ -1076,10 +1076,10 @@ impl App {
         self.load_state.parsed = progress.parsed;
         self.load_state.skipped = progress.skipped;
         self.load_state.cache_hits = progress.cache_hits;
-        if !self.load_state.showing_cached {
-            if let Some(session) = progress.session {
-                self.sessions.push(session);
-            }
+        if !self.load_state.showing_cached
+            && let Some(session) = progress.session
+        {
+            self.sessions.push(session);
         }
     }
 
@@ -1554,17 +1554,17 @@ impl App {
     fn open_governance(&mut self, panel: GovernancePanel) {
         self.view = View::Governance(panel);
         self.scroll = 0;
-        if panel == GovernancePanel::Delivery {
-            if let Some(snapshot) = self.governance.as_mut() {
-                // Review F4 (cycle 7): re-entering the Delivery panel is
-                // the documented retry. A stale error must not survive
-                // it, and the pre-failure evidence it was hiding must not
-                // masquerade as a fresh scan — drop both so the next
-                // render spawns a new worker and shows the scan in
-                // flight. Successful, error-free states keep their cache.
-                if snapshot.delivery_error.take().is_some() {
-                    snapshot.delivery = None;
-                }
+        if panel == GovernancePanel::Delivery
+            && let Some(snapshot) = self.governance.as_mut()
+        {
+            // Review F4 (cycle 7): re-entering the Delivery panel is
+            // the documented retry. A stale error must not survive
+            // it, and the pre-failure evidence it was hiding must not
+            // masquerade as a fresh scan — drop both so the next
+            // render spawns a new worker and shows the scan in
+            // flight. Successful, error-free states keep their cache.
+            if snapshot.delivery_error.take().is_some() {
+                snapshot.delivery = None;
             }
         }
     }

@@ -85,7 +85,11 @@ The install scripts download the release binary for your platform, verify its
 SHA-256 against the published checksum, and add the install directory to your
 PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). Set
 `AGENTTRACE_VERSION=v0.9.1` (or `-Version v0.9.1` in PowerShell) to pin a
-release.
+release. Both installers honor the pin with the same precedence: an
+explicit `-Version` argument (PowerShell) beats `AGENTTRACE_VERSION`,
+which beats `latest`; `install.sh` also keeps `AGENTTRACE_SOURCE_REF`
+as the separate pin for its build-from-source fallback (it wins over
+`AGENTTRACE_VERSION` there when both are set).
 
 Package managers:
 
@@ -481,6 +485,10 @@ Listed in these open source projects:
 - [awesome-claude-skills](https://github.com/BehiSecc/awesome-claude-skills)
 
 ## Contributing
+
+The workspace builds on Rust edition 2024 (rm-981): the declared MSRV is
+1.89 — already above edition 2024's 1.85 floor — with the toolchain pinned
+to 1.98.1 by `rust-toolchain.toml`.
 
 Parser PRs are welcome. A good parser contribution usually includes:
 

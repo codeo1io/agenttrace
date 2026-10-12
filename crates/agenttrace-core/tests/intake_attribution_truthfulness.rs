@@ -51,7 +51,7 @@
 //! `tests/fixtures/hermes-hostile/` (the research PoCs copied
 //! verbatim).
 
-use agenttrace_core::{parse_file, parse_raw_session, Session};
+use agenttrace_core::{Session, parse_file, parse_raw_session};
 use std::path::PathBuf;
 
 fn fixture(rel: &str) -> PathBuf {
@@ -475,9 +475,11 @@ fn assistant_relabels_stay_authoritative() {
         session.metrics.model_used, "claude-opus-4-1-20250805",
         "the later assistant turn relabels (both are authoritative rows)"
     );
-    assert!(!session
-        .metrics
-        .disclosure_counters
-        .contains_key("model_label_non_assistant_ignored"));
+    assert!(
+        !session
+            .metrics
+            .disclosure_counters
+            .contains_key("model_label_non_assistant_ignored")
+    );
     assert_ne!(session.metrics.model_used, "multiple");
 }

@@ -13,7 +13,7 @@
 //! move to a fresh process removed.
 
 use agenttrace_core::{
-    runtime_config_overrides as get, set_runtime_config as set, RuntimeConfigOverrides,
+    RuntimeConfigOverrides, runtime_config_overrides as get, set_runtime_config as set,
 };
 use std::path::PathBuf;
 

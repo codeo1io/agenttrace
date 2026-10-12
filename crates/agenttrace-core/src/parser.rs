@@ -1,5 +1,5 @@
-use crate::{parse_jsonl_session, session_from_events, Event, Session, ToolCall};
-use anyhow::{bail, Context};
+use crate::{Event, Session, ToolCall, parse_jsonl_session, session_from_events};
+use anyhow::{Context, bail};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -17,12 +17,11 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Session> {
     if path.is_dir() {
         return parse_cline_task_dir(path);
     }
-    if is_cline_task_file(path) {
-        if let Some(dir) = path.parent() {
-            if let Ok(session) = parse_cline_task_dir(dir) {
-                return Ok(session);
-            }
-        }
+    if is_cline_task_file(path)
+        && let Some(dir) = path.parent()
+        && let Ok(session) = parse_cline_task_dir(dir)
+    {
+        return Ok(session);
     }
     let raw =
         std::fs::read(path).with_context(|| format!("read session file {}", path.display()))?;
@@ -78,11 +77,11 @@ fn parse_cline_task_dir(dir: &Path) -> anyhow::Result<Session> {
     let mut events = Vec::new();
     let mut seen = BTreeSet::new();
 
-    if let Some(raw) = read_json_value(&dir.join("api_conversation_history.json")) {
-        if let Some(api_events) = parse_cline_value(&raw, &model) {
-            for event in api_events {
-                append_cline_event(&mut events, &mut seen, event);
-            }
+    if let Some(raw) = read_json_value(&dir.join("api_conversation_history.json"))
+        && let Some(api_events) = parse_cline_value(&raw, &model)
+    {
+        for event in api_events {
+            append_cline_event(&mut events, &mut seen, event);
         }
     }
     if let Some(raw) = read_json_value(&dir.join("ui_messages.json")) {
@@ -197,49 +196,49 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             return session_from_events(name, path, events);
         }
     }
-    if parsed_value.is_none() {
-        if let Some((events, parse_counters)) = parse_codex_rollout_jsonl(raw) {
-            let mut session = session_from_events(name, path, events)?;
-            // rm-047 made the fast-path skips visible in parse diagnostics;
-            // rm-401 widened the channel to every codex parse decision
-            // worth disclosing (ignorable lines, counted/deduped/unpaired
-            // token_usage_records).
-            for (key, count) in parse_counters {
-                // rm-730: the two STRUCTURAL counters are deterministic
-                // known-non-loss shapes — event_msg chatter the format
-                // defines as ignorable, and the world_state sub-registry
-                // record that is deliberately neither tool nor message —
-                // so they are assumption-class disclosures under the
-                // rm-538 channel split and ride disclosure_counters,
-                // where they stay fully visible (report Disclosed-facts
-                // row, data_health.disclosures, doctor) but stop tanking
-                // data_health.confidence for an otherwise-exact parse
-                // (the 39acfe43 live PoC: 97/97 parsed, 0 skipped files,
-                // yet confidence "low" via 1,125 structural counters).
-                // True loss (codex_unparseable_line,
-                // codex_non_object_line:*, codex_missing_type,
-                // codex_unmatched_*) and the compaction usage-record
-                // accounting decisions stay on line_skips and keep the
-                // 39acfe43 contract: genuinely dropped lines degrade
-                // confidence. The accounting-truth batch (rm-251 R1
-                // rider) adds two more non-loss keys in the same class:
-                // `codex_token_count_skipped:*` is the deliberate
-                // anti-inflation skip of a usage-less token_count
-                // line, and `codex_rate_limits_observed` counts quota
-                // snapshots wherever the line landed — both
-                // assumption-class disclosures, not parse loss.
-                if key == "codex_ignorable_line"
-                    || key == "codex_world_state"
-                    || key == "codex_rate_limits_observed"
-                    || key.starts_with("codex_token_count_skipped:")
-                {
-                    *session.metrics.disclosure_counters.entry(key).or_insert(0) += count;
-                } else {
-                    *session.metrics.line_skips.entry(key).or_insert(0) += count;
-                }
+    if parsed_value.is_none()
+        && let Some((events, parse_counters)) = parse_codex_rollout_jsonl(raw)
+    {
+        let mut session = session_from_events(name, path, events)?;
+        // rm-047 made the fast-path skips visible in parse diagnostics;
+        // rm-401 widened the channel to every codex parse decision
+        // worth disclosing (ignorable lines, counted/deduped/unpaired
+        // token_usage_records).
+        for (key, count) in parse_counters {
+            // rm-730: the two STRUCTURAL counters are deterministic
+            // known-non-loss shapes — event_msg chatter the format
+            // defines as ignorable, and the world_state sub-registry
+            // record that is deliberately neither tool nor message —
+            // so they are assumption-class disclosures under the
+            // rm-538 channel split and ride disclosure_counters,
+            // where they stay fully visible (report Disclosed-facts
+            // row, data_health.disclosures, doctor) but stop tanking
+            // data_health.confidence for an otherwise-exact parse
+            // (the 39acfe43 live PoC: 97/97 parsed, 0 skipped files,
+            // yet confidence "low" via 1,125 structural counters).
+            // True loss (codex_unparseable_line,
+            // codex_non_object_line:*, codex_missing_type,
+            // codex_unmatched_*) and the compaction usage-record
+            // accounting decisions stay on line_skips and keep the
+            // 39acfe43 contract: genuinely dropped lines degrade
+            // confidence. The accounting-truth batch (rm-251 R1
+            // rider) adds two more non-loss keys in the same class:
+            // `codex_token_count_skipped:*` is the deliberate
+            // anti-inflation skip of a usage-less token_count
+            // line, and `codex_rate_limits_observed` counts quota
+            // snapshots wherever the line landed — both
+            // assumption-class disclosures, not parse loss.
+            if key == "codex_ignorable_line"
+                || key == "codex_world_state"
+                || key == "codex_rate_limits_observed"
+                || key.starts_with("codex_token_count_skipped:")
+            {
+                *session.metrics.disclosure_counters.entry(key).or_insert(0) += count;
+            } else {
+                *session.metrics.line_skips.entry(key).or_insert(0) += count;
             }
-            return Ok(session);
         }
+        return Ok(session);
     }
     // rm-526: `jsonl_objects` silently dropped lines that fail both the
     // strict and the lenient parse, so a torn tail (a writer crash
@@ -372,76 +371,75 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         })
         .unwrap_or_default();
     let mut array_events = serde_json::from_str::<Vec<Event>>(trimmed).ok();
-    if array_events.is_none() {
-        if let Some(items) = parsed_value.as_mut().and_then(Value::as_array_mut) {
-            // rm-860 × value-lane fallbacks (independent review of the
-            // combined tree, conflict case b51a087890464039a0a1e3a762c19f61):
-            // keep the pre-normalization array. An element fails the
-            // strict `Vec<Event>` parse for reasons a duplicate-spelling
-            // pass cannot fix (a wrong-typed `is_error`/`redacted` bool,
-            // a non-object element), and consuming the array via
-            // `std::mem::take` on that failing path would hand the
-            // value-based lanes below (`parse_gemini_value` /
-            // `parse_cline_value` array arms) an EMPTY array — stranding
-            // a doc those lanes would have parsed, regressing it to
-            // `unsupported session format`. The clone rides only the
-            // rare strict-failure path (docs that parse cleanly never
-            // get here), and the untouched array is restored when the
-            // retry still fails so the fallback lanes see exactly what
-            // they saw before rm-860.
-            let original_items = items.clone();
-            for item in items.iter_mut() {
-                normalized_spellings += crate::normalize_duplicate_field_spellings(item);
-            }
-            array_lane_disclosures = items
-                .iter()
-                .flat_map(crate::unrecognized_usage_keys)
-                .collect();
-            array_events =
-                serde_json::from_value(serde_json::Value::Array(std::mem::take(items))).ok();
-            if array_events.is_none() {
-                if let Some(value) = parsed_value.as_mut() {
-                    *value = serde_json::Value::Array(original_items);
-                }
-            }
+    if array_events.is_none()
+        && let Some(items) = parsed_value.as_mut().and_then(Value::as_array_mut)
+    {
+        // rm-860 × value-lane fallbacks (independent review of the
+        // combined tree, conflict case b51a087890464039a0a1e3a762c19f61):
+        // keep the pre-normalization array. An element fails the
+        // strict `Vec<Event>` parse for reasons a duplicate-spelling
+        // pass cannot fix (a wrong-typed `is_error`/`redacted` bool,
+        // a non-object element), and consuming the array via
+        // `std::mem::take` on that failing path would hand the
+        // value-based lanes below (`parse_gemini_value` /
+        // `parse_cline_value` array arms) an EMPTY array — stranding
+        // a doc those lanes would have parsed, regressing it to
+        // `unsupported session format`. The clone rides only the
+        // rare strict-failure path (docs that parse cleanly never
+        // get here), and the untouched array is restored when the
+        // retry still fails so the fallback lanes see exactly what
+        // they saw before rm-860.
+        let original_items = items.clone();
+        for item in items.iter_mut() {
+            normalized_spellings += crate::normalize_duplicate_field_spellings(item);
+        }
+        array_lane_disclosures = items
+            .iter()
+            .flat_map(crate::unrecognized_usage_keys)
+            .collect();
+        array_events = serde_json::from_value(serde_json::Value::Array(std::mem::take(items))).ok();
+        if array_events.is_none()
+            && let Some(value) = parsed_value.as_mut()
+        {
+            *value = serde_json::Value::Array(original_items);
         }
     }
-    if let Some(mut events) = array_events {
-        if !events.is_empty() {
-            for event in &mut events {
-                if event.source_tool.is_empty() {
-                    event.source_tool = "generic".to_string();
-                }
+    if let Some(mut events) = array_events
+        && !events.is_empty()
+    {
+        for event in &mut events {
+            if event.source_tool.is_empty() {
+                event.source_tool = "generic".to_string();
             }
-            // rm-757 (run 9ab0afad assess F2): this array lane used to
-            // hand the events straight to `session_from_events`, so a
-            // top-level JSON-array journal never entered the per-line
-            // disclosure mint in `parse_jsonl_session` — every usage
-            // disclosure it owed was silently zero (PoC arr-low.jsonl:
-            // tokens fell to the text estimator with no `usage_*`
-            // entry anywhere in the JSON). Route the array's elements
-            // through the SAME case-folded classifier (rm-756) and the
-            // SAME capped mint (rm-594 residual) before returning —
-            // the elements were captured into `array_lane_disclosures`
-            // above because the rm-860 retry consumes the array.
-            let mut session = session_from_events(name, path, events)?;
-            for disclosure in array_lane_disclosures {
-                crate::mint_disclosure(&mut session.metrics.line_skips, disclosure, 1);
-            }
-            // rm-860: a duplicate-spelling doc that parsed under the
-            // canonical-winner retry is informational, not parse loss —
-            // the counter rides the NON-LOSS disclosure channel
-            // (`disclosure_counters`, rendered under "Disclosed facts",
-            // never degrading `data_health.confidence`).
-            if normalized_spellings > 0 {
-                *session
-                    .metrics
-                    .disclosure_counters
-                    .entry("duplicate_spelling_normalized".to_string())
-                    .or_insert(0) += normalized_spellings;
-            }
-            return Ok(session);
         }
+        // rm-757 (run 9ab0afad assess F2): this array lane used to
+        // hand the events straight to `session_from_events`, so a
+        // top-level JSON-array journal never entered the per-line
+        // disclosure mint in `parse_jsonl_session` — every usage
+        // disclosure it owed was silently zero (PoC arr-low.jsonl:
+        // tokens fell to the text estimator with no `usage_*`
+        // entry anywhere in the JSON). Route the array's elements
+        // through the SAME case-folded classifier (rm-756) and the
+        // SAME capped mint (rm-594 residual) before returning —
+        // the elements were captured into `array_lane_disclosures`
+        // above because the rm-860 retry consumes the array.
+        let mut session = session_from_events(name, path, events)?;
+        for disclosure in array_lane_disclosures {
+            crate::mint_disclosure(&mut session.metrics.line_skips, disclosure, 1);
+        }
+        // rm-860: a duplicate-spelling doc that parsed under the
+        // canonical-winner retry is informational, not parse loss —
+        // the counter rides the NON-LOSS disclosure channel
+        // (`disclosure_counters`, rendered under "Disclosed facts",
+        // never degrading `data_health.confidence`).
+        if normalized_spellings > 0 {
+            *session
+                .metrics
+                .disclosure_counters
+                .entry("duplicate_spelling_normalized".to_string())
+                .or_insert(0) += normalized_spellings;
+        }
+        return Ok(session);
     }
     if let Some(value) = parsed_value {
         if let Some(events) = parse_opencode_storage_value(path, &value) {
@@ -615,13 +613,12 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         // totalNanoAiu is absent there), so credits must read
                         // both shapes — max-fold, matching the rm-485
                         // family's repeated-snapshot semantics.
-                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64) {
-                            if nano.is_finite() {
-                                let slot =
-                                    per_model_credit_nano.entry(model.clone()).or_insert(0.0);
-                                if nano > *slot {
-                                    *slot = nano;
-                                }
+                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64)
+                            && nano.is_finite()
+                        {
+                            let slot = per_model_credit_nano.entry(model.clone()).or_insert(0.0);
+                            if nano > *slot {
+                                *slot = nano;
                             }
                         }
                         if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
@@ -660,10 +657,10 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 if let Some(nano) = data
                     .and_then(|data| data.get("totalNanoAiu"))
                     .and_then(Value::as_f64)
+                    && nano.is_finite()
+                    && nano > max_credit_nano
                 {
-                    if nano.is_finite() && nano > max_credit_nano {
-                        max_credit_nano = nano;
-                    }
+                    max_credit_nano = nano;
                 }
             }
             // rm-485/rm-551: checkpoints carry the same shapes as shutdown
@@ -683,13 +680,12 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                         // shutdown arm — checkpoints carry modelMetrics
                         // with totalNanoAiu on live agent-host sessions
                         // (top-level nanoAiu but no tokens, #1651).
-                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64) {
-                            if nano.is_finite() {
-                                let slot =
-                                    per_model_credit_nano.entry(model.clone()).or_insert(0.0);
-                                if nano > *slot {
-                                    *slot = nano;
-                                }
+                        if let Some(nano) = metric.get("totalNanoAiu").and_then(Value::as_f64)
+                            && nano.is_finite()
+                        {
+                            let slot = per_model_credit_nano.entry(model.clone()).or_insert(0.0);
+                            if nano > *slot {
+                                *slot = nano;
                             }
                         }
                         if let Some(mut usage) = metric.get("usage").and_then(usage_from_value) {
@@ -727,10 +723,10 @@ fn parse_copilot_session_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 if let Some(nano) = data
                     .and_then(|data| data.get("totalNanoAiu"))
                     .and_then(Value::as_f64)
+                    && nano.is_finite()
+                    && nano > max_credit_nano
                 {
-                    if nano.is_finite() && nano > max_credit_nano {
-                        max_credit_nano = nano;
-                    }
+                    max_credit_nano = nano;
                 }
             }
             _ => {
@@ -1225,10 +1221,10 @@ fn parse_antigravity_trajectory(raw: &str) -> Option<Vec<Event>> {
                 assistant.reasoning = thinking;
                 assistant.tool_calls = tool_calls;
                 events.push(assistant);
-                if let Some(planner) = step.pointer("/plannerResponse").and_then(Value::as_object) {
-                    if let Some(usage) = antigravity_usage_block(planner) {
-                        usage_fold.fold(&usage, antigravity_model_id(planner), &timestamp);
-                    }
+                if let Some(planner) = step.pointer("/plannerResponse").and_then(Value::as_object)
+                    && let Some(usage) = antigravity_usage_block(planner)
+                {
+                    usage_fold.fold(&usage, antigravity_model_id(planner), &timestamp);
                 }
             }
             "CORTEX_STEP_TYPE_RUN_COMMAND" => {
@@ -1897,22 +1893,20 @@ fn apply_hermes_session_timestamps(events: &mut [Event], session_start: &str, se
     if events.iter().any(|event| !event.timestamp.is_empty()) {
         return;
     }
-    if !session_start.is_empty() {
-        if let Some(first) = events
+    if !session_start.is_empty()
+        && let Some(first) = events
             .iter_mut()
             .find(|event| event.role != "meta" && event.role != "session_meta")
-        {
-            first.timestamp = session_start.to_string();
-        }
+    {
+        first.timestamp = session_start.to_string();
     }
-    if !session_end.is_empty() {
-        if let Some(last) = events
+    if !session_end.is_empty()
+        && let Some(last) = events
             .iter_mut()
             .rev()
             .find(|event| event.role != "meta" && event.role != "session_meta")
-        {
-            last.timestamp = session_end.to_string();
-        }
+    {
+        last.timestamp = session_end.to_string();
     }
 }
 
@@ -3745,18 +3739,17 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
             }
             "turn_context" => {
                 saw_codex = true;
-                if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
-                    if let Some(next_model) = string(payload.get("model")).filter(|m| !m.is_empty())
-                    {
-                        model = next_model.to_string();
-                        events.push(Event {
-                            role: "meta".to_string(),
-                            timestamp: ts,
-                            model_used: model.clone(),
-                            source_tool: "codex_cli".to_string(),
-                            ..Event::default()
-                        });
-                    }
+                if let Some(payload) = obj.get("payload").and_then(Value::as_object)
+                    && let Some(next_model) = string(payload.get("model")).filter(|m| !m.is_empty())
+                {
+                    model = next_model.to_string();
+                    events.push(Event {
+                        role: "meta".to_string(),
+                        timestamp: ts,
+                        model_used: model.clone(),
+                        source_tool: "codex_cli".to_string(),
+                        ..Event::default()
+                    });
                 }
             }
             "event_msg" => {
@@ -4119,10 +4112,10 @@ fn parse_codex_rollout_jsonl(raw: &str) -> Option<(Vec<Event>, BTreeMap<String, 
                 // this very payload as latest_token_usage_record. Register the
                 // marker; buffered records pair with it after the loop.
                 if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
-                    if let Some(response_id) = string(payload.get("compaction_response_id")) {
-                        if !response_id.is_empty() {
-                            compaction_response_ids.insert(response_id.to_string());
-                        }
+                    if let Some(response_id) = string(payload.get("compaction_response_id"))
+                        && !response_id.is_empty()
+                    {
+                        compaction_response_ids.insert(response_id.to_string());
                     }
                     if let Some(record) = payload.get("latest_token_usage_record") {
                         collect_codex_usage_record(record, &mut usage_records, &ts);
@@ -4669,34 +4662,34 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut cwd = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
-        if cwd.is_empty() {
-            if let Some(body_cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty()) {
-                // rm-778: cap the journal-derived cwd at parse time
-                // (assess 0ff2b543 F1: the claude lane's unbounded cwd
-                // was the 500k-component PoC's entry point).
-                let (capped, cwd_truncated) = cap_session_cwd(body_cwd);
-                cwd = capped;
-                // rm-585 (spend-by-branch, first cut): gitBranch rides
-                // the same envelope as cwd on every claude-code line;
-                // capture it onto the session_meta event so the session
-                // carries the branch it ran on. Detached HEAD writes
-                // the literal "HEAD" — kept verbatim here, normalized
-                // to the "unknown" bucket only in the overview rollup
-                // (never a panic: the value is a plain map key).
-                let branch = string(obj.get("gitBranch"))
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("")
-                    .to_string();
-                events.push(Event {
-                    role: "session_meta".to_string(),
-                    cwd: cwd.clone(),
-                    branch,
-                    model_used: model.clone(),
-                    source_tool: "claude_code".to_string(),
-                    disclosure_counters: cwd_truncation_disclosure("claude_code", cwd_truncated),
-                    ..Event::default()
-                });
-            }
+        if cwd.is_empty()
+            && let Some(body_cwd) = string(obj.get("cwd")).filter(|value| !value.is_empty())
+        {
+            // rm-778: cap the journal-derived cwd at parse time
+            // (assess 0ff2b543 F1: the claude lane's unbounded cwd
+            // was the 500k-component PoC's entry point).
+            let (capped, cwd_truncated) = cap_session_cwd(body_cwd);
+            cwd = capped;
+            // rm-585 (spend-by-branch, first cut): gitBranch rides
+            // the same envelope as cwd on every claude-code line;
+            // capture it onto the session_meta event so the session
+            // carries the branch it ran on. Detached HEAD writes
+            // the literal "HEAD" — kept verbatim here, normalized
+            // to the "unknown" bucket only in the overview rollup
+            // (never a panic: the value is a plain map key).
+            let branch = string(obj.get("gitBranch"))
+                .filter(|value| !value.is_empty())
+                .unwrap_or("")
+                .to_string();
+            events.push(Event {
+                role: "session_meta".to_string(),
+                cwd: cwd.clone(),
+                branch,
+                model_used: model.clone(),
+                source_tool: "claude_code".to_string(),
+                disclosure_counters: cwd_truncation_disclosure("claude_code", cwd_truncated),
+                ..Event::default()
+            });
         }
         match typ {
             "user" => {
@@ -4713,11 +4706,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 let Some(message) = obj.get("message").and_then(Value::as_object) else {
                     continue;
                 };
-                if model == "unknown" {
-                    if let Some(next_model) = string(message.get("model")).filter(|m| !m.is_empty())
-                    {
-                        model = next_model.to_string();
-                    }
+                if model == "unknown"
+                    && let Some(next_model) = string(message.get("model")).filter(|m| !m.is_empty())
+                {
+                    model = next_model.to_string();
                 }
                 if let Some(usage) = message.get("usage").and_then(usage_from_value) {
                     let message_id = string(message.get("id")).unwrap_or("");
@@ -4896,11 +4888,7 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             _ => {}
         }
     }
-    if saw_claude {
-        non_empty(events)
-    } else {
-        None
-    }
+    if saw_claude { non_empty(events) } else { None }
 }
 
 /// rm-406 (dated 2026-10-07 arm): mine `message.usage.iterations[]`
@@ -4955,27 +4943,27 @@ fn claude_iterations_events(
             continue;
         }
         let advisor_model = string(entry.get("model")).filter(|model| !model.is_empty());
-        if typ == "advisor_message" {
-            if let Some(advisor_model) = advisor_model {
-                if let Some(usage) = usage_from_value(iteration) {
-                    attributed += 1;
-                    events.push(Event {
-                        role: "meta".to_string(),
-                        timestamp: ts.to_string(),
-                        usage,
-                        model_used: advisor_model.to_string(),
-                        source_tool: "claude_code".to_string(),
-                        ..Event::default()
-                    });
-                    continue;
-                }
-                // Advisor entry whose usage keys are absent: disclose,
-                // never guess zeros.
-                *disclosure
-                    .entry("claude_iterations_advisor_usage_missing".to_string())
-                    .or_insert(0) += 1;
+        if typ == "advisor_message"
+            && let Some(advisor_model) = advisor_model
+        {
+            if let Some(usage) = usage_from_value(iteration) {
+                attributed += 1;
+                events.push(Event {
+                    role: "meta".to_string(),
+                    timestamp: ts.to_string(),
+                    usage,
+                    model_used: advisor_model.to_string(),
+                    source_tool: "claude_code".to_string(),
+                    ..Event::default()
+                });
                 continue;
             }
+            // Advisor entry whose usage keys are absent: disclose,
+            // never guess zeros.
+            *disclosure
+                .entry("claude_iterations_advisor_usage_missing".to_string())
+                .or_insert(0) += 1;
+            continue;
         }
         // Unknown or model-less shapes: disclosed by wire type, capped
         // by the shared rm-594 treatment.
@@ -5133,11 +5121,7 @@ fn parse_copilot_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             }
         }
     }
-    if saw_copilot {
-        non_empty(events)
-    } else {
-        None
-    }
+    if saw_copilot { non_empty(events) } else { None }
 }
 
 fn parse_kimi_value(value: &Value) -> Option<Vec<Event>> {
@@ -5434,10 +5418,10 @@ fn parse_gemini_value(value: &Value) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
     parse_gemini_object(value, &mut model, &mut events);
-    if events.is_empty() {
-        if let Some(arr) = value.as_array() {
-            parse_gemini_array(arr, "", &model, &mut events);
-        }
+    if events.is_empty()
+        && let Some(arr) = value.as_array()
+    {
+        parse_gemini_array(arr, "", &model, &mut events);
     }
     non_empty(events)
 }
@@ -5447,10 +5431,10 @@ fn parse_gemini_object(value: &Value, model: &mut String, events: &mut Vec<Event
         return;
     };
     for key in ["modelVersion", "model", "modelId"] {
-        if let Some(value) = string(obj.get(key)) {
-            if !value.is_empty() {
-                *model = value.to_string();
-            }
+        if let Some(value) = string(obj.get(key))
+            && !value.is_empty()
+        {
+            *model = value.to_string();
         }
     }
     for key in ["usageMetadata", "usage", "tokenUsage"] {
@@ -5610,12 +5594,11 @@ fn is_opencode_storage_session_file(path: &str) -> bool {
 }
 
 fn opencode_storage_rel(path: &str) -> Option<String> {
-    if let Ok(root) = std::env::var("OPENCODE_DATA_DIR") {
-        if !root.is_empty() {
-            if let Some(rel) = rel_from_root(Path::new(&root), Path::new(path)) {
-                return Some(rel);
-            }
-        }
+    if let Ok(root) = std::env::var("OPENCODE_DATA_DIR")
+        && !root.is_empty()
+        && let Some(rel) = rel_from_root(Path::new(&root), Path::new(path))
+    {
+        return Some(rel);
     }
 
     let clean = path_slash(Path::new(path));
@@ -6105,17 +6088,18 @@ fn cline_content_events(
                 };
                 match string(block.get("type")).unwrap_or("") {
                     "text" => {
-                        if let Some(text) = string(block.get("text")) {
-                            if !role.is_empty() && !text.is_empty() {
-                                events.push(Event {
-                                    role: role.to_string(),
-                                    content: text.to_string(),
-                                    timestamp: ts.to_string(),
-                                    model_used: model.to_string(),
-                                    source_tool: "cline".to_string(),
-                                    ..Event::default()
-                                });
-                            }
+                        if let Some(text) = string(block.get("text"))
+                            && !role.is_empty()
+                            && !text.is_empty()
+                        {
+                            events.push(Event {
+                                role: role.to_string(),
+                                content: text.to_string(),
+                                timestamp: ts.to_string(),
+                                model_used: model.to_string(),
+                                source_tool: "cline".to_string(),
+                                ..Event::default()
+                            });
                         }
                     }
                     "thinking" => {
@@ -6613,8 +6597,8 @@ fn kimi_message_events(message: &Map<String, Value>, model: &str, events: &mut V
 }
 
 #[cfg(test)] // test-only since rm-526 moved every production caller to
-             // `jsonl_objects_counted`, which discloses the drops instead of
-             // silently filter-mapping them away
+// `jsonl_objects_counted`, which discloses the drops instead of
+// silently filter-mapping them away
 fn jsonl_objects(raw: &str) -> impl Iterator<Item = Map<String, Value>> + '_ {
     raw.lines()
         .filter_map(|line| parse_jsonl_value_lenient(line.trim()))
@@ -6691,33 +6675,35 @@ fn repair_lone_surrogates(line: &str) -> Option<String> {
             i += 2;
             continue;
         }
-        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'u') && i + 6 <= bytes.len() {
-            if let Some(code) = hex_escape_u16(&bytes[i + 2..i + 6]) {
-                if (0xD800..=0xDBFF).contains(&code) {
-                    let pair = i + 12 <= bytes.len()
-                        && bytes.get(i + 6) == Some(&b'\\')
-                        && bytes.get(i + 7) == Some(&b'u')
-                        && hex_escape_u16(&bytes[i + 8..i + 12])
-                            .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next));
-                    if pair {
-                        // Both hex groups are ASCII, so `i..i + 12` lies on
-                        // char boundaries and the slice below cannot cut a
-                        // character.
-                        out.push_str(&line[i..i + 12]);
-                        i += 12;
-                    } else {
-                        out.push_str("\\ufffd");
-                        changed = true;
-                        i += 6;
-                    }
-                    continue;
-                }
-                if (0xDC00..=0xDFFF).contains(&code) {
+        if bytes[i] == b'\\'
+            && bytes.get(i + 1) == Some(&b'u')
+            && i + 6 <= bytes.len()
+            && let Some(code) = hex_escape_u16(&bytes[i + 2..i + 6])
+        {
+            if (0xD800..=0xDBFF).contains(&code) {
+                let pair = i + 12 <= bytes.len()
+                    && bytes.get(i + 6) == Some(&b'\\')
+                    && bytes.get(i + 7) == Some(&b'u')
+                    && hex_escape_u16(&bytes[i + 8..i + 12])
+                        .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next));
+                if pair {
+                    // Both hex groups are ASCII, so `i..i + 12` lies on
+                    // char boundaries and the slice below cannot cut a
+                    // character.
+                    out.push_str(&line[i..i + 12]);
+                    i += 12;
+                } else {
                     out.push_str("\\ufffd");
                     changed = true;
                     i += 6;
-                    continue;
                 }
+                continue;
+            }
+            if (0xDC00..=0xDFFF).contains(&code) {
+                out.push_str("\\ufffd");
+                changed = true;
+                i += 6;
+                continue;
             }
         }
         let ch = line[i..].chars().next()?;
@@ -7149,18 +7135,18 @@ fn read_json_value(path: &Path) -> Option<Value> {
 
 fn cline_model(metadata: &Map<String, Value>) -> String {
     for key in ["model", "modelId", "model_id", "apiModelId"] {
-        if let Some(model) = string(metadata.get(key)) {
-            if !model.is_empty() {
-                return model.to_string();
-            }
+        if let Some(model) = string(metadata.get(key))
+            && !model.is_empty()
+        {
+            return model.to_string();
         }
     }
     if let Some(config) = metadata.get("apiConfiguration").and_then(Value::as_object) {
         for key in ["model", "modelId", "model_id", "apiModelId"] {
-            if let Some(model) = string(config.get(key)) {
-                if !model.is_empty() {
-                    return model.to_string();
-                }
+            if let Some(model) = string(config.get(key))
+                && !model.is_empty()
+            {
+                return model.to_string();
             }
         }
     }
@@ -7262,10 +7248,10 @@ fn apply_cline_metadata_timestamps(events: &mut [Event], metadata: &Map<String, 
     if !start.is_empty() {
         events[0].timestamp = start;
     }
-    if !end.is_empty() {
-        if let Some(last) = events.last_mut() {
-            last.timestamp = end;
-        }
+    if !end.is_empty()
+        && let Some(last) = events.last_mut()
+    {
+        last.timestamp = end;
     }
 }
 
@@ -8309,9 +8295,11 @@ mod tests {
             "argumentsJson must be parsed from its JSON string: {:?}",
             planner.tool_calls[0].args
         );
-        assert!(events
-            .iter()
-            .all(|event| event.source_tool == "antigravity_cli"));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.source_tool == "antigravity_cli")
+        );
     }
 
     #[test]
@@ -9492,10 +9480,12 @@ mod tests {
                 .contains_key("workbuddy_usage_dropped:reasoning"),
             "reasoning-record usage is READ into the sum (upstream #311 rider), never dropped"
         );
-        assert!(!session
-            .metrics
-            .disclosure_counters
-            .contains_key("workbuddy_input_basis:cache_clamped"));
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("workbuddy_input_basis:cache_clamped")
+        );
         assert!(session.metrics.line_skips.is_empty());
     }
 
@@ -9634,10 +9624,12 @@ mod tests {
                 .get("codex_token_usage_record_unpaired"),
             Some(&1)
         );
-        assert!(!session
-            .metrics
-            .line_skips
-            .contains_key("codex_compaction_usage_record"));
+        assert!(
+            !session
+                .metrics
+                .line_skips
+                .contains_key("codex_compaction_usage_record")
+        );
     }
 
     #[test]
@@ -9749,7 +9741,7 @@ mod tests {
         // the cache first).
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("TZ");
-        std::env::set_var("TZ", "America/New_York");
+        crate::test_env::set_var_guarded("TZ", "America/New_York");
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         // Fall-back repeat hour (2026-11-01 01:30 happens twice: EDT
         // -04:00 at 05:30Z, then EST -05:00 at 06:30Z). chrono 0.4.45's
@@ -9784,8 +9776,8 @@ mod tests {
         // Unparseable input stays empty (pre-existing behavior).
         assert_eq!(aider_time("not a timestamp"), "");
         match prior {
-            Some(value) => std::env::set_var("TZ", value),
-            None => std::env::remove_var("TZ"),
+            Some(value) => crate::test_env::set_var_guarded("TZ", value),
+            None => crate::test_env::remove_var_guarded("TZ"),
         }
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         drop(_env);

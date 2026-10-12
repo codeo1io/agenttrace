@@ -18,12 +18,12 @@
 //!   guard), and unknown usage wire keys are disclosed instead of silently
 //!   zeroing tokens (PoC p4-kimi).
 
+use agenttrace_core::TimeRange;
 use agenttrace_core::data_health;
 use agenttrace_core::parse_raw_session;
 use agenttrace_core::report_overview_html_with_context;
 use agenttrace_core::report_overview_markdown_with_context;
 use agenttrace_core::report_overview_text_with_context;
-use agenttrace_core::TimeRange;
 
 fn codex_meta() -> String {
     serde_json::json!({
@@ -113,10 +113,12 @@ fn codex_unmatched_keys_are_sanitized_at_mint() {
     assert_eq!(hostile, 2, "both unmatched hostile arms sanitized");
     // Benign value rides through byte-identical — no persisted-shape
     // change for clean corpora (rm-594: no schema bump).
-    assert!(session
-        .metrics
-        .line_skips
-        .contains_key("codex_unmatched_response_item:future_widget"));
+    assert!(
+        session
+            .metrics
+            .line_skips
+            .contains_key("codex_unmatched_response_item:future_widget")
+    );
 }
 
 #[test]

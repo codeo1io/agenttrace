@@ -6,7 +6,7 @@
 //! names drift, these tests are the tripwire — update the constant and
 //! the attribute spellings together, deliberately.
 
-use agenttrace_core::{parse_file, report_otel_export, SEMCONV_SNAPSHOT_DATE};
+use agenttrace_core::{SEMCONV_SNAPSHOT_DATE, parse_file, report_otel_export};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {

@@ -25,6 +25,21 @@ use std::path::PathBuf;
 /// observe a sibling's).
 static STALE_CACHE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. Every env mutation in this file routes through these
+// helpers while holding this file's `STALE_CACHE_ENV_LOCK` — the single-threaded proof stated once
+// (mirroring core's test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    // SAFETY: caller holds `STALE_CACHE_ENV_LOCK` for the whole mutation window.
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/copilot-checkpoints")
@@ -262,11 +277,11 @@ fn stale_schema_32_cache_cannot_mask_the_agent_lane_rollup() {
     let key = "AGENTTRACE_SESSION_CACHE_DIR";
     let _env_guard = STALE_CACHE_ENV_LOCK.lock().unwrap();
     let previous = std::env::var_os(key);
-    std::env::set_var(key, &root);
+    set_var_guarded(key, &root);
     let sessions = agenttrace_core::load_sessions_from_dir(Some(&sessions_dir));
     match previous {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+        Some(value) => set_var_guarded(key, value),
+        None => remove_var_guarded(key),
     }
 
     assert_eq!(sessions.len(), 1, "one session discovered");
@@ -361,11 +376,11 @@ fn stale_schema_35_cache_cannot_mask_the_hostile_value_folds() {
     let key = "AGENTTRACE_SESSION_CACHE_DIR";
     let _env_guard = STALE_CACHE_ENV_LOCK.lock().unwrap();
     let previous = std::env::var_os(key);
-    std::env::set_var(key, &root);
+    set_var_guarded(key, &root);
     let sessions = agenttrace_core::load_sessions_from_dir(Some(&sessions_dir));
     match previous {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+        Some(value) => set_var_guarded(key, value),
+        None => remove_var_guarded(key),
     }
 
     assert_eq!(sessions.len(), 1, "one session discovered");

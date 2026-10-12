@@ -13,8 +13,8 @@
 ///   `Utc::now()`, so the card cannot drift between renders;
 /// - an empty corpus renders a valid card instead of panicking.
 use agenttrace_core::{
-    compute_overview, demo_sessions, report_overview_svg, report_overview_svg_with_context,
-    SvgCardTheme,
+    SvgCardTheme, compute_overview, demo_sessions, report_overview_svg,
+    report_overview_svg_with_context,
 };
 
 const GOLDEN_DIR: &str = "tests/fixtures/svg-card";

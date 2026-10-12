@@ -108,10 +108,10 @@ impl CapturedStatusline {
 /// removes it by explicit path alongside the other cache artifacts
 /// (rm-086: the session-cache artifact registry owns that set).
 pub fn statusline_capture_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
-            return dir.join("statusline.jsonl");
-        }
+    if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from)
+        && !dir.as_os_str().is_empty()
+    {
+        return dir.join("statusline.jsonl");
     }
     user_cache_dir().join("agenttrace").join("statusline.jsonl")
 }
@@ -139,10 +139,10 @@ fn resolve_user_cache_dir(
     home: Option<&std::ffi::OsStr>,
     xdg_cache_home: Option<&std::ffi::OsStr>,
 ) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = home.filter(|value| !value.is_empty()) {
-            return PathBuf::from(home).join("Library").join("Caches");
-        }
+    if cfg!(target_os = "macos")
+        && let Some(home) = home.filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(home).join("Library").join("Caches");
     }
     if let Some(cache) = xdg_cache_home.filter(|value| !value.is_empty()) {
         return PathBuf::from(cache);
@@ -194,13 +194,13 @@ pub fn run_statusline_host() -> anyhow::Result<()> {
     // problem into exit 101. Write and ignore the error instead.
     let mut stdout = io::stdout().lock();
     let _ = writeln!(stdout, "{line}");
-    if let Some(payload) = payload {
-        if let Err(err) = append_statusline_capture(&payload) {
-            let _ = writeln!(
-                io::stderr(),
-                "agenttrace statusline: capture failed ({err})."
-            );
-        }
+    if let Some(payload) = payload
+        && let Err(err) = append_statusline_capture(&payload)
+    {
+        let _ = writeln!(
+            io::stderr(),
+            "agenttrace statusline: capture failed ({err})."
+        );
     }
     Ok(())
 }
@@ -1960,7 +1960,7 @@ mod tests {
         // lock so sibling-module tests cannot re-point it mid-append.
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let payload: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
         append_statusline_capture(&payload).expect("first append");
         // A crash mid-append leaves a torn line; reads skip it.
@@ -1984,8 +1984,8 @@ mod tests {
         assert_eq!(stats.retained_max_bytes, STATUSLINE_CAPTURE_MAX_BYTES);
         assert!(stats.lines >= 2);
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -2460,9 +2460,9 @@ mod tests {
         // ending on a line boundary.
         let head: String = (0..97).map(|i| format!("line-{i:03}\n")).collect();
         let head_len = head.len() as u64; // 873
-                                          //
-                                          // tail blob: exactly cap-2 bytes, starting with '\n' so the torn char
-                                          // forms its own complete line, then ASCII filler lines.
+        //
+        // tail blob: exactly cap-2 bytes, starting with '\n' so the torn char
+        // forms its own complete line, then ASCII filler lines.
         let mut tail = String::from("\n");
         let mut filler_len = (cap - 3) as usize;
         while filler_len >= 10 {
@@ -2513,7 +2513,7 @@ mod tests {
         // shared env lock so sibling tests cannot re-point it.
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let journal = root.join("statusline.jsonl");
         let mut bytes = Vec::new();
         while bytes.len() <= STATUSLINE_CAPTURE_MAX_BYTES as usize {
@@ -2550,8 +2550,8 @@ mod tests {
             "the newest capture is the appended FIXTURE payload"
         );
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -2641,7 +2641,7 @@ mod tests {
         // lock so sibling-module tests cannot re-point it mid-append.
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let payload = serde_json::json!({
             "session_id": "probe2-RED\u{001b}[31mX",
             "prompt_cache": {
@@ -2683,8 +2683,8 @@ mod tests {
             "JSON output is unchanged: raw payload, serde-escaped"
         );
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -2790,7 +2790,7 @@ mod tests {
         // lock so sibling-module tests cannot re-point it mid-append.
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let payload: Value = serde_json::from_str(FIXTURE).expect("fixture parses");
         append_statusline_capture(&payload).expect("append capture");
         let mode = fs::metadata(&journal)
@@ -2815,8 +2815,8 @@ mod tests {
             mode & 0o777
         );
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(root);
@@ -2966,7 +2966,7 @@ mod tests {
         // cache root mid-append; prior value restored before release.
         let _env = crate::test_env::lock_env();
         let prior = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let journal = statusline_capture_path();
         append_statusline_capture(&serde_json::json!({ "session_id": "seed" }))
             .expect("seed append");
@@ -2990,8 +2990,8 @@ mod tests {
         let after_append = fs::read_to_string(&journal).expect("journal readable");
         assert!(after_append.contains("\"session_id\":\"kept\""));
         match prior {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = fs::remove_dir_all(&root);
@@ -3067,9 +3067,11 @@ mod tests {
         // the same OSC-52 — an implementation that only handled the
         // BEL-terminated form would pass without it (review fix).
         let sanitized = sanitize_output_document(poisoned);
-        assert!(!sanitized
-            .chars()
-            .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control()));
+        assert!(
+            !sanitized
+                .chars()
+                .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+        );
         // Prefixes survive: the readable name around the sequence is kept,
         // so reports stay legible after neutralization.
         assert!(sanitized.starts_with('a') && sanitized.contains('b'));

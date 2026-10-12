@@ -10,7 +10,13 @@ REPO="luoyuctl/agenttrace"
 # clone time is not what this installer was tested against. Keep in
 # lockstep with the newest published release tag; override for forks or
 # testing with AGENTTRACE_SOURCE_REF (tag or branch name).
-REF="${AGENTTRACE_SOURCE_REF:-v0.10.1}"
+# rm-550: honor the documented AGENTTRACE_VERSION pin with the same
+# precedence install.ps1 uses (explicit -Version argument > env > latest):
+# AGENTTRACE_VERSION selects the release tag for the binary download;
+# AGENTTRACE_SOURCE_REF still pins only the build-from-source fallback
+# and, when both are set, wins there (SOURCE_REF > VERSION > v0.10.1).
+VERSION="${AGENTTRACE_VERSION:-}"
+REF="${AGENTTRACE_SOURCE_REF:-${VERSION:-v0.10.1}}"
 # Install receipt for the source-build fallback (rm-051): records the
 # exact ref that was built, so an install can be audited later.
 INSTALL_RECEIPT="${AGENTTRACE_INSTALL_RECEIPT:-${XDG_DATA_HOME:-$HOME/.local/share}/agenttrace/install-receipt}"
@@ -46,11 +52,17 @@ fi
 mkdir -p "$INSTALL_DIR"
 DEST="${INSTALL_DIR}/${BIN}"
 
-# — resolve latest release asset —
-echo "🔍 Fetching latest release..."
+# — resolve the release asset: latest, or the AGENTTRACE_VERSION tag —
 ASSET="${BIN}-${OS}-${ARCH}"
+if [ -n "$VERSION" ]; then
+  echo "🔍 Fetching release ${VERSION} (pinned by AGENTTRACE_VERSION; unset it to install latest)..."
+  DEFAULT_RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}"
+else
+  echo "🔍 Fetching latest release..."
+  DEFAULT_RELEASE_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+fi
 # AGENTTRACE_DOWNLOAD_URL overrides the release URL (used by offline CI tests).
-RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download/${ASSET}}"
+RELEASE_URL="${AGENTTRACE_DOWNLOAD_URL:-$DEFAULT_RELEASE_URL}"
 # AGENTTRACE_SOURCE_URL overrides the source-build clone/fetch URL (offline CI tests).
 SRC_URL="${AGENTTRACE_SOURCE_URL:-https://github.com/${REPO}.git}"
 
@@ -130,7 +142,7 @@ if ! "$TMP" --version >"$VERIFY_LOG" 2>&1; then
   fi
   if command -v git >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
     echo "🔧 Falling back to building from source with this host's toolchain..."
-    echo "   Cloning $REPO at pinned ref $REF (set AGENTTRACE_SOURCE_REF to override)."
+    echo "   Cloning $REPO at pinned ref $REF (AGENTTRACE_SOURCE_REF > AGENTTRACE_VERSION > default; set AGENTTRACE_SOURCE_REF to override)."
     # rm-051 + rm-235 (campaign-local rm-030): the fallback builds a
     # PINNED, verifiable ref -- never a floating master tip. The pin is
     # the release tag declared above (rm-051) or whatever
@@ -167,7 +179,7 @@ if ! "$TMP" --version >"$VERIFY_LOG" 2>&1; then
         echo "❌ Fetched commit ${SRC_SHA} does not match the pinned ref ${PINNED_SHA}; refusing."
       else
         echo "❌ Cannot fetch pinned ref '$REF' for the source build; refusing to build an unverified master tip."
-        echo "   Set AGENTTRACE_SOURCE_REF=<tag-or-full-commit-sha> to pin the build explicitly."
+        echo "   Set AGENTTRACE_SOURCE_REF=<tag-or-full-commit-sha> (or AGENTTRACE_VERSION=<tag> for the release pin) to pin the build explicitly."
       fi
       exit 1
     fi
@@ -204,7 +216,7 @@ if ! "$TMP" --version >"$VERIFY_LOG" 2>&1; then
   else
     echo "❌ No compatible prebuilt binary and no Rust toolchain found."
     echo "   Install Rust (https://rustup.rs), then:"
-    echo "   git clone https://github.com/${REPO}.git && cd agenttrace && cargo build --release -p agenttrace"
+    echo "   git clone https://github.com/${REPO}.git && cd agenttrace && git checkout $REF && cargo build --release -p agenttrace"
     exit 1
   fi
 fi

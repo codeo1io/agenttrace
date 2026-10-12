@@ -1,5 +1,6 @@
 use agenttrace_core::{
-    add_baseline_comparison, average_health, build_doctor_report, compute_overview,
+    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
+    VERSION, add_baseline_comparison, average_health, build_doctor_report, compute_overview,
     compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
     delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
     fix_suggestions, inspect_first, list_pricing, load_sessions_with_options, lookup_price,
@@ -12,10 +13,8 @@ use agenttrace_core::{
     report_overview_text_with_context, report_search_json, report_search_text,
     report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
     session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
-    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
-    VERSION,
 };
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use chrono::Utc;
 use clap::Parser;
 use std::ffi::OsString;
@@ -704,7 +703,8 @@ fn run() -> anyhow::Result<()> {
             Some(sample) if sample < total_sessions => (
                 matched.into_iter().take(sample).collect::<Vec<_>>(),
                 Some(format!(
-                    "sampled first {sample} of {total_sessions} sessions in the --sort {} --order {} view (--sample {sample})", args.sort, args.order
+                    "sampled first {sample} of {total_sessions} sessions in the --sort {} --order {} view (--sample {sample})",
+                    args.sort, args.order
                 )),
             ),
             _ => (matched, None),
@@ -755,7 +755,8 @@ fn run() -> anyhow::Result<()> {
             Some(sample) if sample < total_sessions => (
                 matched.into_iter().take(sample).collect::<Vec<_>>(),
                 Some(format!(
-                    "sampled first {sample} of {total_sessions} sessions in the --sort {} --order {} view (--sample {sample})", args.sort, args.order
+                    "sampled first {sample} of {total_sessions} sessions in the --sort {} --order {} view (--sample {sample})",
+                    args.sort, args.order
                 )),
             ),
             _ => (matched, None),
@@ -1032,23 +1033,23 @@ fn run() -> anyhow::Result<()> {
         // booleans buried in the JSON while the process exited 0 — the
         // opposite of what a gate promises. Breach now exits 2 (mirroring
         // the health gate) unless --no-baseline-gate opts out.
-        if !args.no_baseline_gate {
-            if let Some(breaches) = baseline_breaches.filter(|b| b.any()) {
-                eprintln!("Gate failed: baseline regression above threshold");
-                eprintln!("Local evidence:");
-                if breaches.slower_than_baseline {
-                    eprintln!("- duration delta above --baseline-max-duration-delta-pct");
-                }
-                if breaches.cost_above_threshold {
-                    eprintln!("- cost delta above --baseline-max-cost-delta-pct");
-                }
-                if breaches.tokens_above_threshold {
-                    eprintln!("- token delta above --baseline-max-token-delta-pct");
-                }
-                eprintln!("- inspect: `baseline_comparison` in the report JSON");
-                eprintln!("- opt out: --no-baseline-gate");
-                std::process::exit(2);
+        if !args.no_baseline_gate
+            && let Some(breaches) = baseline_breaches.filter(|b| b.any())
+        {
+            eprintln!("Gate failed: baseline regression above threshold");
+            eprintln!("Local evidence:");
+            if breaches.slower_than_baseline {
+                eprintln!("- duration delta above --baseline-max-duration-delta-pct");
             }
+            if breaches.cost_above_threshold {
+                eprintln!("- cost delta above --baseline-max-cost-delta-pct");
+            }
+            if breaches.tokens_above_threshold {
+                eprintln!("- token delta above --baseline-max-token-delta-pct");
+            }
+            eprintln!("- inspect: `baseline_comparison` in the report JSON");
+            eprintln!("- opt out: --no-baseline-gate");
+            std::process::exit(2);
         }
         return Ok(());
     }
@@ -1340,11 +1341,11 @@ fn attach_audit_coverage(
         }
         _ => {
             let mut wrapped = serde_json::json!({ "report": value });
-            if let serde_json::Value::Object(map) = &mut wrapped {
-                if let serde_json::Value::Object(fields) = coverage {
-                    for (key, field) in fields {
-                        map.insert(key, field);
-                    }
+            if let serde_json::Value::Object(map) = &mut wrapped
+                && let serde_json::Value::Object(fields) = coverage
+            {
+                for (key, field) in fields {
+                    map.insert(key, field);
                 }
             }
             wrapped
@@ -1969,25 +1970,25 @@ fn ensure_output_is_not_an_input(
     };
     let resolved = resolve_output_destination(output);
     for session in sessions {
-        if let Ok(source) = fs::canonicalize(&session.path) {
-            if source == resolved {
-                bail!(
-                    "--output {} is an input session journal ({}); refusing to overwrite a transcript — choose a different --output destination",
-                    output.display(),
-                    session.path
-                );
-            }
+        if let Ok(source) = fs::canonicalize(&session.path)
+            && source == resolved
+        {
+            bail!(
+                "--output {} is an input session journal ({}); refusing to overwrite a transcript — choose a different --output destination",
+                output.display(),
+                session.path
+            );
         }
     }
     for candidate in attempted_parse_failures {
-        if let Ok(source) = fs::canonicalize(candidate) {
-            if source == resolved {
-                bail!(
-                    "--output {} is an input session journal that failed to parse ({}); refusing to overwrite a transcript — convert or move the journal, or choose a different --output destination",
-                    output.display(),
-                    candidate.display()
-                );
-            }
+        if let Ok(source) = fs::canonicalize(candidate)
+            && source == resolved
+        {
+            bail!(
+                "--output {} is an input session journal that failed to parse ({}); refusing to overwrite a transcript — convert or move the journal, or choose a different --output destination",
+                output.display(),
+                candidate.display()
+            );
         }
     }
     Ok(())
@@ -4097,10 +4098,12 @@ mod tests {
             fs::read_to_string(dir.join("missing.md")).unwrap(),
             "created\n"
         );
-        assert!(fs::symlink_metadata(&dangling)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
 
         let a = dir.join("cycle-a");
         let b = dir.join("cycle-b");
@@ -4197,11 +4200,13 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).expect("scratch dir");
         let fifo = dir.join("fifo");
-        assert!(std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo")
-            .success());
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
         let error = write_output(&Some(fifo.clone()), "x\n")
             .unwrap_err()
             .to_string();
@@ -4486,18 +4491,26 @@ mod tests {
     #[test]
     fn governance_formats_and_gate_thresholds_keep_cli_contracts() {
         let value = serde_json::json!({"status": "ok"});
-        assert!(render_governance_report(&value, "json")
-            .expect("json")
-            .starts_with('{'));
-        assert!(render_governance_report(&value, "markdown")
-            .expect("markdown")
-            .starts_with("```json"));
-        assert!(render_governance_report(&value, "html")
-            .expect("html")
-            .starts_with("<pre>"));
-        assert!(render_governance_report(&value, "text")
-            .expect("text")
-            .starts_with("status:"));
+        assert!(
+            render_governance_report(&value, "json")
+                .expect("json")
+                .starts_with('{')
+        );
+        assert!(
+            render_governance_report(&value, "markdown")
+                .expect("markdown")
+                .starts_with("```json")
+        );
+        assert!(
+            render_governance_report(&value, "html")
+                .expect("html")
+                .starts_with("<pre>")
+        );
+        assert!(
+            render_governance_report(&value, "text")
+                .expect("text")
+                .starts_with("status:")
+        );
 
         let mut args = compare_args(None);
         args.max_tool_fail_rate = Some(f64::NAN);

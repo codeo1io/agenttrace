@@ -1,10 +1,11 @@
 use crate::session_cache::{
-    cached_dir_listing, cached_file_mod_time_if_fresh, cached_session, delete_cached_session,
-    load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
+    SessionCache, cached_dir_listing, cached_file_mod_time_if_fresh, cached_session,
+    delete_cached_session, load_session_cache, save_session_cache, store_dir_listing,
+    store_session,
 };
 use crate::{
-    merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
-    Session,
+    Session, merge_preserved_history, parse_file, preserve_derived_history,
+    skip_sqlite_backed_file_dir,
 };
 use chrono::{DateTime, Utc};
 use std::cmp::Reverse;
@@ -212,10 +213,11 @@ pub fn discover_session_dirs() -> Vec<PathBuf> {
             dirs.push(candidate.path);
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join(".aider.chat.history.md").is_file() && seen.insert(cwd.clone()) {
-            dirs.push(cwd);
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && cwd.join(".aider.chat.history.md").is_file()
+        && seen.insert(cwd.clone())
+    {
+        dirs.push(cwd);
     }
     dirs
 }
@@ -1208,10 +1210,10 @@ fn open_code_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
             });
         }
     };
-    if let Some(data_dir) = std::env::var_os("OPENCODE_DATA_DIR").map(PathBuf::from) {
-        if !data_dir.as_os_str().is_empty() {
-            add("OpenCode", data_dir);
-        }
+    if let Some(data_dir) = std::env::var_os("OPENCODE_DATA_DIR").map(PathBuf::from)
+        && !data_dir.as_os_str().is_empty()
+    {
+        add("OpenCode", data_dir);
     }
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
         if !data_home.as_os_str().is_empty() {
@@ -1249,10 +1251,10 @@ fn cline_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
 }
 
 fn user_config_dir(home: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
-            return dir;
-        }
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+        && !dir.as_os_str().is_empty()
+    {
+        return dir;
     }
     if cfg!(target_os = "macos") {
         return home.join("Library").join("Application Support");

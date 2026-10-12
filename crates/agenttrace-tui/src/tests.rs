@@ -1,8 +1,8 @@
 use super::*;
 use agenttrace_core::{Anomaly, Metrics};
 use crossterm::event::KeyModifiers;
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use std::fs;
 
 #[test]
@@ -135,8 +135,10 @@ fn explorer_renders_specialized_previews_and_real_file_size() {
     terminal
         .draw(|frame| render_explorer(frame, &mut app))
         .expect("render timeline");
-    assert!(format!("{:?}", terminal.backend().buffer())
-        .contains("We didn't see a compaction event from this agent."));
+    assert!(
+        format!("{:?}", terminal.backend().buffer())
+            .contains("We didn't see a compaction event from this agent.")
+    );
     fs::remove_file(path).expect("remove session file");
 }
 
@@ -206,9 +208,11 @@ fn explorer_daily_workflow_supports_attention_detail_compare_range_and_projects(
 
     let attention = app.explorer_indices();
     assert_eq!(attention.len(), 2);
-    assert!(attention
-        .iter()
-        .all(|index| app.sessions[*index].name != "healthy"));
+    assert!(
+        attention
+            .iter()
+            .all(|index| app.sessions[*index].name != "healthy")
+    );
 
     app.handle_explorer_event(Event::Key(KeyEvent::new(
         KeyCode::Enter,
@@ -1178,12 +1182,13 @@ fn go_navigation_keys_and_pairwise_diff_stay_compatible() {
         None,
     );
 
-    assert!(app
-        .handle_event(Event::Key(KeyEvent::new(
+    assert!(
+        app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL,
         )))
-        .unwrap());
+        .unwrap()
+    );
     app.handle_normal_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.explorer_overlay, ExplorerOverlay::Help);
@@ -1905,9 +1910,10 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
 
         app.handle_normal_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
             .expect("force reload");
-        assert!(app
-            .status
-            .contains("force reload: discovering session files"));
+        assert!(
+            app.status
+                .contains("force reload: discovering session files")
+        );
         assert_eq!(app.load_state.phase, LoadPhase::Discovering);
         assert_eq!(app.load_state.cache_hits, 0);
         let force_loading = loading_status_lines(&app)
@@ -2032,16 +2038,33 @@ fn session(name: &str, source: &str, model: &str, health: i32, cost: f64, tool: 
 /// pin into an exclusive section instead.
 static SESSION_CACHE_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. The only env mutations in this module go through these
+// helpers while holding SESSION_CACHE_DIR_TEST_LOCK above (the
+// single-threaded proof stated once, mirroring core's
+// test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    // SAFETY: caller holds SESSION_CACHE_DIR_TEST_LOCK for the whole
+    // mutation window (see the comment above).
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn with_session_cache_dir_for_test(cache_dir: &std::path::Path, run: impl FnOnce()) {
     let _guard = SESSION_CACHE_DIR_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-    std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache_dir);
+    set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", cache_dir);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
     match previous {
-        Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-        None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        Some(value) => set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+        None => remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
     }
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
@@ -2095,10 +2118,11 @@ fn delivery_worker_failures_surface_as_diagnostics_not_empty_states() {
             .is_none(),
         "a healthy worker must not set an error"
     );
-    assert!(app
-        .governance
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.delivery.is_some()));
+    assert!(
+        app.governance
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.delivery.is_some())
+    );
 
     // Case 1: worker reports a failure through the channel.
     let (tx, rx) = std::sync::mpsc::channel();

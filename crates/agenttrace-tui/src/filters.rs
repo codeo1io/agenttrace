@@ -351,11 +351,7 @@ pub(super) fn compare_sessions(a: &Session, b: &Session, key: SortKey, desc: boo
             .cmp(&b.anomalies.len())
             .then_with(|| a.name.cmp(&b.name)),
     };
-    if desc {
-        ord.reverse()
-    } else {
-        ord
-    }
+    if desc { ord.reverse() } else { ord }
 }
 
 pub(super) fn cmp_f64(a: f64, b: f64) -> Ordering {

@@ -1,4 +1,4 @@
-use crate::{detect_anomalies, health_score, token_cost, Metrics, Session};
+use crate::{Metrics, Session, detect_anomalies, health_score, token_cost};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -907,10 +907,10 @@ fn capture_opencode_user_text(
         }
     }
     for (session_id, (_, _, text)) in earliest {
-        if let Some(agg) = aggs.get_mut(&session_id) {
-            if agg.first_user_text.is_empty() {
-                agg.first_user_text = text;
-            }
+        if let Some(agg) = aggs.get_mut(&session_id)
+            && agg.first_user_text.is_empty()
+        {
+            agg.first_user_text = text;
         }
     }
 }
@@ -1670,8 +1670,8 @@ mod tests {
             fn drop(&mut self) {
                 for (key, value) in self.0.iter() {
                     match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
+                        Some(value) => crate::test_env::set_var_guarded(key, value),
+                        None => crate::test_env::remove_var_guarded(key),
                     }
                 }
             }
@@ -1693,7 +1693,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("agenttrace-rm753-poison-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("tempdir");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &root);
         let path = opencode_hostile_fixture(&root);
 
         // (a) hostile load through the snapshot-caching entry point:
@@ -1745,7 +1745,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("tempdir");
         let cache = root.join("cache");
         std::fs::create_dir_all(&cache).expect("cache dir");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &cache);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &cache);
         let snapshot = cache.join("hermes-sqlite.json");
         let path = root.join("state.db");
         std::fs::write(&path, b"SQLite format 3\x00corrupted-bytes").expect("write corrupt db");
@@ -1782,8 +1782,8 @@ mod tests {
         let mut repaired_report = SqliteIngestReport::default();
         let repaired = load_hermes_sqlite_sessions(&path, None, &mut repaired_report);
         match previous_cache {
-            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
-            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_DIR"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(&root);
@@ -2039,9 +2039,11 @@ mod tests {
             })
             .collect();
         assert_eq!(children.len(), 2);
-        assert!(children
-            .iter()
-            .all(|child| child.metrics.parent_session == "ses-parent"));
+        assert!(
+            children
+                .iter()
+                .all(|child| child.metrics.parent_session == "ses-parent")
+        );
         // Children stay in the fleet (counted once each).
         assert_eq!(sessions.len(), 5);
         let orphan = sessions
@@ -2081,12 +2083,16 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         assert!(failures.is_clean(), "fixture must load clean: {failures:?}");
         assert_eq!(sessions.len(), 5, "every row loads");
-        assert!(sessions
-            .iter()
-            .all(|session| session.metrics.parent_session.is_empty()));
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.metrics.parent_session.is_empty())
+        );
         crate::subagents::attribute_subagents(&mut sessions);
-        assert!(sessions
-            .iter()
-            .all(|session| session.metrics.subagent_count == 0));
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.metrics.subagent_count == 0)
+        );
     }
 }

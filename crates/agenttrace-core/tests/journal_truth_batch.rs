@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 
-use agenttrace_core::{parse_raw_session, session_from_events, Event, Session};
+use agenttrace_core::{Event, Session, parse_raw_session, session_from_events};
 
 fn parse_one(line: &str) -> Session {
     parse_raw_session("t.jsonl", "t.jsonl", line).unwrap()
@@ -72,11 +72,13 @@ fn codex_lane_caps_hostile_cwd_at_parse_time() {
     .to_string();
     let session = parse_one(&format!("{meta}\n{turn}\n"));
     assert!(session.cwd.len() <= 4096);
-    assert!(session
-        .metrics
-        .disclosure_counters
-        .keys()
-        .any(|key| key == "cwd_truncated:codex_cli"));
+    assert!(
+        session
+            .metrics
+            .disclosure_counters
+            .keys()
+            .any(|key| key == "cwd_truncated:codex_cli")
+    );
 }
 
 #[test]
@@ -90,11 +92,13 @@ fn short_cwds_pass_through_uncapped_and_undisclosed() {
     .to_string();
     let session = parse_one(&claude);
     assert_eq!(session.cwd, "/work/projects/agenttrace");
-    assert!(session
-        .metrics
-        .disclosure_counters
-        .keys()
-        .all(|key| !key.starts_with("cwd_truncated:")));
+    assert!(
+        session
+            .metrics
+            .disclosure_counters
+            .keys()
+            .all(|key| !key.starts_with("cwd_truncated:"))
+    );
 }
 
 #[test]

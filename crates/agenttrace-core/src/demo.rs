@@ -1,4 +1,4 @@
-use crate::{parse_jsonl_session, Session};
+use crate::{Session, parse_jsonl_session};
 
 // The demo corpus must keep pricing (and attributing) through the
 // bundled LiteLLM snapshot, never through fallback rates or gateway

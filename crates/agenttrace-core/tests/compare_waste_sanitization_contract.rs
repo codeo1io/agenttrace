@@ -8,7 +8,7 @@
 //! and no control byte reaches the output — the neutralized bytes are
 //! disclosed in place as U+FFFD instead.
 
-use agenttrace_core::{parse_raw_session, render_waste_report, report_compare, Session};
+use agenttrace_core::{Session, parse_raw_session, render_waste_report, report_compare};
 
 /// OSC-52 clipboard-write payload in the session name (the ESC + "]" +
 /// ... + ESC + "\" framing), the exact shape assess planted in journals.

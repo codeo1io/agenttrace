@@ -28,7 +28,7 @@
 //!   prefixes when deciding a cell is a formula). Plain numbers stay
 //!   bare so cost/token columns import as values.
 
-use agenttrace_core::{sanitize_line_segment, Overview};
+use agenttrace_core::{Overview, sanitize_line_segment};
 
 /// One `--sessions -f csv` row; mirrors the TSV columns plus the
 /// rm-408 disclosure column, so the statement never reports clean

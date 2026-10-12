@@ -25,8 +25,8 @@
 //! no longer silently dropped: the count is returned so callers can
 //! disclose it while the child keeps rendering as a standalone row.
 
-use crate::discovery::{same_file_identity, SameFileIdentity};
-use crate::{total_tokens, Session};
+use crate::discovery::{SameFileIdentity, same_file_identity};
+use crate::{Session, total_tokens};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -352,16 +352,16 @@ mod tests {
                 .map(|k| (*k, std::env::var_os(k)))
                 .collect();
         for (k, _) in &saved {
-            std::env::remove_var(k);
+            crate::test_env::remove_var_guarded(k);
         }
-        std::env::set_var("HOME", &home);
-        std::env::set_var("XDG_CACHE_HOME", &cache);
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &cache);
+        crate::test_env::set_var_guarded("HOME", &home);
+        crate::test_env::set_var_guarded("XDG_CACHE_HOME", &cache);
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", &cache);
         let report = crate::discovery::load_sessions_with_options(Some(&root), &Default::default());
         for (k, v) in &saved {
             match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
+                Some(v) => crate::test_env::set_var_guarded(k, v),
+                None => crate::test_env::remove_var_guarded(k),
             }
         }
         assert_eq!(

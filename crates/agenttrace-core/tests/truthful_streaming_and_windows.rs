@@ -12,8 +12,8 @@
 //! minimal forms of those corpora (see each test).
 
 use agenttrace_core::{
-    data_health, load_sessions_with_options, parse_file, report_scope, session_matches_time_range,
-    LoadOptions, TimeRange,
+    LoadOptions, TimeRange, data_health, load_sessions_with_options, parse_file, report_scope,
+    session_matches_time_range,
 };
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};

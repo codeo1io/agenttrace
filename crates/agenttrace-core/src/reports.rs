@@ -1,12 +1,12 @@
 use crate::{
-    average_health, canonical_sessions, classify_tool_authority, context_trends, cost_audit,
-    delivery_evidence, fmt_duration, format_cost, format_count, format_tokens,
-    highest_authority_for_metrics, is_high_authority_category, mcp_governance, parse_ts,
-    recommendations, report_scope, round4, sanitize_line_segment, sorted_keys, sorted_set,
-    total_tokens, Anomaly, GroupOverview, Overview, Session, TaskTypeOverview, ToolCall, VERSION,
+    Anomaly, GroupOverview, Overview, Session, TaskTypeOverview, ToolCall, VERSION, average_health,
+    canonical_sessions, classify_tool_authority, context_trends, cost_audit, delivery_evidence,
+    fmt_duration, format_cost, format_count, format_tokens, highest_authority_for_metrics,
+    is_high_authority_category, mcp_governance, parse_ts, recommendations, report_scope, round4,
+    sanitize_line_segment, sorted_keys, sorted_set, total_tokens,
 };
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1348,15 +1348,15 @@ fn load_baseline_report(baseline_path: &str) -> anyhow::Result<Value> {
         // delta_pct -100.036). Totals are magnitudes: admit only
         // finite non-negative numbers, with the same flag/path/
         // regenerate-hint shape as the rm-569 rejections above.
-        if let Some(number) = summary.get(key).and_then(Value::as_f64) {
-            if !number.is_finite() || number < 0.0 {
-                anyhow::bail!(
-                    "--baseline: {baseline_path} summary field \"{key}\" is negative or \
+        if let Some(number) = summary.get(key).and_then(Value::as_f64)
+            && (!number.is_finite() || number < 0.0)
+        {
+            anyhow::bail!(
+                "--baseline: {baseline_path} summary field \"{key}\" is negative or \
                      not finite ({number}); a negative baseline total sign-inverts the delta \
                      comparison into a pass — regenerate the baseline with \
                      `agenttrace --overview -f json -o <baseline>`"
-                );
-            }
+            );
         }
     }
     if baseline.get("version").and_then(Value::as_str).is_none() {
@@ -1378,14 +1378,14 @@ pub fn add_baseline_comparison(
     let baseline: Value = load_baseline_report(baseline_path)?;
     // rm-569/rm-389: a baseline from a different report version can zero-fill
     // into a fabricated regression; reject the mismatch loudly instead.
-    if let (Some(current), Some(base)) = (report.get("version"), baseline.get("version")) {
-        if current != base {
-            anyhow::bail!(
-                "--baseline: {baseline_path} version mismatch: baseline version {base} \
+    if let (Some(current), Some(base)) = (report.get("version"), baseline.get("version"))
+        && current != base
+    {
+        anyhow::bail!(
+            "--baseline: {baseline_path} version mismatch: baseline version {base} \
                  != current report version {current}; regenerate the baseline with the \
                  current agenttrace version (--overview -f json -o <baseline>)"
-            );
-        }
+        );
     }
     let summary = report
         .get("summary")
@@ -2748,11 +2748,7 @@ fn average(values: &[f64]) -> f64 {
 
 fn delta_pct(current: f64, baseline: f64) -> f64 {
     if baseline == 0.0 {
-        if current == 0.0 {
-            0.0
-        } else {
-            100.0
-        }
+        if current == 0.0 { 0.0 } else { 100.0 }
     } else {
         round4((current - baseline) / baseline * 100.0)
     }
@@ -3171,22 +3167,22 @@ fn build_incident_timeline(session: &Session) -> IncidentTimelineSummary {
         );
     }
 
-    if let Some(gap) = max_incident_gap(&metrics.gaps_sec) {
-        if gap >= 30.0 {
-            let severity = if gap >= 300.0 {
-                "high"
-            } else if gap >= 60.0 {
-                "medium"
-            } else {
-                "low"
-            };
-            add(
-                "idle_gap",
-                "Longest idle gap",
-                format!("{gap:.1}s gap between recorded events"),
-                severity,
-            );
-        }
+    if let Some(gap) = max_incident_gap(&metrics.gaps_sec)
+        && gap >= 30.0
+    {
+        let severity = if gap >= 300.0 {
+            "high"
+        } else if gap >= 60.0 {
+            "medium"
+        } else {
+            "low"
+        };
+        add(
+            "idle_gap",
+            "Longest idle gap",
+            format!("{gap:.1}s gap between recorded events"),
+            severity,
+        );
     }
 
     let total_tools = metrics.tool_calls_ok + metrics.tool_calls_fail;
@@ -3204,21 +3200,22 @@ fn build_incident_timeline(session: &Session) -> IncidentTimelineSummary {
         );
     }
 
-    if total_tools > 0 && !metrics.tool_usage.is_empty() {
-        if let Some((tool, count)) = top_incident_tool(&metrics.tool_usage) {
-            add(
-                "touched_surface",
-                "Touched surface",
-                format!(
-                    "{} unique tool(s), {} total calls; top tool {} x{}",
-                    metrics.tool_usage.len(),
-                    total_tools,
-                    incident_safe_name(&tool),
-                    count
-                ),
-                "low",
-            );
-        }
+    if total_tools > 0
+        && !metrics.tool_usage.is_empty()
+        && let Some((tool, count)) = top_incident_tool(&metrics.tool_usage)
+    {
+        add(
+            "touched_surface",
+            "Touched surface",
+            format!(
+                "{} unique tool(s), {} total calls; top tool {} x{}",
+                metrics.tool_usage.len(),
+                total_tools,
+                incident_safe_name(&tool),
+                count
+            ),
+            "low",
+        );
     }
 
     let total_tokens = total_tokens(session);

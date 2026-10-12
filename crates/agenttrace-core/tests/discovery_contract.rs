@@ -1,9 +1,9 @@
 use agenttrace_core::SESSION_CACHE_SCHEMA_VERSION;
 use agenttrace_core::{
-    build_doctor_report, collect_session_files, data_health, data_health_scoped,
+    LoadOptions, build_doctor_report, collect_session_files, data_health, data_health_scoped,
     find_session_files, load_sessions_from_dir, load_sessions_with_options,
     load_sessions_with_progress, parse_file, render_waste_report, search_sessions,
-    session_cache_path, session_capability, total_tokens, LoadOptions,
+    session_cache_path, session_capability, total_tokens,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -1258,14 +1258,18 @@ fn rust_writes_and_reuses_go_compatible_session_cache() {
             .pointer(&format!("/entries/{}", escape_json_pointer(&session_path)))
             .expect("cache entry");
         assert!(entry.get("mod_time").and_then(Value::as_i64).is_some());
-        assert!(entry
-            .pointer("/session/Metrics/Provenance/Tokens")
-            .and_then(Value::as_str)
-            .is_some());
-        assert!(entry
-            .pointer("/session/Metrics/Provenance/PricingSource")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty()));
+        assert!(
+            entry
+                .pointer("/session/Metrics/Provenance/Tokens")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        assert!(
+            entry
+                .pointer("/session/Metrics/Provenance/PricingSource")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        );
         assert_eq!(
             entry.pointer("/session/Name").and_then(Value::as_str),
             Some("Inspect billing export.")
@@ -1490,9 +1494,11 @@ fn rust_refreshes_cache_entries_missing_tool_arg_usage() {
                 .and_then(Value::as_u64),
             Some(1)
         );
-        assert!(entry
-            .pointer("/session/Metrics/FileUsage/go test ./...")
-            .is_none());
+        assert!(
+            entry
+                .pointer("/session/Metrics/FileUsage/go test ./...")
+                .is_none()
+        );
     });
 
     let _ = fs::remove_dir_all(root);
@@ -1591,9 +1597,11 @@ fn rust_writes_and_refreshes_go_compatible_directory_cache() {
         bump_dir_mtime(&sessions_dir);
         let sessions = load_sessions_from_dir(Some(&sessions_dir));
         assert_eq!(sessions.len(), 2);
-        assert!(sessions
-            .iter()
-            .any(|session| session.path == second_path.to_string_lossy()));
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.path == second_path.to_string_lossy())
+        );
 
         fs::remove_file(&first_path).expect("remove stale cached session file");
         bump_dir_mtime(&nested);
@@ -2101,9 +2109,10 @@ fn rust_rejects_empty_aider_chat_history() {
     fs::write(&session_path, "").expect("write empty aider history");
 
     let err = parse_file(&session_path).expect_err("empty aider history should fail");
-    assert!(err
-        .to_string()
-        .contains("aider chat history: no parseable events"));
+    assert!(
+        err.to_string()
+            .contains("aider chat history: no parseable events")
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2207,9 +2216,10 @@ fn rust_discovers_pi_session_files() {
         assert_eq!(sessions[0].metrics.source_tool, "pi");
         let raw = fs::read_to_string(session_cache_path()).expect("read cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        assert!(doc
-            .pointer(&format!("/dirs/{}", escape_json_pointer(&session_dir)))
-            .is_some());
+        assert!(
+            doc.pointer(&format!("/dirs/{}", escape_json_pointer(&session_dir)))
+                .is_some()
+        );
     });
 
     let _ = fs::remove_dir_all(root);
@@ -2342,9 +2352,10 @@ fn rust_discovers_qwen_project_chat_files() {
         assert_eq!(sessions[0].metrics.source_tool, "qwen_code");
         let raw = fs::read_to_string(session_cache_path()).expect("read cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
-        assert!(doc
-            .pointer(&format!("/dirs/{}", escape_json_pointer(&chat_dir)))
-            .is_some());
+        assert!(
+            doc.pointer(&format!("/dirs/{}", escape_json_pointer(&chat_dir)))
+                .is_some()
+        );
     });
 
     let _ = fs::remove_dir_all(root);
@@ -2692,7 +2703,7 @@ fn with_session_cache(cache: &std::path::Path, f: impl FnOnce()) {
     let result = {
         let _guard = lock_env();
         let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", cache);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_session_cache);
         result
@@ -2714,11 +2725,11 @@ fn with_home_and_cache(home: &std::path::Path, cache: &std::path::Path, f: impl 
         let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
         let previous_xdg_data = std::env::var_os("XDG_DATA_HOME");
         let previous_session_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
-        std::env::set_var("HOME", home);
-        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
-        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", cache);
+        set_var_guarded("HOME", home);
+        set_var_guarded("XDG_CONFIG_HOME", home.join(".config"));
+        set_var_guarded("XDG_CACHE_HOME", home.join(".cache"));
+        set_var_guarded("XDG_DATA_HOME", home.join(".local/share"));
+        set_var_guarded("AGENTTRACE_SESSION_CACHE_DIR", cache);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         restore_env("HOME", previous_home);
         restore_env("XDG_CONFIG_HOME", previous_xdg_config);
@@ -2738,9 +2749,9 @@ fn escape_json_pointer(path: &std::path::Path) -> String {
 
 fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
     if let Some(value) = previous {
-        std::env::set_var(key, value);
+        set_var_guarded(key, value);
     } else {
-        std::env::remove_var(key);
+        remove_var_guarded(key);
     }
 }
 
@@ -2786,6 +2797,21 @@ fn env_lock() -> &'static Mutex<()> {
 /// Acquire the shared env lock. Poisoning is tolerated on purpose: a
 /// poisoned mutex must fail only the test that panicked, not every test
 /// that still needs the lock (see with_home_and_cache).
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. Every env mutation in this file routes through these
+// helpers while holding this file's `lock_env()` twin below — the single-threaded proof stated once
+// (mirroring core's test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    // SAFETY: caller holds `lock_env()` for the whole mutation window.
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     match env_lock().lock() {
         Ok(guard) => guard,
@@ -3582,9 +3608,11 @@ fn stale_walk_listings_from_the_pre_manifest_blocklist_walker_are_dropped() {
             "the manifest must not surface as a parsed session"
         );
         assert_eq!(
-            replayed.discovered, 1,
+            replayed.discovered,
+            1,
             "a warm listing written by the pre-blocklist walker must not keep offering npm manifests as session candidates (discovered {}): {:?}",
-            replayed.discovered, find_session_files(Some(&root))
+            replayed.discovered,
+            find_session_files(Some(&root))
         );
         assert_eq!(
             replayed.skipped, 0,

@@ -1,4 +1,4 @@
-use crate::{parse_ts, Event, Metrics, Session};
+use crate::{Event, Metrics, Session, parse_ts};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -1194,10 +1194,12 @@ mod tests {
         assert_eq!(diagnostics.large_params.len(), 4);
         assert!(!diagnostics.large_params[0].timestamp.is_empty());
         assert!(!diagnostics.large_params[0].detail.is_empty());
-        assert!(diagnostics
-            .stuck_patterns
-            .iter()
-            .any(|item| item.pattern == "repeated_response"));
+        assert!(
+            diagnostics
+                .stuck_patterns
+                .iter()
+                .any(|item| item.pattern == "repeated_response")
+        );
     }
 
     #[test]
@@ -1555,10 +1557,12 @@ mod tests {
             }
         }
         let diagnostics = analyze_diagnostics(&events, &Metrics::default());
-        assert!(!diagnostics
-            .stuck_patterns
-            .iter()
-            .any(|pattern| pattern.pattern == "repeated_response"));
+        assert!(
+            !diagnostics
+                .stuck_patterns
+                .iter()
+                .any(|pattern| pattern.pattern == "repeated_response")
+        );
 
         // Four byte-identical responses still report exactly once, with
         // the true repeat count.
@@ -1602,9 +1606,11 @@ mod tests {
         session.diagnostics.loop_cost.loop_groups = 1;
         let findings = session_findings(&session, &[]);
         assert!(findings.iter().any(|finding| finding.kind == "loop"));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.kind == "retry" && finding.severity == "high"));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.kind == "retry" && finding.severity == "high")
+        );
     }
 
     #[test]

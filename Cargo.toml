@@ -8,7 +8,15 @@ resolver = "2"
 
 [workspace.package]
 version = "0.0.0-dev"
-edition = "2021"
+# rm-981: edition 2024 makes `std::env::set_var`/`remove_var` unsafe —
+# the migration IS the env-mutation audit. Production code has zero
+# callers (verified live: every set_var/remove_var site in every src
+# file sits below its `#[cfg(test)]` marker; the edition-2024 build
+# turns any future one into a hard compile error), and every test-scope
+# site routes through `test_env::set_var_guarded`/`remove_var_guarded`
+# holding the shared env lock. Edition 2024's floor is 1.85; the
+# rm-386/rm-166 floor below stays the binding one at 1.89.
+edition = "2024"
 # rm-386: the declared floor was 1.80 while the dependency graph has
 # required ~1.88 for a while (ratatui 0.30 -> ratatui-crossterm 0.1.2 and
 # zeroize 1.9.0 are edition-2024 crates with rust_version 1.88). A false

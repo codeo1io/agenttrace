@@ -90,7 +90,9 @@ curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.
 
 安装脚本会下载对应平台的发布版程序，按发布的校验和验证 SHA-256，并把安装目录
 （`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）加入 PATH。
-设置 `AGENTTRACE_VERSION=v0.9.1`（PowerShell 用 `-Version v0.9.1`）可固定版本。
+设置 `AGENTTRACE_VERSION=v0.9.1`（PowerShell 用 `-Version v0.9.1`）可固定版本。两个安装脚本对该固定版本的优先级一致：PowerShell 显式 `-Version` 参数 >
+`AGENTTRACE_VERSION` > 最新版；`install.sh` 另保留 `AGENTTRACE_SOURCE_REF` 作为从源码构建回退时的固定引用（两者同时设置时优先于
+`AGENTTRACE_VERSION`）。
 
 包管理器：
 
@@ -198,6 +200,8 @@ agenttrace 已被这些项目收录：
 - [awesome-claude-skills](https://github.com/BehiSecc/awesome-claude-skills)
 
 ## 贡献
+
+本仓库基于 Rust edition 2024 构建（rm-981）：声明的 MSRV 为 1.89（已高于 edition 2024 的 1.85 下限），工具链由 `rust-toolchain.toml` 固定为 1.98.1。
 
 欢迎提交 Parser PR。一个好的 parser 贡献通常包含：
 

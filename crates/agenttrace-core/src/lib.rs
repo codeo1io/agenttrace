@@ -23,81 +23,82 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use demo::{demo_sessions, DEMO_REPORT_EPOCH};
+pub use demo::{DEMO_REPORT_EPOCH, demo_sessions};
 pub use diagnostics::{
-    attention_priority, attention_rank, fix_suggestions, inspect_first, inspect_reason,
-    loop_waste_percent, needs_attention, predict_cost_anomaly, session_findings,
     ContextUtilization, CostAlert, Diagnostics, FindingEvidence, FixSuggestion, InspectFirst,
     LargeParam, LoopCost, LoopCostBasis, LoopFingerprint, SessionFinding, StuckPattern,
-    ToolLatency, TraceStep, UnusedTool,
+    ToolLatency, TraceStep, UnusedTool, attention_priority, attention_rank, fix_suggestions,
+    inspect_first, inspect_reason, loop_waste_percent, needs_attention, predict_cost_anomaly,
+    session_findings,
 };
 pub use filters::{
-    matches_numeric_filter, parse_finite_f64, parse_numeric_filter, parse_numeric_filter_i32,
-    NumericFilterOp,
+    NumericFilterOp, matches_numeric_filter, parse_finite_f64, parse_numeric_filter,
+    parse_numeric_filter_i32,
 };
 
 pub use discovery::{
-    collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
+    KnownSessionDir, LoadOptions, LoadProgress, LoadReport, collect_session_files,
+    discover_session_dirs, find_session_files, known_session_dirs, load_sessions_from_dir,
+    load_sessions_with_options, load_sessions_with_progress,
     load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
-    KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
 };
-pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
+pub use doctor::{DoctorDirReport, DoctorReport, build_doctor_report, render_doctor_report};
 pub use governance::{
-    context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance,
-    recommendations, session_cost_audit, ContextTrend, ContextTrendTotals, CostAudit,
-    DeliveryEvidence, DeliverySummary, McpGovernance, McpGovernanceItem, ModelCostAudit,
-    PriceBreakdown, PricingCoverage, ProjectContextTrend, Recommendation, SessionCostAudit,
-    SessionDeliveryEvidence, TokenBreakdown,
+    ContextTrend, ContextTrendTotals, CostAudit, DeliveryEvidence, DeliverySummary, McpGovernance,
+    McpGovernanceItem, ModelCostAudit, PriceBreakdown, PricingCoverage, ProjectContextTrend,
+    Recommendation, SessionCostAudit, SessionDeliveryEvidence, TokenBreakdown, context_trends,
+    cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance, recommendations,
+    session_cost_audit,
 };
 pub use history::{history_path, merge_preserved_history, preserve_derived_history};
 pub use insights::{
-    compare_session_outcome, data_health, data_health_scoped, filter_sessions,
+    DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope, SessionComparison, SourceScope,
+    TimeRange, compare_session_outcome, data_health, data_health_scoped, filter_sessions,
     project_decode_status, project_name, report_scope, resolve_project, session_capability,
-    session_matches_time_range, DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope,
-    SessionComparison, SourceScope, TimeRange,
+    session_matches_time_range,
 };
-pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
+pub use otel::{SEMCONV_SNAPSHOT_DATE, gen_ai_system_for_path, report_otel_export};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
     list_pricing, lookup_price, pricing_cache_path, pricing_source, pricing_source_for,
     render_model_pricing_list, render_test_match, update_pricing,
 };
 pub use reports::{
+    BaselineBreaches, BaselineThresholds, GROUP_TAKE, ReportLanguage, SvgCardTheme,
     add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
     report_json, report_json_with_language, report_overview_html,
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,
     report_overview_text, report_overview_text_with_context, report_text,
-    report_text_with_language, BaselineBreaches, BaselineThresholds, ReportLanguage, SvgCardTheme,
-    GROUP_TAKE,
+    report_text_with_language,
 };
 pub use runtime_config::{
-    get as runtime_config_overrides, set as set_runtime_config, RuntimeConfigOverrides,
+    RuntimeConfigOverrides, get as runtime_config_overrides, set as set_runtime_config,
 };
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
+    MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
+    MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION, SessionCache,
     cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
     load_cached_sessions_from_cache, load_session_cache, save_session_cache,
-    session_cache_entries_source, session_cache_path, store_session, SessionCache,
-    MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
-    MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION,
+    session_cache_entries_source, session_cache_path, store_session,
 };
 pub use sqlite_sessions::{
-    load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported, skip_sqlite_backed_file_dir,
     SqliteDroppedRows, SqliteDuplicateDb, SqliteIngestReport, SqliteUnreadableDb,
+    load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported, skip_sqlite_backed_file_dir,
 };
 pub use statusline::{
-    is_bidi_format_control, load_statusline_insights, render_budget_view, render_statusline_report,
-    run_statusline_host, sanitize_line_segment, sanitize_output_document, statusline_budget_series,
-    statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
-    StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
+    CapturedStatusline, StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats,
+    StatuslineRateLimitState, is_bidi_format_control, load_statusline_insights, render_budget_view,
+    render_statusline_report, run_statusline_host, sanitize_line_segment, sanitize_output_document,
+    statusline_budget_series, statusline_capture_path, statusline_insights,
+    statusline_journal_stats,
 };
 pub use subagents::attribute_subagents;
 pub use waste::{
-    compute_waste_report, render_waste_report, render_waste_report_with_language,
-    waste_report_json, WasteReport,
+    WasteReport, compute_waste_report, render_waste_report, render_waste_report_with_language,
+    waste_report_json,
 };
 
 pub const VERSION: &str = match option_env!("AGENTTRACE_RELEASE_VERSION") {
@@ -931,8 +932,8 @@ pub(crate) fn unrecognized_usage_keys(value: &serde_json::Value) -> Vec<String> 
             );
             let prefix = if consumed_location && (canonical || normalized_cache_read_spelling) {
                 continue; // actually accounted: canonical at the read
-                          // place, or an rm-718-normalized spelling
-                          // folded onto it
+            // place, or an rm-718-normalized spelling
+            // folded onto it
             } else if canonical {
                 "usage_unconsumed_location"
             } else if recognized {
@@ -1029,10 +1030,10 @@ pub fn parse_jsonl_session(name: &str, path: &str, raw: &str) -> anyhow::Result<
             }
             continue;
         };
-        if line_objects.len() < 20 {
-            if let Some(object) = value.as_object() {
-                line_objects.push(object.clone());
-            }
+        if line_objects.len() < 20
+            && let Some(object) = value.as_object()
+        {
+            line_objects.push(object.clone());
         }
         let has_event_type = value
             .as_object()
@@ -1649,16 +1650,15 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             "tool" => {
                 metrics.tool_results += 1;
                 let mut is_error = event.is_error;
-                if !is_error && !event.content.is_empty() {
-                    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&event.content) {
-                        if obj.get("success") == Some(&Value::Bool(false))
-                            || obj
-                                .get("error")
-                                .is_some_and(|value| !matches!(value, Value::Null))
-                        {
-                            is_error = true;
-                        }
-                    }
+                if !is_error
+                    && !event.content.is_empty()
+                    && let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&event.content)
+                    && (obj.get("success") == Some(&Value::Bool(false))
+                        || obj
+                            .get("error")
+                            .is_some_and(|value| !matches!(value, Value::Null)))
+                {
+                    is_error = true;
                 }
                 if is_error {
                     metrics.tool_calls_fail += 1;
@@ -1698,10 +1698,10 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     }
     // rm-490: apply the family fallback after the loop — only when no
     // non-meta event ever named a tool (see capture above).
-    if metrics.source_tool.is_empty() {
-        if let Some(fallback) = meta_fallback_source_tool {
-            metrics.source_tool = fallback;
-        }
+    if metrics.source_tool.is_empty()
+        && let Some(fallback) = meta_fallback_source_tool
+    {
+        metrics.source_tool = fallback;
     }
     // rm-436: tokens whose cost the source journal recorded (pi
     // `type:"usage"` entries carrying `usage.cost.total`) were already
@@ -2411,13 +2411,13 @@ pub fn evaluate_overview_gate(
     if fail_on_critical && overview.critical > 0 {
         failures.push(format!("{} critical sessions found", overview.critical));
     }
-    if let Some(max_tool_fail_rate) = max_tool_fail_rate {
-        if tool_fail_rate > max_tool_fail_rate {
-            failures.push(format!(
-                "tool failure rate {:.1}% exceeds {:.1}%",
-                tool_fail_rate, max_tool_fail_rate
-            ));
-        }
+    if let Some(max_tool_fail_rate) = max_tool_fail_rate
+        && tool_fail_rate > max_tool_fail_rate
+    {
+        failures.push(format!(
+            "tool failure rate {:.1}% exceeds {:.1}%",
+            tool_fail_rate, max_tool_fail_rate
+        ));
     }
     failures
 }
@@ -2934,6 +2934,30 @@ pub(crate) mod test_env {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+
+    /// rm-981 (edition 2024): `std::env::set_var` is `unsafe` because
+    /// another thread may be reading the process environment while we
+    /// mutate it. Test-scope callers route env mutations through these
+    /// two helpers so the safety proof is stated once, here, instead of
+    /// inline at every site: every caller mutates env only while
+    /// holding `lock_env()` (this crate's one shared env mutex) across
+    /// its whole mutation window, so no other thread of this test
+    /// binary can be touching the environment at the same time.
+    /// Production code has no set_var/remove_var caller — under
+    /// edition 2024 that is a hard compile error, not a convention.
+    pub(crate) fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+        key: K,
+        value: V,
+    ) {
+        // SAFETY: caller holds `lock_env()` for the mutation window (or
+        // the test binary is single-threaded); see the doc above.
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    pub(crate) fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+        // SAFETY: same contract as `set_var_guarded`.
+        unsafe { std::env::remove_var(key) }
+    }
 }
 
 #[cfg(test)]
@@ -3012,6 +3036,64 @@ mod tests {
         assert_eq!(
             names,
             vec!["z-later", "plus-nine", "z-morning", "naive-utc", "absent"]
+        );
+    }
+
+    #[test]
+    fn workspace_edition_is_2024() {
+        // rm-981: the edition-2024 migration IS the env-mutation audit
+        // -- under edition 2024 a production set_var/remove_var caller
+        // is a hard compile error. This pin holds the edition against
+        // silent regression (cargo sets no CARGO_PKG_EDITION env var,
+        // so the assertion reads the workspace manifest — the single
+        // source of truth every crate's `edition.workspace = true`
+        // inherits): a flip back to 2021 would let production env
+        // mutation compile silently again, reopening the UB class
+        // behind the intermittent full-suite SIGSEGV.
+        let manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
+                .expect("workspace Cargo.toml readable");
+        let declared = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("edition = "))
+            .expect("workspace declares edition");
+        assert_eq!(
+            declared.trim(),
+            "\"2024\"",
+            "the workspace edition must stay 2024 (rm-981); it is {declared}"
+        );
+    }
+
+    #[test]
+    fn installers_honor_the_documented_version_pin() {
+        // rm-550: README.md documents AGENTTRACE_VERSION as the pin,
+        // but until this batch neither installer read it -- an
+        // env-pinned install silently fetched latest. Content contract
+        // on both installers (the rm-005/rm-234 installer-parity
+        // pattern): precedence explicit param > env > latest, plus the
+        // #314 arch fallback seams in install.ps1.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../");
+        let ps1 =
+            std::fs::read_to_string(format!("{root}install.ps1")).expect("install.ps1 readable");
+        let sh = std::fs::read_to_string(format!("{root}install.sh")).expect("install.sh readable");
+        assert!(
+            ps1.contains("AGENTTRACE_VERSION")
+                && ps1.contains("PSBoundParameters.ContainsKey('Version')"),
+            "install.ps1 must honor AGENTTRACE_VERSION behind an explicit -Version"
+        );
+        assert!(
+            ps1.contains("Resolve-AgenttraceArch")
+                && ps1.contains("PROCESSOR_ARCHITEW6432")
+                && ps1.contains("PROCESSOR_ARCHITECTURE"),
+            "install.ps1 must resolve arch through the #314 machine-env fallback"
+        );
+        assert!(
+            sh.contains("AGENTTRACE_VERSION") && sh.contains("releases/download/${VERSION}"),
+            "install.sh must download the AGENTTRACE_VERSION-tagged release"
+        );
+        assert!(
+            sh.contains("AGENTTRACE_SOURCE_REF") && sh.contains("AGENTTRACE_DOWNLOAD_URL"),
+            "install.sh keeps the SOURCE_REF/DOWNLOAD_URL override seams"
         );
     }
 
@@ -3254,7 +3336,9 @@ mod tests {
         };
         let cases = [
             (
-                vec![user("<system-reminder>\nworktree\n</system-reminder>\n\n搜索最近3天ai新闻")],
+                vec![user(
+                    "<system-reminder>\nworktree\n</system-reminder>\n\n搜索最近3天ai新闻",
+                )],
                 "搜索最近3天ai新闻",
             ),
             (
@@ -3265,15 +3349,21 @@ mod tests {
                 "继续修复",
             ),
             (
-                vec![user("<system-reminder data-role=\"user-context\">\nOS\n</system-reminder>\n<user_query>帮我领个优惠券</user_query>")],
+                vec![user(
+                    "<system-reminder data-role=\"user-context\">\nOS\n</system-reminder>\n<user_query>帮我领个优惠券</user_query>",
+                )],
                 "帮我领个优惠券",
             ),
             (
-                vec![user("<teammate-message teammate_id=\"lead\" summary=\"x\">\n第二轮分析\n</teammate-message>")],
+                vec![user(
+                    "<teammate-message teammate_id=\"lead\" summary=\"x\">\n第二轮分析\n</teammate-message>",
+                )],
                 "第二轮分析",
             ),
             (
-                vec![user("<goal_context>\nContinue.\n<objective>\n回测最近任务\n</objective>\nmore\n</goal_context>")],
+                vec![user(
+                    "<goal_context>\nContinue.\n<objective>\n回测最近任务\n</objective>\nmore\n</goal_context>",
+                )],
                 "回测最近任务",
             ),
             (
@@ -3666,9 +3756,11 @@ mod tests {
             });
         }
         let warnings = validate_tool_warnings(&events);
-        assert!(warnings
-            .iter()
-            .any(|item| item.pattern == "fail_retry_chain"));
+        assert!(
+            warnings
+                .iter()
+                .any(|item| item.pattern == "fail_retry_chain")
+        );
 
         let redundant = (0..4)
             .flat_map(|index| {
@@ -3689,9 +3781,11 @@ mod tests {
                 ]
             })
             .collect::<Vec<_>>();
-        assert!(validate_tool_warnings(&redundant)
-            .iter()
-            .any(|item| item.pattern == "redundant"));
+        assert!(
+            validate_tool_warnings(&redundant)
+                .iter()
+                .any(|item| item.pattern == "redundant")
+        );
 
         let repeated = (0..4)
             .map(|index| Event {
@@ -3704,9 +3798,11 @@ mod tests {
                 ..Event::default()
             })
             .collect::<Vec<_>>();
-        assert!(validate_tool_warnings(&repeated)
-            .iter()
-            .any(|item| item.pattern == "dead_loop"));
+        assert!(
+            validate_tool_warnings(&repeated)
+                .iter()
+                .any(|item| item.pattern == "dead_loop")
+        );
     }
 
     #[test]
@@ -3919,9 +4015,11 @@ mod tests {
                 .get("workbuddy_input_basis:cache_subtracted"),
             Some(&1)
         );
-        assert!(!metrics
-            .disclosure_counters
-            .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
+        assert!(
+            !metrics
+                .disclosure_counters
+                .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch")
+        );
     }
 
     #[test]
@@ -4002,10 +4100,12 @@ mod tests {
                 .get("workbuddy_input_basis:cache_subtracted"),
             Some(&1)
         );
-        assert!(!session
-            .metrics
-            .disclosure_counters
-            .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch"));
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("workbuddy_input_basis:zeroed_suspected_mismatch")
+        );
         assert_eq!(session.metrics.tokens_input, 500);
     }
 }

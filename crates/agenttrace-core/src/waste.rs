@@ -1,7 +1,7 @@
 use crate::diagnostics::LoopCostBasis;
 use crate::{
-    format_cost, format_tokens, loop_waste_percent, pricing, round4, sanitize_line_segment,
-    Metrics, ReportLanguage, Session, VERSION,
+    Metrics, ReportLanguage, Session, VERSION, format_cost, format_tokens, loop_waste_percent,
+    pricing, round4, sanitize_line_segment,
 };
 
 #[derive(Debug, Clone)]
@@ -564,7 +564,9 @@ fn cache_suggestion(rating: &str, language: ReportLanguage) -> &'static str {
             "excellent" => "cache utilization excellent - keep current prompt structure",
             "good" => "moderate cache hit - place static system instructions at prompt prefix",
             "poor" => "low cache hit rate - enable prompt caching with static prefix content",
-            _ => "caching not enabled - enable Anthropic prompt caching to save up to 90% on input cost",
+            _ => {
+                "caching not enabled - enable Anthropic prompt caching to save up to 90% on input cost"
+            }
         };
     }
     match rating {

@@ -1,7 +1,7 @@
 use agenttrace_core::{
-    add_baseline_comparison, compute_overview, demo_sessions, evaluate_overview_gate,
-    report_json_with_language, report_overview_json, search_sessions, BaselineThresholds, Metrics,
-    ReportLanguage, Session, VERSION,
+    BaselineThresholds, Metrics, ReportLanguage, Session, VERSION, add_baseline_comparison,
+    compute_overview, demo_sessions, evaluate_overview_gate, report_json_with_language,
+    report_overview_json, search_sessions,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -20,23 +20,29 @@ fn demo_overview_exposes_ci_contract_fields() {
         report["summary"]["tool_authority"]["highest"],
         "test_or_build"
     );
-    assert!(report["summary"]["total_duration_seconds"]
-        .as_f64()
-        .is_some());
+    assert!(
+        report["summary"]["total_duration_seconds"]
+            .as_f64()
+            .is_some()
+    );
     assert!(report["summary"]["total_cost"].as_f64().unwrap() > 0.0);
-    assert!(report["recent_sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|session| session["possible_cost_driver"]
-            .as_str()
-            .unwrap_or("")
-            .contains("possible driver")));
-    assert!(report["surfaces"]["authority_categories"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|item| item == "test_or_build"));
+    assert!(
+        report["recent_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["possible_cost_driver"]
+                .as_str()
+                .unwrap_or("")
+                .contains("possible driver"))
+    );
+    assert!(
+        report["surfaces"]["authority_categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "test_or_build")
+    );
     assert!(report["by_project"].is_array());
 }
 
@@ -57,9 +63,11 @@ fn range_and_project_filters_share_one_session_scope() {
         "",
         now,
     );
-    assert!(filtered
-        .iter()
-        .all(|session| session.cwd.ends_with("alpha")));
+    assert!(
+        filtered
+            .iter()
+            .all(|session| session.cwd.ends_with("alpha"))
+    );
 }
 
 #[test]
@@ -67,10 +75,12 @@ fn demo_search_returns_metadata_evidence() {
     let sessions = demo_sessions().expect("demo sessions parse");
     let results = search_sessions(&sessions, "internal/ws", 20);
     assert_eq!(results.len(), 1);
-    assert!(results[0]
-        .matches
-        .iter()
-        .any(|item| item.contains("internal/ws")));
+    assert!(
+        results[0]
+            .matches
+            .iter()
+            .any(|item| item.contains("internal/ws"))
+    );
 }
 
 #[test]

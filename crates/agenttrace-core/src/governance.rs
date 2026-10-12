@@ -1,6 +1,6 @@
 use crate::{
-    parse_ts, pricing, project_name, resolve_project, round4, session_capability, total_tokens,
-    Session, PER_BLOCK_PRICING_MARKER,
+    PER_BLOCK_PRICING_MARKER, Session, parse_ts, pricing, project_name, resolve_project, round4,
+    session_capability, total_tokens,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -1232,11 +1232,7 @@ fn priority(value: &str) -> &'static str {
     }
 }
 fn severity_from_cost(value: f64) -> &'static str {
-    if value >= 10.0 {
-        "high"
-    } else {
-        "medium"
-    }
+    if value >= 10.0 { "high" } else { "medium" }
 }
 fn mcp_server_name(tool: &str) -> Option<String> {
     let tool = tool.trim();
@@ -1348,7 +1344,7 @@ fn is_write_tool(tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{demo_sessions, Diagnostics, Metrics, ToolWarning};
+    use crate::{Diagnostics, Metrics, ToolWarning, demo_sessions};
 
     fn session(name: &str) -> Session {
         Session {
@@ -1922,14 +1918,14 @@ mod tests {
         std::fs::set_permissions(shim_dir.join("git"), std::fs::Permissions::from_mode(0o755))
             .expect("chmod git shim");
         let previous_path = std::env::var_os("PATH");
-        std::env::set_var(
+        crate::test_env::set_var_guarded(
             "PATH",
             format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
         );
         let started = std::time::Instant::now();
         let commits = git_commits(root.to_str().expect("utf-8 root"));
         if let Some(path) = previous_path {
-            std::env::set_var("PATH", path);
+            crate::test_env::set_var_guarded("PATH", path);
         }
         assert!(
             commits.is_none(),

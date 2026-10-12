@@ -431,10 +431,12 @@ fn empty_home_is_a_tool_error_not_a_crash() {
     assert_eq!(Some(0), code);
     assert_eq!(1, responses.len());
     assert_eq!(true, responses[0]["result"]["isError"]);
-    assert!(responses[0]["result"]["content"][0]["text"]
-        .as_str()
-        .expect("error text")
-        .contains("No session files found"));
+    assert!(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text")
+            .contains("No session files found")
+    );
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
 
@@ -926,10 +928,10 @@ fn config_layer_prices_the_mcp_tools_identically_to_the_cli() {
         ],
     );
     assert_eq!(Some(0), code, "CLI priced arm must succeed");
-    let cli_cost = serde_json::from_str::<Value>(&stdout).expect("overview json")["summary"]
-        ["total_cost"]
-        .as_f64()
-        .expect("total_cost is a number");
+    let cli_cost =
+        serde_json::from_str::<Value>(&stdout).expect("overview json")["summary"]["total_cost"]
+            .as_f64()
+            .expect("total_cost is a number");
     assert_eq!(
         mcp_cost, cli_cost,
         "MCP and CLI must report the same total under the same override"

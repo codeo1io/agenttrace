@@ -407,7 +407,10 @@ fn pi_writer_surface_contract_covers_all_thirteen_dist_types() {
         if disclosed {
             assert_eq!(hits, 1, "writer type {typ} must disclose its skip");
         } else {
-            assert_eq!(hits, 0, "writer type {typ} is handled — a skip counter here means an arm regressed to the catch-all");
+            assert_eq!(
+                hits, 0,
+                "writer type {typ} is handled — a skip counter here means an arm regressed to the catch-all"
+            );
         }
     }
 
@@ -450,7 +453,10 @@ fn pi_writer_surface_contract_covers_all_thirteen_dist_types() {
     );
     assert_eq!(counters.get("pi_usage_entry:main").copied().unwrap_or(0), 1);
     assert_eq!(
-        counters.get("pi_compaction_usage_counted:compaction").copied().unwrap_or(0),
+        counters
+            .get("pi_compaction_usage_counted:compaction")
+            .copied()
+            .unwrap_or(0),
         1,
         "the compaction usage fold must be disclosed per kind — its absence is the pre-rm-939 silent drop"
     );

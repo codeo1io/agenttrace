@@ -193,9 +193,7 @@ fn json_lanes_escape_control_bytes_instead_of_emitting_raw() {
         // break (invalid \u{ escape), the escape text vanishes and this
         // assertion catches the vacuous green.
         assert!(
-            stdout
-                .windows(b"\\u001b".len())
-                .any(|w| w == b"\\u001b"),
+            stdout.windows(b"\\u001b".len()).any(|w| w == b"\\u001b"),
             "{report} -f json carries no \\u001b escape text — the poisoned payload never parsed (fixture vacuity)"
         );
     }

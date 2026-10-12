@@ -1,4 +1,4 @@
-use crate::{parse_ts, pricing, total_tokens, Session};
+use crate::{Session, parse_ts, pricing, total_tokens};
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -1384,8 +1384,10 @@ mod tests {
             TimeRange::Today.since(now),
             Some(day_start_for_offset(now, offset))
         );
-        assert!(TimeRange::Today
-            .since(now)
-            .is_some_and(|start| start <= now));
+        assert!(
+            TimeRange::Today
+                .since(now)
+                .is_some_and(|start| start <= now)
+        );
     }
 }

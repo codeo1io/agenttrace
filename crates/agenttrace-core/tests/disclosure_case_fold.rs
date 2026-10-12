@@ -30,7 +30,7 @@
 use std::fs;
 use std::path::Path;
 
-use agenttrace_core::{build_doctor_report, parse_file, render_doctor_report, Session};
+use agenttrace_core::{Session, build_doctor_report, parse_file, render_doctor_report};
 
 fn parse_fixture(name: &str, body: &str) -> Session {
     let dir = std::env::temp_dir().join(format!("rm756-{name}-{}", std::process::id()));
@@ -210,11 +210,13 @@ fn disclosure_distinct_keys_are_capped_and_the_cap_discloses_itself() {
     );
     // Occurrences, not distinctness, drive existing counters: repeating
     // a suppressed key keeps counting into the cap disclosure.
-    assert!(session
-        .metrics
-        .line_skips
-        .keys()
-        .all(|key| key.starts_with("usage_unknown_key:") || key == "disclosure_keys_capped"));
+    assert!(
+        session
+            .metrics
+            .line_skips
+            .keys()
+            .all(|key| key.starts_with("usage_unknown_key:") || key == "disclosure_keys_capped")
+    );
 }
 
 #[test]

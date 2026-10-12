@@ -5,7 +5,7 @@
 //! mixed case (zeros counted alongside real usage) and the JSON
 //! surface downstream automation reads.
 
-use agenttrace_core::{parse_file, Session};
+use agenttrace_core::{Session, parse_file};
 use std::fs;
 use std::path::PathBuf;
 
@@ -98,11 +98,13 @@ fn mixed_session_counts_only_the_zero_blocks() {
     );
     let session = parse_file(&path).expect("claude transcript parses");
     assert_eq!(session.metrics.zero_usage_events, 1);
-    assert!(session
-        .metrics
-        .provenance
-        .tokens
-        .contains("zero_usage_reported:1"));
+    assert!(
+        session
+            .metrics
+            .provenance
+            .tokens
+            .contains("zero_usage_reported:1")
+    );
     // The real block is still counted; the zero block adds nothing.
     // (input stays gross; cache-read is its own column: 10/5/3.)
     assert_eq!(session.metrics.tokens_input, 10);
@@ -195,13 +197,38 @@ fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     let _ = fs::remove_dir_all(&root);
 }
 
+// rm-981 (edition 2024): `std::env::set_var`/`remove_var` are `unsafe`
+// because another thread of this test binary may be reading the env
+// concurrently. Every env mutation in this file routes through these
+// helpers while holding `with_session_cache_dir`'s static lock — the
+// single-threaded proof stated once (mirroring core's
+// test_env::set_var_guarded).
+fn set_var_guarded<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    // SAFETY: caller holds with_session_cache_dir's static LOCK for the
+    // whole mutation window.
+    unsafe { std::env::set_var(key, value) }
+}
+
+fn remove_var_guarded<K: AsRef<std::ffi::OsStr>>(key: K) {
+    // SAFETY: same contract as `set_var_guarded` above.
+    unsafe { std::env::remove_var(key) }
+}
+
 fn with_session_cache_dir(cache: &std::path::Path, f: impl FnOnce()) {
+    // rm-981: serialize this binary's env mutations behind one static
+    // lock twin — the discipline every other env-touching test file
+    // already carried — before pinning the process-global cache dir.
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let key = "AGENTTRACE_SESSION_CACHE_DIR";
     let previous = std::env::var_os(key);
-    std::env::set_var(key, cache);
+    set_var_guarded(key, cache);
     f();
     match previous {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+        Some(value) => set_var_guarded(key, value),
+        None => remove_var_guarded(key),
     }
 }

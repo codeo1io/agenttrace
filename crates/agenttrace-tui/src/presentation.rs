@@ -2991,11 +2991,7 @@ pub(super) fn token_share(part: i64, total: i64) -> String {
 }
 
 pub(super) fn empty_as_unknown(value: &str) -> &str {
-    if value.is_empty() {
-        "unknown"
-    } else {
-        value
-    }
+    if value.is_empty() { "unknown" } else { value }
 }
 
 pub(super) fn diff_text(app: &App) -> String {
@@ -3934,10 +3930,10 @@ pub(super) fn next_action(app: &App) -> String {
         }
         return app.t("load sessions", "加载会话").to_string();
     }
-    if matches!(app.view, View::Detail | View::Diagnostics) {
-        if let Some(session) = app.selected_session() {
-            return selected_next_action(session, app.language);
-        }
+    if matches!(app.view, View::Detail | View::Diagnostics)
+        && let Some(session) = app.selected_session()
+    {
+        return selected_next_action(session, app.language);
     }
     if app.overview.critical > 0 {
         return app.t("open critical sessions", "打开严重会话").to_string();

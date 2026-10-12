@@ -564,14 +564,13 @@ impl App {
             entry.cost += session.metrics.cost_estimated;
         }
         for entry in totals.values_mut() {
-            if names.get(&entry.label).copied().unwrap_or(0) > 1 {
-                if let Some(parent) = Path::new(&entry.root)
+            if names.get(&entry.label).copied().unwrap_or(0) > 1
+                && let Some(parent) = Path::new(&entry.root)
                     .parent()
                     .and_then(Path::file_name)
                     .and_then(|name| name.to_str())
-                {
-                    entry.label = format!("{parent}/{}", entry.label);
-                }
+            {
+                entry.label = format!("{parent}/{}", entry.label);
             }
         }
         totals
@@ -1116,7 +1115,11 @@ fn context_preview(session: &Session, language: Language) -> String {
         format_tokens(value.available_for_task as i64),
         text(language, "What's taking space", "什么在占空间"),
         if params.is_empty() {
-            text(language, "No oversized tool arguments showed up.", "没看到特别大的工具参数。")
+            text(
+                language,
+                "No oversized tool arguments showed up.",
+                "没看到特别大的工具参数。",
+            )
         } else {
             &params
         },
@@ -1957,7 +1960,14 @@ fn render_help_overlay(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 // Deliberately exclude titles, paths, arguments and log excerpts from clipboard output.
 fn share_summary(session: &Session) -> String {
-    format!("AgentTrace\nHealth: {}\nEstimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n", session.health, session.metrics.cost_estimated, session.metrics.duration_sec, session.metrics.tool_calls_fail, session.anomalies.len())
+    format!(
+        "AgentTrace\nHealth: {}\nEstimated cost: ${:.4}\nDuration: {:.1}s\nTool failures: {}\nAnomalies: {}\n",
+        session.health,
+        session.metrics.cost_estimated,
+        session.metrics.duration_sec,
+        session.metrics.tool_calls_fail,
+        session.anomalies.len()
+    )
 }
 
 /// Bound on how long the TUI waits for a clipboard helper to exit after
@@ -2561,11 +2571,7 @@ fn detail_files(session: &Session, language: Language) -> String {
         } else {
             accessed
         },
-        text(
-            language,
-            "Possible repeated reads",
-            "可能重复读取的文件",
-        ),
+        text(language, "Possible repeated reads", "可能重复读取的文件",),
         if repeated.is_empty() {
             text(
                 language,
@@ -2886,7 +2892,7 @@ mod interaction_tests {
 
     #[test]
     fn initial_progress_remains_visible_after_first_batch() {
-        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui::{Terminal, backend::TestBackend};
         let mut app = App::new(agenttrace_core::demo_sessions().unwrap(), "demo", None);
         let (_tx, rx) = mpsc::channel();
         app.pending_load = Some(rx);
@@ -2907,7 +2913,7 @@ mod interaction_tests {
 
     #[test]
     fn notices_expire_without_busy_polling_and_filters_fit_narrow_header() {
-        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui::{Terminal, backend::TestBackend};
         let mut app = App::new(agenttrace_core::demo_sessions().unwrap(), "demo", None);
         app.notice = Some((
             "Copied".into(),

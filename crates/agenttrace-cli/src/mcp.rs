@@ -61,11 +61,11 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 use agenttrace_core::{
-    compute_overview, data_health_scoped, load_sessions_with_options,
-    report_overview_json_with_context, LoadOptions, LoadReport, TimeRange,
+    LoadOptions, LoadReport, TimeRange, compute_overview, data_health_scoped,
+    load_sessions_with_options, report_overview_json_with_context,
 };
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// JSON-RPC 2.0 error codes used by this server.
 const CODE_PARSE_ERROR: i64 = -32700;

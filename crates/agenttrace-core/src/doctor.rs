@@ -1,7 +1,7 @@
 use crate::{
-    cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
-    SqliteIngestReport, VERSION,
+    Session, SqliteIngestReport, VERSION, cached_session, find_session_files, known_session_dirs,
+    load_session_cache, load_sqlite_backed_sessions_reported, parse_file, save_session_cache,
+    store_session,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1321,24 +1321,24 @@ fn load_session_cache_report() -> SessionCacheReport {
 }
 
 fn session_cache_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
-            return dir.join("sessions.json");
-        }
+    if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from)
+        && !dir.as_os_str().is_empty()
+    {
+        return dir.join("sessions.json");
     }
     user_cache_dir().join("agenttrace").join("sessions.json")
 }
 
 fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
+    if cfg!(target_os = "macos")
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    {
+        return home.join("Library").join("Caches");
     }
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() {
-            return cache;
-        }
+    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+        && !cache.as_os_str().is_empty()
+    {
+        return cache;
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         return home.join(".cache");
@@ -1431,7 +1431,7 @@ mod tests {
         // mode is hermetic (no host walk, zero session files), so the
         // waste arm reads zero here; the knob arms are the report's.
         let _env = crate::test_env::lock_env();
-        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES");
         let report = build_doctor_report(None, true);
         assert_eq!(
             report.cache_entry_bound,
@@ -1439,9 +1439,11 @@ mod tests {
         );
         assert_eq!(report.cache_entry_bound_source, "default");
         assert_eq!(report.reparsed_this_scan, 0, "demo mode discovers no files");
-        assert!(report
-            .cache_limits
-            .contains(&format!("entries<={}", report.cache_entry_bound)));
+        assert!(
+            report
+                .cache_limits
+                .contains(&format!("entries<={}", report.cache_entry_bound))
+        );
         let text = doctor_report_text(&report);
         assert!(text.contains("entry bound from default"), "{text}");
         assert!(
@@ -1449,13 +1451,13 @@ mod tests {
             "{text}"
         );
 
-        std::env::set_var("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
+        crate::test_env::set_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES", "1500");
         let report = build_doctor_report(None, true);
         assert_eq!(report.cache_entry_bound, 1_500);
         assert_eq!(report.cache_entry_bound_source, "env");
         assert!(report.cache_limits.contains("entries<=1500"));
         assert!(doctor_report_text(&report).contains("entry bound from env"));
-        std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+        crate::test_env::remove_var_guarded("AGENTTRACE_SESSION_CACHE_ENTRIES");
     }
 
     #[test]

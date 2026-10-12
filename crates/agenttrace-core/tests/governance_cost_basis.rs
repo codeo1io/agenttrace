@@ -15,7 +15,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use agenttrace_core::{cost_audit, lookup_price, parse_file, session_cost_audit, Session};
+use agenttrace_core::{Session, cost_audit, lookup_price, parse_file, session_cost_audit};
 
 const RECORDED: &str = concat!(
     r#"{"id": "b1", "timestamp": "2026-10-04T07:16:46.634Z", "type": "session", "version": 3, "cwd": "/redacted/project"}"#,

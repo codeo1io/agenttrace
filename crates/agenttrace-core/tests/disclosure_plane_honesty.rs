@@ -49,8 +49,8 @@
 //! `tests/fixtures/codex-legacy/` (see their READMEs).
 
 use agenttrace_core::{
-    compute_overview, data_health, parse_file, parse_raw_session, pricing_source_for,
-    render_doctor_report, report_overview_markdown_with_context, Session, TimeRange,
+    Session, TimeRange, compute_overview, data_health, parse_file, parse_raw_session,
+    pricing_source_for, render_doctor_report, report_overview_markdown_with_context,
 };
 use std::path::PathBuf;
 
@@ -320,10 +320,12 @@ fn modern_rollout_with_usage_reports_no_absence_verdict() {
         "disclosure_counters: {:#?}",
         session.metrics.disclosure_counters
     );
-    assert!(!session
-        .metrics
-        .line_skips
-        .contains_key("codex_rollout_no_usage_rows"));
+    assert!(
+        !session
+            .metrics
+            .line_skips
+            .contains_key("codex_rollout_no_usage_rows")
+    );
     assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
     assert_eq!(
         session.metrics.tokens_input, 400,

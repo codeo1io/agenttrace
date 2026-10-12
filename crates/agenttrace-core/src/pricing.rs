@@ -1,5 +1,5 @@
 use crate::round4;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -604,16 +604,15 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
             // descriptive fields the override leaves unset; an override
             // that sets `max_input_tokens: 0` still clears the window
             // on purpose (0 is filtered out at lookup time).
-            if override_price.max_input_tokens.is_none()
-                || override_price.deprecation_date.is_none()
+            if (override_price.max_input_tokens.is_none()
+                || override_price.deprecation_date.is_none())
+                && let Some(catalog_price) = catalog.entries.get(&name)
             {
-                if let Some(catalog_price) = catalog.entries.get(&name) {
-                    if override_price.max_input_tokens.is_none() {
-                        override_price.max_input_tokens = catalog_price.max_input_tokens;
-                    }
-                    if override_price.deprecation_date.is_none() {
-                        override_price.deprecation_date = catalog_price.deprecation_date.clone();
-                    }
+                if override_price.max_input_tokens.is_none() {
+                    override_price.max_input_tokens = catalog_price.max_input_tokens;
+                }
+                if override_price.deprecation_date.is_none() {
+                    override_price.deprecation_date = catalog_price.deprecation_date.clone();
                 }
             }
             override_models.insert(name.clone());
@@ -1023,17 +1022,18 @@ fn normalize_model(raw: &str) -> String {
         return "default".to_string();
     }
     let mut value = raw.trim().to_ascii_lowercase();
-    if let Some((_, candidate)) = value.rsplit_once('/') {
-        if !candidate.starts_with('v') && !candidate.starts_with("20") {
-            value = candidate.to_string();
-        }
+    if let Some((_, candidate)) = value.rsplit_once('/')
+        && !candidate.starts_with('v')
+        && !candidate.starts_with("20")
+    {
+        value = candidate.to_string();
     }
     for marker in [".anthropic.", ".google.", ".meta.", ".amazon."] {
-        if let Some(idx) = value.find(marker) {
-            if idx > 0 {
-                value = value[idx + marker.len()..].to_string();
-                break;
-            }
+        if let Some(idx) = value.find(marker)
+            && idx > 0
+        {
+            value = value[idx + marker.len()..].to_string();
+            break;
         }
     }
     value = strip_date_suffix(&value);
@@ -1706,15 +1706,15 @@ fn write_pricing_header(out: &mut String, name_width: usize) {
 }
 
 fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
+    if cfg!(target_os = "macos")
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+    {
+        return home.join("Library").join("Caches");
     }
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() {
-            return cache;
-        }
+    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+        && !cache.as_os_str().is_empty()
+    {
+        return cache;
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         return home.join(".cache");
@@ -1934,16 +1934,16 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp cache dir");
-        std::env::set_var("XDG_CACHE_HOME", &dir);
-        std::env::set_var("HOME", &dir);
+        crate::test_env::set_var_guarded("XDG_CACHE_HOME", &dir);
+        crate::test_env::set_var_guarded("HOME", &dir);
         let result = body();
         match prior_xdg {
-            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
+            Some(value) => crate::test_env::set_var_guarded("XDG_CACHE_HOME", value),
+            None => crate::test_env::remove_var_guarded("XDG_CACHE_HOME"),
         }
         match prior_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => crate::test_env::set_var_guarded("HOME", value),
+            None => crate::test_env::remove_var_guarded("HOME"),
         }
         let _ = std::fs::remove_dir_all(&dir);
         result
@@ -2231,11 +2231,11 @@ mod tests {
 
         let _env = crate::test_env::lock_env();
         let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
-        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", &override_file);
         let override_models = apply_pricing_overrides(&mut catalog);
         match prior_file {
-            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
-            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_PRICING_FILE"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(root);
@@ -2666,11 +2666,11 @@ mod tests {
 
         let _env = crate::test_env::lock_env();
         let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
-        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", &override_file);
         let override_models = apply_pricing_overrides(&mut catalog);
         match prior_file {
-            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
-            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+            Some(value) => crate::test_env::set_var_guarded("AGENTTRACE_PRICING_FILE", value),
+            None => crate::test_env::remove_var_guarded("AGENTTRACE_PRICING_FILE"),
         }
         drop(_env);
         let _ = std::fs::remove_dir_all(root);

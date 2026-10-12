@@ -32,8 +32,8 @@
 use std::fs;
 
 use agenttrace_core::{
-    compute_overview, data_health, parse_file, parse_raw_session,
-    report_overview_markdown_with_context, Session, TimeRange,
+    Session, TimeRange, compute_overview, data_health, parse_file, parse_raw_session,
+    report_overview_markdown_with_context,
 };
 
 /// Cache-inclusive basis: 2,000 reported input with 1,500 cache-read —
