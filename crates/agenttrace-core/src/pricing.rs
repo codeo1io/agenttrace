@@ -1018,13 +1018,26 @@ fn parse_pricing_overrides(raw: &[u8]) -> Result<PricingOverrideMaps, String> {
     // walk sees this file's rows alone (bundled alias rows are
     // single-hop SKU redirects, rm-610). Unresolvable cycles fail
     // this arm too: they never resolved anywhere, and the source
-    // line's "applied" claim was equally false.
+    // line's "applied" claim was equally false. rm-968 residual
+    // (run 12a73275 cycle 4, assess F3): the degenerate 1-cycle
+    // (`x -> x`) failed this arm too — the assess PoC's
+    // `selfevil`-aliased-to-itself file was accepted silently and
+    // billed at built-in fallback, byte-identical to running with
+    // no file, so the residual now fails the same loud arm.
     if let Some((alias, hops)) = alias_chain_over_budget(&aliases) {
-        return Err(format!(
-            "alias {alias:?} cannot resolve within the {ALIAS_HOP_BUDGET}-hop budget \
-             ({hops} hops walked without reaching a priced model); it would silently \
-             price at fallback while this file claims to apply"
-        ));
+        return Err(if hops == 0 {
+            format!(
+                "alias {alias:?} maps to itself, so it can never resolve to a \
+                 priced model; it would silently price at fallback while this \
+                 file claims to apply — drop the row or point it at a real model"
+            )
+        } else {
+            format!(
+                "alias {alias:?} cannot resolve within the {ALIAS_HOP_BUDGET}-hop budget \
+                 ({hops} hops walked without reaching a priced model); it would silently \
+                 price at fallback while this file claims to apply"
+            )
+        });
     }
     Ok((prices, aliases))
 }
@@ -1036,7 +1049,10 @@ const ALIAS_HOP_BUDGET: usize = 8;
 /// current key is STILL an alias after `ALIAS_HOP_BUDGET` hops, the
 /// chain is unresolvable within the budget (too deep, or a cycle).
 /// Returns the first offending alias (BTreeMap order — the failure
-/// message is deterministic) and the hops walked.
+/// message is deterministic) and the hops walked. A walk that ends
+/// on `hops == 0` is the rm-968 residual's 1-cycle flag: the alias's
+/// own first hop is itself (`x -> x`), which resolves to the key and
+/// never to a priced model.
 fn alias_chain_over_budget(aliases: &BTreeMap<String, String>) -> Option<(&String, usize)> {
     for alias in aliases.keys() {
         let mut current = alias.clone();
@@ -1046,6 +1062,17 @@ fn alias_chain_over_budget(aliases: &BTreeMap<String, String>) -> Option<(&Strin
                 break;
             };
             if next == &current {
+                // rm-968 residual (assess F3): only the FIRST-hop
+                // self-encounter is the degenerate row itself — flag
+                // it with hops == 0 so the caller renders the
+                // maps-to-itself message. A MID-walk self-break (a
+                // chain ending on a self-mapped key) keeps the old
+                // exit: that terminal is priced or not by other
+                // maps, and the 1-cycle row is still flagged when
+                // the outer loop reaches ITS key.
+                if hops == 0 {
+                    return Some((alias, hops));
+                }
                 break;
             }
             current = next.clone();
@@ -1062,6 +1089,11 @@ fn alias_chain_over_budget(aliases: &BTreeMap<String, String>) -> Option<(&Strin
 /// Mirrors the `convert_litellm` non-finite guard, but for user-supplied
 /// files the rejection is named (model + field) instead of a silent skip:
 /// a typo like `-3` used to flow straight into a negative session cost.
+///
+/// rm-492 (run 12a73275 cycle 4): rates must also sit below the sanity
+/// ceiling below — a per-million rate pasted into a per-token field is
+/// finite and positive, so it used to pass every arm and silently mint
+/// 1e+304 session totals.
 fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
     for (field, value) in [
         ("input", price.input),
@@ -1078,6 +1110,9 @@ fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
             return Err(format!(
                 "model {model:?}: {field} rate is negative ({value})"
             ));
+        }
+        if value >= ABSURD_RATE_CEILING {
+            return Err(absurd_rate_error(model, field, value));
         }
     }
     // rm-610: the flex slots are Option-valued — absent means "no
@@ -1100,9 +1135,36 @@ fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
                     "model {model:?}: {field} rate is negative ({value})"
                 ));
             }
+            if value >= ABSURD_RATE_CEILING {
+                return Err(absurd_rate_error(model, field, value));
+            }
         }
     }
     Ok(())
+}
+
+/// rm-492: the per-token rate sanity ceiling for user override files.
+/// The priciest real catalog rows sit near $0.0001/token ($100 per
+/// million tokens); the ceiling sits at $10,000 per token ($10,000,000
+/// per million) — four orders of magnitude above anything a SKU could
+/// publish — so it can never reject a defensible rate (the landed
+/// negative-rate suite, for one, pins single-digit per-token rates as
+/// valid). What it does catch is the f64-extreme class: a 1e308 rate
+/// is finite and positive, passed every arm, and silently minted
+/// 1e+304 session totals (the assess PoC) — the usual cause is a
+/// per-million rate pasted into a per-token field.
+const ABSURD_RATE_CEILING: f64 = 10_000.0;
+
+/// The named rejection for a rate at or above [`ABSURD_RATE_CEILING`]:
+/// model + field + the per-token/per-million unit hint, the same
+/// loud class as the non-finite and negative arms.
+fn absurd_rate_error(model: &str, field: &str, value: f64) -> String {
+    format!(
+        "model {model:?}: {field} rate {value} is at or above the sanity ceiling \
+         of ${ABSURD_RATE_CEILING:.0} per token (${:.0} per million tokens); override \
+         rates are PER-TOKEN — did you paste a per-million rate?",
+        ABSURD_RATE_CEILING * 1_000_000.0
+    )
 }
 
 fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
@@ -3178,6 +3240,72 @@ mod tests {
             err.contains("8-hop budget"),
             "a cycle never resolves: {err}"
         );
+    }
+
+    #[test]
+    fn alias_self_cycle_is_rejected_loudly() {
+        // rm-968 residual (run 12a73275 cycle 4, assess F3): the
+        // degenerate 1-cycle used to pass validation — the walk broke
+        // on `next == current` at hop 0 — and the model silently
+        // priced at built-in fallback, byte-identical to running with
+        // no file at all (the assess PoC: cost 0.0105 and
+        // PricingSource=built-in fallback both with and without the
+        // file). Same loud arm as the budget-overrun chains now.
+        let raw = include_str!("../tests/fixtures/pricing-overrides/self.json");
+        let err = parse_pricing_overrides(raw.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("selfevil") && err.contains("maps to itself"),
+            "the rejection names the self-alias: {err}"
+        );
+    }
+
+    #[test]
+    fn alias_self_cycle_terminating_a_chain_is_caught_by_its_own_row() {
+        // a -> x -> x: walking `a` exits on the mid-walk self-break at
+        // hop 1 (the old behavior, correct for a chain ENDING on a
+        // self-mapped key), but the degenerate row `x -> x` is itself
+        // the failure — the outer loop flags it when it reaches `x`,
+        // so the file is still rejected whole instead of letting `a`
+        // resolve onto an unpriced `x` at fallback.
+        let raw = br#"{"aliases": {"a": "x", "x": "x"}}"#;
+        let err = parse_pricing_overrides(raw).unwrap_err();
+        assert!(
+            err.contains("\"x\"") && err.contains("maps to itself"),
+            "the 1-cycle row is the named offender: {err}"
+        );
+    }
+
+    #[test]
+    fn absurd_override_rates_are_rejected_loudly() {
+        // rm-492: a 1e308 rate is finite and positive, so it passed
+        // every landed arm and silently minted 1e+304 session totals
+        // (the assess PoC). The ceiling arm rejects it with the
+        // per-token/per-million unit hint.
+        let raw = include_str!("../tests/fixtures/pricing-overrides/absurd.json");
+        let err = parse_pricing_overrides(raw.as_bytes()).unwrap_err();
+        assert!(
+            err.contains("absurd") && err.contains("sanity ceiling"),
+            "names the model and the unit hint: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("per-token"),
+            "carries the per-token/per-million unit hint: {err}"
+        );
+        // The flex slots join the same ceiling arm (they are rates
+        // too, and a per-million paste lands there just as easily).
+        let raw =
+            br#"{"prices": {"m": {"input": 1, "output": 2, "cw": 0, "cr": 0, "input_flex": 1e308}}}"#;
+        let err = parse_pricing_overrides(raw).unwrap_err();
+        assert!(
+            err.contains("input_flex") && err.contains("sanity ceiling"),
+            "flex slots hit the same named ceiling: {err}"
+        );
+        // And the ceiling is a ceiling, not a clamp: a single-digit
+        // per-token rate (the landed negative-rate suite's own valid
+        // example) stays a numeric choice.
+        let raw = br#"{"prices": {"m": {"input": 5, "output": 0.5, "cw": 0, "cr": 0}}}"#;
+        let (prices, _) = parse_pricing_overrides(raw).unwrap();
+        assert_eq!(prices["m"].input, 5.0);
     }
 
     // --- rm-613: catalog identity covers flex slots and providers -------

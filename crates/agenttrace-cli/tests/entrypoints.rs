@@ -2845,3 +2845,103 @@ fn doctor_json_artifact_carries_config_disclosure() {
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+#[test]
+fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
+    // rm-201 (run 12a73275 cycle 4): --quota emits the stable
+    // agenttrace.quota/1 schema with TTL-correct rolling windows and
+    // disclosed-unknown limits, and joins every action guard — pairing
+    // it with another report action is the loud rm-246 hijack class,
+    // and the --range view filter (which would distort a spend
+    // window) is refused rather than silently ignored.
+    let fixture = generated_fixture("detailed-tool-steps.jsonl")
+        .to_str()
+        .expect("fixture path is valid UTF-8")
+        .to_string();
+
+    let json = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", "-f", "json", &fixture])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(json.status.success(), "quota json lane failed: {:?}", json);
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&json.stdout).trim_end())
+            .expect("quota json lane is one pure JSON document");
+    assert_eq!(report["schema"], "agenttrace.quota/1");
+    for window in ["five_hour", "weekly"] {
+        assert!(
+            report[window].is_object(),
+            "{window} window object must be present for a timed corpus"
+        );
+        for key in [
+            "window_start_utc",
+            "window_end_utc",
+            "spend_usd",
+            "sessions_contributing",
+            "resets_at_utc",
+        ] {
+            assert!(
+                report[window]
+                    .as_object()
+                    .expect("window object")
+                    .contains_key(key),
+                "{window}.{key} missing"
+            );
+        }
+    }
+    assert!(
+        report["limits"]["five_hour_usd"].is_null() && report["limits"]["weekly_usd"].is_null(),
+        "limits are disclosed-unknown, never invented"
+    );
+    assert!(
+        report["corpus"]["cutoff_utc"].is_string(),
+        "the corpus cutoff is disclosed: {}",
+        report["corpus"]
+    );
+
+    let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", &fixture])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(text.status.success(), "quota text lane failed: {:?}", text);
+    let text_stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text_stdout.contains("Quota view") && text_stdout.contains("limits"),
+        "text lane renders the summary: {text_stdout}"
+    );
+
+    // Pairing --quota with another report action is a loud usage
+    // error (rm-246 hijack class), not a silent first-branch win.
+    let pair = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", "--overview", &fixture])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !pair.status.success(),
+        "--quota --overview must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&pair.stderr).contains("choose exactly one report action"),
+        "the pair names the rule: {:?}",
+        String::from_utf8_lossy(&pair.stderr)
+    );
+
+    // The --range view filter does not apply to the corpus-scope
+    // quota view and must be refused loudly, not silently ignored —
+    // including on the positional-path form, where the generic guard
+    // would otherwise let it through (a <path> counts as a session
+    // action) and load_sessions would filter the corpus empty.
+    let range = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", "--range", "1d", &fixture])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(
+        !range.status.success(),
+        "--quota --range must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&range.stderr).contains("--range does not apply to --quota"),
+        "the range refusal names the quota rule: {:?}",
+        String::from_utf8_lossy(&range.stderr)
+    );
+}

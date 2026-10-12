@@ -2659,6 +2659,268 @@ pub fn canonical_sessions(sessions: &[Session]) -> Vec<Session> {
     out
 }
 
+// ---- rm-201 (run 12a73275 cycle 4): the --quota plan-window view -------
+
+/// One rolling plan window of the `--quota` view: a trailing span that
+/// ends at the corpus cutoff, with the TTL-correct spend and the
+/// sessions that contributed to it.
+struct QuotaWindow {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    spend_usd: f64,
+    sessions_contributing: usize,
+}
+
+/// The corpus cutoff: the newest instant any loaded session can place
+/// a cost on — the last event timestamp when the parse carried one
+/// (fresh parses), else the parsed `session_end` (warm-cache rows,
+/// which lose the event-timestamp vector to its serde skip).
+fn quota_cutoff(sessions: &[Session]) -> Option<DateTime<Utc>> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .metrics
+                .timestamps
+                .last()
+                .copied()
+                .or_else(|| parse_ts(&session.metrics.session_end))
+        })
+        .max()
+}
+
+/// The share of a session's cost that sits inside `[start, end]`.
+/// Fresh parses carry the full event-timestamp vector, so the share is
+/// the fraction of events inside the window; warm-cache rows keep only
+/// `session_start`/`session_end`, so the share is the fraction of the
+/// session's span inside the window (an instant session counts fully
+/// when its instant is inside). `None` when the row carries no
+/// placeable time at all — the caller counts it as unplaced and bills
+/// it at zero rather than guessing.
+fn quota_cost_share(metrics: &Metrics, start: &DateTime<Utc>, end: &DateTime<Utc>) -> Option<f64> {
+    if !metrics.timestamps.is_empty() {
+        let total = metrics.timestamps.len();
+        let inside = metrics
+            .timestamps
+            .iter()
+            .filter(|ts| **ts >= *start && **ts <= *end)
+            .count();
+        return Some(inside as f64 / total as f64);
+    }
+    let (Some(first), Some(last)) = (
+        parse_ts(&metrics.session_start),
+        parse_ts(&metrics.session_end),
+    ) else {
+        return None;
+    };
+    let span_ms = (last - first).num_milliseconds();
+    if span_ms <= 0 {
+        // Instant (or inverted) span: the whole cost rides the single
+        // instant the row does carry.
+        return Some(if first >= *start && first <= *end {
+            1.0
+        } else {
+            0.0
+        });
+    }
+    let overlap_ms = (last.min(*end) - first.max(*start)).num_milliseconds();
+    Some(overlap_ms.clamp(0, span_ms) as f64 / span_ms as f64)
+}
+
+/// Fold one rolling window: every session contributes its cost times
+/// its [`quota_cost_share`] inside the window, so spend is TTL-correct
+/// — a session's cost leaves the window as its events age out, which
+/// is the rolling analog of a plan-window reset.
+fn quota_window(
+    sessions: &[Session],
+    cutoff: DateTime<Utc>,
+    span: chrono::Duration,
+) -> QuotaWindow {
+    let start = cutoff - span;
+    let mut spend_usd = 0.0;
+    let mut sessions_contributing = 0;
+    for session in sessions {
+        if let Some(share) = quota_cost_share(&session.metrics, &start, &cutoff) {
+            if share > 0.0 {
+                sessions_contributing += 1;
+            }
+            spend_usd += session.metrics.cost_estimated * share;
+        }
+    }
+    QuotaWindow {
+        start,
+        end: cutoff,
+        spend_usd: round4(spend_usd),
+        sessions_contributing,
+    }
+}
+
+/// Census of the attribution bases across the corpus — which sessions
+/// the event-timestamp share covers, which the warm-cache span share,
+/// and which carry no placeable time at all (counted, disclosed, billed
+/// at zero).
+fn quota_attribution_census(sessions: &[Session]) -> (usize, usize, usize) {
+    let mut event_basis = 0;
+    let mut span_basis = 0;
+    let mut unplaced = 0;
+    for session in sessions {
+        if !session.metrics.timestamps.is_empty() {
+            event_basis += 1;
+        } else if parse_ts(&session.metrics.session_start).is_some()
+            && parse_ts(&session.metrics.session_end).is_some()
+        {
+            span_basis += 1;
+        } else {
+            unplaced += 1;
+        }
+    }
+    (event_basis, span_basis, unplaced)
+}
+
+fn quota_ts(ts: &DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json::Value {
+    serde_json::json!({
+        "window_start_utc": quota_ts(&window.start),
+        "window_end_utc": quota_ts(&window.end),
+        "spend_usd": window.spend_usd,
+        "sessions_contributing": window.sessions_contributing,
+        // Rolling analog of a plan reset: the instant after which every
+        // event currently counted has aged out of the trailing window.
+        "resets_at_utc": quota_ts(&(window.end + span)),
+    })
+}
+
+/// rm-201 (run 12a73275 cycle 4): the `--quota` report value —
+/// plan-window truth from the local corpus alone. The two plan
+/// windows (5h, 7d) are ROLLING spans that end at the corpus cutoff,
+/// because the provider's own anchors (a first-use 5h start, a weekly
+/// 7am-UTC Monday reset) are not knowable without credentials, which
+/// agenttrace never reads; the JSON says so in `corpus.window_anchor`
+/// instead of inventing them. Spend is TTL-correct per session (see
+/// [`quota_cost_share`]), limits are disclosed-unknown (`limits` is
+/// null with its basis — a config-provided limit is a later extension
+/// arm), and the cutoff itself is disclosed so a stale corpus cannot
+/// masquerade as a live quota. Schema `agenttrace.quota/1` is stable:
+/// the README "Quota view" section documents every key.
+pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
+    let cutoff = quota_cutoff(sessions);
+    let (event_basis, span_basis, unplaced) = quota_attribution_census(sessions);
+    let (five_hour, weekly) = match cutoff {
+        Some(cutoff) => (
+            quota_window(sessions, cutoff, chrono::Duration::hours(5)),
+            quota_window(sessions, cutoff, chrono::Duration::days(7)),
+        ),
+        None => {
+            return serde_json::json!({
+                "schema": "agenttrace.quota/1",
+                "five_hour": serde_json::Value::Null,
+                "weekly": serde_json::Value::Null,
+                "limits": {
+                    "five_hour_usd": null,
+                    "weekly_usd": null,
+                    "basis": "unknown: agenttrace reads no credentials and no plan data; config-provided limits are a later extension",
+                },
+                "corpus": {
+                    "sessions": sessions.len(),
+                    "cutoff_utc": serde_json::Value::Null,
+                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time",
+                    "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
+                    "attribution": {
+                        "event_timestamps": event_basis,
+                        "session_span": span_basis,
+                        "unplaced": unplaced,
+                    },
+                    "attribution_basis": "a session's cost enters a window pro rata: the share of its event timestamps inside the window (fresh parses), or the share of its start-end span inside the window (warm-cache rows, which do not carry event timestamps); unplaced rows are counted and disclosed but billed at zero",
+                },
+            })
+        }
+    };
+    serde_json::json!({
+        "schema": "agenttrace.quota/1",
+        "five_hour": quota_window_json(&five_hour, chrono::Duration::hours(5)),
+        "weekly": quota_window_json(&weekly, chrono::Duration::days(7)),
+        "limits": {
+            "five_hour_usd": null,
+            "weekly_usd": null,
+            "basis": "unknown: agenttrace reads no credentials and no plan data; config-provided limits are a later extension",
+        },
+        "corpus": {
+            "sessions": sessions.len(),
+            "cutoff_utc": quota_ts(&five_hour.end),
+            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end)",
+            "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
+            "attribution": {
+                "event_timestamps": event_basis,
+                "session_span": span_basis,
+                "unplaced": unplaced,
+            },
+            "attribution_basis": "a session's cost enters a window pro rata: the share of its event timestamps inside the window (fresh parses), or the share of its start-end span inside the window (warm-cache rows, which do not carry event timestamps); unplaced rows are counted and disclosed but billed at zero",
+        },
+    })
+}
+
+/// Render the `--quota` view (rm-201). `-f json` emits the stable
+/// `agenttrace.quota/1` schema; the default text lane emits the same
+/// numbers as a compact human summary. Any other format is rejected
+/// loudly — the quota view has no csv/markdown/html rendering, and a
+/// silent text fallback would look like a supported one.
+pub fn render_quota_view(format: &str, sessions: &[Session]) -> anyhow::Result<String> {
+    let report = quota_report(sessions);
+    match format {
+        "json" => Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&report)?
+        )),
+        "text" => Ok(render_quota_text(&report)),
+        other => anyhow::bail!(
+            "--quota supports -f text and -f json only (got {other:?}); the quota view has no {other} rendering"
+        ),
+    }
+}
+
+fn render_quota_text(report: &serde_json::Value) -> String {
+    let corpus = &report["corpus"];
+    let mut out =
+        String::from("Quota view — rolling plan windows from the local corpus (rm-201)\n");
+    match corpus["cutoff_utc"].as_str() {
+        Some(cutoff) => {
+            out.push_str(&format!(
+                "  corpus cutoff  {cutoff}  ({} session(s) loaded)\n",
+                corpus["sessions"]
+            ));
+            for (label, key) in [("5h window", "five_hour"), ("7d window", "weekly")] {
+                match report[key].as_object() {
+                    Some(window) => out.push_str(&format!(
+                        "  {label}      {} → {}  spend ${:.4} across {} session(s); ages out fully {}\n",
+                        window["window_start_utc"].as_str().unwrap_or("?"),
+                        window["window_end_utc"].as_str().unwrap_or("?"),
+                        window["spend_usd"].as_f64().unwrap_or(0.0),
+                        window["sessions_contributing"],
+                        window["resets_at_utc"].as_str().unwrap_or("?"),
+                    )),
+                    None => out.push_str(&format!("  {label}      undefined (no cutoff)\n")),
+                }
+            }
+        }
+        None => out.push_str(&format!(
+            "  no session carries placeable time — windows and spend are undefined ({} session(s) loaded)\n",
+            corpus["sessions"]
+        )),
+    }
+    let attribution = &corpus["attribution"];
+    out.push_str(&format!(
+        "  attribution     event-timestamp share ({}), start/end span share ({} warm-cache), unplaced ({})\n",
+        attribution["event_timestamps"], attribution["session_span"], attribution["unplaced"],
+    ));
+    out.push_str(
+        "  limits          unknown — agenttrace reads no credentials and knows no plan limits\n",
+    );
+    out
+}
+
 pub fn evaluate_overview_gate(
     overview: &Overview,
     sessions: &[Session],
@@ -4342,4 +4604,194 @@ fn detect_anomalies_flags_implausible_magnitudes_from_the_disclosure_channel() {
             .any(|anomaly| anomaly.kind == "implausible_magnitude"),
         "clean metrics must stay clean"
     );
+}
+
+// ---- rm-201 (run 12a73275 cycle 4): --quota plan-window view -----------
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    fn quota_session(name: &str, stamps: &[&str], cost: f64) -> Session {
+        let timestamps = stamps
+            .iter()
+            .map(|stamp| parse_ts(stamp).expect("fixture timestamp parses"))
+            .collect::<Vec<_>>();
+        Session {
+            name: name.to_string(),
+            path: format!("/{name}.jsonl"),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                timestamps,
+                cost_estimated: cost,
+                session_start: stamps.first().copied().unwrap_or("").to_string(),
+                session_end: stamps.last().copied().unwrap_or("").to_string(),
+                ..Default::default()
+            },
+            anomalies: vec![],
+            health: 0,
+            tool_warnings: vec![],
+            diagnostics: Diagnostics::default(),
+        }
+    }
+
+    fn quota_span_session(name: &str, start: &str, end: &str, cost: f64) -> Session {
+        // The warm-cache shape: `timestamps` is serde-skipped, only the
+        // session_start/session_end strings round-trip.
+        Session {
+            name: name.to_string(),
+            path: format!("/{name}.jsonl"),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                timestamps: Vec::new(),
+                cost_estimated: cost,
+                session_start: start.to_string(),
+                session_end: end.to_string(),
+                ..Default::default()
+            },
+            anomalies: vec![],
+            health: 0,
+            tool_warnings: vec![],
+            diagnostics: Diagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn quota_windows_bill_ttl_correctly() {
+        // Cutoff is the newest event: 2026-10-12T10:30:00Z. The 5h
+        // window is [05:30, 10:30]; the 7d window starts 2026-10-05.
+        let sessions = vec![
+            // Both events inside the 5h window: full $1.00.
+            quota_session(
+                "fresh",
+                &["2026-10-12T10:00:00Z", "2026-10-12T10:30:00Z"],
+                1.0,
+            ),
+            // Half the events inside (05:00 is out, 10:30 is in): $2.00 x 0.5.
+            quota_session(
+                "straddler",
+                &["2026-10-12T05:00:00Z", "2026-10-12T10:30:00Z"],
+                2.0,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(report["schema"], "agenttrace.quota/1");
+        assert_eq!(report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z");
+        let five = &report["five_hour"];
+        assert_eq!(five["window_start_utc"], "2026-10-12T05:30:00Z");
+        assert_eq!(five["spend_usd"], 2.0, "1.0 x 1.0 + 2.0 x 0.5");
+        assert_eq!(five["sessions_contributing"], 2);
+        assert_eq!(five["resets_at_utc"], "2026-10-12T15:30:00Z");
+        let weekly = &report["weekly"];
+        assert_eq!(weekly["window_start_utc"], "2026-10-05T10:30:00Z");
+        assert_eq!(weekly["spend_usd"], 3.0, "every event is inside the week");
+        assert_eq!(weekly["resets_at_utc"], "2026-10-19T10:30:00Z");
+        // Limits are disclosed-unknown, never invented.
+        assert!(report["limits"]["five_hour_usd"].is_null());
+        assert!(report["limits"]["weekly_usd"].is_null());
+        assert_eq!(report["corpus"]["attribution"]["event_timestamps"], 2);
+        assert_eq!(report["corpus"]["attribution"]["unplaced"], 0);
+    }
+
+    #[test]
+    fn quota_warm_cache_sessions_bill_by_span() {
+        // 6h span [04:30, 10:30], 5h window [05:30, 10:30]: overlap 5h of
+        // 6h -> $6.00 x 5/6 = $5.00, plus the instant session's full
+        // $0.50 -> $5.50 (rounded to 4dp).
+        let sessions = vec![
+            quota_span_session(
+                "cached",
+                "2026-10-12T04:30:00Z",
+                "2026-10-12T10:30:00Z",
+                6.0,
+            ),
+            // Instant span inside the window: full cost.
+            quota_span_session(
+                "instant",
+                "2026-10-12T08:00:00Z",
+                "2026-10-12T08:00:00Z",
+                0.5,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z");
+        assert_eq!(report["five_hour"]["spend_usd"], 5.5);
+        assert_eq!(report["five_hour"]["sessions_contributing"], 2);
+        assert_eq!(report["weekly"]["spend_usd"], 6.5);
+        let attribution = &report["corpus"]["attribution"];
+        assert_eq!(attribution["session_span"], 2);
+        assert_eq!(attribution["event_timestamps"], 0);
+        assert_eq!(attribution["unplaced"], 0);
+    }
+
+    #[test]
+    fn quota_empty_and_unplaced_corpus_discloses_instead_of_guessing() {
+        // Empty corpus: no cutoff, undefined windows — never a zero-cost
+        // window that would masquerade as a measured quota.
+        let report = quota_report(&[]);
+        assert!(report["corpus"]["cutoff_utc"].is_null());
+        assert!(report["five_hour"].is_null());
+        assert!(report["weekly"].is_null());
+        let text = render_quota_view("text", &[]).expect("text lane renders");
+        assert!(
+            text.contains("no session carries placeable time"),
+            "empty render says so: {text}"
+        );
+
+        // A session with cost but no placeable time at all: counted,
+        // disclosed, billed at zero.
+        let unplaced = vec![quota_session("nowhen", &[], 9.0)];
+        let report = quota_report(&unplaced);
+        assert_eq!(report["corpus"]["sessions"], 1);
+        assert_eq!(report["corpus"]["attribution"]["unplaced"], 1);
+        assert!(report["five_hour"].is_null(), "cutoff stays null");
+    }
+
+    #[test]
+    fn quota_render_lanes_and_schema_stability() {
+        let sessions = vec![quota_session("solo", &["2026-10-12T10:30:00Z"], 0.0105)];
+        let json = render_quota_view("json", &sessions).expect("json lane renders");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json.trim()).expect("json lane is valid JSON");
+        assert_eq!(parsed["schema"], "agenttrace.quota/1");
+        for key in ["five_hour", "weekly", "limits", "corpus"] {
+            assert!(
+                parsed.as_object().expect("object").contains_key(key),
+                "key {key}"
+            );
+        }
+        for key in [
+            "window_start_utc",
+            "window_end_utc",
+            "spend_usd",
+            "sessions_contributing",
+            "resets_at_utc",
+        ] {
+            assert!(
+                parsed["five_hour"]
+                    .as_object()
+                    .expect("window object")
+                    .contains_key(key),
+                "window key {key}"
+            );
+        }
+        let text = render_quota_view("text", &sessions).expect("text lane renders");
+        assert!(text.starts_with("Quota view"), "text lane: {text}");
+        assert!(
+            text.contains("$0.0105"),
+            "spend carries sub-cent precision: {text}"
+        );
+        assert!(
+            text.contains("unknown"),
+            "limits stay disclosed-unknown: {text}"
+        );
+        // Unsupported formats are loud, not silent text fallbacks.
+        let err = render_quota_view("csv", &sessions).unwrap_err();
+        assert!(
+            err.to_string().contains("-f text and -f json only"),
+            "format guard names the supported lanes: {err}"
+        );
+    }
 }
