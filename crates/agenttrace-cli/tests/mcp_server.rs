@@ -24,6 +24,11 @@
 //!   refused with -32600 naming the transport cap (the landed rm-923
 //!   refusal contract, which supersedes this run's -32700 draft at
 //!   integration), and the server keeps serving either way (rm-782);
+//! * a request whose `jsonrpc` member is absent or not exactly the
+//!   string `"2.0"` answers `-32600` echoing its id, while
+//!   notification-shaped lines without the member stay silent
+//!   (rm-998 — the member lane of the rm-780/rm-782/rm-998
+//!   validation triad);
 //! * a discovered-but-empty corpus is a tool-level `isError` result —
 //!   the server exits 0 either way, because the host stays connected,
 //!   and a corpus whose sessions fall outside the requested window
@@ -716,6 +721,144 @@ fn invalid_request_shapes_answer_spec_errors() {
     assert!(
         responses[3]["result"].is_object(),
         "the server keeps serving after every refusal"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn malformed_jsonrpc_member_answers_32600_echoing_the_id() {
+    // rm-998 (malformed-member arm): the member must be exactly the
+    // string "2.0". "9.9", the number 2.0, and "2.0.0" are all
+    // refused with -32600 echoing the request id (the id WAS
+    // decodable, so the spec answer echoes it — only undecodable
+    // ids answer with null, per the rm-782 lane above), and the
+    // server keeps serving after every refusal.
+    let (home, cache) = seed_home("member-malformed", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"9.9","id":31,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":2.0,"id":32,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0.0","id":33,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":34,"method":"ping"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "a refusal script still exits rc0 on EOF");
+    assert_eq!(4, responses.len());
+    for (index, id) in [(0_usize, 31_i64), (1, 32), (2, 33)] {
+        assert_eq!(
+            Some(-32600),
+            responses[index]["error"]["code"].as_i64(),
+            "entry {index}: a non-\"2.0\" member is an invalid request"
+        );
+        assert_eq!(
+            serde_json::json!(id),
+            responses[index]["id"],
+            "entry {index}: a decodable id is echoed on the refusal"
+        );
+        assert!(
+            responses[index]["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("jsonrpc"),
+            "entry {index}: the message names the member"
+        );
+    }
+    assert!(
+        responses[3]["result"].is_object(),
+        "the server keeps serving a valid request after the refusals"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn absent_jsonrpc_member_answers_32600_echoing_the_id() {
+    // rm-998 (absent-member arm): an id-bearing request with no
+    // `jsonrpc` member at all is not a JSON-RPC 2.0 Request — answer
+    // -32600 echoing the id (the assess live probe showed this exact
+    // shape being served results). Notification-shaped lines without
+    // the member keep the stays-silent posture: an id-less line can
+    // never be answered with an id echo, the same call the
+    // missing-method arm makes for its lane.
+    let (home, cache) = seed_home("member-absent", false);
+    let requests = concat!(
+        r#"{"id":41,"method":"ping"}"#,
+        "\n",
+        r#"{"method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"id":42,"method":"ping"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(
+        2,
+        responses.len(),
+        "one refusal per id-bearing line; the notification-shaped line stays silent"
+    );
+    assert_eq!(
+        Some(-32600),
+        responses[0]["error"]["code"].as_i64(),
+        "a request without the member is invalid"
+    );
+    assert_eq!(
+        serde_json::json!(41),
+        responses[0]["id"],
+        "the decodable id is echoed"
+    );
+    assert!(
+        responses[0]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("jsonrpc"),
+        "the message names the member"
+    );
+    assert_eq!(
+        Some(-32600),
+        responses[1]["error"]["code"].as_i64(),
+        "the server keeps serving after the silent notification-shaped line"
+    );
+    assert_eq!(serde_json::json!(42), responses[1]["id"]);
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn valid_jsonrpc_member_control_still_answers_results() {
+    // rm-998 (valid control): the exact string "2.0" keeps
+    // answering — a ping result, and a full initialize handshake
+    // (including the silent notifications/initialized transition) is
+    // unaffected by the member gate.
+    let (home, cache) = seed_home("member-valid", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":51,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":52,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":53,"method":"ping"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code);
+    assert_eq!(
+        3,
+        responses.len(),
+        "initialize and pings answer; the notification stays silent"
+    );
+    assert!(
+        responses[0]["result"].is_object(),
+        "a valid ping still answers a result"
+    );
+    assert!(
+        responses[1]["result"]["protocolVersion"].is_string(),
+        "initialize still negotiates through the member gate"
+    );
+    assert!(
+        responses[2]["result"].is_object(),
+        "the server keeps serving after the handshake"
     );
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));
 }
