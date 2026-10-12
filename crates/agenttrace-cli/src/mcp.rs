@@ -43,7 +43,12 @@
 //!   stays framed: the requests after the discarded line still
 //!   answer); request ids are validated to the JSON-RPC 2.0
 //!   String|Number|Null set — anything else answers `-32600` with id
-//!   null; non-object `params`/`arguments` answer `-32602`. A
+//!   null; the `jsonrpc` member must be exactly the string `"2.0"`
+//!   (absent, misspelled, or non-string members answer `-32600`
+//!   echoing the request id — rm-998, the member lane of the
+//!   rm-780/rm-782/rm-998 validation triad; notification-shaped
+//!   lines keep the stays-silent posture); non-object
+//!   `params`/`arguments` answer `-32602`. A
 //!   discovered-but-empty corpus is a tool-level error result
 //!   (`isError: true`), mirroring the CLI's non-zero exit for the
 //!   same situation — and a discovered corpus whose sessions all
@@ -332,6 +337,33 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
             ));
         }
     };
+    // rm-998: JSON-RPC 2.0 §5.1 — the `jsonrpc` member MUST be
+    // exactly the string "2.0". This is the member lane of the
+    // validation triad: rm-780 hardened the `initialize`
+    // negotiation, rm-782 the id-type and params lanes, and this arm
+    // closes the last gap — the three-way live probe at assess
+    // (`{"id":1,"method":"ping"}`, `{"id":3,"jsonrpc":"9.9",…}`)
+    // showed both shapes answered results, so a host speaking any
+    // other dialect was silently served. The check sits AFTER id
+    // validation (so the echoed id is always spec-shaped — the
+    // rm-782 discipline is not weakened) and BEFORE method
+    // extraction (so the member violation wins the message when a
+    // line is wrong in both). A number (`"jsonrpc": 2.0`) is not
+    // the string "2.0" and is refused the same way. Lines without
+    // an id keep the notification posture (silence): an id-less
+    // message could never be answered with an id echo, and the
+    // missing-method arm below made the same call for its lane.
+    match object.get("jsonrpc") {
+        Some(Value::String(version)) if version == "2.0" => {}
+        _ => {
+            id.as_ref()?;
+            return Some(error_response(
+                id,
+                CODE_INVALID_REQUEST,
+                "Invalid Request: `jsonrpc` must be exactly \"2.0\"",
+            ));
+        }
+    }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
         // No method: a request is invalid, a notification is ignorable.
         // (`id.as_ref()?` silences a notification here without moving it.)
