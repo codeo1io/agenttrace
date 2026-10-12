@@ -179,3 +179,40 @@ printf '%s\n' \
   | "$bin" mcp >"$out_dir/docs/mcp-tools.json"
 node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const names=r.result.tools.map(t=>t.name).sort(); if (names.join(",") !== "by_model_breakdown,usage_overview") { console.error("unexpected tools: " + names); process.exit(1); }' "$out_dir/docs/mcp-tools.json" \
   || fail "the mcp server must expose exactly usage_overview and by_model_breakdown"
+
+# gates-that-cannot-lie (cycle 2): README's "Discovered session roots"
+# table must enumerate exactly the family discovery.rs scans — the next
+# root added to the code must not silently skip the docs (README carried
+# NO enumeration before this lane). Static checks only; no binary needed.
+discovery="crates/agenttrace-core/src/discovery.rs"
+[[ -f "$discovery" ]] || fail "missing $discovery"
+code_roots="$(
+  {
+    sed -n '/fn known_session_dirs(/,/^    \];/p' "$discovery" |
+      grep -oE 'name: "[^"]+"' | sed -e 's/^name: "//' -e 's/"$//'
+    sed -n '/fn open_code_known_session_dirs(/,/^}/p' "$discovery" | tr '\n' ' ' |
+      grep -oE 'add\(\s*"[^"]+"' | grep -oE '"[^"]+"' | tr -d '"'
+    sed -n '/fn cline_known_session_dirs(/,/^}/p' "$discovery" |
+      grep -oE 'name: "[^"]+"' | sed -e 's/^name: "//' -e 's/"$//'
+    sed -n '/fn pi_family_known_session_dirs(/,/^}/p' "$discovery" |
+      grep -oE ',\s*"[^"]+"\)' | grep -oE '"[^"]+"' | tr -d '"'
+  } | sort -u
+)"
+[[ -n "$code_roots" ]] ||
+  fail "could not extract session-root names from discovery.rs"
+while IFS= read -r root; do
+  grep -qF "| $root |" README.md ||
+    fail "README's 'Discovered session roots' table must document the code root '$root'"
+done <<<"$code_roots"
+expected_rows=$(grep -c . <<<"$code_roots")
+readme_rows=$(
+  awk '/^## Discovered session roots/{f=1;next} /^## /{f=0} f' README.md |
+    grep -cE '^\| [^:-]'
+)
+readme_rows=$((readme_rows - 1)) # the header row "| Source | Default root |"
+[[ "$readme_rows" -eq "$expected_rows" ]] ||
+  fail "README documents $readme_rows session roots but discovery.rs enumerates $expected_rows — keep the table and the code family in lockstep"
+awk '/^## Discovered session roots/{f=1;next} /^## /{f=0} f' README.md |
+  grep -q 'aider.chat.history.md' ||
+  fail "README's 'Discovered session roots' section must mention the cwd-scoped Aider history file"
+echo "check-docs-commands: session-roots table in lockstep with discovery.rs ($expected_rows roots)"
