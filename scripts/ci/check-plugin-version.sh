@@ -62,8 +62,32 @@ fi
 # mid-range merged tags could stay sectionless forever (v0.8.1 shipped
 # that way: heading jump v0.9.0 -> v0.7.1). Lineage-scoped and
 # no-tag-fallback like the anchor above.
-while IFS= read -r tag; do
-  [[ -n "$tag" ]] || continue
+#
+# Fork-scope cut (rm-1365, run 43db92ef): tags strictly older than v0.4.0
+# are inherited upstream releases imported at the fork point — the fork's
+# CHANGELOG does not document them and never should (49 such tags,
+# v0.0.4..v0.3.9, made this arm red on every full clone with visible tags
+# while a zero-tag checkout passed vacuously). The cut is an explicit
+# constant, NOT derived from the CHANGELOG: an oldest-sectioned-tag
+# derivation would silently move forward the first time a fork tag ships
+# without a section — exactly the regression this arm exists to catch.
+# Bump the constant only if the fork deliberately re-imports upstream
+# history.
+fork_first_tag='v0.4.0'
+mapfile -t merged_tags < <(git -C "$root" tag --merged HEAD 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V || true)
+
+# Vacuous-pass killer (rm-1365): a full clone that can see no merged
+# semver tag has broken tag transport, and a silent green here would be
+# a false pass. Shallow checkouts (git's shallow marker present) still
+# degrade to the CHANGELOG chain by design, exactly like the anchor
+# arm above.
+if [[ ${#merged_tags[@]} -eq 0 ]] && [[ ! -e "$(git -C "$root" rev-parse --git-dir)/shallow" ]]; then
+  fail "no merged semver tags visible on a full clone — tag transport broken (vacuous pass refused, rm-1365)"
+fi
+
+for tag in "${merged_tags[@]}"; do
+  # Inherited upstream tag (older than the fork cut): exempt.
+  [[ "$(printf '%s\n%s\n' "$fork_first_tag" "$tag" | sort -V | tail -1)" == "$tag" ]] || continue
   escaped_tag=${tag//./\\.}
   if grep -qE "^## ${escaped_tag}( |$)" "$changelog"; then
     continue
@@ -71,8 +95,8 @@ while IFS= read -r tag; do
   if grep -qF "<!-- no-changelog-section: $tag:" "$changelog"; then
     continue
   fi
-  fail "merged tag $tag has no CHANGELOG section: add a '## $tag' heading or an explicit '<!-- no-changelog-section: $tag: reason -->' marker"
-done < <(git -C "$root" tag --merged HEAD 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+  fail "merged fork-owned tag $tag (>= $fork_first_tag) has no CHANGELOG section: add a '## $tag' heading or an explicit '<!-- no-changelog-section: $tag: reason -->' marker"
+done
 
 # Asset integrity: every string value in the manifest that looks like a
 # relative path must resolve at the repo root.

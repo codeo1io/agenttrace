@@ -84,6 +84,10 @@ jobs:
           git fetch --tags --quiet || true
           scripts/ci/check-plugin-version.sh
 
+      - name: CHANGELOG shape gate
+        # rm-1366: at most one kind-heading per version section.
+        run: scripts/ci/check-changelog.sh
+
       - name: Validate Homebrew formula syntax
         run: ruby -c homebrew/Formula/agenttrace.rb
 

@@ -84,7 +84,7 @@ curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.
 The install scripts download the release binary for your platform, verify its
 SHA-256 against the published checksum, and add the install directory to your
 PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). Set
-`AGENTTRACE_VERSION=v0.9.1` (or `-Version v0.9.1` in PowerShell) to pin a
+`AGENTTRACE_VERSION=v0.10.1` (or `-Version v0.10.1` in PowerShell) to pin a
 release.
 
 Package managers:

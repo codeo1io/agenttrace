@@ -35,6 +35,14 @@ target/release/agenttrace --demo --doctor
 target/release/agenttrace --demo --overview -f json
 ```
 
+## Changelog Entries
+
+Inside a version section of `CHANGELOG.md`, each kind heading (`### Added`,
+`### Changed`, `### Fixed`, ...) appears at most once: append new entries under
+the section's EXISTING kind heading, in order, instead of adding a fresh one.
+`scripts/ci/check-changelog.sh` enforces this in CI (run it locally after
+touching the changelog).
+
 ## Translations
 
 All user-visible text lives in `crates/agenttrace-core/locales/en.yml` and
