@@ -342,3 +342,64 @@ fn otel_export_has_no_network_transport() {
         assert!(!src.contains(banned), "otel.rs must not reference {banned}");
     }
 }
+
+#[test]
+fn prompt_id_joins_statusline_captures_to_otel_export() {
+    // rm-708 end-to-end fixture pair (cycle 2, run 415d77e1): the
+    // statusline payload's `prompt_id` is documented to "Match the
+    // `prompt.id` attribute on OpenTelemetry events, when they exist"
+    // (statusline docs, fetched 2026-10-07). The fork's own emitter
+    // does not set `prompt.id` yet (that arm is a later OTel change);
+    // an emitter that does — the next fork arm or a CC-native otel
+    // lane — produces spans like the ones injected below on the real
+    // export document. The pure capture-side join must then correlate
+    // exactly the shared ids, and only those.
+    use agenttrace_core::{correlated_prompt_ids, CapturedStatusline};
+
+    let a = write_session("claude-join.jsonl", CLAUDE_BODY);
+    let sessions = vec![parse_file(&a).unwrap()];
+    let raw = report_otel_export(&sessions);
+    let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    // Inject the documented attribute onto the real exported span,
+    // keeping the OTLP-JSON wire shape (`attributes[]` with
+    // `key` + `value.stringValue`) this export already pins.
+    let span = &mut doc["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    span["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "key": "prompt.id",
+            "value": {"stringValue": "550e8400-e29b-41d4-a716-446655440000"}
+        }));
+
+    let capture = |session_id: &str, prompt_id: Option<&str>| CapturedStatusline {
+        captured_at: 1_790_000_000,
+        payload: match prompt_id {
+            Some(id) => serde_json::json!({
+                "session_id": session_id,
+                "prompt_id": id,
+                "context_window": {"used_percentage": 41.2}
+            }),
+            None => serde_json::json!({"session_id": session_id}),
+        },
+    };
+    let captures = vec![
+        capture("sess-a", Some("550e8400-e29b-41d4-a716-446655440000")),
+        capture("sess-b", Some("00000000-0000-4000-8000-000000000000")),
+        capture("sess-c", None),
+    ];
+
+    // The join surface: exactly the shared id correlates.
+    assert_eq!(
+        correlated_prompt_ids(&captures, &doc),
+        vec!["550e8400-e29b-41d4-a716-446655440000".to_string()],
+        "one prompt id shared between the journal and the export"
+    );
+
+    // Control: without the attribute the real export joins nothing —
+    // the emitter-side arm being absent is a disclosed empty state,
+    // never an error.
+    let bare: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(correlated_prompt_ids(&captures, &bare).is_empty());
+}

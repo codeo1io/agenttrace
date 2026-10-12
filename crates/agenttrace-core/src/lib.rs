@@ -89,10 +89,13 @@ pub use sqlite_sessions::{
     SqliteDroppedRows, SqliteDuplicateDb, SqliteIngestReport, SqliteUnreadableDb,
 };
 pub use statusline::{
-    is_bidi_format_control, load_statusline_insights, render_budget_view, render_statusline_report,
-    run_statusline_host, sanitize_line_segment, sanitize_output_document, statusline_budget_series,
-    statusline_capture_path, statusline_insights, statusline_journal_stats, CapturedStatusline,
-    StatuslineBudgetSeries, StatuslineInsights, StatuslineJournalStats, StatuslineRateLimitState,
+    correlated_prompt_ids, is_bidi_format_control, load_statusline_insights, render_budget_view,
+    render_statusline_report, run_statusline_host, sanitize_line_segment, sanitize_output_document,
+    statusline_budget_series, statusline_capture_path, statusline_insights,
+    statusline_journal_stats, CapturedStatusline, StatuslineBudgetSeries, StatuslineContextUsage,
+    StatuslineContextWindow, StatuslineInsights, StatuslineJournalStats, StatuslinePromptCache,
+    StatuslineRateLimitState, StatuslineSessionContextWindow, StatuslineSessionPrompt,
+    StatuslineSpendLimit,
 };
 pub use subagents::attribute_subagents;
 pub use waste::{
