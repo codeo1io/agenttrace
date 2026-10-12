@@ -351,6 +351,21 @@ and never reads a baseline document, so combining `--baseline` with
 `--compare` exits 1 with an error naming both flags rather than falling
 through to a misleading action error.
 
+### Multi-machine usage over synced roots (rm-1061)
+
+If you sync or mount your agent homes across machines (for example a
+shared `~/.claude/projects` tree, or per-machine copies under one
+folder), pass every root with a repeated `-d` — report lanes scan the
+union and count a session file that appears in more than one root
+exactly once, so synced copies never double-bill:
+
+```bash
+agenttrace -d ~/machines/laptop/.claude/projects -d ~/machines/desktop/.claude/projects --overview
+```
+
+Deduplication is keyed by (source, file name), which is what survives
+sync copies. `mcp`, `--doctor`, and the TUI take exactly one `--dir`.
+
 ### Statusline capture
 
 Subscription limit windows (`5h`/`7d` usage and reset times) and Claude
@@ -398,7 +413,7 @@ fails when the README table drifts from the binary's actual flag count
 | --- | --- | --- |
 | `-f, --format <FORMAT>` | `text` | Output format for the requested view: text (default), json, csv, markdown/md, html, svg (the shareable usage card; requires --overview), otel (the OTLP-JSON export of the whole corpus; requires --overview), or tsv (the --sessions table, byte-identical to its default text render; requires --sessions). Unsupported combinations fail loudly instead of falling back to text |
 | `--card-theme <CARD_THEME>` | `auto` | rm-576: color scheme of the SVG usage card (`-f svg`). `auto` ships the light palette plus a `prefers-color-scheme` override so the static file adapts to the viewer; bytes stay deterministic |
-| `-d, --dir <DIR>` |  | Session directory to scan instead of auto-discovered agent homes |
+| `-d, --dir <DIR>` |  | Session directory to scan instead of auto-discovered agent homes; repeatable on report lanes — several roots are scanned as one deduplicated union (same file in two roots counts once) |
 | `--compare` |  | Compare the inspected session against the healthy-baseline summary (narrative framed for `-m`) |
 | `--audit` |  | Render the governance audit report across matching sessions (tool-authority drift and spend oversight; `--sample` bounds it) |
 | `--recommend` |  | Render cost and efficiency recommendations derived from the session corpus |

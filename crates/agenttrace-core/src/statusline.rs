@@ -286,6 +286,19 @@ pub fn run_statusline_host() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A2 (run 62250c06): USD money rendering with the sign before the
+/// currency marker — negative costs must read "-$5.00", never
+/// "$-5.00", so downstream terminals cannot misread the value as a
+/// literal/prefixed string when spreadsheets or host bars consume
+/// the line.
+fn format_usd(value: f64) -> String {
+    if value.is_sign_negative() {
+        format!("-${:.2}", -value)
+    } else {
+        format!("${:.2}", value)
+    }
+}
+
 /// One line of status from the payload: model or session name, context
 /// window pressure, subscription limit pressure with the next reset,
 /// cache hit ratio, and running cost. Only fields that exist are shown.
@@ -352,7 +365,7 @@ fn render_status_line(payload: &Value) -> String {
         .and_then(|cost| cost.get("total_cost_usd"))
         .and_then(Value::as_f64)
     {
-        parts.push(format!("${cost:.2}"));
+        parts.push(format_usd(cost));
     }
     if parts.is_empty() {
         "agenttrace".to_string()
@@ -1373,8 +1386,10 @@ fn render_statusline_report_text(
     if let Some(spend) = &insights.spend_limit {
         let mut parts: Vec<String> = Vec::new();
         let mut usd = match (spend.used_usd, spend.limit_usd) {
-            (Some(used), Some(limit)) => Some(format!("${used:.2} of ${limit:.2}")),
-            (Some(used), None) => Some(format!("${used:.2} spent")),
+            (Some(used), Some(limit)) => {
+                Some(format!("{} of {}", format_usd(used), format_usd(limit)))
+            }
+            (Some(used), None) => Some(format!("{} spent", format_usd(used))),
             (None, _) => None,
         };
         if let Some(period) = &spend.period {
@@ -1413,7 +1428,7 @@ fn render_statusline_report_text(
             let state = if remaining < 0.0 {
                 format!("OVER by ${:.2}", -remaining)
             } else {
-                format!("${remaining:.2} remaining")
+                format!("{} remaining", format_usd(remaining))
             };
             out.push_str(&format!(
                 "Budget: 7d spend ${:.2} of ${budget:.2} — {state}\n",
@@ -1769,6 +1784,24 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn negative_cost_renders_sign_before_currency() {
+        // A2 (run 62250c06): negative payload cost must render
+        // "-$5.00", never "$-5.00" — the sign belongs before the
+        // currency marker in every downstream terminal that consumes
+        // the host line.
+        let payload = serde_json::json!({
+            "model": {"display_name": "S"},
+            "cost": {"total_cost_usd": -5.0}
+        });
+        let line = crate::statusline::render_status_line(&payload);
+        assert!(
+            line.contains("-$5.00"),
+            "sign must precede currency: {line}"
+        );
+        assert!(!line.contains("$-"), "currency-then-sign is wrong: {line}");
+    }
+
     #[test]
     fn rm936_is_bidi_format_control_bounds() {
         // The directional/format set (Cf) the lane sanitizers must kill.
