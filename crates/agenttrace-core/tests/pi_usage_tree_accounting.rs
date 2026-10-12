@@ -312,12 +312,43 @@ const USAGE_RECORDED_COST_GPT5: &str = concat!(
     r#"{"type": "usage", "id": "31", "parentId": "21", "timestamp": "2026-10-04T10:00:05.000Z", "kind": "cache_warm", "provider": "openai", "model": "gpt-5", "usage": {"input": 1000000, "output": 0, "cacheRead": 0, "cacheWrite": 0, "cost": {"input": 5.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 5.0}}}"#,
 );
 
-fn scratch_dir() -> PathBuf {
+fn scratch_dir() -> ScratchDir {
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("at-pi-accounting-{}-{seq}", std::process::id()));
     fs::create_dir_all(&dir).expect("scratch dir");
-    dir
+    ScratchDir(dir)
+}
+
+/// rm-1067: a test-scoped scratch dir that removes itself. The plain
+/// `PathBuf` this used to return outlived every test that built a
+/// fixture in it — a live census on this host (2026-10-13) counted
+/// 1,004 leftover `at-pi-accounting-*` dirs from 43 stale pids,
+/// ~23 per run, none referenced again. The guard derefs to `Path` so
+/// existing `journal(&dir, ...)` call sites are unchanged; scope-end
+/// (or an unwinding assert) sweeps the tree. Tests that genuinely
+/// need the tree to persist must do so on purpose (e.g. `let leaked =
+/// dir.as_path().to_path_buf()`), which the drop then still cleans at
+/// scope end.
+struct ScratchDir(PathBuf);
+
+impl std::ops::Deref for ScratchDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl ScratchDir {
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn journal(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -330,6 +361,38 @@ fn parsed(name: &str, body: &str) -> Session {
     let dir = scratch_dir();
     let path = journal(&dir, name, body);
     parse_file(&path).unwrap_or_else(|error| panic!("{name} must parse as pi journal: {error}"))
+}
+
+#[test]
+fn scratch_dirs_do_not_outlive_their_scope() {
+    // rm-1067 (red-first): every test above builds its fixture inside a
+    // `scratch_dir()` and then simply stops using it — the dirs pile up
+    // under $TMPDIR forever. The live census on this host (2026-10-13)
+    // found 1,004 leftover at-pi-accounting-* dirs from 43 stale pids,
+    // 1004/43 ≈ 23 dirs per test run, none of them referenced by
+    // anything again. The guard (ScratchDir) removes the tree when the
+    // binding's scope ends, so a suite's scratch footprint is zero and
+    // any future test that WANTS persistence must say so explicitly by
+    // leaking the dir on purpose.
+    let leaked: PathBuf = {
+        let dir = scratch_dir();
+        let path = journal(
+            &dir,
+            "usage-recorded-cost-gpt5.jsonl",
+            USAGE_RECORDED_COST_GPT5,
+        );
+        assert!(
+            path.is_file(),
+            "fixture written inside the scratch dir must exist while in scope"
+        );
+        dir.as_path().to_path_buf()
+    };
+    assert!(
+        !leaked.exists(),
+        "scratch dir {leaked:?} must be removed when its scope ends \
+         (rm-1067): nothing references it again and the alternative is \
+         another one of the 1,004 leaked at-pi-accounting dirs"
+    );
 }
 
 #[test]

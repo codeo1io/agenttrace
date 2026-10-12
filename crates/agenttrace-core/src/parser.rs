@@ -5905,6 +5905,12 @@ fn parse_opencode_storage_session(
     let mut model = opencode_session_model(session);
     let mut usage = BTreeMap::new();
     let mut body = Vec::new();
+    // rm-164: the service tiers carried by the messages that actually
+    // contributed usage. Exactly one distinct tier labels the session's
+    // meta usage event (the pricing seam bills it); disagreement or
+    // absence carries no tier, the same single-agreement rule as the
+    // session-fold, rather than mislabeling the whole bill.
+    let mut service_tiers = std::collections::BTreeSet::new();
     for msg in messages {
         if model == "unknown" {
             let msg_model = opencode_message_model(&msg.doc);
@@ -5919,9 +5925,14 @@ fn parse_opencode_storage_session(
         // consumed no billing class, so the rescue still fires and the
         // step's input/output survives.
         let message_fold = add_opencode_tokens(&mut usage, msg.doc.get("tokens"), true);
-        let (events, part_usage) =
+        let (events, part_usage, message_tier) =
             parse_opencode_message(&storage_root, &msg.doc, &model, message_fold);
         add_usage(&mut usage, &part_usage);
+        if message_fold.billing || !part_usage.is_empty() {
+            if let Some(tier) = message_tier {
+                service_tiers.insert(tier);
+            }
+        }
         body.extend(events);
     }
     if body.is_empty() {
@@ -5938,6 +5949,11 @@ fn parse_opencode_storage_session(
                 usage
             } else {
                 BTreeMap::new()
+            },
+            service_tier: if service_tiers.len() == 1 {
+                service_tiers.into_iter().next()
+            } else {
+                None
             },
             ..Event::default()
         });
@@ -5987,12 +6003,37 @@ fn sort_opencode_records(records: &mut [OpenCodeRecord]) {
     );
 }
 
+fn opencode_service_tier(obj: &Map<String, Value>) -> Option<String> {
+    // rm-164 (2026-10-13): opencode v1.19.0 accepts OpenAI service
+    // tiers — config-side `serviceTier`
+    // (auto/flex/priority/ultrafast/default), on-wire `service_tier`
+    // in the outgoing request (anomalyco/opencode PR #53875 "accept
+    // OpenAI ultrafast service tier" + #47671 "preserve explicit
+    // OpenAI service tiers"). The storage schema's TokenUsage.Info
+    // carries no tier slot yet, so this is a tolerant reader, not a
+    // schema pin: the object's own `serviceTier`/`service_tier`, then
+    // its `tokens` object's same fields, either spelling, either
+    // case. `auto`/`default` (and anything blank) mean "no pinned
+    // tier" — the provider picked, so the turn bills standard.
+    let raw = string(obj.get("serviceTier"))
+        .or_else(|| string(obj.get("service_tier")))
+        .or_else(|| {
+            let tokens = obj.get("tokens")?.as_object()?;
+            string(tokens.get("serviceTier")).or_else(|| string(tokens.get("service_tier")))
+        })?;
+    let tier = raw.trim().to_ascii_lowercase();
+    match tier.as_str() {
+        "" | "auto" | "default" | "none" => None,
+        _ => Some(tier),
+    }
+}
+
 fn parse_opencode_message(
     storage_root: &Path,
     msg: &Map<String, Value>,
     model: &str,
     message_fold: OpencodeTokensFold,
-) -> (Vec<Event>, BTreeMap<String, i64>) {
+) -> (Vec<Event>, BTreeMap<String, i64>, Option<String>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
     let msg_id = string(msg.get("id")).unwrap_or("");
@@ -6001,6 +6042,11 @@ fn parse_opencode_message(
 
     let mut events = Vec::new();
     let mut part_usage = BTreeMap::new();
+    // rm-164: the tier this message ran on, when the journal carries
+    // it (message doc first, then its step-finish part — see the arm
+    // below). Gated on the message actually contributing usage by the
+    // caller.
+    let mut tier = opencode_service_tier(msg);
     for record in parts.iter() {
         let part = &record.doc;
         let part_ts = opencode_part_timestamp(part, &ts);
@@ -6032,13 +6078,24 @@ fn parse_opencode_message(
                 }
             }
             "tool" => events.extend(opencode_tool_events(part, &part_ts, model)),
-            "step-finish" if !message_fold.billing => {
+            "step-finish" => {
                 // rm-619 rescue: the message level reported no billing
                 // classes, so this part is the only place the step's usage
                 // exists. Reasoning folds here only when the message level
                 // did not already disclose it — each key class counts once
                 // under the mirror contract.
-                add_opencode_tokens(&mut part_usage, part.get("tokens"), !message_fold.reasoning);
+                if !message_fold.billing {
+                    add_opencode_tokens(
+                        &mut part_usage,
+                        part.get("tokens"),
+                        !message_fold.reasoning,
+                    );
+                }
+                // rm-164: the step-finish part is the other place a
+                // journal can carry the service tier it ran on.
+                if tier.is_none() {
+                    tier = opencode_service_tier(part);
+                }
             }
             _ => {}
         }
@@ -6056,7 +6113,7 @@ fn parse_opencode_message(
             });
         }
     }
-    (events, part_usage)
+    (events, part_usage, tier)
 }
 
 fn opencode_tool_events(part: &Map<String, Value>, ts: &str, model: &str) -> Vec<Event> {
@@ -10609,6 +10666,209 @@ mod tests {
         let session = parse_codex_rollout_jsonl(&raw).expect("tier-less codex rollout parses");
         let (events, _skips) = session;
         assert!(events.iter().all(|event| event.service_tier.is_none()));
+    }
+
+    #[test]
+    fn opencode_storage_service_tier_rides_the_usage_event() {
+        // rm-164 (2026-10-13): opencode v1.19.0 accepts OpenAI service
+        // tiers — config-side `serviceTier`
+        // (auto/flex/priority/ultrafast/default), on-wire
+        // `service_tier` in the outgoing request (anomalyco/opencode PR
+        // #53875 "accept OpenAI ultrafast service tier" + #47671
+        // "preserve explicit OpenAI service tiers"). The storage
+        // schema's TokenUsage.Info carries no tier slot yet, so this
+        // seam is a tolerant reader, not a schema pin: where a journal
+        // DOES carry the tier it ran on — the step-finish part, its
+        // `tokens` object, or the message-level `tokens` object, in
+        // either spelling — it rides the session's usage event so the
+        // pricing seam bills the tier that actually ran. Tier-less
+        // journals keep every service_tier None (additive-only, the
+        // same rule as the codex lane). Sessions whose usage messages
+        // disagree on the tier carry no tier (single-agreement, like
+        // the session-fold rule) instead of mislabeling the whole bill.
+        type Msg<'a> = (
+            Option<serde_json::Value>,
+            Option<&'a str>,
+            Option<serde_json::Value>,
+            Option<&'a str>,
+        );
+        fn session_events(name: &str, messages: &[Msg]) -> Vec<Event> {
+            let root = std::env::temp_dir()
+                .join(format!("at-opencode-tier-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            let session_dir = root.join("opencode/storage/session/ses_tier");
+            let message_dir = root.join("opencode/storage/message/ses_tier");
+            fs::create_dir_all(&session_dir).expect("create session dir");
+            fs::create_dir_all(&message_dir).expect("create message dir");
+            let session_path = session_dir.join("ses_tier.json");
+            fs::write(
+                &session_path,
+                serde_json::json!({
+                    "id": "ses_tier", "projectID": "p",
+                    "model": {"id": "gpt-6-astra"},
+                    "time": {"created": 1764750000000i64}
+                })
+                .to_string(),
+            )
+            .expect("write session doc");
+            for (index, (message_tokens, message_tier, part_tokens, part_tier)) in
+                messages.iter().enumerate()
+            {
+                let msg_id = format!("msg_t{index}");
+                let mut message = serde_json::json!({
+                    "id": msg_id, "role": "assistant", "modelID": "gpt-6-astra",
+                    "time": {"created": 1764750000000 + index as i64}
+                });
+                let message_map = message.as_object_mut().expect("message object");
+                if let Some(tokens) = message_tokens {
+                    message_map.insert("tokens".to_string(), tokens.clone());
+                }
+                if let Some(tier) = message_tier {
+                    message_map.insert("service_tier".to_string(), serde_json::json!(tier));
+                }
+                fs::write(
+                    message_dir.join(format!("{msg_id}.json")),
+                    message.to_string(),
+                )
+                .expect("write message doc");
+                // Every message carries a text part so the message always
+                // yields a parseable event (an empty message yields none).
+                let text_part_dir = root.join(format!("opencode/storage/part/{msg_id}"));
+                fs::create_dir_all(&text_part_dir).expect("create part dir");
+                fs::write(
+                    text_part_dir.join("part_text.json"),
+                    serde_json::json!({
+                        "id": format!("{msg_id}_text"), "type": "text", "text": "reply"
+                    })
+                    .to_string(),
+                )
+                .expect("write text part");
+                if part_tokens.is_some() || part_tier.is_some() {
+                    let part_dir = root.join(format!("opencode/storage/part/{msg_id}"));
+                    fs::create_dir_all(&part_dir).expect("create part dir");
+                    let mut part = serde_json::json!({"id": format!("{msg_id}_finish"), "type": "step-finish"});
+                    let part_map = part.as_object_mut().expect("part object");
+                    if let Some(tokens) = part_tokens {
+                        part_map.insert("tokens".to_string(), tokens.clone());
+                    }
+                    if let Some(tier) = part_tier {
+                        part_map.insert("serviceTier".to_string(), serde_json::json!(tier));
+                    }
+                    fs::write(part_dir.join("part_finish.json"), part.to_string())
+                        .expect("write part doc");
+                }
+            }
+            let session: Map<String, Value> =
+                serde_json::from_str(&fs::read_to_string(&session_path).expect("read session doc"))
+                    .expect("session doc parses");
+            parse_opencode_storage_session(session_path.to_str().expect("utf8 path"), &session)
+                .unwrap_or_else(|error| panic!("opencode storage session must parse: {error}"))
+        }
+        let meta_tier = |events: &[Event]| -> Option<String> {
+            events
+                .iter()
+                .find(|event| event.role == "meta" && !event.usage.is_empty())
+                .and_then(|event| event.service_tier.clone())
+        };
+        // Part-level camelCase spelling, case-normalized (opencode
+        // config writes "ultrafast"; journals may echo either case).
+        let events = session_events(
+            "part",
+            &[(
+                None,
+                None,
+                Some(serde_json::json!({"input": 100, "output": 50})),
+                Some("Ultrafast"),
+            )],
+        );
+        assert_eq!(
+            meta_tier(&events).as_deref(),
+            Some("ultrafast"),
+            "part-level serviceTier rides the usage event: {events:?}"
+        );
+        // Message-level snake_case spelling with the authoritative
+        // message-level `tokens` fold.
+        let events = session_events(
+            "message",
+            &[(
+                Some(serde_json::json!({"input": 10, "output": 5})),
+                Some("flex"),
+                None,
+                None,
+            )],
+        );
+        assert_eq!(meta_tier(&events).as_deref(), Some("flex"));
+        // The `tokens` object itself carries the tier (both spellings
+        // inside the object).
+        let events = session_events(
+            "tokens-object",
+            &[(
+                None,
+                None,
+                Some(serde_json::json!({"input": 7, "output": 8, "serviceTier": "priority"})),
+                None,
+            )],
+        );
+        assert_eq!(meta_tier(&events).as_deref(), Some("priority"));
+        let events = session_events(
+            "tokens-object-snake",
+            &[(
+                Some(serde_json::json!({"input": 7, "output": 8, "service_tier": "flex"})),
+                None,
+                None,
+                None,
+            )],
+        );
+        assert_eq!(meta_tier(&events).as_deref(), Some("flex"));
+        // Disagreeing tiers across usage-carrying messages carry no
+        // tier at all rather than mislabel the whole session.
+        let events = session_events(
+            "mixed",
+            &[
+                (
+                    None,
+                    None,
+                    Some(serde_json::json!({"input": 100, "output": 50})),
+                    Some("flex"),
+                ),
+                (
+                    Some(serde_json::json!({"input": 10, "output": 5})),
+                    Some("ultrafast"),
+                    None,
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(
+            meta_tier(&events),
+            None,
+            "no single agreed tier means no tier label"
+        );
+        // A tier on a message that contributed no usage is not carried.
+        let events = session_events(
+            "usage-less",
+            &[(None, None, Some(serde_json::json!({})), Some("ultrafast"))],
+        );
+        assert_eq!(
+            meta_tier(&events),
+            None,
+            "tier without usage is not carried"
+        );
+        // Tier-less journals (the only known storage shapes today)
+        // keep every service_tier None.
+        let events = session_events(
+            "plain",
+            &[(
+                None,
+                None,
+                Some(serde_json::json!({"input": 100, "output": 50})),
+                None,
+            )],
+        );
+        assert!(
+            events.iter().all(|event| event.service_tier.is_none()),
+            "additive-only: tier-less journals are unchanged"
+        );
     }
 }
 
