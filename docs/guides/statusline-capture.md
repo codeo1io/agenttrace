@@ -34,7 +34,7 @@ script](../../README.md#install) puts it on `~/.local/bin` or `/usr/local/bin`).
 Claude Code invokes the command with the payload as a single line of JSON on
 stdin and expects **exactly one line on stdout**. `agenttrace statusline`:
 
-- renders `name | ctx N% | 5h/7d N% until HH:MM | cache N% | $cost`,
+- renders `name | ctx N% | 5h/7d N% until HH:MM (UTC±HH:MM) | cache N% | $cost` — the reset clock is the host's **local** timezone with an explicit UTC offset label (rm-165),
 - exits `0` for **any** input — valid payload, malformed JSON, or empty stdin,
 - exits `0` for any **stdout condition** too — a closed pipe or full disk is
   reported to stderr at most, never a panic (the line is written with the

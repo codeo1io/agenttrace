@@ -124,7 +124,12 @@ enum AnyValue {
 /// this folds into its shared helper. rm-936: the fold landed — the Cc
 /// test now composes with the shared Cf predicate
 /// ([`crate::statusline::is_bidi_format_control`]) so span names and
-/// attribute values cannot carry directional controls either.
+/// attribute values cannot carry directional controls either. rm-1063:
+/// that guarantee now holds at the construction site itself — span
+/// names (`session {name}`) pass through this sanitizer in
+/// [`session_span`], so the library surface is covered without the
+/// CLI's dispatch sanitizer (which had been masking the gap for CLI
+/// exports only).
 fn sanitize_otel_string(value: &str) -> String {
     value
         .chars()
@@ -367,7 +372,7 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
         trace_id: trace_id_for(session),
         span_id: span_id_for(session, ordinal),
         parent_span_id: None,
-        name: format!("session {}", session.name),
+        name: sanitize_otel_string(&format!("session {}", session.name)),
         kind: SPAN_KIND_INTERNAL,
         start_time_unix_nano: start,
         end_time_unix_nano: end,
@@ -381,7 +386,14 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
 /// Render the sessions as a pretty-printed OTLP-JSON
 /// `ExportTraceServiceRequest` document (export trace lane).
 pub fn report_otel_export(sessions: &[Session]) -> String {
-    let version = option_env!("CARGO_PKG_VERSION").unwrap_or("0.0.0");
+    // rm-1062: self-identify with the release-aware crate::VERSION, not
+    // CARGO_PKG_VERSION — the workspace-level package version is
+    // "0.0.0-dev" in every dev build AND in every released binary
+    // (release.yml stamps AGENTTRACE_RELEASE_VERSION, which VERSION
+    // resolves at compile time), so the old stamp misidentified every
+    // release to OTLP backends (assess 2b1c7797 PoC: --version
+    // 9.9.9-poc vs "service.version": "0.0.0-dev" on the wire).
+    let version = crate::VERSION;
     let spans = sessions
         .iter()
         .enumerate()
@@ -415,6 +427,58 @@ pub fn gen_ai_system_for_path(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rm1063_span_names_are_sanitized_at_construction() {
+        // rm-1063: `session {name}` used to be built raw — only the
+        // CLI's dispatch sanitizer covered span names, so the library
+        // surface (report_otel_export without the CLI wrapper) emitted
+        // hostile directional controls in span.name.
+        let session = crate::Session {
+            name: "bank\u{202E}evac \u{2066}probe\u{001B}".to_string(),
+            path: "/poc/claude-code.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: crate::Metrics::default(),
+            anomalies: vec![],
+            health: 0,
+            tool_warnings: vec![],
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let span = session_span(&session, 0);
+        for c in ['\u{202E}', '\u{2066}', '\u{001B}'] {
+            assert!(
+                !span.name.contains(c),
+                "raw control {c:?} survived span-name construction"
+            );
+        }
+        // The neutralized form is what a library consumer sees with
+        // no CLI wrapper in the path.
+        assert!(span.name.contains('\u{FFFD}'));
+        assert!(span.name.starts_with("session "));
+    }
+
+    #[test]
+    fn rm1062_otel_export_self_identifies_with_the_release_version() {
+        // rm-1062: the export stamped CARGO_PKG_VERSION (the workspace
+        // 0.0.0-dev) so released binaries misidentified to OTLP
+        // backends; both the resource service.version and the scope
+        // version must carry the release-aware crate::VERSION.
+        let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&[])).unwrap();
+        let attrs = doc["resourceSpans"][0]["resource"]["attributes"]
+            .as_array()
+            .unwrap();
+        let service_version = attrs
+            .iter()
+            .find(|kv| kv["key"] == "service.version")
+            .and_then(|kv| kv["value"]["stringValue"].as_str())
+            .unwrap();
+        assert_eq!(service_version, crate::VERSION);
+        let scope_version = doc["resourceSpans"][0]["scopeSpans"][0]["scope"]["version"]
+            .as_str()
+            .unwrap();
+        assert_eq!(scope_version, crate::VERSION);
+    }
+
     #[test]
     fn rm936_sanitize_otel_string_neutralizes_bidi_format_controls() {
         // rm-936: span names and attribute values must not carry raw
