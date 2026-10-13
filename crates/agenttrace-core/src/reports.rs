@@ -1594,6 +1594,65 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     out.push_str("  ── By Model ──\n");
     push_text_group_family(&mut out, &overview.by_model, 25, |name| name.clone());
 
+    // rm-995: generation speed beside the by-model family it rolls up
+    // from — 0-count-clean (no line when no session carries a span),
+    // weighted corpus rate (never an average of averages), top-5 rows
+    // by rate, and the TTFT basis sized explicitly because the cache
+    // does not round-trip event timestamps.
+    {
+        let speed = generation_speed_payload(sessions);
+        let sessions_with_rate = speed
+            .get("sessions_with_rate")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        if sessions_with_rate > 0 {
+            out.push_str("  ── Generation speed ──\n");
+            if let Some(models) = speed.get("by_model").and_then(Value::as_array) {
+                for row in models.iter().take(5) {
+                    let model =
+                        text_cell(row.get("model").and_then(Value::as_str).unwrap_or(""), 25);
+                    let rate = row
+                        .get("tokens_per_sec")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+                    let model_sessions = row
+                        .get("sessions_with_rate")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    out.push_str(&format!(
+                        "    {:<25} {:>8.1} tok/s over {} session(s)\n",
+                        model, rate, model_sessions
+                    ));
+                }
+            }
+            out.push_str(&format!(
+                "    corpus: {:.1} tok/s over {} session(s) with a span",
+                speed
+                    .get("tokens_per_sec")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                sessions_with_rate
+            ));
+            let ttft_sessions = speed
+                .get("time_to_first_token")
+                .and_then(|ttft| ttft.get("sessions"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if ttft_sessions > 0 {
+                out.push_str(&format!(
+                    "; time-to-first-token: {:.1}s avg over {} session(s) with parse-time timestamps",
+                    speed
+                        .get("time_to_first_token")
+                        .and_then(|ttft| ttft.get("avg_sec"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0),
+                    ttft_sessions
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
     // rm-245: vendor and task-type dimensions beside by-model. Providers
     // come from the pricing catalog row that prices each model;
     // unresolvable models land in the explicit "unknown" bucket.
@@ -2477,6 +2536,111 @@ fn parse_avg_reasoning_chars(detail: &str) -> Option<f64> {
     value.parse().ok()
 }
 
+/// rm-995: generation-speed rollup shared by the overview JSON
+/// (`overview_summary`) and the `--sessions -f json` arm — pure
+/// render-time aggregation over already-parsed Metrics, so a
+/// cold-parsed and a warm-cache session of the same transcript carry
+/// the identical number (no new cache field). Per-session rate is
+/// `counted tokens / duration_sec` (`Metrics::tokens_per_sec`); the
+/// corpus and per-model rates are weighted (sum tokens over sum
+/// duration across the sessions that carry a rate), never an average
+/// of averages. Time-to-first-token is reported only where timestamps
+/// allow — the cache does not round-trip event timestamps, so warm
+/// sessions honestly stay out of that basis, and the basis sizes ship
+/// beside every number.
+pub fn generation_speed_payload<'a>(sessions: impl IntoIterator<Item = &'a Session>) -> Value {
+    let sessions: Vec<&Session> = sessions.into_iter().collect();
+    struct ModelSpeed {
+        tokens: i64,
+        duration: f64,
+        sessions: usize,
+    }
+    let mut corpus_tokens = 0i64;
+    let mut corpus_duration = 0f64;
+    let mut sessions_with_rate = 0usize;
+    let mut models: std::collections::BTreeMap<&str, ModelSpeed> =
+        std::collections::BTreeMap::new();
+    for session in &sessions {
+        let metrics = &session.metrics;
+        if metrics.duration_sec <= 0.0 || !metrics.duration_sec.is_finite() {
+            continue;
+        }
+        let tokens = crate::total_tokens(session);
+        if tokens <= 0 {
+            continue;
+        }
+        sessions_with_rate += 1;
+        corpus_tokens = corpus_tokens.saturating_add(tokens);
+        corpus_duration += metrics.duration_sec;
+        let entry = models
+            .entry(session.metrics.model_used.as_str())
+            .or_insert(ModelSpeed {
+                tokens: 0,
+                duration: 0.0,
+                sessions: 0,
+            });
+        entry.tokens = entry.tokens.saturating_add(tokens);
+        entry.duration += metrics.duration_sec;
+        entry.sessions += 1;
+    }
+    let ttft_values: Vec<f64> = sessions
+        .iter()
+        .filter_map(|session| session.metrics.ttft_sec())
+        .collect();
+    let ttft = if ttft_values.is_empty() {
+        json!({
+            "basis": "first assistant stamp minus earliest event stamp; parse-time timestamps only (the session cache does not round-trip them)",
+            "sessions": 0,
+        })
+    } else {
+        json!({
+            "basis": "first assistant stamp minus earliest event stamp; parse-time timestamps only (the session cache does not round-trip them)",
+            "sessions": ttft_values.len(),
+            "avg_sec": round4(ttft_values.iter().sum::<f64>() / ttft_values.len() as f64),
+        })
+    };
+    let mut by_model: Vec<Value> = models
+        .iter()
+        .map(|(name, speed)| {
+            json!({
+                "model": name,
+                "tokens_per_sec": round4(speed.tokens as f64 / speed.duration),
+                "sessions_with_rate": speed.sessions,
+            })
+        })
+        .collect();
+    by_model.sort_by(|a, b| {
+        let left = a
+            .get("tokens_per_sec")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let right = b
+            .get("tokens_per_sec")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        right
+            .partial_cmp(&left)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("model").and_then(Value::as_str).unwrap_or(""))
+            })
+    });
+    json!({
+        "basis": "counted tokens / duration_sec over the session timestamp span",
+        "sessions_with_rate": sessions_with_rate,
+        "tokens_per_sec": if corpus_duration > 0.0 {
+            round4(corpus_tokens as f64 / corpus_duration)
+        } else {
+            0.0
+        },
+        "by_model": by_model,
+        "time_to_first_token": ttft,
+    })
+}
+
 fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
     // Saturating: per-session totals can legitimately sit at i64::MAX, so a
     // plain `.sum()` overflowed across sessions (debug panic, release -2).
@@ -2503,6 +2667,9 @@ fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
         "total_cost": round4(overview.total_cost),
         "total_duration_seconds": round4(total_duration),
         "total_tokens": total_tokens,
+        // rm-995: generation-speed rollup (tokens/sec + TTFT basis) —
+        // see `generation_speed_payload`.
+        "generation_speed": generation_speed_payload(sessions),
         "tool_calls": total_tools,
         "tool_failures": failed_tools,
         "tool_fail_rate": if total_tools > 0 { round4(failed_tools as f64 / total_tools as f64 * 100.0) } else { 0.0 },

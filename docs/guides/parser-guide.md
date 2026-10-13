@@ -68,6 +68,17 @@ For SQLite-backed tools like Cursor, prefer a documented JSON export path unless
 
 Token counts are untrusted input: a corrupt or hostile journal can carry `1e300`, and the parser clamps every such value into `i64` with a saturating cast (`1e300` → `i64::MAX`) before it ever reaches a struct. Every layer that *aggregates* those counts must saturate too — a plain `i64 +=` on two clamped values panics the debug binary (`attempt to add with overflow`) and silently wraps in release. The parser's `add_usage` and the report layer's overview accumulations (e.g. `compute_overview`'s per-task-type totals, rm-541) therefore accumulate with `saturating_add`: a row saturates at `i64::MAX` **once** and stays there no matter how many more clamped sessions arrive, so downstream rates and shares always divide by finite non-negative totals. Costs are `f64` dollars, which cannot overflow-panic. When you add a new aggregation site, use `saturating_add` for token counts and add a fixture with two `i64::MAX` sessions to the report-layer contract tests (`tests/report_numeric_truthfulness.rs`).
 
+## Transcript Retention (in-place rewrites)
+
+Journals are not append-only in practice. Claude Code \u{2265} 2.1.296 may rewrite a live transcript **in place** (local GC behind the `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC` behavior, changelog lines 49/62): the oldest messages are dropped from the same `*.jsonl` file, so the re-parsed session legitimately carries LOWER totals than an earlier scan of the same path.
+
+agenttrace does not fight that: the report always shows what the file holds **now** (the fresh, smaller totals are the truth). What it refuses to do is re-baseline silently — a corpus total that drops because the source transcript shrank is a fact an operator must be able to see:
+
+- The session cache compares every re-parse against the entry it previously fingerprinted (size+mtime miss triggers the re-parse); when counted tokens or event totals DECREASE, the drop is recorded as a durable `transcript_shrink_events` ledger entry (path, session identity, before/after token and event counts, observation time) in the cache journal, plus a monotone `transcript_shrink_total` counter.
+- The ledger is bounded to the newest 8 records; the cumulative counter counts past the bound.
+- `agenttrace --doctor` renders a `transcript shrink:` disclosure row with the count and the newest records (text and JSON arms; the JSON members are omitted when nothing has ever shrunk).
+- Growth and appends are the normal story — only decreases record. A deleted file is not a shrink. A schema-bump or catalog-refresh rebuild of the store never resets the cumulative counter.
+
 ## Privacy Notes
 
 Do not commit real agent logs unless they are fully synthetic or carefully redacted. Session logs often include prompts, source code, file paths, tool arguments, and secrets.

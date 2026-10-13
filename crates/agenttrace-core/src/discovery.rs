@@ -72,6 +72,14 @@ pub struct LoadReport {
     /// count is disclosed so "SUBAGENTS 0" never reads as "no
     /// subagent work happened".
     pub unlinked_subagents: usize,
+    /// rm-993: re-parsed sessions whose totals DECREASED against their
+    /// previously-cached entry — the signature of Claude Code
+    /// \u{2265}2.1.296 local GC (`CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`)
+    /// rewriting a transcript in place. The fresh (smaller) totals are
+    /// what the report shows — this count exists so the corpus total
+    /// never silently re-baselines: the CLI prints a stderr advisory
+    /// and `--doctor` carries the ledger.
+    pub transcript_shrunk: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -393,6 +401,9 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // LoadReport so the CLI can say what actually happened.
     let mut parse_failures = 0usize;
     let mut first_parse_failure: Option<String> = None;
+    // rm-993: sessions observed shrinking this pass (see the
+    // LoadReport field).
+    let mut transcript_shrunk = 0usize;
     // rm-912: attempted-but-failed paths in discovery order, for the
     // CLI's -o membership check (see LoadReport::parse_failure_paths).
     let mut parse_failure_paths: Vec<PathBuf> = Vec::new();
@@ -423,7 +434,15 @@ pub fn load_sessions_with_progress_from_cache_mode(
                 match (&result, from_cache) {
                     (Some(_), true) => cache_hits += 1,
                     (Some(session), false) => {
+                        // rm-993: count shrinks observed by this store
+                        // pass — the ledger (durable in the cache
+                        // journal) is authoritative, this is the
+                        // per-run delta for the load advisory.
+                        let before = cache.transcript_shrink_total();
                         let _ = store_session(&files[next], session, cache);
+                        if cache.transcript_shrink_total() > before {
+                            transcript_shrunk += 1;
+                        }
                     }
                     (None, _) => {
                         skipped += 1;
@@ -539,6 +558,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         first_parse_failure,
         parse_failure_paths,
         unlinked_subagents,
+        transcript_shrunk,
     }
 }
 

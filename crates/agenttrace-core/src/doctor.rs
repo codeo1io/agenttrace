@@ -81,6 +81,19 @@ pub struct DoctorReport {
     /// changes alike). `None` when the journal has never recorded one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_invalidation_note: Option<String>,
+    /// rm-993: cumulative transcript-shrink count recorded in the
+    /// session journal — re-parses whose totals DECREASED against the
+    /// cache (Claude Code \u{2265}2.1.296 local GC
+    /// `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC` rewriting transcripts in
+    /// place). The report totals show the fresh smaller numbers; this
+    /// counter is the disclosed baseline shift so a shrinking corpus
+    /// never reads as a usage anomaly.
+    pub transcript_shrink_total: u64,
+    /// rm-993: the bounded shrink ledger (newest last) — path, session,
+    /// before/after token and event counts, observation time. Omitted
+    /// from JSON when empty (0-count-clean).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub transcript_shrink_events: Vec<Value>,
     pub sessions: usize,
     pub session_files: usize,
     /// rm-607 disclosure: sibling sqlite databases (outside the
@@ -143,6 +156,10 @@ struct SessionCacheReport {
     entries: BTreeMap<String, CacheEntryHeader>,
     dirs: usize,
     invalidation_note: Option<String>,
+    /// rm-993: shrink ledger + cumulative count straight off the
+    /// journal file (doctor reads the file, not the live cache).
+    transcript_shrink_total: u64,
+    transcript_shrink_events: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +217,8 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
                 entries: BTreeMap::new(),
                 dirs: 0,
                 invalidation_note: None,
+                transcript_shrink_total: 0,
+                transcript_shrink_events: Vec::new(),
             },
             cache_size_bytes: 0,
             files: Vec::new(),
@@ -316,6 +335,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_entry_bound_source: entry_bound_source.to_string(),
         reparsed_this_scan,
         cache_invalidation_note: cache.invalidation_note.clone(),
+        transcript_shrink_total: cache.transcript_shrink_total,
+        transcript_shrink_events: cache.transcript_shrink_events.clone(),
         sessions: files.len() + sessions.len(),
         session_files: files.len(),
         sqlite_duplicate_dbs: sqlite_ingest.duplicate_dbs,
@@ -1137,6 +1158,25 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     if let Some(note) = &report.cache_invalidation_note {
         out.push_str(&format!("  cache disclosure: {note}\n"));
     }
+    // rm-993: the shrink ledger — mirrors the invalidation-note arm
+    // (count first, then the newest records verbatim).
+    if report.transcript_shrink_total > 0 {
+        out.push_str(&format!(
+            "  transcript shrink: {} session transcript(s) shrank against the cache so far (Claude Code local GC rewrites transcripts in place; report totals show the fresh smaller numbers)\n",
+            report.transcript_shrink_total
+        ));
+        for record in report.transcript_shrink_events.iter().rev().take(3) {
+            let path = record.get("path").and_then(Value::as_str).unwrap_or("?");
+            let session = record.get("session").and_then(Value::as_str).unwrap_or("?");
+            let before = record.get("tokens_total_before").and_then(Value::as_i64);
+            let after = record.get("tokens_total_after").and_then(Value::as_i64);
+            let events_before = record.get("events_total_before").and_then(Value::as_i64);
+            let events_after = record.get("events_total_after").and_then(Value::as_i64);
+            out.push_str(&format!(
+                "    {path} ({session}): tokens {before:?} -> {after:?}, events {events_before:?} -> {events_after:?}\n"
+            ));
+        }
+    }
     let statusline_state = if report.statusline.exists {
         format!(
             "{} captures, {} distinct sessions, {} bytes",
@@ -1312,11 +1352,25 @@ fn load_session_cache_report() -> SessionCacheReport {
                     .unwrap_or_else(|_| "<unserializable record>".to_string())
             )
         });
+    // rm-993: the shrink members are read off the same document —
+    // count, then the bounded ledger (newest last).
+    let transcript_shrink_events = doc
+        .get("transcript_shrink_events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let transcript_shrink_total = doc
+        .get("transcript_shrink_total")
+        .and_then(Value::as_u64)
+        .map(|total| total.max(transcript_shrink_events.len() as u64))
+        .unwrap_or(transcript_shrink_events.len() as u64);
     SessionCacheReport {
         path,
         entries,
         dirs,
         invalidation_note,
+        transcript_shrink_total,
+        transcript_shrink_events,
     }
 }
 

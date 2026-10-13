@@ -1858,6 +1858,7 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // -f json) stays clean; exit codes are unchanged.
     disclose_sqlite_ingest(&report.sqlite);
     disclose_unlinked_subagents(report.unlinked_subagents);
+    disclose_transcript_shrinks(report.transcript_shrunk);
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
@@ -1938,6 +1939,23 @@ fn disclose_unlinked_subagents(count: usize) {
     if count > 0 {
         eprintln!(
             "agenttrace: warning: {count} subagent transcript(s) have no parent session in the loaded corpus; they render as standalone rows and roll into no parent"
+        );
+    }
+}
+
+/// rm-993: transcript-shrink advisory — re-parsed sessions whose
+/// totals DECREASED against the cache (Claude Code \u{2265}2.1.296
+/// rewrites live transcripts in place when local GC
+/// `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC` fires, dropping oldest messages
+/// first). Without this line the corpus total silently re-baselines
+/// downward and reads like a usage anomaly in the tool. The report
+/// itself stays clean: totals shown are the fresh smaller ones; the
+/// advisory + `--doctor` (ledger: newest records + cumulative count)
+/// carry the story. stdout untouched, exit code unchanged.
+fn disclose_transcript_shrinks(count: usize) {
+    if count > 0 {
+        eprintln!(
+            "agenttrace: warning: {count} session transcript(s) shrank since the last scan (oldest messages removed — Claude Code local GC rewrites transcripts in place); totals now reflect the smaller transcripts; --doctor lists the shrink records"
         );
     }
 }
@@ -2517,12 +2535,39 @@ fn render_session_list(sessions: &[Session], format: &str, limit: usize) -> Stri
     let matched = sessions.len();
     let sessions = sessions.iter().take(limit).collect::<Vec<_>>();
     if format == "json" {
+        // rm-995: each row carries its render-time generation speed
+        // (counted tokens / duration_sec — identical cold and warm,
+        // not a cache field), and time-to-first-token where parse-time
+        // timestamps allow (null on warm-cache rows: the cache does
+        // not round-trip event stamps, and null is the honest basis
+        // rather than a re-derived approximation). A sibling
+        // `generation_speed` rollup mirrors the overview's.
+        let rows: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|session| {
+                let mut value = serde_json::to_value(session).expect("session serializes");
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "generation_tokens_per_sec".to_string(),
+                        serde_json::json!(session.metrics.tokens_per_sec()),
+                    );
+                    object.insert(
+                        "time_to_first_token_sec".to_string(),
+                        serde_json::json!(session.metrics.ttft_sec()),
+                    );
+                }
+                value
+            })
+            .collect();
         return serde_json::to_string_pretty(&serde_json::json!({
             "matched_sessions": matched,
             "returned_sessions": sessions.len(),
             "truncated": sessions.len() < matched,
             "limit": limit,
-            "sessions": sessions,
+            "generation_speed": agenttrace_core::generation_speed_payload(
+                sessions.iter().copied(),
+            ),
+            "sessions": rows,
         }))
         .expect("sessions serialize");
     }
@@ -2790,6 +2835,28 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
             "--baseline cannot be combined with --compare: --baseline gates --overview -f json only"
         );
     }
+    // rm-997: an explicitly-passed empty (or whitespace-only) --search
+    // operand used to fall through this validator untouched — the search
+    // row in the action table below only counted a non-empty query —
+    // so `agenttrace --search ''` rendered nothing, matched zero
+    // actions, and dropped into the interactive TUI launcher, where a
+    // piped stdout produced "stdout is not a terminal" instead of a
+    // usage error (assess aa5eb07a P-SEARCH PoC: rc1, empty stdout,
+    // `--search '' --overview` even reported rc0 with an empty-string
+    // header). Reject the operand loudly at the top so the flag is
+    // named, and harden the table row below to count ANY --search: the
+    // bail above guarantees a counted operand is non-empty, so a
+    // future edit that weakens the guard can only ever land the search
+    // lane — the silent TUI fallthrough is no longer reachable from
+    // --search at all (reachability cannot silently change).
+    if let Some(query) = args.search.as_deref() {
+        if query.trim().is_empty() {
+            bail!(
+                "--search requires a non-empty query (got {:?}): pass a search term, e.g. `agenttrace --search refactor`",
+                query
+            );
+        }
+    }
     let actions = [
         args.compare,
         args.audit,
@@ -2814,9 +2881,10 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
         // close. Registered here so the pair is a loud usage error.
         args.budget,
         args.version,
-        args.search
-            .as_deref()
-            .is_some_and(|query| !query.trim().is_empty()),
+        // rm-997: any --search counts as an action — emptiness was
+        // already rejected above, so this row can never silently stop
+        // counting the flag.
+        args.search.is_some(),
     ];
     if actions.into_iter().filter(|active| *active).count() > 1 {
         bail!("choose exactly one report action");
