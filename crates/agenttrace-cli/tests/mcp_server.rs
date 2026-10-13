@@ -958,3 +958,53 @@ fn config_layer_prices_the_mcp_tools_identically_to_the_cli() {
     let _ = std::fs::remove_dir_all(home_plain.parent().expect("root"));
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+#[test]
+fn jsonrpc_member_must_be_the_string_2_0() {
+    // rm-782 (member arm): JSON-RPC 2.0 requires the `jsonrpc` member
+    // to be exactly the string "2.0". A request without it (or with
+    // any other shape — wrong value, wrong type) used to be answered
+    // like a well-formed request, so junk carrying a plausible id
+    // still drove dispatch. Answer -32600 beside the id-class guard,
+    // echoing the decoded id; the server stays up and serves the next
+    // well-formed line.
+    let (home, cache) = seed_home("jsonrpc-member", true);
+    let requests = concat!(
+        r#"{"id":20,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"1.0","id":21,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":2.0,"id":22,"method":"ping"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":23,"method":"ping"}"#,
+        "\n",
+    );
+    let (code, responses, _stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "a refusal script still exits rc0 on EOF");
+    assert_eq!(4, responses.len(), "one answer per script line");
+    for (index, expected_id) in [(0usize, 20i64), (1, 21), (2, 22)] {
+        assert_eq!(
+            Some(-32600),
+            responses[index]["error"]["code"].as_i64(),
+            "arm {index} answers Invalid Request"
+        );
+        assert_eq!(
+            serde_json::json!(expected_id),
+            responses[index]["id"],
+            "arm {index} echoes the decoded id"
+        );
+        assert!(
+            responses[index]["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("jsonrpc"),
+            "arm {index} must name the member it rejected: {}",
+            responses[index]
+        );
+    }
+    assert!(
+        responses[3]["result"].is_object(),
+        "a well-formed ping still answers after the refusals"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}

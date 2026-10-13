@@ -119,11 +119,22 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         // the terminal (assess PoC: --search -f text emitted a verbatim
         // clipboard-write sequence from a crafted tool name). JSON output
         // escapes control bytes losslessly and is intentionally untouched.
+        // rm-988: the sanitized cells additionally route through the
+        // formula guard — the name cell whole, the value half of each
+        // `label: value` match item (guard_formula_text) — so a
+        // `=HYPERLINK(...)`-named session can no longer ride the match
+        // header or detail line raw into a spreadsheet paste.
         out.push_str(&format!(
             "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
-            crate::statusline::sanitize_line_segment(&result.name),
-            crate::statusline::sanitize_line_segment(&result.source_tool),
-            crate::statusline::sanitize_line_segment(&result.model),
+            crate::reports::guard_formula_text(&crate::statusline::sanitize_line_segment(
+                &result.name
+            )),
+            crate::reports::guard_formula_text(&crate::statusline::sanitize_line_segment(
+                &result.source_tool
+            )),
+            crate::reports::guard_formula_text(&crate::statusline::sanitize_line_segment(
+                &result.model
+            )),
             result.health,
             format_cost(result.cost),
             format_tokens(result.tokens)
@@ -131,19 +142,23 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         if !result.cwd.is_empty() {
             out.push_str(&format!(
                 "  cwd: {}\n",
-                crate::statusline::sanitize_line_segment(&result.cwd)
+                crate::reports::guard_formula_text(&crate::statusline::sanitize_line_segment(
+                    &result.cwd
+                ))
             ));
         }
         if !result.path.is_empty() {
             out.push_str(&format!(
                 "  path: {}\n",
-                crate::statusline::sanitize_line_segment(&result.path)
+                crate::reports::guard_formula_text(&crate::statusline::sanitize_line_segment(
+                    &result.path
+                ))
             ));
         }
         for item in &result.matches {
             out.push_str(&format!(
                 "  - {}\n",
-                crate::statusline::sanitize_line_segment(item)
+                crate::reports::guard_formula_text(&crate::statusline::sanitize_line_segment(item))
             ));
         }
     }
@@ -324,5 +339,55 @@ mod tests {
         );
         assert!(text.contains('\u{FFFD}'));
         assert!(text.contains("]52;c;aGVsbG8="));
+    }
+
+    #[test]
+    fn text_lane_guards_spreadsheet_formula_introducers() {
+        // rm-988: the search text lane was the last raw match-header /
+        // detail arm — a session named `=HYPERLINK(...)` rode the
+        // header cell and the `name:` match detail byte-for-byte
+        // (assess PoC, run 0e3b248f4dac, dossier 271ff08b). Both arms
+        // must now carry the sessions lane's leading-apostrophe guard:
+        // the name cell whole, the VALUE half of each `label: value`
+        // match item. The JSON lane stays lossless (byte-identical).
+        let hostile = "=HYPERLINK(evil.example)";
+        let result = || SearchResult {
+            name: hostile.to_string(),
+            path: "/tmp/session.jsonl".to_string(),
+            cwd: String::new(),
+            source_tool: "codex_cli".to_string(),
+            model: "mimo-v2.5-pro".to_string(),
+            health: 100,
+            cost: 0.01,
+            tokens: 10,
+            matches: vec![format!("name: {hostile}"), "tool: Bash".to_string()],
+        };
+        let text = report_search_text(&[result()], "hyperlink");
+        assert!(
+            text.contains(&format!("'{hostile}")),
+            "match header must guard the name cell:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("name: '{hostile}")),
+            "match detail must guard the value half:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("\n{hostile}")),
+            "a raw formula must not lead the header line:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("name: {hostile}")),
+            "a raw formula must not ride the detail line:\n{text}"
+        );
+        // Benign composites stay unmangled (the guard fires on the
+        // value half's introducer, not on the label delimiter).
+        assert!(text.contains("tool: Bash"));
+        // JSON lane stays byte-identical: the raw formula survives
+        // (serde escapes control bytes; introducers are not controls).
+        let json = report_search_json(&[result()]);
+        assert!(
+            json.contains(&format!("\"{hostile}\"")),
+            "JSON lane keeps the raw name for machine consumers:\n{json}"
+        );
     }
 }
