@@ -116,6 +116,88 @@ fn doctor_demo_discloses_no_operator_home_paths() {
 }
 
 #[test]
+fn doctor_positional_root_refuses_missing_and_file_valued_paths() {
+    // rm-1012 (run 975ac79d assess F2): the positional scan root must
+    // get the same exists + is_dir refusal as the --dir arm (rm-608) —
+    // pre-fix `--doctor /nonexistent-dir-xyz` and `--doctor <file>`
+    // exited rc=0 reporting a "healthy" scan over 0 sessions, the
+    // exact false-healthy class main.rs's own rm-608 comment names.
+    let root = std::env::temp_dir().join(format!("at-rm1012-cli-{}", std::process::id()));
+    let home = root.join("home");
+    let cache = root.join("cache");
+    fs::create_dir_all(&home).expect("home dir");
+    fs::create_dir_all(&cache).expect("cache dir");
+    let file_valued = root.join("plain-file.txt");
+    fs::write(&file_valued, "not a directory\n").expect("plant plain file");
+    let missing = root.join("nonexistent-dir-xyz");
+
+    let run = |args: &[std::ffi::OsString]| {
+        Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .arg("--doctor")
+            .arg("-f")
+            .arg("json")
+            .args(args)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", &cache)
+            .env_remove("AGENTTRACE_SESSION_CACHE_DIR")
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .expect("spawn agenttrace")
+    };
+
+    // Nonexistent positional: rc=2, stderr names the path, and stdout
+    // stays EMPTY — never rc=0 with a healthy 0-session report.
+    let out = run(&[missing.clone().into()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing positional must refuse with rc=2, got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "refusal must precede any report");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("session directory does not exist"),
+        "refusal must name the failure class: {stderr}"
+    );
+    assert!(
+        stderr.contains("nonexistent-dir-xyz"),
+        "refusal must name the positional: {stderr}"
+    );
+
+    // File-valued positional: same rc=2 refusal, is_not_a_directory
+    // wording.
+    let out = run(&[file_valued.clone().into()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "file-valued positional must refuse with rc=2, got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is not a directory") && stderr.contains("plain-file.txt"),
+        "refusal must name the file-valued positional: {stderr}"
+    );
+
+    // Contrast pin: the --dir arm's refusal stays byte-identical to the
+    // landed rm-608 shape (this batch must not touch it).
+    let out = run(&["-d".into(), "/nonexistent-dir-xyz".into()]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        stderr,
+        "agenttrace: session directory does not exist: /nonexistent-dir-xyz\n\
+         - inspect: the -d/--dir value; drop -d to auto-discover agent homes\n"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn doctor_positional_path_is_honored_as_scan_root() {
     // rm-439 arm (run 57c491338818 assess F2): `--doctor <positional>`
     // must scan that root. Pre-fix, the positional is silently ignored

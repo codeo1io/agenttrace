@@ -593,7 +593,15 @@ fn run() -> anyhow::Result<()> {
                 validate_explicit_dir(Some(d));
                 Some(PathBuf::from(d))
             }
-            (None, Some(p)) => Some(PathBuf::from(p)),
+            (None, Some(p)) => {
+                // rm-1012 (run 975ac79d assess F2): the positional scan
+                // root is the same trust surface the rm-608 --dir guard
+                // covers — pre-fix a typo'd or file-valued positional
+                // reported rc=0 "healthy" over 0 sessions instead of the
+                // refusal every -d consumer gets.
+                validate_positional_dir(p);
+                Some(PathBuf::from(p))
+            }
             (None, None) => None,
         };
         // rm-384: disclose the configuration layers and the winning
@@ -1407,8 +1415,15 @@ fn attach_audit_coverage(
 fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
     let indent = "  ".repeat(depth);
     match value {
+        // rm-1014 (run 975ac79d assess F7): null-valued keys are
+        // omitted — `excluded_reason: null` used to print the bare
+        // word null in every governance-family text lane, reading as
+        // a value instead of an absence. Null array elements are
+        // omitted for the same reason; the JSON/HTML lanes keep the
+        // null (native / escaped-by-design) untouched.
         serde_json::Value::Object(items) => items
             .iter()
+            .filter(|(_, value)| !value.is_null())
             .map(|(key, value)| match value {
                 serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
                     format!("{indent}{key}:\n{}", render_plain_value(value, depth + 1))
@@ -1419,6 +1434,7 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
             .join("\n"),
         serde_json::Value::Array(items) => items
             .iter()
+            .filter(|value| !value.is_null())
             .map(|value| {
                 format!(
                     "{indent}- {}",
@@ -1432,6 +1448,9 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
         // crafted tool name) through this leaf; control bytes must not
         // reach the terminal (same contract as the TSV/search renderers).
         serde_json::Value::String(value) => sanitize_line_segment(value),
+        // rm-1014: an unfiltered null reaching a leaf (top-level call)
+        // renders empty — the text lane never prints the word null.
+        serde_json::Value::Null => String::new(),
         _ => value.to_string(),
     }
 }
@@ -1814,6 +1833,24 @@ fn validate_explicit_dir(dir_arg: Option<&str>) {
     }
     if !path.is_dir() {
         eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
+        std::process::exit(2);
+    }
+}
+
+/// rm-1012: the positional-scan-root twin of `validate_explicit_dir`
+/// (rm-608): `--doctor <path>` must refuse a typo'd or file-valued
+/// positional with rc=2 — never fall through to a "healthy, 0
+/// sessions" report over a root that cannot hold journals. Kept a
+/// sibling (not a parameter) so the --dir arm's bytes stay untouched.
+fn validate_positional_dir(dir: &str) {
+    let path = Path::new(dir);
+    if !path.exists() {
+        eprintln!("agenttrace: session directory does not exist: {dir}");
+        eprintln!("- inspect: the positional scan root; drop it to auto-discover agent homes");
+        std::process::exit(2);
+    }
+    if !path.is_dir() {
+        eprintln!("agenttrace: positional scan root is not a directory: {dir}");
         std::process::exit(2);
     }
 }
@@ -3614,6 +3651,47 @@ mod tests {
         // terminal trust, by design.
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert!(json.contains("\\u001b"));
+    }
+
+    #[test]
+    fn plain_text_lanes_omit_null_valued_keys() {
+        // rm-1014 (run 975ac79d assess F7): the governance-family text
+        // renderer printed `excluded_reason: null` — the bare word null
+        // reads as a value, not an absence. Null-valued keys are omitted
+        // (at every nesting depth), null array elements are omitted, a
+        // top-level null renders empty; sibling values stay put.
+        let report = serde_json::json!({
+            "audited_sessions": 1,
+            "excluded_sessions": 0,
+            "excluded_reason": serde_json::Value::Null,
+            "nested": {
+                "keep": "value",
+                "drop_me": serde_json::Value::Null,
+            },
+            "samples": [
+                "kept-element",
+                serde_json::Value::Null,
+                { "level": "none", "note": serde_json::Value::Null },
+            ],
+        });
+        let text = render_plain_value(&report, 0);
+        assert!(
+            !text.contains("null"),
+            "text lane printed the word null: {text:?}"
+        );
+        assert!(!text.contains("excluded_reason"));
+        assert!(!text.contains("drop_me"));
+        assert!(!text.contains("note"));
+        assert!(text.contains("audited_sessions: 1"));
+        assert!(text.contains("keep: value"));
+        assert!(text.contains("- kept-element"));
+        assert!(text.contains("level: none"));
+        // The JSON lane keeps the nulls natively — byte-level data
+        // integrity is that lane's contract, not the text lane's.
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"excluded_reason\":null"));
+        // A top-level null never prints the word either.
+        assert_eq!(render_plain_value(&serde_json::Value::Null, 0), "");
     }
 
     #[test]
