@@ -4,7 +4,7 @@ use agenttrace_core::{
     delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
     fix_suggestions, inspect_first, list_pricing, load_sessions_with_options, lookup_price,
     matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter, parse_stdin_bytes,
-    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
+    predict_cost_anomaly, pricing_cache_path, pricing_source, pricing_source_for, recommendations,
     render_doctor_report, render_model_pricing_list, render_test_match,
     render_waste_report_with_language, report_compare_json, report_json_with_language,
     report_overview_html_with_context, report_overview_json_with_context,
@@ -36,7 +36,8 @@ mod config;
 struct Args {
     /// Session file to analyze (`-` reads one session stream from
     /// stdin through the same parser; stdin sessions are ephemeral and
-    /// never touch the session cache)
+    /// never touch the session cache; the stdin lane caps what it
+    /// buffers — override with AGENTTRACE_STDIN_CAP_BYTES)
     path: Option<String>,
     /// Output format for the requested view: text (default), json, csv,
     /// markdown/md, html, svg (the shareable usage card; requires
@@ -140,7 +141,9 @@ struct Args {
     #[arg(long = "update-pricing")]
     update_pricing: bool,
     /// Print the catalog-resolution table for a probe set of model
-    /// identifiers (alias and rate-match verification).
+    /// identifiers (alias and rate-match verification); with a
+    /// positional MODEL operand, resolve just that model through the
+    /// same matcher instead of the fixed probe set
     #[arg(long = "test-match")]
     test_match: bool,
     /// Report on the Claude Code statusline capture journal (candidate
@@ -561,10 +564,16 @@ fn run() -> anyhow::Result<()> {
     if args.test_match {
         // rm-341: the early exits must honor -o and -f json like every
         // other report action instead of ignoring both.
-        let out = if args.format == "json" {
-            render_test_match_json()?
-        } else {
-            render_test_match()
+        // rm-089: a positional operand is the model expression under
+        // test — `--test-match gpt-5.6` resolves THAT model through
+        // the same matcher the probe table uses. The operand used to
+        // fall into the session-path slot and be silently ignored
+        // (md5-identical output for every operand).
+        let out = match (args.format.as_str(), args.path.as_deref()) {
+            ("json", Some(model)) => render_test_match_model_json(model)?,
+            ("json", None) => render_test_match_json()?,
+            (_, Some(model)) => render_test_match_model_text(model),
+            (_, None) => render_test_match(),
         };
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
@@ -1443,6 +1452,65 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// rm-558: the flag tokens clap actually knows, derived from the live
+/// parser definition (the same source the rm-247 canary test uses) so
+/// the shaper's known set cannot drift from the parser it feeds. The
+/// help/version routes clap auto-adds are unioned in — they are valid
+/// anywhere on the command line and must never be rejected as unknown
+/// by the pre-parser.
+fn known_flag_tokens() -> std::collections::HashSet<String> {
+    use clap::CommandFactory;
+    let mut known: std::collections::HashSet<String> = ["-h", "--help", "-V", "--version"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for arg in Args::command().get_arguments() {
+        if let Some(short) = arg.get_short() {
+            known.insert(format!("-{short}"));
+        }
+        if let Some(long) = arg.get_long() {
+            known.insert(format!("--{long}"));
+        }
+    }
+    known
+}
+
+/// rm-558: if `arg` is a flag-shaped token clap does not know, return
+/// the flag name to reject (an embedded `=value` is stripped so the
+/// error names the flag, not its value). Positionals, the `-` stdin
+/// marker, and the `--` separator are not unknown flags and return
+/// `None`.
+fn unknown_flag_token(arg: &OsString, known: &std::collections::HashSet<String>) -> Option<String> {
+    let text = arg.to_string_lossy();
+    if text == "-" || text == "--" || !text.starts_with('-') {
+        return None;
+    }
+    if let Some(long) = text.strip_prefix("--") {
+        // `--name=value` names the flag; `--name` is itself the base.
+        let base = format!("--{}", long.split('=').next().unwrap_or(long));
+        if known.contains(&base) {
+            None
+        } else {
+            Some(base)
+        }
+    } else {
+        // Short token: `-d`, or a cluster like `-vf`. Known as a whole
+        // or decomposable into known shorts — not unknown.
+        if known.contains(text.as_ref()) {
+            return None;
+        }
+        let all_shorts_known = text
+            .chars()
+            .skip(1)
+            .all(|c| known.contains(&format!("-{c}")));
+        if all_shorts_known {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+}
+
 fn go_flag_compatible_args<I>(args: I) -> anyhow::Result<Vec<OsString>>
 where
     I: IntoIterator<Item = OsString>,
@@ -1453,6 +1521,10 @@ where
         out.push(program);
     }
 
+    // rm-558: the known-flag set the unknown-flag rejection below
+    // consults — derived once per process from the live clap
+    // definition.
+    let known = known_flag_tokens();
     let mut expecting_value = false;
     while let Some(arg) = args.next() {
         if expecting_value {
@@ -1470,6 +1542,26 @@ where
         if is_go_flag_positional(&arg) {
             out.push(arg);
             break;
+        }
+        // rm-558: reject tokens clap does not know BEFORE reshaping.
+        // An unknown value-taking flag (`--since 2d -d DIR`) used to
+        // swallow its would-be value into the positional slot, so the
+        // loud rm-247 error blamed a LATER flag (`-d`) for "following
+        // the positional session path" — the error named the wrong
+        // flag and its remedy ("place flags before the positional
+        // path") was the wrong advice for the real mistake: typing a
+        // flag the binary does not have. Unknown flags are named and
+        // rejected as unknown, in front of the shaper, for both the
+        // free-standing (`--since 2d`) and embedded (`--since=2d`)
+        // forms.
+        if let Some(flag) = unknown_flag_token(&arg, &known) {
+            bail!(
+                "unknown flag `{flag}`; rejected before the Go-flag compatibility \
+                 shaper reshapes the command line — a value-taking unknown flag would \
+                 otherwise swallow the next argument as the positional session path \
+                 and the error would blame a later flag; run `agenttrace --help` for \
+                 the flag surface"
+            );
         }
         expecting_value = flag_takes_value(&arg);
         out.push(arg);
@@ -1818,6 +1910,37 @@ fn validate_explicit_dir(dir_arg: Option<&str>) {
     }
 }
 
+/// rm-503: byte ceiling for the `-` stdin session lane — 256 MiB, ~100x
+/// the operator corpus's largest single journal (2.0 MB) while bounding
+/// hostile pipes that used to buffer unbounded input before the parser
+/// rejected the first byte (assess PoC: 400 MB piped in, ~765 MB RSS).
+const STDIN_SESSION_BYTE_CAP: u64 = 256 * 1024 * 1024;
+
+/// rm-503: the effective ceiling for the stdin lane. The default is
+/// the documented constant; `AGENTTRACE_STDIN_CAP_BYTES` (a positive
+/// integer) overrides it — tests pin the boundary with a small cap so
+/// CI never ships a default-sized fixture. An invalid value is
+/// announced on stderr and ignored, mirroring the pricing-file knob's
+/// posture (`AGENTTRACE_PRICING_FILE ignored: …`).
+fn stdin_session_byte_cap() -> u64 {
+    match std::env::var_os("AGENTTRACE_STDIN_CAP_BYTES") {
+        Some(raw) => match raw
+            .to_str()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            Some(cap) if cap > 0 => cap,
+            _ => {
+                eprintln!(
+                    "agenttrace: AGENTTRACE_STDIN_CAP_BYTES ignored: not a positive \
+                     integer ({raw:?}); using the default {STDIN_SESSION_BYTE_CAP}-byte cap"
+                );
+                STDIN_SESSION_BYTE_CAP
+            }
+        },
+        None => STDIN_SESSION_BYTE_CAP,
+    }
+}
+
 fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<LoadReport>)> {
     if args.demo {
         // rm-735: the demo substitution must never silently swallow an
@@ -1833,10 +1956,28 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         // read nor write), which `--help` discloses. `-d` stays a
         // separate multi-session lane and is out of scope here.
         if path == "-" {
+            // rm-503 cap arm: `-` is a hostile-input surface — the
+            // assess PoC (`head -c 400000000 /dev/zero | agenttrace -`)
+            // buffered ~765 MB of RSS before the parser rejected the
+            // first byte. Fail closed at a documented ceiling instead
+            // of buffering unbounded stdin: read one byte PAST the cap
+            // so the oversize verdict is instant (no full stream
+            // buffered either way) and the error names both numbers.
+            let cap = stdin_session_byte_cap();
             let mut raw = Vec::new();
             io::stdin()
+                .take(cap.saturating_add(1))
                 .read_to_end(&mut raw)
                 .context("read session from stdin")?;
+            if raw.len() as u64 > cap {
+                bail!(
+                    "stdin session stream exceeds the byte cap: read {} bytes against \
+                     the {}-byte cap (`-` refuses to buffer unbounded stdin); stream a \
+                     smaller session, or raise the ceiling with AGENTTRACE_STDIN_CAP_BYTES",
+                    raw.len(),
+                    cap
+                );
+            }
             return Ok((
                 prepare_explicit_sessions(vec![parse_stdin_bytes(raw)?], args)?,
                 None,
@@ -2351,6 +2492,26 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
     Ok(())
 }
 
+fn test_match_json_row(model: &str) -> serde_json::Value {
+    // rm-089: one row shape everywhere — shared by the fixed probe
+    // table and the single-model operand lane.
+    let price = lookup_price(model);
+    // rm-610: flex-tier rates disclosed per row (null when the
+    // row carries none — flex turns then bill at the standard
+    // rates above).
+    serde_json::json!({
+        "model": model,
+        "input_per_million": price.input,
+        "output_per_million": price.output,
+        "cache_write_per_million": price.cw,
+        "cache_read_per_million": price.cr,
+        "flex_input_per_million": price.input_flex,
+        "flex_output_per_million": price.output_flex,
+        "flex_cache_write_per_million": price.cw_flex,
+        "flex_cache_read_per_million": price.cr_flex,
+    })
+}
+
 fn render_test_match_json() -> anyhow::Result<String> {
     // rm-341: -f json support for the --test-match early exit; the same
     // probe models as render_test_match, one row per model.
@@ -2369,27 +2530,47 @@ fn render_test_match_json() -> anyhow::Result<String> {
     ];
     let rows: Vec<_> = models
         .iter()
-        .map(|model| {
-            let price = lookup_price(model);
-            // rm-610: flex-tier rates disclosed per row (null when the
-            // row carries none — flex turns then bill at the standard
-            // rates above).
-            serde_json::json!({
-                "model": model,
-                "input_per_million": price.input,
-                "output_per_million": price.output,
-                "cache_write_per_million": price.cw,
-                "cache_read_per_million": price.cr,
-                "flex_input_per_million": price.input_flex,
-                "flex_output_per_million": price.output_flex,
-                "flex_cache_write_per_million": price.cw_flex,
-                "flex_cache_read_per_million": price.cr_flex,
-            })
-        })
+        .map(|model| test_match_json_row(model))
         .collect();
     let doc = serde_json::json!({
         "source": pricing_source(),
         "models": rows,
+    });
+    Ok(serde_json::to_string_pretty(&doc)?)
+}
+
+/// rm-089: the `--test-match MODEL` text lane — one row in the probe
+/// table's own format, resolved through the same matcher
+/// (`lookup_price`), with the row's own pricing source named. The row
+/// format is duplicated here rather than widening core's probe
+/// renderer — the same house pattern as `unique_temp_sibling`.
+fn render_test_match_model_text(model: &str) -> String {
+    let price = lookup_price(model);
+    let mut out = format!("Pricing: {}\n\n", pricing_source_for(model));
+    out.push_str(&format!(
+        "  {:<50} → in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+        model, price.input, price.output, price.cw, price.cr
+    ));
+    // rm-610 parity: disclose the flex-tier rates when the row carries
+    // them, exactly like the probe table.
+    if let (Some(input_flex), Some(output_flex)) = (price.input_flex, price.output_flex) {
+        out.push_str(&format!(
+            "      flex: in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+            input_flex,
+            output_flex,
+            price.cw_flex.unwrap_or(price.cw),
+            price.cr_flex.unwrap_or(price.cr)
+        ));
+    }
+    out
+}
+
+/// rm-089: the `--test-match MODEL` json lane — the probe document's
+/// shape narrowed to one row, with the row's own pricing source.
+fn render_test_match_model_json(model: &str) -> anyhow::Result<String> {
+    let doc = serde_json::json!({
+        "source": pricing_source_for(model),
+        "models": [test_match_json_row(model)],
     });
     Ok(serde_json::to_string_pretty(&doc)?)
 }
@@ -4485,6 +4666,135 @@ mod tests {
         ])
         .expect("--weekly-budget takes a value");
         assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn go_flag_shaper_names_the_unknown_value_taking_flag_not_a_later_one() {
+        // rm-558 (assess 314b395b PoC): `agenttrace --since 2d -d DIR`
+        // used to misdiagnose the invocation — the shaper let the
+        // unknown value-taking flag `--since` swallow `2d` into the
+        // positional slot, so the loud rm-247 error blamed a LATER
+        // flag (`-d`) for "following the positional session path" and
+        // the remedy in the message ("place flags before the
+        // positional path") was the wrong advice for the real mistake
+        // (typing a flag the binary does not have). Unknown flags are
+        // rejected as unknown, named, before the reshape.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--since"),
+            OsString::from("2d"),
+            OsString::from("-d"),
+            OsString::from("/tmp/at-corpus"),
+        ])
+        .expect_err("unknown value-taking flag must be rejected as unknown");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown flag `--since`"),
+            "error must name the actual misroute: {message}"
+        );
+        assert!(
+            !message.contains("follows the positional"),
+            "must not blame a later flag for the unknown flag's reshape: {message}"
+        );
+
+        // The same flag with NO later arguments must fail the same
+        // way (today clap names it only after the shaper let it
+        // through; the shaper itself now owns the rejection).
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--since"),
+            OsString::from("2d"),
+        ])
+        .expect_err("unknown value-taking flag is rejected without a tail too");
+        assert!(
+            error.to_string().contains("unknown flag `--since`"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn go_flag_shaper_rejects_unknown_flags_in_equals_form_too() {
+        // rm-558: `--since=2d` embeds the value in the token, so the
+        // shaper never sees a free-standing operand to swallow — but
+        // the token is still an unknown flag and must be named as such,
+        // not passed through for clap to discover after any reshape.
+        let error = go_flag_compatible_args([
+            OsString::from("agenttrace"),
+            OsString::from("--since=2d"),
+            OsString::from("--overview"),
+        ])
+        .expect_err("unknown flag in = form must be rejected as unknown");
+        let message = error.to_string();
+        assert!(
+            message.contains("unknown flag `--since`"),
+            "names the flag without the embedded value: {message}"
+        );
+    }
+
+    #[test]
+    fn go_flag_shaper_known_value_taking_flags_keep_their_today_shape() {
+        // rm-558 control: the fix must not reshape VALID argv. A known
+        // value-taking flag (`--range`, the live time-window filter the
+        // README phantom `--since` misnames) still consumes its value,
+        // the scan continues past it, and the tokens come through
+        // verbatim — byte-for-byte what today's shaper emits.
+        let argv = [
+            "agenttrace",
+            "--range",
+            "2d",
+            "-d",
+            "/tmp/at-corpus",
+            "--overview",
+        ];
+        let shaped = go_flag_compatible_args(argv.iter().map(OsString::from))
+            .expect("known value-taking flags keep working");
+        assert_eq!(
+            shaped,
+            argv.iter().map(OsString::from).collect::<Vec<_>>(),
+            "valid argv must pass through the shaper verbatim"
+        );
+    }
+
+    #[test]
+    fn known_flag_tokens_cover_the_clap_surface_including_help_and_version() {
+        // rm-558 canary: the shaper's known set is DERIVED from the
+        // live clap definition, so it cannot drift; this pins the
+        // derivation itself — every short/long the parser enumerates
+        // is present, and the auto-added help/version routes clap owns
+        // are present too (they are valid anywhere on the command line
+        // and must never be rejected as unknown by the pre-parser).
+        use clap::CommandFactory;
+        let known = known_flag_tokens();
+        for arg in Args::command().get_arguments() {
+            if let Some(short) = arg.get_short() {
+                let token = format!("-{short}");
+                assert!(known.contains(&token), "{token} missing from the known set");
+            }
+            if let Some(long) = arg.get_long() {
+                let token = format!("--{long}");
+                assert!(known.contains(&token), "{token} missing from the known set");
+            }
+        }
+        for token in ["-h", "--help", "-V", "--version"] {
+            assert!(
+                known.contains(token),
+                "{token} must be known: it is a live clap route anywhere on the line"
+            );
+        }
+        // The README phantom from the rm-558 PoC stays unknown, and
+        // the shaper says so by name.
+        assert!(!known.contains("--since"));
+    }
+
+    #[test]
+    fn stdin_session_byte_cap_default_is_the_documented_ceiling() {
+        // rm-503: the documented default (help text + CHANGELOG point
+        // at the knob; the number lives here) — 256 MiB is ~100x the
+        // operator corpus's largest single journal (2.0 MB) while
+        // bounding hostile pipes that used to buffer unbounded input
+        // before the parser rejected the first byte.
+        assert_eq!(STDIN_SESSION_BYTE_CAP, 256 * 1024 * 1024);
     }
 
     #[test]

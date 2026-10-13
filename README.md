@@ -415,7 +415,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--waste` |  | Render the token-waste report: redundant context, loop cost, and unused tool output, with a per-reason breakdown |
 | `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes |
 | `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |
-| `--test-match` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification) |
+| `--test-match [MODEL]` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification); with a positional MODEL operand, resolve just that model through the same matcher instead of the fixed probe set |
 | `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
 | `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
 | `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
