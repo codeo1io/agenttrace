@@ -2,18 +2,18 @@ use agenttrace_core::{
     add_baseline_comparison, average_health, build_doctor_report, compute_overview,
     compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
     delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
-    fix_suggestions, inspect_first, list_pricing, load_sessions_with_options, lookup_price,
-    matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter, parse_stdin_bytes,
-    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
-    render_doctor_report, render_model_pricing_list, render_test_match,
-    render_waste_report_with_language, report_compare_json, report_json_with_language,
-    report_overview_html_with_context, report_overview_json_with_context,
-    report_overview_markdown_with_context, report_overview_svg_with_context,
-    report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
-    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
-    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
-    VERSION,
+    fix_suggestions, guard_formula_json_leaves, inspect_first, list_pricing,
+    load_sessions_with_options, lookup_price, matches_numeric_filter, mcp_governance, parse_file,
+    parse_numeric_filter, parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path,
+    pricing_source, recommendations, render_doctor_report, render_model_pricing_list,
+    render_test_match, render_waste_report_with_language, report_compare_json,
+    report_json_with_language, report_overview_html_with_context,
+    report_overview_json_with_context, report_overview_markdown_with_context,
+    report_overview_svg_with_context, report_overview_text_with_context, report_search_json,
+    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
+    session_capability, session_start_cmp, tool_fail_rate, total_tokens, update_pricing,
+    waste_report_json, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
+    SvgCardTheme, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -1324,7 +1324,16 @@ fn render_governance_report(value: &serde_json::Value, format: &str) -> anyhow::
     let disclosure = audit_coverage_phrase(value);
     Ok(match format {
         "json" => json,
+        // rm-985: the human-readable fences embed the serialized report
+        // verbatim, so transcript-derived string values (a session named
+        // `=HYPERLINK(…)`) rode into the ```json fence / <pre> block raw
+        // (assess fdaf8b39 PoC: governance markdown line 15, html line
+        // 13). Both arms serialize the guard_formula_json_leaves walk —
+        // string VALUE leaves receive the `'` paste-marker, keys and
+        // numbers stay untouched — while the machine `json` lane above
+        // stays byte-lossless by design.
         "markdown" | "md" => {
+            let json = serde_json::to_string_pretty(&guard_formula_json_leaves(value))?;
             if disclosure.is_empty() {
                 format!("```json\n{json}\n```")
             } else {
@@ -1332,6 +1341,7 @@ fn render_governance_report(value: &serde_json::Value, format: &str) -> anyhow::
             }
         }
         "html" => {
+            let json = serde_json::to_string_pretty(&guard_formula_json_leaves(value))?;
             if disclosure.is_empty() {
                 format!("<pre>{}</pre>", escape_html(&json))
             } else {
@@ -1431,7 +1441,16 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
         // journal-derived strings (e.g. mcp_server_name inferred from a
         // crafted tool name) through this leaf; control bytes must not
         // reach the terminal (same contract as the TSV/search renderers).
-        serde_json::Value::String(value) => sanitize_line_segment(value),
+        serde_json::Value::String(value) => {
+            // rm-985 rider on the sanitizer arm above: the plain-text
+            // governance lane is a paste target like every other text
+            // surface — a session or MCP-server name beginning with a
+            // spreadsheet introducer gets the same leading `'`
+            // paste-marker the CSV/TSV/markdown lanes emit (assess
+            // fdaf8b39 PoC: delivery-evidence-text.txt:11 shipped the
+            // raw `=HYPERLINK(… please review` session field).
+            csv_export::guard_formula(&sanitize_line_segment(value))
+        }
         _ => value.to_string(),
     }
 }
@@ -4736,6 +4755,47 @@ mod tests {
         assert!(validate_gate_thresholds(&args).is_err());
         args.max_tool_fail_rate = Some(100.0);
         assert!(validate_gate_thresholds(&args).is_ok());
+    }
+
+    #[test]
+    fn governance_human_lanes_neutralize_formula_introducers() {
+        // rm-985: every human-readable governance rendering (plain text,
+        // markdown ```json fence, html <pre>) must neutralize a
+        // transcript-derived string value that begins with a spreadsheet
+        // introducer, while the machine `json` lane stays byte-lossless
+        // by design (assess fdaf8b39 F1: --delivery-evidence -f text
+        // shipped the raw `=HYPERLINK("http://evil.example",…) please
+        // review` session field; the md fence and html pre carried the
+        // same string inside the serialized document).
+        let value = serde_json::json!({
+            "session": "=HYPERLINK(\"http://evil.example\",\"click-me\") please review",
+            "server": "@import('x')",
+            "delta": "-1.5",
+            "count": -42,
+            "nested": { "model": "=cmd|' /C calc'!A1'!A0", "ok": "plain" }
+        });
+        let text = render_governance_report(&value, "text").expect("text");
+        assert!(
+            text.contains("session: '=HYPERLINK("),
+            "text lane must prefix the paste-marker: {text}"
+        );
+        assert!(text.contains("server: '@import"));
+        assert!(text.contains("delta: -1.5"));
+        let md = render_governance_report(&value, "markdown").expect("markdown");
+        assert!(md.contains("\"session\": \"'=HYPERLINK("));
+        assert!(md.contains("\"model\": \"'=cmd"));
+        assert!(md.contains("\"delta\": \"-1.5\""));
+        assert!(md.contains("\"count\": -42"));
+        let html = render_governance_report(&value, "html").expect("html");
+        assert!(html.contains("\"'@import"));
+        assert!(!html.contains("&#39;=HYPERLINK("));
+        // main.rs::escape_html leaves `'` literal — the marker survives
+        // the <pre> verbatim, which is exactly what a paste needs.
+        assert!(html.contains("\"'=HYPERLINK("));
+        // The machine lane stays lossless BY DESIGN.
+        let json = render_governance_report(&value, "json").expect("json");
+        assert!(json.contains("\"=HYPERLINK("));
+        assert!(json.contains("\"@import"));
     }
 
     fn write_compare_session(path: &std::path::Path, idx: usize) {

@@ -322,7 +322,10 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
         language.t("model", "模型"),
         // rm-383: model strings are transcript-derived; sanitize for the
         // terminal like every other text-renderer field.
-        sanitize_line_segment(&metrics.model_used)
+        // rm-985 review-fix (a3e986ef F3): the model cell is a paste cell
+        // in its own right — ride the formula guard like the table lanes
+        // (numeric-looking models stay bare via the exemption).
+        guard_formula_cell(&sanitize_line_segment(&metrics.model_used))
     ));
 
     out.push_str(language.t("📊 ACTIVITY\n", "📊 活动\n"));
@@ -406,9 +409,12 @@ pub fn report_text_with_language(session: &Session, language: ReportLanguage) ->
             // rm-383: tool names are journal/transcript-derived (assess PoC:
             // --latest -f text rendered a raw OSC-52 clipboard-write from a
             // crafted tool name); no control byte may reach the terminal.
+            // rm-985 review-fix (a3e986ef F3): the name column starts at
+            // column 3 — the first non-whitespace char of the line — so
+            // the sanitized name additionally rides the formula guard.
             out.push_str(&format!(
                 "  {:<35} {:>4}\n",
-                sanitize_line_segment(&tool),
+                guard_formula_cell(&sanitize_line_segment(&tool)),
                 count
             ));
         }
@@ -2180,7 +2186,14 @@ pub fn report_compare_with_language(
         // journal emitted one OSC-52 clipboard-write sequence). Route
         // through the shared sanitizer before layout so the 27-rune
         // budget applies to sanitized text.
-        let name = truncate_runes(&sanitize_line_segment(&session.name), 27);
+        // rm-985 rider: the guard_formula pass runs after the sanitizer
+        // and before the rune budget, so a `=HYPERLINK(…` name keeps
+        // its leading `'` paste-marker inside the 27-rune cell (the
+        // marker counts against the budget, never past it).
+        let name = truncate_runes(
+            &guard_formula_cell(&sanitize_line_segment(&session.name)),
+            27,
+        );
         out.push_str(&format!(
             "  {:<28} {:>4} {:>5} {:>5} {:>5} {:>9} {} {}/100\n",
             name,
@@ -3398,6 +3411,18 @@ fn report_html_code_list(values: &[String]) -> String {
 }
 
 fn html_escape(value: &str) -> String {
+    // rm-985: HTML report cells route through the formula guard before
+    // the entity escape, arm for arm with `markdown_cell` (rm-897). A
+    // transcript-derived session name, model or branch key that begins
+    // with a spreadsheet introducer survives the entity escape
+    // untouched (`<td>=HYPERLINK(&#34;…`), and pasting the rendered
+    // table into a spreadsheet re-arms the payload (assess fdaf8b39
+    // PoC: overview-html.txt:39/:43/:61). The guard's leading `'`
+    // renders as `&#39;` in the HTML source and as the paste-marker
+    // `'` once rendered; the numeric exemption keeps number-like
+    // cells bare so cost/token-adjacent strings still import as
+    // values.
+    let value = guard_formula_cell(value);
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -3486,6 +3511,18 @@ fn text_cell(value: &str, limit: usize) -> String {
     // byte-identical.
     let value = sanitize_line_segment(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    // rm-985: the text report family was the last lane whose cells
+    // could carry a spreadsheet-formula introducer to the terminal
+    // (assess fdaf8b39 PoC: overview-text.txt:12/:20 emitted the raw
+    // `=HYPERLINK("http://evil.exa…` session name in the incident
+    // timeline and top-cost-driver rows). The guard runs here —
+    // after the control-byte substitution and whitespace squash,
+    // BEFORE rune truncation — so the `'` paste-marker stays at cell
+    // position 0 even for over-long names, and it counts against the
+    // width budget rather than past it. Same guard family as the CSV
+    // (rm-540), markdown (rm-897) and sessions TSV (33eddd4) lanes;
+    // numeric-looking cells stay bare for value import.
+    let value = guard_formula_cell(&value);
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
     } else {
@@ -3624,7 +3661,7 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 /// payloads when the markdown report is pasted into a spreadsheet; the
 /// false-positive cost (a leading apostrophe on benign `-` bullets) is the
 /// same trade the CSV lane accepted — guarding is the safe direction.
-fn guard_formula_cell(value: &str) -> String {
+pub(crate) fn guard_formula_cell(value: &str) -> String {
     if value.trim().parse::<f64>().is_ok() {
         return value.to_string();
     }
@@ -3647,6 +3684,33 @@ fn guard_formula_cell(value: &str) -> String {
         format!("'{value}")
     } else {
         value.to_string()
+    }
+}
+
+/// rm-985: governance-family renderers embed the whole report as a
+/// pretty-printed JSON document — verbatim inside a ```json markdown
+/// fence and (entity-escaped) inside an HTML `<pre>` — so a
+/// transcript-derived session name (`=HYPERLINK(…)`) rides into the
+/// fence raw (assess fdaf8b39 PoC: governance markdown line 15 / html
+/// line 13). This walk guards every JSON *string value* leaf — object
+/// members and array items alike; keys are report vocabulary and are
+/// never guarded — with the same `guard_formula_cell` the table lanes
+/// use, applied to the value tree BEFORE serialization for the
+/// human-readable fences. The machine `json` output lane is
+/// intentionally NOT routed through here: JSON stays byte-lossless
+/// by design; only fence/`<pre>` renderings receive the paste-marker.
+pub fn guard_formula_json_leaves(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(guard_formula_cell(text)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(guard_formula_json_leaves).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), guard_formula_json_leaves(item)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -3767,6 +3831,75 @@ mod tests {
         // Truncation still applies after sanitization.
         let long = "x".repeat(90);
         assert_eq!(text_cell(&long, 40).chars().count(), 40);
+    }
+
+    #[test]
+    fn text_and_html_cells_neutralize_formula_introducers() {
+        // rm-985: the text and HTML overview lanes are the remaining
+        // render boundaries that shipped a transcript-derived
+        // `=HYPERLINK(…` session name raw (assess fdaf8b39 PoC,
+        // overview-text.txt:12/:20 and overview-html.txt:39/:43/:61).
+        // Both chokepoints must neutralize the introducer with the
+        // leading `'` paste-marker, keep the numeric exemption the
+        // CSV/markdown guards established (a `-42.5` cell stays bare so
+        // numeric columns import as values), and — for the text lane —
+        // keep the marker inside the width budget.
+        let hostile = "=HYPERLINK(\"http://evil.example\",\"click-me\") please review";
+        let guarded_text = text_cell(hostile, 30);
+        assert!(
+            guarded_text.starts_with("'="),
+            "text lane must prefix the paste-marker: {guarded_text:?}"
+        );
+        assert_eq!(
+            guarded_text.chars().count(),
+            30,
+            "marker counts against the width budget, never past it"
+        );
+        assert_eq!(text_cell("-42.50", 30), "-42.50");
+        assert_eq!(text_cell("+1e3", 30), "+1e3");
+        // Ordering pin: the guard runs AFTER the whitespace squash, so
+        // leading whitespace can not smuggle a payload past it (a tab is
+        // neutralized to U+FFFD by the sanitizer before this point —
+        // only the space case reaches the guard cell-start check).
+        assert_eq!(text_cell("   =2+5", 30), "'=2+5");
+        let guarded_html = html_escape(hostile);
+        assert!(
+            guarded_html.starts_with("&#39;="),
+            "html lane must prefix the (entity-escaped) paste-marker: {guarded_html:?}"
+        );
+        assert_eq!(html_escape("-42.50"), "-42.50");
+        // Fullwidth introducers normalize to ASCII meaning in
+        // spreadsheet apps and are guarded like the ASCII set
+        // (rm-540's introducer census, shared by this family).
+        assert!(html_escape("＝SUM(1+1)").starts_with("&#39;＝"));
+    }
+
+    #[test]
+    fn guard_formula_json_leaves_guards_string_values_only() {
+        // rm-985: the governance fences embed a serialized JSON
+        // document; only STRING VALUE leaves may receive the
+        // paste-marker. Keys stay untouched (report vocabulary),
+        // JSON numbers stay untouched, and numeric-exempt strings
+        // ("-1.5") stay bare so the fence still reads as data.
+        let value = serde_json::json!({
+            "session": "=HYPERLINK(\"http://evil.example\",\"click-me\") please review",
+            "delta": "-1.5",
+            "count": -42,
+            "nested": { "model": "=cmd|' /C calc'!A1'!A0", "ok": "plain" },
+            "tags": ["@import(x)", "bare"],
+            "=SUM(key)": "value"
+        });
+        let guarded = guard_formula_json_leaves(&value);
+        let text = serde_json::to_string_pretty(&guarded).unwrap();
+        assert!(text.contains("\"session\": \"'=HYPERLINK("));
+        assert!(text.contains("\"delta\": \"-1.5\""));
+        assert!(text.contains("\"count\": -42"));
+        assert!(text.contains("\"model\": \"'=cmd"));
+        assert!(text.contains("\"'@import(x)\""));
+        assert!(
+            text.contains("\"=SUM(key)\": \"value\""),
+            "keys are report vocabulary and stay unguarded; their plain values too: {text}"
+        );
     }
 
     #[test]
