@@ -331,7 +331,18 @@ fn render_status_line(payload: &Value) -> String {
                 .resets_at
                 .map(|epoch| {
                     chrono::DateTime::from_timestamp(epoch, 0)
-                        .map(|at| at.format("%H:%M").to_string())
+                        .map(|at| {
+                            // rm-165 (arm 1): a bare HH:MM reads as
+                            // local while meaning UTC (assess 2b1c7797
+                            // PoC: "until 08:53" under
+                            // TZ=America/New_York for a 04:53 NY reset).
+                            // Render the instant in the host's local
+                            // timezone with an explicit UTC offset
+                            // label, matching the labeled-UTC convention
+                            // of `format_epoch`.
+                            let local = at.with_timezone(&chrono::Local);
+                            format!("{} (UTC{})", local.format("%H:%M"), local.format("%:z"))
+                        })
                         .unwrap_or_else(|| epoch.to_string())
                 })
                 .map(|at| format!(" until {at}"))
@@ -1769,6 +1780,36 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rm1065_reset_clock_renders_local_timezone_with_offset_label() {
+        // rm-165 (arm 1): the reset clock used to render UTC as a bare
+        // HH:MM ("until 08:53" under TZ=America/New_York for a 04:53
+        // New York reset). It must render the instant in the host's
+        // local timezone with an explicit UTC offset label — this is
+        // self-consistent under any host TZ and fails on a revert even
+        // on a UTC host (the expected form always carries the label).
+        let epoch = 1_760_000_000_i64;
+        let payload = serde_json::json!({
+            "session_name": "tz-poc",
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 50.0,
+                    "resets_at": epoch,
+                }
+            }
+        });
+        let line = render_status_line(&payload);
+        assert!(line.contains("5h 50%"), "usage arm missing: {line:?}");
+        let at = chrono::DateTime::from_timestamp(epoch, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let expect = format!(" until {} (UTC{})", at.format("%H:%M"), at.format("%:z"));
+        assert!(
+            line.contains(&expect),
+            "reset clock not local+offset: {line:?} (expected {expect:?})"
+        );
+    }
+
     #[test]
     fn rm936_is_bidi_format_control_bounds() {
         // The directional/format set (Cf) the lane sanitizers must kill.
