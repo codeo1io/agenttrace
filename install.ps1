@@ -1,10 +1,20 @@
 # agenttrace Windows installer (PowerShell)
 # Usage: powershell -ExecutionPolicy Bypass -File install.ps1
 # Or:    iwr -useb https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+#
+# Environment (same names as install.sh; used when the matching parameter
+# is not given, which is always the case under `irm | iex` — adopted from
+# upstream 20acb561, whose docs told Windows users to pin with
+# `-Version v0.9.1`, a parameter that cannot reach a piped script):
+#   AGENTTRACE_VERSION      release tag to install (default: latest), e.g. v0.10.1
+#   AGENTTRACE_INSTALL_DIR  install directory (default: %LOCALAPPDATA%\agenttrace)
+# (Upstream also honors AGENTTRACE_NO_MODIFY_PATH for a PATH-write
+# switch this installer does not have — it only warns about PATH,
+# never writes it — so that env name stays unclaimed here.)
 
 param(
-    [string]$Version = "latest",
-    [string]$InstallDir = "$env:LOCALAPPDATA\agenttrace"
+    [string]$Version = $(if ($env:AGENTTRACE_VERSION) { $env:AGENTTRACE_VERSION } else { "latest" }),
+    [string]$InstallDir = $(if ($env:AGENTTRACE_INSTALL_DIR) { $env:AGENTTRACE_INSTALL_DIR } else { "$env:LOCALAPPDATA\agenttrace" })
 )
 
 $REPO = "luoyuctl/agenttrace"

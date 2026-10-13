@@ -90,7 +90,15 @@ curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.
 
 安装脚本会下载对应平台的发布版程序，按发布的校验和验证 SHA-256，并把安装目录
 （`~/.local/bin`，Windows 上为 `%LOCALAPPDATA%\agenttrace`）加入 PATH。
-设置 `AGENTTRACE_VERSION=v0.9.1`（PowerShell 用 `-Version v0.9.1`）可固定版本。
+设置 `AGENTTRACE_VERSION` 可固定版本（参数无法传给 `irm | iex` 运行的脚本）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | AGENTTRACE_VERSION=v0.10.1 sh
+```
+
+```powershell
+$env:AGENTTRACE_VERSION = "v0.10.1"; irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+```
 
 包管理器：
 

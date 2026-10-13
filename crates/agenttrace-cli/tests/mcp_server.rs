@@ -65,6 +65,35 @@ fn seed_home(tag: &str, with_fixture: bool) -> (PathBuf, PathBuf) {
     (home, cache)
 }
 
+/// Seed a hermetic HOME whose discovered corpus is the committed
+/// by_model tie fixture (rm-987): two `zeta-model` sessions and one
+/// `alpha-model` session at MEASURED zero usage (an explicit
+/// `usage:{input_tokens:0,output_tokens:0}` block on the assistant
+/// line). Lane discipline is load-bearing: the lines carry NO
+/// `timestamp`, so `jsonl_source_tool` classifies them `generic` —
+/// with a timestamp they would fall to the `hermes_jsonl` lane,
+/// whose text estimator prices per session (0.0002 each) and the
+/// group cost tie becomes a 0.0004-vs-0.0002 ordering by cost, no
+/// tie at all. As committed, both models price at exactly 0.0 with
+/// differing session counts — a structural tie in which only the
+/// sessions tie-break can order the rows.
+fn seed_tie_home() -> (PathBuf, PathBuf) {
+    let root = std::env::temp_dir().join(format!("agenttrace-mcp-tie-{}", std::process::id()));
+    let home = root.join("home");
+    let cache = root.join("cache");
+    let sessions = home.join(".hermes").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create sessions home");
+    for name in ["zeta-session-one", "zeta-session-two", "alpha-session-one"] {
+        std::fs::copy(
+            generated_fixture(&format!("by-model-tie/{name}.jsonl")),
+            sessions.join(format!("{name}.jsonl")),
+        )
+        .expect("seed tie fixture session");
+    }
+    std::fs::create_dir_all(&cache).expect("create cache dir");
+    (home, cache)
+}
+
 /// Run the built CLI with `argv` (which includes the `mcp` keyword
 /// when a server is wanted), a hermetic environment, and stdin fed
 /// from `input` to EOF; return (exit code, stdout response objects,
@@ -237,6 +266,91 @@ fn handshake_tools_and_report_rendering() {
             .any(|row| row["name"] == "gpt-5" && row["sessions"] == 1),
         "breakdown must roll the seeded session: {}",
         breakdown_payload["by_model"]
+    );
+
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
+fn by_model_breakdown_orders_ties_like_the_cli_overview() {
+    // rm-987: `by_model_breakdown` used to sort cost→name while the
+    // CLI's `--overview -f json` by_model array (core reports.rs
+    // `group_items(by_model, agent_display=false)`) sorts
+    // cost→sessions→name. On a cost tie with differing session counts
+    // the two surfaces ordered the SAME corpus differently (assess F3
+    // PoC, reproduced with this committed tie corpus: zeta-model ×2
+    // sessions vs alpha-model ×1, both cost 0.0 — the old MCP arm put
+    // alpha-model first on the name tie-break while the CLI put
+    // zeta-model first on the sessions tie-break). This golden test
+    // drives BOTH surfaces over the one corpus and pins both the
+    // parity and the exact group_items semantics.
+    let (home, cache) = seed_tie_home();
+
+    // Surface 1: the CLI overview JSON document.
+    let (code, stdout, stderr) = cli_run(&home, &cache, &["--overview", "-f", "json"]);
+    assert_eq!(Some(0), code, "cli overview must succeed: {stderr}");
+    let overview: Value = serde_json::from_str(&stdout).expect("cli overview json");
+    let rows = overview["by_model"]
+        .as_array()
+        .expect("cli overview carries by_model");
+    let cli_order: Vec<&str> = rows
+        .iter()
+        .map(|row| row["name"].as_str().expect("model name"))
+        .collect();
+    // The tie must be structural, not accidental: one cost value
+    // across both models, and the expected session split 2/1.
+    let costs: Vec<f64> = rows
+        .iter()
+        .map(|row| row["cost"].as_f64().expect("model cost"))
+        .collect();
+    assert_eq!(
+        costs.iter().filter(|c| **c == costs[0]).count(),
+        costs.len(),
+        "the tie corpus must price both models identically: {rows:?}"
+    );
+    let sessions_of = |name: &str| {
+        rows.iter()
+            .find(|row| row["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be reported: {rows:?}"))["sessions"]
+            .as_u64()
+            .expect("session count")
+    };
+    assert_eq!(2, sessions_of("zeta-model"));
+    assert_eq!(1, sessions_of("alpha-model"));
+
+    // Surface 2: the MCP by_model_breakdown tool over the same HOME.
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"by_model_breakdown","arguments":{"range":"all"}}}"#,
+        "\n",
+    );
+    let (code, responses, stderr) = mcp_session(&home, &cache, requests);
+    assert_eq!(Some(0), code, "mcp server must exit rc0: {stderr}");
+    assert_eq!(2, responses.len(), "one response per request");
+    assert_eq!(false, responses[1]["result"]["isError"]);
+    let payload = text_payload(&responses[1]);
+    let mcp_rows = payload["by_model"]
+        .as_array()
+        .expect("breakdown carries by_model");
+    let mcp_order: Vec<&str> = mcp_rows
+        .iter()
+        .map(|row| row["name"].as_str().expect("model name"))
+        .collect();
+
+    // Parity: identical ordering across the two surfaces...
+    assert_eq!(
+        cli_order, mcp_order,
+        "by_model_breakdown must order by_model exactly like the CLI overview json"
+    );
+    // ...and the pinned group_items semantics: under a cost tie the
+    // higher session count wins (name asc only after that).
+    assert_eq!(
+        cli_order,
+        vec!["zeta-model", "alpha-model"],
+        "cost tie → sessions desc → name asc, not name asc alone"
     );
 
     let _ = std::fs::remove_dir_all(home.parent().expect("root"));

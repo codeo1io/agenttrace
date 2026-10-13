@@ -10,6 +10,14 @@ fail() {
 # not /tmp/agenttrace — /tmp persists across sessions on the CI fleet and a
 # days-old binary silently answered gate runs (observed on 2026-10-03).
 # AGENTTRACE_BIN still overrides for A/B against a pinned build.
+#
+# rm-989 scope note: this gate verifies the commands it RUNS and the
+# flags invoked in skills/*/SKILL.md command lines. Free-prose flag
+# mentions inside README/guide sentence text are deliberately outside
+# its sweep — README.md's CSV rollup paragraph documented a `--since`
+# flag that does not exist until it was hand-corrected to `--range`
+# (2026-10-13). A prose-reconciliation arm for inline mentions is
+# recorded as deferred follow-up on rm-989; do not assume it exists.
 repo_root="$(git rev-parse --show-toplevel)" \
   || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
 bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
