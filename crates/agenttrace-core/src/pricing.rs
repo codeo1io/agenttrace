@@ -99,6 +99,16 @@ pub struct PricingCatalog {
     /// compares model deprecation dates against THIS — never the wall
     /// clock — so report bytes stay stable for a given catalog.
     pub reference_date: Option<u32>,
+    /// Load-time duplicate-key collapse ledger (rm-1419): raw catalog
+    /// spellings that normalize onto one key, mapped
+    /// normalized-key -> [winning raw, losing raws...]. Every losing
+    /// spelling keeps its own exact-match entry in `entries`, so this
+    /// map is a disclosure of resolved ambiguity, never a loss of data.
+    /// Census-style consumers (priced-model counts, deprecation) must
+    /// count ONE model per family — the winner's row at the family
+    /// key; a fixed-point loser shares that key and adds no row
+    /// (review F1/F2).
+    pub duplicate_collapses: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,7 +149,33 @@ pub fn lookup_price(model: &str) -> Price {
 
 /// rm-610: resolve a model's rates for the service tier the turn
 /// actually ran on. `Some("flex")` bills at the entry's `*_flex`
-/// slots when the catalog row carries them — input AND output must
+/// rm-1419 (+ review F3): pick the catalog identity a price lookup
+/// consults. A user alias hop (rm-511) outranks every catalog row — an
+/// override file that renames an id the catalog ALSO keys must keep
+/// working, consistent with `has_specific_price`, which resolves
+/// aliases first too — while a raw/near-raw catalog hit outranks only
+/// the normalization fold, so exact-match entries (regional
+/// spellings) answer lookups that carry them verbatim.
+fn resolve_lookup_model(model: &str, catalog: &PricingCatalog) -> String {
+    let folded = normalize_model(model);
+    let resolved = resolve_alias(model, &catalog.aliases);
+    if resolved != folded {
+        // An alias hop fired (user override): alias first.
+        resolved
+    } else if matching_catalog_key(model, &catalog.entries).is_some() {
+        // No alias; the id hits a raw/near-raw catalog row: keep the id
+        // verbatim so the exact-match entry — not the normalization
+        // fold — answers the lookup.
+        model.to_string()
+    } else {
+        // No alias, no raw hit: the plain alias/normalization walk.
+        resolved
+    }
+}
+
+/// Per-model price lookup for a service tier. `None` and every tier
+/// name but `"flex"` bill at the standard rates; `"flex"` bills the
+/// flex slots when the catalog row carries them — input AND output must
 /// both be present, and a missing cache slot falls back to that
 /// standard rate — while every other tier (None, "default",
 /// "priority", ...) bills at the standard rates. A model without
@@ -147,7 +183,15 @@ pub fn lookup_price(model: &str) -> Price {
 /// published behavior (codeburn #1642), not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
-    let model = resolve_alias(model, &catalog.aliases);
+    // rm-1419 (+ review F3): a user alias hop outranks every catalog
+    // row (an override file that renames a catalog-keyed id must keep
+    // working — see resolve_lookup_model); an exact/near-raw catalog
+    // hit outranks only the normalization fold, so regional spellings
+    // (us-gov./au./global.…) that carry their own exact-match entries
+    // at load bill at their own rows instead of collapsing onto the
+    // family's base key.
+    let model = model.trim().to_ascii_lowercase();
+    let model = resolve_lookup_model(&model, catalog);
     let mut price = lookup_price_in(&model, &catalog.entries);
     if service_tier == Some("flex") {
         if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
@@ -219,6 +263,37 @@ pub fn pricing_source() -> String {
 /// Model count in the bundled offline snapshot, parsed once, for
 /// provenance disclosure (cycle 7 R1: users should be able to see how
 /// old the offline catalog they are paying from actually is).
+impl PricingCatalog {
+    /// Duplicate spelling entries that occupy their OWN exact-match
+    /// row at load (rm-1419): every losing raw spelling in a collapse
+    /// family except a fixed-point loser whose spelling IS the family
+    /// key — that key holds the WINNER's row, so no second row exists
+    /// there (review F1). Census-style counts subtract exactly this to
+    /// keep counting distinct models, one per family.
+    fn spelling_duplicates(&self) -> usize {
+        self.duplicate_collapses
+            .iter()
+            .map(|(name, family)| {
+                family[1..]
+                    .iter()
+                    .filter(|spelling| spelling.as_str() != name.as_str())
+                    .count()
+            })
+            .sum()
+    }
+
+    /// True when `key` is a losing duplicate spelling's own
+    /// exact-match entry (rm-1419) — never the family winner at the
+    /// family key, and never a fixed-point loser (the row at that key
+    /// is the winner's). Census-style filters use this to skip losing
+    /// spellings while counting each family's winner exactly once.
+    fn is_duplicate_spelling(&self, key: &str) -> bool {
+        self.duplicate_collapses.iter().any(|(name, family)| {
+            key != name.as_str() && family.len() > 1 && family[1..].iter().any(|k| k == key)
+        })
+    }
+}
+
 pub fn bundled_snapshot_date() -> &'static str {
     PRICING_SNAPSHOT_DATE
 }
@@ -287,11 +362,30 @@ pub fn bundled_snapshot_deprecated() -> (usize, Option<String>) {
     static CENSUS: OnceLock<(usize, Option<String>)> = OnceLock::new();
     CENSUS
         .get_or_init(|| {
-            let entries = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes()).entries;
+            let converted = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+            let entries = converted.entries;
+            // rm-1419 (+ review F1/F2): count distinct MODELS — one
+            // per collapse family. Skip losing spellings that hold
+            // their own exact-match rows (each carries its own row's
+            // deprecation date, which would double-count the family);
+            // a fixed-point loser instead shares the family key with
+            // the winner, whose row must count.
+            let losers: BTreeSet<&String> = converted
+                .duplicate_collapses
+                .iter()
+                .flat_map(|(name, family)| {
+                    family[1..]
+                        .iter()
+                        .filter(|spelling| spelling.as_str() != name.as_str())
+                })
+                .collect();
             let reference = iso_to_ymd(PRICING_SNAPSHOT_DATE).unwrap_or(0);
             let mut count = 0;
             let mut oldest: Option<u32> = None;
-            for price in entries.values() {
+            for (key, price) in entries.iter() {
+                if losers.contains(key) {
+                    continue;
+                }
                 let Some(ymd) = price.deprecation_date.as_deref().and_then(iso_to_ymd) else {
                     continue;
                 };
@@ -305,6 +399,19 @@ pub fn bundled_snapshot_deprecated() -> (usize, Option<String>) {
             (count, oldest.map(ymd_to_iso))
         })
         .clone()
+}
+
+/// Load-time duplicate-key collapse disclosure (rm-1419) for the
+/// bundled snapshot: (losing-spelling entries resolved, collapse
+/// families, family ledger keyed by normalized key with the winning
+/// raw spelling first). Zero families leaves doctor output unchanged.
+pub fn bundled_snapshot_duplicate_collapses(
+) -> (usize, usize, &'static BTreeMap<String, Vec<String>>) {
+    static LEDGER: OnceLock<BTreeMap<String, Vec<String>>> = OnceLock::new();
+    let ledger = LEDGER
+        .get_or_init(|| convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes()).duplicate_collapses);
+    let resolved: usize = ledger.values().map(|f| f.len() - 1).sum();
+    (resolved, ledger.len(), ledger)
 }
 
 /// Resolve a model's vendor context window (input-token cap) from the
@@ -408,15 +515,23 @@ fn catalog_source(catalog: &PricingCatalog) -> String {
     // vintage so the suffix is a property of the catalog, not of when
     // the binary runs. Empty catalogs keep the legacy label untouched.
     if let Some(reference) = catalog.reference_date {
+        // rm-1419 (+ review F2): count distinct MODELS — one per
+        // collapse family. Losing spellings hold their own exact-match
+        // rows (each with its own row's deprecation date, which would
+        // double-count the family in both the numerator and the
+        // denominator); a fixed-point loser instead shares the family
+        // key with the winner, whose row counts.
+        let priced = catalog.entries.len() - catalog.spelling_duplicates();
         let deprecated = catalog
             .entries
-            .values()
-            .filter(|price| past_deprecated(price, reference))
+            .iter()
+            .filter(|(key, price)| {
+                !catalog.is_duplicate_spelling(key) && past_deprecated(price, reference)
+            })
             .count();
         if deprecated > 0 {
             return format!(
-                "{label}; {deprecated} of {} priced models past vendor deprecation",
-                catalog.entries.len()
+                "{label}; {deprecated} of {priced} priced models past vendor deprecation"
             );
         }
     }
@@ -554,6 +669,7 @@ pub fn update_pricing() -> anyhow::Result<usize> {
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
         providers: converted.providers,
+        duplicate_collapses: converted.duplicate_collapses,
         reference_date: today_ymd(),
     };
     let override_models = apply_pricing_overrides(&mut catalog);
@@ -750,6 +866,7 @@ fn fallback_catalog() -> PricingCatalog {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
     }
@@ -758,6 +875,7 @@ fn fallback_catalog() -> PricingCatalog {
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
         providers: converted.providers,
+        duplicate_collapses: converted.duplicate_collapses,
         reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
     }
 }
@@ -815,6 +933,7 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
         providers: converted.providers,
+        duplicate_collapses: converted.duplicate_collapses,
         // A cached catalog's vintage is its fetch date (rm-419); when
         // the provenance stamp is missing (pre-rm-167 cache) fall back
         // to the bundled snapshot date as a conservative anchor.
@@ -1208,6 +1327,9 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
 struct ConvertedCatalog {
     entries: BTreeMap<String, Price>,
     providers: BTreeMap<String, String>,
+    /// rm-1419: raw spellings that normalize onto one key, winner
+    /// first, mapped by the key they collapse onto.
+    duplicate_collapses: BTreeMap<String, Vec<String>>,
 }
 
 /// Per-token flex rate -> per-million flex slot, dropping absent,
@@ -1223,9 +1345,19 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         return ConvertedCatalog {
             entries: BTreeMap::new(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
         };
     };
-    let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    // rm-1419: collect EVERY viable row per normalized key, then
+    // resolve each family by an explicit precedence rule. The previous
+    // single-pass insert kept the first row of the sorted source on
+    // equal priority, which silently billed regional spellings at a
+    // lexicographic neighbor's rates: us-gov.anthropic.claude-sonnet-
+    // 4-5-20250929-v1:0 collapsed onto the au twin's $3.30/M-in row
+    // ($4.95 per 1M-in/100k-out) while the snapshot carries the
+    // correct $3.60/M-in us-gov row ($5.40). Family resolution below
+    // is deterministic regardless of source iteration order.
+    let mut families: BTreeMap<String, Vec<(i32, Price, String, String)>> = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -1275,20 +1407,54 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             continue;
         }
         let priority = provider_priority(&model.provider);
-        match selected.get(&normalized) {
-            Some((existing, _, _)) if *existing >= priority => {}
-            _ => {
-                selected.insert(normalized, (priority, price, model.provider));
-            }
-        }
+        families
+            .entry(normalized)
+            .or_default()
+            .push((priority, price, model.provider, key));
     }
     let mut entries = BTreeMap::new();
     let mut providers = BTreeMap::new();
-    for (name, (_, price, provider)) in selected {
-        providers.insert(name.clone(), provider);
-        entries.insert(name, price);
+    let mut duplicate_collapses = BTreeMap::new();
+    for (name, mut candidates) in families {
+        // Precedence rule (rm-1419) — a total order so the winner never
+        // depends on the source map's iteration order:
+        //   1. higher provider priority wins the base key;
+        //   2. at equal priority the SHORTEST raw spelling wins — the
+        //      most generic spelling owns the base key;
+        //   3. remaining ties break lexicographically.
+        candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.3.len().cmp(&b.3.len()))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+        let (_, winner_price, winner_provider, winner_raw) = candidates.swap_remove(0);
+        providers.insert(name.clone(), winner_provider);
+        entries.insert(name.clone(), winner_price);
+        let mut family = vec![winner_raw];
+        for (_, loser_price, loser_provider, loser_raw) in candidates {
+            // A spelling that loses the base key keeps its own
+            // exact-match row: lookups that carry the spelling verbatim
+            // bill at that row's rates instead of the winner's. One
+            // exception (review F1): a fixed-point loser whose spelling
+            // IS the family key must not overwrite the winner's row
+            // there — provider attribution, flex tiers, deprecation,
+            // and context window all ride the row, and the winner owns
+            // the key. The ledger still records the collapse either way.
+            if !entries.contains_key(&loser_raw) {
+                providers.insert(loser_raw.clone(), loser_provider);
+                entries.insert(loser_raw.clone(), loser_price);
+            }
+            family.push(loser_raw);
+        }
+        if family.len() > 1 {
+            duplicate_collapses.insert(name, family);
+        }
     }
-    ConvertedCatalog { entries, providers }
+    ConvertedCatalog {
+        entries,
+        providers,
+        duplicate_collapses,
+    }
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -2379,6 +2545,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: source.to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2497,6 +2664,7 @@ mod tests {
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
@@ -2532,6 +2700,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "retired-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         // Plain catalog arm.
@@ -2559,6 +2728,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2570,6 +2740,7 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2617,6 +2788,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -2810,6 +2982,7 @@ mod tests {
             aliases: BTreeMap::from([("wide-alias".to_string(), "wide-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2857,6 +3030,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "snapshot".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         let overrides = BTreeSet::new();
@@ -2899,6 +3073,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2910,6 +3085,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2937,10 +3113,12 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         let same_content = PricingCatalog {
             source: "cache(stale)".to_string(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: Some(2026_1004),
             ..base.clone()
         };
@@ -3052,6 +3230,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -3199,6 +3378,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "test".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         apply_codex_sku_aliases(&mut catalog);
@@ -3218,6 +3398,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "test".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         apply_codex_sku_entries(&mut catalog);
@@ -3241,6 +3422,7 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "test".to_string(),
             providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::new(),
             reference_date: None,
         };
         apply_codex_sku_entries(&mut shipped);
@@ -3404,6 +3586,7 @@ mod tests {
                 aliases: BTreeMap::new(),
                 source: "test".to_string(),
                 providers: BTreeMap::from([("m".to_string(), provider.to_string())]),
+                duplicate_collapses: BTreeMap::new(),
                 reference_date: None,
             }
         }
@@ -3422,6 +3605,299 @@ mod tests {
         assert_ne!(
             base, provider_flip,
             "a rate-identical provider flip changes attribution and must change the digest (rm-613)"
+        );
+    }
+
+    // ── rm-1419: load-time duplicate-key collapse rule ──────────────
+
+    fn synthetic_catalog(json: &str) -> ConvertedCatalog {
+        convert_litellm(json.as_bytes())
+    }
+
+    #[test]
+    fn duplicate_collapse_higher_priority_owns_the_base_key() {
+        // `cli-dup-model-x` family: a bedrock_converse spelling at
+        // priority 5 and an openai spelling at priority 10. Priority —
+        // not source order — must own the base key.
+        let catalog = synthetic_catalog(
+            r#"{
+                "zz.anthropic.cli-dup-model-x": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "chat",
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6
+                },
+                "openai/cli-dup-model-x": {
+                    "litellm_provider": "openai",
+                    "mode": "chat",
+                    "input_cost_per_token": 3e-6,
+                    "output_cost_per_token": 6e-6
+                }
+            }"#,
+        );
+        let price = catalog
+            .entries
+            .get("cli-dup-model-x")
+            .expect("base key must exist");
+        assert!((price.input - 3.0).abs() < 1e-9, "openai wins by priority");
+        // The losing spelling keeps its own exact-match entry.
+        let loser = catalog
+            .entries
+            .get("zz.anthropic.cli-dup-model-x")
+            .expect("losing spelling keeps an exact entry");
+        assert!((loser.input - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duplicate_collapse_shortest_raw_owns_the_base_key_on_ties() {
+        // Both spellings are bedrock_converse (priority 5): the
+        // SHORTER raw spelling wins the base key; the longer one keeps
+        // an exact entry.
+        let catalog = synthetic_catalog(
+            r#"{
+                "aaaaa.anthropic.cli-dup-model-y": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "chat",
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6
+                },
+                "a.anthropic.cli-dup-model-y": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "chat",
+                    "input_cost_per_token": 3e-6,
+                    "output_cost_per_token": 6e-6
+                }
+            }"#,
+        );
+        let price = &catalog.entries["cli-dup-model-y"];
+        assert!((price.input - 3.0).abs() < 1e-9, "shortest raw wins");
+        let loser = &catalog.entries["aaaaa.anthropic.cli-dup-model-y"];
+        assert!((loser.input - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duplicate_collapse_lexicographic_final_tie_break() {
+        // Same provider, same length: lexicographic order decides so
+        // the winner never depends on iteration order.
+        let catalog = synthetic_catalog(
+            r#"{
+                "bbb.anthropic.cli-dup-model-z": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "chat",
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6
+                },
+                "aaa.anthropic.cli-dup-model-z": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "chat",
+                    "input_cost_per_token": 3e-6,
+                    "output_cost_per_token": 6e-6
+                }
+            }"#,
+        );
+        let price = &catalog.entries["cli-dup-model-z"];
+        assert!(
+            (price.input - 3.0).abs() < 1e-9,
+            "aaa wins lexicographically"
+        );
+    }
+
+    #[test]
+    fn duplicate_collapse_ledger_records_family_winner_first() {
+        let catalog = synthetic_catalog(
+            r#"{
+                "m2.anthropic.cli-dup-ledger": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "chat",
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6
+                },
+                "m1.anthropic.cli-dup-ledger": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "chat",
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6
+                }
+            }"#,
+        );
+        let family = &catalog.duplicate_collapses["cli-dup-ledger"];
+        assert_eq!(
+            family,
+            &vec![
+                "m1.anthropic.cli-dup-ledger".to_string(),
+                "m2.anthropic.cli-dup-ledger".to_string()
+            ],
+            "winner first, then losers sorted"
+        );
+        // Single-row keys never enter the ledger.
+        assert!(!catalog.duplicate_collapses.contains_key("no-such"));
+    }
+
+    #[test]
+    fn duplicate_collapse_non_chat_and_unpriced_rows_never_enter() {
+        let catalog = synthetic_catalog(
+            r#"{
+                "zz.anthropic.cli-dup-model-w": {
+                    "litellm_provider": "bedrock_converse",
+                    "mode": "embedding",
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6
+                },
+                "openai/cli-dup-model-w": {
+                    "litellm_provider": "openai",
+                    "mode": "chat",
+                    "input_cost_per_token": 3e-6,
+                    "output_cost_per_token": 6e-6
+                }
+            }"#,
+        );
+        assert!(
+            !catalog.duplicate_collapses.contains_key("cli-dup-model-w"),
+            "non-chat rows are filtered before family resolution"
+        );
+    }
+
+    #[test]
+    fn fixed_point_loser_never_overwrites_the_winner_row() {
+        // rm-1419 review F1: a bare spelling that is a normalize_model
+        // FIXED POINT can still LOSE its family's base key on provider
+        // priority (the bundled snapshot has 15 such gemini families).
+        // The loser's insert must not overwrite the winner's row at the
+        // family key — provider attribution, flex tiers, deprecation,
+        // and context window all ride the row.
+        let catalog = synthetic_catalog(
+            r#"{
+                "gemini/fp-model": {
+                    "litellm_provider": "gemini",
+                    "mode": "chat",
+                    "input_cost_per_token": 1e-6,
+                    "output_cost_per_token": 2e-6,
+                    "input_cost_per_token_flex": 0.5e-6,
+                    "output_cost_per_token_flex": 1e-6
+                },
+                "fp-model": {
+                    "litellm_provider": "vertex_ai-language-models",
+                    "mode": "chat",
+                    "input_cost_per_token": 3e-6,
+                    "output_cost_per_token": 4e-6,
+                    "deprecation_date": "2001-01-01"
+                }
+            }"#,
+        );
+        // Family "fp-model": the gemini/ twin wins on priority; the
+        // bare spelling is a fixed-point loser sharing the family key.
+        let winner = catalog.entries.get("fp-model").expect("family key present");
+        assert_eq!(winner.input, 1.0, "winner rates own the family key");
+        assert_eq!(winner.output, 2.0);
+        assert_eq!(
+            winner.input_flex,
+            Some(0.5),
+            "winner's flex tier must survive at the family key"
+        );
+        assert_eq!(
+            winner.deprecation_date, None,
+            "loser's retirement must not leak into the base key"
+        );
+        assert_eq!(
+            catalog.providers.get("fp-model").map(String::as_str),
+            Some("gemini"),
+            "provider attribution must ride the winner, not the loser"
+        );
+        // The ledger still discloses the collapse: winner first, then
+        // the fixed-point loser — the count keys resolved, not rows added.
+        assert_eq!(
+            catalog
+                .duplicate_collapses
+                .get("fp-model")
+                .map(Vec::as_slice),
+            Some(&["gemini/fp-model".to_string(), "fp-model".to_string()][..])
+        );
+        // And the entry census counts ONE distinct model for the family:
+        // no separate exact-match row exists for the fixed-point loser.
+        assert!(!catalog.entries.contains_key("gemini/fp-model"));
+        assert_eq!(catalog.entries.len(), 1);
+    }
+
+    #[test]
+    fn user_alias_hops_outrank_exact_catalog_rows() {
+        // rm-1419 review F3: an override alias for an id the catalog
+        // ALSO keys must still fire (rm-511); the raw-first match
+        // outranks only the normalization fold, never the user's alias
+        // — consistent with has_specific_price, which resolves
+        // aliases first.
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "us-gov.anthropic.claude-x".to_string(),
+                    Price {
+                        input: 3.6,
+                        output: 18.0,
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "claude-x".to_string(),
+                    Price {
+                        input: 3.0,
+                        output: 15.0,
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "deepseek-chat".to_string(),
+                    Price {
+                        input: 0.28,
+                        output: 0.42,
+                        ..Price::default()
+                    },
+                ),
+            ]),
+            aliases: BTreeMap::from([("claude-x".to_string(), "deepseek-chat".to_string())]),
+            source: "snapshot".to_string(),
+            providers: BTreeMap::new(),
+            duplicate_collapses: BTreeMap::from([(
+                "claude-x".to_string(),
+                vec![
+                    "claude-x".to_string(),
+                    "us-gov.anthropic.claude-x".to_string(),
+                ],
+            )]),
+            reference_date: None,
+        };
+        // Alias fires although the id is a catalog key (F3).
+        assert_eq!(
+            resolve_lookup_model("claude-x", &catalog),
+            "deepseek-chat",
+            "a user alias hop outranks the catalog row the id keys"
+        );
+        // The regional spelling normalizes onto the aliased base key,
+        // so it follows the same redirect — consistent alias
+        // semantics: the user renamed the family, not one spelling.
+        assert_eq!(
+            resolve_lookup_model("us-gov.anthropic.claude-x", &catalog),
+            "deepseek-chat",
+            "a regional spelling of an aliased base key follows the alias"
+        );
+        // No alias, no exact row: the plain normalization fold applies,
+        // matching the pre-rm-1419 alias walk.
+        assert_eq!(
+            resolve_lookup_model("totally-unknown-model", &catalog),
+            normalize_model("totally-unknown-model"),
+            "ids with no raw hit and no alias keep folding through resolve_alias"
+        );
+
+        // Same entries, NO alias on the family: the raw-first arm must
+        // answer the regional spelling verbatim (the rm-1419
+        // acceptance corridor) — the alias above, not the raw-row arm,
+        // caused the redirect in the previous block.
+        let unaliased = PricingCatalog {
+            aliases: BTreeMap::new(),
+            ..catalog
+        };
+        assert_eq!(
+            resolve_lookup_model("us-gov.anthropic.claude-x", &unaliased),
+            "us-gov.anthropic.claude-x",
+            "with no alias on the family an exact-match row must answer lookups verbatim"
         );
     }
 }

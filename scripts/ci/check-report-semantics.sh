@@ -1,14 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
-out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
-expected_cost_label="${AGENTTRACE_EXPECTED_COST_LABEL:-Total estimated cost}"
-
 fail() {
   echo "check-report-semantics: $*" >&2
   exit 1
 }
+
+# rm-1419 rider: never default to the shared /tmp/agenttrace binary or
+# the shared /tmp/agenttrace-ci out dir (rm-369 precedent; env overrides
+# still win for A/B against a pinned build). The repo root derives from
+# the script's own location, not `git rev-parse`, so an out-of-repo
+# invocation with AGENTTRACE_BIN set works — the git guard used to
+# fail it before the env was ever consulted (rm-1419 review F5).
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)" \
+  || fail "cannot locate the agenttrace repository from the script path"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+if [[ -n "${AGENTTRACE_CI_OUT:-}" ]]; then
+  out_dir="$AGENTTRACE_CI_OUT"
+else
+  out_dir="$(mktemp -d /tmp/agenttrace-report-semantics.XXXXXX)"
+  trap 'rm -rf "$out_dir"' EXIT
+fi
+
+expected_cost_label="${AGENTTRACE_EXPECTED_COST_LABEL:-Total estimated cost}"
 
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir/semantics"

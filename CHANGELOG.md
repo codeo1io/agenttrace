@@ -225,6 +225,42 @@
 
 ### Fixed
 
+- Pricing: regional model spellings bill at their own snapshot rows (rm-1419, run
+  e62e2630 cycle 1). The LiteLLM snapshot load collapsed every raw spelling that
+  normalized onto one catalog key to a single entry, keeping the first row in
+  sorted order on equal provider priority — a lexicographic accident, not a
+  policy. The worst case was real: `us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0`
+  billed $4.95/M-in via its `au.anthropic…` twin while the snapshot carried the
+  correct us-gov row ($5.40). Load now resolves each duplicate family by an
+  explicit rule — provider priority, then the shortest raw spelling, then
+  lexicographic order — and every losing spelling keeps its own exact-match
+  entry, so a model id carried verbatim in a session bills at that row's rates.
+  Resolutions are disclosed instead of silent: `--doctor` reports `N duplicate
+  catalog keys across M families resolved by rule (priority, then shortest
+  spelling)`, and the priced-model/deprecation censuses still count distinct
+  models, keeping report bytes stable. Two precedence commitments pin the
+  edges: a losing spelling that IS its family's normalize fixed point never
+  overwrites the winner's row at the family key (provider attribution, flex
+  tiers, deprecation, and context window all ride the winner's row), and a
+  user pricing-override alias (rm-511) outranks every catalog row — an
+  override file that renames an id the catalog also keys keeps working.
+  Census note: the explicit rule re-picks some family winners, and the
+  deprecation census now counts exactly one model per family — the winner's
+  row at the family key — moving the bundled census from `61 of 1529` to
+  `65 of 1529` priced models (the all-zero-rate row filter is pre-existing
+  and unchanged); the three svg card goldens were regenerated with
+  `UPDATE_CARD_GOLDEN=1` in this change.
+- CI gates no longer default to the shared `/tmp/agenttrace` binary or the
+  shared `/tmp/agenttrace-ci` output directory (rm-1419 rider; rm-369/rm-444
+  precedent, assess F6/F7): `check-deterministic-output`, `check-report-semantics`,
+  and `check-output-contract` now derive the binary from the repo's own release
+  build and write to a run-private `mktemp` dir (cleaned on exit) when the
+  `AGENTTRACE_BIN`/`AGENTTRACE_CI_OUT` overrides are unset. A missing binary is
+  a named error instead of a stale-binary false green, and the output-contract
+  doctor leg additionally scopes its corpus to a repo fixture and an isolated
+  HOME instead of walking the operator's real HOME and banking a session entry
+  into `~/.cache/agenttrace`.
+
 - blank/whitespace `--search` is rejected instead of silently matching nothing
   (rm-988, run b5affead cycle 2): `--search ''` (or a whitespace-only paste)
   exited 0 with `{"query":"","count":0,"results":[]}` — an unquoted empty
