@@ -225,6 +225,9 @@
 
 ### Fixed
 
+- statusline context-window truths now parse `context_window()` exactly once per capture: the peak-utilization fold and the per-session latest-window list share a single pre-parsed vector instead of each cloning + serde-parsing the payload (rm-921 residual, run 4401a380 cycle 2; pinned by `context_window_parsed_once_per_capture`).
+- `tests/otel_export` fixture directories are now unique per call (atomic per-process suffix instead of the constant `line!()`), closing the intra-process window where one suite's truncating fixture rewrite could be observed mid-write by another suite's parse (rm-1065, run 4401a380 cycle 2; pinned by `fixture_dirs_are_unique_per_call`).
+- the Codex plugin version sync gate is green in full clones again: the 49 merged legacy tags (v0.0.4 and the v0.3.x line) that predate per-release CHANGELOG sections now carry explicit `no-changelog-section` markers (rm-1064, run 4401a380 cycle 2).
 - An empty or relative `HOME` no longer plants a per-cwd cache (rm-248 rider, run 64e89da50d71 cycle 3): statusline's copy of the cache-root ladder already treated a set-but-empty `HOME` as unset (review 95d74221 F2), but the three inline copies did not — `env HOME= agenttrace --overview -d <dir>` joined the RELATIVE `.cache` and planted `./.cache/agenttrace/sessions.json` (mode 0600) in the working directory (live PoC: /tmp/at-probe-8275/homeempty/), and `HOME=rel-home` planted `./rel-home/.cache` the same way. The three copies (session_cache, doctor, pricing) now resolve through a pure `resolve_user_cache_dir` core in the statusline pattern: a set-but-empty OR RELATIVE `HOME` is unset-equivalent on both arms (the macOS-first branch order is untouched), an absolute `$XDG_CACHE_HOME` still wins over an unusable HOME, `AGENTTRACE_SESSION_CACHE_DIR` stays first-class, and the ladder ends at the always-absolute temp dir. Pinned per site by `user_cache_dir_treats_empty_and_relative_home_as_unset` in all three module test-beds (statusline's pin keeps its historical `user_cache_dir_treats_empty_env_as_unset` name and gained the same relative-HOME arms), plus a red→green binary probe (stat on a fixture cwd) recorded on the row. The cycle's independent review (ae97110b F1) caught the fourth copy — statusline — still honoring a RELATIVE `HOME`: `HOME=rel-home agenttrace statusline` planted `./rel-home/.cache/agenttrace/statusline.jsonl` (mode 0600) in the CWD and `--statusline-report` read the planted journal back into the budget view; the review-fix turn (attempt 13fb6a7f) closed it with the same unset-equivalence on both arms of statusline's resolve core.
 - **rm-985 / rm-897 — spreadsheet-formula injection is neutralized in every human-readable report lane (formula-guard completion, run 8e5a0887 cycle 3, landed at its integration past the sibling landings):** the rm-540 CSV guard and the rm-897 markdown/HTML fence arms left every plain-text and prose-bearing lane untouched — a session named `=HYPERLINK("http://evil.example","click-me") please review` (name provenance: the first user message) or a tool named `+cmd|' /C calc'!A0` flowed raw into `--overview -f text` (session table AND the per-session TOP TOOLS table), `--audit`/`--recommend` evidence rows, the governance plain-text leaf and its fenced-JSON blocks in markdown/HTML, `--waste`'s Tool Bloat table, `--search` text hits, and `--compare`'s name cell — every one a copy-paste-into-spreadsheet target that would execute as a formula on open. All of those lanes now route through `guard_formula_cell` (core, `pub(crate)`): any cell whose first non-whitespace byte is an introducer (`=`, `+`, `@`, `-`, plus the fullwidth ＝＋＠－ shapes a hostile paste survives) is prefixed with a literal `'` neutralizer; numeric-looking cells stay bare so the tables keep right-aligning (the rm-540 exemption), keys and non-string JSON leaves are untouched, and the machine `json` lanes stay byte-lossless by design — the guard is for humans reading, not for pipelines counting. The markdown/HTML governance fences go through the same guard via `guard_formula_json_leaves` (exported; string VALUE leaves only), and the CLI's own `render_plain_value` leaf composes the rm-540 string guard with the rm-1014 null-omission semantics at the merge. Pinned by `tests/formula_lane_contract.rs` (5 pins, red-first against the assess PoC shapes) over two vendored hostile fixtures; at the integration's independent review (case 3304528b) the name-fixture was renamed `=2+5_cmd.jsonl` — the raw PoC filename's `|` is un-creatable on NTFS and would have broken the windows-latest Test lane at checkout (the poison is the message body, so the rename costs nothing).
 - **rm-1052 / rm-499 — pi cost truth: a recorded $0 no longer masquerades as a free session, and the 1h-tier cache write is counted.** The pi v3 recorded-cost arm kept recorded-wins (the rm-419 discipline — the recorded number stays authoritative) but a well-formed `cost.total == 0` — at the wire, a gateway passthrough that never priced the call is indistinguishable from a subscription flat rate — silently suppressed the catalog estimate for the whole block (598/600 sampled fleet journals carry exactly this zero). Every recorded-cost block now computes its suppressed catalog estimate — tier-aware (rm-610) when the block carries its own model — and discloses the divergence in both pricing arms (per-block and session-rate, so no session shape can hide it) via two informational counters: `recorded_cost_suppressed_estimate_cents` (the suppressed amount) and `recorded_cost_zero_blocks` (gateway-unpriced blocks, recorded $0 on priced tokens); a recorded cost that matches the catalog discloses nothing (negative control pinned). Alongside, pi's 1h-tier cache write (`cacheWrite1h`, carried by 77% of the live fleet corpus) gains its own `cache_write_1h_tokens` usage class — never folded into the 5m `cache_creation_input_tokens` class, since a fold would let a future pricing arm bill the 1h tier at the 5m rate — disclosed via the `pi_cache_write_1h_blocks` counter at all three `oh_my_pi_usage` call sites (message, compaction, and the standalone `type:"usage"` arm, added at the review fix); 1h-tier pricing itself stays gated until the catalog carries tier rates. PoC: a pi journal with 100k in / 50k out on claude-sonnet-4-5 and `cost.total == 0` reported `$0.0000, no markers` — now reports cost $0 (recorded, unchanged) with `recorded_cost_suppressed_estimate_cents = 105` ($1.05 suppressed) and `recorded_cost_zero_blocks = 1`; `cacheWrite1h: 99999` dropped silently, now surfaces its own class and counter. Session-cache schema bumped to 64 at this integration: the run minted 60 → 61 straight at its base 82e23b9, below the frontier — this tree had landed 62 (run 4309a268's gemini chats rung) and 63 (run b5affead's agent/summary-name rung, conflict case fbe92e4b80db45d0a2fb2b5c020b81a4) mid-run — so the rung re-bases onto the advanced ceiling as 63 → 64 per the landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c), one invalidation either way (a warm pre-rung entry keeps serving the silent $0 and drops the 1h-tier class); conflict case 8fbcfcfd5e4d440b8e2890456aaacede. Pins: `recorded_zero_discloses_suppressed_catalog_estimate` + `recorded_cost_matching_catalog_discloses_nothing` (pi_usage_tree_accounting.rs), `pi_cache_write_1h_blocks_disclosed` + the `pi-cachewrite-1h` fixture (pi_journal_contract.rs), `pi_cache_write_1h_counts_standalone_usage_entries` (the standalone `type:"usage"` arm — the third call site, added at the review fix), `oh_my_pi_usage_cache_write_1h_is_own_class` (parser.rs unit), oracle `warm_cache_replays_cold_disclosure_and_schema_64_invalidates_v32` (usage_occurrence_contract.rs).
@@ -1106,6 +1109,55 @@ section); this section records the upstream release being adopted wholesale:
   these refs visible to `git tag --merged HEAD`; nothing about the releases
   themselves changed.
 -->
+<!-- no-changelog-section: v0.0.4: ci: bump go version to 1.24 for build matrix; release -->
+<!-- no-changelog-section: v0.3.0: feat: complete bilingual i18n support (EN/ZH) across all user-facing strings; release -->
+<!-- no-changelog-section: v0.3.1: Merge pull request #1 from luoyuctl/codex/tui-product-polish; release -->
+<!-- no-changelog-section: v0.3.2: Add built-in demo sessions; release -->
+<!-- no-changelog-section: v0.3.3: Prepare v0.3.3 release; release -->
+<!-- no-changelog-section: v0.3.4: Add setup doctor command; release -->
+<!-- no-changelog-section: v0.3.5: Bump version to 0.3.5; release -->
+<!-- no-changelog-section: v0.3.6: Bump version to 0.3.6; release -->
+<!-- no-changelog-section: v0.3.7: Add Cursor export parser; release -->
+<!-- no-changelog-section: v0.3.8: Bump version to 0.3.8; release -->
+<!-- no-changelog-section: v0.3.9: Bump version to 0.3.9; release -->
+<!-- no-changelog-section: v0.3.10: Release 0.3.10; release -->
+<!-- no-changelog-section: v0.3.11: Release 0.3.11; release -->
+<!-- no-changelog-section: v0.3.12: Release 0.3.12; release -->
+<!-- no-changelog-section: v0.3.13: Release 0.3.13; release -->
+<!-- no-changelog-section: v0.3.14: Release 0.3.14; release -->
+<!-- no-changelog-section: v0.3.15: Release 0.3.15; release -->
+<!-- no-changelog-section: v0.3.16: Release 0.3.16; release -->
+<!-- no-changelog-section: v0.3.17: Release 0.3.17; release -->
+<!-- no-changelog-section: v0.3.18: Release 0.3.18; release -->
+<!-- no-changelog-section: v0.3.19: Release 0.3.19; release -->
+<!-- no-changelog-section: v0.3.20: Release 0.3.20; release -->
+<!-- no-changelog-section: v0.3.21: Release 0.3.21; release -->
+<!-- no-changelog-section: v0.3.22: Release 0.3.22; release -->
+<!-- no-changelog-section: v0.3.23: Release 0.3.23; release -->
+<!-- no-changelog-section: v0.3.24: Release 0.3.24; release -->
+<!-- no-changelog-section: v0.3.25: Release 0.3.25; release -->
+<!-- no-changelog-section: v0.3.26: Release 0.3.26; release -->
+<!-- no-changelog-section: v0.3.27: Release 0.3.27; release -->
+<!-- no-changelog-section: v0.3.28: Release 0.3.28; release -->
+<!-- no-changelog-section: v0.3.29: Release 0.3.29; release -->
+<!-- no-changelog-section: v0.3.30: Add health trend to overview; release -->
+<!-- no-changelog-section: v0.3.31: Prepare 0.3.31 release; release -->
+<!-- no-changelog-section: v0.3.32: Prepare 0.3.32 release; release -->
+<!-- no-changelog-section: v0.3.33: Prepare 0.3.33 release; release -->
+<!-- no-changelog-section: v0.3.34: Prepare 0.3.34 release; release -->
+<!-- no-changelog-section: v0.3.35: Bump version to 0.3.35; release -->
+<!-- no-changelog-section: v0.3.36: Bump version to 0.3.36; release -->
+<!-- no-changelog-section: v0.3.37: Bump version to 0.3.37; release -->
+<!-- no-changelog-section: v0.3.38: Sync 0.3.38 metadata; release -->
+<!-- no-changelog-section: v0.3.39: Show compact triage columns; release -->
+<!-- no-changelog-section: v0.3.40: Improve keymap readability; release -->
+<!-- no-changelog-section: v0.3.41: Improve standard-width TUI readability; release -->
+<!-- no-changelog-section: v0.3.42: Pin npm installer release tag (#6); release -->
+<!-- no-changelog-section: v0.3.44: Prepare 0.3.44 release (#15); release -->
+<!-- no-changelog-section: v0.3.45: Bump version to 0.3.45 (#78); release -->
+<!-- no-changelog-section: v0.3.46: Bump version to 0.3.46 (#81); release -->
+<!-- no-changelog-section: v0.3.47: Bump version to 0.3.47; release -->
+<!-- no-changelog-section: v0.3.48: Bump version to 0.3.48; release -->
 <!-- no-changelog-section: v0.7.2: release only decoupled the Pages checks from the release version (3f6252a); CI wiring, no user-facing behavior to section -->
 <!-- no-changelog-section: v0.7.3: release only fixed npm tarball publishing (739a6c3); packaging plumbing, no user-facing behavior to section -->
 <!-- no-changelog-section: v0.7.4: release only configured npm auth before publishing (2462045); packaging plumbing, no user-facing behavior to section -->
