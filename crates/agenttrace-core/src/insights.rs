@@ -1148,6 +1148,15 @@ mod tests {
         let fixture = root.join(format!("agenttrace-project-{}", std::process::id()));
         let repo = fixture.join("src").join("my-repo");
         fs::create_dir_all(&repo).expect("create repo");
+        // rm-382 hermeticity arm (run cacc672e cycle 3): `git_root` walks the
+        // fixture's ancestors looking for `.git`, so on a host whose TMPDIR
+        // lives inside a git repository (the conductor's
+        // /home/agent/.hermes/tmp, say) the ancestor repo latched the
+        // attribution (display_name ".hermes", root wrong). Planting the
+        // project's own `.git` marker anchors resolution at the fixture on
+        // any host; the hostile `agenttrace` sibling below still exercises
+        // the shadow-directory lane.
+        fs::create_dir_all(repo.join(".git")).expect("anchor fixture repo");
         fs::create_dir_all(root.join("agenttrace")).expect("plant shadow ancestor");
         let encoded = repo.to_string_lossy().replace('/', "-");
         let transcript = root.join("projects").join(&encoded).join("session.jsonl");
@@ -1262,6 +1271,10 @@ mod tests {
         let base = root.join("misattr");
         let true_repo = base.join("my-repo");
         fs::create_dir_all(&true_repo).expect("create true repo");
+        // rm-382 hermeticity arm (run cacc672e cycle 3): same anchor as the
+        // shadow test — without the project's own `.git`, `git_root` latched
+        // a hostile ancestor repo when TMPDIR lives inside one.
+        fs::create_dir_all(true_repo.join(".git")).expect("anchor true repo");
         let decoy = base.join("my").join("repo");
         fs::create_dir_all(&decoy).expect("plant decoy");
         let encoded = true_repo.to_string_lossy().replace('/', "-");

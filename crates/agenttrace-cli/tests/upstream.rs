@@ -253,7 +253,22 @@ fn outside_a_git_repository_fails() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create plain dir");
 
-    let output = run_cli(&root, &["upstream"]);
+    // rm-241 hermeticity arm (run cacc672e cycle 3): a host whose TMPDIR lives
+    // inside a git repository (the conductor's /home/agent/.hermes/tmp, say)
+    // makes git discovery walk above this fixture and report it as inside a repo
+    // it does not own. GIT_CEILING_DIRECTORIES stops discovery at the fixture's
+    // parent (and at `/`), so the fixture is genuinely outside any repository on
+    // any host — exactly what this test needs to keep asserting.
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+    command.args(["upstream"]).current_dir(&root);
+    for (key, value) in GIT_ENV {
+        command.env(key, value);
+    }
+    command.env(
+        "GIT_CEILING_DIRECTORIES",
+        format!("{}/", root.parent().unwrap().display()),
+    );
+    let output = command.output().expect("run agenttrace CLI");
     assert!(
         !output.status.success(),
         "must fail outside a git repository"
