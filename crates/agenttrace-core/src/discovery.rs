@@ -1219,12 +1219,19 @@ fn open_code_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
         }
     };
     if let Some(data_dir) = std::env::var_os("OPENCODE_DATA_DIR").map(PathBuf::from) {
-        if !data_dir.as_os_str().is_empty() {
+        // rm-248 rider: absolute-only, matching the landed env arms
+        // (history.rs, session_cache.rs, doctor.rs, pricing.rs) — a
+        // relative OPENCODE_DATA_DIR is rejected, not silently honored.
+        if !data_dir.as_os_str().is_empty() && data_dir.is_absolute() {
             add("OpenCode", data_dir);
         }
     }
     if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
-        if !data_home.as_os_str().is_empty() {
+        // rm-248 rider: same absolute-only contract. A set-but-relative
+        // XDG_DATA_HOME is rejected outright; the ~/.local/share fallback
+        // below stays unreachable when the variable is set, so there is
+        // no silent fallback to a different root.
+        if !data_home.as_os_str().is_empty() && data_home.is_absolute() {
             add("OpenCode", data_home.join("opencode").join("storage"));
         }
     } else {

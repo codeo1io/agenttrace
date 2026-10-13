@@ -4313,3 +4313,109 @@ fn antigravity_sibling_roots_are_discovered_and_disclosed() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+/// rm-248 rider test isolation: set OPENCODE_DATA_DIR / XDG_DATA_HOME (and
+/// a throwaway HOME) under the env lock. Poison-avoidance shape copied
+/// from with_home_and_cache — the guard drops before a caught panic
+/// resumes, so one flaky assertion cannot fail every later env-isolated
+/// test in this binary.
+fn with_opencode_env(
+    home: &std::path::Path,
+    data_dir: Option<&str>,
+    xdg_data_home: Option<&str>,
+    f: impl FnOnce(),
+) {
+    let result = {
+        let _guard = lock_env();
+        let previous_home = std::env::var_os("HOME");
+        let previous_opencode = std::env::var_os("OPENCODE_DATA_DIR");
+        let previous_xdg_data = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("HOME", home);
+        match data_dir {
+            Some(value) => std::env::set_var("OPENCODE_DATA_DIR", value),
+            None => std::env::remove_var("OPENCODE_DATA_DIR"),
+        }
+        match xdg_data_home {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        restore_env("HOME", previous_home);
+        restore_env("OPENCODE_DATA_DIR", previous_opencode);
+        restore_env("XDG_DATA_HOME", previous_xdg_data);
+        result
+    };
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+fn opencode_env_roots_must_be_absolute_like_the_landed_env_arms() {
+    // rm-248 rider: the OPENCODE_DATA_DIR / XDG_DATA_HOME arms of the
+    // opencode known-session-dir list must reject relative roots, matching
+    // the landed absolute-only env arms (history.rs, session_cache.rs,
+    // doctor.rs, pricing.rs). A relative root must not become a known
+    // session dir, and a set-but-relative XDG_DATA_HOME must not silently
+    // fall back to ~/.local/share.
+    let root = temp_root("agenttrace-opencode-env-arms");
+    let home = root.join("home");
+    fs::create_dir_all(&home).expect("create home");
+
+    with_opencode_env(
+        &home,
+        Some("rel/opencode/data"),
+        Some("rel/xdg/data"),
+        || {
+            let dirs = agenttrace_core::known_session_dirs();
+            let opencode: Vec<_> = dirs
+                .iter()
+                .filter(|dir| dir.name == "OpenCode")
+                .map(|dir| dir.path.clone())
+                .collect();
+            assert!(
+                opencode.iter().all(|path| path.is_absolute()),
+                "relative OPENCODE_DATA_DIR must be rejected, got: {opencode:?}"
+            );
+            assert!(
+                !opencode
+                    .iter()
+                    .any(|path| path.ends_with("rel/xdg/data/opencode/storage")),
+                "relative XDG_DATA_HOME must be rejected, got: {opencode:?}"
+            );
+            let fallback = home.join(".local/share/opencode/storage");
+            assert!(
+                !opencode.contains(&fallback),
+                "a set-but-relative XDG_DATA_HOME must not silently fall back to ~/.local/share, got: {opencode:?}"
+            );
+        },
+    );
+
+    // Positive controls: absolute forms are honored on both arms.
+    let abs_data = root.join("abs").join("data");
+    let abs_share = root.join("abs").join("share");
+    let abs_storage = abs_share.join("opencode").join("storage");
+    with_opencode_env(
+        &home,
+        Some(abs_data.to_str().unwrap()),
+        Some(abs_share.to_str().unwrap()),
+        || {
+            let dirs = agenttrace_core::known_session_dirs();
+            let opencode: Vec<_> = dirs
+                .iter()
+                .filter(|dir| dir.name == "OpenCode")
+                .map(|dir| dir.path.clone())
+                .collect();
+            assert!(
+                opencode.contains(&abs_data),
+                "absolute OPENCODE_DATA_DIR must be honored, got: {opencode:?}"
+            );
+            assert!(
+                opencode.contains(&abs_storage),
+                "absolute XDG_DATA_HOME must be honored, got: {opencode:?}"
+            );
+        },
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
