@@ -139,6 +139,12 @@ pub struct DataHealth {
     /// `skipped` so "Parse coverage N/M" is true for every range
     /// (pass-8 F8-2).
     pub out_of_scope: usize,
+    /// rm-440: discovered session files of zero bytes — the same class
+    /// doctor reports as `empty` (the parser never ran on them, so they
+    /// are neither `skipped` failures nor scope exclusions). 0-count-
+    /// clean: the key vanishes when the class is absent.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub empty_files: usize,
     pub cache_hits: usize,
     pub unknown_sources: usize,
     pub unknown_models: usize,
@@ -833,13 +839,22 @@ pub fn report_scope(
     }
 }
 
+/// rm-440: serde helper — the empty-file disclosure key appears only
+/// when the class is present, so healthy corpora serialize
+/// identically to pre-rm-440 output.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 pub fn data_health(sessions: &[Session], discovered: usize, cache_hits: usize) -> DataHealth {
     // Legacy semantics kept for callers without a LoadReport (TUI view,
     // explicit-path runs): parse failures and scope exclusions cannot be
     // separated, so they fold into `skipped` and out_of_scope stays 0.
     let parsed = sessions.len();
     let skipped = discovered.saturating_sub(parsed);
-    data_health_from_parts(sessions, discovered, skipped, 0, cache_hits, Vec::new())
+    // rm-440: this lane has no discovery report, so the empty-file
+    // class is unobservable here and stays 0.
+    data_health_from_parts(sessions, discovered, skipped, 0, 0, cache_hits, Vec::new())
 }
 
 /// Truthful coverage accounting from the discovery loader (pass-8
@@ -851,16 +866,21 @@ pub fn data_health_scoped(
     sessions: &[Session],
     discovered: usize,
     parse_failures: usize,
+    // rm-440: zero-byte session files — the loader's `empty`, so
+    // doctor's `empty` and the health block report one class, one
+    // count, for the same files.
+    empty: usize,
     cache_hits: usize,
     opencode_fork_excluded: usize,
     sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
 ) -> DataHealth {
     let parsed = sessions.len();
-    let out_of_scope = discovered.saturating_sub(parsed + parse_failures);
+    let out_of_scope = discovered.saturating_sub(parsed + parse_failures + empty);
     let mut health = data_health_from_parts(
         sessions,
         discovered,
         parse_failures,
+        empty,
         out_of_scope,
         cache_hits,
         sqlite_read_failures,
@@ -885,6 +905,7 @@ fn data_health_from_parts(
     sessions: &[Session],
     discovered: usize,
     skipped: usize,
+    empty: usize,
     out_of_scope: usize,
     cache_hits: usize,
     sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
@@ -943,6 +964,7 @@ fn data_health_from_parts(
         discovered,
         parsed,
         skipped,
+        empty_files: empty,
         out_of_scope,
         cache_hits,
         sqlite_read_failures,

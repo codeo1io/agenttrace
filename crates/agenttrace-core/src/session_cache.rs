@@ -964,6 +964,14 @@ pub struct SessionCache {
 struct CacheEntry {
     mod_time: i64,
     size: i64,
+    /// rm-1060: head+tail content digest captured at store time so the
+    /// freshness oracle can catch a same-size in-place rewrite (Claude
+    /// Code 2.1.296 transcript GC rewrites large transcripts in place)
+    /// that keeps mtime-ns and size identical. `None` on entries
+    /// persisted before the probe existed: the oracle re-parses once
+    /// rather than serve an unverified hit, then this field is stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_probe: Option<u64>,
     session: GoSession,
 }
 
@@ -971,6 +979,10 @@ struct CacheEntry {
 struct CacheEntryHeader {
     mod_time: i64,
     size: i64,
+    /// rm-1060: see `CacheEntry::content_probe`. Optional because
+    /// entries persisted before the probe existed have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_probe: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1863,6 +1875,46 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
+/// rm-1060: byte window the content probe digests at each end of a
+/// watched file. Files of twice this size or less are digested whole;
+/// edits confined to the middle of larger files are outside the probe's
+/// guarantee, and the doctor's fingerprint line states exactly that.
+pub(crate) const CONTENT_PROBE_WINDOW: u64 = 64 * 1024;
+
+/// rm-1060: digest of the first and last `CONTENT_PROBE_WINDOW` bytes
+/// of a watched file, with the byte count mixed in. The stat-only
+/// fingerprint cannot see an in-place rewrite that lands within
+/// timestamp granularity and holds the byte count (Claude Code 2.1.296
+/// `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC` rewrites large transcripts in
+/// place); this probe can, except for middle-only edits in files larger
+/// than the window. `None` only when the file cannot be opened or read,
+/// which the oracle treats as unverifiable (re-parse, never a stale hit).
+fn content_probe(path: &Path, len: u64) -> Option<u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    use std::io::{Read, Seek};
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u64(len);
+    let mut head = Vec::new();
+    file.by_ref()
+        .take(CONTENT_PROBE_WINDOW)
+        .read_to_end(&mut head)
+        .ok()?;
+    hasher.write(&head);
+    // Tail window: for files between one and two windows long the head
+    // read already sits inside it, so reading to the end is the tail;
+    // only larger files need the explicit seek.
+    if len > 2 * CONTENT_PROBE_WINDOW {
+        file.seek(std::io::SeekFrom::Start(len - CONTENT_PROBE_WINDOW))
+            .ok()?;
+    }
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    hasher.write(&tail);
+    Some(hasher.finish())
+}
+
 pub fn load_session_cache() -> SessionCache {
     let path = session_cache_path();
     sweep_orphaned_temps(&path, ORPHAN_TEMP_MAX_AGE);
@@ -2268,7 +2320,20 @@ pub(crate) fn cached_file_mod_time_if_fresh(
     let key = cache_key(path);
     let header = cached_entry_header(&key, cache)?;
     if header.size == metadata.len() as i64 && header.mod_time == file_mod_time_nanos(metadata) {
-        return Some(header.mod_time);
+        // rm-1060: stat-only equality cannot see a same-size in-place
+        // rewrite that lands within timestamp granularity (Claude Code
+        // 2.1.296 transcript GC rewrites large transcripts in place),
+        // so the content probe is required before serving the warm
+        // hit. A missing probe (an entry persisted before rm-1060) or
+        // an unreadable file is unverified: miss and re-parse rather
+        // than serve a possibly stale snapshot.
+        if header.content_probe.is_some()
+            && header.content_probe == content_probe(path, metadata.len())
+        {
+            return Some(header.mod_time);
+        }
+        delete_cached_session_key(&key, cache);
+        return None;
     }
     delete_cached_session_key(&key, cache);
     None
@@ -2278,6 +2343,7 @@ fn decode_cache_entry_header(value: &Value) -> Option<CacheEntryHeader> {
     Some(CacheEntryHeader {
         mod_time: value.get("mod_time")?.as_i64()?,
         size: value.get("size")?.as_i64()?,
+        content_probe: value.get("content_probe").and_then(Value::as_u64),
     })
 }
 
@@ -2286,6 +2352,7 @@ fn cached_entry_header(path: &str, cache: &mut SessionCache) -> Option<CacheEntr
         return Some(CacheEntryHeader {
             mod_time: entry.mod_time,
             size: entry.size,
+            content_probe: entry.content_probe,
         });
     }
     cache
@@ -2877,12 +2944,17 @@ pub fn store_session(
     cache: &mut SessionCache,
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(path)?;
+    // rm-1060: stamp the content probe at store time. If the file is
+    // unreadable here the entry stores `None` and the next warm scan
+    // re-parses once (unverified hits are never served).
+    let probe = content_probe(path, metadata.len());
     let key = cache_key(path);
     cache.entries.insert(
         key.clone(),
         CacheEntry {
             mod_time: file_mod_time_nanos(&metadata),
             size: metadata.len() as i64,
+            content_probe: probe,
             session: GoSession::from_session(session),
         },
     );
@@ -3234,7 +3306,13 @@ fn is_fresh(path: &Path, entry: &CacheEntryHeader) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
-    entry.size == metadata.len() as i64 && entry.mod_time == file_mod_time_nanos(&metadata)
+    if entry.size != metadata.len() as i64 || entry.mod_time != file_mod_time_nanos(&metadata) {
+        return false;
+    }
+    // rm-1060: same probe rule as `cached_file_mod_time_if_fresh` —
+    // the load lane must not serve what the scan lane would reject,
+    // so an unprobed (legacy) entry re-parses exactly once.
+    entry.content_probe.is_some() && entry.content_probe == content_probe(path, metadata.len())
 }
 
 #[cfg(unix)]
@@ -4471,6 +4549,9 @@ mod tests {
                     CacheEntry {
                         mod_time: 900_000 + i * 1_000,
                         size: 1,
+                        // rm-1060: not exercised here — probe-None is a
+                        // valid stored shape (pre-rm-1060 entries).
+                        content_probe: None,
                         session,
                     },
                 );
@@ -5997,6 +6078,171 @@ mod tests {
             Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
             None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
         }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_size_inplace_rewrite_invalidates_the_warm_entry() {
+        // rm-1060 red-first: an in-place rewrite that holds the byte
+        // count and lands within timestamp granularity is invisible to
+        // a stat-only fingerprint and served the stale parse forever.
+        // The cached header is stamped with the rewritten file's own
+        // mtime — exactly the state the cache holds when a rewrite
+        // lands inside the same nanosecond (the Claude Code 2.1.296
+        // transcript-GC rewrite class).
+        let _env = crate::test_env::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-probe-rewrite-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create sandbox");
+        let journal = root.join("warm.jsonl");
+        let original =
+            "{\"type\":\"user\",\"message\":\"first user turn\"}\n{\"type\":\"assistant\",\"message\":\"reply one\"}\n";
+        fs::write(&journal, original).expect("write journal");
+        let mut cache = SessionCache::default();
+        let session = crate::parse_file(&journal).expect("parse journal");
+        store_session(&journal, &session, &mut cache).expect("store");
+
+        // Same-size in-place rewrite: identical byte count, different
+        // head/tail content.
+        let rewritten = original.replace("reply one", "reply two");
+        assert_eq!(original.len(), rewritten.len(), "fixture must hold size");
+        fs::write(&journal, rewritten).expect("rewrite journal in place");
+        let metadata = fs::metadata(&journal).expect("stat journal");
+        assert_ne!(
+            content_probe(&journal, metadata.len()),
+            cache
+                .entries
+                .get(&cache_key(&journal))
+                .and_then(|entry| entry.content_probe),
+            "probe must detect the same-size rewrite"
+        );
+
+        // Simulate the rewrite landing within mtime granularity: the
+        // cached header holds the rewritten file's own stat.
+        let key = cache_key(&journal);
+        let entry = cache.entries.get_mut(&key).expect("warm entry");
+        entry.mod_time = file_mod_time_nanos(&metadata);
+
+        // Stat matches; only the content probe can reject the hit.
+        assert!(
+            cached_file_mod_time_if_fresh(&journal, &metadata, &mut cache).is_none(),
+            "same-size in-place rewrite must invalidate the warm entry"
+        );
+        assert!(
+            !cache.entries.contains_key(&key),
+            "stale entry must be deleted"
+        );
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_entry_without_probe_reparses_once() {
+        // rm-1060: entries persisted before the probe existed carry
+        // `content_probe: None`; the oracle treats a missing probe as
+        // unverified — one re-parse, then the stored probe makes the
+        // entry warm again. Legacy caches must never keep serving
+        // unprobed hits.
+        let _env = crate::test_env::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-probe-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create sandbox");
+        let journal = root.join("legacy.jsonl");
+        let original =
+            "{\"type\":\"user\",\"message\":\"first user turn\"}\n{\"type\":\"assistant\",\"message\":\"reply one\"}\n";
+        fs::write(&journal, original).expect("write journal");
+        let mut cache = SessionCache::default();
+        let session = crate::parse_file(&journal).expect("parse journal");
+        store_session(&journal, &session, &mut cache).expect("store");
+
+        // Strip the probe — the on-disk shape of every entry cached by
+        // a pre-rm-1060 binary.
+        let key = cache_key(&journal);
+        cache
+            .entries
+            .get_mut(&key)
+            .expect("warm entry")
+            .content_probe = None;
+        let metadata = fs::metadata(&journal).expect("stat journal");
+        assert!(
+            cached_file_mod_time_if_fresh(&journal, &metadata, &mut cache).is_none(),
+            "unverified legacy hit must miss"
+        );
+        assert!(
+            !cache.entries.contains_key(&key),
+            "legacy entry must re-parse"
+        );
+
+        // Re-store stamps the probe; the file is unchanged, so the
+        // next warm scan is a hit again (one re-parse total).
+        store_session(&journal, &session, &mut cache).expect("re-store");
+        let metadata = fs::metadata(&journal).expect("stat journal");
+        assert_eq!(
+            cached_file_mod_time_if_fresh(&journal, &metadata, &mut cache),
+            Some(file_mod_time_nanos(&metadata)),
+            "stamped entry must be warm again"
+        );
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_only_journal_stays_hit_stable() {
+        // rm-1060 regression guard: the common append-only journal
+        // must not take false invalidations — N warm scans over an
+        // unchanged file hit every time, and an append (size change)
+        // misses exactly once before warming again.
+        let _env = crate::test_env::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-probe-append-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create sandbox");
+        let journal = root.join("append.jsonl");
+        let original =
+            "{\"type\":\"user\",\"message\":\"first user turn\"}\n{\"type\":\"assistant\",\"message\":\"reply one\"}\n";
+        fs::write(&journal, original).expect("write journal");
+        let mut cache = SessionCache::default();
+        let session = crate::parse_file(&journal).expect("parse journal");
+        store_session(&journal, &session, &mut cache).expect("store");
+
+        for _ in 0..5 {
+            let metadata = fs::metadata(&journal).expect("stat journal");
+            assert!(
+                cached_file_mod_time_if_fresh(&journal, &metadata, &mut cache).is_some(),
+                "unchanged journal must stay a warm hit"
+            );
+        }
+
+        // Append: size changes, so stat alone misses; re-store warms.
+        fs::write(
+            &journal,
+            format!("{original}{{\"type\":\"user\",\"message\":\"second user turn\"}}\n"),
+        )
+        .expect("append journal");
+        let metadata = fs::metadata(&journal).expect("stat journal");
+        assert!(
+            cached_file_mod_time_if_fresh(&journal, &metadata, &mut cache).is_none(),
+            "append must invalidate"
+        );
+        let session = crate::parse_file(&journal).expect("re-parse journal");
+        store_session(&journal, &session, &mut cache).expect("re-store");
+        let metadata = fs::metadata(&journal).expect("stat journal");
+        assert!(
+            cached_file_mod_time_if_fresh(&journal, &metadata, &mut cache).is_some(),
+            "re-stored journal must be warm"
+        );
         drop(_env);
         let _ = fs::remove_dir_all(root);
     }

@@ -35,6 +35,11 @@ pub struct LoadReport {
     pub discovered: usize,
     pub parsed: usize,
     pub skipped: usize,
+    /// rm-440: discovered session files of zero bytes — their own
+    /// disclosed class, distinct from `skipped` (the parser never
+    /// ran on them) and from `parse_failures` (no attempt was made).
+    /// The data_health lane reports the same class as `empty_files`.
+    pub empty: usize,
     pub cache_hits: usize,
     /// rm-753: SQLite-backed ingestion failures (unreadable agent
     /// databases, dropped session rows) so the CLI can disclose
@@ -366,7 +371,15 @@ pub fn load_sessions_with_progress_from_cache_mode(
     type Slot = Option<(Option<Session>, Option<String>, bool)>;
     let mut slots: Vec<Slot> = Vec::with_capacity(files.len());
     let mut misses = Vec::new();
+    // rm-440: zero-byte session files never enter the warm or parse
+    // lanes — they are disclosed as `empty`, not counted as failures.
+    let mut empty = 0usize;
     for (index, path) in files.iter().enumerate() {
+        if crate::parser::is_empty_session_file(path) {
+            empty += 1;
+            slots.push(Some((None, None, true)));
+            continue;
+        }
         match cached_session(path, cache) {
             Some(session) => slots.push(Some((Some(session), None, true))),
             None => {
@@ -425,7 +438,11 @@ pub fn load_sessions_with_progress_from_cache_mode(
                     (Some(session), false) => {
                         let _ = store_session(&files[next], session, cache);
                     }
-                    (None, _) => {
+                    // rm-440: the warm lane stamped the 0-byte slot
+                    // cache-flagged with no session — not a failure, no
+                    // parse attempt, just progress.
+                    (None, true) => {}
+                    (None, false) => {
                         skipped += 1;
                         // rm-835: keep the first failure's parser message
                         // (discovery order) for the LoadReport.
@@ -529,7 +546,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
     }
     LoadReport {
         parsed: sessions.len(),
-        skipped: discovered.saturating_sub(live_parsed),
+        skipped: discovered.saturating_sub(live_parsed + empty),
+        empty,
         sessions,
         discovered,
         cache_hits,

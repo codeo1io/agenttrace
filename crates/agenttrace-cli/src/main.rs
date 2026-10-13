@@ -939,6 +939,7 @@ fn run() -> anyhow::Result<()> {
                 &sessions,
                 report.discovered,
                 report.skipped,
+                report.empty,
                 report.cache_hits,
                 report.opencode_fork_excluded,
                 report.sqlite.unreadable.clone(),
