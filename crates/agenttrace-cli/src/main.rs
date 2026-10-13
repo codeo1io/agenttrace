@@ -1902,6 +1902,7 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // -f json) stays clean; exit codes are unchanged.
     disclose_sqlite_ingest(&report.sqlite);
     disclose_unlinked_subagents(report.unlinked_subagents);
+    disclose_codex_state_db(&report.codex_state_db);
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
@@ -1984,6 +1985,35 @@ fn disclose_unlinked_subagents(count: usize) {
             "agenttrace: warning: {count} subagent transcript(s) have no parent session in the loaded corpus; they render as standalone rows and roll into no parent"
         );
     }
+}
+
+/// rm-1040: one stderr line when the Codex CLI's default-written state
+/// database (`~/.codex/state_*.sqlite`, newest version by filename,
+/// opened read-only) disagrees with the walked rollout corpus — threads
+/// the DB records that the walk missed, or walked files the DB does not
+/// record. Listing cross-check only: totals, counts and costs are the
+/// rollout walk's alone and stay unchanged. stdout stays clean; exit
+/// codes are unchanged.
+fn disclose_codex_state_db(report: &agenttrace_core::CodexStateDbReport) {
+    if !report.has_disagreement() {
+        return;
+    }
+    let path = report
+        .state_db_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    eprintln!(
+        "agenttrace: warning: Codex state DB cross-check ({}): {} thread(s) recorded in the state DB have no walked session file{}; {} walked Codex file(s) are not recorded in the state DB; listing cross-check only — session totals and costs are unchanged",
+        path,
+        report.db_only_threads,
+        if report.db_only_samples.is_empty() {
+            String::new()
+        } else {
+            format!(" (e.g. {})", report.db_only_samples.join(", "))
+        },
+        report.walk_only_files
+    );
 }
 
 /// rm-753: one stderr line per SQLite-backed ingestion failure — a

@@ -9,8 +9,26 @@
 use agenttrace_core::{parse_file, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 use std::path::PathBuf;
 
+/// rm-1040 rider: race-free fixture dirs under a per-process root.
+/// The previous implementation embedded `line!()` *inside* the helper, so
+/// every call in the process resolved the SAME temp path: parallel tests
+/// and repeat runs shared (and raced on) one directory. Each call now gets
+/// its own subdirectory under `at-otel-test-<pid>/`; the root is cleaned
+/// once at first use, so the /tmp footprint stays one directory per
+/// process (same as before) instead of one per call.
 fn fixture_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("at-otel-test-{}-{}", std::process::id(), line!()))
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    let root = ROOT.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!("at-otel-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    });
+    let dir = root.join(SEQ.fetch_add(1, Ordering::Relaxed).to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 fn write_session(file: &str, body: &str) -> PathBuf {

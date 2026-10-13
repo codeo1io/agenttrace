@@ -135,6 +135,11 @@ pub struct DoctorDirReport {
     pub symlink_target: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub failure_samples: Vec<String>,
+    /// rm-1040: one-line annotation for non-directory rows (the Codex
+    /// state-DB listing cross-check) whose counts the renderers cannot
+    /// express without lying about their meaning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -795,6 +800,13 @@ fn doctor_directories(
         let _ = save_session_cache(&mut cache);
     }
     dirs.extend(doctor_sqlite_directories(sessions, sqlite_ingest));
+    // rm-1040: the Codex state-DB listing cross-check rides the same
+    // file walk — one non-directory row disclosing both disagreement
+    // directions; its files/parsed/failed describe the DB's `threads`
+    // listing coverage, never session accounting.
+    if let Some(row) = doctor_codex_state_db_row(files) {
+        dirs.push(row);
+    }
     // SQLite-backed sessions (and, under `--demo`, the bundled corpus)
     // never flow through doctor_dir_report; fold their disclosure
     // counters in directly so every scanned session discloses
@@ -906,6 +918,7 @@ fn doctor_dir_report(
         cache_hits,
         symlink_target: symlink_target_of(path),
         failure_samples,
+        note: None,
     }
 }
 
@@ -987,9 +1000,43 @@ fn doctor_sqlite_directories(
             cache_hits: 0,
             symlink_target: symlink_target_of(&path),
             failure_samples,
+            note: None,
         });
     }
     dirs
+}
+
+/// rm-1040: one [`DoctorDirReport`] row for the Codex state-DB listing
+/// cross-check (see [`crate::codex_state_db`]). Present only when a state
+/// DB was actually consulted against this walk: `files`/`parsed`/`failed`
+/// describe the DB `threads` listing (threads total / walked-backed /
+/// walk-missing), `failure_samples` carries sample missing rollout
+/// filenames, and the note carries the walk-only direction. Never adds
+/// to session accounting.
+fn doctor_codex_state_db_row(files: &[PathBuf]) -> Option<DoctorDirReport> {
+    let report = crate::codex_state_db::codex_state_db_report(files);
+    if !report.consulted {
+        return None;
+    }
+    Some(DoctorDirReport {
+        name: "Codex state DB (listing cross-check)".to_string(),
+        path: report
+            .state_db_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        exists: true,
+        files: report.db_threads,
+        parsed: report.db_threads.saturating_sub(report.db_only_threads),
+        failed: report.db_only_threads,
+        cache_hits: 0,
+        symlink_target: None,
+        failure_samples: report.db_only_samples,
+        note: Some(format!(
+            "{} walked Codex file(s) not recorded in the state DB; listing cross-check only — session totals and costs are unchanged",
+            report.walk_only_files
+        )),
+    })
 }
 
 /// rm-858: POSIX single-quote a path for interpolation into a shell command
@@ -1255,6 +1302,9 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));
+        }
+        if let Some(note) = &dir.note {
+            out.push_str(&format!("    note: {note}\n"));
         }
     }
     out.push_str("\nRecommendations:\n");

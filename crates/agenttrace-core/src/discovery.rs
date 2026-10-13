@@ -72,6 +72,14 @@ pub struct LoadReport {
     /// count is disclosed so "SUBAGENTS 0" never reads as "no
     /// subagent work happened".
     pub unlinked_subagents: usize,
+    /// rm-1040: listing cross-check against the Codex CLI's default-written
+    /// state database (`~/.codex/state_*.sqlite`, newest version by
+    /// filename). Read-only consult; never contributes to totals or
+    /// costs — disagreement between the DB's `threads` table and the
+    /// walked rollout files is disclosed, not reconciled. `Default` =
+    /// not consulted (no Codex files in the corpus, or no resolvable
+    /// Codex home).
+    pub codex_state_db: Box<crate::codex_state_db::CodexStateDbReport>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -539,6 +547,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         first_parse_failure,
         parse_failure_paths,
         unlinked_subagents,
+        codex_state_db: Box::new(crate::codex_state_db::codex_state_db_report(&files)),
     }
 }
 

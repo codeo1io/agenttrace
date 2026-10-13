@@ -33,6 +33,8 @@
 
 One `agenttrace` binary provides both interfaces: run it without a report action to open the TUI, or pass flags such as `--sessions` and `--overview` for CLI output.
 
+When a Codex home is in the corpus, the CLI listing surfaces and `--doctor` also cross-check the Codex CLI's own state database (`~/.codex/state_*.sqlite`, newest version by filename, opened read-only) and disclose any disagreement between its thread index and the walked rollout files — a listing cross-check only; session totals and costs come from the parsed rollouts alone.
+
 ## Why agenttrace?
 
 AI coding agents now behave like small build systems: they call tools, retry, stall, and spend tokens while you only see the final answer.
