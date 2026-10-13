@@ -179,3 +179,35 @@ fn doctor_discloses_orphaned_subagents_zero_count_clean() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+#[test]
+fn doctor_hints_at_near_miss_cache_env_var() {
+    // rm-575: AGENTTRACE_CACHE_DIR is not read by anything (the fleet
+    // constraint pins that it never relocates), so an operator who sets
+    // it gets a silent no-op today. The doctor discloses the near-miss
+    // instead: name the var, point at AGENTTRACE_SESSION_CACHE_DIR.
+    let _env = lock_env();
+    let corpus = planted_clean_corpus("near-miss-env");
+    let previous = std::env::var_os("AGENTTRACE_CACHE_DIR");
+
+    std::env::set_var("AGENTTRACE_CACHE_DIR", "/tmp/does-not-relocate");
+    let text = render_doctor_report(Some(&corpus), false, "text").expect("render text");
+    assert!(
+        text.contains("AGENTTRACE_CACHE_DIR"),
+        "doctor must name the near-miss var when set: {text}"
+    );
+    assert!(
+        text.contains("AGENTTRACE_SESSION_CACHE_DIR"),
+        "the hint must point at the real var: {text}"
+    );
+
+    std::env::remove_var("AGENTTRACE_CACHE_DIR");
+    let clean = render_doctor_report(Some(&corpus), false, "text").expect("render text");
+    assert!(
+        !clean.contains("AGENTTRACE_CACHE_DIR"),
+        "unset var must not produce the hint: {clean}"
+    );
+
+    restore_env("AGENTTRACE_CACHE_DIR", previous);
+    let _ = fs::remove_dir_all(&corpus);
+}

@@ -372,7 +372,9 @@ Claude Code invokes the command on every prompt with a single-line JSON
 payload on stdin; agenttrace renders the status line and appends the raw
 payload to a local journal (`~/.cache/agenttrace/statusline.jsonl`, capped at
 10 MiB, oldest lines compacted away; set `AGENTTRACE_SESSION_CACHE_DIR` to
-relocate it). The parsed-session cache is bounded by entries and
+relocate it). The pricing catalog refreshed by `--update-pricing` and its
+provenance stamp honor the same variable — one env relocates every at-rest
+cache artifact, and `--clear-cache` sweeps them all. The parsed-session cache is bounded by entries and
 bytes; raise or lower the entry bound with `session_cache_entries` in
 the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
 variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
