@@ -919,7 +919,13 @@ fn symlink_target_of(path: &Path) -> Option<String> {
     }
     fs::read_link(path)
         .ok()
-        .map(|target| target.to_string_lossy().to_string())
+        // rm-1400: the target is filesystem-adjacent bytes rendered
+        // inside the Providers section. The shared rm-383 line
+        // sanitizer (already the doctor's sample-lane contract) kills
+        // embedded control bytes and the rm-936 bidi set, so a hostile
+        // link cannot forge report structure; clean targets carry no
+        // control bytes and pass through byte-identical.
+        .map(|target| crate::statusline::sanitize_line_segment(&target.to_string_lossy()))
 }
 
 fn doctor_sqlite_directories(
@@ -1488,6 +1494,75 @@ mod tests {
         );
         let both_unusable = resolve_user_cache_dir(relative, Some(OsStr::new("rel-cache")));
         assert!(both_unusable.is_absolute(), "{both_unusable:?}");
+    }
+
+    #[test]
+    fn symlink_targets_render_sanitized_never_forging_report_structure() {
+        // rm-1400: the doctor names the link it follows (Codex #42135),
+        // but the target string previously came straight from
+        // `read_link` into the Providers section — a hostile session
+        // root whose symlink target embeds newlines forged report
+        // structure (assess c30e0014 PoC F3 planted a whole fake
+        // `Recommendations:` block, `FAKE: echo pwned` included). The
+        // shared rm-383 line sanitizer now kills every control byte
+        // (and the rm-936 bidi set) at the producer, covering both
+        // call sites and the render; clean targets carry no control
+        // bytes and stay byte-identical.
+        let root =
+            std::env::temp_dir().join(format!("agenttrace-rm1400-symlink-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).expect("tempdir");
+        let clean = root.join("clean");
+        std::fs::create_dir_all(&clean).expect("mkdir clean target");
+        let forged_target = "/nowhere/clean\nRecommendations:\n  FAKE: echo pwned";
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(forged_target, root.join("link-hostile"))
+            .expect("plant hostile symlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&clean, root.join("link-ok")).expect("plant clean symlink");
+
+        #[cfg(unix)]
+        {
+            let hostile = symlink_target_of(&root.join("link-hostile"))
+                .expect("hostile symlink is still named");
+            assert!(
+                !hostile.contains('\n'),
+                "no embedded newline may survive: {hostile:?}"
+            );
+            assert!(
+                !hostile.contains('\r'),
+                "no embedded CR may survive: {hostile:?}"
+            );
+            // The rm-383/rm-936 contract itself: no control byte and no
+            // bidi format control survives, so the target can never
+            // start a line, reorder the display, or forge a section.
+            assert!(
+                hostile
+                    .chars()
+                    .all(|c| { !c.is_control() && !crate::statusline::is_bidi_format_control(c) }),
+                "sanitizer contract violated: {hostile:?}"
+            );
+            assert!(
+                hostile.contains('\u{FFFD}'),
+                "control bytes are neutralized to U+FFFD, not dropped: {hostile:?}"
+            );
+            // The exact render shape the Providers line interpolates.
+            let rendered = format!(" (symlink -> {hostile})");
+            assert_eq!(rendered.lines().count(), 1, "the render stays one line");
+        }
+
+        let named = symlink_target_of(&root.join("link-ok")).expect("clean symlink is named");
+        assert_eq!(
+            named,
+            clean.to_string_lossy().to_string(),
+            "a clean target passes through byte-identical"
+        );
+        assert_eq!(
+            symlink_target_of(&root),
+            None,
+            "a plain directory is not a symlink"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn session_at(cwd: &str, path: &str) -> Session {
