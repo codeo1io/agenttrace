@@ -289,11 +289,20 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             }
             return Ok(session);
         }
-        let probes: [JsonlProbe; 4] = [
+        let probes: [JsonlProbe; 5] = [
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
             parse_claude_transcript_jsonl,
             parse_copilot_session_jsonl,
+            // rm-715 (silent-zero closeout LEAD): last, with the
+            // strictest claim rule in the array — the gemini-cli >= 0.63
+            // chats record stream (metadata line carrying sessionId +
+            // projectHash, MessageRecords keyed by id). Every earlier
+            // probe keeps its claim precedence; this lane only picks up
+            // the shape nothing else recognizes, so the generic-lane
+            // fallback below stays byte-identical for every corpus it
+            // served before this run.
+            parse_gemini_chats_jsonl,
         ];
         if let Some(events) = probes.iter().find_map(|probe| probe(&objs)) {
             return finish(events);
@@ -5788,6 +5797,359 @@ fn parse_gemini_content_object(
     }
 }
 
+// rm-715 (silent-zero closeout LEAD): gemini-cli >= 0.63 records its
+// chats as an append-only record stream under
+// `~/.gemini/tmp/<hash>/chats/session-*.jsonl` (upstream
+// `chatRecordingService.ts`, tag v0.63.0), and that file is NOT the
+// API-response shape the object lane above reads: line 1 is a metadata
+// record (`sessionId`/`projectHash`/`startTime`), each turn is a
+// MessageRecord (`{id, timestamp, type: user|info|error|warning|gemini,
+// content, tokens?, model?, toolCalls?, thoughts?}`), and usage rides
+// the `tokens` carrier — a TokensSummary (input/output/cached/
+// thoughts/tool/total) the lane's usageMetadata/usage/tokenUsage key
+// list never reads, so every such session fell through to the generic
+// lane as a silent zero (PoC pre-edit: session-a → generic/0/$0.0000
+// while the same turn under the old usageMetadata shape priced at
+// 1500 tokens).
+//
+// The stream semantics mirror the upstream reader (`loadConversationRecord`
+// at tag v0.63.0; the `$patch` arms follow main-tip d1cc08a8, which
+// deprecated the `$set.messages` checkpoint in favor of patch records):
+// - a MessageRecord appends by `id`; `pushMessage` re-appends the FULL
+//   record when tokens/toolCalls attach (`recordMessageTokens`/
+//   `recordToolCalls`), so one id legitimately appears twice and the
+//   reader REPLACES in place — counting both appends would double-bill
+//   every tool-using turn;
+// - `{$set: {messages: [...]}}` is a compaction checkpoint: clear and
+//   rebuild from the array;
+// - `{$rewindTo: id}` truncates from that id onward (clears everything
+//   when the id is gone);
+// - `{$patch: {...}}` rewrites content/toolCalls in place, removes ids,
+//   and reorders — best-effort per the main reader.
+fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
+    if !is_gemini_chats_jsonl(objs) {
+        return None;
+    }
+    // Insertion-ordered id -> record map with in-place replacement,
+    // mirroring the reader's `messagesMap`.
+    let mut messages: Vec<(String, JsonObject)> = Vec::new();
+    let upsert =
+        |messages: &mut Vec<(String, JsonObject)>, id: String, record: JsonObject| match messages
+            .iter_mut()
+            .find(|(existing, _)| *existing == id)
+        {
+            Some(slot) => slot.1 = record,
+            None => messages.push((id, record)),
+        };
+    for obj in objs {
+        if let Some(set) = obj.get("$set").and_then(Value::as_object) {
+            if let Some(replacement) = set.get("messages").and_then(Value::as_array) {
+                messages.clear();
+                for record in replacement.iter().filter_map(Value::as_object) {
+                    if let Some(id) = gemini_chats_message_id(record) {
+                        upsert(&mut messages, id, record.clone());
+                    }
+                }
+            }
+            // Remaining $set fields (lastUpdated, summary, directories,
+            // memoryScratchpad) are metadata with no accounting effect.
+            continue;
+        }
+        if let Some(rewind_to) = obj.get("$rewindTo").and_then(Value::as_str) {
+            match messages.iter().position(|(id, _)| id == rewind_to) {
+                Some(at) => messages.truncate(at),
+                None => messages.clear(),
+            }
+            continue;
+        }
+        if let Some(patch) = obj.get("$patch").and_then(Value::as_object) {
+            gemini_chats_apply_patch(&mut messages, patch);
+            continue;
+        }
+        if let Some(id) = gemini_chats_message_id(obj) {
+            upsert(&mut messages, id, obj.clone());
+        }
+    }
+    let mut events = Vec::new();
+    for (_, record) in &messages {
+        gemini_chats_message_events(record, &mut events);
+    }
+    non_empty(events)
+}
+
+/// Claim rule: the 0.63 writer always leads with the metadata record
+/// (`sessionId` + `projectHash` + `kind` of main|subagent, no `type`),
+/// EVERY id-bearing record must map to the writer's type enum, and the
+/// file must hold at least one recognizable MessageRecord — so legacy
+/// generic journals that open with session metadata
+/// (`{"kind":"session",…}` carrying `assistant` role events) keep
+/// their generic-lane home, and an empty session (metadata line only)
+/// stays unclaimed exactly as before.
+fn is_gemini_chats_jsonl(objs: &[JsonObject]) -> bool {
+    let Some(first) = objs.first() else {
+        return false;
+    };
+    if string(first.get("sessionId")).is_none()
+        || string(first.get("projectHash")).is_none()
+        || first.contains_key("type")
+    {
+        return false;
+    }
+    // The 0.63 writer stamps `kind: main|subagent`
+    // (chatRecordingTypes.ts); a generic journal leading with session
+    // metadata (`{"kind":"session",…}`) does not.
+    match string(first.get("kind")).unwrap_or("") {
+        "main" | "subagent" => {}
+        _ => return false,
+    }
+    let mut message_records = 0;
+    for obj in objs {
+        if obj.contains_key("id") && !obj.contains_key("$set") && !obj.contains_key("$patch") {
+            match gemini_chats_message_id(obj) {
+                Some(_) => message_records += 1,
+                // A typed record outside the writer's enum (e.g. an
+                // `assistant` role event) is another producer's
+                // journal that happens to open with session metadata —
+                // refuse the claim, generic lane keeps it.
+                None => return false,
+            }
+        }
+    }
+    message_records > 0
+}
+
+/// A MessageRecord per the 0.63 writer: non-empty `id`, a `type` in the
+/// writer's enum, and a payload key. Returns the id (the reader's map
+/// key) when the record is one of ours.
+fn gemini_chats_message_id(record: &JsonObject) -> Option<String> {
+    let id = string(record.get("id")).filter(|id| !id.is_empty())?;
+    match string(record.get("type")).unwrap_or("") {
+        "user" | "info" | "error" | "warning" | "gemini" => {}
+        _ => return None,
+    }
+    let carries_payload = [
+        "content",
+        "toolCalls",
+        "thoughts",
+        "tokens",
+        "displayContent",
+    ]
+    .iter()
+    .any(|key| record.contains_key(*key));
+    if carries_payload {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+/// `{$patch: {...}}` best-effort (main-tip reader arms): id/content/
+/// toolCalls rewrite, `updates` list, `removeIds`, `orderIds` (untouched
+/// entries keep their current order first, then the patched ids in
+/// patch order).
+fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &JsonObject) {
+    if let Some(id) = string(patch.get("id")) {
+        gemini_chats_patch_one(messages, id, patch);
+    }
+    if let Some(updates) = patch.get("updates").and_then(Value::as_array) {
+        for update in updates.iter().filter_map(Value::as_object) {
+            if let Some(id) = string(update.get("id")) {
+                gemini_chats_patch_one(messages, id, update);
+            }
+        }
+    }
+    if let Some(remove_ids) = patch.get("removeIds").and_then(Value::as_array) {
+        for id in remove_ids.iter().filter_map(Value::as_str) {
+            messages.retain(|(existing, _)| existing != id);
+        }
+    }
+    if let Some(order_ids) = patch.get("orderIds").and_then(Value::as_array) {
+        let ordered: Vec<&str> = order_ids.iter().filter_map(Value::as_str).collect();
+        let mut untouched: Vec<(String, JsonObject)> = Vec::new();
+        let mut patched: Vec<(String, JsonObject)> = Vec::new();
+        for entry in messages.drain(..) {
+            if ordered.contains(&entry.0.as_str()) {
+                patched.push(entry);
+            } else {
+                untouched.push(entry);
+            }
+        }
+        patched.sort_by_key(|(id, _)| {
+            ordered
+                .iter()
+                .position(|ordered_id| *ordered_id == id.as_str())
+                .unwrap_or(usize::MAX)
+        });
+        messages.extend(untouched);
+        messages.extend(patched);
+    }
+}
+
+fn gemini_chats_patch_one(messages: &mut [(String, JsonObject)], id: &str, patch: &JsonObject) {
+    let Some(slot) = messages.iter_mut().find(|(existing, _)| existing == id) else {
+        return;
+    };
+    if let Some(content) = patch.get("content") {
+        slot.1.insert("content".to_string(), content.clone());
+    }
+    if let Some(tool_calls) = patch.get("toolCalls").and_then(Value::as_array) {
+        // The reader merges by call id (ToolCallPatch); replacing the
+        // whole array would drop calls the patch did not mention.
+        let calls = slot
+            .1
+            .entry("toolCalls".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(existing) = calls.as_array_mut() {
+            for call in tool_calls {
+                let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                let matched = if call_id.is_empty() {
+                    None
+                } else {
+                    existing.iter().position(|current| {
+                        current.get("id").and_then(Value::as_str) == Some(call_id)
+                    })
+                };
+                match matched {
+                    Some(at) => existing[at] = call.clone(),
+                    None => existing.push(call.clone()),
+                }
+            }
+        }
+    }
+}
+
+/// One final-state MessageRecord -> Events. `info`/`error`/`warning`
+/// records are UI-synthetic (compression notices, slash-command
+/// echoes) that never carry tokens (`recordMessageTokens` only fires on
+/// gemini records), so they produce no events. The `thoughts` array on
+/// a record is the display-layer thought-summary list — its TOKENS are
+/// the accounting truth (folded below); the summary text is not model
+/// reasoning output and is deliberately not counted as reasoning
+/// content.
+fn gemini_chats_message_events(record: &JsonObject, events: &mut Vec<Event>) {
+    let kind = string(record.get("type")).unwrap_or("");
+    if kind != "user" && kind != "gemini" {
+        return;
+    }
+    let ts = string(record.get("timestamp")).unwrap_or("");
+    let model = match string(record.get("model")) {
+        Some(model) if !model.is_empty() => model.to_string(),
+        // Model attribution unknown — the metadata record and user
+        // messages carry no model, and fabricating one would misprice:
+        // the session falls back to the unknown-model pricing basis.
+        _ => "unknown".to_string(),
+    };
+    let mut content: Vec<String> = Vec::new();
+    let mut reasoning: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    match record.get("content") {
+        // PartListUnion: bare string or array of Parts. Text parts
+        // flow the same way the object lane's part walk does — a
+        // `thought: true` part is reasoning, everything else content;
+        // inlineData/fileData parts carry no text to account.
+        Some(Value::String(text)) => content.push(text.clone()),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                match part {
+                    // PartListUnion: the array mixes bare strings with
+                    // Part objects.
+                    Value::String(text) => content.push(text.clone()),
+                    Value::Object(part) => {
+                        if let Some(text) = string(part.get("text")) {
+                            if part
+                                .get("thought")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                reasoning.push(text.to_string());
+                            } else {
+                                content.push(text.to_string());
+                            }
+                        }
+                        if let Some(call) = part.get("functionCall").and_then(Value::as_object) {
+                            gemini_chats_push_call(call, &mut tool_calls);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    // The dedicated toolCalls array (ToolCallRecord) is the 0.63 shape;
+    // result/displayName/status are display state — name and args are
+    // the accounting truth.
+    for call in record
+        .get("toolCalls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(call) = call.as_object() {
+            gemini_chats_push_call(call, &mut tool_calls);
+        }
+    }
+    if !content.is_empty() || !reasoning.is_empty() || !tool_calls.is_empty() {
+        events.push(Event {
+            role: if kind == "user" {
+                "user".to_string()
+            } else {
+                "assistant".to_string()
+            },
+            content: content.join("\n"),
+            reasoning: reasoning.join("\n"),
+            timestamp: ts.to_string(),
+            tool_calls,
+            model_used: model.clone(),
+            source_tool: "gemini_cli".to_string(),
+            ..Event::default()
+        });
+    }
+    // The TokensSummary carrier (rm-715). Producer semantics match the
+    // usageMetadata family: `output` (candidatesTokenCount) EXCLUDES
+    // `thoughts` (thoughtsTokenCount), so thoughts folds into
+    // output_tokens AND rides its own reasoning_tokens breakdown —
+    // the gemini_usage lane convention above. `cached` is
+    // cache_read_input_tokens. `tool` (toolUsePromptTokenCount) is a
+    // subset of `input` on the API, and `total` is the producer's sum
+    // of buckets already counted here — adding either would
+    // double-bill, so neither gets a bucket.
+    if let Some(tokens) = record.get("tokens").and_then(Value::as_object) {
+        let number = |key: &str| tokens.get(key).and_then(number_as_i64).unwrap_or(0);
+        let input = number("input");
+        let output = number("output");
+        let thoughts = number("thoughts");
+        let cached = number("cached");
+        let mut usage = BTreeMap::new();
+        usage.insert("input_tokens".to_string(), input);
+        usage.insert("output_tokens".to_string(), output.saturating_add(thoughts));
+        if thoughts > 0 {
+            usage.insert("reasoning_tokens".to_string(), thoughts);
+        }
+        usage.insert("cache_read_input_tokens".to_string(), cached);
+        events.push(Event {
+            role: "meta".to_string(),
+            usage,
+            timestamp: ts.to_string(),
+            model_used: model,
+            source_tool: "gemini_cli".to_string(),
+            ..Event::default()
+        });
+    }
+}
+
+fn gemini_chats_push_call(call: &Map<String, Value>, tool_calls: &mut Vec<ToolCall>) {
+    let name = string(call.get("name")).unwrap_or("").to_string();
+    let args = jsonish(call.get("args"));
+    if !name.is_empty() || !args.is_empty() {
+        tool_calls.push(ToolCall {
+            id: string(call.get("id")).unwrap_or("").to_string(),
+            name,
+            args,
+        });
+    }
+}
+
 #[derive(Debug)]
 struct OpenCodeRecord {
     path: PathBuf,
@@ -10588,4 +10950,188 @@ fn number_as_i64_counts_magnitude_clamps_on_the_disclosure_census() {
         Some(9_007_199_254_740_993i64)
     );
     assert_eq!(take_magnitude_clamp_count(), 0);
+}
+
+// ------------------------------------------------------------------
+// rm-715 (silent-zero closeout LEAD): gemini-cli >= 0.63 chats
+// record streams. Event-level semantics that the public Session
+// surface cannot observe live here; the metrics-level contracts
+// live in tests/gemini_chats_contract.rs.
+// ------------------------------------------------------------------
+
+#[cfg(test)]
+fn chats_objs(raw: &str) -> Vec<JsonObject> {
+    jsonl_objects(raw).collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+const CHATS_METADATA: &str = concat!(
+    r#"{"sessionId":"sess-a","projectHash":"h1","startTime":"2026-10-12T08:00:00.000Z","#,
+    r#""lastUpdated":"2026-10-12T08:01:00.000Z","kind":"main"}"#
+);
+
+#[test]
+fn gemini_chats_lane_claims_the_record_stream_and_replaces_reappends() {
+    let raw = format!(
+        "{CHATS_METADATA}\n{}",
+        concat!(
+            r#"{"id":"m-user-1","timestamp":"2026-10-12T08:00:01.000Z","type":"user","content":"hello gemini"}"#,
+            "\n",
+            r#"{"id":"m-gen-1","timestamp":"2026-10-12T08:00:05.000Z","type":"gemini","content":"hi there","model":"gemini-2.5-pro"}"#,
+            "\n",
+            r#"{"$set":{"lastUpdated":"2026-10-12T08:00:05.000Z"}}"#,
+            "\n",
+            r#"{"id":"m-gen-1","timestamp":"2026-10-12T08:00:05.000Z","type":"gemini","content":"hi there","model":"gemini-2.5-pro","tokens":{"input":1000,"output":200,"cached":300,"thoughts":0,"tool":0,"total":1500}}"#,
+            "\n",
+        )
+    );
+    let events =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("chats record stream claimed");
+    // Full-record re-append (tokens attach to the turn's own id)
+    // replaces in place: one user event, one assistant event, one
+    // usage event -- never a duplicate of the generation.
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].role, "user");
+    assert_eq!(events[0].content, "hello gemini");
+    assert_eq!(events[0].source_tool, "gemini_cli");
+    assert_eq!(events[1].role, "assistant");
+    assert_eq!(events[1].content, "hi there");
+    assert_eq!(events[1].model_used, "gemini-2.5-pro");
+    let usage = &events[2].usage;
+    assert_eq!(usage["input_tokens"], 1000);
+    assert_eq!(usage["output_tokens"], 200);
+    assert_eq!(usage["cache_read_input_tokens"], 300);
+    // `thoughts` == 0 must NOT mint a zero reasoning bucket; a
+    // present-but-zero summary stays indistinguishable from the
+    // usageMetadata family's absent key.
+    assert!(!usage.contains_key("reasoning_tokens"));
+}
+
+#[test]
+fn gemini_chats_detector_requires_metadata_plus_a_message_record() {
+    // Metadata only: unclaimed (the generic lane keeps the shape).
+    assert!(parse_gemini_chats_jsonl(&chats_objs(&format!("{CHATS_METADATA}\n"))).is_none());
+    // A claude transcript must NOT be claimed even if a line
+    // happens to carry a sessionId.
+    let claude = concat!(
+        r#"{"type":"user","sessionId":"not-chats","cwd":"/x","message":{"role":"user","content":"hi"},"timestamp":"2026-10-12T08:00:00Z"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":"yo"},"timestamp":"2026-10-12T08:00:02Z"}"#,
+        "\n",
+    );
+    assert!(parse_gemini_chats_jsonl(&chats_objs(claude)).is_none());
+    // An empty stream stays empty.
+    assert!(parse_gemini_chats_jsonl(&[]).is_none());
+}
+
+#[test]
+fn gemini_chats_patch_rewrites_content_and_merges_tool_calls() {
+    let raw = format!(
+        "{CHATS_METADATA}\n{}",
+        concat!(
+            r#"{"id":"m-g1","timestamp":"2026-10-12T09:00:03.000Z","type":"gemini","content":"original reply","model":"gemini-2.5-pro","toolCalls":[{"id":"tc-1","name":"read_file","args":{"path":"x.rs"}}]}"#,
+            "\n",
+            r#"{"$patch":{"id":"m-g1","content":"patched reply"}}"#,
+            "\n",
+            r#"{"$patch":{"id":"m-g1","toolCalls":[{"id":"tc-1","name":"read_file","args":{"path":"y.rs"}},{"id":"tc-2","name":"edit_file","args":{}}]}}"#,
+            "\n",
+        )
+    );
+    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("claimed");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].content, "patched reply",
+        "$patch rewrites content"
+    );
+    let calls = &events[0].tool_calls;
+    // Reader merge semantics (ToolCallPatch): the tc-1 entry is
+    // REPLACED in place, tc-2 appended -- never a doubled list.
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].id, "tc-1");
+    assert!(
+        calls[0].args.contains("y.rs"),
+        "matched call replaced, not appended"
+    );
+    assert_eq!(calls[1].name, "edit_file");
+}
+
+#[test]
+fn gemini_chats_order_ids_reorder_and_remove_ids_drop() {
+    let raw = format!(
+        "{CHATS_METADATA}\n{}",
+        concat!(
+            r#"{"id":"m-u1","timestamp":"2026-10-12T09:00:01.000Z","type":"user","content":"u1"}"#,
+            "\n",
+            r#"{"id":"m-g1","timestamp":"2026-10-12T09:00:03.000Z","type":"gemini","content":"g1","model":"gemini-2.5-pro"}"#,
+            "\n",
+            r#"{"id":"m-g2","timestamp":"2026-10-12T09:00:07.000Z","type":"gemini","content":"g2","model":"gemini-2.5-pro"}"#,
+            "\n",
+            r#"{"$patch":{"removeIds":["m-u1"],"orderIds":["m-g2","m-g1"]}}"#,
+            "\n",
+        )
+    );
+    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("claimed");
+    let content: Vec<&str> = events.iter().map(|e| e.content.as_str()).collect();
+    assert_eq!(
+        content,
+        vec!["g2", "g1"],
+        "removeIds drops m-u1; orderIds puts m-g2 first (patch order), untouched entries first otherwise"
+    );
+}
+
+#[test]
+fn gemini_chats_part_content_walks_text_thought_and_function_calls() {
+    let raw = format!(
+        "{CHATS_METADATA}\n{}",
+        concat!(
+            r#"{"id":"m-g1","timestamp":"2026-10-12T09:00:03.000Z","type":"gemini","content":["before",{"thought":true,"text":"inner deliberation"},"after",{"functionCall":{"name":"read_file","args":{"path":"x.rs"}}}],"model":"gemini-2.5-pro","tokens":{"input":10,"output":5,"cached":0,"thoughts":2,"tool":0,"total":17}}"#,
+            "\n",
+        )
+    );
+    let events = parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("claimed");
+    let assistant = events
+        .iter()
+        .find(|e| e.role == "assistant")
+        .expect("assistant event");
+    assert_eq!(assistant.content, "before\nafter");
+    assert_eq!(assistant.reasoning, "inner deliberation");
+    assert_eq!(assistant.tool_calls.len(), 1);
+    assert_eq!(assistant.tool_calls[0].name, "read_file");
+    // thoughts > 0 folds into output AND rides its own bucket.
+    let usage = events
+        .iter()
+        .find(|e| e.role == "meta")
+        .expect("usage event")
+        .usage
+        .clone();
+    assert_eq!(usage["output_tokens"], 7);
+    assert_eq!(usage["reasoning_tokens"], 2);
+}
+
+#[test]
+fn gemini_chats_lane_refuses_legacy_generic_metadata_journals() {
+    // rm-715 claim-rule regression guard: a legacy generic journal that
+    // happens to open with session metadata — kind:"session" (not the
+    // writer's main|subagent), assistant role events — must stay in the
+    // generic lane (discovery_contract
+    // rust_generic_jsonl_accepts_legacy_type_events_without_role pinned
+    // this shape before the chats lane existed).
+    let legacy = concat!(
+        r#"{"kind":"session","sessionId":"s1","projectHash":"p","startTime":"2026-05-03T10:00:00Z","lastUpdated":"2026-05-03T10:00:01Z"}"#,
+        "\n",
+        r#"{"type":"user","id":"u1","timestamp":"2026-05-03T10:00:00Z","content":["hello"]}"#,
+        "\n",
+        r#"{"type":"assistant","id":"a1","timestamp":"2026-05-03T10:00:01Z","content":"hi"}"#,
+        "\n",
+    );
+    assert!(parse_gemini_chats_jsonl(&chats_objs(legacy)).is_none());
+    // And the strict rule still claims the writer's own shape
+    // (kind:"main", gemini types only) — the same corpus arm A parses.
+    assert!(
+        parse_gemini_chats_jsonl(&chats_objs(&format!(
+            "{CHATS_METADATA}\n{}",
+            r#"{"id":"m-gen-1","timestamp":"2026-10-12T08:00:05.000Z","type":"gemini","content":"hi","model":"gemini-2.5-pro","tokens":{"input":10,"output":2,"cached":0,"thoughts":0,"tool":0,"total":12}}"#
+        )))
+        .is_some()
+    );
 }

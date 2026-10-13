@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 59 and the SQLite snapshot is schema 11; the
+The session cache is schema 62 and the SQLite snapshot is schema 11; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -373,7 +373,16 @@ upstream-#312 port fork-adjudicated, whose other arms were superseded
 by this tree's own landed lanes; minted 27 → 28 at the run's base
 8991144 and re-based at integration onto the advanced ceiling as
 58 → 59, one invalidation either way, conflict case
-963662941e3a40579e658a63f2b88da6)
+963662941e3a40579e658a63f2b88da6),
+and to 62 when gemini-cli >= 0.63 chats record streams began
+counting (run 4309a268 cycle 1, rm-715: the writer's append-only
+`~/.gemini/tmp/<hash>/chats/session-*.jsonl` journals carry usage on a
+`tokens` carrier — a TokensSummary appended to the turn's record —
+that the usageMetadata/usage/tokenUsage key list never read, so every
+such session served as a generic-lane silent zero while the same turn
+priced normally under the old API-response shape; minted 59 → 62
+above the fleet census frontier — origin's landed 60 and a sibling's
+uncommitted 61 — one invalidation either way)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

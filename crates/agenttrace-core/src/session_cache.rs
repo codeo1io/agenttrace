@@ -5,7 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 59;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 62;
+// Bumped 59 -> 62 (run 4309a268 cycle 1 'silent-zero closeout',
+// attempt 97c41efd @ base b798247, rm-715 LEAD): gemini-cli >= 0.63
+// chats record streams (~/.gemini/tmp/<hash>/chats/session-*.jsonl)
+// began counting — their usage rides a `tokens` carrier (a
+// TokensSummary) the usageMetadata/usage/tokenUsage key list never
+// read, so every such session served as a generic-lane silent zero;
+// a warm v59 entry keeps serving the zeros with matching fingerprints
+// (rm-230 convention: parser-semantics changes that alter reported
+// totals for unchanged files bump the schema so cached sessions
+// regenerate under corrected accounting). SEAM: this worktree's base
+// b798247 carried the landed 59 while origin landed 60 mid-run (run
+// e486dc1adb9b, merge ecf84dc) and sibling worktree run-b5affeade894
+// held an uncommitted 61 (rm-990) — 62 is minted at the fleet census
+// frontier as the lowest rung unique above it (e944a060/0a55a397
+// convention), one invalidation either way. Entries regenerate once
+// on next scan.
 // Bumped 58 -> 59 (integration of run e5653f52 cycle 2 'usage-accounting
 // truth (upstream #312 port, fork-adjudicated)', conflict case
 // 963662941e3a40579e658a63f2b88da6, candidate 3ad47fd @ base 8991144):
