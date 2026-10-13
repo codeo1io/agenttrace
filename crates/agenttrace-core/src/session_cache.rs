@@ -1255,10 +1255,12 @@ pub fn session_cache_path() -> PathBuf {
 /// Every at-rest artifact `--clear-cache` removes (rm-086), built
 /// from the same constructors that write the files: the parsed-metrics
 /// journal, the Hermes and OpenCode SQLite snapshots, the statusline
-/// capture journal, and the LiteLLM pricing catalog. The statusline
-/// and pricing files resolve through their own env-aware path
-/// constructors, so each artifact is cleared where it actually lives
-/// instead of assuming it sits beside the session cache.
+/// capture journal, and the LiteLLM pricing catalog with its
+/// provenance stamp. The statusline and pricing files resolve through
+/// their own env-aware path constructors (rm-575: the pricing pair now
+/// honors AGENTTRACE_SESSION_CACHE_DIR like the session cache), so
+/// each artifact is cleared where it actually lives instead of
+/// assuming it sits beside the session cache.
 /// `privacy_disclosure_lists_every_artifact` (tests) pins PRIVACY.md's
 /// disclosure table against these file names, so a new store cannot
 /// ship undisclosed.
@@ -1273,6 +1275,11 @@ pub(crate) fn cache_artifact_paths() -> Vec<PathBuf> {
         sqlite_snapshot_path("opencode"),
         crate::statusline::statusline_capture_path(),
         crate::pricing::pricing_cache_path(),
+        // Provenance stamp beside the pricing catalog (rm-167):
+        // --update-pricing always banks both, so the sweep removes
+        // both (rm-575) — leaving the stamp behind would strand a
+        // stale fetch date next to a fresh catalog.
+        crate::pricing::pricing_meta_cache_path(),
     ]
 }
 
@@ -4866,8 +4873,8 @@ mod tests {
             .collect();
         assert_eq!(
             paths.len(),
-            6,
-            "registry: session cache, its advisory lock, two sqlite snapshots, statusline journal, pricing catalog"
+            7,
+            "registry: session cache, its advisory lock, two sqlite snapshots, statusline journal, pricing catalog, pricing provenance stamp"
         );
         for path in &paths {
             fs::write(path, b"x").expect("write artifact");
@@ -4886,9 +4893,9 @@ mod tests {
         }
 
         // e2e through the real entry point: pin the env-aware roots
-        // (the session-cache dir — and XDG_CACHE_HOME too, because the
-        // pricing catalog resolves through user_cache_dir(), not through
-        // AGENTTRACE_SESSION_CACHE_DIR) and drive clear_session_cache(),
+        // (the session-cache dir — which relocates every artifact,
+        // pricing pair included, under rm-575 — and XDG_CACHE_HOME for
+        // the default-root constructors) and drive clear_session_cache(),
         // which composes the registry with the legacy sweep —
         // remove_cache_artifacts alone would not exercise
         // legacy_cache_artifact_paths() at all. Artifacts are written

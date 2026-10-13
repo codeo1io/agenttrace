@@ -521,7 +521,26 @@ fn pricing_source_for_catalog(
 }
 
 pub fn pricing_cache_path() -> PathBuf {
+    // rm-575: the pricing catalog joins the session cache's relocation
+    // contract — a non-empty AGENTTRACE_SESSION_CACHE_DIR moves
+    // pricing.json beside sessions.json, so one env relocates every
+    // at-rest artifact and an operator scrubbing a shared host leaves
+    // no pricing trail behind. The provenance stamp derives from this
+    // same path (pricing_meta_cache_path), so both move together. An
+    // empty value stays inert, matching the session cache's ladder.
+    if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
+        if !dir.as_os_str().is_empty() {
+            return dir.join("pricing.json");
+        }
+    }
     user_cache_dir().join("agenttrace").join("pricing.json")
+}
+
+/// Provenance stamp written beside the catalog (`pricing.meta.json`,
+/// rm-167). Derived from the catalog path so both always live
+/// together — wherever the catalog relocates, the stamp follows.
+pub fn pricing_meta_cache_path() -> PathBuf {
+    pricing_cache_path().with_extension("meta.json")
 }
 
 pub fn update_pricing() -> anyhow::Result<usize> {
@@ -1970,6 +1989,65 @@ fn user_cache_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn pricing_cache_path_honors_session_cache_env() {
+        // rm-575: the pricing catalog joins the session cache's
+        // relocation contract. A non-empty AGENTTRACE_SESSION_CACHE_DIR
+        // moves pricing.json beside sessions.json (and the provenance
+        // stamp derives from this same path, so both relocate
+        // together); an empty value stays inert exactly like the
+        // session cache's ladder. Pinning XDG/HOME keeps the
+        // default-root arms deterministic.
+        let _env = crate::test_env::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let previous_env = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        let previous_home = std::env::var_os("HOME");
+        let previous_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let default_root = root.join("home").join(".cache").join("agenttrace");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::remove_var("XDG_CACHE_HOME");
+
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &root);
+        assert_eq!(
+            pricing_cache_path(),
+            root.join("pricing.json"),
+            "set env must relocate the catalog beside the session cache"
+        );
+
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", "");
+        assert_eq!(
+            pricing_cache_path(),
+            default_root.join("pricing.json"),
+            "empty env must fall through to the default root, matching session_cache_path"
+        );
+
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        assert_eq!(
+            pricing_cache_path(),
+            default_root.join("pricing.json"),
+            "unset env must keep the default root"
+        );
+
+        match previous_env {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        match previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match previous_xdg {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn pricing_download_cap_rejects_oversized_bodies() {

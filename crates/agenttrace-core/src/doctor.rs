@@ -1122,6 +1122,17 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     out.push_str(&format!("Mode: {}\n", report.mode));
     out.push_str(&format!("Session files: {}\n", report.sessions));
     out.push_str(&format!("Cache: {}\n", report.cache_path));
+    // rm-575: AGENTTRACE_CACHE_DIR is not read by anything (the fleet
+    // constraint pins that it never relocates). A set value is almost
+    // certainly a typo for AGENTTRACE_SESSION_CACHE_DIR — disclose the
+    // near-miss instead of letting it silently no-op.
+    if let Some(value) = std::env::var_os("AGENTTRACE_CACHE_DIR") {
+        if !value.is_empty() {
+            out.push_str(
+                "  note: AGENTTRACE_CACHE_DIR is set but not used; did you mean AGENTTRACE_SESSION_CACHE_DIR? It does not relocate anything.\n",
+            );
+        }
+    }
     out.push_str(&format!(
         "  {} parsed session cache entries, {} reusable for this scan, {} cached directory listings\n",
         report.cache_entries, report.cached_valid, report.cache_dirs
