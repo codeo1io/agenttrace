@@ -107,6 +107,18 @@ fn write_string_array_json(out: &mut String, values: &[String], base_indent: usi
     out.push(']');
 }
 
+/// rm-985: the transcript-derived fields of the search text renderer are
+/// guarded at the render boundary — control bytes first (rm-383's
+/// sanitizer), then the spreadsheet-formula introducer neutralizer
+/// (`reports::guard_formula_cell`, the same family the CSV/markdown/
+/// sessions-TSV lanes use) — so a session named `=HYPERLINK(…)` or a
+/// match-evidence line beginning with an introducer carries the leading
+/// `'` paste-marker instead of re-arming when the pasted output lands in
+/// a spreadsheet. JSON output stays lossless by design.
+fn guarded_segment(value: &str) -> String {
+    crate::reports::guard_formula_cell(&crate::statusline::sanitize_line_segment(value))
+}
+
 pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
     let mut out = format!("Search results: {:?} ({})\n", query, results.len());
     if results.is_empty() {
@@ -119,32 +131,25 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         // the terminal (assess PoC: --search -f text emitted a verbatim
         // clipboard-write sequence from a crafted tool name). JSON output
         // escapes control bytes losslessly and is intentionally untouched.
+        // rm-985 rider: the same fields then take the formula-introducer
+        // guard (`guarded_segment`) so the text lane is paste-safe too.
         out.push_str(&format!(
             "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
-            crate::statusline::sanitize_line_segment(&result.name),
-            crate::statusline::sanitize_line_segment(&result.source_tool),
-            crate::statusline::sanitize_line_segment(&result.model),
+            guarded_segment(&result.name),
+            guarded_segment(&result.source_tool),
+            guarded_segment(&result.model),
             result.health,
             format_cost(result.cost),
             format_tokens(result.tokens)
         ));
         if !result.cwd.is_empty() {
-            out.push_str(&format!(
-                "  cwd: {}\n",
-                crate::statusline::sanitize_line_segment(&result.cwd)
-            ));
+            out.push_str(&format!("  cwd: {}\n", guarded_segment(&result.cwd)));
         }
         if !result.path.is_empty() {
-            out.push_str(&format!(
-                "  path: {}\n",
-                crate::statusline::sanitize_line_segment(&result.path)
-            ));
+            out.push_str(&format!("  path: {}\n", guarded_segment(&result.path)));
         }
         for item in &result.matches {
-            out.push_str(&format!(
-                "  - {}\n",
-                crate::statusline::sanitize_line_segment(item)
-            ));
+            out.push_str(&format!("  - {}\n", guarded_segment(item)));
         }
     }
     out
@@ -324,5 +329,48 @@ mod tests {
         );
         assert!(text.contains('\u{FFFD}'));
         assert!(text.contains("]52;c;aGVsbG8="));
+    }
+
+    #[test]
+    fn search_text_neutralizes_formula_introducers_in_every_field() {
+        // rm-985: assess fdaf8b39 F1 family — the search text lane renders
+        // session names, tool/model strings, cwd/path and match evidence;
+        // every one of them must arrive paste-safe (leading `'` marker on
+        // an introducer) while numeric-looking fields stay bare.
+        let result = SearchResult {
+            name: "=HYPERLINK(\"http://evil.example\",\"click-me\") please review".to_string(),
+            path: "/tmp/s.jsonl".to_string(),
+            cwd: "/tmp".to_string(),
+            source_tool: "pi".to_string(),
+            model: "@import('x')".to_string(),
+            health: 88,
+            cost: 0.0,
+            tokens: 42,
+            matches: vec!["+SUM(9)".to_string()],
+        };
+        let text = report_search_text(&[result], "probe");
+        assert!(
+            text.contains("\n'=HYPERLINK("),
+            "session name must carry the paste-marker: {text:?}"
+        );
+        assert!(text.contains("'@import"));
+        // The matches list is routed through the same guard: evidence
+        // items are `field: snippet`-shaped today (introducer can never
+        // sit at cell start), but the render boundary is pinned for any
+        // future item shape that leads with the payload itself.
+        assert!(text.contains("- '+SUM(9)"));
+        // The JSON lane stays lossless by design.
+        let json = report_search_json(&[SearchResult {
+            name: "=2+5|cmd".to_string(),
+            path: String::new(),
+            cwd: String::new(),
+            source_tool: String::new(),
+            model: String::new(),
+            health: 88,
+            cost: 0.0,
+            tokens: 42,
+            matches: Vec::new(),
+        }]);
+        assert!(json.contains("\"=2+5|cmd\""));
     }
 }
