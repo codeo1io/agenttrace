@@ -1,5 +1,5 @@
 use crate::{
-    cached_session, find_session_files, known_session_dirs, load_session_cache,
+    cached_session, find_session_files_reported, known_session_dirs, load_session_cache,
     load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
     SqliteIngestReport, VERSION,
 };
@@ -107,6 +107,24 @@ pub struct DoctorReport {
     /// database reads cleanly.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
+    /// rm-1047: present when a history_dir is resolved (`--history-dir`
+    /// > config file > `AGENTTRACE_HISTORY_DIR`): discovery — and this
+    /// report's inventory — is scoped to exactly that directory, so the
+    /// root table below shows the UNSCOPED registry with zero counts by
+    /// design, not a discovery failure. Absent on `-d`/`--demo` lanes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_dir_scope: Option<String>,
+    /// rm-249: directories the discovery walk could not read (mode
+    /// bits, ownership, vanished mid-walk) — disclosed with the io
+    /// error kind instead of narrowing the corpus silently.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_dirs: Vec<crate::discovery::UnreadableDir>,
+    /// rm-343: set when the session cache root is unusable (a FILE
+    /// where the root directory belongs, an uncreatable parent) — the
+    /// cache is disabled for this host and every run re-parses from
+    /// source; `None` when the cache root is fine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_disabled_reason: Option<String>,
     pub recommendations: Vec<String>,
 }
 
@@ -179,6 +197,9 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    /// rm-249: directories the discovery walk could not read, surfaced
+    /// as a doctor row instead of silent walk narrowing.
+    unreadable_dirs: Vec<crate::discovery::UnreadableDir>,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -206,16 +227,18 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            unreadable_dirs: Vec::new(),
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
+    let (files, opencode_fork_excluded, unreadable_dirs) = if dir.is_none() {
         find_reportable_session_files(None)
     } else {
-        (find_session_files(dir), 0)
+        let (files, unreadable_dirs) = find_session_files_reported(dir);
+        (files, 0, unreadable_dirs)
     };
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
@@ -231,7 +254,12 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     // databases suppressed as cross-file duplicates, so doctor
     // disclosures the dedup through one struct instead of a second
     // load lane.
-    let (sessions, sqlite_ingest) = if dir.is_none() {
+    // rm-1047: the HOME-anchored sqlite census is part of the UNSCOPED
+    // default view — under a resolved history_dir it stays out of the
+    // doctor inventory for the same reason the loader skips it.
+    let (sessions, sqlite_ingest) = if dir.is_none()
+        && crate::discovery::resolved_history_dir().is_none()
+    {
         load_sqlite_backed_sessions_reported(None)
     } else {
         (Vec::new(), SqliteIngestReport::default())
@@ -243,6 +271,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        unreadable_dirs,
     }
 }
 
@@ -254,6 +283,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        unreadable_dirs,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -332,6 +362,28 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
         ) + &doctor_deprecation_suffix(),
         sqlite_read_failures: sqlite_ingest.unreadable,
+        // rm-1047: only the UNSCOPED non-demo auto-discovery lane can
+        // be history_dir-scoped; `-d` is an explicit directory and
+        // `--demo` reads no operator state.
+        history_dir_scope: if !demo && dir.is_none() {
+            crate::discovery::resolved_history_dir().map(|dir| {
+                format!(
+                    "{} (discovery is scoped to exactly this directory; the root table below lists the unscoped registry with zero counts)",
+                    dir.display()
+                )
+            })
+        } else {
+            None
+        },
+        unreadable_dirs,
+        // rm-343: the doctor states the cache is DISABLED (with the
+        // reason) instead of rendering an empty-but-healthy row over a
+        // root that can never hold a journal.
+        cache_disabled_reason: if demo {
+            None
+        } else {
+            crate::session_cache::cache_root_disabled_reason()
+        },
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
@@ -622,9 +674,12 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
+fn find_reportable_session_files(
+    dir: Option<&Path>,
+) -> (Vec<PathBuf>, usize, Vec<crate::discovery::UnreadableDir>) {
     if dir.is_some() {
-        return (find_session_files(dir), 0);
+        let (files, unreadable) = crate::discovery::find_session_files_reported(dir);
+        return (files, 0, unreadable);
     }
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
@@ -640,12 +695,12 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
+    let (files, opencode_fork_excluded, unreadable_dirs) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, unreadable_dirs)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite
@@ -1120,8 +1175,40 @@ fn doctor_report_text(report: &DoctorReport) -> String {
     out.push_str("AGENTTRACE Doctor\n");
     out.push_str(&format!("Version: {}\n", report.version));
     out.push_str(&format!("Mode: {}\n", report.mode));
+    // rm-1047: say the corpus is scoped BEFORE any counts, so the zero
+    // counts below the scope read as "outside the pinned directory",
+    // not "discovery found nothing".
+    if let Some(scope) = &report.history_dir_scope {
+        out.push_str(&format!("History dir scoping: {scope}\n"));
+    }
     out.push_str(&format!("Session files: {}\n", report.sessions));
+    // rm-249: walk narrowing disclosed, non-fatally.
+    if !report.unreadable_dirs.is_empty() {
+        let samples: Vec<String> = report
+            .unreadable_dirs
+            .iter()
+            .take(3)
+            .map(|dir| format!("{} ({})", dir.path.display(), dir.reason))
+            .collect();
+        let more = report.unreadable_dirs.len().saturating_sub(samples.len());
+        let more_note = if more > 0 {
+            format!(", +{more} more")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "Unreadable directories: {} skipped during discovery: {}{}\n",
+            report.unreadable_dirs.len(),
+            samples.join("; "),
+            more_note
+        ));
+    }
     out.push_str(&format!("Cache: {}\n", report.cache_path));
+    // rm-343: disabled-with-reason, never a healthy-looking row of
+    // zeros over an unusable root.
+    if let Some(reason) = &report.cache_disabled_reason {
+        out.push_str(&format!("  disabled: {reason}\n"));
+    }
     out.push_str(&format!(
         "  {} parsed session cache entries, {} reusable for this scan, {} cached directory listings\n",
         report.cache_entries, report.cached_valid, report.cache_dirs

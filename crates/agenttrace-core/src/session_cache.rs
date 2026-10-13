@@ -1252,6 +1252,74 @@ pub fn session_cache_path() -> PathBuf {
     user_cache_dir().join("agenttrace").join("sessions.json")
 }
 
+/// rm-1047: the resolved history directory scoping disclosure and
+/// rm-343's cache-root checks both need the cache ROOT (the directory
+/// holding `sessions.json`), not the file path.
+pub fn session_cache_root() -> PathBuf {
+    session_cache_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The one-line warning the cache emits when its root cannot be
+/// created or used (rm-343) — a pure formatter so tests can pin the
+/// text without racing the once-per-process emitter.
+pub fn cache_root_warning_text(reason: &str, path: &Path) -> String {
+    format!(
+        "agenttrace: warning: session cache disabled ({reason}); every run re-parses sessions from source — fix or unset the cache root at {}",
+        path.display()
+    )
+}
+
+/// rm-343: every cache root failure mode in ONE place, warned at most
+/// once per process: a root that exists but is not a directory, a
+/// parent that refuses creation (permissions, ENOSPC), anything else
+/// `create_dir_all` can hit. Returns `true` when the root is usable.
+fn ensure_cache_root(parent: &Path) -> bool {
+    if let Err(err) = fs::create_dir_all(parent) {
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if WARNED.set(()).is_ok() {
+            eprintln!(
+                "{}",
+                cache_root_warning_text(&err.kind().to_string(), parent)
+            );
+        }
+        return false;
+    }
+    true
+}
+
+/// rm-343: the reason the cache at [`session_cache_root`] is unusable,
+/// for `--doctor`'s "disabled with reason" row — `None` when the root
+/// is (or can become) a usable directory. Probes with the same
+/// `create_dir_all` the save path performs, so the doctor's claim and
+/// the writer's behavior cannot drift.
+pub fn cache_root_disabled_reason() -> Option<String> {
+    let root = session_cache_root();
+    match fs::symlink_metadata(&root) {
+        Ok(meta) if meta.is_dir() => None,
+        Ok(_) => Some(format!(
+            "cache root {} exists but is not a directory — every run re-parses from source",
+            root.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir_all(&root)
+            .err()
+            .map(|err| {
+                format!(
+                    "cache root {} cannot be created: {}",
+                    root.display(),
+                    err.kind()
+                )
+            }),
+        Err(err) => Some(format!(
+            "cache root {} cannot be accessed: {}",
+            root.display(),
+            err.kind()
+        )),
+    }
+}
+
 /// Every at-rest artifact `--clear-cache` removes (rm-086), built
 /// from the same constructors that write the files: the parsed-metrics
 /// journal, the Hermes and OpenCode SQLite snapshots, the statusline
@@ -1341,7 +1409,12 @@ impl CacheFileLock {
     fn acquire(path: &Path) -> Option<Self> {
         let lock_path = lock_sibling(path);
         if let Some(parent) = lock_path.parent() {
-            let _ = fs::create_dir_all(parent);
+            // rm-343: an unusable cache root (a FILE where the root
+            // directory belongs, an unwritable parent) used to be
+            // swallowed here AND at every save site — the cache silently
+            // degraded to "re-parse everything, every run" with no
+            // message. Warn once per process instead.
+            ensure_cache_root(parent);
         }
         let token = format!(
             "{}-{}",
@@ -2744,7 +2817,11 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(parent) = cache.path.parent() {
-        fs::create_dir_all(parent)?;
+        // rm-343: same once-per-process disclosure as the lock arm —
+        // `let _ =` here used to eat the error entirely.
+        if !ensure_cache_root(parent) {
+            return Err(anyhow::anyhow!("session cache root is not usable"));
+        }
     }
     // rm-298 residual: save used to be a lockless read-modify-write —
     // two agenttrace processes that loaded the store before either

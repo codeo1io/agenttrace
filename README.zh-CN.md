@@ -154,7 +154,12 @@ stdin 关闭即退出；对非 UTF-8 的行回 `-32700`、对超过 1 MiB 传输
 
 标志放在 `mcp` 关键字之前：`-d/--dir` 与配置族（`--config`、
 `--history-dir`、`--pricing-file`）生效，其余无法作用于服务器的标志
-以退出码 2 拒绝，不再被静默丢弃（rm-781）。
+以退出码 2 拒绝，不再被静默丢弃（rm-781）。`--history-dir` 一经解析
+（标志 > 配置文件 > `AGENTTRACE_HISTORY_DIR`，rm-384）即把所有面向
+语料库的读取——会话发现、报告语料（`--sessions`/`--overview`/
+`--doctor`/`--search` 等）以及 HOME 锚定的 sqlite 盘点——全部限定在该
+目录内，而不只是派生 `history.json` 的写入路径（rm-1047）；生效时
+`--doctor` 会输出 `History dir scoping:` 一行说明。
 
 ```json
 {

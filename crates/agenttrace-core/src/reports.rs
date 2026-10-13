@@ -2193,6 +2193,43 @@ pub fn report_compare_with_language(
             session.health
         ));
     }
+    // rm-089: `-m <model>` on --compare PRICES the comparison against
+    // the named model — corpus tokens repriced at its catalog rates —
+    // instead of decorating the banner while the help text claims
+    // "cost-rate attribution". Semantics chosen and documented: -m is
+    // a reference pricing lens (never a session filter; that is
+    // `--model-filter`). `default` (the unset sentinel) keeps the
+    // legacy banner-only behavior.
+    if model != "default" {
+        let (input, output, cache_w, cache_r) = sessions.iter().fold(
+            (0i64, 0i64, 0i64, 0i64),
+            |(i, o, w, r), session| {
+                (
+                    i + session.metrics.tokens_input,
+                    o + session.metrics.tokens_output,
+                    w + session.metrics.tokens_cache_w,
+                    r + session.metrics.tokens_cache_r,
+                )
+            },
+        );
+        let reference = crate::pricing::token_cost(input, output, cache_w, cache_r, model, None);
+        let recorded: f64 = sessions.iter().map(|s| s.metrics.cost_estimated).sum();
+        out.push('\n');
+        out.push_str(&format!(
+            "  {}: {} — corpus repriced at its rates: {} (recorded: {} over {} session(s))\n",
+            language.t("Reference model", "参考模型"),
+            model,
+            format_cost(reference),
+            format_cost(recorded),
+            sessions.len()
+        ));
+        if crate::pricing::lookup_price(model) == crate::pricing::default_price() {
+            out.push_str(&format!(
+                "  {} (not in the catalog; priced at the default rates)\n",
+                language.t("note", "注")
+            ));
+        }
+    }
     out.push_str(&sep);
     out.push('\n');
     out
@@ -2239,6 +2276,42 @@ pub fn report_compare_json(sessions: &[Session]) -> String {
     }
     out.push(']');
     out
+}
+
+/// rm-089: `-m <model>` on `--compare -f json` wraps the legacy session
+/// array in a reference-pricing envelope (`reference_model`, the corpus
+/// repriced at that model's catalog rates, the recorded total, and the
+/// sessions array verbatim). Without `-m` (or with the `default`
+/// sentinel) the output is byte-identical to [`report_compare_json`] —
+/// the envelope is additive, and the text lane documents the same
+/// semantics.
+pub fn report_compare_json_with_model(sessions: &[Session], model: &str) -> String {
+    let array = report_compare_json(sessions);
+    if model == "default" {
+        return array;
+    }
+    let (input, output, cache_w, cache_r) = sessions.iter().fold(
+        (0i64, 0i64, 0i64, 0i64),
+        |(i, o, w, r), session| {
+            (
+                i + session.metrics.tokens_input,
+                o + session.metrics.tokens_output,
+                w + session.metrics.tokens_cache_w,
+                r + session.metrics.tokens_cache_r,
+            )
+        },
+    );
+    let reference = crate::pricing::token_cost(input, output, cache_w, cache_r, model, None);
+    let recorded: f64 = sessions.iter().map(|s| s.metrics.cost_estimated).sum();
+    let default_rates = crate::pricing::lookup_price(model) == crate::pricing::default_price();
+    format!(
+        "{{\n  \"reference_model\": {},\n  \"reference_cost_estimated\": {},\n  \"recorded_cost_estimated\": {},\n  \"default_rate_fallback\": {},\n  \"sessions\": {}\n}}",
+        json_string(model),
+        json_float(reference),
+        json_float(recorded),
+        default_rates,
+        array
+    )
 }
 
 fn health_emoji(health: i32) -> &'static str {

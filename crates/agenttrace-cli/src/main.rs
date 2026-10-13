@@ -6,7 +6,9 @@ use agenttrace_core::{
     matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter, parse_stdin_bytes,
     predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
     render_doctor_report, render_model_pricing_list, render_test_match,
-    render_waste_report_with_language, report_compare_json, report_json_with_language,
+    render_test_match_for_model, render_waste_report_with_language, report_compare_json,
+    report_compare_json_with_model, report_json_with_language, resolved_history_dir,
+    TEST_MATCH_PROBE_MODELS,
     report_overview_html_with_context, report_overview_json_with_context,
     report_overview_markdown_with_context, report_overview_svg_with_context,
     report_overview_text_with_context, report_search_json, report_search_text,
@@ -56,7 +58,10 @@ struct Args {
     /// the static file adapts to the viewer; bytes stay deterministic.
     #[arg(long = "card-theme", default_value = "auto")]
     card_theme: SvgCardTheme,
-    /// Session directory to scan instead of auto-discovered agent homes
+    /// Session directory to scan instead of auto-discovered agent
+    /// homes. rm-249: takes a directory — a file belongs on the
+    /// positional PATH; an unreadable/unreachable -d value exits 2
+    /// with the reason instead of scanning the default homes.
     #[arg(short = 'd', long = "dir")]
     dir: Option<String>,
     /// Compare the inspected session against the healthy-baseline
@@ -108,10 +113,13 @@ struct Args {
     /// (1-based) instead of the whole corpus.
     #[arg(long)]
     inspect: Option<usize>,
-    /// Reference model for `--compare` framing (cost-rate attribution
-    /// in the comparison narrative; not a session filter — see
-    /// `--model-filter`).
-    #[arg(short = 'm', default_value = "default")]
+    /// Reference model for `--compare` framing — rm-089: prices the
+    /// corpus at the named model's catalog rates (`-f json` wraps the
+    /// session array in a reference-pricing envelope; `default` keeps
+    /// the legacy banner-only behavior) and targets `--test-match` at
+    /// the named model's lookup. Not a session filter — see
+    /// `--model-filter`.
+    #[arg(short = 'm', value_name = "MODEL", default_value = "default")]
     model: String,
     /// Write the report to this path instead of stdout. Regular paths
     /// stage atomically through a temp sibling (rm-250); terminal
@@ -160,7 +168,11 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
     /// Override the history directory: highest precedence, then the
-    /// config files, then `AGENTTRACE_HISTORY_DIR` (rm-384).
+    /// config files, then `AGENTTRACE_HISTORY_DIR` (rm-384). rm-1047:
+    /// a resolved history dir scopes EVERY corpus-facing read —
+    /// discovery, the report loaders, and the session cache-keyed
+    /// sqlite lanes — to exactly that directory, not just the derived
+    /// `history.json` write path.
     #[arg(long, value_name = "PATH")]
     history_dir: Option<PathBuf>,
     /// Override the pricing override file: highest precedence, then
@@ -559,10 +571,29 @@ fn run() -> anyhow::Result<()> {
     }
 
     if args.test_match {
+        // rm-089: a positional session path is meaningless on the
+        // pricing-probe lane — it used to be silently ignored; now the
+        // conflict is an error naming the two real options.
+        if let Some(path) = args.path.as_deref() {
+            bail!(
+                "--test-match takes no positional session path (`{path}`) — it prints pricing-lookup probes; target one model with -m <model>, or use the path on a report lane",
+            );
+        }
         // rm-341: the early exits must honor -o and -f json like every
-        // other report action instead of ignoring both.
+        // other report action instead of ignoring both. rm-089: -m
+        // targets the named model's lookup instead of being swallowed
+        // by the fixed probe set.
         let out = if args.format == "json" {
-            render_test_match_json()?
+            // Bind the named model so the borrowed slice outlives the
+            // call — `&[args.model.as_str()]` inline would dangle.
+            let named = (args.model != "default").then(|| args.model.clone());
+            let models: Vec<&str> = named
+                .as_deref()
+                .map(|model| vec![model])
+                .unwrap_or_else(|| TEST_MATCH_PROBE_MODELS.to_vec());
+            render_test_match_json(&models)?
+        } else if args.model != "default" {
+            render_test_match_for_model(&args.model)
         } else {
             render_test_match()
         };
@@ -786,11 +817,25 @@ fn run() -> anyhow::Result<()> {
             _ => (matched, None),
         };
         let out = if args.format == "json" {
-            let compared =
-                serde_json::from_str::<serde_json::Value>(&report_compare_json(&sessions))
-                    .context("compare report serializes")?;
+            // rm-089: `-m <model>` wraps the sessions in the reference-
+            // pricing envelope; without it the shape is byte-identical
+            // to the legacy array-under-sessions object.
+            let value = if args.model != "default" {
+                serde_json::from_str::<serde_json::Value>(&report_compare_json_with_model(
+                    &sessions,
+                    &args.model,
+                ))
+                .context("compare report serializes")?
+            } else {
+                serde_json::json!({
+                    "sessions": serde_json::from_str::<serde_json::Value>(&report_compare_json(
+                        &sessions,
+                    ))
+                    .context("compare report serializes")?
+                })
+            };
             let value = attach_audit_coverage(
-                serde_json::json!({ "sessions": compared }),
+                value,
                 sessions.len(),
                 total_sessions,
                 excluded_reason,
@@ -1806,15 +1851,51 @@ fn validate_explicit_dir(dir_arg: Option<&str>) {
     let Some(dir) = dir_arg else {
         return;
     };
+    // rm-249: distinguish the three failure stories of a bad -d value
+    // instead of collapsing them — and never fall through to the
+    // default homes: the user asked for THIS corpus, so a bad value is
+    // a hard exit-2 error, not a silent substitution.
     let path = Path::new(dir);
-    if !path.exists() {
-        eprintln!("agenttrace: session directory does not exist: {dir}");
-        eprintln!("- inspect: the -d/--dir value; drop -d to auto-discover agent homes");
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            eprintln!(
+                "agenttrace: {}",
+                explicit_dir_rejection(dir, &err).expect("metadata err always rejects")
+            );
+            std::process::exit(2);
+        }
+    };
+    if !metadata.is_dir() {
+        eprintln!(
+            "agenttrace: -d/--dir takes a directory, not a file: {dir} \u{2014}\n    pass the file as the positional PATH instead"
+        );
         std::process::exit(2);
     }
-    if !path.is_dir() {
-        eprintln!("agenttrace: -d/--dir is not a directory: {dir}");
+    if let Err(err) = fs::read_dir(path) {
+        eprintln!(
+            "agenttrace: -d/--dir directory exists but cannot be read: {dir} ({}) \u{2014}\n    check permissions (ls -ld {dir}) and retry",
+            err.kind()
+        );
         std::process::exit(2);
+    }
+}
+
+/// rm-249: the message for a -d value whose metadata could not even be
+/// read — permission failures point at the mode bits, absence at the
+/// path itself. Pure string building so tests can pin each story.
+fn explicit_dir_rejection(dir: &str, err: &std::io::Error) -> Option<String> {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => Some(format!(
+            "-d/--dir does not exist: {dir} \u{2014}\n    inspect the -d/--dir value; drop -d to auto-discover agent homes"
+        )),
+        std::io::ErrorKind::PermissionDenied => Some(format!(
+            "-d/--dir cannot be accessed: {dir} (permission denied) \u{2014}\n    check permissions (ls -ld {dir}) and retry"
+        )),
+        _ => Some(format!(
+            "-d/--dir cannot be accessed: {dir} ({}) \u{2014}\n    inspect the -d/--dir value; drop -d to auto-discover agent homes",
+            err.kind()
+        )),
     }
 }
 
@@ -1902,13 +1983,42 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // -f json) stays clean; exit codes are unchanged.
     disclose_sqlite_ingest(&report.sqlite);
     disclose_unlinked_subagents(report.unlinked_subagents);
+    // rm-249: walk narrowing disclosed, non-fatal — the walk skipped
+    // directories it could not read; stdout stays clean.
+    disclose_unreadable_dirs(&report.unreadable_dirs);
     if sessions.is_empty() {
         if report.discovered == 0 {
             match args.dir.as_deref() {
-                Some(dir) => bail!(
-                    "No session files found in {dir} (directory exists but holds no session files)"
-                ),
+                Some(dir) => {
+                    // rm-249: an unreadable -d root is a corpus that
+                    // could not be read, not "no session files" — name
+                    // the reason and the permission hint.
+                    if let Some(root) = report
+                        .unreadable_dirs
+                        .iter()
+                        .find(|unreadable| Path::new(dir) == unreadable.path)
+                    {
+                        bail!(
+                            "No session files found in {dir}: the directory could not be read ({}) \u{2014} check permissions (ls -ld {dir}) and retry",
+                            root.reason
+                        );
+                    }
+                    bail!(
+                        "No session files found in {dir} (directory exists but holds no session files)"
+                    )
+                }
                 None => {
+                    // rm-1047: under a resolved history_dir the empty
+                    // corpus reads "the pinned directory holds no
+                    // session files" — not "no auto-discovered agent
+                    // home had anything", which would imply the whole
+                    // home corpus is empty.
+                    if let Some(scope) = resolved_history_dir() {
+                        bail!(
+                            "No session files found in history_dir {} \u{2014} discovery is scoped to exactly this directory (--history-dir/config/AGENTTRACE_HISTORY_DIR); drop the pin to scan the default agent homes",
+                            scope.display()
+                        );
+                    }
                     // rm-753: a discovered-but-unreadable agent database
                     // must not be reported as "nothing found" — the
                     // corpus is unreadable, not absent (P12/P14 used to
@@ -1984,6 +2094,35 @@ fn disclose_unlinked_subagents(count: usize) {
             "agenttrace: warning: {count} subagent transcript(s) have no parent session in the loaded corpus; they render as standalone rows and roll into no parent"
         );
     }
+}
+
+/// rm-249: one stderr line when the discovery walk skipped unreadable
+/// directories — the corpus may be narrower than the on-disk truth, and
+/// the report below must not read as the whole story. Non-fatal by
+/// design (a readable corpus still reports); stdout stays clean.
+fn disclose_unreadable_dirs(unreadable: &[agenttrace_core::UnreadableDir]) {
+    if unreadable.is_empty() {
+        return;
+    }
+    let listed = unreadable
+        .iter()
+        .take(3)
+        .map(|dir| format!("{} ({})", dir.path.display(), dir.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = unreadable.len().saturating_sub(3);
+    let more_note = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "agenttrace: warning: discovery skipped {} unreadable director{}: {}{} \u{2014} check permissions (ls -ld) if the corpus looks smaller than expected",
+        unreadable.len(),
+        if unreadable.len() == 1 { "y" } else { "ies" },
+        listed,
+        more_note
+    );
 }
 
 /// rm-753: one stderr line per SQLite-backed ingestion failure — a
@@ -2351,22 +2490,10 @@ fn write_output_resolved(requested: &Path, target: &Path, content: &str) -> anyh
     Ok(())
 }
 
-fn render_test_match_json() -> anyhow::Result<String> {
-    // rm-341: -f json support for the --test-match early exit; the same
-    // probe models as render_test_match, one row per model.
-    let models = [
-        "claude-sonnet-4-5-20250929",
-        "anthropic/claude-sonnet-4-6",
-        "vertex_ai/claude-opus-4-5@20251101",
-        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "openai/gpt-4.1",
-        "gpt-5.6",
-        "gpt-4.1-mini-2025-04-14",
-        "deepseek-chat",
-        "deepseek/deepseek-v3.2",
-        "gemini-2.5-pro",
-        "unknown-model-xyz",
-    ];
+fn render_test_match_json(models: &[&str]) -> anyhow::Result<String> {
+    // rm-341: -f json support for the --test-match early exit; rm-089:
+    // the probe set is the caller's — the fixed set by default, the
+    // `-m`-named model when one was given — one row per model.
     let rows: Vec<_> = models
         .iter()
         .map(|model| {

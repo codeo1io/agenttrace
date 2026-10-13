@@ -72,6 +72,48 @@ pub struct LoadReport {
     /// count is disclosed so "SUBAGENTS 0" never reads as "no
     /// subagent work happened".
     pub unlinked_subagents: usize,
+    /// rm-249: directories the discovery walk could not read (mode
+    /// bits, ownership, vanished mid-walk), in walk order. Empty when
+    /// the walk narrowed silently before this disclosure existed —
+    /// every unreadable directory used to shrink the corpus with no
+    /// message at all. Carried per-path with the io error kind so the
+    /// CLI can distinguish a permission problem from a vanished root
+    /// in its empty-corpus errors.
+    pub unreadable_dirs: Vec<UnreadableDir>,
+}
+
+/// rm-249: one unreadable directory encountered during the discovery
+/// walk — the path plus the `io::ErrorKind` text ("permission denied",
+/// "not a directory", …) so disclosures and empty-corpus errors can
+/// name the actual failure instead of "no session files found".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UnreadableDir {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl UnreadableDir {
+    fn from_err(dir: &Path, err: &std::io::Error) -> Self {
+        UnreadableDir {
+            path: dir.to_path_buf(),
+            reason: err.kind().to_string(),
+        }
+    }
+}
+
+/// rm-1047: the fully resolved history directory — the same rm-384
+/// cascade `history_path()` follows (`--history-dir` flag > config
+/// file > `AGENTTRACE_HISTORY_DIR` env), surfaced here because a
+/// pinned history_dir now scopes EVERY corpus-facing read (see
+/// [`discover_session_dirs`]), not just the derived `history.json`
+/// write path. Library consumers and the statusline host install the
+/// flag/file layers via [`crate::set_runtime_config`]; everyone else
+/// rides the env fallback.
+pub fn resolved_history_dir() -> Option<PathBuf> {
+    crate::runtime_config::get()
+        .history_dir
+        .clone()
+        .or_else(|| std::env::var_os("AGENTTRACE_HISTORY_DIR").map(PathBuf::from))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -205,6 +247,23 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
 }
 
 pub fn discover_session_dirs() -> Vec<PathBuf> {
+    // rm-1047: a resolved history_dir scopes discovery to exactly that
+    // directory — the corpus you asked for. Before this, a pinned
+    // history_dir (`--history-dir`, config file, or
+    // `AGENTTRACE_HISTORY_DIR`) steered ONLY the derived history.json
+    // write path while discovery walked every real agent home: a user
+    // pinning an empty history_dir to isolate a run got the entire
+    // home corpus parsed and cached (assess PoC: 30,769 sessions, 73s)
+    // with no disclosure. Scoped discovery returns the pinned root
+    // as the only root — nonexistent included, so a bad pin reads as
+    // an empty corpus with the walk's unreadable-dir disclosure
+    // naming the root, never as the unscoped home corpus. Explicit
+    // `-d <dir>` still wins per-call (it never reaches this fn), and
+    // the HOME-anchored sqlite lane is gated off under scoping (see
+    // the `dir.is_none()` sqlite arm in the load path).
+    if let Some(dir) = resolved_history_dir() {
+        return vec![dir];
+    }
     let mut seen = HashSet::new();
     let mut dirs = Vec::new();
     for candidate in known_session_dirs() {
@@ -292,18 +351,28 @@ fn canonical_identity(path: &Path) -> PathBuf {
 }
 
 pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
+    find_session_files_reported(dir).0
+}
+
+/// rm-249: [`find_session_files`] plus the walk's unreadable-directory
+/// disclosure, so `--doctor` (and any caller that surfaces the corpus)
+/// can report walk narrowing instead of rendering it as the whole
+/// corpus. The session-file half is byte-identical to
+/// [`find_session_files`].
+pub fn find_session_files_reported(dir: Option<&Path>) -> (Vec<PathBuf>, Vec<UnreadableDir>) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return vec![dir.to_path_buf()];
+            return (vec![dir.to_path_buf()], Vec::new());
         }
-        return collect_session_files(dir);
+        return collect_session_files_reported(dir);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
     let mut identities: HashSet<PathBuf> = HashSet::new();
     let mut all = Vec::new();
+    let mut unreadable = Vec::new();
     for dir in dirs {
-        for path in collect_session_files(&dir) {
+        for path in collect_session_files_with(&dir, &mut unreadable) {
             // rm-338: dedup across roots by canonical identity so roots
             // aliasing or nesting one canonical directory cannot
             // double-count a session file; listed paths are kept as-is.
@@ -317,7 +386,7 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
-    sort_paths_by_mod_time(all)
+    (sort_paths_by_mod_time(all), unreadable)
 }
 
 pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
@@ -354,7 +423,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (files, json_fork_excluded, unreadable_dirs) = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -469,7 +538,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     // retained, attributed children), but the lane-level sum keeps the
     // shared carrier honest for both lanes.
     let mut opencode_fork_excluded = json_fork_excluded;
-    if dir.is_none() {
+    // rm-1047: the HOME-anchored sqlite lane only runs on the UNSCOPED
+    // default view — under a resolved history_dir the corpus is exactly
+    // the pinned directory, and ~/.local/share sqlite databases are
+    // outside it, so folding them in would re-leak the home corpus the
+    // scoping just excluded.
+    if dir.is_none() && resolved_history_dir().is_none() {
         let (sqlite_sessions, ingest) =
             crate::sqlite_sessions::load_sqlite_backed_sessions_reported(options.since);
         sessions.extend(sqlite_sessions);
@@ -539,6 +613,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         first_parse_failure,
         parse_failure_paths,
         unlinked_subagents,
+        unreadable_dirs,
     }
 }
 
@@ -560,6 +635,18 @@ fn matches_filter(value: &str, filter: &str) -> bool {
 }
 
 pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
+    collect_session_files_reported(dir).0
+}
+
+/// rm-249: [`collect_session_files`] plus the walk's unreadable-
+/// directory disclosure (see [`UnreadableDir`]).
+pub fn collect_session_files_reported(dir: &Path) -> (Vec<PathBuf>, Vec<UnreadableDir>) {
+    let mut unreadable = Vec::new();
+    let files = collect_session_files_with(dir, &mut unreadable);
+    (files, unreadable)
+}
+
+fn collect_session_files_with(dir: &Path, unreadable: &mut Vec<UnreadableDir>) -> Vec<PathBuf> {
     if is_cline_task_dir(dir) {
         return vec![dir.to_path_buf()];
     }
@@ -574,6 +661,7 @@ pub fn collect_session_files(dir: &Path) -> Vec<PathBuf> {
         &mut items,
         &mut visited,
         &mut file_targets,
+        unreadable,
     );
     items.sort_by_key(|item| Reverse(item.1));
     items.into_iter().map(|item| item.0).collect()
@@ -583,25 +671,30 @@ pub(crate) fn find_session_files_cached(
     dir: Option<&Path>,
     cache: &mut SessionCache,
     skip_sqlite_backed: bool,
-) -> (Vec<PathBuf>, usize) {
+) -> (Vec<PathBuf>, usize, Vec<UnreadableDir>) {
     if let Some(dir) = dir {
         if is_cline_task_dir(dir) {
-            return (vec![dir.to_path_buf()], 0);
+            return (vec![dir.to_path_buf()], 0, Vec::new());
         }
         // rm-548: an explicitly requested directory keeps every file —
         // a forked copy loaded by explicit path still renders (the
         // exclusion is an aggregation rule, not a parse block).
-        return (collect_session_files_cached(dir, cache), 0);
+        // rm-249: the explicit-dir walk carries its unreadable dirs too
+        // (the root itself may be unreadable — read_dir Err — while the
+        // `is_dir()` validation upstream still passed).
+        let (files, unreadable) = collect_session_files_cached_reported(dir, cache);
+        return (files, 0, unreadable);
     }
     let dirs = discover_session_dirs();
     let cross_root = dirs.len() > 1;
     let mut seen = HashSet::new();
     let mut all = Vec::new();
+    let mut unreadable = Vec::new();
     for dir in dirs {
         if skip_sqlite_backed && skip_sqlite_backed_file_dir(&dir) {
             continue;
         }
-        for path in collect_session_files_cached(&dir, cache) {
+        for path in collect_session_files_cached_with(&dir, cache, &mut unreadable) {
             // rm-338: dedup across roots by canonical identity (see
             // canonical_identity); listed paths are kept as-is.
             let identity = if cross_root {
@@ -631,7 +724,11 @@ pub(crate) fn find_session_files_cached(
             true
         }
     });
-    (sort_paths_by_cache(all, cache), opencode_fork_excluded)
+    (
+        sort_paths_by_cache(all, cache),
+        opencode_fork_excluded,
+        unreadable,
+    )
 }
 
 /// rm-548: an opencode storage session doc (`.../storage/session/info/
@@ -695,7 +792,22 @@ pub(crate) fn opencode_session_fork_parent_cached(
     probed
 }
 
-fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<PathBuf> {
+/// rm-249: the cached walk plus the walk's unreadable-directory
+/// disclosure (see [`UnreadableDir`]).
+fn collect_session_files_cached_reported(
+    dir: &Path,
+    cache: &mut SessionCache,
+) -> (Vec<PathBuf>, Vec<UnreadableDir>) {
+    let mut unreadable = Vec::new();
+    let files = collect_session_files_cached_with(dir, cache, &mut unreadable);
+    (files, unreadable)
+}
+
+fn collect_session_files_cached_with(
+    dir: &Path,
+    cache: &mut SessionCache,
+    unreadable: &mut Vec<UnreadableDir>,
+) -> Vec<PathBuf> {
     if is_cline_task_dir(dir) {
         return vec![dir.to_path_buf()];
     }
@@ -711,6 +823,7 @@ fn collect_session_files_cached(dir: &Path, cache: &mut SessionCache) -> Vec<Pat
         &mut items,
         &mut visited,
         &mut file_targets,
+        unreadable,
     );
     sort_paths_by_cache(items, cache)
 }
@@ -833,6 +946,7 @@ fn walk_session_files_cached(
     items: &mut Vec<PathBuf>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    unreadable: &mut Vec<UnreadableDir>,
 ) {
     if depth > max_depth {
         return;
@@ -841,8 +955,14 @@ fn walk_session_files_cached(
         items.push(dir.to_path_buf());
         return;
     }
-    let Ok(metadata) = fs::metadata(dir) else {
-        return;
+    // rm-249: a metadata failure used to narrow the walk silently;
+    // record it so the disclosure channel can name the directory.
+    let metadata = match fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            unreadable.push(UnreadableDir::from_err(dir, &err));
+            return;
+        }
     };
     if !metadata.is_dir() {
         return;
@@ -876,14 +996,21 @@ fn walk_session_files_cached(
                     items,
                     visited,
                     file_targets,
+                    unreadable,
                 );
             }
         }
         return;
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            // rm-249: record the narrowed directory instead of the
+            // silent `return` (mode bits, ownership, vanished root).
+            unreadable.push(UnreadableDir::from_err(dir, &err));
+            return;
+        }
     };
     let mut files = Vec::new();
     let mut dirs = Vec::new();
@@ -948,6 +1075,7 @@ fn walk_session_files_cached(
             items,
             visited,
             file_targets,
+            unreadable,
         );
     }
 }
@@ -959,12 +1087,18 @@ fn walk_session_files(
     items: &mut Vec<(PathBuf, SystemTime)>,
     visited: &mut SymlinkTargets,
     file_targets: &mut SessionFileTargets,
+    unreadable: &mut Vec<UnreadableDir>,
 ) {
     if depth > max_depth {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            // rm-249: same disclosure as the cached walk.
+            unreadable.push(UnreadableDir::from_err(dir, &err));
+            return;
+        }
     };
     // rm-597 review fix: collect candidates first and admit them in
     // sorted order, mirroring the cached walk (files.sort() before the
@@ -991,7 +1125,15 @@ fn walk_session_files(
             if !visited.admit(&path) {
                 continue;
             }
-            walk_session_files(&path, depth + 1, max_depth, items, visited, file_targets);
+            walk_session_files(
+                &path,
+                depth + 1,
+                max_depth,
+                items,
+                visited,
+                file_targets,
+                unreadable,
+            );
             continue;
         }
         let name = entry.file_name();

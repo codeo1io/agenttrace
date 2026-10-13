@@ -49,7 +49,7 @@ pub fn pricing_override_status() -> &'static PricingOverrideStatus {
     PRICING_OVERRIDE_STATUS.get_or_init(|| PricingOverrideStatus::NotRequested)
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
 pub struct Price {
     pub input: f64,
     pub output: f64,
@@ -601,20 +601,38 @@ pub fn render_model_pricing_list() -> String {
 }
 
 pub fn render_test_match() -> String {
+    render_test_match_probes(TEST_MATCH_PROBE_MODELS)
+}
+
+/// The fixed probe set `--test-match` prints when no model is named
+/// (rm-089 made the set targetable by `-m`); public so the CLI's
+/// `-f json` lane prints the same rows.
+pub const TEST_MATCH_PROBE_MODELS: &[&str] = &[
+    "claude-sonnet-4-5-20250929",
+    "anthropic/claude-sonnet-4-6",
+    "vertex_ai/claude-opus-4-5@20251101",
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "openai/gpt-4.1",
+    "gpt-5.6",
+    "gpt-4.1-mini-2025-04-14",
+    "deepseek-chat",
+    "deepseek/deepseek-v3.2",
+    "gemini-2.5-pro",
+    "unknown-model-xyz",
+];
+
+/// rm-089: `-m <model> --test-match` targets the named model's lookup
+/// — the flag's evident purpose on that lane — instead of being
+/// swallowed by the fixed probe set. Same rendering as
+/// [`render_test_match`], one row (plus its flex arm) for the named
+/// model; the `-m` help documents both lanes' semantics.
+pub fn render_test_match_for_model(model: &str) -> String {
+    render_test_match_probes(&[model])
+}
+
+fn render_test_match_probes(models: &[&str]) -> String {
     let mut out = format!("Pricing: {}\n\n", pricing_source());
-    for model in [
-        "claude-sonnet-4-5-20250929",
-        "anthropic/claude-sonnet-4-6",
-        "vertex_ai/claude-opus-4-5@20251101",
-        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "openai/gpt-4.1",
-        "gpt-5.6",
-        "gpt-4.1-mini-2025-04-14",
-        "deepseek-chat",
-        "deepseek/deepseek-v3.2",
-        "gemini-2.5-pro",
-        "unknown-model-xyz",
-    ] {
+    for model in models {
         let p = lookup_price(model);
         out.push_str(&format!(
             "  {:<50} → in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",

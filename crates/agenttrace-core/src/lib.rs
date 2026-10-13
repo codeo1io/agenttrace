@@ -37,10 +37,11 @@ pub use filters::{
 };
 
 pub use discovery::{
-    collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
-    load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
-    KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
+    collect_session_files, collect_session_files_reported, discover_session_dirs,
+    find_session_files, find_session_files_reported, known_session_dirs, load_sessions_from_dir,
+    load_sessions_with_options, load_sessions_with_progress, load_sessions_with_progress_from_cache,
+    load_sessions_with_progress_from_cache_mode, resolved_history_dir, KnownSessionDir,
+    LoadOptions, LoadProgress, LoadReport, UnreadableDir,
 };
 pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
 pub use governance::{
@@ -61,11 +62,12 @@ pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
     list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
+    pricing_source_for, render_model_pricing_list, render_test_match, render_test_match_for_model,
+    update_pricing, Price, TEST_MATCH_PROBE_MODELS,
 };
 pub use reports::{
-    add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
-    report_json, report_json_with_language, report_overview_html,
+    add_baseline_comparison, report_compare, report_compare_json, report_compare_json_with_model,
+    report_compare_with_language, report_json, report_json_with_language, report_overview_html,
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,
@@ -78,11 +80,11 @@ pub use runtime_config::{
 };
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
-    cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
-    load_cached_sessions_from_cache, load_session_cache, save_session_cache,
-    session_cache_entries_source, session_cache_path, store_session, SessionCache,
-    MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
-    MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION,
+    cache_root_disabled_reason, cache_root_warning_text, cached_session, clear_session_cache,
+    effective_session_cache_entries, load_cached_sessions, load_cached_sessions_from_cache,
+    load_session_cache, save_session_cache, session_cache_entries_source, session_cache_path,
+    store_session, SessionCache, MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES,
+    MAX_SESSION_CACHE_ENTRIES, MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION,
 };
 pub use sqlite_sessions::{
     load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported, skip_sqlite_backed_file_dir,
