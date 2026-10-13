@@ -457,6 +457,49 @@ fails when the README table drifts from the binary's actual flag count
 | `--include-history` |  | Merge preserved-history sessions into the view (offline or retained-history analysis); the interactive and utility lanes reject the flag loudly |
 | `-h, --help` |  | Print help |
 
+### Auto-discovered session roots
+
+Without `-d/--dir`, agenttrace scans every auto-discovered agent home
+below (transparency contract rm-1022: this table is pinned to
+discovery's declared roots by
+`crates/agenttrace-core/tests/docs_discovery_roots_contract.rs`, so a
+newly registered root cannot ship undocumented). `~` is your home
+directory; missing directories are simply skipped.
+
+| Source | Root |
+| --- | --- |
+| Hermes Agent | `~/.hermes/sessions` |
+| Codex CLI | `~/.codex/sessions` |
+| Codex CLI (archived) | `~/.codex/archived_sessions` |
+| Gemini CLI | `~/.gemini/tmp` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/brain` |
+| Antigravity CLI (conversations) | `~/.gemini/antigravity-cli/conversations` |
+| Antigravity (conversations) | `~/.gemini/antigravity/conversations` |
+| Antigravity IDE (conversations) | `~/.gemini/antigravity-ide/conversations` |
+| Antigravity backup (conversations) | `~/.gemini/antigravity-backup/conversations` |
+| Antigravity config (conversations) | `~/.config/antigravity/conversations` |
+| Claude Code transcripts | `~/.claude/transcripts` |
+| Qwen Code | `~/.qwen/projects` |
+| Claude Code | `~/.claude/projects` |
+| WorkBuddy | `~/.workbuddy/projects` |
+| Cursor | `~/.cursor/projects` |
+| GitHub Copilot CLI | `~/.copilot/session-state` |
+| GitHub Copilot CLI (OTEL) | `~/.copilot/otel` |
+| Kimi CLI | `~/.kimi/sessions` |
+| OpenCode | `~/.local/share/opencode/storage` |
+| OpenCode (macOS) | `~/Library/Application Support/opencode/storage` |
+| Cline (VS Code) | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` |
+
+Relocations honored at scan time: `CODEX_HOME` (Codex sessions and
+archived sessions), `CLAUDE_CONFIG_DIR` (Claude Code transcripts and
+projects), `XDG_CONFIG_HOME` (Antigravity config and Cline),
+`XDG_DATA_HOME` / `OPENCODE_DATA_DIR` (OpenCode). Pi-family homes are
+enumerated structurally (every `~/.pi`, `~/.omp`, `~/.senpi`, `~/.omo`,
+`~/.config/pi` root child carrying a `sessions/` directory registers —
+including fork-relocated agent dirs), so they have no fixed rows here.
+Anything outside these roots is reachable only through the explicit
+`-d/--dir` escape.
+
 ## What you get
 
 | Need | agenttrace gives you |

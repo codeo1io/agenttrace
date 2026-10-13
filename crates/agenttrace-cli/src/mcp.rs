@@ -103,6 +103,16 @@ const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2026-07-28", "2025-11-25", "202
 /// above: raise it only with a reason.
 const MCP_INPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// rm-1025: the oversized-line refusal text is DERIVED from
+/// [`MCP_INPUT_MAX_BYTES`], not hand-written — a cap change must never
+/// leave the user-facing message stating a stale numeral.
+fn oversized_line_message() -> String {
+    format!(
+        "Invalid Request: message line exceeds the {}-byte transport cap and was discarded",
+        MCP_INPUT_MAX_BYTES
+    )
+}
+
 /// The `range` labels [`TimeRange::parse`] actually enforces
 /// (agenttrace-core insights.rs) — the tools' `inputSchema` enum and
 /// the `-32602` message list this exact set, locked by the
@@ -155,11 +165,7 @@ pub fn serve(root: Option<&Path>) -> anyhow::Result<()> {
                 // bytes.
                 emit(
                     &mut stdout,
-                    &error_response(
-                        None,
-                        CODE_INVALID_REQUEST,
-                        "Invalid Request: message line exceeds the 1048576-byte transport cap and was discarded",
-                    ),
+                    &error_response(None, CODE_INVALID_REQUEST, &oversized_line_message()),
                 )?;
                 continue;
             }
@@ -761,4 +767,27 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> String {
         json!({ "code": code, "message": message }),
     );
     Value::Object(object).to_string()
+}
+
+#[cfg(test)]
+mod rm_1025_tests {
+    //! rm-1025 (silent-zero closeout rider): the refusal text must
+    //! track the constant, not a hand-typed numeral. If this test
+    //! fails, the message and the enforced cap have drifted apart.
+    use super::*;
+
+    #[test]
+    fn oversized_line_message_tracks_the_constant() {
+        let message = oversized_line_message();
+        assert_eq!(
+            message,
+            format!(
+                "Invalid Request: message line exceeds the {MCP_INPUT_MAX_BYTES}-byte transport cap and was discarded"
+            )
+        );
+        // The numeral itself renders (today 1048576); asserting the
+        // formatted value, not a re-typed literal, is what makes the
+        // test fail loudly if someone re-hardcodes the string.
+        assert!(message.contains(&MCP_INPUT_MAX_BYTES.to_string()));
+    }
 }

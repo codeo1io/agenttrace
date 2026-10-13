@@ -170,6 +170,46 @@ stdin 关闭即退出；对非 UTF-8 的行回 `-32700`、对超过 1 MiB 传输
 [docs/guides/mcp-server.md](docs/guides/mcp-server.md)（英文）。该关键字
 与 `--mcp-governance` 报告过滤标志无关。
 
+## 自动发现的会话根目录
+
+不传 `-d/--dir` 时，agenttrace 会扫描下列所有自动发现的 Agent 主目录
+（透明度契约 rm-1022：本表由
+`crates/agenttrace-core/tests/docs_discovery_roots_contract.rs` 钉在
+discovery 声明的根目录上，新注册的根目录无法绕过文档落地）。`~` 指
+你的主目录；不存在的目录会被直接跳过。
+
+| 来源 | 根目录 |
+| --- | --- |
+| Hermes Agent | `~/.hermes/sessions` |
+| Codex CLI | `~/.codex/sessions` |
+| Codex CLI（归档） | `~/.codex/archived_sessions` |
+| Gemini CLI | `~/.gemini/tmp` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/brain` |
+| Antigravity CLI（对话） | `~/.gemini/antigravity-cli/conversations` |
+| Antigravity（对话） | `~/.gemini/antigravity/conversations` |
+| Antigravity IDE（对话） | `~/.gemini/antigravity-ide/conversations` |
+| Antigravity 备份（对话） | `~/.gemini/antigravity-backup/conversations` |
+| Antigravity 配置（对话） | `~/.config/antigravity/conversations` |
+| Claude Code 转写 | `~/.claude/transcripts` |
+| Qwen Code | `~/.qwen/projects` |
+| Claude Code | `~/.claude/projects` |
+| WorkBuddy | `~/.workbuddy/projects` |
+| Cursor | `~/.cursor/projects` |
+| GitHub Copilot CLI | `~/.copilot/session-state` |
+| GitHub Copilot CLI（OTEL） | `~/.copilot/otel` |
+| Kimi CLI | `~/.kimi/sessions` |
+| OpenCode | `~/.local/share/opencode/storage` |
+| OpenCode（macOS） | `~/Library/Application Support/opencode/storage` |
+| Cline（VS Code） | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` |
+
+扫描时识别的迁移变量：`CODEX_HOME`（Codex 会话与归档会话）、
+`CLAUDE_CONFIG_DIR`（Claude Code 转写与 projects）、`XDG_CONFIG_HOME`
+（Antigravity 配置与 Cline）、`XDG_DATA_HOME` / `OPENCODE_DATA_DIR`
+（OpenCode）。Pi 家族主目录按结构枚举（`~/.pi`、`~/.omp`、`~/.senpi`、
+`~/.omo`、`~/.config/pi` 下任何携带 `sessions/` 目录的子目录都会注册，
+包括 fork 迁移过的 agent 目录），因此这里没有固定行。表外的任何
+位置只能通过显式的 `-d/--dir` 逃生口扫描。
+
 ## 你会得到什么
 
 | 需求 | agenttrace 提供 |

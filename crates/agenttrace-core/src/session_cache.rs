@@ -5,7 +5,26 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 60;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 62;
+// Bumped 59 -> 62 (run 4309a268 cycle 1 'silent-zero closeout',
+// attempt 97c41efd @ base b798247, rm-715 LEAD): gemini-cli >= 0.63
+// chats record streams (~/.gemini/tmp/<hash>/chats/session-*.jsonl)
+// began counting — their usage rides a `tokens` carrier (a
+// TokensSummary) the usageMetadata/usage/tokenUsage key list never
+// read, so every such session served as a generic-lane silent zero;
+// a warm v59 entry keeps serving the zeros with matching fingerprints
+// (rm-230 convention: parser-semantics changes that alter reported
+// totals for unchanged files bump the schema so cached sessions
+// regenerate under corrected accounting). SEAM: this worktree's base
+// b798247 carried the landed 59 while origin landed 60 mid-run (run
+// e486dc1adb9b, merge ecf84dc) and sibling worktree run-b5affeade894
+// held an uncommitted 61 (rm-990) — 62 is minted at the fleet census
+// frontier as the lowest rung unique above it (e944a060/0a55a397
+// convention), one invalidation either way; this integration (conflict
+// case 0dee05b41d4b4252934f5f69bcf62cd6) confirms the rung at 62 with
+// that landed 60 as the ladder entry directly below and 61 left free
+// for the sibling's uncommitted mint. Entries regenerate once on next
+// scan.
 // Bumped 59 -> 60 (integration of run e486dc1adb9b cycle 2 'pi journal
 // accounting truth, part 2', conflict case 38b020c7f8f1463fb56f21772d627068,
 // candidate d9b3333 @ base 1511547): the batch's two units both change
