@@ -9,6 +9,10 @@
 
 ### Fixed
 
+- statusline context-window truths now parse `context_window()` exactly once per capture: the peak-utilization fold and the per-session latest-window list share a single pre-parsed vector instead of each cloning + serde-parsing the payload (rm-921 residual, run 4401a380 cycle 2; pinned by `context_window_parsed_once_per_capture`).
+- `tests/otel_export` fixture directories are now unique per call (atomic per-process suffix instead of the constant `line!()`), closing the intra-process window where one suite's truncating fixture rewrite could be observed mid-write by another suite's parse (rm-1065, run 4401a380 cycle 2; pinned by `fixture_dirs_are_unique_per_call`).
+- the Codex plugin version sync gate is green in full clones again: the 49 merged legacy tags (v0.0.4 and the v0.3.x line) that predate per-release CHANGELOG sections now carry explicit `no-changelog-section` markers (rm-1064, run 4401a380 cycle 2).
+
 - pi v3 MESSAGE usage blocks pass their upstream-recorded cost through (rm-253): the message arm built its usage meta event without reading `message.usage.cost.total`, so a pi journal that recorded $0.0075 for a turn was catalog-billed at the session model's list rate ($0.0165 on the PoC corpus, 2.2x) with `calculated_from_tokens` provenance and no disclosure — the same defect rm-436 fixed for standalone `type:"usage"` entries, one arm of the same family left inconsistent. The message arm now reads the cost through the same helper (`oh_my_pi_recorded_cost_usd`), marks the meta event `recorded_cost_usd`, and emits on either signal (mirroring the standalone arm's review-F-C repair), so analyze() excludes those tokens from the catalog formula, adds the recorded value at face value, and the pricing source discloses `+ recorded cost`. The rm-423 contract suite's catalog-priced pin on the shipped pi-pi-v3 fixture flipped to recorded-wins by intent (the fixture's own block records `total: 0.0075`, and a new pin proves both pi arms honor the same cost shape on one corpus — two $0.0075 blocks land $0.015 with neither catalog-priced), and the rm-436 accounting suite gains the message-arm goldens (non-zero tokens + cost, and the zero-token + cost either-signal shape). The session cache schema was bumped at this integration 59 → 60 per the rm-230 convention so cached sessions regenerate under the corrected accounting, one bump covering this and the zero rider below (the batch minted its bump as 24 → 25 at its base 1511547; the rung re-bases onto the advanced ceiling per the landed-rung-keeps-numeral convention — conflict case 38b020c7f8f1463fb56f21772d627068 — and the zero-insert gate composes with the landed rm-618 first-present alias rule). At the integration's independent review (case ca2e54c3ce87400e978a84415bba9708) two control surfaces were reconciled to the same rule: the rm-578 governance cost-basis catalog-only control carried a full `cost` object inside its assistant message, so its own "recorded dollars absent" premise was falsified by this fix — the control now carries tokens only (its recorded-cost arm and both drift tests unchanged), and the intentionally-literal schema oracle (`usage_occurrence_contract` fn/assert/messages) was swept to 60 alongside the sweep doc's site-5/site-6 re-anchor, closing the one literal site round 1 left behind.
 - Present-but-zero pi usage blocks count as measured zeros instead of vanishing (rm-408 residual, pi arm): the pi usage extractor inserted only classes greater than zero, so a present `{input: 0, output: 0}` block on a message or a standalone usage entry produced no event at all — no `zero_usage_events` disclosure, clean provenance — while the claude-family alias table landed by rm-408 inserts recognized classes unconditionally, making pi the one family where "present-zero never reads as clean" was false (the assess PoC: `--doctor` reported `zero_usage {sessions: 0, events: 0}` for a session whose journal reports an all-zero block). The pi extractor now inserts every recognized class, zeros included (a block with no recognized numeric key still stays absent, keeping the text-estimate path untouched), so the event emits and lands in the landed disclosure surfaces — `--doctor`'s `zero_usage` census, the `zero_usage_reported:<N>` provenance suffix, and the CSV column pick it up with no further changes. Pinned for both pi arms with the absent-key contrast, at the parser-unit level and through `--doctor`.
 - Kimi session usage double-mirror counts once (rm-982, landed at the integration of run e5653f52 cycle 2 — the upstream #312 token-accounting port, fork-adjudicated, conflict case 963662941e3a40579e658a63f2b88da6): a kimi session.json carrying BOTH a top-level `usage` and a `metadata.usage` mirror of the same counters counted each mirror and doubled every total; one source counts now — `parse_kimi_value` reads usage XOR `metadata.usage`, top-level preferred with the nested copy as fallback — pinned red-first by `kimi_session_usage_and_metadata_usage_count_once` (survived the merge verbatim). The port's other arms were superseded by this tree's own landed lanes and folded at the merge rather than re-landed: the claude streamed-row per-message-id fold (landed rm-601/rm-834), qwen first-alias reading with cache netting (landed rm-602/rm-618/rm-981), the opencode reasoning-subtree rescue (landed rm-619), and the codex reasoning breakdown + per-distinct-cumulative dedupe (landed rm-617/rm-863/rm-980) — the candidate's red-first pins for those arms were kept where they stay green on the merged semantics (the claude fold/ordering trio, `qwen_mirrored_input_aliases_count_once_and_cache_nets_out` re-added with an integration-survival note, and the codex saturation pin under the `total_token_usage` key). The session cache schema bumps 58 → 59 (the batch minted 27 → 28 at its base 8991144; the rung re-bases onto the advanced ceiling per the landed-rung-keeps-numeral convention, one invalidation either way — a warm v58 entry keeps serving the doubled kimi totals), swept in the same unit: the const + dated ladder rung, the occurrence-contract oracle (`schema_59_invalidates_v32`, fn + assert + messages), the TUI planted warm fixture (interpolates the exported constant), the governance-guide sentence and its enumeration rung, the two discovery pins (dynamic), and the sweep doc's site-5 quote and site-6 fn reference. SQLite snapshot stays 11.
@@ -791,6 +795,55 @@ section); this section records the upstream release being adopted wholesale:
   these refs visible to `git tag --merged HEAD`; nothing about the releases
   themselves changed.
 -->
+<!-- no-changelog-section: v0.0.4: ci: bump go version to 1.24 for build matrix; release -->
+<!-- no-changelog-section: v0.3.0: feat: complete bilingual i18n support (EN/ZH) across all user-facing strings; release -->
+<!-- no-changelog-section: v0.3.1: Merge pull request #1 from luoyuctl/codex/tui-product-polish; release -->
+<!-- no-changelog-section: v0.3.2: Add built-in demo sessions; release -->
+<!-- no-changelog-section: v0.3.3: Prepare v0.3.3 release; release -->
+<!-- no-changelog-section: v0.3.4: Add setup doctor command; release -->
+<!-- no-changelog-section: v0.3.5: Bump version to 0.3.5; release -->
+<!-- no-changelog-section: v0.3.6: Bump version to 0.3.6; release -->
+<!-- no-changelog-section: v0.3.7: Add Cursor export parser; release -->
+<!-- no-changelog-section: v0.3.8: Bump version to 0.3.8; release -->
+<!-- no-changelog-section: v0.3.9: Bump version to 0.3.9; release -->
+<!-- no-changelog-section: v0.3.10: Release 0.3.10; release -->
+<!-- no-changelog-section: v0.3.11: Release 0.3.11; release -->
+<!-- no-changelog-section: v0.3.12: Release 0.3.12; release -->
+<!-- no-changelog-section: v0.3.13: Release 0.3.13; release -->
+<!-- no-changelog-section: v0.3.14: Release 0.3.14; release -->
+<!-- no-changelog-section: v0.3.15: Release 0.3.15; release -->
+<!-- no-changelog-section: v0.3.16: Release 0.3.16; release -->
+<!-- no-changelog-section: v0.3.17: Release 0.3.17; release -->
+<!-- no-changelog-section: v0.3.18: Release 0.3.18; release -->
+<!-- no-changelog-section: v0.3.19: Release 0.3.19; release -->
+<!-- no-changelog-section: v0.3.20: Release 0.3.20; release -->
+<!-- no-changelog-section: v0.3.21: Release 0.3.21; release -->
+<!-- no-changelog-section: v0.3.22: Release 0.3.22; release -->
+<!-- no-changelog-section: v0.3.23: Release 0.3.23; release -->
+<!-- no-changelog-section: v0.3.24: Release 0.3.24; release -->
+<!-- no-changelog-section: v0.3.25: Release 0.3.25; release -->
+<!-- no-changelog-section: v0.3.26: Release 0.3.26; release -->
+<!-- no-changelog-section: v0.3.27: Release 0.3.27; release -->
+<!-- no-changelog-section: v0.3.28: Release 0.3.28; release -->
+<!-- no-changelog-section: v0.3.29: Release 0.3.29; release -->
+<!-- no-changelog-section: v0.3.30: Add health trend to overview; release -->
+<!-- no-changelog-section: v0.3.31: Prepare 0.3.31 release; release -->
+<!-- no-changelog-section: v0.3.32: Prepare 0.3.32 release; release -->
+<!-- no-changelog-section: v0.3.33: Prepare 0.3.33 release; release -->
+<!-- no-changelog-section: v0.3.34: Prepare 0.3.34 release; release -->
+<!-- no-changelog-section: v0.3.35: Bump version to 0.3.35; release -->
+<!-- no-changelog-section: v0.3.36: Bump version to 0.3.36; release -->
+<!-- no-changelog-section: v0.3.37: Bump version to 0.3.37; release -->
+<!-- no-changelog-section: v0.3.38: Sync 0.3.38 metadata; release -->
+<!-- no-changelog-section: v0.3.39: Show compact triage columns; release -->
+<!-- no-changelog-section: v0.3.40: Improve keymap readability; release -->
+<!-- no-changelog-section: v0.3.41: Improve standard-width TUI readability; release -->
+<!-- no-changelog-section: v0.3.42: Pin npm installer release tag (#6); release -->
+<!-- no-changelog-section: v0.3.44: Prepare 0.3.44 release (#15); release -->
+<!-- no-changelog-section: v0.3.45: Bump version to 0.3.45 (#78); release -->
+<!-- no-changelog-section: v0.3.46: Bump version to 0.3.46 (#81); release -->
+<!-- no-changelog-section: v0.3.47: Bump version to 0.3.47; release -->
+<!-- no-changelog-section: v0.3.48: Bump version to 0.3.48; release -->
 <!-- no-changelog-section: v0.7.2: release only decoupled the Pages checks from the release version (3f6252a); CI wiring, no user-facing behavior to section -->
 <!-- no-changelog-section: v0.7.3: release only fixed npm tarball publishing (739a6c3); packaging plumbing, no user-facing behavior to section -->
 <!-- no-changelog-section: v0.7.4: release only configured npm auth before publishing (2462045); packaging plumbing, no user-facing behavior to section -->

@@ -144,6 +144,15 @@ pub struct CapturedStatusline {
     pub payload: Value,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// rm-921 residual test hook: counts `context_window()` invocations,
+    /// so a test can pin the once-per-capture parse discipline (the peak
+    /// fold and the per-session latest-window list must share one parse
+    /// per capture instead of each cloning + parsing the payload).
+    static CONTEXT_WINDOW_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CapturedStatusline {
     pub fn session_id(&self) -> Option<&str> {
         self.payload.get("session_id").and_then(Value::as_str)
@@ -158,7 +167,10 @@ impl CapturedStatusline {
     }
 
     fn context_window(&self) -> Option<StatuslineContextWindow> {
-        serde_json::from_value(self.payload.get("context_window")?.clone()).ok()
+        let raw = self.payload.get("context_window")?;
+        #[cfg(test)]
+        CONTEXT_WINDOW_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+        serde_json::from_value(raw.clone()).ok()
     }
 
     fn prompt_cache(&self) -> Option<StatuslinePromptCache> {
@@ -1000,9 +1012,18 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
     // rm-037: peak context utilization across every capture that
     // carried a non-null percentage (the docs allow null before the
     // first API call and right after /compact).
-    let context_peak_used_percentage = deduped
+    // rm-921 residual: one context_window() parse per capture feeds BOTH
+    // the peak fold and the per-session latest-window list (each call
+    // clones the payload Value and serde-parses the subtree; the
+    // once-per-capture discipline is pinned by
+    // context_window_parsed_once_per_capture).
+    let context_windows_parsed: Vec<Option<StatuslineContextWindow>> = deduped
         .iter()
-        .filter_map(|capture| capture.context_window())
+        .map(|capture| capture.context_window())
+        .collect();
+    let context_peak_used_percentage = context_windows_parsed
+        .iter()
+        .filter_map(|window| window.as_ref())
         .filter_map(|window| window.used_percentage)
         .fold(None::<f64>, |acc, used| {
             Some(match acc {
@@ -1012,8 +1033,8 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
         });
     let mut context_windows: Vec<StatuslineSessionContextWindow> = Vec::new();
     let mut context_seen: HashSet<String> = HashSet::new();
-    for capture in deduped.iter().rev() {
-        let Some(window) = capture.context_window() else {
+    for (capture, window) in deduped.iter().zip(context_windows_parsed.iter()).rev() {
+        let Some(window) = window.as_ref() else {
             continue;
         };
         let session_id = capture.session_id().unwrap_or("(unknown)").to_string();
@@ -1024,7 +1045,7 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
             session_id,
             used_percentage: window.used_percentage,
             remaining_percentage: window.remaining_percentage,
-            current_usage: window.current_usage,
+            current_usage: window.current_usage.clone(),
         });
     }
 
@@ -2461,6 +2482,62 @@ mod tests {
             insights.five_hour.as_ref().and_then(|s| s.used_percentage),
             Some(84.0)
         );
+    }
+
+    #[test]
+    fn context_window_parsed_once_per_capture() {
+        // rm-921 residual: the peak-utilization fold and the per-session
+        // latest-window list must share ONE context_window() parse per
+        // capture (each parse is a Value clone + serde deserialize on the
+        // statusline hot path). Red on the double-parse layout: the
+        // counter observes two invocations per capture that carries a
+        // context_window payload.
+        let captures = vec![
+            CapturedStatusline {
+                captured_at: 1_000,
+                payload: serde_json::json!({
+                    "session_id": "sess-a",
+                    "context_window": {
+                        "used_percentage": 41.2,
+                        "remaining_percentage": 58.8
+                    }
+                }),
+            },
+            CapturedStatusline {
+                captured_at: 2_000,
+                payload: serde_json::json!({
+                    "session_id": "sess-a",
+                    "context_window": {
+                        "used_percentage": 90.0,
+                        "remaining_percentage": 10.0
+                    }
+                }),
+            },
+            CapturedStatusline {
+                captured_at: 3_000,
+                payload: serde_json::json!({
+                    "session_id": "sess-b",
+                    "prompt_id": "prompt-b-1"
+                }),
+            },
+        ];
+        CONTEXT_WINDOW_PARSE_COUNT.with(|count| count.set(0));
+        let insights = statusline_insights(&captures);
+        CONTEXT_WINDOW_PARSE_COUNT.with(|count| {
+            assert_eq!(
+                count.get(),
+                2,
+                "context_window() must be invoked exactly once per capture \
+                 that carries a payload — the peak fold and the per-session \
+                 list share the parse"
+            );
+        });
+        // Both consumers still ran: the peak fold and the per-session
+        // latest-window list (sess-a wins with the newest capture).
+        assert_eq!(insights.context_peak_used_percentage, Some(90.0));
+        assert_eq!(insights.context_windows.len(), 1);
+        assert_eq!(insights.context_windows[0].session_id, "sess-a");
+        assert_eq!(insights.context_windows[0].used_percentage, Some(90.0));
     }
 
     #[test]

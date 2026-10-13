@@ -10,7 +10,15 @@ use agenttrace_core::{parse_file, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("at-otel-test-{}-{}", std::process::id(), line!()))
+    // rm-1065: per-call unique fixture directories. The pid separates
+    // concurrent processes; the monotonically increasing suffix separates
+    // tests (and successive writes) within one process, so the two suites
+    // that rewrite the same fixture filenames can never observe each
+    // other's in-flight O_TRUNC writes.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("at-otel-test-{}-{}", std::process::id(), seq))
 }
 
 fn write_session(file: &str, body: &str) -> PathBuf {
@@ -19,6 +27,21 @@ fn write_session(file: &str, body: &str) -> PathBuf {
     let path = dir.join("sessions").join(file);
     std::fs::write(&path, body).unwrap();
     path
+}
+
+#[test]
+fn fixture_dirs_are_unique_per_call() {
+    // rm-1065: fixture_dir() must return a fresh directory per call — the
+    // suites at this file's two write_session() sites rewrite the same
+    // fixture filenames (claude-a.jsonl / codex-b.jsonl), so a shared
+    // directory leaves an intra-process window where one test's O_TRUNC
+    // write is observed mid-truncation by another test's
+    // parse_file().unwrap(). The pid alone separates processes; the
+    // per-call suffix must separate tests (and successive writes) within
+    // one process.
+    let a = fixture_dir();
+    let b = fixture_dir();
+    assert_ne!(a, b, "fixture_dir() must return a fresh directory per call");
 }
 
 const CLAUDE_BODY: &str = concat!(
