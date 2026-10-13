@@ -10,7 +10,7 @@ use crate::{parse_jsonl_session, Session};
 // silently reassigned the old name to an openrouter gateway row —
 // with byte-identical rates, so every demo cost is unchanged.
 const DEMO_HEALTHY_SESSION: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4-5"}
-{"role":"meta","ModelUsed":"claude-sonnet-4-5","Usage":{"input_tokens":4200,"output_tokens":1800,"cache_read_input_tokens":9000}}
+{"role":"meta","ModelUsed":"claude-sonnet-4-5","Usage":{"input_tokens":4200,"output_tokens":1800,"cache_read_input_tokens":9000},"service_tier":"flex"}
 {"role":"user","content":"Implement the billing export endpoint and keep the patch small.","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"claude-sonnet-4-5"}
 {"role":"assistant","content":"I will inspect the API shape, add the endpoint, and run the focused tests.","timestamp":"2026-05-02T10:00:04Z","reasoning":"Plan: locate the billing router, reuse the existing CSV serializer, add one route and a focused regression test. Risk is around permissions, so verify auth middleware before editing. Keep the patch narrow: route registration, handler wiring, and one test fixture. After implementation, run only the billing package tests, then a final package-wide smoke to catch integration fallout. If the serializer already handles date ranges, avoid inventing another abstraction and pass through the existing query parser.","tool_calls":[{"id":"t1","name":"rg","args":"billing export"}],"ModelUsed":"claude-sonnet-4-5"}
 {"role":"tool","content":"{\"success\":true,\"matches\":4}","tool_call_id":"t1","timestamp":"2026-05-02T10:00:05Z"}
@@ -19,7 +19,7 @@ const DEMO_HEALTHY_SESSION: &str = r#"{"role":"session_meta","timestamp":"2026-0
 "#;
 
 const DEMO_HANGING_SESSION: &str = r#"{"role":"session_meta","timestamp":"2026-05-02T10:10:00Z","ModelUsed":"gpt-5.1"}
-{"role":"meta","ModelUsed":"gpt-5.1","Usage":{"input_tokens":185000,"output_tokens":48000}}
+{"role":"meta","ModelUsed":"gpt-5.1","Usage":{"input_tokens":185000,"output_tokens":48000},"service_tier":"banana"}
 {"role":"user","content":"Refactor the flaky websocket reconnect flow.","timestamp":"2026-05-02T10:10:00Z","ModelUsed":"gpt-5.1"}
 {"role":"assistant","content":"I am going to reproduce the reconnect failure first.","timestamp":"2026-05-02T10:10:02Z","reasoning":"Need a focused repro before changing reconnect backoff. Start with existing websocket tests, then inspect the retry path.","tool_calls":[{"id":"t1","name":"terminal","args":"go test ./internal/ws -run Reconnect"}],"ModelUsed":"gpt-5.1"}
 {"role":"tool","content":"{\"error\":\"test timed out after 10m\"}","tool_call_id":"t1","is_error":true,"timestamp":"2026-05-02T10:18:24Z"}

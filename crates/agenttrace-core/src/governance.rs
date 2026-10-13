@@ -45,6 +45,16 @@ pub struct ModelCostAudit {
     pub provider: String,
     pub model: String,
     pub pricing_source: String,
+    /// Structured service tier (review fix f0118b8c/a253deee, dossier
+    /// F3): the tier the
+    /// row's usage events ran on, when they ran on a SINGLE tier.
+    /// `None` covers tierless usage AND mixed-tier rows - the two stay
+    /// distinguishable via `pricing_source` (which embeds the tier
+    /// suffix whenever any tiered event fed the row) and via the
+    /// per-session audit rows (single-session by construction).
+    /// Consumers must not parse `pricing_source` to recover this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
     pub sessions: usize,
     pub tokens: TokenBreakdown,
     /// Thinking-token share of billed output tokens (0-100), only when
@@ -385,6 +395,18 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         // re-prices tier-aware; a mix cannot carry one rate row and is
         // disclosed as such instead of silently pricing standard.
         tiers: BTreeSet<Option<String>>,
+        // rm-164: the service tiers that forced a fallback on a
+        // catalog-matched model (an unrecognized tier string, or a
+        // family the row does not carry) — the row's note names them
+        // so "fallback" distinguishes "no catalog row" from "the
+        // catalog cannot price this tier".
+        tier_fallback: BTreeSet<String>,
+        // rm-164 review fix (2026-10-13, dossier F3): some session in
+        // the row mixed service tiers INTERNALLY (per-block pricing) —
+        // no single rate row reproduces its stored total, so the
+        // current-rate column is withheld exactly like a row whose
+        // sessions disagree about the tier.
+        internally_mixed: bool,
     }
     let mut rows: BTreeMap<(String, String), Aggregate> = BTreeMap::new();
     let mut coverage = PricingCoverage::default();
@@ -410,6 +432,29 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         let row = rows.entry((provider, model.clone())).or_default();
         row.sessions += 1;
         row.tiers.insert(session.metrics.service_tier.clone());
+        // rm-164 review fix (2026-10-13, dossier F3): analyze() counts
+        // every billing decision that fell back to standard rates
+        // because the row lacked the block's tier — the authoritative
+        // tier-fallback signal, present for MIXED-tier sessions too
+        // (whose session-level service_tier is None by construction).
+        let session_tier_fallbacks: Vec<String> = session
+            .metrics
+            .disclosure_counters
+            .keys()
+            .filter_map(|key| key.strip_prefix("tier_fallback:"))
+            .map(str::to_string)
+            .collect();
+        // rm-610 mirror (review fix, dossier F3): a session that mixed
+        // tiers internally priced per usage block — the row cannot
+        // re-price it at one rate either.
+        if session
+            .metrics
+            .provenance
+            .pricing_source
+            .contains("mixed service tiers")
+        {
+            row.internally_mixed = true;
+        }
         row.tokens.input = row
             .tokens
             .input
@@ -467,12 +512,28 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         if matches!(model.as_str(), "default" | "unknown" | "multiple") {
             row.unknown += 1;
             coverage.unpriced_or_unknown_sessions += 1;
-        } else if pricing::has_specific_price(&model) {
+        } else if pricing::has_specific_tier_price(&model, session.metrics.service_tier.as_deref())
+            && session_tier_fallbacks.is_empty()
+        {
+            // rm-164: exactness is (model, tier) — a session whose
+            // service tier the row cannot price bills at the standard
+            // rates and is DISCLOSED as fallback, never claimed exact
+            // (the ultrafast PoC billed $0.0232 and reported exact=1
+            // at 6x under before this seam existed). Review fix
+            // (dossier F3): the analyze() counters close the
+            // mixed-tier hole — a session whose blocks fell back must
+            // not count as exact even though its single session-level
+            // tier is None.
             row.specific += 1;
             coverage.priced_sessions += 1;
         } else {
             row.fallback += 1;
             coverage.fallback_priced_sessions += 1;
+            if session.metrics.service_tier.is_some() && pricing::has_specific_price(&model) {
+                row.tier_fallback
+                    .insert(session.metrics.service_tier.clone().unwrap_or_default());
+            }
+            row.tier_fallback.extend(session_tier_fallbacks);
         }
     }
     let negative_components = sessions
@@ -504,6 +565,16 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         .map(|((provider, model), row)| {
             let mixed_tiers = row.tiers.len() > 1;
             let row_tier = row.tiers.iter().next().and_then(|tier| tier.as_deref());
+            // rm-164: the row-level tier-fallback note — precomputed
+            // so the static-str arm chain below can borrow it.
+            let tier_note = format!(
+                "exact model match but service_tier(s) {} carry no catalog tier rates; standard rates used",
+                row.tier_fallback
+                    .iter()
+                    .map(|tier| format!("{tier:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             // rm-520/rm-578: re-price on the stored estimate's basis —
             // `current_cost_estimate` applies the catalog rates only
             // to the tokens the journal did not already price and
@@ -517,7 +588,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 // the recorded dollars — withhold the current-rate
                 // column for the row.
                 None
-            } else if mixed_tiers {
+            } else if mixed_tiers || row.internally_mixed {
+                // rm-610 + review fix (dossier F3): withheld for a
+                // tier mix across sessions AND for a session that
+                // mixed tiers internally (per-block pricing) — no
+                // single rate row reproduces either stored total.
                 None
             } else {
                 current_cost_estimate(&model, row_tier, &row.tokens, &row.recorded)
@@ -529,13 +604,24 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 // cache rows and from cost-only usage entries no cache
                 // ever touched.
                 "unavailable: recorded-cost token split not reproducible".to_string()
-            } else if mixed_tiers {
+            } else if mixed_tiers || row.internally_mixed {
                 "unavailable: mixed service tiers".to_string()
             } else {
                 current
                     .as_ref()
                     .map(|(source, _, _)| source.clone())
                     .unwrap_or_else(|| "unavailable: multiple models".to_string())
+            };
+            // Review fix f0118b8c/a253deee (dossier F3): the
+            // catalog-match note must name the tier the row priced on
+            // (current_cost_estimate billed that tier's rates).
+            // Hoisted above the arm chain so the borrow outlives the
+            // tail expression.
+            let catalog_note = match row_tier {
+                Some(tier) => format!(
+                    "exact normalized model match in pricing catalog (service_tier={tier})"
+                ),
+                None => "exact normalized model match in pricing catalog".to_string(),
             };
             let (pricing_status, pricing_note) = if model == "multiple" {
                 if row.per_block_multiple == row.sessions {
@@ -553,6 +639,17 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                         "SQLite aggregated multiple model IDs; no single-model exact price applies",
                     )
                 }
+            } else if !row.tier_fallback.is_empty() {
+                // rm-164: hoisted ABOVE the mixed-tier arm (review
+                // fix, dossier F3): a row that billed blocks on
+                // uncarried tiers must disclose that even when its
+                // sessions also disagree about the tier — "each
+                // session's cost prices the tier it ran on" is not
+                // true for the blocks that fell back to standard.
+                (
+                    "fallback_estimate",
+                    tier_note.as_str(),
+                )
             } else if mixed_tiers {
                 (
                     "aggregate_estimate",
@@ -566,10 +663,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                     "no exact catalog match; built-in fallback rate used",
                 )
             } else {
-                (
-                    "catalog_estimate",
-                    "exact normalized model match in pricing catalog",
-                )
+                ("catalog_estimate", catalog_note.as_str())
             };
             let pricing_note = append_drift_note(
                 pricing_note,
@@ -602,6 +696,15 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 provider,
                 model,
                 pricing_source,
+                // Review fix f0118b8c/a253deee (dossier F3): structured
+                // tier so JSON
+                // consumers need no string parsing. `None` covers
+                // tierless AND mixed-tier rows (see the field docs).
+                service_tier: if mixed_tiers {
+                    None
+                } else {
+                    row_tier.map(str::to_string)
+                },
                 sessions: row.sessions,
                 tokens: row.tokens,
                 reasoning_share_pct,
@@ -700,6 +803,34 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
             &recorded,
         )
     };
+    // rm-164: session-level tier-fallback note — the model matched a
+    // catalog row but the service tier it ran on cannot be priced.
+    // Precomputed so the static-str arm chain below can borrow it.
+    let tier_note = session
+        .metrics
+        .service_tier
+        .as_deref()
+        .map(|tier| {
+            format!(
+                "exact model match but service_tier {tier:?} carries no catalog tier rates; standard rates used"
+            )
+        })
+        .unwrap_or_default();
+    // rm-164 review fix (2026-10-13, dossier F3): the mixed-tier
+    // session's uncarried tiers, from analyze()'s per-block counters —
+    // blocks on these tiers billed standard rates, so "per-tier
+    // totals exact" would be the exact over-claim the review flagged.
+    let mixed_uncarried: Vec<String> = session
+        .metrics
+        .disclosure_counters
+        .keys()
+        .filter_map(|key| key.strip_prefix("tier_fallback:"))
+        .map(|tier| format!("{tier:?}"))
+        .collect();
+    let mixed_tier_note = format!(
+        "single model, mixed service tiers, priced per usage block; service_tier(s) {} carry no catalog tier rates — those blocks billed standard (disclosed fallback)",
+        mixed_uncarried.join(", ")
+    );
     let (pricing_status, pricing_note) = if model == "multiple" {
         if is_per_block_multiple(session) {
             // rm-521: per-block pricing (rm-438) priced every usage
@@ -719,20 +850,34 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         // rm-610: the session-level mirror of the mixed-tier row rule
         // and of rm-521's per-block disclosure — the stored total is
         // exact per block, and no single rate row reproduces it.
-        (
-            "aggregate_estimate",
-            "single model, mixed service tiers, priced per usage block; per-tier totals exact",
-        )
+        // Review fix (2026-10-13, dossier F3): "exact per block" only
+        // holds when every block's tier was carried — analyze()'s
+        // tier_fallback counters say otherwise here, and the note
+        // names the tiers that billed standard instead.
+        if mixed_uncarried.is_empty() {
+            (
+                "aggregate_estimate",
+                "single model, mixed service tiers, priced per usage block; per-tier totals exact",
+            )
+        } else {
+            ("aggregate_estimate", mixed_tier_note.as_str())
+        }
     } else if matches!(model.as_str(), "default" | "unknown") {
         (
             "unpriced_or_unknown",
             "model name is missing or generic; cost is not a catalog match",
         )
-    } else if pricing::has_specific_price(&model) {
+    } else if pricing::has_specific_tier_price(&model, session.metrics.service_tier.as_deref()) {
         (
             "catalog_estimate",
             "exact normalized model match in pricing catalog",
         )
+    } else if session.metrics.service_tier.is_some() && pricing::has_specific_price(&model) {
+        // rm-164: the model matched but the service tier did not — an
+        // unrecognized tier string or a family the row does not
+        // carry. Standard-rate billing on an unmodeled tier is a
+        // disclosed fallback, never an exact catalog match.
+        ("fallback_estimate", tier_note.as_str())
     } else {
         (
             "fallback_estimate",
@@ -1790,6 +1935,70 @@ mod tests {
             "a withheld recompute must not claim drift: {}",
             audit.pricing_note
         );
+    }
+
+    #[test]
+    fn mixed_tier_sessions_disclose_blocks_billed_on_uncarried_tiers() {
+        // rm-164 review fix (2026-10-13, dossier F3): a MIXED-tier
+        // session prices each block on its own tier; when one of those
+        // tiers is one the model's row cannot price (here: an
+        // unrecognized tier string), that block bills standard —
+        // analyze() counts it, the session note names it, the row
+        // downgrades to fallback_estimate, and the current-rate column
+        // is withheld instead of re-pricing every token at the
+        // standard row against the per-block stored total.
+        let journal = concat!(
+            r#"{"role":"session_meta","timestamp":"2026-05-02T10:00:00Z","ModelUsed":"gpt-5.6"}"#,
+            "\n",
+            r#"{"role":"meta","ModelUsed":"gpt-5.6","Usage":{"input_tokens":1000000,"output_tokens":1000000},"service_tier":"flex"}"#,
+            "\n",
+            r#"{"role":"meta","ModelUsed":"gpt-5.6","Usage":{"input_tokens":1000000,"output_tokens":1000000},"service_tier":"banana"}"#,
+            "\n"
+        );
+        let session =
+            crate::parse_jsonl_session("tier-mix", "rollout.jsonl", journal).expect("parses");
+        assert!(
+            session.metrics.service_tier.is_none(),
+            "two tiers => no single session-level tier"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("tier_fallback:banana"),
+            Some(&1),
+            "analyze() must count the standard-rate fallback on the uncarried tier: {:?}",
+            session.metrics.disclosure_counters
+        );
+
+        let audit = session_cost_audit(&session);
+        assert_eq!(audit.pricing_status, "aggregate_estimate");
+        assert!(
+            audit.pricing_note.contains("banana"),
+            "the session note must name the uncarried tier: {}",
+            audit.pricing_note
+        );
+        assert!(
+            !audit.pricing_note.contains("per-tier totals exact"),
+            "a mixed session with an uncarried tier must not claim per-tier exactness: {}",
+            audit.pricing_note
+        );
+
+        let audit = cost_audit(&[session]);
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.pricing_status, "fallback_estimate");
+        assert!(
+            row.pricing_note.contains("banana"),
+            "the row note must name the uncarried tier: {}",
+            row.pricing_note
+        );
+        assert_eq!(row.service_tier, None, "a mixed row carries no single tier");
+        assert_eq!(
+            row.pricing_source, "unavailable: mixed service tiers",
+            "the current-rate column must be withheld for an internally mixed row"
+        );
+        assert!(row.estimated_cost_usd.is_none());
+        assert_eq!(audit.pricing_coverage.fallback_priced_sessions, 1);
     }
 
     #[test]
