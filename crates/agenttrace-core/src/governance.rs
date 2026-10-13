@@ -2,6 +2,11 @@ use crate::{
     parse_ts, pricing, project_name, resolve_project, round4, session_capability, total_tokens,
     Session, PER_BLOCK_PRICING_MARKER,
 };
+// rm-985 (adopted) / rm-897 rider: the --recommend evidence strings are a text
+// lane the CLI dispatch sanitizer only strips control bytes from, so a session
+// or tool name that begins with a spreadsheet formula introducer would paste
+// straight through. Guard at the source, like every other rm-985 text lane.
+use crate::reports::guard_formula_cell;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -827,7 +832,7 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
                         + session.diagnostics.loop_cost.loop_groups
                 ),
                 vec![
-                    format!("session={}", session.name),
+                    format!("session={}", guard_formula_cell(&session.name)),
                     // rm-754: the dollar figure names its basis -- a
                     // constant-derived synthetic estimate can no longer
                     // wear a plain $ label in the advice.
@@ -850,7 +855,7 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
                 "tool_failure",
                 "Reduce failing tool calls",
                 "Tool failures increase wall time and often precede repeated work.".to_string(),
-                vec![format!("session={}", session.name), format!("failed_calls={}", session.metrics.tool_calls_fail)],
+                vec![format!("session={}", guard_formula_cell(&session.name)), format!("failed_calls={}", session.metrics.tool_calls_fail)],
                 session.metrics.cost_estimated * session.metrics.tool_calls_fail as f64
                     / session.metrics.tool_calls_total.max(1) as f64,
                 0,
@@ -867,7 +872,7 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
                 "context",
                 "Start a narrower follow-up session",
                 "Conversation and tool context leave little room for the active task.".to_string(),
-                vec![format!("session={}", session.name), format!("utilization={:.1}%", context.utilization_pct)],
+                vec![format!("session={}", guard_formula_cell(&session.name)), format!("utilization={:.1}%", context.utilization_pct)],
                 session.metrics.cost_estimated * 0.2,
                 (context.conversation_history / 5) as i64,
                 "medium",
@@ -914,10 +919,12 @@ pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
                 "Bound slow tool execution",
                 "A tool exceeded the latency threshold or returned without a result.".to_string(),
                 vec![
-                    format!("session={}", session.name),
+                    format!("session={}", guard_formula_cell(&session.name)),
                     format!(
                         "tool={} p95={:.1}s unmatched={}",
-                        slow.tool_name, slow.p95_sec, slow.unmatched
+                        guard_formula_cell(&slow.tool_name),
+                        slow.p95_sec,
+                        slow.unmatched
                     ),
                 ],
                 session.metrics.cost_estimated * 0.1,

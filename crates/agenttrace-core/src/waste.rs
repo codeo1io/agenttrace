@@ -1,4 +1,5 @@
 use crate::diagnostics::LoopCostBasis;
+use crate::reports::guard_formula_cell;
 use crate::{
     format_cost, format_tokens, loop_waste_percent, pricing, round4, sanitize_line_segment,
     Metrics, ReportLanguage, Session, VERSION,
@@ -478,7 +479,16 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
             // and this was the only default text lane with no sanitizer
             // import at all (assess PoC: `--waste` emitted one OSC-52
             // clipboard-write sequence from a crafted tool name).
-            sanitize_line_segment(&item.tool_name),
+            // rm-985 review fix (review 1bbb59f2 F1, attempt d28abb78):
+            // this row LEADS with the tool name at the cell start, and
+            // the control-byte sanitizer does not touch formula
+            // introducers — the review's live PoC rendered
+            // `    +cmd|' /C calc'!A0` here, and the four leading spaces
+            // do NOT protect a pasted cell (rm-540 threat model:
+            // spreadsheet apps ignore leading whitespace when deciding
+            // a cell is a formula). Same guard_formula_cell paste-marker
+            // as every other rm-985 text lane.
+            guard_formula_cell(&sanitize_line_segment(&item.tool_name)),
             item.call_count,
             format_cost(item.total_cost),
             share,
