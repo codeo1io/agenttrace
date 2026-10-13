@@ -207,7 +207,14 @@ discovery 声明的根目录上，新注册的根目录无法绕过文档落地�
 （Antigravity 配置与 Cline）、`XDG_DATA_HOME` / `OPENCODE_DATA_DIR`
 （OpenCode）。Pi 家族主目录按结构枚举（`~/.pi`、`~/.omp`、`~/.senpi`、
 `~/.omo`、`~/.config/pi` 下任何携带 `sessions/` 目录的子目录都会注册，
-包括 fork 迁移过的 agent 目录），因此这里没有固定行。表外的任何
+包括 fork 迁移过的 agent 目录），因此这里没有固定行。Claude Code
+的每账号 profile 主目录同样按结构枚举（rm-1397）：`~/.claude/profiles`
+（重定位时在 `CLAUDE_CONFIG_DIR` 下）的每个子目录都会注册其
+`projects/` 与 `transcripts/` 子目录 —— 即 `CLAUDE_CODE_PROFILE=<name>`
+所选择的布局 —— 因此家目录里的第二个企业账号无需白名单即可被扫描，
+且会话会把日志中的身份面（organization/email，Claude Code 2.1.299+）
+带入报告的 `By org` 维度（零噪声：仅当语料携带身份时才渲染该维度，
+无身份的输出保持不变）。表外的任何
 位置只能通过显式的 `-d/--dir` 逃生口扫描。
 
 ## 你会得到什么

@@ -1506,6 +1506,20 @@ fn parse_claude_transcript_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             _ => {}
         }
     }
+    // rm-1397: the flat transcripts lane has no session_meta event, so
+    // the journal's identity (if any) is stamped on the first event —
+    // `session_from_events` folds org/email first-non-empty exactly
+    // like cwd/branch, so the slot choice does not affect the rollup.
+    let (identity_org, identity_email) = claude_identity_first(objs);
+    if (!identity_org.is_empty() || !identity_email.is_empty()) && !events.is_empty() {
+        let first = &mut events[0];
+        if first.org.is_empty() {
+            first.org = identity_org;
+        }
+        if first.email.is_empty() {
+            first.email = identity_email;
+        }
+    }
     non_empty(events)
 }
 
@@ -4921,6 +4935,89 @@ fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage 
     .collect()
 }
 
+/// rm-1397 (Claude org/account-aware attribution, first cut): the
+/// identity surfaces a claude-code journal line can carry. CC 2.1.299
+/// exposes `$.session.identity` (an `organization` slug and the
+/// account's `email` address) on regular turns; gateway-managed
+/// accounts carry the same fields under a top-level `attribution`
+/// block instead; some deployments inline `identity` at the top level;
+/// older journals carry nothing. Accepts a generous set of spellings
+/// (`organizationSlug`, `emailAddress`, uuid variants) — the value is a
+/// bucket key, not a lookup, so over-accepting costs nothing while a
+/// miss would silently collapse accounts together.
+fn claude_identity_from_object(obj: &JsonObject) -> Option<(String, String)> {
+    let mut org = String::new();
+    let mut email = String::new();
+    let sources: [&Value; 3] = [
+        obj.get("session")
+            .and_then(|v| v.get("identity"))
+            .unwrap_or(&Value::Null),
+        obj.get("identity").unwrap_or(&Value::Null),
+        obj.get("attribution").unwrap_or(&Value::Null),
+    ];
+    for source in sources {
+        let Some(map) = source.as_object() else {
+            continue;
+        };
+        if org.is_empty() {
+            for key in [
+                "organization",
+                "organizationSlug",
+                "organization_slug",
+                "organizationUuid",
+                "organizationUUID",
+                "organization_uuid",
+                "orgSlug",
+                "orgUUID",
+                "orgUuid",
+                "org",
+            ] {
+                if let Some(value) = string(map.get(key)).filter(|v| !v.is_empty()) {
+                    org = value.to_string();
+                    break;
+                }
+            }
+        }
+        if email.is_empty() {
+            for key in ["email", "emailAddress", "email_address"] {
+                if let Some(value) = string(map.get(key)).filter(|v| !v.is_empty()) {
+                    email = value.to_string();
+                    break;
+                }
+            }
+        }
+        if !org.is_empty() && !email.is_empty() {
+            break;
+        }
+    }
+    (!org.is_empty() || !email.is_empty()).then_some((org, email))
+}
+
+/// rm-1397: first non-empty identity across a journal's lines. The
+/// projects lane stamps the pair onto its `session_meta` event (which
+/// `session_from_events` folds first-non-empty like `cwd`/`branch`);
+/// the flat lane stamps the first event it emits. Identity can ride
+/// ANY line (gateway attribution blocks appear mid-journal), so the
+/// scan is not limited to the first line.
+fn claude_identity_first(objs: &[JsonObject]) -> (String, String) {
+    let mut org = String::new();
+    let mut email = String::new();
+    for obj in objs {
+        if let Some((next_org, next_email)) = claude_identity_from_object(obj) {
+            if org.is_empty() {
+                org = next_org;
+            }
+            if email.is_empty() {
+                email = next_email;
+            }
+            if !org.is_empty() && !email.is_empty() {
+                break;
+            }
+        }
+    }
+    (org, email)
+}
+
 fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -4953,6 +5050,10 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     }
     let mut tool_results_by_message: BTreeSet<(String, ToolResultFoldKey)> = BTreeSet::new();
     let mut tool_result_refolds: BTreeMap<String, i64> = BTreeMap::new();
+    // rm-1397: identity can ride any line, so it is resolved up front
+    // and stamped on the session_meta event below (same slot as
+    // cwd/branch).
+    let (identity_org, identity_email) = claude_identity_first(objs);
     // rm-406 (dated 2026-10-07 arm): message ids whose usage.iterations[]
     // array was already mined — the streaming re-emission problem rm-601
     // solved for top-level usage applies to the iterations array verbatim
@@ -4983,6 +5084,8 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     role: "session_meta".to_string(),
                     cwd: cwd.clone(),
                     branch,
+                    org: identity_org.clone(),
+                    email: identity_email.clone(),
                     model_used: model.clone(),
                     source_tool: "claude_code".to_string(),
                     disclosure_counters: cwd_truncation_disclosure("claude_code", cwd_truncated),

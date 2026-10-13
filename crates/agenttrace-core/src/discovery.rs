@@ -201,6 +201,52 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
     dirs.extend(open_code_known_session_dirs(&home));
     dirs.extend(cline_known_session_dirs(&home));
     dirs.extend(pi_family_known_session_dirs(&home));
+    dirs.extend(claude_profile_session_dirs(&home));
+    dirs
+}
+
+/// rm-1397 (Claude org/account-aware attribution, first cut): the
+/// per-account session homes Claude Code keeps under
+/// `<config_root>/profiles/<name>/{projects,transcripts}` (the layout
+/// `CLAUDE_CODE_PROFILE=<name>` selects). Enumeration is structural,
+/// following the rm-084 pi-family precedent: every child directory of
+/// `profiles/` that actually carries a `projects/` or `transcripts/`
+/// subdirectory registers it, so a second corporate account dropped
+/// into the home appears in discovery without a per-account allowlist.
+/// Children without those subdirectories never register, and a
+/// `profiles/` that does not exist contributes nothing — identical
+/// output on single-account homes. An account relocated outside the
+/// config root is not discoverable from layout; `-d <dir>` remains the
+/// documented escape.
+fn claude_profile_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
+    let config_root = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"));
+    let profiles_root = config_root.join("profiles");
+    let mut dirs = Vec::new();
+    let Ok(children) = fs::read_dir(&profiles_root) else {
+        return dirs;
+    };
+    let mut children: Vec<PathBuf> = children.flatten().map(|entry| entry.path()).collect();
+    children.sort();
+    for profile in children {
+        if !profile.is_dir() {
+            continue;
+        }
+        let Some(slug) = profile.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        for (label_tail, sub) in [("projects", "projects"), ("transcripts", "transcripts")] {
+            let path = profile.join(sub);
+            if path.is_dir() {
+                dirs.push(KnownSessionDir {
+                    name: format!("Claude Code profile {slug} ({label_tail})"),
+                    path,
+                });
+            }
+        }
+    }
     dirs
 }
 

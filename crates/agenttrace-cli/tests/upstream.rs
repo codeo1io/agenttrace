@@ -49,9 +49,22 @@ fn write(dir: &Path, rel: &str, content: &str) {
 }
 
 fn run_cli(cwd: &Path, args: &[&str]) -> Output {
+    run_cli_with_env(cwd, args, &[])
+}
+
+/// rm-1398: `run_cli` with extra environment pairs. The git-hermeticity
+/// tests below pin `GIT_CEILING_DIRECTORIES` through here — a plain
+/// fixture dir under `std::env::temp_dir()` is only outside a
+/// repository as long as TMPDIR itself is not inside one (CI sandboxes
+/// and per-test scratch homes place it there), and the ceiling is the
+/// git-native way to stop repo discovery exactly at the fixture root.
+fn run_cli_with_env(cwd: &Path, args: &[&str], extra_env: &[(&str, String)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
     command.args(args).current_dir(cwd);
     for (key, value) in GIT_ENV {
+        command.env(key, value);
+    }
+    for (key, value) in extra_env {
         command.env(key, value);
     }
     command.output().expect("run agenttrace CLI")
@@ -248,12 +261,30 @@ fn missing_upstream_remote_fails_with_setup_hint() {
 
 #[test]
 fn outside_a_git_repository_fails() {
+    // rm-1398: hermetic. A plain dir under `std::env::temp_dir()` used
+    // to be assumed outside any repository, but git discovers repos by
+    // walking UP — on hosts whose TMPDIR lives inside a repository
+    // (CI sandbox homes, scratch checkouts; this delegate host's TMPDIR
+    // sits inside a real repo, which is how the hazard was first
+    // caught) the walk found the ENCLOSING repo, `agenttrace upstream`
+    // started reporting on it, and this test failed through no change
+    // in the CLI. GIT_CEILING_DIRECTORIES stops the walk at an
+    // ANCESTOR of the cwd — a ceiling on the cwd itself never fires —
+    // so the ceiling sits on the fixture root's PARENT (temp_dir):
+    // the fixture root is examined (no .git), and the walk may not
+    // step up into the parent, where an enclosing repo could lurk.
+    // The probe is then outside a repository on every host.
     let root =
         std::env::temp_dir().join(format!("agenttrace-upstream-nogit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create plain dir");
 
-    let output = run_cli(&root, &["upstream"]);
+    let ceiling = std::env::temp_dir().to_string_lossy().to_string();
+    let output = run_cli_with_env(
+        &root,
+        &["upstream"],
+        &[("GIT_CEILING_DIRECTORIES", ceiling)],
+    );
     assert!(
         !output.status.success(),
         "must fail outside a git repository"
@@ -261,6 +292,68 @@ fn outside_a_git_repository_fails() {
     assert!(
         stderr(&output).contains("not inside a git repository"),
         "expected repository hint, got {:?}",
+        stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn plain_dir_inside_an_enclosing_repository_still_probes_as_outside() {
+    // rm-1398, red-first variant of the hazard above: the fixture dir
+    // sits INSIDE a real git repository, which is exactly the shape a
+    // TMPDIR-inside-a-repository host gives every test that builds its
+    // fixtures under `std::env::temp_dir()`. Without the ceiling the
+    // upward walk finds the enclosing repo (pinned by the control arm
+    // below — this is why the pre-rm-1398 test shape was wrong); with
+    // GIT_CEILING_DIRECTORIES at the enclosing repo's root, discovery
+    // may not cross it and the probe correctly reports outside.
+    let tag = format!("nogit-enclosing-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("agenttrace-upstream-{tag}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("enclosing-repo");
+    std::fs::create_dir_all(&repo).expect("create enclosing repo dir");
+    git(&repo, &["init", "-q", "-b", "master"]);
+    write(&repo, "README.md", "enclosing fixture\n");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "enclosing fixture commit"]);
+    let plain = repo.join("plain-subdir");
+    std::fs::create_dir_all(&plain).expect("create plain subdir inside the repo");
+
+    // Control arm (the hazard, pinned): without the ceiling the upward
+    // walk finds the enclosing repo, so the CLI proceeds past the
+    // repository probe and dies at the next prerequisite — the missing
+    // `upstream` remote — instead of at "not inside a git repository".
+    // If this arm ever stops holding, the enclosing fixture stopped
+    // being a repository and the hermeticity pin below is vacuous.
+    let control = run_cli(&plain, &["upstream"]);
+    assert!(
+        !control.status.success(),
+        "control arm must still fail (no upstream remote)"
+    );
+    assert!(
+        stderr(&control).contains("no 'upstream' remote configured"),
+        "control arm must show the enclosing repo WAS discovered, got {:?}",
+        stderr(&control)
+    );
+
+    // Hermetic arm: same cwd, ceiling on the cwd's PARENT (the
+    // enclosing repo root — an ancestor is the only position where a
+    // ceiling fires). The walk examines `plain-subdir` (no .git), then
+    // may not step up into the repo — the probe reports outside a
+    // repository even though a real repo encloses the fixture.
+    let ceiling = repo.to_string_lossy().to_string();
+    let output = run_cli_with_env(
+        &plain,
+        &["upstream"],
+        &[("GIT_CEILING_DIRECTORIES", ceiling)],
+    );
+    assert!(
+        !output.status.success(),
+        "must fail outside a git repository even inside an enclosing one"
+    );
+    assert!(
+        stderr(&output).contains("not inside a git repository"),
+        "expected repository hint under the ceiling, got {:?}",
         stderr(&output)
     );
     let _ = std::fs::remove_dir_all(&root);

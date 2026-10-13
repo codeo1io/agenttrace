@@ -725,6 +725,8 @@ mod tests {
             path: "/tmp/anom.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 tokens_input: 10,
                 tokens_cache_r: 5_000,
@@ -760,6 +762,8 @@ mod tests {
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -783,6 +787,8 @@ mod tests {
             path: "/tmp/s".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 gaps_sec: vec![130.0, 140.0, 150.0],
                 ..Metrics::default()
@@ -815,6 +821,8 @@ mod tests {
             path: "/tmp/s".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 assistant_turns: 10,
                 cost_estimated: 10.0,
@@ -867,6 +875,8 @@ mod loop_cost_basis_disclosure_tests {
             path: String::from("/tmp/loop-basis-probe.jsonl"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 cost_estimated: 1.0,
                 ..Metrics::default()

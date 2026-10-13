@@ -529,6 +529,15 @@ projects), `XDG_CONFIG_HOME` (Antigravity config and Cline),
 enumerated structurally (every `~/.pi`, `~/.omp`, `~/.senpi`, `~/.omo`,
 `~/.config/pi` root child carrying a `sessions/` directory registers —
 including fork-relocated agent dirs), so they have no fixed rows here.
+Claude Code per-account profile homes are enumerated structurally too
+(rm-1397): every child of `~/.claude/profiles` (under
+`CLAUDE_CONFIG_DIR` when relocated) registers its `projects/` and
+`transcripts/` subdirectories — the layout `CLAUDE_CODE_PROFILE=<name>`
+selects — so a second corporate account in the home is scanned without
+an allowlist, and sessions carry the journal's identity surfaces
+(organization/email, Claude Code 2.1.299+) into the `By org` report
+dimension (zero-noise: the dimension renders only when the corpus
+carries identity; identity-free output is unchanged).
 Anything outside these roots is reachable only through the explicit
 `-d/--dir` escape.
 

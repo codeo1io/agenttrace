@@ -1396,6 +1396,8 @@ mod tests {
             path: format!("/tmp/{name}"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 assistant_turns: 10,
                 cost_estimated: cost,
@@ -1604,6 +1606,8 @@ mod tests {
             diagnostics: Diagnostics::default(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
         };
         session.diagnostics.loop_cost.loop_groups = 1;
         let findings = session_findings(&session, &[]);
@@ -1678,6 +1682,8 @@ mod tests {
             diagnostics: Diagnostics::default(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
         }
     }
 
@@ -1871,6 +1877,8 @@ mod tests {
             path: String::new(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: vec![Anomaly {
                 kind: "implausible_magnitude".to_string(),
