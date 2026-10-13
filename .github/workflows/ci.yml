@@ -77,6 +77,21 @@ jobs:
         # the newest CHANGELOG release heading.
         run: scripts/ci/check-install-ref-drift.sh
 
+      - name: Changelog structure gate
+        # rm-1036: no `##` section of CHANGELOG.md may carry duplicate
+        # `###` kinds — first-per-section consumers drop the later blocks.
+        run: scripts/ci/check-changelog-structure.sh
+
+      - name: npm files pack gate
+        # rm-1037: every npm/package.json files entry must match something
+        # in the tree (lib/ is a postinstall artifact, never packed).
+        run: scripts/ci/check-npm-files.sh
+
+      - name: Release pin examples gate
+        # rm-1038: version-pin examples on install.cmd / README*.md must
+        # match install.sh's AGENTTRACE_SOURCE_REF default (rm-017 chain).
+        run: scripts/ci/check-release-pins.sh
+
       - name: Codex plugin version sync
         run: |
           # rm-163: the tag anchor needs tags; a fetch-depth:1 checkout has
