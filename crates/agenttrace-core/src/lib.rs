@@ -97,7 +97,7 @@ pub use statusline::{
 pub use subagents::attribute_subagents;
 pub use waste::{
     compute_waste_report, render_waste_report, render_waste_report_with_language,
-    waste_report_json, WasteReport,
+    waste_report_json, WasteReport, WastedCostBreakdown,
 };
 
 pub const VERSION: &str = match option_env!("AGENTTRACE_RELEASE_VERSION") {

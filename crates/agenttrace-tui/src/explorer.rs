@@ -1316,7 +1316,28 @@ fn cost_preview(session: &Session, language: Language) -> String {
     .join("\n")
 }
 
+/// rm-857 TUI arm: every explorer loop-analysis line carries the
+/// same basis marker the CLI governance advice emits
+/// (LoopCostBasis::disclosure) — the TUI must never surface a loop
+/// signal whose dollar basis is hidden. Loopless sessions stay
+/// unmarked (byte-stable for the loop-free layout).
+fn loop_basis_marker(session: &Session) -> String {
+    if session.diagnostics.loop_cost.loop_groups == 0 {
+        return String::new();
+    }
+    format!(
+        " ({})",
+        session.diagnostics.loop_cost.cost_basis.disclosure()
+    )
+}
+
 fn tools_preview(session: &Session, language: Language) -> String {
+    // rm-857: the loop count carries the basis marker inline.
+    let repeat_loops = format!(
+        "{}{}",
+        session.diagnostics.loop_cost.loop_groups,
+        loop_basis_marker(session)
+    );
     let mut usage = session.metrics.tool_usage.iter().collect::<Vec<_>>();
     usage.sort_by_key(|(_, count)| std::cmp::Reverse(**count));
     let usage = usage
@@ -1359,7 +1380,7 @@ fn tools_preview(session: &Session, language: Language) -> String {
         text(language, "failed", "失败"),
         session.metrics.tool_calls_fail,
         text(language, "repeat loops", "反复调用"),
-        session.diagnostics.loop_cost.loop_groups,
+        repeat_loops,
         text(language, "Most used tools", "用得最多的工具"),
         if usage.is_empty() {
             text(language, "No tool calls showed up.", "没看到工具调用。")
@@ -2494,9 +2515,10 @@ fn health_explanation(session: &Session, language: Language) -> String {
     }
     if session.diagnostics.loop_cost.loop_groups > 0 {
         parts.push(format!(
-            "{} {}",
+            "{} {}{}",
             session.diagnostics.loop_cost.loop_groups,
-            text(language, "repeat loops", "组反复调用")
+            text(language, "repeat loops", "组反复调用"),
+            loop_basis_marker(session)
         ));
     }
     if !session.anomalies.is_empty() {
@@ -2613,9 +2635,10 @@ fn primary_finding(session: &Session, language: Language) -> String {
             format_context_pct(session.diagnostics.context_utilization.utilization_pct)
         ),
         "loops" => format!(
-            "{}: {}",
+            "{}: {}{}",
             text(language, "Repeated tool loop", "工具反复调用"),
-            session.diagnostics.loop_cost.loop_groups
+            session.diagnostics.loop_cost.loop_groups,
+            loop_basis_marker(session)
         ),
         "latency" => format!(
             "{} {}",
@@ -2670,9 +2693,10 @@ fn explorer_evidence(session: &Session, language: Language) -> Vec<String> {
     }
     if session.diagnostics.loop_cost.loop_groups > 0 {
         evidence.push(format!(
-            "{} {}",
+            "{} {}{}",
             session.diagnostics.loop_cost.loop_groups,
-            text(language, "repeat loops", "组反复调用")
+            text(language, "repeat loops", "组反复调用"),
+            loop_basis_marker(session)
         ));
     }
     for anomaly in session
@@ -2969,5 +2993,99 @@ mod interaction_tests {
         let summary = share_summary(app.explorer_session().unwrap());
         assert!(!summary.contains("beta"));
         assert!(!summary.contains(&app.explorer_session().unwrap().name));
+    }
+}
+
+#[cfg(test)]
+mod loop_basis_marker_tests {
+    //! rm-857 TUI arm: every explorer loop-analysis line carries the
+    //! same basis marker the CLI governance advice emits
+    //! (LoopCostBasis::disclosure) — the TUI must never surface a loop
+    //! signal whose dollar basis is hidden.
+
+    use super::*;
+    use agenttrace_core::{Diagnostics, LoopCost, LoopCostBasis, LoopFingerprint, Metrics};
+
+    fn session(basis: LoopCostBasis, groups: usize) -> Session {
+        Session {
+            name: String::from("loop-basis-probe"),
+            path: String::from("/tmp/loop-basis-probe.jsonl"),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                cost_estimated: 1.0,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics {
+                loop_cost: LoopCost {
+                    cost_basis: basis,
+                    total_loop_cost: 0.9,
+                    retry_events: 4,
+                    retry_cost: 0.0,
+                    tool_loop_cost: 0.0,
+                    loop_groups: groups,
+                    loop_type: String::from("identical"),
+                    turns: 5,
+                },
+                loop_fingerprints: vec![LoopFingerprint {
+                    tool_name: String::from("bash"),
+                    result_hash: String::new(),
+                    count: 3,
+                    first_index: 0,
+                    last_index: 2,
+                    severity: String::from("high"),
+                    detail: String::new(),
+                }],
+                ..Diagnostics::default()
+            },
+        }
+    }
+
+    #[test]
+    fn tools_preview_marks_synthetic_loop_cost() {
+        let out = tools_preview(&session(LoopCostBasis::Synthetic, 1), Language::En);
+        assert!(out.contains("synthetic estimate"), "rm-857: {out}");
+    }
+
+    #[test]
+    fn health_explanation_marks_the_loop_basis() {
+        let out = health_explanation(&session(LoopCostBasis::Synthetic, 1), Language::En);
+        assert!(out.contains("synthetic estimate"), "rm-857: {out}");
+    }
+
+    #[test]
+    fn primary_finding_marks_the_loop_basis() {
+        let out = primary_finding(&session(LoopCostBasis::Synthetic, 1), Language::En);
+        assert!(out.contains("synthetic estimate"), "rm-857: {out}");
+    }
+
+    #[test]
+    fn evidence_marks_the_loop_basis() {
+        let out = explorer_evidence(&session(LoopCostBasis::Synthetic, 1), Language::En);
+        assert!(
+            out.join("|").contains("synthetic estimate"),
+            "rm-857: {out:?}"
+        );
+    }
+
+    #[test]
+    fn priced_loops_carry_the_priced_marker() {
+        let out = tools_preview(&session(LoopCostBasis::Priced, 1), Language::En);
+        assert!(
+            out.contains("priced at session model rates"),
+            "rm-857: {out}"
+        );
+    }
+
+    #[test]
+    fn loopless_sessions_stay_unmarked() {
+        let out = tools_preview(&session(LoopCostBasis::Synthetic, 0), Language::En);
+        assert!(
+            !out.contains("synthetic estimate"),
+            "loopless must stay unmarked: {out}"
+        );
     }
 }
