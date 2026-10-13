@@ -143,6 +143,17 @@ struct Args {
     /// identifiers (alias and rate-match verification).
     #[arg(long = "test-match")]
     test_match: bool,
+    /// Show the plan-window quota view (rm-201): current 5h and 7d
+    /// rolling spend windows over the discovered corpus, TTL-correct
+    /// (a session's cost enters a window pro rata by its event
+    /// timestamps; warm-cache sessions by their start-to-end span),
+    /// with resets_at full-decay horizons and a corpus-cutoff
+    /// disclosure. `-f json` emits the stable `agenttrace.quota/1`
+    /// schema, the default a text summary. Limits are
+    /// disclosed-unknown: agenttrace reads no credentials and no plan
+    /// data. Corpus-scope — view filters do not apply.
+    #[arg(long)]
+    quota: bool,
     /// Report on the Claude Code statusline capture journal (candidate
     /// 53, cycle 7): limit-pressure windows, reset crossings, and
     /// per-session prompt-cache miss causes recorded by
@@ -660,6 +671,22 @@ fn run() -> anyhow::Result<()> {
         } else {
             render_model_pricing_list()
         };
+        let out = dispatch_sanitize(&args.format, out);
+        write_output(&args.output, &out)?;
+        write_stdout(&out)?;
+        return Ok(());
+    }
+
+    if args.quota {
+        // rm-201 (run 12a73275 cycle 4): the plan-window quota view —
+        // corpus-scope like the sessions rollups (rm-798): every
+        // discovered session contributes, because view filters would
+        // distort a spend window; the filter family is instead rejected
+        // loudly upstream by the applicability guards (`--range`,
+        // `--sample`, `--include-history`), which do not count `--quota`
+        // as a session report action for exactly that reason.
+        let sessions = load_sessions(&args)?;
+        let out = agenttrace_core::render_quota_view(&args.format, &sessions)?;
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &out)?;
         write_stdout(&out)?;
@@ -1241,6 +1268,7 @@ fn refuse_inapplicable_mcp_flags(args: &Args) {
     flag(args.list_models, "--list-models");
     flag(args.update_pricing, "--update-pricing");
     flag(args.test_match, "--test-match");
+    flag(args.quota, "--quota");
     flag(args.fetch, "--fetch");
     flag(args.weekly_budget.is_some(), "--weekly-budget");
     flag(args.budget, "--budget");
@@ -2744,6 +2772,7 @@ fn has_post_pricing_action(args: &Args) -> bool {
         || args.doctor
         || args.statusline_report
         || args.budget
+        || args.quota
 }
 
 /// Session-report actions only — the interactive-TUI fallback and the
@@ -2783,6 +2812,19 @@ fn has_session_action(args: &Args) -> bool {
 /// the combination loudly, in the same style as the format
 /// applicability guard in `main`.
 fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
+    // rm-201 (run 12a73275 cycle 4): `--quota` is corpus-scope — a
+    // spend window over every discovered session — so `--range` never
+    // applies to it. The generic guard below would let the flag
+    // through on the positional-path form (`<path>` counts as a
+    // session action), and load_sessions would then silently filter
+    // the corpus down (an old fixture under `--range 1d` renders an
+    // EMPTY quota, which looks exactly like a measured zero). Refuse
+    // the pair loudly before that, in this guard's own voice.
+    if args.range != "all" && args.quota {
+        bail!(
+            "--range does not apply to --quota: the quota view is corpus-scope (every discovered session bills the window); drop --range to see the full-corpus windows"
+        );
+    }
     if args.range != "all" && !has_session_action(args) {
         bail!(
             "--range requires a session report action (for example --overview, --sessions, --diagnostics, --waste, --search QUERY, --compare, or --audit); the interactive and utility views ignore it"
@@ -2910,6 +2952,10 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
         // dropped — exactly the action-hijack class rm-246 landed to
         // close. Registered here so the pair is a loud usage error.
         args.budget,
+        // rm-201 (run 12a73275 cycle 4): `--quota` joins the same
+        // registration contract — it is a report action, so pairing it
+        // with another one is the same hijack, not a combination.
+        args.quota,
         args.version,
         args.search
             .as_deref()
@@ -3129,6 +3175,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         waste: false,
         list_models: false,
         statusline_report: false,
+        quota: false,
         fetch: false,
         update_pricing: false,
         test_match: false,
@@ -3287,6 +3334,16 @@ mod tests {
             ("--budget", {
                 let mut a = base();
                 a.budget = true;
+                a
+            }),
+            ("--quota", {
+                // rm-201 (run 12a73275 cycle 4): the quota view registers
+                // like every report action — both side-effect guards ask
+                // "does an arm after me still need to run?" and a dropped
+                // `--clear-cache --quota` would print "cache cleared" and
+                // exit 0 with the quota action silently swallowed.
+                let mut a = base();
+                a.quota = true;
                 a
             }),
         ];

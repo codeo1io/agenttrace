@@ -352,6 +352,37 @@ and never reads a baseline document, so combining `--baseline` with
 `--compare` exits 1 with an error naming both flags rather than falling
 through to a misleading action error.
 
+### Quota view
+
+`--quota` answers "what have the plan windows cost so far?" from the local
+corpus alone (rm-201). It renders two ROLLING spend windows that end at the
+corpus cutoff — the newest event timestamp across the loaded sessions
+(cached sessions contribute their newest `session_end`) — a 5-hour window
+and a 7-day window, each with its `resets_at` full-decay horizon (the
+instant after which every event currently counted has aged out).
+
+Spend is TTL-correct per session: a session's cost enters a window pro
+rata — the share of its event timestamps inside the window for freshly
+parsed sessions, the share of its start-to-end span inside the window for
+warm-cache sessions (which do not carry event timestamps). The report
+discloses the attribution census and bills unplaceable rows at zero
+instead of guessing.
+
+The view never reads credentials and knows no plan limits, so limits are
+disclosed-unknown rather than invented; a config-provided limit is a
+planned extension. The provider's own window anchors (a first-use 5h
+start, a weekly 7am-UTC Monday reset) are equally unknowable without
+credentials — both windows are rolling and the JSON says so in
+`corpus.window_anchor`, and `corpus.cutoff_utc` discloses the corpus age
+so a stale corpus cannot masquerade as a live quota.
+
+`-f json` emits the stable `agenttrace.quota/1` schema; the default text
+lane summarizes the same numbers. The view is corpus-scope: `--range`,
+`--sample`, and the history flags do not apply to it and are refused
+loudly, and pairing `--quota` with any other report action is a usage
+error (every discovered session bills the window — view filters would
+distort it).
+
 ### Statusline capture
 
 Subscription limit windows (`5h`/`7d` usage and reset times) and Claude
@@ -419,6 +450,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes |
 | `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |
 | `--test-match` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification) |
+| `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range` and the other view filters do not apply and are refused loudly |
 | `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
 | `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
 | `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
