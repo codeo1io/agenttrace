@@ -201,6 +201,13 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
     dirs.extend(open_code_known_session_dirs(&home));
     dirs.extend(cline_known_session_dirs(&home));
     dirs.extend(pi_family_known_session_dirs(&home));
+    // rm-1031: Claude Science (beta) homes — SQLite-backed roots whose
+    // corpus is loaded by the claude_science lane; the registry entries
+    // keep the doctor's directory census and the file-walk skip in
+    // sync with where the databases live.
+    dirs.extend(crate::claude_science::claude_science_known_session_dirs(
+        &home,
+    ));
     dirs
 }
 
@@ -1087,6 +1094,13 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.ends_with(".lock") {
         return false;
     }
+    // rm-1032: Cline sess-v transcript bodies (`<id>.messages.json`)
+    // are session units through their PARENT directory — `is_cline_task_dir`
+    // admits the dir — so the body itself is never a standalone session
+    // file. Both walks and the cached listing replay go through here.
+    if name.ends_with(".messages.json") {
+        return false;
+    }
     name.ends_with(".jsonl") || name.ends_with(".json")
 }
 
@@ -1119,6 +1133,22 @@ fn is_cline_task_dir(path: &Path) -> bool {
     path.join("api_conversation_history.json").is_file()
         || path.join("ui_messages.json").is_file()
         || path.join("task_metadata.json").is_file()
+        // rm-1032: the sess-v storage generation keeps the same task-dir
+        // shape but stores the transcript as `<dir>.messages.json` (ccusage
+        // PR #1642: `tasks/<id>/<id>.messages.json`, CLI `data/sessions/<id>/`).
+        || is_cline_sessv_dir(path)
+}
+
+/// rm-1032: recognize a Cline sess-v session dir by its documented
+/// naming — the transcript body is named after the directory that
+/// holds it. A bare `*.messages.json` anywhere else stays unclaimed
+/// (the file-name exclusion in `is_session_file_name` keeps bodies out
+/// of the walk; the dir is the session unit).
+fn is_cline_sessv_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    path.join(format!("{name}.messages.json")).is_file()
 }
 
 fn is_skipped_session_dir(path: &Path) -> bool {
@@ -1247,7 +1277,7 @@ fn open_code_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
 }
 
 fn cline_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
-    vec![KnownSessionDir {
+    let mut dirs = vec![KnownSessionDir {
         name: "Cline".to_string(),
         path: user_config_dir(home)
             .join("Code")
@@ -1255,7 +1285,35 @@ fn cline_known_session_dirs(home: &Path) -> Vec<KnownSessionDir> {
             .join("globalStorage")
             .join("saoudrizwan.claude-dev")
             .join("tasks"),
-    }]
+    }];
+    // rm-1032: the standalone Cline homes (ccusage PR #1642):
+    // `${CLINE_HOME:-~/.cline}` — the Cline CLI and the JetBrains
+    // plugin share `~/.cline`, with historical sessions under
+    // `data/sessions`; `~/.config/cline` is the XDG-config home. The
+    // env override accepts a comma-separated root list like the
+    // reference collector. Registered only when present (the
+    // pi_family precedent) so hosts without the CLI see no new
+    // always-absent doctor rows.
+    let mut seen_paths: Vec<PathBuf> = dirs.iter().map(|dir| dir.path.clone()).collect();
+    let mut push_existing = |name: &str, path: PathBuf| {
+        if path.is_dir() && !seen_paths.contains(&path) {
+            seen_paths.push(path.clone());
+            dirs.push(KnownSessionDir {
+                name: name.to_string(),
+                path,
+            });
+        }
+    };
+    match std::env::var("CLINE_HOME") {
+        Ok(roots) if !roots.trim().is_empty() => {
+            for root in roots.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                push_existing("Cline CLI", PathBuf::from(root));
+            }
+        }
+        _ => push_existing("Cline CLI", home.join(".cline")),
+    }
+    push_existing("Cline XDG", user_config_dir(home).join("cline"));
+    dirs
 }
 
 fn user_config_dir(home: &Path) -> PathBuf {
