@@ -563,3 +563,26 @@ fn pi_compaction_usage_sentinel_counts_tokens_cost_and_disclosure() {
         1
     );
 }
+
+/// rm-499: `cacheWrite1h` (the 1h-tier cache write, present in 77% of
+/// the live fleet corpus) is recognized as its own canonical class and
+/// disclosed via `pi_cache_write_1h_blocks`. Pricing stays gated: the
+/// 1h tier feeds no rate and never inflates the 5m cache-write total.
+#[test]
+fn pi_cache_write_1h_blocks_disclosed() {
+    let session = parse_fixture_session(
+        "pi-cachewrite-1h",
+        "tests/fixtures/pi-cachewrite-1h/journal.jsonl",
+    );
+    let counters = &session.metrics.disclosure_counters;
+    assert_eq!(
+        counters
+            .get("pi_cache_write_1h_blocks")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "1h-tier cache-write block must be disclosed"
+    );
+    // gated: only the 5m tier reaches the cache-write token total.
+    assert_eq!(session.metrics.tokens_cache_w, 200);
+}

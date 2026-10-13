@@ -1237,3 +1237,101 @@ fn present_zero_pi_usage_counts_as_measured_zeros_on_both_arms() {
         "absent usage never flags"
     );
 }
+
+/// rm-1052: a well-formed recorded $0 (gateway unpriced passthrough)
+/// must not masquerade as a free session. The recorded number stays
+/// authoritative — cost stays $0.0000 — but the suppressed catalog
+/// estimate is disclosed through the counters: 100k in / 50k out on
+/// claude-sonnet-4-5 would have priced at 100000*3/1e6 + 50000*15/1e6
+/// = $1.05 → 105 cents suppressed.
+#[test]
+fn recorded_zero_discloses_suppressed_catalog_estimate() {
+    let session = parsed(
+        "pi-cost-zero.jsonl",
+        r#"{"id":"s1","timestamp":"2026-10-12T10:00:00Z","type":"session","version":3,"cwd":"/tmp","titleSource":"user"}
+{"timestamp":"2026-10-12T10:00:01Z","type":"model_change","model":"claude-sonnet-4-5"}
+{"timestamp":"2026-10-12T10:00:02Z","type":"message","message":{"role":"user","content":"hi"}}
+{"timestamp":"2026-10-12T10:00:05Z","type":"message","message":{"role":"assistant","usage":{"input":100000,"output":50000,"cost":{"total":0.0}},"content":[{"type":"text","text":"yo"}]}}"#,
+    );
+    // recorded wins: the number is unchanged, never repriced.
+    assert_eq!(session.metrics.cost_estimated, 0.0);
+    let counters = &session.metrics.disclosure_counters;
+    assert_eq!(
+        counters
+            .get("recorded_cost_zero_blocks")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "gateway-unpriced block (recorded $0 on priced tokens) must be counted"
+    );
+    assert_eq!(
+        counters
+            .get("recorded_cost_suppressed_estimate_cents")
+            .copied()
+            .unwrap_or(0),
+        105,
+        "suppressed catalog estimate must be disclosed in cents"
+    );
+}
+
+/// rm-1052 (negative control): when the recorded cost matches the
+/// catalog estimate there is no divergence and nothing is disclosed —
+/// the counter must not fire on honest gateways.
+#[test]
+fn recorded_cost_matching_catalog_discloses_nothing() {
+    // 10k in / 10k out on claude-sonnet-4-5 = 10000*3/1e6 + 10000*15/1e6
+    // = $0.18 recorded.
+    let session = parsed(
+        "pi-recorded-match.jsonl",
+        r#"{"id":"s2","timestamp":"2026-10-12T10:00:00Z","type":"session","version":3,"cwd":"/tmp","titleSource":"user"}
+{"timestamp":"2026-10-12T10:00:01Z","type":"model_change","model":"claude-sonnet-4-5"}
+{"timestamp":"2026-10-12T10:00:02Z","type":"message","message":{"role":"user","content":"hi"}}
+{"timestamp":"2026-10-12T10:00:05Z","type":"message","message":{"role":"assistant","usage":{"input":10000,"output":10000,"cost":{"total":0.18}},"content":[{"type":"text","text":"yo"}]}}"#,
+    );
+    let counters = &session.metrics.disclosure_counters;
+    assert_eq!(
+        counters
+            .get("recorded_cost_suppressed_estimate_cents")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "honest gateway: no divergence disclosure"
+    );
+    assert_eq!(
+        counters
+            .get("recorded_cost_zero_blocks")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+}
+
+/// rm-499 (review 37f970af F3): the standalone `type:"usage"` arm is
+/// the third oh_my_pi_usage call site — its 1h-tier blocks must count
+/// into pi_cache_write_1h_blocks exactly like the message arm's, or a
+/// journal whose only 1h traffic rides standalone entries (warmup
+/// counters, per-kind disclosures) stays silent on the 1h tier.
+#[test]
+fn pi_cache_write_1h_counts_standalone_usage_entries() {
+    let session = parsed(
+        "pi-1h-standalone.jsonl",
+        r#"{"id":"s3","timestamp":"2026-10-13T10:00:00Z","type":"session","version":3,"cwd":"/tmp","titleSource":"user"}
+{"timestamp":"2026-10-13T10:00:01Z","type":"model_change","model":"claude-sonnet-4-5"}
+{"timestamp":"2026-10-13T10:00:02Z","type":"usage","kind":"warmup","usage":{"input":1000,"output":100,"cacheWrite1h":500}}
+{"timestamp":"2026-10-13T10:00:05Z","type":"message","message":{"role":"assistant","usage":{"input":100000,"output":50000,"cacheWrite1h":300},"content":[{"type":"text","text":"yo"}]}}"#,
+    );
+    let counters = &session.metrics.disclosure_counters;
+    assert_eq!(
+        counters.get("pi_usage_entry:warmup").copied().unwrap_or(0),
+        1,
+        "standalone entry keeps its per-kind disclosure"
+    );
+    assert_eq!(
+        counters
+            .get("pi_cache_write_1h_blocks")
+            .copied()
+            .unwrap_or(0),
+        2,
+        "BOTH arms must count: standalone usage entry + assistant message (review F3: the standalone arm was missed)"
+    );
+}

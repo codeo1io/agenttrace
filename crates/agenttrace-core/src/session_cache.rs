@@ -5,7 +5,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 63;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+// Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
+// cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
+// accounting', rm-1052 LEAD + rm-499, conflict case
+// 8fbcfcfd5e4d440b8e2890456aaacede, candidate 9a881b9 @ base 82e23b9):
+// a recorded $0 block — gateway unpriced passthrough — used to
+// masquerade as a free session while silently suppressing the catalog
+// estimate (now disclosed as recorded_cost_suppressed_estimate_cents
+// + recorded_cost_zero_blocks; the recorded number stays
+// authoritative — disclosure, never repricing), and pi's 1h-tier
+// cacheWrite1h gained its own cache_write_1h_tokens class with the
+// pi_cache_write_1h_blocks counter at all three oh_my_pi_usage call
+// sites. Warm pre-rung entries keep serving the silent $0 and drop
+// the 1h-tier class (rm-230 convention: parser-semantics changes
+// that alter reported totals for unchanged files bump the schema so
+// cached sessions regenerate under corrected accounting). SEAM: the
+// run minted its bump as 60 -> 61 straight at its base 82e23b9,
+// below the frontier — this tree had landed 62 mid-run (run
+// 4309a268's gemini chats rung, which deliberately left 61 free for
+// sibling mints) and 63 after it (run b5affead's
+// agent/summary-name rung, re-based at conflict case
+// fbe92e4b80db45d0a2fb2b5c020b81a4) — so this integration re-bases
+// the rung onto this tree's already-advanced ceiling 63 as
+// 63 -> 64 per the landed-rung-keeps-numeral convention
+// (c7c07e48/58fbbd6c/7762d54b precedent), one invalidation either
+// way; 61 stays a permanently free rung on the ladder. The SQLite
+// snapshot stays 12 — this run minted no snapshot rung, and the
+// landed 12 (run b5affead, same lane) remains the ceiling. Entries
+// regenerate once on next scan.
 // Bumped 62 -> 63 (integration of run b5affead89448d8a664fc699fe42c49
 // cycle 2 'consume the new fields, close the silent gaps', rm-991,
 // conflict case fbe92e4b80db45d0a2fb2b5c020b81a4, candidate 52ddee6 @
