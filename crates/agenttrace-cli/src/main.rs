@@ -335,6 +335,35 @@ fn main() {
     }
 }
 
+/// rm-558: flags that only mean something on the positional report lane
+/// must fail loudly when an offline keyword lane dispatches early — the
+/// keyword arms in `run` would otherwise swallow them silently.
+fn validate_keyword_lane_flags(
+    path: &Option<String>,
+    fetch: bool,
+    statusline_report: bool,
+) -> anyhow::Result<()> {
+    let Some(keyword) = path.as_deref() else {
+        return Ok(());
+    };
+    if statusline_report || !fetch {
+        return Ok(());
+    }
+    match keyword {
+        "statusline" => bail!(
+            "--fetch has no effect before the `statusline` keyword: the \
+             statusline host command is fully offline. Drop the keyword to \
+             run the fetch-bearing report lane"
+        ),
+        "mcp" => bail!(
+            "--fetch has no effect before the `mcp` keyword: the MCP server \
+             is stdio-only and fully offline. Drop the keyword to run the \
+             fetch-bearing report lane"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn run() -> anyhow::Result<()> {
     // rm-247: flags after the positional session path used to be
     // silently dropped by the Go-flag shim; reject them loudly
@@ -360,6 +389,11 @@ fn run() -> anyhow::Result<()> {
     // otherwise `agenttrace --statusline-report statusline` runs the host and
     // appends a bogus capture to the real journal before the report renders.
     if args.path.as_deref() == Some("statusline") && !args.statusline_report {
+        // rm-558: `--fetch` only means something on the positional
+        // report lane. Swallowed silently here it would look honored
+        // while the host command (fully offline) ignored it — the
+        // keyword-shadowing class rm-573 closed for report flags.
+        validate_keyword_lane_flags(&args.path, args.fetch, args.statusline_report)?;
         return agenttrace_core::run_statusline_host();
     }
     // `agenttrace upstream` is a repository status host command (rm-024,
@@ -396,6 +430,10 @@ fn run() -> anyhow::Result<()> {
     // never renders; the same keyword-shadowing class rm-573 closed for
     // statusline/upstream, caught for `mcp` at integration of rm-455).
     if args.path.as_deref() == Some("mcp") && !args.statusline_report {
+        // rm-558: same loud pre-flight as the statusline keyword — the
+        // MCP server is offline by design, so --fetch could only be a
+        // silently-dropped typo for the report lane.
+        validate_keyword_lane_flags(&args.path, args.fetch, args.statusline_report)?;
         // rm-781: this arm used to reach `serve()` before the CLI's
         // layered configuration was resolved, so file-layer pricing
         // and history knobs (user/project config.toml, `--config`,
@@ -1978,7 +2016,7 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
             preserve_history: args.preserve_history,
         },
     );
-    let sessions = report.sessions.clone();
+    let mut sessions = report.sessions.clone();
     // rm-753: SQLite-backed ingestion failures are disclosed, never
     // silently swallowed — a discovered-but-unreadable agent database
     // or a dropped session row prints one stderr note so report runs
@@ -2053,6 +2091,10 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // admitted) — loud BEFORE any bytes are staged. rm-912: the walk
     // lane also contributes its attempted-but-unparseable journals —
     // overwriting one would destroy the user's only copy.
+    // rm-402: reconcile codex multi-agent replay families on the assembled
+    // corpus — discovery lanes see parent and child rollouts together, and a
+    // replayed prefix billed inside both would double the family's usage.
+    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
     ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
     Ok((sessions, Some(report)))
 }
@@ -2209,6 +2251,10 @@ fn prepare_explicit_sessions(
     if args.include_history {
         agenttrace_core::merge_preserved_history(&mut sessions);
     }
+    // rm-402: codex MultiAgent V2 replay families must be reconciled
+    // wherever a full corpus assembles — the explicit lane can load a
+    // parent/child pair via repeated positional files.
+    agenttrace_core::reconcile_codex_multiagent_replays(&mut sessions);
     filter_cli_sessions(sessions, args)
 }
 
@@ -5025,6 +5071,37 @@ mod tests {
         args.overview = true;
         args.compare = false;
         validate_gate_thresholds(&args).expect("valid limits pass");
+    }
+
+    #[test]
+    fn fetch_before_offline_keywords_fails_loudly() {
+        // rm-558: `--fetch statusline` / `--fetch mcp` would previously
+        // dispatch the offline keyword lane and silently swallow the flag.
+        let err = super::validate_keyword_lane_flags(&Some("statusline".into()), true, false)
+            .expect_err("--fetch + statusline keyword must fail");
+        assert!(
+            err.to_string().contains("--fetch") && err.to_string().contains("statusline"),
+            "loud, named error; got: {err}"
+        );
+        let err = super::validate_keyword_lane_flags(&Some("mcp".into()), true, false)
+            .expect_err("--fetch + mcp keyword must fail");
+        assert!(
+            err.to_string().contains("--fetch") && err.to_string().contains("mcp"),
+            "loud, named error; got: {err}"
+        );
+    }
+
+    #[test]
+    fn keyword_lane_guard_stays_quiet_when_it_must() {
+        // No keyword, no fetch, or the report lane winning: all quiet.
+        assert!(super::validate_keyword_lane_flags(&None, true, false).is_ok());
+        assert!(
+            super::validate_keyword_lane_flags(&Some("statusline".into()), false, false).is_ok()
+        );
+        assert!(super::validate_keyword_lane_flags(&Some("statusline".into()), true, true).is_ok());
+        // The upstream keyword legitimately consumes --fetch (network is
+        // its purpose), so it must stay quiet.
+        assert!(super::validate_keyword_lane_flags(&Some("upstream".into()), true, false).is_ok());
     }
 
     #[test]

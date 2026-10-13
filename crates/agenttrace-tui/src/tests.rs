@@ -2729,3 +2729,72 @@ fn load_summary_discloses_unlinked_subagents_zero_count_clean() {
         load_summary_line(&app)
     );
 }
+
+#[test]
+fn tui_reconciles_replay_families_and_discloses_them() {
+    // rm-402 TUI arm (review af521003 F5): the TUI loads through the same
+    // core loaders the CLI does, but never ran the replay reconciliation —
+    // it rendered naive double-counted family totals while every CLI view
+    // showed reconciled numbers. apply_loaded_sessions now reconciles
+    // before derived state, and the Ready summary discloses adjusted
+    // children 0-count-clean (rm-904 clause pattern).
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../agenttrace-core/tests/fixtures/codex-multiagent-v2");
+    let mut family = Vec::new();
+    for name in ["child.jsonl", "parent.jsonl"] {
+        let path = dir.join(name);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        family.push(
+            agenttrace_core::parse_raw_session("codex", path.to_str().unwrap(), &raw).unwrap(),
+        );
+    }
+    assert!(
+        family.iter().map(|s| s.metrics.tokens_input).sum::<i64>() == 3_100,
+        "naive family total before reconciliation"
+    );
+    let mut app = App::new(Vec::new(), "test", None);
+    app.apply_loaded_sessions(
+        LoadReport {
+            sessions: family,
+            discovered: 2,
+            parsed: 2,
+            ..LoadReport::default()
+        },
+        false,
+    );
+    assert_eq!(app.load_state.phase, LoadPhase::Ready);
+    // The substance: the TUI's own session list carries the reconciled
+    // family total (1,700), not the naive 3,100.
+    assert_eq!(
+        app.sessions
+            .iter()
+            .map(|s| s.metrics.tokens_input)
+            .sum::<i64>(),
+        1_700,
+        "TUI must show reconciled family totals"
+    );
+    assert_eq!(app.load_state.replay_children_adjusted, 1);
+    assert!(
+        load_summary_line(&app).contains("replay-adjusted"),
+        "Ready summary must disclose adjusted children: {}",
+        load_summary_line(&app)
+    );
+
+    // 0-count-clean: a reload without a family carries no clause.
+    let solo = session("solo", "pi", "m", 90, 0.1, "rg");
+    app.apply_loaded_sessions(
+        LoadReport {
+            sessions: vec![solo],
+            discovered: 1,
+            parsed: 1,
+            ..LoadReport::default()
+        },
+        false,
+    );
+    assert_eq!(app.load_state.replay_children_adjusted, 0);
+    assert!(
+        !load_summary_line(&app).contains("replay-adjusted"),
+        "family-free corpus must not carry the clause: {}",
+        load_summary_line(&app)
+    );
+}

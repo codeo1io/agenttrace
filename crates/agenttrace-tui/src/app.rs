@@ -8,9 +8,9 @@ use agenttrace_core::{
     delivery_evidence_with_git, format_cost, format_tokens, inspect_first, inspect_reason,
     load_cached_sessions_from_cache, load_session_cache, load_sessions_with_progress,
     load_sessions_with_progress_from_cache_mode, mcp_governance, needs_attention, project_name,
-    recommendations, resolve_project, session_capability, session_cost_audit,
-    session_matches_time_range, total_tokens, ContextTrend, CostAudit, DataHealth,
-    DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
+    recommendations, reconcile_codex_multiagent_replays, resolve_project, session_capability,
+    session_cost_audit, session_matches_time_range, total_tokens, ContextTrend, CostAudit,
+    DataHealth, DeliveryEvidence, LoadOptions, LoadProgress, LoadReport, McpGovernance, Overview,
     ProjectIdentity, Recommendation, ReportLanguage, Session, SessionCache, TimeRange,
 };
 #[cfg(test)]
@@ -380,6 +380,12 @@ struct LoadState {
     /// so the summary line can disclose it; 0-count-clean (the
     /// clause renders only when non-zero).
     unlinked_subagents: usize,
+    /// rm-402 (review af521003 F5): codex MultiAgent V2 replay children
+    /// reconciled onto their parent during THIS load — the TUI used to
+    /// render naive double-counted family totals while every CLI view
+    /// showed reconciled numbers. 0-count-clean, same clause pattern
+    /// as `unlinked_subagents`.
+    replay_children_adjusted: usize,
     cache_state: String,
     sources: Vec<(String, usize)>,
     showing_cached: bool,
@@ -397,7 +403,13 @@ enum LoadPhase {
 
 impl App {
     fn new(sessions: Vec<Session>, source_label: &str, reload_dir: Option<String>) -> Self {
-        let sessions = canonical_sessions(&sessions);
+        let mut sessions = canonical_sessions(&sessions);
+        // rm-402 (review af521003 F5): the boot path (cache-loaded
+        // sessions via `new_loading`) assembles the same corpus the
+        // CLI reconciles before any view — replay families must
+        // reconcile here too, or the TUI rendered double-counted
+        // family totals until the first reload landed.
+        let _replay = reconcile_codex_multiagent_replays(&mut sessions);
         let overview = compute_overview(&sessions);
         let project_identities = sessions
             .iter()
@@ -979,6 +991,7 @@ impl App {
             // rm-904: reset per load — the disclosure clause belongs to
             // the report that lands, not the previous one.
             unlinked_subagents: 0,
+            replay_children_adjusted: 0,
             cache_state,
             sources: Vec::new(),
             showing_cached: !force && !self.sessions.is_empty(),
@@ -1102,6 +1115,14 @@ impl App {
         // load state; the summary line discloses it when non-zero.
         self.load_state.unlinked_subagents = report.unlinked_subagents;
         self.sessions = report.sessions;
+        // rm-402 (review af521003 F5): the reload path lands the fresh
+        // corpus here — reconcile replay families before any derived
+        // state is rebuilt, the same pass the CLI runs after loading.
+        // Reconciliation never touches non-family sessions, so every
+        // replay-free corpus is byte-identical before/after.
+        let replay = reconcile_codex_multiagent_replays(&mut self.sessions);
+        // Reset per load with the report that landed (rm-904 pattern).
+        self.load_state.replay_children_adjusted = replay.children_adjusted;
         self.sessions
             .sort_by(|left, right| compare_sessions(left, right, SortKey::Recent, true));
         // rm-038: the session list was replaced wholesale — identities are
