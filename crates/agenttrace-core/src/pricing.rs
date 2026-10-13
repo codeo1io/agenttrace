@@ -17,7 +17,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-13";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -81,6 +81,29 @@ pub struct Price {
     pub cw_flex: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cr_flex: Option<f64>,
+    /// Priority-tier rates (LiteLLM `*_cost_per_token_priority`, rm-164):
+    /// the rate a turn that ran on `service_tier: "priority"` bills at.
+    /// Same skip/absent semantics as the flex slots — a priority turn of
+    /// a priority-less row bills at the standard rates, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_priority: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_priority: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw_priority: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr_priority: Option<f64>,
+    /// Ultrafast-tier rates (LiteLLM `*_cost_per_token_ultrafast`, rm-164
+    /// 2026-10-13 addendum): the rate a turn that ran on OpenAI's
+    /// `ultrafast` service tier bills at. Same skip/absent semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_ultrafast: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ultrafast: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw_ultrafast: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr_ultrafast: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,37 +154,128 @@ struct LiteLlmModel {
     cache_write_cost_flex: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost_flex")]
     cache_read_cost_flex: Option<f64>,
+    // Priority- and ultrafast-tier rates (rm-164; the 2026-10-13
+    // snapshot refresh carries them). The `*_above_272k_tokens_*`
+    // long-context variants are deliberately NOT ingested, matching
+    // the flex rule above.
+    #[serde(default, rename = "input_cost_per_token_priority")]
+    input_cost_priority: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_priority")]
+    output_cost_priority: Option<f64>,
+    #[serde(default, rename = "cache_creation_input_token_cost_priority")]
+    cache_write_cost_priority: Option<f64>,
+    #[serde(default, rename = "cache_read_input_token_cost_priority")]
+    cache_read_cost_priority: Option<f64>,
+    #[serde(default, rename = "input_cost_per_token_ultrafast")]
+    input_cost_ultrafast: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_ultrafast")]
+    output_cost_ultrafast: Option<f64>,
+    #[serde(default, rename = "cache_creation_input_token_cost_ultrafast")]
+    cache_write_cost_ultrafast: Option<f64>,
+    #[serde(default, rename = "cache_read_input_token_cost_ultrafast")]
+    cache_read_cost_ultrafast: Option<f64>,
 }
 
 pub fn lookup_price(model: &str) -> Price {
     lookup_price_tiered(model, None)
 }
 
-/// rm-610: resolve a model's rates for the service tier the turn
-/// actually ran on. `Some("flex")` bills at the entry's `*_flex`
-/// slots when the catalog row carries them — input AND output must
-/// both be present, and a missing cache slot falls back to that
-/// standard rate — while every other tier (None, "default",
-/// "priority", ...) bills at the standard rates. A model without
-/// flex rates bills flex turns at the standard rates: that is the
-/// published behavior (codeburn #1642), not a guess.
+/// rm-610/rm-164: resolve a model's rates for the service tier the
+/// turn actually ran on. `Some("flex"/"priority"/"ultrafast")` bills
+/// at the entry's matching tier slots when the catalog row carries
+/// them — input AND output must both be present, and a missing cache
+/// slot falls back to that standard rate — while every other tier
+/// (None, "default", ...) bills at the standard rates. `Some("fast")`
+/// bills at the published per-model fast multiplier applied to the
+/// standard rates (LiteLLM publishes no `*_fast` per-token fields
+/// anywhere; fast is multiplier-only — ccusage PR #1855). A model
+/// without the tier's slots bills that tier at the standard rates:
+/// that is the published behavior (codeburn #1642), not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
     let model = resolve_alias(model, &catalog.aliases);
     let mut price = lookup_price_in(&model, &catalog.entries);
-    if service_tier == Some("flex") {
-        if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
-            price.input = input;
-            price.output = output;
-            if let Some(cw) = price.cw_flex {
-                price.cw = cw;
-            }
-            if let Some(cr) = price.cr_flex {
-                price.cr = cr;
+    // Journals spell the tier "ultrafast"/"Ultrafast"/"FLEX " —
+    // normalize before matching so spelling can never split the bill.
+    let tier = service_tier.unwrap_or("").trim().to_ascii_lowercase();
+    match tier.as_str() {
+        "flex" => {
+            let (input, output, cw, cr) = (
+                price.input_flex,
+                price.output_flex,
+                price.cw_flex,
+                price.cr_flex,
+            );
+            apply_tier_slots(&mut price, input, output, cw, cr);
+        }
+        "priority" => {
+            let (input, output, cw, cr) = (
+                price.input_priority,
+                price.output_priority,
+                price.cw_priority,
+                price.cr_priority,
+            );
+            apply_tier_slots(&mut price, input, output, cw, cr);
+        }
+        "ultrafast" => {
+            let (input, output, cw, cr) = (
+                price.input_ultrafast,
+                price.output_ultrafast,
+                price.cw_ultrafast,
+                price.cr_ultrafast,
+            );
+            apply_tier_slots(&mut price, input, output, cw, cr);
+        }
+        "fast" => {
+            if let Some(multiplier) = fast_multiplier(&model) {
+                price.input *= multiplier;
+                price.output *= multiplier;
+                price.cw *= multiplier;
+                price.cr *= multiplier;
             }
         }
+        _ => {}
     }
     price
+}
+
+/// rm-610: the flex apply rule. rm-164 generalized it to every tier
+/// the bundle carries slots for — kept as its own fn so the rule has
+/// exactly one home: input AND output both present, missing cache
+/// slots fall back to the standard rates, and an absent pair bills
+/// standard (never zero).
+fn apply_tier_slots(
+    price: &mut Price,
+    input: Option<f64>,
+    output: Option<f64>,
+    cw: Option<f64>,
+    cr: Option<f64>,
+) {
+    if let (Some(input), Some(output)) = (input, output) {
+        price.input = input;
+        price.output = output;
+        if let Some(cw) = cw {
+            price.cw = cw;
+        }
+        if let Some(cr) = cr {
+            price.cr = cr;
+        }
+    }
+}
+
+/// rm-164 (2026-10-13): LiteLLM publishes NO `*_fast` per-token
+/// fields anywhere (2026-10-13 full-catalog census, all keys) — fast
+/// is published per-model as a multiplier on the standard rates.
+/// ccusage PR #1855 (merged 2026-10-10) pins the table: GPT-6 Astra,
+/// GPT-6 Sol, GPT-6.1 Sol and GPT-6 Luna fast = 2x standard —
+/// corroborated by LiteLLM listing exactly those rows' `*_priority`
+/// rates at 2x. Per-model on purpose, never a flat table; a model
+/// without an entry bills fast at the standard rates.
+fn fast_multiplier(model: &str) -> Option<f64> {
+    match model {
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna" => Some(2.0),
+        _ => None,
+    }
 }
 
 pub fn has_specific_price(model: &str) -> bool {
@@ -364,15 +478,24 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         );
         // rm-610: a None slot must hash differently from Some(value) —
         // the flag byte keeps gained/lost flex pricing from colliding
-        // with a value change.
-        for flex in [
+        // with a value change. rm-164: priority and ultrafast slots
+        // hash under the same rule.
+        for tier in [
             price.input_flex,
             price.output_flex,
             price.cw_flex,
             price.cr_flex,
+            price.input_priority,
+            price.output_priority,
+            price.cw_priority,
+            price.cr_priority,
+            price.input_ultrafast,
+            price.output_ultrafast,
+            price.cw_ultrafast,
+            price.cr_ultrafast,
         ] {
-            hash = fnv1a(&[flex.is_some() as u8], hash);
-            if let Some(value) = flex {
+            hash = fnv1a(&[tier.is_some() as u8], hash);
+            if let Some(value) = tier {
                 hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
             }
         }
@@ -609,6 +732,8 @@ pub fn render_test_match() -> String {
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "openai/gpt-4.1",
         "gpt-5.6",
+        "gpt-6-astra",
+        "gpt-6-luna",
         "gpt-4.1-mini-2025-04-14",
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
@@ -631,6 +756,32 @@ pub fn render_test_match() -> String {
                 out_flex,
                 p.cw_flex.unwrap_or(p.cw),
                 p.cr_flex.unwrap_or(p.cr)
+            ));
+        }
+        // rm-164: disclose the priority/ultrafast rates the same way,
+        // plus the fast multiplier where one is published, so the rate
+        // any service tier bills at is answerable from this probe.
+        if let (Some(in_priority), Some(out_priority)) = (p.input_priority, p.output_priority) {
+            out.push_str(&format!(
+                "      priority: in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+                in_priority,
+                out_priority,
+                p.cw_priority.unwrap_or(p.cw),
+                p.cr_priority.unwrap_or(p.cr)
+            ));
+        }
+        if let (Some(in_uf), Some(out_uf)) = (p.input_ultrafast, p.output_ultrafast) {
+            out.push_str(&format!(
+                "      ultrafast: in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+                in_uf,
+                out_uf,
+                p.cw_ultrafast.unwrap_or(p.cw),
+                p.cr_ultrafast.unwrap_or(p.cr)
+            ));
+        }
+        if let Some(multiplier) = fast_multiplier(model) {
+            out.push_str(&format!(
+                "      fast: {multiplier}x the standard rates (per-model published multiplier)\n"
             ));
         }
     }
@@ -1082,12 +1233,21 @@ fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
     }
     // rm-610: the flex slots are Option-valued — absent means "no
     // published flex rate"; present must still be finite and
-    // non-negative like every other rate.
+    // non-negative like every other rate. rm-164: priority and
+    // ultrafast slots follow the same rule.
     for (field, value) in [
         ("input_flex", price.input_flex),
         ("output_flex", price.output_flex),
         ("cw_flex", price.cw_flex),
         ("cr_flex", price.cr_flex),
+        ("input_priority", price.input_priority),
+        ("output_priority", price.output_priority),
+        ("cw_priority", price.cw_priority),
+        ("cr_priority", price.cr_priority),
+        ("input_ultrafast", price.input_ultrafast),
+        ("output_ultrafast", price.output_ultrafast),
+        ("cw_ultrafast", price.cw_ultrafast),
+        ("cr_ultrafast", price.cr_ultrafast),
     ] {
         if let Some(value) = value {
             if !value.is_finite() {
@@ -1129,9 +1289,11 @@ struct ConvertedCatalog {
     providers: BTreeMap<String, String>,
 }
 
-/// Per-token flex rate -> per-million flex slot, dropping absent,
-/// zero, negative, non-finite, and overflow-scaling values (rm-610).
-fn flex_slot(rate: Option<f64>) -> Option<f64> {
+/// Per-token tier rate -> per-million tier slot, dropping absent,
+/// zero, negative, non-finite, and overflow-scaling values. rm-610
+/// minted it for flex; rm-164 applies the same rule to priority and
+/// ultrafast.
+fn tier_slot(rate: Option<f64>) -> Option<f64> {
     rate.filter(|rate| rate.is_finite() && *rate > 0.0)
         .map(|rate| rate * 1e6)
         .filter(|scaled| scaled.is_finite())
@@ -1176,10 +1338,20 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             // flex field means "no published flex rate", never "flex
             // is free". `flex_slot` filters after scaling so a hostile
             // near-f64-max per-token flex cost cannot survive as inf.
-            input_flex: flex_slot(model.input_cost_flex),
-            output_flex: flex_slot(model.output_cost_flex),
-            cw_flex: flex_slot(model.cache_write_cost_flex),
-            cr_flex: flex_slot(model.cache_read_cost_flex),
+            input_flex: tier_slot(model.input_cost_flex),
+            output_flex: tier_slot(model.output_cost_flex),
+            cw_flex: tier_slot(model.cache_write_cost_flex),
+            cr_flex: tier_slot(model.cache_read_cost_flex),
+            // rm-164: priority and ultrafast slots ride the same
+            // scale-and-filter rule as flex.
+            input_priority: tier_slot(model.input_cost_priority),
+            output_priority: tier_slot(model.output_cost_priority),
+            cw_priority: tier_slot(model.cache_write_cost_priority),
+            cr_priority: tier_slot(model.cache_read_cost_priority),
+            input_ultrafast: tier_slot(model.input_cost_ultrafast),
+            output_ultrafast: tier_slot(model.output_cost_ultrafast),
+            cw_ultrafast: tier_slot(model.cache_write_cost_ultrafast),
+            cr_ultrafast: tier_slot(model.cache_read_cost_ultrafast),
         };
         // Hostile or overflowing catalog rates must not reach costing:
         // the 1e6 scaling can turn a near-f64-max per-token cost into
@@ -2637,10 +2809,12 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // The 1M-window default class (rm-231's motivating case); the
+        // 2026-10-13 catalog (rm-176 refresh) carries Claude Sonnet
+        // 4.5 at the vendor's 200k input window.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 
@@ -3007,7 +3181,7 @@ mod tests {
         // Codeburn #1642 published numbers for GPT-5.6: flex is half.
         assert_eq!((flex.input, flex.output), (2.0, 10.0));
         assert!(near(flex.cw, 2.5) && near(flex.cr, 0.2));
-        for tier in ["default", "priority", "fast", "scale", "garbage"] {
+        for tier in ["default", "scale", "garbage"] {
             let priced = lookup_price_tiered("gpt-5.6", Some(tier));
             assert_eq!(
                 (priced.input, priced.output),
@@ -3019,6 +3193,49 @@ mod tests {
         let no_flex = lookup_price_tiered("deepseek-chat", Some("flex"));
         let plain = lookup_price("deepseek-chat");
         assert_eq!((no_flex.input, no_flex.output), (plain.input, plain.output));
+    }
+
+    #[test]
+    fn tiered_lookup_bills_priority_ultrafast_and_fast() {
+        // 1e-7 * 1e6 is 0.09999999999999999 in f64, not 0.1 —
+        // tiny-tier rows need a tolerance, not ==.
+        fn near(a: f64, b: f64) -> bool {
+            (a - b).abs() < 1e-9
+        }
+        // rm-164: the 2026-10-13 snapshot refresh (rm-176) carries the
+        // `*_priority`/`*_ultrafast` rows LiteLLM publishes, and the
+        // tiered lookup bills them. GPT-5.6's published priority row
+        // is exactly 2x standard; gpt-6-astra carries all three tier
+        // families (priority 2x, ultrafast 6x); gpt-6-luna carries no
+        // ultrafast row so an ultrafast turn bills standard; fast is
+        // a per-model multiplier (ccusage PR #1855), so gpt-6-luna
+        // fast = 2x standard while gpt-5.6 fast (no published
+        // multiplier) bills standard.
+        let priority = lookup_price_tiered("gpt-5.6", Some("priority"));
+        assert_eq!((priority.input, priority.output), (8.0, 40.0));
+        assert!((priority.cw - 10.0).abs() < 1e-9);
+        assert!((priority.cr - 0.8).abs() < 1e-9);
+        let ultrafast = lookup_price_tiered("gpt-6-astra", Some("ultrafast"));
+        assert_eq!((ultrafast.input, ultrafast.output), (60.0, 300.0));
+        let astra_priority = lookup_price_tiered("gpt-6-astra", Some("priority"));
+        assert_eq!((astra_priority.input, astra_priority.output), (20.0, 100.0));
+        let luna = lookup_price("gpt-6-luna");
+        let luna_ultrafast = lookup_price_tiered("gpt-6-luna", Some("ultrafast"));
+        assert!(
+            near(luna_ultrafast.input, 0.1) && near(luna_ultrafast.output, 0.5),
+            "no ultrafast row: bills standard"
+        );
+        let luna_fast = lookup_price_tiered("gpt-6-luna", Some("fast"));
+        assert!(
+            near(luna_fast.input, 0.2) && near(luna_fast.output, 1.0),
+            "2x standard"
+        );
+        assert!(near(luna_fast.cw, luna.cw * 2.0));
+        let no_multiplier = lookup_price_tiered("gpt-5.6", Some("fast"));
+        assert_eq!((no_multiplier.input, no_multiplier.output), (4.0, 20.0));
+        // Journal spelling never splits the bill.
+        let shouty = lookup_price_tiered("gpt-6-astra", Some("ULTRAFAST"));
+        assert_eq!((shouty.input, shouty.output), (60.0, 300.0));
     }
 
     #[test]

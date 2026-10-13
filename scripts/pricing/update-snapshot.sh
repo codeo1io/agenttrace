@@ -151,19 +151,33 @@ def trim(data):
         deprecation = value.get("deprecation_date")
         if isinstance(deprecation, str) and deprecation.strip():
             entry["deprecation_date"] = deprecation.strip()
-        # Flex-tier rates ride along when the source carries them (rm-610,
-        # run 36c9140f). Zero/absent values are omitted so "carries flex
-        # pricing" stays greppable — a flex turn of a row without them
-        # bills at the standard rates above.
-        for flex_field in (
+        # Tiered rates ride along when the source carries them (rm-610
+        # flex; rm-164 2026-10-13 adds priority + ultrafast, the tiers
+        # opencode v1.19.0 puts on the wire). Zero/absent values are
+        # omitted so "carries tier pricing" stays greppable — a tier
+        # turn of a row without them bills at the standard rates above.
+        # LiteLLM publishes NO `*_fast` per-token fields anywhere (the
+        # fast tier is a per-model multiplier on the standard rates,
+        # priced code-side from the published multipliers), and the
+        # `*_above_272k_tokens_*` long-context variants are deliberately
+        # not ingested (no long-context tier extraction to pair with).
+        for tier_field in (
             "input_cost_per_token_flex",
             "output_cost_per_token_flex",
             "cache_creation_input_token_cost_flex",
             "cache_read_input_token_cost_flex",
+            "input_cost_per_token_priority",
+            "output_cost_per_token_priority",
+            "cache_creation_input_token_cost_priority",
+            "cache_read_input_token_cost_priority",
+            "input_cost_per_token_ultrafast",
+            "output_cost_per_token_ultrafast",
+            "cache_creation_input_token_cost_ultrafast",
+            "cache_read_input_token_cost_ultrafast",
         ):
-            flex = value.get(flex_field)
-            if isinstance(flex, (int, float)) and flex > 0:
-                entry[flex_field] = flex
+            tier = value.get(tier_field)
+            if isinstance(tier, (int, float)) and tier > 0:
+                entry[tier_field] = tier
         keep[key] = entry
     return keep
 
