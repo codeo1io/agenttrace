@@ -648,6 +648,56 @@ fn rust_discovers_and_loads_real_jsonl_files() {
 }
 
 #[test]
+fn non_parsing_root_contributes_zero_sessions_and_no_secrets() {
+    // rm-451 fleet datum (host ~/.hermes/sessions): a registered root
+    // can hold single-object .json debug dumps that are not Vec<Event>
+    // — `request_dump_*`/`sessions.json` are name-excluded in the
+    // walker (discovery.rs), but any other single-object .json still
+    // reaches the parser. Such a root must contribute ZERO sessions
+    // to a scan that also covers a healthy parse-capable root, and no
+    // session surface may echo its payload — 747/900 of the host
+    // corpus embed real bearer tokens in Authorization headers.
+    let root = std::env::temp_dir().join(format!("agenttrace-rm451-{}", std::process::id()));
+    let parseable = root.join("parseable");
+    let hostile = root.join("hostile");
+    fs::create_dir_all(&parseable).expect("mkdir parseable");
+    fs::create_dir_all(&hostile).expect("mkdir hostile");
+    fs::write(parseable.join("session.jsonl"), SAMPLE_JSONL).expect("write session");
+    fs::write(
+        hostile.join("debug-dump-2026.json"),
+        r#"{"Authorization":"Bearer sk-live-fleet-secret-0","request":{"model":"gpt-4o"}}"#,
+    )
+    .expect("write hostile single-object dump");
+
+    with_session_cache(&root.join("cache"), || {
+        let parseable_sessions = load_sessions_from_dir(Some(&parseable));
+        assert_eq!(
+            parseable_sessions.len(),
+            1,
+            "the parse-capable root's session appears"
+        );
+        let hostile_sessions = load_sessions_from_dir(Some(&hostile));
+        assert!(
+            hostile_sessions.is_empty(),
+            "a root of single-object dumps must yield zero sessions, got {:?}",
+            hostile_sessions
+                .iter()
+                .map(|session| session.name.clone())
+                .collect::<Vec<_>>()
+        );
+        for session in &hostile_sessions {
+            assert!(
+                !session.name.contains("sk-live-fleet-secret"),
+                "session names must not echo dump payload: {}",
+                session.name
+            );
+        }
+    });
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn rust_parses_workbuddy_messages_tools_usage_and_millis() {
     let root = temp_root("agenttrace-rust-workbuddy");
     fs::create_dir_all(&root).expect("create workbuddy temp dir");
@@ -1417,7 +1467,7 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         let raw = fs::read_to_string(session_cache_path()).expect("read refreshed cache");
         let doc: Value = serde_json::from_str(&raw).expect("cache json");
         // The stale v3 cache must be rewritten at the current schema
-        // version (v53 — see the rm-939, rm-520, rm-585/rm-730, rm-834/
+        // version (v59 — see the rm-939, rm-520, rm-585/rm-730, rm-834/
         // rm-694, rm-718/719/716, rm-754, rm-502, rm-720/rm-721,
         // rm-710, rm-616, usage-accounting-truthfulness,
         // rm-551, rm-538, rm-600, rm-529, rm-542,
@@ -1426,7 +1476,11 @@ fn rust_refreshes_cache_entries_from_old_schema_version() {
         // run 4ffc4fbb) carried 52 -> 53 at this integration, re-based
         // off the campaign's own 27 -> 28 bump; the session-cache
         // store-integrity batch (rm-292/rm-041, run 2d92ee95) carried
-        // 51 -> 52, re-based off the campaign's own 24 -> 26 bump).
+        // 51 -> 52, re-based off the campaign's own 24 -> 26 bump; the
+        // adoption-regression truthfulness re-land (run a68ac27ee6d6
+        // cycle 1, the kimi usage XOR re-landed from pre-adoption
+        // 82e23b9) carried 58 -> 59, its original rung e5653f52's
+        // 58 -> 59 kept numeral-for-numeral).
         assert_eq!(
             doc.pointer("/schema_version").and_then(Value::as_i64),
             Some(SESSION_CACHE_SCHEMA_VERSION)

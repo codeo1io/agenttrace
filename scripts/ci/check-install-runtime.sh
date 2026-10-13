@@ -19,6 +19,20 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+# rm-1030: the expected pinned ref is DERIVED from install.sh itself.
+# The gate used to carry its own v0.9.0 literals (test D's `ref=v0.9.0`
+# receipt check, test E's `clone --branch v0.9.0` + 'pinned ref
+# v0.9.0' output) — an independent pin copy, which is exactly what let
+# the a9c18c4 'adopt upstream v0.10.1' stitch move install.sh:13 to
+# v0.10.1 while this gate kept demanding v0.9.0: every CI push ran the
+# install lane red (assess a6753407, live rc1 at test D) while local
+# runs against the real network were green. One source of truth, the
+# installer; if the REF line changes shape, fail loudly instead of
+# silently reverting to a stale literal.
+expected_ref="$(sed -n 's/^REF="${AGENTTRACE_SOURCE_REF:-\([^"]*\)}"$/\1/p' install.sh)"
+[[ -n "$expected_ref" ]] ||
+	fail "rm-1030: cannot derive the pinned default ref from install.sh (REF= line changed shape?)"
+
 fail() {
 	echo "check-install-runtime: $*" >&2
 	exit 1
@@ -110,7 +124,8 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
-# The ref is the installer's pinned default (v0.9.0, rm-051) or whatever
+# The ref is the installer's pinned default (whatever install.sh's
+# REF= names, derived live above — rm-051/rm-1030) or whatever
 # AGENTTRACE_SOURCE_REF names, so the fallback never has to resolve
 # api.github.com in an offline run.
 shims="$tmp/shims"
@@ -149,8 +164,8 @@ grep -q "pinned ref" "$out" ||
 	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
-grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
-	fail "test D: install receipt must record the default pinned ref (rm-051)"
+grep -q "^ref=$expected_ref\$" "$tmp/d-receipt" ||
+	fail "test D: install receipt must record the installer's pinned ref ($expected_ref, rm-051/rm-1030)"
 
 # — test E: the fallback clones a PINNED ref, never a moving default
 #   branch (rm-051) — this fake git refuses an unpinned clone and
@@ -194,9 +209,9 @@ if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
 	cat "$out" >&2
 	fail "test E: pinned source build must succeed"
 fi
-grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
-	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
-grep -q "pinned ref v0.9.0" "$out" ||
+grep -q "^clone --branch $expected_ref\$" "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch $expected_ref (the pinned default ref)"
+grep -q "pinned ref $expected_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"

@@ -83,9 +83,16 @@ curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.
 
 The install scripts download the release binary for your platform, verify its
 SHA-256 against the published checksum, and add the install directory to your
-PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). Set
-`AGENTTRACE_VERSION=v0.9.1` (or `-Version v0.9.1` in PowerShell) to pin a
-release.
+PATH (`~/.local/bin`, or `%LOCALAPPDATA%\agenttrace` on Windows). To pin a
+release, set `AGENTTRACE_VERSION`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.sh | AGENTTRACE_VERSION=v0.9.1 sh
+```
+
+```powershell
+$env:AGENTTRACE_VERSION = "v0.9.1"; irm https://raw.githubusercontent.com/luoyuctl/agenttrace/master/install.ps1 | iex
+```
 
 Package managers:
 
@@ -430,7 +437,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--search-limit <SEARCH_LIMIT>` | `20` | Cap the number of `--search` hits reported (default 20) |
 | `--fail-under-health <FAIL_UNDER_HEALTH>` | `0` | CI gate: exit non-zero when corpus health drops below this score (0 disables the gate) |
 | `--fail-on-critical` |  | CI gate: exit non-zero when any critical-severity finding exists |
-| `--max-tool-fail-rate <MAX_TOOL_FAIL_RATE>` |  | CI gate: exit non-zero when the tool failure rate exceeds this fraction (0.0-1.0) |
+| `--max-tool-fail-rate <MAX_TOOL_FAIL_RATE>` |  | CI gate: exit non-zero when the tool failure rate exceeds this percent (0.0-100.0, the same scale the report prints — `15` means 15%, and `0.5` means half a percent, rm-1032) |
 | `--baseline <BASELINE>` |  | Load a healthy-baseline summary JSON (path or id) to compare `--compare` runs against |
 | `--baseline-max-duration-delta-pct <BASELINE_MAX_DURATION_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session duration drift, in percent |
 | `--baseline-max-cost-delta-pct <BASELINE_MAX_COST_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session cost drift, in percent |

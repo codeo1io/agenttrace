@@ -1631,6 +1631,26 @@ fn ctrl_r_force_reload_clears_session_cache_before_loading() {
     fs::write(
             &cache_path,
             format!(
+                // Schema 60 (integration of run e486dc1adb9b cycle 2
+                // 'pi journal accounting truth, part 2' — the pi
+                // MESSAGE arm passes message.usage.cost.total through
+                // as recorded cost (recorded wins over catalog) and
+                // the rm-408 pi residual inserts recognized-but-zero
+                // usage classes so present-zero pi blocks emit and
+                // disclose; re-based off the campaign's 24 -> 25 mint
+                // onto the advanced ceiling as 59 -> 60 — conflict case
+                // 38b020c7f8f1463fb56f21772d627068);
+                // Schema 59 (integration of run e5653f52 cycle 2 —
+                // the #312 port's kimi arm survived its adjudication:
+                // `usage` and `metadata.usage` mirror the same
+                // counters, so parse_kimi_value now counts ONE of the
+                // two instead of both; the batch's other arms (claude
+                // message-id fold, qwen first-alias netting, codex ring
+                // ledger, opencode reasoning breakdown) were superseded
+                // by this tree's own landed lanes and re-based off the
+                // campaign's 27 -> 28 mint onto the advanced ceiling as
+                // 58 -> 59 per the landed-rung-keeps-numeral convention
+                // — conflict case 963662941e3a40579e658a63f2b88da6);
                 // Schema 58 (integration of run
                 // 57c49133881840c4b7f81dba107d6333 cycle 1 — the
                 // id-less tool_result fold left the wire tool_use_id
