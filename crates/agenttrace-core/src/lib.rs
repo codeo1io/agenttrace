@@ -536,6 +536,27 @@ pub struct Metrics {
     /// costs. `skip` keeps tier-less output byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
+    /// rm-991 (cycle 2, run b5affead): the agent name the opencode
+    /// session DB records on its `session` table (`agent` column;
+    /// live census 2026-10-12: 302/310 rows carry one, the rest are
+    /// parent/subagent lanes). Empty when the lane carries no name —
+    /// the `by_agent` rollup then falls back to the source-tool
+    /// bucket exactly as before. `skip` keeps unnamed output
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_name: String,
+    /// rm-991: the writer-reported diff summary opencode stores beside
+    /// the session (`summary_additions` / `summary_deletions` /
+    /// `summary_files`), each read leniently — `None` when the column
+    /// or the value is absent, and the by_agent split never depends on
+    /// them. `reported_by_agent` in `provenance.files` is the only
+    /// consumer that upgrades on `summary_files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_additions: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_deletions: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_files: Option<i64>,
     pub source_tool: String,
     pub session_start: String,
     pub session_end: String,
@@ -2431,7 +2452,17 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         } else {
             overview.critical += 1;
         }
-        let agent = session.metrics.source_tool.clone();
+        let agent = if session.metrics.agent_name.is_empty() {
+            session.metrics.source_tool.clone()
+        } else {
+            session.metrics.agent_name.clone()
+        };
+        // rm-991 (cycle 2, run b5affead): the opencode `session.agent`
+        // column names WHO ran the session (live census 2026-10-12:
+        // 302/310 rows). Keying on it splits the one `opencode_db`
+        // bucket every opencode session used to collapse into; every
+        // other lane never sets `agent_name`, so their buckets are
+        // byte-identical to before (same source_tool fallback).
         let agent_entry = overview.by_agent.entry(agent).or_default();
         agent_entry.sessions += 1;
         agent_entry.cost += session.metrics.cost_estimated;

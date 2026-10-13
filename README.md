@@ -29,7 +29,7 @@
 
 ---
 
-**agenttrace** is a local-first terminal TUI and report generator for AI coding-agent session history. It reads Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi and its forks (Senpi, Omo) plus agent-dir variants like `~/.pi/agent-cliproxy-only`, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces, then helps with two daily jobs: see what multiple agents spent across cost, tokens, and time; and diagnose why a task ran slowly.
+**agenttrace** is a local-first terminal TUI and report generator for AI coding-agent session history. It reads Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cline, Aider, Cursor exports, Hermes Agent, OpenCode, OpenClaw, Pi and its forks (Senpi, Omo — cancelled-run markers on the pi ≥1.1.0 wire, `agent_settled.aborted` and the terminal `stopReason:"aborted"`, are consumed and disclosed as `pi_run_aborted`) plus agent-dir variants like `~/.pi/agent-cliproxy-only`, Oh My Pi, Kimi CLI, Copilot-style logs, and generic JSON/JSONL traces, then helps with two daily jobs: see what multiple agents spent across cost, tokens, and time; and diagnose why a task ran slowly.
 
 One `agenttrace` binary provides both interfaces: run it without a report action to open the TUI, or pass flags such as `--sessions` and `--overview` for CLI output.
 
@@ -461,7 +461,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--version` |  | Print the version banner and exit 0; wins over action validation |
 | `--demo` |  | Use the built-in demo corpus instead of discovered agent homes (stable epoch-anchored sessions) |
 | `--doctor` |  | Run environment self-checks (config paths, cache consistency, agent homes) and exit non-zero on failure |
-| `--search <SEARCH>` |  | Full-text search across discovered session transcripts for this query |
+| `--search <SEARCH>` |  | Full-text search across discovered session transcripts for this query (blank or whitespace-only queries are rejected with a usage error — an empty query matches nothing and is far more likely an unquoted accident than a search) |
 | `--search-limit <SEARCH_LIMIT>` | `20` | Cap the number of `--search` hits reported (default 20) |
 | `--fail-under-health <FAIL_UNDER_HEALTH>` | `0` | CI gate: exit non-zero when corpus health drops below this score (0 disables the gate) |
 | `--fail-on-critical` |  | CI gate: exit non-zero when any critical-severity finding exists |

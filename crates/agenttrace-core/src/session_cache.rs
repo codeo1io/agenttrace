@@ -5,7 +5,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 62;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 63;
+// Bumped 62 -> 63 (integration of run b5affead89448d8a664fc699fe42c49
+// cycle 2 'consume the new fields, close the silent gaps', rm-991,
+// conflict case fbe92e4b80db45d0a2fb2b5c020b81a4, candidate 52ddee6 @
+// base 82e23b9): a SHAPE-ONLY rung — Metrics began persisting the
+// opencode `session.agent` name and the `summary_additions`/
+// `summary_deletions`/`summary_files` diff columns read off the
+// session table. No parser semantics moved (the JSONL lanes parse
+// byte-identically), but a warm v62 entry replays an EMPTY
+// `agent_name`, so the by_agent rollup collapses back onto the
+// source-tool bucket while a fresh parse of the same database splits
+// it — and the summary diff numbers plus the `files:`
+// `reported_by_agent` provenance upgrade never reach a warm hit at
+// all. SEAM: the run minted its bump as 60 -> 61 straight at its base
+// 82e23b9, below the frontier — this tree had landed 62 mid-run (run
+// 4309a268's gemini chats rung, conflict case
+// 0dee05b41d4b4252934f5f69bcf62cd6, which deliberately left 61 free
+// for this sibling's mint), so this integration re-bases the rung
+// onto the already-advanced ceiling 62 as 62 -> 63 per the
+// landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c/7762d54b
+// precedent), one invalidation either way. Entries regenerate once
+// on next scan. The SQLite snapshot moved 11 -> 12 in the same unit
+// and lands as minted — no snapshot rung rode the landed 62 (that
+// mint was parser-only), so the candidate's snapshot bump is the
+// unique rung in its own lane; its own oracle and enumeration rung
+// swept together, per the schema-bump sweep doc.
 // Bumped 59 -> 62 (run 4309a268 cycle 1 'silent-zero closeout',
 // attempt 97c41efd @ base b798247, rm-715 LEAD): gemini-cli >= 0.63
 // chats record streams (~/.gemini/tmp/<hash>/chats/session-*.jsonl)
@@ -23,8 +48,11 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 62;
 // convention), one invalidation either way; this integration (conflict
 // case 0dee05b41d4b4252934f5f69bcf62cd6) confirms the rung at 62 with
 // that landed 60 as the ladder entry directly below and 61 left free
-// for the sibling's uncommitted mint. Entries regenerate once on next
-// scan.
+// for the sibling's uncommitted mint — that sibling (run
+// b5affead89448d8a664fc699fe42c49) lands next, its 61 re-based onto
+// this rung as 62 -> 63 at conflict case
+// fbe92e4b80db45d0a2fb2b5c020b81a4, so 61 stays a permanently free
+// rung on the ladder. Entries regenerate once on next scan.
 // Bumped 59 -> 60 (integration of run e486dc1adb9b cycle 2 'pi journal
 // accounting truth, part 2', conflict case 38b020c7f8f1463fb56f21772d627068,
 // candidate d9b3333 @ base 1511547): the batch's two units both change
@@ -803,7 +831,7 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 62;
 // ledger; the bump also composes with the landed rm-753/rm-734
 // poison gate (fail-closed reads never bank) and the schema-11
 // eviction retires any v10 entry a pre-gate binary already banked.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 11;
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 12;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -1148,6 +1176,21 @@ struct GoMetrics {
     /// the flex slots joined the digest, rm-613).
     #[serde(default, rename = "ServiceTier")]
     service_tier: Option<String>,
+    /// rm-991 (cycle 2, run b5affead): opencode `session.agent` and
+    /// the `summary_*` diff columns. Defaulted so pre-existing cache
+    /// rows deserialize unchanged — but the schema bump to 61 evicts
+    /// them anyway: a warm row banked before this arm would replay an
+    /// empty `agent_name` (by_agent falls back to the source-tool
+    /// bucket) while a fresh parse of the same database splits it, so
+    /// warm and cold runs would disagree on the rollup.
+    #[serde(default, rename = "AgentName")]
+    agent_name: String,
+    #[serde(default, rename = "SummaryAdditions")]
+    summary_additions: Option<i64>,
+    #[serde(default, rename = "SummaryDeletions")]
+    summary_deletions: Option<i64>,
+    #[serde(default, rename = "SummaryFiles")]
+    summary_files: Option<i64>,
     #[serde(default, rename = "SourceTool")]
     source_tool: String,
     #[serde(default, rename = "SessionStart")]
@@ -3033,6 +3076,10 @@ impl GoMetrics {
             gaps_sec: metrics.gaps_sec.clone(),
             model_used: metrics.model_used.clone(),
             service_tier: metrics.service_tier.clone(),
+            agent_name: metrics.agent_name.clone(),
+            summary_additions: metrics.summary_additions,
+            summary_deletions: metrics.summary_deletions,
+            summary_files: metrics.summary_files,
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
@@ -3084,6 +3131,10 @@ impl GoMetrics {
             gaps_sec: self.gaps_sec,
             model_used: self.model_used,
             service_tier: self.service_tier,
+            agent_name: self.agent_name,
+            summary_additions: self.summary_additions,
+            summary_deletions: self.summary_deletions,
+            summary_files: self.summary_files,
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,
@@ -3481,7 +3532,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_eleven_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_twelve_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -3504,11 +3555,21 @@ mod tests {
                 // hits.
                 session_key: "ses-cached".to_string(),
                 parent_session: "ses-parent".to_string(),
+                // rm-991 (cycle 2, run b5affead): the agent name and the
+                // summary diff columns are SOURCE DATA — they must
+                // survive the snapshot round-trip or a warm hit would
+                // silently degrade by_agent back to the source-tool
+                // bucket (the divergence the schema bump to 12 evicts).
+                agent_name: "build".to_string(),
+                summary_additions: Some(120),
+                summary_deletions: Some(8),
+                summary_files: Some(4),
                 provenance: crate::MetricProvenance {
                     tokens: "stored_session_totals".to_string(),
                     duration: "timestamp_span".to_string(),
                     tool_results: "reported_by_agent".to_string(),
                     pricing_source: "LiteLLM (cached)".to_string(),
+                    files: "reported_by_agent".to_string(),
                     ..crate::MetricProvenance::default()
                 },
                 ..Metrics::default()
@@ -3523,6 +3584,14 @@ mod tests {
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         let ledger_key = database.to_string_lossy().to_string();
+        // Version twelve (rm-991, cycle 2 of run b5affead): the
+        // opencode `session.agent` name and the `summary_*` diff
+        // columns joined the snapshot payload — a banked snapshot
+        // without them would replay an empty agent_name (by_agent
+        // collapsing back to the source-tool bucket) while a fresh
+        // parse of the same database splits it, so every older
+        // snapshot regenerates once, in place.
+        //
         // Version eleven (integration of run a0d0d353, rm-626/rm-627;
         // the candidate minted 7 → 8 at base 8991144 and the merged
         // wall re-bases the bump onto the advanced ceiling as 10 → 11,
@@ -3539,7 +3608,7 @@ mod tests {
         // and the raw parent row id; v8 (rm-548/rm-734) — the opencode
         // fork-exclusion count plus the poison-gate eviction; v7
         // (rm-198) — hermes tool outcome semantics.
-        assert_eq!(doc["schema_version"], 11);
+        assert_eq!(doc["schema_version"], 12);
         assert_eq!(
             doc["entries"][ledger_key.as_str()]["sessions"][0]["Metrics"]["Provenance"]["Tokens"]
                 .as_str(),
@@ -3551,7 +3620,7 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema eleven cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema twelve cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
@@ -3564,8 +3633,22 @@ mod tests {
             loaded[0].metrics.parent_session, "ses-parent",
             "rm-791: the raw parent row id round-trips for post-load attribution"
         );
+        assert_eq!(
+            loaded[0].metrics.agent_name, "build",
+            "rm-991: the agent name round-trips so warm by_agent hits match cold parses"
+        );
+        assert_eq!(loaded[0].metrics.summary_additions, Some(120));
+        assert_eq!(loaded[0].metrics.summary_deletions, Some(8));
+        assert_eq!(loaded[0].metrics.summary_files, Some(4));
+        assert_eq!(
+            loaded[0].metrics.provenance.files, "reported_by_agent",
+            "rm-991: the files provenance upgrade rides WITH the summary columns that earned it — \
+             the snapshot neither invents it (a summary-less lane stays `unavailable`, pinned \
+             end-to-end in tests/opencode_agent_summary.rs against a column-less fixture DB) \
+             nor erases it on a warm hit"
+        );
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(10);
+        old["schema_version"] = serde_json::Value::from(11);
         fs::write(
             &snapshot,
             serde_json::to_vec(&old).expect("schema ten json"),

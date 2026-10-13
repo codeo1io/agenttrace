@@ -59,6 +59,8 @@ agenttrace --audit --range 30d -f json
 
 The audit groups sessions by source and normalized model, and reports input, output, cache-write, and cache-read tokens; per-million-token rates; estimated component costs; and pricing confidence. Thinking tokens (Gemini `thoughtsTokenCount` and OpenAI-compatible `reasoning_tokens`/`thinking_tokens` aliases) are billed at the output rate: they are folded into the output count and additionally broken out as `tokens.reasoning` plus a `reasoning_share_pct` of billed output tokens per model row.
 
+The audit also splits cancelled runs from finished ones: pi journals from pi ≥ 1.1.0 mark cancellation on the wire (`agent_settled.aborted` plus the terminal message's `stopReason: "aborted"`), both arms fold into one `pi_run_aborted` disclosure counter and a `Run cancelled` insight incident, and the audit reports the census as `aborted_sessions` (omitted from JSON when zero, like `clamped_values`, so clean corpora render identically; journals without the arms parse unchanged — the format is additive-only).
+
 Pricing status is intentionally explicit:
 
 - `catalog_estimate`: an exact normalized model match exists in the pricing catalog.
@@ -102,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 62 and the SQLite snapshot is schema 11; the
+The session cache is schema 63 and the SQLite snapshot is schema 12; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -394,7 +396,19 @@ priced normally under the old API-response shape; minted 59 → 62
 above the fleet census frontier — origin's landed 60 and a sibling's
 uncommitted 61 — one invalidation either way; this integration,
 conflict case 0dee05b41d4b4252934f5f69bcf62cd6, lands origin's 60 rung
-(run e486dc1adb9b, the entry above) directly below this one)
+(run e486dc1adb9b, the entry above) directly below this one),
+and to 63 when the opencode `session.agent` name and the
+`summary_additions`/`summary_deletions`/`summary_files` diff columns
+joined the persisted metrics — a warm v62 entry replays an empty
+`agent_name` (the by-agent rollup collapses back onto the source-tool
+bucket) while a fresh parse of the same database splits it, and the
+summary diff numbers plus the `files: reported_by_agent` provenance
+upgrade never reach a warm hit; a shape-only rung minted 60 → 61
+straight at run b5affead cycle 2's base 82e23b9 (rm-991), below the
+frontier — this tree's landed 62 — so the integration (conflict case
+fbe92e4b80db45d0a2fb2b5c020b81a4) re-bases it onto the advanced
+ceiling as 62 → 63, one invalidation either way; the SQLite snapshot
+moved to 12 in the same unit)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
@@ -417,7 +431,15 @@ stop persisting an empty snapshot that masks a healthy database
 8991144 with its own 7 → 8 bump, re-based at integration onto the
 advanced ceiling as 10 → 11, composing with the landed rm-753/rm-734
 poison gate — fail-closed reads never bank, and the schema-11 eviction
-retires any v10 entry a pre-gate binary already banked). Older versions are discarded and
+retires any v10 entry a pre-gate binary already banked), and to 12 when
+the opencode `session.agent` name and the `summary_additions`/
+`summary_deletions`/`summary_files` diff columns joined the persisted
+model — a snapshot banked before them replays an empty agent name (the
+by-agent rollup collapses back onto the source-tool bucket) while a
+fresh parse of the same database splits it, so every older snapshot
+regenerates once, in place (rm-991, run b5affead cycle 2; the JSONL
+session cache moved for the same reason — 62 → 63 at this integration,
+the run's 60 → 61 mint re-based onto the advanced ceiling). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the JSONL-backed session cache is

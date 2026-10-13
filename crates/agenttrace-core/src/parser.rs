@@ -2528,6 +2528,25 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                     });
                 }
             }
+            "agent_settled" => {
+                // rm-990 (cycle 2, run b5affead): pi >=1.1.0 (#10607)
+                // added `aborted` to the agent-settled event. The wire
+                // census that motivated this arm (23,174 journals on
+                // this host, 2026-10-12) found ZERO persisted entries
+                // of this type — the dist settles only on the
+                // in-process event stream, never the JSONL — but
+                // format v3 is additive-only, so the entry is
+                // consumed defensively: present -> counted, absent ->
+                // invisible (a journal without one is byte-identical
+                // to before this arm existed, including the
+                // pi_entry_skipped disclosure it used to mint). The
+                // arm that actually fires on real journals is the
+                // message-level stopReason check in
+                // oh_my_pi_message_events below.
+                if boolish(obj.get("aborted")) {
+                    *counters.entry("pi_run_aborted".to_string()).or_insert(0) += 1;
+                }
+            }
             other => {
                 // rm-436 counter family (rm-437 evidence): every other
                 // documented-but-uncounted entry type stays visible as
@@ -2739,6 +2758,20 @@ fn oh_my_pi_message_events(
     // face value instead of the catalog rate.
     let usage = oh_my_pi_usage(message.get("usage"));
     let recorded_cost_usd = oh_my_pi_recorded_cost_usd(message.get("usage"));
+    // rm-990 (cycle 2, run b5affead): pi persists the cancelled-run
+    // signal on the aborted assistant message itself as
+    // `stopReason:"aborted"` (live wire census, 2026-10-12: 211 lines
+    // across 196 journals on this host, including pre-1.1.0 senpi
+    // writers — this arm fires on real journals, unlike the
+    // agent_settled entry arm above, whose wire census found zero
+    // persisted entries). The 1.1.0 sibling `durationMs` (#10549)
+    // carries no cancellation semantics and is deliberately not
+    // read. Mints the SAME counter as the settled arm so both
+    // spellings of one cancellation land in one number; journals
+    // without the field are unaffected.
+    if string(message.get("stopReason")) == Some("aborted") {
+        *counters.entry("pi_run_aborted".to_string()).or_insert(0) += 1;
+    }
     if usage.is_some() || recorded_cost_usd.is_some() {
         events.push(Event {
             role: "meta".to_string(),

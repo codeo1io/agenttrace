@@ -325,4 +325,44 @@ mod tests {
         assert!(text.contains('\u{FFFD}'));
         assert!(text.contains("]52;c;aGVsbG8="));
     }
+
+    /// rm-988 (cycle 2, run b5affead): the LIBRARY-side guard the CLI
+    /// now front-stops. A blank or whitespace-only query must match
+    /// NOTHING (never everything) — this is the semantic the CLI
+    /// rejection leans on: had the guard instead returned all
+    /// sessions, the loud rejection would be masking a wildcard, and a
+    /// future caller that bypasses the CLI (library consumer, MCP
+    /// tool) would inherit the wildcard. Pinned red-first at mint:
+    /// the same session matches a real query, so the empty results
+    /// below are the guard, not the fixture.
+    #[test]
+    fn blank_and_whitespace_queries_match_nothing() {
+        let session = Session {
+            name: "01-healthy-ship".to_string(),
+            path: "demo://01-healthy-ship.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                source_tool: "pi".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let sessions = [session];
+
+        assert_eq!(
+            search_sessions(&sessions, "healthy", 20).len(),
+            1,
+            "the fixture must match a real query, or the blank pins below are vacuous"
+        );
+        for blank in ["", "   ", "\t"] {
+            assert!(
+                search_sessions(&sessions, blank, 20).is_empty(),
+                "blank query {blank:?} must match nothing (not everything)"
+            );
+        }
+    }
 }

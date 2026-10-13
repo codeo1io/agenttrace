@@ -3205,6 +3205,27 @@ fn build_incident_timeline(session: &Session) -> IncidentTimelineSummary {
         );
     }
 
+    // rm-990 (cycle 2, run b5affead): a cancelled run reads as an
+    // incident, not silence. Both pi spellings of one cancellation
+    // (message-level `stopReason:"aborted"` and the pi >=1.1.0
+    // `agent_settled{aborted:true}` entry) mint the same
+    // `pi_run_aborted` disclosure counter; the detail names the
+    // counter so the reader can trace it into the health/data-health
+    // disclosures. Zero-signal corpora never reach this arm, so their
+    // timelines are byte-identical to before.
+    if let Some(signals) = metrics.disclosure_counters.get("pi_run_aborted") {
+        if *signals > 0 {
+            add(
+                "cancelled_run",
+                "Run cancelled",
+                format!(
+                    "{signals} abort signal(s) recorded (stopReason=aborted / agent_settled; disclosure pi_run_aborted)"
+                ),
+                "low",
+            );
+        }
+    }
+
     if let Some(gap) = max_incident_gap(&metrics.gaps_sec) {
         if gap >= 30.0 {
             let severity = if gap >= 300.0 {
