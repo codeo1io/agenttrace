@@ -131,6 +131,110 @@ struct LiteLlmModel {
     cache_write_cost_flex: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost_flex")]
     cache_read_cost_flex: Option<f64>,
+    // Unmodeled cost classes (rm-1059): billed dimensions this entry
+    // carries that the token costing does NOT model. Parsed ONLY to
+    // classify and disclose — they never reach a `Price`. A positive
+    // finite value means "the vendor bills this dimension", so a
+    // session priced against this row must not report that dimension
+    // as $0 in silence.
+    #[serde(default, rename = "search_context_cost_per_query")]
+    search_context_cost_per_query: Option<f64>,
+    #[serde(default, rename = "input_cost_per_image_token")]
+    input_cost_per_image_token: Option<f64>,
+    #[serde(default, rename = "output_cost_per_image_token")]
+    output_cost_per_image_token: Option<f64>,
+    #[serde(default, rename = "cache_read_input_image_token_cost")]
+    cache_read_input_image_token_cost: Option<f64>,
+    #[serde(default, rename = "input_cost_per_audio_token")]
+    input_cost_per_audio_token: Option<f64>,
+    #[serde(default, rename = "output_cost_per_audio_token")]
+    output_cost_per_audio_token: Option<f64>,
+    #[serde(default, rename = "input_cost_per_second")]
+    input_cost_per_second: Option<f64>,
+    #[serde(default, rename = "output_cost_per_second")]
+    output_cost_per_second: Option<f64>,
+    #[serde(default, rename = "cost_per_second")]
+    cost_per_second: Option<f64>,
+    // Service-tier variants of the token rates (rm-1059, feeding
+    // rm-164's arms): flex is modeled; priority, ultrafast and fast
+    // are not — a turn that ran on one of those tiers bills at the
+    // standard rates, disclosed as a tier-variant class until the
+    // tiered lookup learns them.
+    #[serde(default, rename = "input_cost_per_token_priority")]
+    input_cost_per_token_priority: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_priority")]
+    output_cost_per_token_priority: Option<f64>,
+    #[serde(default, rename = "input_cost_per_token_ultrafast")]
+    input_cost_per_token_ultrafast: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_ultrafast")]
+    output_cost_per_token_ultrafast: Option<f64>,
+    #[serde(default, rename = "input_cost_per_token_fast")]
+    input_cost_per_token_fast: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_fast")]
+    output_cost_per_token_fast: Option<f64>,
+}
+
+impl LiteLlmModel {
+    /// Unmodeled cost families this raw entry carries (rm-1059).
+    /// A field counts only when present, finite, and positive — a
+    /// zero or absent field means "no published rate", never "free".
+    fn unmodeled_families(&self) -> Vec<&'static str> {
+        fn present(rate: Option<f64>) -> bool {
+            rate.is_some_and(|rate| rate.is_finite() && rate > 0.0)
+        }
+        let mut families = Vec::new();
+        if present(self.search_context_cost_per_query) {
+            families.push("search-context");
+        }
+        if present(self.input_cost_per_image_token)
+            || present(self.output_cost_per_image_token)
+            || present(self.cache_read_input_image_token_cost)
+        {
+            families.push("image-token");
+        }
+        if present(self.input_cost_per_audio_token) || present(self.output_cost_per_audio_token) {
+            families.push("audio-token");
+        }
+        if present(self.input_cost_per_second)
+            || present(self.output_cost_per_second)
+            || present(self.cost_per_second)
+        {
+            families.push("per-second");
+        }
+        if present(self.input_cost_per_token_priority)
+            || present(self.output_cost_per_token_priority)
+            || present(self.input_cost_per_token_ultrafast)
+            || present(self.output_cost_per_token_ultrafast)
+            || present(self.input_cost_per_token_fast)
+            || present(self.output_cost_per_token_fast)
+        {
+            families.push("tier-variants");
+        }
+        families.sort_unstable();
+        families.dedup();
+        families
+    }
+}
+
+/// Families of unmodeled cost classes (rm-1059): billed dimensions
+/// the token costing does not model, disclosed per catalog entry so
+/// their contribution can never silently read $0.
+pub const UNMODELED_COST_FAMILIES: [&str; 5] = [
+    "search-context",
+    "image-token",
+    "audio-token",
+    "per-second",
+    "tier-variants",
+];
+
+/// Classify ONE raw catalog entry (rm-1059). Integration-test and
+/// downstream entry point: classification without engaging the
+/// process-global catalog (the converter classifies internally via
+/// `LiteLlmModel::unmodeled_families`).
+pub fn unmodeled_class_families_for_entry(raw: &serde_json::Value) -> Vec<&'static str> {
+    serde_json::from_value::<LiteLlmModel>(raw.clone())
+        .map(|model| model.unmodeled_families())
+        .unwrap_or_default()
 }
 
 pub fn lookup_price(model: &str) -> Price {
@@ -173,6 +277,53 @@ pub fn has_specific_price(model: &str) -> bool {
     match_variants(&model)
         .into_iter()
         .any(|variant| catalog.entries.contains_key(&variant))
+}
+
+/// rm-1059: model-key -> unmodeled cost families, captured from the
+/// same raw bytes the WINNING catalog branch converted (cache or
+/// bundled snapshot). Held beside `PRICING_CATALOG` so the disclosure
+/// can never describe a catalog that is not the one pricing sessions.
+static UNMODELED_COST_TABLE: OnceLock<BTreeMap<String, Vec<&'static str>>> = OnceLock::new();
+type UnmodeledTable = BTreeMap<String, Vec<&'static str>>;
+
+/// Families of unmodeled cost classes on the catalog row that would
+/// price `model` (rm-1059). Resolution mirrors `has_specific_price`
+/// (alias, then variant match), so a class is claimed exactly where a
+/// price is claimed. Empty for fallback/unknown models — those are
+/// already disclosed via `fallback_pricing`.
+pub fn unmodeled_cost_classes(model: &str) -> Vec<&'static str> {
+    if matches!(model.trim(), "" | "default" | "unknown") {
+        return Vec::new();
+    }
+    let catalog = pricing_catalog();
+    let normalized = normalize_model(model);
+    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
+        return Vec::new();
+    };
+    UNMODELED_COST_TABLE
+        .get()
+        .and_then(|table| table.get(&key))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Per-family count for the BUNDLED snapshot only (rm-1059): offline
+/// truth for `--doctor`, which must never read the user's cache.
+pub fn bundled_unmodeled_census() -> BTreeMap<&'static str, usize> {
+    static CENSUS: OnceLock<BTreeMap<&'static str, usize>> = OnceLock::new();
+    CENSUS
+        .get_or_init(|| {
+            let converted = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+            let mut census: BTreeMap<&'static str, usize> = BTreeMap::new();
+            for families in converted.unmodeled.values() {
+                for family in families {
+                    *census.entry(*family).or_insert(0) += 1;
+                }
+            }
+            census
+        })
+        .clone()
 }
 
 pub fn list_pricing() -> BTreeMap<String, Price> {
@@ -663,7 +814,12 @@ fn pricing_catalog() -> &'static PricingCatalog {
 /// bundled snapshot is used. The only network path is the explicit
 /// `--update-pricing` action.
 fn load_catalog_for_current_env() -> PricingCatalog {
-    let mut catalog = load_pricing_cache().unwrap_or_else(fallback_catalog);
+    let (mut catalog, unmodeled) = load_pricing_cache().unwrap_or_else(fallback_catalog);
+    // rm-1059: capture the winning branch's unmodeled side-table
+    // BEFORE overrides/SKU rows are applied — those reshape rates and
+    // aliases, while the unmodeled classes are facts about the vendor
+    // rows that survived conversion.
+    let _ = UNMODELED_COST_TABLE.set(unmodeled);
     let override_models = apply_pricing_overrides(&mut catalog);
     let _ = PRICING_OVERRIDE_MODELS.set(override_models);
     apply_codex_sku_entries(&mut catalog);
@@ -723,24 +879,30 @@ fn apply_codex_sku_entries(catalog: &mut PricingCatalog) {
         .or_insert_with(|| "openai".to_string());
 }
 
-fn fallback_catalog() -> PricingCatalog {
+fn fallback_catalog() -> (PricingCatalog, UnmodeledTable) {
     let converted = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
     if converted.entries.is_empty() {
-        return PricingCatalog {
-            entries: builtin_pricing(),
+        return (
+            PricingCatalog {
+                entries: builtin_pricing(),
+                aliases: BTreeMap::new(),
+                source: "builtin".to_string(),
+                providers: BTreeMap::new(),
+                reference_date: None,
+            },
+            converted.unmodeled,
+        );
+    }
+    (
+        PricingCatalog {
+            entries: converted.entries,
             aliases: BTreeMap::new(),
-            source: "builtin".to_string(),
-            providers: BTreeMap::new(),
-            reference_date: None,
-        };
-    }
-    PricingCatalog {
-        entries: converted.entries,
-        aliases: BTreeMap::new(),
-        source: "snapshot".to_string(),
-        providers: converted.providers,
-        reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
-    }
+            source: "snapshot".to_string(),
+            providers: converted.providers,
+            reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
+        },
+        converted.unmodeled,
+    )
 }
 
 fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
@@ -777,7 +939,7 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
     override_models
 }
 
-fn load_pricing_cache() -> Option<PricingCatalog> {
+fn load_pricing_cache() -> Option<(PricingCatalog, UnmodeledTable)> {
     let path = pricing_cache_path();
     let metadata = path.metadata().ok()?;
     let stale = metadata
@@ -791,17 +953,20 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
     if converted.entries.is_empty() {
         return None;
     }
-    Some(PricingCatalog {
-        entries: converted.entries,
-        aliases: BTreeMap::new(),
-        source: if stale { "cache(stale)" } else { "cache" }.to_string(),
-        providers: converted.providers,
-        // A cached catalog's vintage is its fetch date (rm-419); when
-        // the provenance stamp is missing (pre-rm-167 cache) fall back
-        // to the bundled snapshot date as a conservative anchor.
-        reference_date: pricing_cache_vintage_ymd(&path)
-            .or_else(|| iso_to_ymd(PRICING_SNAPSHOT_DATE)),
-    })
+    Some((
+        PricingCatalog {
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: if stale { "cache(stale)" } else { "cache" }.to_string(),
+            providers: converted.providers,
+            // A cached catalog's vintage is its fetch date (rm-419); when
+            // the provenance stamp is missing (pre-rm-167 cache) fall back
+            // to the bundled snapshot date as a conservative anchor.
+            reference_date: pricing_cache_vintage_ymd(&path)
+                .or_else(|| iso_to_ymd(PRICING_SNAPSHOT_DATE)),
+        },
+        converted.unmodeled,
+    ))
 }
 
 /// YYYYMMDD of the fetch recorded in a pricing cache's provenance
@@ -1127,6 +1292,7 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
 struct ConvertedCatalog {
     entries: BTreeMap<String, Price>,
     providers: BTreeMap<String, String>,
+    unmodeled: UnmodeledTable,
 }
 
 /// Per-token flex rate -> per-million flex slot, dropping absent,
@@ -1142,9 +1308,10 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         return ConvertedCatalog {
             entries: BTreeMap::new(),
             providers: BTreeMap::new(),
+            unmodeled: BTreeMap::new(),
         };
     };
-    let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    let mut selected: BTreeMap<String, (i32, Price, String, Vec<&'static str>)> = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -1194,20 +1361,29 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             continue;
         }
         let priority = provider_priority(&model.provider);
+        let families = model.unmodeled_families();
         match selected.get(&normalized) {
-            Some((existing, _, _)) if *existing >= priority => {}
+            Some((existing, _, _, _)) if *existing >= priority => {}
             _ => {
-                selected.insert(normalized, (priority, price, model.provider));
+                selected.insert(normalized, (priority, price, model.provider, families));
             }
         }
     }
     let mut entries = BTreeMap::new();
     let mut providers = BTreeMap::new();
-    for (name, (_, price, provider)) in selected {
+    let mut unmodeled = BTreeMap::new();
+    for (name, (_, price, provider, families)) in selected {
         providers.insert(name.clone(), provider);
+        if !families.is_empty() {
+            unmodeled.insert(name.clone(), families);
+        }
         entries.insert(name, price);
     }
-    ConvertedCatalog { entries, providers }
+    ConvertedCatalog {
+        entries,
+        providers,
+        unmodeled,
+    }
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -2614,7 +2790,9 @@ mod tests {
         // vendor context window (the source file is literally named
         // model_prices_and_context_window.json) and the deprecation
         // date. Zero-value windows and blank dates normalize to absent.
-        let catalog = fallback_catalog();
+        // rm-1059: fallback_catalog now returns the unmodeled cost
+        // side-table alongside the catalog.
+        let (catalog, unmodeled_table) = fallback_catalog();
         let with_window = catalog
             .entries
             .values()
@@ -2642,6 +2820,16 @@ mod tests {
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
             Some(1_000_000)
         );
+        // rm-1059: the bundled side-table's families must all be known
+        // classes — the lib-side mirror of the keep-list contract.
+        for families in unmodeled_table.values() {
+            for family in families {
+                assert!(
+                    UNMODELED_COST_FAMILIES.contains(family),
+                    "unknown unmodeled family {family} escaped classification"
+                );
+            }
+        }
     }
 
     #[test]

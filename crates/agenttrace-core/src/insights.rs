@@ -127,6 +127,10 @@ pub struct SourceScope {
     pub estimated_cost: f64,
 }
 
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DataHealth {
     pub discovered: usize,
@@ -143,6 +147,16 @@ pub struct DataHealth {
     pub unknown_sources: usize,
     pub unknown_models: usize,
     pub fallback_pricing: usize,
+    /// Sessions priced by a catalog entry that ALSO carries
+    /// cost-field classes the token costing does not model
+    /// (rm-1059): the token totals for these sessions are exact,
+    /// but other billed dimensions (search-context queries,
+    /// image/audio tokens, per-second billing, non-flex service-tier
+    /// variants) read $0 — the count exists so that $0 is disclosed,
+    /// never silent. Skipped while zero so existing report bytes do
+    /// not move for catalogs without such classes.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub unmodeled_cost_class_sessions: usize,
     /// Last ACTIVITY across parsed sessions — max(session_start,
     /// session_end) per session, the same basis as the report scope
     /// window end (rm-694): the health block can never report a
@@ -905,6 +919,17 @@ fn data_health_from_parts(
         .iter()
         .filter(|s| !pricing::has_specific_price(&s.metrics.model_used))
         .count();
+    // rm-1059: the inverse half of fallback_pricing — sessions that
+    // DID find a catalog row, but the row carries unmodeled cost
+    // classes. Their token rates are exact; the disclosure exists so
+    // the unmodeled dimensions cannot read $0 in silence.
+    let unmodeled_cost_class_sessions = sessions
+        .iter()
+        .filter(|s| {
+            pricing::has_specific_price(&s.metrics.model_used)
+                && !pricing::unmodeled_cost_classes(&s.metrics.model_used).is_empty()
+        })
+        .count();
     let stored_totals_sessions = sessions
         .iter()
         .filter(|s| s.metrics.provenance.tokens == "stored_session_totals")
@@ -949,6 +974,7 @@ fn data_health_from_parts(
         unknown_sources,
         unknown_models,
         fallback_pricing,
+        unmodeled_cost_class_sessions,
         // rm-694 review fix (0772a0ca, HIGH finding): same activity
         // basis as `report_scope` — a start-basis value let the
         // data_health block report a "latest" older than the window

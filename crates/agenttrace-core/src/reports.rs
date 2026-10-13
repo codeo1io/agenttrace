@@ -671,13 +671,24 @@ pub fn report_overview_text_with_context(
             failure.reason
         ));
     }
-    out.push_str(&format!(
-        "  Pricing: {} | exact={} fallback={} unknown={}\n",
+    let mut pricing_line = format!(
+        "  Pricing: {} | exact={} fallback={} unknown={}",
         audit.pricing_source,
         audit.pricing_coverage.priced_sessions,
         audit.pricing_coverage.fallback_priced_sessions,
         audit.pricing_coverage.unpriced_or_unknown_sessions
-    ));
+    );
+    // rm-1059: priced sessions whose catalog row also carries unmodeled
+    // cost-field classes — appended only when nonzero so corpora without
+    // such rows keep byte-identical output.
+    if audit.pricing_coverage.unmodeled_cost_class_sessions > 0 {
+        pricing_line.push_str(&format!(
+            " | unmodeled-classes={}",
+            audit.pricing_coverage.unmodeled_cost_class_sessions
+        ));
+    }
+    out.push_str(&pricing_line);
+    out.push('\n');
     render_recommendations_text(&mut out, &recommendations(sessions));
     out
 }
@@ -693,7 +704,20 @@ pub fn report_overview_markdown_with_context(
     let audit = cost_audit(sessions);
     let mut out = report_overview_markdown(overview, sessions);
     out.push_str("\n## Scope and confidence\n\n| Field | Value |\n|---|---|\n");
-    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", markdown_cell(&scope.range), markdown_cell(&scope.earliest_session_at), markdown_cell(&scope.latest_session_at), markdown_cell(&parse_coverage_phrase(data_health, "; ")), markdown_cell(&data_health.confidence), markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
+    let mut coverage_cell = format!(
+        "exact: {}; fallback: {}; unknown: {}",
+        audit.pricing_coverage.priced_sessions,
+        audit.pricing_coverage.fallback_priced_sessions,
+        audit.pricing_coverage.unpriced_or_unknown_sessions
+    );
+    // rm-1059: same nonzero-only append as the text lane above.
+    if audit.pricing_coverage.unmodeled_cost_class_sessions > 0 {
+        coverage_cell.push_str(&format!(
+            "; unmodeled cost classes: {}",
+            audit.pricing_coverage.unmodeled_cost_class_sessions
+        ));
+    }
+    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | {} |\n", markdown_cell(&scope.range), markdown_cell(&scope.earliest_session_at), markdown_cell(&scope.latest_session_at), markdown_cell(&parse_coverage_phrase(data_health, "; ")), markdown_cell(&data_health.confidence), markdown_cell(&audit.pricing_source), coverage_cell));
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
             "| Dropped lines | {} |\n",
