@@ -1,0 +1,23 @@
+# rm-210 self-test: the old scanner (a) never scanned *.yaml at all and
+# (b) false-tripped this shape — the verb and --locked split across a
+# continuation. Joined, every invocation here carries its flag, so the
+# whole file must stay clean.
+name: wrapped-locked
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cargo test \
+            --locked \
+            --all-targets
+      - run: |
+          cargo \
+            +1.89 \
+            check \
+            --frozen
+      - run: |
+          cargo \
+            build \
+            --locked

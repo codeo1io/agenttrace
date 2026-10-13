@@ -1,0 +1,21 @@
+# rm-210 self-test: every core dependency-resolving verb is gated —
+# the old scanner only knew test|build|clippy, so each of these could
+# drift the reviewed lockfile unflagged. One marker per expected
+# offender, 10 total (counted at end-of-line so prose like this header
+# never inflates the expectation).
+name: ungated-verbs
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo run -p agenttrace -- report  # EXPECT-TRIP
+      - run: cargo check --workspace  # EXPECT-TRIP
+      - run: cargo bench -p agenttrace-core  # EXPECT-TRIP
+      - run: cargo doc --no-deps  # EXPECT-TRIP
+      - run: cargo fetch  # EXPECT-TRIP
+      - run: cargo fix --allow-dirty  # EXPECT-TRIP
+      - run: cargo install cargo-deny  # EXPECT-TRIP
+      - run: cargo rustc -- --emit=metadata  # EXPECT-TRIP
+      - run: cargo tree -p agenttrace-core  # EXPECT-TRIP
+      - run: cargo +nightly test  # EXPECT-TRIP

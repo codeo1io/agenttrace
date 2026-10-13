@@ -9,8 +9,19 @@
 use agenttrace_core::{parse_file, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 use std::path::PathBuf;
 
+// rm-1058: `line!()` evaluated INSIDE the helper is a process constant,
+// so every write_session() resolved the SAME tmpdir and parallel tests
+// writing identical fixture names (claude-a.jsonl / codex-b.jsonl)
+// interleaved in the O_TRUNC window — parser.rs:178 "empty session"
+// unwrap panic, three live full-suite flakes in one week. Unique dirs
+// per call make the cross-test clobber impossible by construction,
+// mirroring the subagents.rs Scratch::new precedent: pid + stable tag +
+// atomic sequence, no lock — the battery stays parallel.
+static FIXTURE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn fixture_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("at-otel-test-{}-{}", std::process::id(), line!()))
+    let seq = FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("at-otel-test-{}-{}", std::process::id(), seq))
 }
 
 fn write_session(file: &str, body: &str) -> PathBuf {
@@ -402,4 +413,35 @@ fn prompt_id_joins_statusline_captures_to_otel_export() {
     // never an error.
     let bare: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert!(correlated_prompt_ids(&captures, &bare).is_empty());
+}
+
+#[test]
+fn fixture_dir_is_unique_per_concurrent_call() {
+    // rm-1058 acceptance (d): two concurrent fixture_dir() calls in
+    // one process must receive different paths. The pre-fix helper
+    // baked line!() into a constant tag, so every call from every
+    // thread resolved the same directory — the exact collision the
+    // export battery raced on (across processes the same shape hit
+    // the O_TRUNC window); this pin keeps it dead in-process too.
+    const THREADS: usize = 8;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let joins: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let tx = tx.clone();
+            std::thread::spawn(move || tx.send(fixture_dir()).unwrap())
+        })
+        .collect();
+    drop(tx);
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for path in rx.iter().take(THREADS) {
+        assert!(seen.insert(path), "concurrent fixture_dir() collision");
+    }
+    for join in joins {
+        join.join().unwrap();
+    }
+    // Later sequential callers keep their uniqueness as well.
+    assert!(
+        seen.insert(fixture_dir()),
+        "sequential fixture_dir() collided with a concurrent one"
+    );
 }

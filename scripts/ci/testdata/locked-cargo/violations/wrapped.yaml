@@ -1,0 +1,15 @@
+# rm-210 acceptance fixture: a backslash-wrapped verb in a *.yaml file
+# — the exact shape BOTH old blind spots let through (the old glob
+# never scanned *.yaml, and the old same-line regex never saw the verb
+# because `cargo` and `test` sit on different lines). The scanner must
+# join the continuation, resolve the verb, and report the invocation at
+# its FIRST line.
+name: wrapped-violation
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cargo \
+            test -p agenttrace-core  # EXPECT-TRIP
