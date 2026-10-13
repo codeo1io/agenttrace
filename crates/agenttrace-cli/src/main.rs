@@ -2,9 +2,9 @@ use agenttrace_core::{
     add_baseline_comparison, average_health, build_doctor_report, compute_overview,
     compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
     delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
-    fix_suggestions, inspect_first, list_pricing, load_sessions_with_options, lookup_price,
-    matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter, parse_stdin_bytes,
-    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
+    fix_suggestions, guard_formula_cell, inspect_first, list_pricing, load_sessions_with_options,
+    lookup_price, matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter,
+    parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
     render_doctor_report, render_model_pricing_list, render_test_match,
     render_waste_report_with_language, report_compare_json, report_json_with_language,
     report_overview_html_with_context, report_overview_json_with_context,
@@ -1431,7 +1431,17 @@ fn render_plain_value(value: &serde_json::Value, depth: usize) -> String {
         // journal-derived strings (e.g. mcp_server_name inferred from a
         // crafted tool name) through this leaf; control bytes must not
         // reach the terminal (same contract as the TSV/search renderers).
-        serde_json::Value::String(value) => sanitize_line_segment(value),
+        //
+        // cycle 2 (S1, rm-540/rm-897 family): the same leaf also rides
+        // the formula-introducer guard — every string field of the
+        // governance plain-text render (session names, model ids, MCP
+        // server names, evidence phrases) gets the leading-apostrophe
+        // marker when it starts with `=`/`+`/`@`/`-`, so a pasted
+        // `--audit`/`--delivery-evidence` block cannot re-arm a
+        // `=HYPERLINK`/`=cmd|'` payload in a spreadsheet; numeric-looking
+        // strings stay bare, and the JSON/markdown-fenced lanes stay
+        // lossless.
+        serde_json::Value::String(value) => guard_formula_cell(&sanitize_line_segment(value)),
         _ => value.to_string(),
     }
 }
@@ -3132,6 +3142,45 @@ mod tests {
     use super::*;
     use agenttrace_core::Metrics;
     use std::io::Write;
+
+    #[test]
+    fn governance_plain_text_neutralizes_formula_introducers() {
+        // cycle 2 (S1, rm-540/rm-897 family): the governance-family plain
+        // renderer (`--audit`/`--delivery-evidence`/`--recommend`/
+        // `--mcp-governance`/`--context-trends` `-f text`) emits one
+        // `key: value` line per string leaf — pasted into a spreadsheet,
+        // a session named `=HYPERLINK(...)` or a model id `=2+5|cmd`
+        // re-arms exactly the way a TSV cell would, so the leaf rides the
+        // same leading-apostrophe guard the CSV/markdown/text-table
+        // lanes emit; the JSON and fenced-markdown lanes stay lossless.
+        let hostile = serde_json::json!({
+            "sessions": [
+                {
+                    "session": "=HYPERLINK(\"a\",\"b\")",
+                    "model": "=2+5|cmd",
+                    "server": "+run-cmd",
+                    "topic": "@sum-model",
+                    "count": "2048",
+                    "plain": "benign-session-name"
+                }
+            ]
+        });
+        let text = render_governance_report(&hostile, "text").unwrap();
+        assert!(text.contains("session: '=HYPERLINK(\"a\",\"b\")"));
+        assert!(text.contains("model: '=2+5|cmd"));
+        assert!(text.contains("server: '+run-cmd"));
+        assert!(text.contains("topic: '@sum-model"));
+        // numeric-looking strings stay bare (the guard's judged-first
+        // numeric exemption) and benign names are byte-identical:
+        assert!(text.contains("count: 2048"));
+        assert!(text.contains("plain: benign-session-name"));
+        // the JSON lane is lossless — no marker ever injected there:
+        let json = render_governance_report(&hostile, "json").unwrap();
+        assert!(json.contains("=HYPERLINK"));
+        assert!(!json.contains("'=HYPERLINK"));
+        let md = render_governance_report(&hostile, "markdown").unwrap();
+        assert!(md.contains("=HYPERLINK"));
+    }
 
     #[test]
     fn has_followup_action_covers_every_action_arm_for_both_side_effect_exits() {

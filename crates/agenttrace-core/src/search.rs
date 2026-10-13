@@ -1,4 +1,5 @@
-use crate::reports::{json_float, json_string};
+use crate::reports::{guard_formula_cell, json_float, json_string};
+use crate::statusline::sanitize_line_segment;
 use crate::{
     canonical_sessions, format_cost, format_tokens, highest_authority_for_metrics, round4,
     total_tokens, SearchResult, Session, VERSION,
@@ -119,11 +120,17 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         // the terminal (assess PoC: --search -f text emitted a verbatim
         // clipboard-write sequence from a crafted tool name). JSON output
         // escapes control bytes losslessly and is intentionally untouched.
+        //
+        // cycle 2 (S1, rm-540/rm-897 family): the same fields also carry the
+        // formula-introducer guard — pasted as whitespace-split columns, a
+        // `=HYPERLINK` name re-arms in a spreadsheet exactly like a TSV
+        // cell would; sanitize first, guard after, so the marker sits on
+        // the first printable character.
         out.push_str(&format!(
             "\n{}  {}  {}  health={}  {}  {} TOKENS\n",
-            crate::statusline::sanitize_line_segment(&result.name),
-            crate::statusline::sanitize_line_segment(&result.source_tool),
-            crate::statusline::sanitize_line_segment(&result.model),
+            guard_formula_cell(&sanitize_line_segment(&result.name)),
+            guard_formula_cell(&sanitize_line_segment(&result.source_tool)),
+            guard_formula_cell(&sanitize_line_segment(&result.model)),
             result.health,
             format_cost(result.cost),
             format_tokens(result.tokens)
@@ -131,19 +138,19 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
         if !result.cwd.is_empty() {
             out.push_str(&format!(
                 "  cwd: {}\n",
-                crate::statusline::sanitize_line_segment(&result.cwd)
+                guard_formula_cell(&sanitize_line_segment(&result.cwd))
             ));
         }
         if !result.path.is_empty() {
             out.push_str(&format!(
                 "  path: {}\n",
-                crate::statusline::sanitize_line_segment(&result.path)
+                guard_formula_cell(&sanitize_line_segment(&result.path))
             ));
         }
         for item in &result.matches {
             out.push_str(&format!(
                 "  - {}\n",
-                crate::statusline::sanitize_line_segment(item)
+                guard_formula_cell(&sanitize_line_segment(item))
             ));
         }
     }
@@ -241,6 +248,52 @@ fn add_match(
 mod tests {
     use super::*;
     use crate::{Metrics, Session};
+
+    #[test]
+    fn search_text_fields_neutralize_formula_introducers() {
+        // cycle 2 (S1, rm-540/rm-897 family): every transcript-derived
+        // field in the text lane is terminal-sanitized (rm-383) AND
+        // formula-guarded — pasted as whitespace-split columns a
+        // `=HYPERLINK` name re-arms in a spreadsheet exactly like a TSV
+        // cell. The JSON lane stays lossless and untouched.
+        let hostile = || SearchResult {
+            name: "=HYPERLINK(\"a\",\"b\")".to_string(),
+            path: "/tmp/probe.jsonl".to_string(),
+            cwd: String::new(),
+            source_tool: "+run-cmd".to_string(),
+            model: "@sum-model".to_string(),
+            health: 100,
+            cost: 0.0,
+            tokens: 10,
+            matches: vec!["=2+5|cmd".to_string()],
+        };
+        let text = report_search_text(&[hostile()], "probe");
+        assert!(text.contains("'=HYPERLINK(\"a\",\"b\")"));
+        assert!(text.contains("'+run-cmd"));
+        assert!(text.contains("'@sum-model"));
+        assert!(text.contains("'=2+5|cmd"));
+        // numeric-looking tokens stay bare (rm-540's safe trade — a bare
+        // number is inert), which also proves the guard is not a blanket
+        // prefix on every non-alphabetic value:
+        let numeric = || SearchResult {
+            name: "+1024".to_string(),
+            path: "/tmp/probe.jsonl".to_string(),
+            cwd: String::new(),
+            source_tool: "Bash".to_string(),
+            model: "claude-sonnet-5.5".to_string(),
+            health: 100,
+            cost: 0.0,
+            tokens: 10,
+            matches: vec!["-42.50".to_string()],
+        };
+        let numeric_text = report_search_text(&[numeric()], "probe");
+        assert!(numeric_text.contains("+1024"));
+        assert!(!numeric_text.contains("'+1024"));
+        assert!(numeric_text.contains("-42.50"));
+        let json = report_search_json(&[hostile()]);
+        assert!(json.contains("=HYPERLINK"));
+        assert!(!json.contains("'=HYPERLINK"));
+    }
 
     #[test]
     fn search_evidence_uses_go_labels_dedupes_and_caps_matches() {

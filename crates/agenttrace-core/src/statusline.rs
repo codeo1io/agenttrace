@@ -2502,7 +2502,15 @@ mod tests {
         // on B8, one byte into the 3-byte char.
         let contents = format!("{head}\u{4E2D}{tail}");
         let total = head_len + 3 + tail_len;
-        let journal = std::env::temp_dir().join("agenttrace-test-statusline-torn-utf8.jsonl");
+        // rm-929 (cycle 2, clause c): the name is per-run unique — two
+        // concurrent test binaries raced this exact static name on the
+        // fleet and the loser truncated mid-write (assess pair-4 panic,
+        // capped_away_bytes 0 vs 10486634).
+        let journal = std::env::temp_dir().join(format!(
+            "agenttrace-test-statusline-torn-utf8-{}-{:?}.jsonl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&journal, contents.as_bytes()).unwrap();
         let stats = statusline_journal_stats(&journal);
         // The walk advances B8 -> AD and stops at the '\n' (an ASCII start):

@@ -9490,7 +9490,13 @@ mod tests {
         // keeps claude-only keys (parentUuid here), so is_qwen_code_jsonl must
         // not claim the file and parse_claude_code_jsonl must — the session
         // classifies claude_code instead of qwen_code.
-        let dir = std::env::temp_dir().join("agenttrace-rm345-claude-stripped");
+        // rm-929 (cycle 2, clause c): per-run suffix — the static name
+        // raced a concurrent test binary's dir on the fleet.
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm345-claude-stripped-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stripped.jsonl");
         std::fs::write(
@@ -9532,7 +9538,13 @@ mod tests {
         // overview normalizes it to the "unknown" bucket), and a
         // journal with no gitBranch parses with an empty branch —
         // never a panic, never an invented value.
-        let dir = std::env::temp_dir().join("agenttrace-rm585-git-branch");
+        // rm-929 (cycle 2, clause c): per-run suffix — the static name
+        // raced a concurrent test binary's dir on the fleet.
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm585-git-branch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
 
         let branchy = dir.join("branchy.jsonl");

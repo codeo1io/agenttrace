@@ -2180,7 +2180,14 @@ pub fn report_compare_with_language(
         // journal emitted one OSC-52 clipboard-write sequence). Route
         // through the shared sanitizer before layout so the 27-rune
         // budget applies to sanitized text.
-        let name = truncate_runes(&sanitize_line_segment(&session.name), 27);
+        //
+        // cycle 2 (S1, rm-540/rm-897 family): guard BEFORE truncating so
+        // the introducer marker cannot be cut off — same order text_cell
+        // applies.
+        let name = truncate_runes(
+            &guard_formula_cell(&sanitize_line_segment(&session.name)),
+            27,
+        );
         out.push_str(&format!(
             "  {:<28} {:>4} {:>5} {:>5} {:>5} {:>9} {} {}/100\n",
             name,
@@ -3486,6 +3493,12 @@ fn text_cell(value: &str, limit: usize) -> String {
     // byte-identical.
     let value = sanitize_line_segment(value);
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    // cycle 2 (S1, rm-540/rm-897 family): after sanitization every text
+    // cell also rides the formula-introducer guard — a space-aligned text
+    // table pastes into a spreadsheet one whitespace-delimited token per
+    // cell, so a column value like `=HYPERLINK(a,b)` re-arms exactly the
+    // way a TSV cell does; bare numbers stay bare.
+    let value = guard_formula_cell(&value);
     if limit > 3 {
         truncate_text_runes(&value, limit, "...")
     } else {
@@ -3624,7 +3637,15 @@ fn parse_coverage_phrase(health: &crate::DataHealth, sep: &str) -> String {
 /// payloads when the markdown report is pasted into a spreadsheet; the
 /// false-positive cost (a leading apostrophe on benign `-` bullets) is the
 /// same trade the CSV lane accepted — guarding is the safe direction.
-fn guard_formula_cell(value: &str) -> String {
+///
+/// cycle 2 (S1): `pub` — the search lane's text renderer guards its
+/// transcript-derived fields through this same function (rm-383 sanitizes
+/// them for the terminal; this keeps them inert when pasted into a
+/// spreadsheet as whitespace-split columns), and the CLI's governance
+/// plain-text renderer (`--audit`/`--delivery-evidence`/`--recommend`/
+/// `--mcp-governance`/`--context-trends` `-f text`) guards every string
+/// leaf the same way while the JSON lane stays lossless.
+pub fn guard_formula_cell(value: &str) -> String {
     if value.trim().parse::<f64>().is_ok() {
         return value.to_string();
     }
@@ -3767,6 +3788,31 @@ mod tests {
         // Truncation still applies after sanitization.
         let long = "x".repeat(90);
         assert_eq!(text_cell(&long, 40).chars().count(), 40);
+    }
+
+    #[test]
+    fn text_lane_cells_neutralize_formula_introducers() {
+        // cycle 2 (S1, rm-540/rm-897 family): text tables paste into
+        // spreadsheets one whitespace-delimited token per cell, so every
+        // column value carrying a formula introducer gets the same leading
+        // apostrophe the CSV and markdown lanes emit; bare numbers stay
+        // bare and benign text is byte-identical. Guarding happens before
+        // truncation so the marker always survives the cut.
+        assert_eq!(
+            text_cell("=HYPERLINK(\"a\",\"b\")", 80),
+            "'=HYPERLINK(\"a\",\"b\")"
+        );
+        assert_eq!(text_cell("  =2+5|cmd", 80), "'=2+5|cmd");
+        // numeric-looking values stay bare on purpose (rm-540's safe
+        // trade): `+1024` pastes as the number 1024, inert — only a
+        // non-numeric introducer payload gets the marker.
+        assert_eq!(text_cell("+1024", 80), "+1024");
+        assert_eq!(text_cell("+run-cmd", 80), "'+run-cmd");
+        assert_eq!(text_cell("@ref", 80), "'@ref");
+        assert_eq!(text_cell("\u{FF1D}SUM(1)", 80), "'\u{FF1D}SUM(1)");
+        assert_eq!(text_cell("-42.50", 80), "-42.50");
+        assert_eq!(text_cell("claude-sonnet-5.5", 80), "claude-sonnet-5.5");
+        assert_eq!(text_cell("=HYPERLINK(a,long-payload)", 8), "'=HYP...");
     }
 
     #[test]

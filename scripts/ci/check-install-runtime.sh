@@ -26,6 +26,16 @@ fail() {
 
 sh -n install.sh || fail "install.sh must remain valid POSIX sh"
 
+# rm-051 (cycle 2): the pinned default ref the tests expect is DERIVED from
+# install.sh at runtime — the old literals still said v0.9.0 while install.sh
+# had already moved on, so every full battery run went red on the mismatch.
+# Deriving keeps the gate following the installer wherever the pin moves;
+# the poison arm (test K) proves the derivation is live, never a second
+# hardcoded copy that can drift again.
+expected_ref="$(sed -n 's/^REF="\${AGENTTRACE_SOURCE_REF:-\([^"]*\)}"$/\1/p' install.sh)"
+[[ -n "$expected_ref" ]] ||
+	fail "cannot derive the pinned default ref from install.sh (did the REF= line shape change?)"
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -110,9 +120,9 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
-# The ref is the installer's pinned default (v0.9.0, rm-051) or whatever
-# AGENTTRACE_SOURCE_REF names, so the fallback never has to resolve
-# api.github.com in an offline run.
+# The ref is the installer's pinned default (derived from install.sh
+# above, rm-051) or whatever AGENTTRACE_SOURCE_REF names, so the fallback
+# never has to resolve api.github.com in an offline run.
 shims="$tmp/shims"
 mkdir -p "$shims"
 cat >"$shims/git" <<FAKE_GIT
@@ -149,8 +159,8 @@ grep -q "pinned ref" "$out" ||
 	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
-grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
-	fail "test D: install receipt must record the default pinned ref (rm-051)"
+grep -q "^ref=$expected_ref$" "$tmp/d-receipt" ||
+	fail "test D: install receipt must record the default pinned ref ($expected_ref, derived — rm-051)"
 
 # — test E: the fallback clones a PINNED ref, never a moving default
 #   branch (rm-051) — this fake git refuses an unpinned clone and
@@ -194,9 +204,9 @@ if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
 	cat "$out" >&2
 	fail "test E: pinned source build must succeed"
 fi
-grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
-	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
-grep -q "pinned ref v0.9.0" "$out" ||
+grep -q "^clone --branch $expected_ref$" "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch $expected_ref (the pinned default ref)"
+grep -q "pinned ref $expected_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"
@@ -297,6 +307,26 @@ grep -q "Checksum mismatch" "$out" ||
 	fail "test J: refusal must diagnose the checksum mismatch"
 grep -q "not installing" "$out" ||
 	fail "test J: refusal must state the install is aborted"
+
+# — test K: the expected ref is DERIVED from install.sh, not hardcoded —
+#   the same default is injected with a poison value into a copy of
+#   install.sh and must flow all the way to the receipt; had the gate
+#   hardcoded the default anywhere, this arm is what catches it on the
+#   next pin bump (rm-051) —
+poison_ref="v9.9.9-poison"
+sed "s/^REF=\"\${AGENTTRACE_SOURCE_REF:-[^\"]*}\"/REF=\"\${AGENTTRACE_SOURCE_REF:-$poison_ref}\"/" \
+	install.sh >"$tmp/install-poison.sh"
+grep -q "REF=\"\${AGENTTRACE_SOURCE_REF:-$poison_ref}\"" "$tmp/install-poison.sh" ||
+	fail "test K: the poison rewrite must actually change install.sh's REF default"
+out="$tmp/out.k"
+if ! env PATH="$shims:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/k" \
+	AGENTTRACE_INSTALL_RECEIPT="$tmp/k-receipt" \
+	AGENTTRACE_DOWNLOAD_URL="file://$bad_stub" sh "$tmp/install-poison.sh" >"$out" 2>&1; then
+	cat "$out" >&2
+	fail "test K: the poisoned-default install must still succeed"
+fi
+grep -q "^ref=$poison_ref$" "$tmp/k-receipt" ||
+	fail "test K: the receipt must follow install.sh's own default (derivation, not a hardcode)"
 
 # — glibc-baseline guard: a locally built binary must not require a glibc
 #   newer than the compatibility floor we defend (Ubuntu 22.04 = 2.35) —

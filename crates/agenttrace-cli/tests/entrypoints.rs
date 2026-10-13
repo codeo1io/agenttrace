@@ -1661,7 +1661,13 @@ fn stdin_dash_empty_input_fails_like_an_empty_file() {
     // rm-503: empty stdin is the empty-session error class (rc1), the
     // same failure an empty named file produces — not a hang, not a
     // zero-session success.
-    let empty = std::env::temp_dir().join("agenttrace-stdin-empty-probe.jsonl");
+    // rm-929 (cycle 2, clause c): per-run suffix — the static file name
+    // raced a concurrent test binary on the fleet.
+    let empty = std::env::temp_dir().join(format!(
+        "agenttrace-stdin-empty-probe-{}-{:?}.jsonl",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     std::fs::write(&empty, b"").expect("write empty probe file");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))

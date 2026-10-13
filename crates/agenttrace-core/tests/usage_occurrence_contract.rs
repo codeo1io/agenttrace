@@ -65,7 +65,13 @@ fn codex_post_compaction_revisit_counts_fresh_last_usage() {
 #[test]
 fn codex_rate_limit_reemission_stays_free() {
     let window = r#"{"timestamp":"2026-10-06T06:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"output_tokens":500},"last_token_usage":{"input_tokens":1000,"output_tokens":500}}}}"#;
-    let dir = std::env::temp_dir().join("agenttrace-contract-ratelimit");
+    // rm-929 (cycle 2, clause c): per-run suffix — the static dir name
+    // raced a concurrent test binary on the fleet.
+    let dir = std::env::temp_dir().join(format!(
+        "agenttrace-contract-ratelimit-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("rollout-2026-10-06T06-00-00.jsonl");
     fs::write(
