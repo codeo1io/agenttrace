@@ -280,6 +280,21 @@ note), and entry/listing keys encode non-UTF-8 paths losslessly
 very non-UTF-8 journals it exists to remember; concurrent saves and
 clears serialize under an advisory lock sibling (`sessions.json.lock`)
 instead of racing last-writer-wins, and to 53 when the pi journal's
+same-second id derivation was corrected (run 2023f222, conflict case
+below). A second bounded ledger rides the same wiring without a
+schema rung (rm-996, run cebf20d5 cycle 2, batch "trusted
+instruments"): `transcript_shrunk` records every cached transcript
+that re-parsed with FEWER events than the entry it replaced — the
+in-place prefix rewrite a producer's local garbage collector performs
+(Claude Code's `CLAUDE_CODE_TRANSCRIPT_LOCAL_GC`) — because that shape
+otherwise lowers every total on the warm report silently. The shrunk
+session carries a `transcript_shrunk` anomaly naming prior and
+current totals, the ledger records the observation (file, name,
+prior/current events, tokens, and cost), and `--doctor` surfaces it as
+a `cache shrink disclosure:` note beside the schema-invalidation note;
+totals follow the on-disk journal, growth never fires, and journals
+that never observed a shrink stay byte-identical (`SESSION_CACHE_SCHEMA_VERSION`
+stays 60).
 compaction/`branch_summary` entries stopped dropping their inline
 usage blocks — the whole-context compaction call's real spend (tokens
 plus the upstream-recorded cost, disclosed per kind as

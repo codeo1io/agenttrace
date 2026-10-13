@@ -899,6 +899,15 @@ pub fn session_cache_entries_source() -> &'static str {
 /// bound counts it either way.
 const MAX_SCHEMA_INVALIDATION_RECORDS: usize = 8;
 
+/// How many `transcript_shrunk` records the journal keeps (rm-996,
+/// run cebf20d5 cycle 2, batch "trusted instruments"). Each record is
+/// one observed in-place shrink (a cached transcript re-parsed with
+/// fewer events — the CLAUDE_CODE_TRANSCRIPT_LOCAL_GC strict-prefix
+/// rewrite shape); bounded like the invalidation ledger so a cache
+/// that outlives many GC passes cannot grow the disclosure without
+/// limit — the byte bound counts the member either way.
+const MAX_TRANSCRIPT_SHRINK_RECORDS: usize = 8;
+
 /// Walk-semantics version for cached directory listings. Bumped when the
 /// discovery walk's directory set changes so stale listings are dropped
 /// once at load (see `load_session_cache`). v2: symlinked child
@@ -957,6 +966,20 @@ pub struct SessionCache {
     /// `schema_invalidations` member at save time (bounded by
     /// `MAX_SCHEMA_INVALIDATION_RECORDS`).
     schema_invalidations: Vec<Value>,
+    /// Durable disclosure of transcript-shrink observations (rm-996):
+    /// cached transcripts that re-parsed with FEWER events than the
+    /// entry they replaced. Persisted as the top-level
+    /// `transcript_shrunk` member at save time, bounded by
+    /// `MAX_TRANSCRIPT_SHRINK_RECORDS` and omitted entirely when empty
+    /// so a journal that never observed a shrink stays byte-identical
+    /// (no schema rung rides the disclosure — the baseline comes from
+    /// the entry the journal already persists). See
+    /// `transcript_shrunk_records()`.
+    transcript_shrunk: Vec<Value>,
+    /// rm-996: stale-entry totals captured at the fingerprint miss in
+    /// `cached_session` and consumed by the next `store_session` on
+    /// the same key. In-memory only — never serialized.
+    shrink_baselines: BTreeMap<String, ShrinkBaseline>,
     dirty: bool,
 }
 
@@ -1929,6 +1952,10 @@ pub fn load_session_cache() -> SessionCache {
             path,
             dirs,
             schema_invalidations,
+            // rm-996: the shrink ledger is history, not live state —
+            // it survives an entry-drop invalidation (the observations
+            // happened even though the entries are regenerating).
+            transcript_shrunk: persisted_transcript_shrunk(&doc),
             dirty: true,
             ..SessionCache::default()
         };
@@ -2024,6 +2051,7 @@ pub fn load_session_cache() -> SessionCache {
         raw_entries,
         dirs,
         schema_invalidations,
+        transcript_shrunk: persisted_transcript_shrunk(&doc),
         // A catalog mismatch dirties the cache so the emptied entry map
         // is persisted with the new id at the next save (rm-196).
         dirty: listing_stale || !pricing_matches,
@@ -2129,6 +2157,17 @@ impl SessionCache {
     /// stranding from here without the loader staying silent.
     pub fn schema_invalidations(&self) -> &[Value] {
         self.schema_invalidations.as_slice()
+    }
+
+    /// Durable record of transcript-shrink observations (rm-996): each
+    /// record names a cached transcript that re-parsed with fewer
+    /// events than the entry it replaced (an in-place prefix rewrite,
+    /// e.g. Claude Code's CLAUDE_CODE_TRANSCRIPT_LOCAL_GC), with prior
+    /// and current totals. The doctor lane summarizes it beside the
+    /// schema-invalidation note; the shrink is ALSO annotated on the
+    /// stored session itself (`transcript_shrunk` anomaly).
+    pub fn transcript_shrunk_records(&self) -> &[Value] {
+        self.transcript_shrunk.as_slice()
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -2446,6 +2485,7 @@ fn doc_frame_len(
     dirs_bytes: usize,
     dirs_count: usize,
     invalidations_bytes: usize,
+    shrinks_bytes: usize,
 ) -> usize {
     let mut total = format!(
         "{{\"schema_version\":{},\"dir_listing_version\":{},\"pricing_catalog_id\":",
@@ -2468,6 +2508,9 @@ fn doc_frame_len(
     if invalidations_bytes > 0 {
         total += 1 + "\"schema_invalidations\":".len() + invalidations_bytes;
     }
+    if shrinks_bytes > 0 {
+        total += 1 + "\"transcript_shrunk\":".len() + shrinks_bytes;
+    }
     total + 1
 }
 
@@ -2489,6 +2532,7 @@ fn serialized_doc_size(cache: &SessionCache) -> usize {
         dirs_member_bytes(cache),
         cache.dirs.len(),
         invalidations_member_bytes(&cache.schema_invalidations),
+        invalidations_member_bytes(&cache.transcript_shrunk),
     )
 }
 
@@ -2614,6 +2658,7 @@ fn enforce_byte_bound(cache: &mut SessionCache, max: usize) -> usize {
         dirs_bytes,
         cache.dirs.len(),
         invalidations_member_bytes(&cache.schema_invalidations),
+        invalidations_member_bytes(&cache.transcript_shrunk),
     );
     if total <= max {
         return 0;
@@ -2653,10 +2698,86 @@ fn persisted_schema_invalidations(doc: &Map<String, Value>) -> Vec<Value> {
     records
 }
 
+fn persisted_transcript_shrunk(doc: &Map<String, Value>) -> Vec<Value> {
+    let mut records = doc
+        .get("transcript_shrunk")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    cap_transcript_shrunk_records(&mut records);
+    records
+}
+
 fn cap_schema_invalidations(records: &mut Vec<Value>) {
     let len = records.len();
     if len > MAX_SCHEMA_INVALIDATION_RECORDS {
         records.drain(0..len - MAX_SCHEMA_INVALIDATION_RECORDS);
+    }
+}
+
+fn cap_transcript_shrunk_records(records: &mut Vec<Value>) {
+    let len = records.len();
+    if len > MAX_TRANSCRIPT_SHRINK_RECORDS {
+        records.drain(0..len - MAX_TRANSCRIPT_SHRINK_RECORDS);
+    }
+}
+
+/// rm-996: the stale entry's totals, captured when a fingerprint miss
+/// invalidates it, for the shrink comparison at the store that
+/// follows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ShrinkBaseline {
+    events_total: usize,
+    tokens_input: i64,
+    tokens_output: i64,
+    tokens_cache_r: i64,
+    tokens_cache_w: i64,
+    cost_estimated: f64,
+}
+
+impl ShrinkBaseline {
+    fn from_go_metrics(metrics: &GoMetrics) -> Self {
+        Self {
+            events_total: metrics.events_total,
+            tokens_input: metrics.tokens_input,
+            tokens_output: metrics.tokens_output,
+            tokens_cache_r: metrics.tokens_cache_r,
+            tokens_cache_w: metrics.tokens_cache_w,
+            cost_estimated: metrics.cost_estimated,
+        }
+    }
+
+    fn tokens_total(&self) -> i64 {
+        self.tokens_input
+            .saturating_add(self.tokens_output)
+            .saturating_add(self.tokens_cache_r)
+            .saturating_add(self.tokens_cache_w)
+    }
+}
+
+fn go_tokens_total(metrics: &GoMetrics) -> i64 {
+    metrics
+        .tokens_input
+        .saturating_add(metrics.tokens_output)
+        .saturating_add(metrics.tokens_cache_r)
+        .saturating_add(metrics.tokens_cache_w)
+}
+
+/// rm-996: called on the fingerprint-miss path of `cached_session`
+/// before the stale entry is dropped — the file changed under the
+/// size+mtime fingerprint, so the parse that follows describes the
+/// same lineage. Keeping the stale totals as the baseline lets the
+/// store disclose a shrink instead of silently lowering totals. The
+/// entry-shape invalidation branches below do NOT capture: there the
+/// file is unchanged and only the entry layout was old, so a totals
+/// delta there is a semantics change (a schema concern), never an
+/// on-disk truncation.
+fn capture_shrink_baseline(key: &str, cache: &mut SessionCache) {
+    if let Some(entry) = cached_entry(key, cache) {
+        cache.shrink_baselines.insert(
+            key.to_string(),
+            ShrinkBaseline::from_go_metrics(&entry.session.metrics),
+        );
     }
 }
 
@@ -2726,6 +2847,16 @@ fn merge_concurrent_disk_state(cache: &mut SessionCache) {
             }
         }
         cap_schema_invalidations(&mut cache.schema_invalidations);
+    }
+    // rm-996: shrink observations union the same way — a concurrent
+    // writer's disclosure must survive this process's save.
+    if let Some(records) = doc.get("transcript_shrunk").and_then(Value::as_array) {
+        for record in records {
+            if !cache.transcript_shrunk.contains(record) {
+                cache.transcript_shrunk.push(record.clone());
+            }
+        }
+        cap_transcript_shrunk_records(&mut cache.transcript_shrunk);
     }
 }
 
@@ -2820,6 +2951,16 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
                 Value::Array(cache.schema_invalidations.clone()),
             );
         }
+        // rm-996: the transcript-shrink ledger — bounded like the
+        // invalidation ledger and omitted entirely when empty so a
+        // journal that never observed a shrink stays byte-identical
+        // (no schema rung rides the disclosure).
+        if !cache.transcript_shrunk.is_empty() {
+            doc.insert(
+                "transcript_shrunk".to_string(),
+                Value::Array(cache.transcript_shrunk.clone()),
+            );
+        }
         let tmp = unique_temp_path(&cache.path);
         write_private(&tmp, &serde_json::to_vec(&Value::Object(doc))?)?;
         // Fence the rename: if our lock was stolen while this document
@@ -2848,6 +2989,13 @@ pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> 
     let key = cache_key(path);
     let header = cached_entry_header(&key, cache)?;
     if !is_fresh(path, &header) {
+        // rm-996: the file changed under the fingerprint. Capture the
+        // stale entry's totals BEFORE dropping it, so the store that
+        // follows can disclose a shrink (re-parse with fewer events —
+        // an in-place prefix rewrite, e.g. Claude Code's
+        // CLAUDE_CODE_TRANSCRIPT_LOCAL_GC) instead of silently
+        // lowering every total on the warm report.
+        capture_shrink_baseline(&key, cache);
         delete_cached_session_key(&key, cache);
         return None;
     }
@@ -2878,12 +3026,51 @@ pub fn store_session(
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(path)?;
     let key = cache_key(path);
+    let mut go = GoSession::from_session(session);
+    // rm-996: the shrink check at the refresh seam. A fingerprint miss
+    // captured this key's stale totals as the baseline; if the
+    // re-parse comes back with FEWER events, the transcript was
+    // rewritten in place shorter (the strict-prefix GC shape) — that
+    // is disclosed on the stored session and in the journal ledger
+    // instead of letting the warm report's totals drop silently.
+    // Growth and unchanged totals (the normal refresh paths) consume
+    // the baseline with no disclosure; the check reads only the
+    // metrics the entry already persists, so it is layout-independent
+    // and no schema rung rides it.
+    if let Some(baseline) = cache.shrink_baselines.remove(&key) {
+        if baseline.events_total > 0 && go.metrics.events_total < baseline.events_total {
+            cache.transcript_shrunk.push(serde_json::json!({
+                "file": path.display().to_string(),
+                "name": session.name,
+                "prior_events_total": baseline.events_total,
+                "current_events_total": go.metrics.events_total,
+                "prior_tokens_total": baseline.tokens_total(),
+                "current_tokens_total": go_tokens_total(&go.metrics),
+                "prior_cost_estimated_usd": baseline.cost_estimated,
+                "current_cost_estimated_usd": go.metrics.cost_estimated,
+            }));
+            cap_transcript_shrunk_records(&mut cache.transcript_shrunk);
+            go.anomalies.push(GoAnomaly {
+                kind: "transcript_shrunk".to_string(),
+                severity: "low".to_string(),
+                emoji: String::new(),
+                detail: format!(
+                    "the on-disk transcript was rewritten shorter since the last cached parse \
+                     (events {} -> {}): totals now describe the truncated journal, not the \
+                     original session — expected after in-place garbage collection \
+                     (CLAUDE_CODE_TRANSCRIPT_LOCAL_GC); the prior totals are disclosed in the \
+                     session-cache journal, not silently dropped",
+                    baseline.events_total, go.metrics.events_total,
+                ),
+            });
+        }
+    }
     cache.entries.insert(
         key.clone(),
         CacheEntry {
             mod_time: file_mod_time_nanos(&metadata),
             size: metadata.len() as i64,
-            session: GoSession::from_session(session),
+            session: go,
         },
     );
     cache.raw_entries.remove(&key);

@@ -172,9 +172,26 @@ These checks cover:
 - `-o` stdout/stderr behavior and failing gate exit code `2`
 - repeated demo latest/overview JSON determinism
 - report cost-label and version metadata consistency
-- README and Homebrew formula version drift
+- README and Homebrew formula version drift, plus README install-example version pins matching `install.sh`'s default ref
 - non-interactive README/docs command smoke tests
 - local real-data CLI smoke with sampled real local session files
 - local Rust TUI pty smoke with sampled real local session files
+
+Two gate properties worth knowing when running them on a populated host
+(rm-994, run cebf20d5 cycle 2, batch "trusted instruments"):
+
+- **They are hermetic in their `--doctor` legs.** The output-contract
+  doctor leg runs against the bundled demo corpus, and the real-CLI
+  smoke's default-discovery doctor leg runs against a gate-built empty
+  corpus — neither walks the operator's real `$HOME` corpus lanes
+  anymore. Before rm-994 both ran `agenttrace --doctor` unscoped, so
+  either gate could hang for its full timeout on a host with a large
+  real corpus while CI stayed green only because its environment pins
+  kept `$HOME` empty.
+- **The real-CLI smoke keeps transcript copies private.** It copies
+  sampled real session files into a shared `/tmp` out-dir; every
+  artifact it writes is owner-only (dirs `0700`, files `0600`) and a
+  closing `find -perm` leg fails the gate if any artifact ever carries
+  a group or other access bit.
 
 CI uploads generated demo reports as artifacts so reviewers can inspect the JSON, Markdown, and HTML output without rerunning local commands.

@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# rm-994 (run cebf20d5 cycle 2, batch "trusted instruments"): the
+# out-dir below carries COPIES of the operator's real session
+# transcripts and report renders over them into a shared /tmp path —
+# every artifact this gate writes must stay owner-only (dirs 0700,
+# files 0600). The umask makes that the default; the closing find leg
+# pins it.
+umask 077
+
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
@@ -53,12 +61,27 @@ mkdir -p "$snapshot_dir"
 copied=0
 while IFS= read -r file; do
   cp "$file" "$snapshot_dir/session-$copied-${file##*/}"
+  # rm-994: the copy is the transcript itself — pin it owner-only
+  # regardless of the source file's mode (the umask already strips
+  # group/other bits; this survives a cp that preserves modes).
+  chmod 600 "$snapshot_dir/session-$copied-${file##*/}"
   copied=$((copied + 1))
   [[ "$copied" -ge "$file_limit" ]] && break
 done < <(find "$source_dir" -type f 2>/dev/null | sort)
 [[ "$copied" -gt 0 ]] || fail "could not copy real session files from: $source_dir"
 
-run_capture doctor-default --doctor -f json
+# rm-994: the default doctor capture used to run UNscoped — default
+# discovery walks the operator's REAL corpus homes (every agent lane,
+# not just the sampled source dir), so this leg hung at the gate
+# timeout (rc=124 at 240s) on populated hosts while CI stayed green
+# only because its env pins kept $HOME empty. The default-discovery
+# contract now runs against a gate-built EMPTY corpus: doctor must
+# exit 0 with a valid custom-directory report when there is nothing
+# to parse. The populated custom-dir shape stays covered by the
+# doctor-snapshot leg below.
+empty_dir="$out_dir/empty-corpus"
+mkdir -p "$empty_dir"
+run_capture doctor-empty --doctor -d "$empty_dir" -f json
 run_capture doctor-snapshot --doctor -d "$snapshot_dir" -f json
 run_capture overview-snapshot -d "$snapshot_dir" --overview -f json
 run_capture latest-snapshot -d "$snapshot_dir" --latest -f json
@@ -84,13 +107,13 @@ env AGENTTRACE_SESSION_CACHE_DIR="$out_dir/cache-step-summary" \
 printf "%s\n" "$step_summary_status" >"$out_dir/step-summary.status"
 
 for name in \
-  doctor-default doctor-snapshot overview-snapshot \
+  doctor-empty doctor-snapshot overview-snapshot \
   latest-snapshot search-snapshot compare-snapshot waste-snapshot step-summary
 do
   expect_status "$name" 0
 done
 
-for name in doctor-default doctor-snapshot overview-snapshot latest-snapshot search-snapshot compare-snapshot step-summary; do
+for name in doctor-empty doctor-snapshot overview-snapshot latest-snapshot search-snapshot compare-snapshot step-summary; do
   require_json "$out_dir/$name.out"
 done
 
@@ -103,6 +126,17 @@ grep -q "^# agenttrace overview" "$step_summary" \
   || fail "step summary should carry the overview render heading"
 ! grep -q "could not append GITHUB_STEP_SUMMARY" "$out_dir/step-summary.err" \
   || fail "step-summary arm reported an append failure on stderr"
+
+# rm-994: pin the privacy contract the umask established — nothing
+# under the out-dir (dirs, transcript copies, reports, status files)
+# may carry any group or other access bit. POSIX `find -perm -0NN`
+# tests one bit at a time; `-print -quit` names the first offender.
+leaked="$(
+  find "$out_dir" \
+    \( -perm -040 -o -perm -020 -o -perm -010 \
+    -o -perm -004 -o -perm -002 -o -perm -001 \) -print -quit
+)"
+[[ -z "$leaked" ]] || fail "real-cli smoke artifacts must stay owner-only (0700/0600): $leaked"
 
 node - "$out_dir" "$copied" <<'NODE'
 const fs = require("fs");
@@ -121,6 +155,12 @@ function assert(condition, message) {
 const doctor = readJson("doctor-snapshot");
 assert(doctor.mode === "custom directory", `snapshot doctor mode changed: ${doctor.mode}`);
 assert(doctor.session_files > 0, `snapshot doctor should parse at least one copied session file, copied ${copied}`);
+
+// rm-994: the empty-corpus leg — doctor on a directory with nothing
+// to parse must still exit 0 with a valid custom-directory report.
+const doctorEmpty = readJson("doctor-empty");
+assert(doctorEmpty.mode === "custom directory", `empty doctor mode changed: ${doctorEmpty.mode}`);
+assert(doctorEmpty.session_files === 0, `empty corpus doctor should disclose zero files, saw ${doctorEmpty.session_files}`);
 
 const overview = readJson("overview-snapshot");
 assert(overview.version && overview.summary, "overview snapshot missing version or summary");
