@@ -37,10 +37,11 @@ pub use filters::{
 };
 
 pub use discovery::{
-    collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
-    load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
-    KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
+    collect_session_files, corpus_fingerprint, discover_session_dirs, find_session_files,
+    known_session_dirs, load_sessions_from_dir, load_sessions_with_options,
+    load_sessions_with_progress, load_sessions_with_progress_from_cache,
+    load_sessions_with_progress_from_cache_mode, CorpusFileStamp, KnownSessionDir, LoadOptions,
+    LoadProgress, LoadReport,
 };
 pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
 pub use governance::{
@@ -64,8 +65,8 @@ pub use pricing::{
     pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
 };
 pub use reports::{
-    add_baseline_comparison, report_compare, report_compare_json, report_compare_with_language,
-    report_json, report_json_with_language, report_overview_html,
+    add_baseline_comparison, overview_group_rows, report_compare, report_compare_json,
+    report_compare_with_language, report_json, report_json_with_language, report_overview_html,
     report_overview_html_with_context, report_overview_json, report_overview_json_with_context,
     report_overview_json_with_health, report_overview_markdown,
     report_overview_markdown_with_context, report_overview_svg, report_overview_svg_with_context,

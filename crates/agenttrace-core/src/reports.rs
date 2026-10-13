@@ -2565,6 +2565,25 @@ fn group_items(groups: &BTreeMap<String, GroupOverview>, agent_display: bool) ->
     items
 }
 
+/// rm-781 (ordering parity): the group rows the overview renders —
+/// `{name, sessions, cost}` in the comparator order
+/// [`group_items`] defines (cost desc, sessions desc, name asc;
+/// sessions-first for agent display) — exposed so the MCP
+/// `by_model_breakdown` tool renders through the SAME comparator
+/// instead of re-deriving (and re-diverging) a second one. One
+/// comparator, two callers: the tool's rows and the `--overview`
+/// document's rows are identical by construction. The divergence
+/// this kills: the MCP copy sorted cost desc → name asc only, so on a
+/// cost TIE the CLI ordered `zzz(3)` before `aaa(1)` while the tool
+/// ordered `aaa` first — pinned by the tie-corpus e2e test in
+/// `agenttrace-cli/tests/mcp_server.rs`.
+pub fn overview_group_rows(
+    groups: &BTreeMap<String, GroupOverview>,
+    agent_display: bool,
+) -> Vec<Value> {
+    group_items(groups, agent_display)
+}
+
 /// rm-245: per-task-type rollup entries. Keys are the fixed taxonomy
 /// (coding / debugging / planning) produced by `infer_task_type`;
 /// tokens ride along because "what kind of work burned the tokens" is

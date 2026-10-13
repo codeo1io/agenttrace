@@ -25,6 +25,24 @@
 //! * no writes outside artifact roots — the only write is the session
 //!   cache the CLI itself maintains
 //!   (`AGENTTRACE_SESSION_CACHE_DIR`), which loading may refresh.
+//! * one corpus load per process (rm-1039) — the server used to
+//!   discover and parse the corpus on EVERY `tools/call` (measured
+//!   live at mint: 194.71s per `by_model_breakdown today` call on
+//!   the real agent home, paid again on the next call; a 4-file `-d`
+//!   corpus cost 0.50s — the cost is the rescan, not the report).
+//!   The load is now held in [`ServerState`] and revalidated per
+//!   call against the corpus fingerprint
+//!   ([`agenttrace_core::corpus_fingerprint`]: size+mtime per
+//!   enumerated session file, plus the SQLite databases the
+//!   auto-discovery lane reads — the session cache's own per-file
+//!   fingerprint discipline), so a mutated, added, or removed
+//!   transcript or database reloads and a quiet corpus reuses the
+//!   same in-process report. Windowed ranges additionally
+//!   revalidate when the window boundary moves ([`window_epoch`]):
+//!   `today` exactly at the local-midnight rollover, rolling
+//!   windows within one boundary-hour. The timing band is pinned by
+//!   `scripts/ci/check-mcp-corpus-reuse.sh`; the mutation arms by
+//!   the e2e tests in `tests/mcp_server.rs`.
 //! * protocol currency (rm-780) — the server speaks the MCP revisions
 //!   in [`SUPPORTED_PROTOCOL_VERSIONS`], newest first. `initialize`
 //!   answers the newest revision the client also declared, never a
@@ -43,7 +61,12 @@
 //!   stays framed: the requests after the discarded line still
 //!   answer); request ids are validated to the JSON-RPC 2.0
 //!   String|Number|Null set — anything else answers `-32600` with id
-//!   null; non-object `params`/`arguments` answer `-32602`. A
+//!   null; non-object `params`/`arguments` answer `-32602`, and so do
+//!   unknown `arguments` KEYS — naming the key(s) and the known set
+//!   (rm-840 residual arm: the schema publishes
+//!   `additionalProperties: false`, and a silently-ignored typo like
+//!   `rang` used to execute the full `all` window with no error on
+//!   the wire). A
 //!   discovered-but-empty corpus is a tool-level error result
 //!   (`isError: true`), mirroring the CLI's non-zero exit for the
 //!   same situation — and a discovered corpus whose sessions all
@@ -58,13 +81,15 @@
 //! licensing review) would be its own change-unit if ever wanted.
 
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agenttrace_core::{
-    compute_overview, data_health_scoped, load_sessions_with_options,
-    report_overview_json_with_context, LoadOptions, LoadReport, TimeRange,
+    compute_overview, corpus_fingerprint, data_health_scoped, load_sessions_with_options,
+    overview_group_rows, report_overview_json_with_context, CorpusFileStamp, LoadOptions,
+    LoadReport, TimeRange,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 /// JSON-RPC 2.0 error codes used by this server.
@@ -113,6 +138,105 @@ const RANGE_ALIASES: [&str; 11] = [
 /// grow past that cap).
 const RECENT_SESSIONS_LIMIT: usize = 10;
 
+/// The corpus one server process serves (rm-1039): the [`LoadReport`]
+/// from the most recent load, the `(root, range)` it answered for,
+/// the corpus fingerprint it was computed under, and the window
+/// epoch of its boundary. Reused verbatim when all four still match;
+/// reloaded otherwise. One entry — the most recent load — is kept:
+/// the corpus `root` is fixed for the process, and a `range` change
+/// reloading is exactly the CLI's own contract (a different window
+/// is a different question).
+struct ServedCorpusEntry {
+    root: Option<PathBuf>,
+    range: TimeRange,
+    since_epoch: Option<i64>,
+    fingerprint: Vec<CorpusFileStamp>,
+    report: Arc<LoadReport>,
+}
+
+impl ServedCorpusEntry {
+    /// Reuse decision: every leg must match. A different corpus root,
+    /// a different window, a moved window boundary, or ANY fingerprint
+    /// change (size, mtime, added, removed, renamed file) forces a
+    /// reload. Each leg is pinned independently by the unit tests
+    /// below; the mutation legs are additionally pinned end-to-end
+    /// through the binary in `tests/mcp_server.rs`.
+    fn matches(
+        &self,
+        root: Option<&Path>,
+        range: TimeRange,
+        since_epoch: Option<i64>,
+        fingerprint: &[CorpusFileStamp],
+    ) -> bool {
+        self.root.as_deref() == root
+            && self.range == range
+            && self.since_epoch == since_epoch
+            && self.fingerprint == fingerprint
+    }
+}
+
+/// Per-process service state carried through `serve` ->
+/// `handle_message` -> `call_tool` (rm-1039).
+#[derive(Default)]
+struct ServerState {
+    entry: Option<ServedCorpusEntry>,
+}
+
+impl ServerState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The corpus for `(root, range)`: reused verbatim when the corpus
+    /// is quiet, reloaded when the fingerprint or the window boundary
+    /// moved (rm-1039). The fingerprint is stamped BEFORE the load, so
+    /// a corpus that changes DURING the load still invalidates the
+    /// entry on the next call — the safe direction (reload, never
+    /// reuse across a change).
+    fn load(&mut self, root: Option<&Path>, range: TimeRange) -> Arc<LoadReport> {
+        let fingerprint = corpus_fingerprint(root);
+        let since_epoch = window_epoch(range, Utc::now());
+        if let Some(entry) = &self.entry {
+            if entry.matches(root, range, since_epoch, &fingerprint) {
+                return Arc::clone(&entry.report);
+            }
+        }
+        let report = Arc::new(load_for_range(root, range));
+        self.entry = Some(ServedCorpusEntry {
+            root: root.map(Path::to_path_buf),
+            range,
+            since_epoch,
+            fingerprint,
+            report: Arc::clone(&report),
+        });
+        report
+    }
+}
+
+/// Window-boundary epoch of a range at `now` (rm-1039): what a reused
+/// report must still agree with, beyond the corpus fingerprint.
+///
+/// * `all` has no boundary — `None`; a quiet corpus reuses for the
+///   life of the process (the CLI's own answer changes only when the
+///   corpus does).
+/// * `today`'s boundary is LOCAL MIDNIGHT — piecewise constant within
+///   the day — so the epoch is the boundary instant itself: equal
+///   within the day, different the moment local midnight rolls (and
+///   on a DST offset change, which moves the boundary instant).
+/// * Rolling windows (`7d`/`30d` families) move their boundary
+///   CONTINUOUSLY — one second per second — so an exact comparison
+///   would never reuse. The epoch is the boundary truncated to the
+///   hour: a reused report's window is at most one boundary-hour
+///   stale, while a quiet corpus still reuses across the natural
+///   burst of calls within an hour.
+fn window_epoch(range: TimeRange, now: DateTime<Utc>) -> Option<i64> {
+    match range.since(now) {
+        None => None,
+        Some(since) if range == TimeRange::Today => Some(since.timestamp()),
+        Some(since) => Some(since.timestamp().div_euclid(3600)),
+    }
+}
+
 /// Entry point for the `agenttrace mcp` host command.
 ///
 /// Reads newline-delimited JSON-RPC from stdin until EOF and writes
@@ -129,6 +253,7 @@ pub fn serve(root: Option<&Path>) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = io::stdout().lock();
+    let mut state = ServerState::new();
     loop {
         let bytes = match read_wire_line(&mut reader) {
             Ok(WireLine::Eof) => return Ok(()),
@@ -184,7 +309,7 @@ pub fn serve(root: Option<&Path>) -> anyhow::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_message(line.trim(), root) {
+        if let Some(response) = handle_message(line.trim(), root, &mut state) {
             emit(&mut stdout, &response)?;
         }
     }
@@ -293,8 +418,9 @@ fn read_wire_line(reader: &mut impl BufRead) -> io::Result<WireLine> {
 
 /// Handle one wire message. `None` means "no reply" (a notification);
 /// `Some(json)` is the exact line to write back. `root` is the corpus
-/// root the dispatch site resolved (rm-781).
-fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
+/// root the dispatch site resolved (rm-781); `state` is the
+/// per-process corpus cache (rm-1039).
+fn handle_message(raw: &str, root: Option<&Path>, state: &mut ServerState) -> Option<String> {
     let message = match serde_json::from_str::<Value>(raw) {
         Ok(message) => message,
         Err(_) => return Some(error_response(None, CODE_PARSE_ERROR, "Parse error")),
@@ -366,7 +492,7 @@ fn handle_message(raw: &str, root: Option<&Path>) -> Option<String> {
         "initialize" => initialize_result(params),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list_result()),
-        "tools/call" => call_tool(params, root),
+        "tools/call" => call_tool(params, root, state),
         _ => {
             return Some(error_response(
                 Some(id),
@@ -493,7 +619,11 @@ fn json_type_name(value: &Value) -> &'static str {
 /// CLI's rc2 usage error), corpus-level failures are `isError`
 /// results (the twin of the CLI's rc1 bail). `root` is the corpus
 /// root the dispatch site resolved (rm-781).
-fn call_tool(params: Value, root: Option<&Path>) -> Result<Value, (i64, String)> {
+fn call_tool(
+    params: Value,
+    root: Option<&Path>,
+    state: &mut ServerState,
+) -> Result<Value, (i64, String)> {
     let invalid = |message: String| (CODE_INVALID_PARAMS, message);
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return Err(invalid(
@@ -522,13 +652,46 @@ fn call_tool(params: Value, root: Option<&Path>) -> Result<Value, (i64, String)>
             )));
         }
     };
+    // rm-840 residual arm: the schema above publishes
+    // `"additionalProperties": false` — the server must enforce the
+    // promise it publishes instead of silently ignoring what it does
+    // not know. An unknown `arguments` key used to execute the tool
+    // with DEFAULT arguments: `{"rang": "today"}` (a typo) served
+    // the full `all` window, and a stray corpus-naming key (`root`)
+    // sent an accidental auto-discovery run — no error on the wire in
+    // either case. Unknown keys now answer `-32602` naming every
+    // unknown key and the known set, so a host bug surfaces at the
+    // boundary instead of billing the wrong window.
+    let mut unknown_keys: Vec<&str> = arguments
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    unknown_keys.retain(|key| *key != "range");
+    if !unknown_keys.is_empty() {
+        unknown_keys.sort_unstable();
+        unknown_keys.dedup();
+        let listed = unknown_keys
+            .iter()
+            .map(|key| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if unknown_keys.len() == 1 {
+            "argument"
+        } else {
+            "arguments"
+        };
+        return Err(invalid(format!(
+            "Invalid params: unknown {noun} {listed} for tool `{name}` (known \
+arguments: `range`)"
+        )));
+    }
     let range = match parse_range_argument(&arguments) {
         Ok(range) => range,
         Err(message) => return Err(invalid(message)),
     };
     match name {
-        "usage_overview" => usage_overview(root, range),
-        "by_model_breakdown" => by_model_breakdown(root, range),
+        "usage_overview" => usage_overview(root, range, state),
+        "by_model_breakdown" => by_model_breakdown(root, range, state),
         other => Err(invalid(format!(
             "Invalid params: unknown tool `{other}` (available: usage_overview, \
 by_model_breakdown)"
@@ -629,8 +792,12 @@ point HOME at the machine whose agents you want to report on, or see \
 
 /// `usage_overview`: render through the CLI's own report path so the
 /// MCP answer and `agenttrace --overview -f json` stay one truth.
-fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, String)> {
-    let report = load_for_range(root, range);
+fn usage_overview(
+    root: Option<&Path>,
+    range: TimeRange,
+    state: &mut ServerState,
+) -> Result<Value, (i64, String)> {
+    let report = state.load(root, range);
     if report.sessions.is_empty() {
         return empty_corpus_result(root, range, &report);
     }
@@ -664,35 +831,27 @@ fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, 
 
 /// `by_model_breakdown`: the `by_model` rollup of the same overview
 /// computation — same discovery, same pricing, smaller answer.
-fn by_model_breakdown(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, String)> {
-    let report = load_for_range(root, range);
+fn by_model_breakdown(
+    root: Option<&Path>,
+    range: TimeRange,
+    state: &mut ServerState,
+) -> Result<Value, (i64, String)> {
+    let report = state.load(root, range);
     if report.sessions.is_empty() {
         return empty_corpus_result(root, range, &report);
     }
     let overview = compute_overview(&report.sessions);
-    let mut models: Vec<Value> = overview
-        .by_model
-        .iter()
-        .map(|(name, group)| {
-            json!({
-                "name": name,
-                "sessions": group.sessions,
-                "cost": round4(group.cost),
-            })
-        })
-        .collect();
-    // Cost-descending, name-tie-broken — the ordering the overview's
-    // own `by_model` section uses.
-    models.sort_by(|a, b| {
-        let cost = |value: &Value| value["cost"].as_f64().unwrap_or(0.0);
-        cost(b)
-            .partial_cmp(&cost(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                let name = |value: &Value| value["name"].as_str().unwrap_or("").to_string();
-                name(a).cmp(&name(b))
-            })
-    });
+    // rm-781 (ordering parity): rendered through the overview's OWN
+    // group comparator — cost desc, sessions desc, name asc — the
+    // same function that orders the CLI's `by_model` section
+    // (`overview_group_rows` over `reports::group_items`), so this
+    // tool's rows and the `--overview -f json` document's rows are
+    // identical by construction. The pre-fix copy here sorted cost
+    // desc → name asc only while its comment claimed parity: on a
+    // cost TIE the CLI ordered by sessions desc (`zzz(3)` before
+    // `aaa(1)` on the tie corpus) while this tool ordered by name
+    // (`aaa` first) — the divergence the tie-corpus e2e test pins.
+    let models = overview_group_rows(&overview.by_model, false);
     let body = json!({
         "range": range.label(),
         "total_sessions": overview.total_sessions,
@@ -729,4 +888,141 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> String {
         json!({ "code": code, "message": message }),
     );
     Value::Object(object).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn stamp(path: &str, size: u64, mod_time_nanos: i64) -> CorpusFileStamp {
+        CorpusFileStamp {
+            path: PathBuf::from(path),
+            size,
+            mod_time_nanos,
+        }
+    }
+
+    /// rm-1039: the reuse decision is an AND over corpus root, window,
+    /// window epoch, and fingerprint — each leg alone must force a
+    /// reload.
+    #[test]
+    fn served_corpus_reuse_requires_every_leg_to_match() {
+        let fingerprint = vec![
+            stamp("/corpus/a.jsonl", 100, 1),
+            stamp("/corpus/b.jsonl", 200, 2),
+        ];
+        let entry = ServedCorpusEntry {
+            root: Some(PathBuf::from("/corpus")),
+            range: TimeRange::All,
+            since_epoch: None,
+            fingerprint: fingerprint.clone(),
+            report: Arc::new(LoadReport::default()),
+        };
+        let root = Some(Path::new("/corpus"));
+        assert!(
+            entry.matches(root, TimeRange::All, None, &fingerprint),
+            "a quiet corpus reuses the in-process load"
+        );
+        assert!(
+            !entry.matches(None, TimeRange::All, None, &fingerprint),
+            "a different corpus root reloads"
+        );
+        assert!(
+            !entry.matches(
+                root,
+                TimeRange::Days7,
+                window_epoch(TimeRange::Days7, Utc::now()),
+                &fingerprint
+            ),
+            "a different range reloads"
+        );
+        assert!(
+            !entry.matches(root, TimeRange::All, Some(0), &fingerprint),
+            "a moved window boundary reloads"
+        );
+        for (label, mutated) in [
+            (
+                "a size change",
+                vec![
+                    stamp("/corpus/a.jsonl", 101, 1),
+                    stamp("/corpus/b.jsonl", 200, 2),
+                ],
+            ),
+            (
+                "an mtime change",
+                vec![
+                    stamp("/corpus/a.jsonl", 100, 9),
+                    stamp("/corpus/b.jsonl", 200, 2),
+                ],
+            ),
+            (
+                "an added file",
+                vec![
+                    stamp("/corpus/a.jsonl", 100, 1),
+                    stamp("/corpus/b.jsonl", 200, 2),
+                    stamp("/corpus/c.jsonl", 1, 1),
+                ],
+            ),
+            ("a removed file", vec![stamp("/corpus/a.jsonl", 100, 1)]),
+            (
+                "a renamed file",
+                vec![
+                    stamp("/corpus/a.jsonl", 100, 1),
+                    stamp("/corpus/renamed.jsonl", 200, 2),
+                ],
+            ),
+        ] {
+            assert!(
+                !entry.matches(root, TimeRange::All, None, &mutated),
+                "{label} reloads"
+            );
+        }
+    }
+
+    /// rm-1039: window epochs — `today` exact at the local-midnight
+    /// boundary, rolling windows hour-bucketed, `all` boundary-less.
+    /// Fixed instants (no dependence on the runner's clock): local
+    /// noon on a fixed date behaves identically in every offset.
+    #[test]
+    fn window_epoch_is_exact_for_today_hourly_for_rolling_none_for_all() {
+        let local_noon = chrono::Local
+            .with_ymd_and_hms(2026, 10, 13, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        // `today`'s boundary is piecewise constant: stable within the
+        // local day…
+        assert_eq!(
+            window_epoch(TimeRange::Today, local_noon),
+            window_epoch(TimeRange::Today, local_noon + chrono::Duration::seconds(60)),
+            "the same local day reuses"
+        );
+        // …and different once the day rolls: +24h from any local noon
+        // is the next day's local noon, DST transition or not, so the
+        // local-midnight boundary instant differs.
+        assert_ne!(
+            window_epoch(TimeRange::Today, local_noon),
+            window_epoch(TimeRange::Today, local_noon + chrono::Duration::hours(24)),
+            "the local-midnight rollover reloads"
+        );
+        // Rolling windows bucket by hour: within the hour equal…
+        let rolling = window_epoch(TimeRange::Days7, local_noon);
+        assert_eq!(
+            rolling,
+            window_epoch(TimeRange::Days7, local_noon + chrono::Duration::seconds(60)),
+            "a rolling window reuses within the boundary hour"
+        );
+        // …across it different (the fixed noon keeps the boundaries
+        // on exact hour marks, so the crossing is deterministic).
+        assert_ne!(
+            rolling,
+            window_epoch(TimeRange::Days7, local_noon + chrono::Duration::hours(1)),
+            "a rolling window reloads once the boundary moves an hour"
+        );
+        assert_eq!(
+            None,
+            window_epoch(TimeRange::All, local_noon),
+            "`all` has no window boundary"
+        );
+    }
 }

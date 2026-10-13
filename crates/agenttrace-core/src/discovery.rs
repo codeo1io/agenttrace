@@ -320,6 +320,77 @@ pub fn find_session_files(dir: Option<&Path>) -> Vec<PathBuf> {
     sort_paths_by_mod_time(all)
 }
 
+/// One file's corpus stamp (rm-1039): path plus the size/mtime pair —
+/// the session cache's own per-file fingerprint discipline, applied
+/// to the corpus as a whole so a long-lived consumer (the MCP
+/// server) can revalidate one load per call instead of re-parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorpusFileStamp {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mod_time_nanos: i64,
+}
+
+/// Stamp every file a load of `dir` reads (rm-1039): the session-file
+/// enumeration [`find_session_files`] walks, plus — under
+/// auto-discovery — the SQLite databases the sqlite lane reads
+/// (`hermes_state_db_paths`/`opencode_db_paths`), so a mutated agent
+/// database invalidates exactly like a mutated journal. The value is
+/// sorted by path and deduplicated, making it a SET fingerprint:
+/// any size change, mtime change, added, removed, or renamed file
+/// changes the value, while a quiet corpus returns the same value
+/// every time regardless of enumeration order
+/// (`find_session_files` orders by mtime, so files rewritten in
+/// place would reorder — sorting neutralizes that).
+///
+/// Deliberately an UNCACHED walk (callers revalidate per call): the
+/// fingerprint must see additions the loader's own dir-listing cache
+/// could be serving stale. Divergence from the loader's cached
+/// enumeration is therefore possible in ONE direction only — a file
+/// the fingerprint sees but the loader skips (sqlite-backed dirs,
+/// fork copies) can force a reload, never a missed change; a file
+/// that vanishes between enumeration and stat is simply absent, and
+/// its return likewise changes the set — always the safe direction.
+pub fn corpus_fingerprint(dir: Option<&Path>) -> Vec<CorpusFileStamp> {
+    let mut files = find_session_files(dir);
+    if dir.is_none() {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            files.extend(crate::sqlite_sessions::hermes_state_db_paths(&home));
+            files.extend(crate::sqlite_sessions::opencode_db_paths(&home));
+        }
+    }
+    let mut stamps: Vec<CorpusFileStamp> = files
+        .iter()
+        .filter_map(|path| {
+            let metadata = fs::metadata(path).ok()?;
+            let mod_time_nanos = mod_time_nanos(&metadata)?;
+            Some(CorpusFileStamp {
+                path: path.clone(),
+                size: metadata.len(),
+                mod_time_nanos,
+            })
+        })
+        .collect();
+    stamps.sort_by(|a, b| a.path.cmp(&b.path));
+    stamps.dedup_by(|a, b| a.path == b.path);
+    stamps
+}
+
+#[cfg(unix)]
+fn mod_time_nanos(metadata: &fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.mtime() * 1_000_000_000 + metadata.mtime_nsec())
+}
+
+#[cfg(not(unix))]
+fn mod_time_nanos(metadata: &fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+}
+
 pub fn load_sessions_from_dir(dir: Option<&Path>) -> Vec<Session> {
     load_sessions_with_options(dir, &LoadOptions::default()).sessions
 }
@@ -1307,5 +1378,49 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod corpus_fingerprint_tests {
+    use super::*;
+
+    /// rm-1039: the fingerprint is a set-stable stamp of the corpus —
+    /// identical while quiet, changed by size, mtime, membership.
+    #[test]
+    fn fingerprint_tracks_size_mtime_and_membership() {
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-fingerprint-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let one = dir.join("one.jsonl");
+        fs::write(&one, "{\"role\":\"user\"}\n").expect("seed file");
+
+        let quiet = corpus_fingerprint(Some(&dir));
+        assert_eq!(
+            quiet,
+            vec![CorpusFileStamp {
+                path: one.clone(),
+                size: fs::metadata(&one).unwrap().len(),
+                mod_time_nanos: quiet[0].mod_time_nanos,
+            }],
+            "one file, stamped size+mtime"
+        );
+        // A quiet corpus returns the identical value.
+        assert_eq!(corpus_fingerprint(Some(&dir)), quiet);
+
+        // A size change (rewrite in place) changes the value.
+        fs::write(&one, "{\"role\":\"user\",\"content\":\"grew\"}\n").unwrap();
+        let grown = corpus_fingerprint(Some(&dir));
+        assert_ne!(grown, quiet);
+
+        // An added file changes the value; removing it restores the
+        // previous one (membership, not just content, is stamped).
+        fs::write(dir.join("two.jsonl"), "{}\n").unwrap();
+        assert_ne!(corpus_fingerprint(Some(&dir)), grown);
+        fs::remove_file(dir.join("two.jsonl")).unwrap();
+        assert_eq!(corpus_fingerprint(Some(&dir)), grown);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -236,6 +236,9 @@ jobs:
       - name: Deterministic demo output
         run: scripts/ci/check-deterministic-output.sh
 
+      - name: MCP corpus reuse
+        run: scripts/ci/check-mcp-corpus-reuse.sh
+
       - name: Report semantic consistency
         run: scripts/ci/check-report-semantics.sh
 
