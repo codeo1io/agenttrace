@@ -3,7 +3,7 @@ use anyhow::{bail, Context};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 type TokenUsage = BTreeMap<String, i64>;
@@ -289,23 +289,39 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             }
             return Ok(session);
         }
-        let probes: [JsonlProbe; 5] = [
+        let probes: [JsonlProbe; 4] = [
             parse_antigravity_jsonl,
             parse_cursor_transcript_jsonl,
             parse_claude_transcript_jsonl,
             parse_copilot_session_jsonl,
-            // rm-715 (silent-zero closeout LEAD): last, with the
-            // strictest claim rule in the array — the gemini-cli >= 0.63
-            // chats record stream (metadata line carrying sessionId +
-            // projectHash, MessageRecords keyed by id). Every earlier
-            // probe keeps its claim precedence; this lane only picks up
-            // the shape nothing else recognizes, so the generic-lane
-            // fallback below stays byte-identical for every corpus it
-            // served before this run.
-            parse_gemini_chats_jsonl,
         ];
         if let Some(events) = probes.iter().find_map(|probe| probe(&objs)) {
             return finish(events);
+        }
+        // rm-715 (silent-zero closeout LEAD) put the gemini-cli >= 0.63
+        // chats record stream LAST, after every earlier probe keeps its
+        // claim precedence, with the strictest claim rule in the array.
+        // rm-1377 moves it out of the probe array (the workbuddy/kimi
+        // pattern) for the same reason those two moved: the lane now
+        // carries a disclosure channel — writer drift (a typed record
+        // outside the writer's current enum) is SKIPPED with a counter
+        // instead of sinking the whole claim, and a drifted stream must
+        // say so on the session it still mints, not vanish silently
+        // (the exact rm-715 regression class this lane was built to
+        // close). Position in the cascade is unchanged: exactly where
+        // it sat, after copilot and ahead of kimi, so the generic-lane
+        // fallback below stays byte-identical for every corpus it
+        // served before this run.
+        if let Some((events, drift_counters)) = parse_gemini_chats_jsonl_counted(&objs) {
+            let mut session = finish(events)?;
+            for (key, count) in drift_counters {
+                crate::mint_disclosure(
+                    &mut session.metrics.disclosure_counters,
+                    key,
+                    count,
+                );
+            }
+            return Ok(session);
         }
         // kimi_cli parses outside the probe array — last, exactly where it
         // used to sit — because it carries its own disclosure channel for
@@ -453,6 +469,13 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
             return Ok(session);
         }
     }
+    // rm-1377: the gemini value lane refuses checkpoint-shaped docs with
+    // a named outcome, so its refusal count has to outlive the value
+    // block — the doc keeps falling through the value lanes below, and
+    // if NOTHING claims it the final error names the refusal instead of
+    // the generic "unsupported session format" (and the generic jsonl
+    // lane never gets a chance to mint the phantom back).
+    let mut gemini_checkpoint_docs = 0usize;
     if let Some(value) = parsed_value {
         if let Some(events) = parse_opencode_storage_value(path, &value) {
             return session_from_events(name, path, events);
@@ -460,8 +483,18 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some(events) = parse_cursor_export(&value) {
             return session_from_events(name, path, events);
         }
-        if let Some(events) = parse_gemini_value(&value) {
-            return session_from_events(name, path, events);
+        let (gemini_events, checkpoint_docs_refused) = parse_gemini_value(&value);
+        gemini_checkpoint_docs = checkpoint_docs_refused;
+        if let Some(events) = gemini_events {
+            let mut session = session_from_events(name, path, events)?;
+            if gemini_checkpoint_docs > 0 {
+                crate::mint_disclosure(
+                    &mut session.metrics.disclosure_counters,
+                    "gemini_checkpoint_doc_refused".to_string(),
+                    gemini_checkpoint_docs,
+                );
+            }
+            return Ok(session);
         }
         if let Some(events) = parse_kimi_value(&value) {
             return session_from_events(name, path, events);
@@ -472,6 +505,21 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         if let Some(events) = parse_messages_value(&value, "codex_cli") {
             return session_from_events(name, path, events);
         }
+    }
+    // rm-1377: an unclaimed doc that the gemini lane refused as an
+    // upstream checkpoint snapshot (ToolCallData: toolCall +
+    // commitHash/messageId embedding the whole clientHistory) errors
+    // BY NAME — a named refusal keeps the exclusion honest (the
+    // conversation it embeds is counted once, from its chats journal)
+    // and stops the generic jsonl lane below from resurrecting the
+    // phantom as a generic session off the embedded history array.
+    if gemini_checkpoint_docs > 0 {
+        bail!(
+            "gemini-cli checkpoint document (rm-1377): not a session — an upstream \
+             ToolCallData snapshot whose embedded conversation history is counted \
+             from its chats journal; refused with disclosure instead of minting a \
+             phantom session"
+        );
     }
     if let Ok(session) = parse_jsonl_session(name, path, raw) {
         return Ok(session);
@@ -5683,19 +5731,64 @@ fn cursor_composer_message_events(composer: &Map<String, Value>, fallback_ts: &s
 // gemini_usage alias table (input from promptTokenCount-class aliases,
 // thoughts folded into output) which already follows the same
 // first-matching/net-of-cache decomposition this batch pins elsewhere.
-fn parse_gemini_value(value: &Value) -> Option<Vec<Event>> {
-    let mut events = Vec::new();
-    let mut model = "unknown".to_string();
-    parse_gemini_object(value, &mut model, &mut events);
-    if events.is_empty() {
-        if let Some(arr) = value.as_array() {
-            parse_gemini_array(arr, "", &model, &mut events);
+fn parse_gemini_value(value: &Value) -> (Option<Vec<Event>>, usize) {
+    // rm-1377: a top-level document carrying the upstream checkpoint
+    // marker pair is a ToolCallData snapshot, not a session — refuse it
+    // whole (see `is_gemini_checkpoint_doc`). The refusal count travels
+    // with the return so the caller can disclose it: on whatever
+    // session the parse still mints (the doc carried other content), or
+    // as the named error when it mints none.
+    if let Some(obj) = value.as_object() {
+        if is_gemini_checkpoint_doc(obj) {
+            return (None, 1);
         }
     }
-    non_empty(events)
+    let mut events = Vec::new();
+    let mut model = "unknown".to_string();
+    let mut checkpoint_docs_refused = 0usize;
+    parse_gemini_object(value, &mut model, &mut events, &mut checkpoint_docs_refused);
+    if events.is_empty() {
+        if let Some(arr) = value.as_array() {
+            parse_gemini_array(arr, "", &model, &mut events, &mut checkpoint_docs_refused);
+        }
+    }
+    (non_empty(events), checkpoint_docs_refused)
 }
 
-fn parse_gemini_object(value: &Value, model: &mut String, events: &mut Vec<Event>) {
+/// rm-1377: upstream checkpoint truth (google-gemini/gemini-cli
+/// `checkpointUtils.ts`, `ToolCallData`): a checkpoint snapshot written
+/// to `~/.gemini/tmp/<hash>/checkpoints/<ts>-<file>-<tool>.json` is
+/// `{ history?, clientHistory?, toolCall: {name, args}, commitHash?,
+/// messageId? }` — the tool call plus the ENTIRE conversation history
+/// at that moment. This lane's array walk reads `history`/
+/// `clientHistory`, so every such document parsed as a full gemini_cli
+/// session: one phantom session per checkpoint and the conversation
+/// counted 1+N times (assess 10424d06 F1, proven parse-level and
+/// end-to-end: sessions 2 / cost $0.0034 with checkpoints vs 1 /
+/// $0.0033 control). A document carrying the marker pair (top-level
+/// `toolCall` OBJECT plus a `commitHash` or `messageId` STRING) and no
+/// `contents` of its own is a checkpoint snapshot, not a session. The
+/// pair-plus-absence shape is upstream-specific: no chats journal
+/// record, API response, or other producer carries a top-level
+/// `toolCall` object with a commit hash — so the refusal cannot eat a
+/// real session.
+fn is_gemini_checkpoint_doc(obj: &JsonObject) -> bool {
+    let tool_call = obj
+        .get("toolCall")
+        .and_then(Value::as_object)
+        .is_some_and(|call| !call.is_empty());
+    let snapshot_marker = ["commitHash", "messageId"]
+        .iter()
+        .any(|key| string(obj.get(*key)).is_some());
+    tool_call && snapshot_marker && !obj.contains_key("contents")
+}
+
+fn parse_gemini_object(
+    value: &Value,
+    model: &mut String,
+    events: &mut Vec<Event>,
+    checkpoint_docs_refused: &mut usize,
+) {
     let Some(obj) = value.as_object() else {
         return;
     };
@@ -5719,7 +5812,7 @@ fn parse_gemini_object(value: &Value, model: &mut String, events: &mut Vec<Event
     }
     let fallback_ts = string(obj.get("timestamp")).unwrap_or("");
     if let Some(contents) = obj.get("contents").and_then(Value::as_array) {
-        parse_gemini_array(contents, fallback_ts, model, events);
+        parse_gemini_array(contents, fallback_ts, model, events, checkpoint_docs_refused);
     }
     for key in [
         "history",
@@ -5729,7 +5822,7 @@ fn parse_gemini_object(value: &Value, model: &mut String, events: &mut Vec<Event
         "chatHistory",
     ] {
         if let Some(contents) = obj.get(key).and_then(Value::as_array) {
-            parse_gemini_array(contents, fallback_ts, model, events);
+            parse_gemini_array(contents, fallback_ts, model, events, checkpoint_docs_refused);
         }
     }
     if let Some(candidates) = obj.get("candidates").and_then(Value::as_array) {
@@ -5744,14 +5837,38 @@ fn parse_gemini_object(value: &Value, model: &mut String, events: &mut Vec<Event
     }
     for key in ["checkpoint", "session", "chat"] {
         if let Some(nested) = obj.get(key) {
-            parse_gemini_object(nested, model, events);
+            // rm-1377: do not descend into a nested checkpoint-shaped
+            // wrapper (a `checkpoint` key holding a ToolCallData) — its
+            // embedded history array would replay the whole snapshot
+            // conversation into this session. Refuse with a counter
+            // instead of silently replaying.
+            if let Some(nested_obj) = nested.as_object() {
+                if is_gemini_checkpoint_doc(nested_obj) {
+                    *checkpoint_docs_refused += 1;
+                    continue;
+                }
+            }
+            parse_gemini_object(nested, model, events, checkpoint_docs_refused);
         }
     }
 }
 
-fn parse_gemini_array(items: &[Value], fallback_ts: &str, model: &str, events: &mut Vec<Event>) {
+fn parse_gemini_array(
+    items: &[Value],
+    fallback_ts: &str,
+    model: &str,
+    events: &mut Vec<Event>,
+    checkpoint_docs_refused: &mut usize,
+) {
     for item in items {
         if let Some(item) = item.as_object() {
+            // rm-1377: skip checkpoint snapshots embedded in an array
+            // document (a bare `[{ToolCallData}, ...]` export) — same
+            // refusal as the nested wrapper, counted the same way.
+            if is_gemini_checkpoint_doc(item) {
+                *checkpoint_docs_refused += 1;
+                continue;
+            }
             parse_gemini_content_object(item, fallback_ts, model, events);
         }
     }
@@ -5863,28 +5980,30 @@ fn parse_gemini_content_object(
 //   when the id is gone);
 // - `{$patch: {...}}` rewrites content/toolCalls in place, removes ids,
 //   and reorders — best-effort per the main reader.
+#[cfg(test)]
 fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
-    if !is_gemini_chats_jsonl(objs) {
+    parse_gemini_chats_jsonl_counted(objs).map(|(events, _)| events)
+}
+
+/// rm-1377 counted wrapper: the lane claims (or refuses) the stream and
+/// reports what writer drift it SKIPPED while claiming — the
+/// workbuddy/kimi disclosure-channel pattern, so a drifted record is
+/// visible on the session instead of silently sinking the claim.
+fn parse_gemini_chats_jsonl_counted(
+    objs: &[JsonObject],
+) -> Option<(Vec<Event>, Vec<(String, usize)>)> {
+    let mut drift_counters = Vec::new();
+    if !is_gemini_chats_jsonl(objs, &mut drift_counters) {
         return None;
     }
-    // Insertion-ordered id -> record map with in-place replacement,
-    // mirroring the reader's `messagesMap`.
-    let mut messages: Vec<(String, JsonObject)> = Vec::new();
-    let upsert =
-        |messages: &mut Vec<(String, JsonObject)>, id: String, record: JsonObject| match messages
-            .iter_mut()
-            .find(|(existing, _)| *existing == id)
-        {
-            Some(slot) => slot.1 = record,
-            None => messages.push((id, record)),
-        };
+    let mut messages = GeminiChatsMessages::new();
     for obj in objs {
         if let Some(set) = obj.get("$set").and_then(Value::as_object) {
             if let Some(replacement) = set.get("messages").and_then(Value::as_array) {
                 messages.clear();
                 for record in replacement.iter().filter_map(Value::as_object) {
                     if let Some(id) = gemini_chats_message_id(record) {
-                        upsert(&mut messages, id, record.clone());
+                        messages.upsert(id, record.clone());
                     }
                 }
             }
@@ -5893,36 +6012,188 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             continue;
         }
         if let Some(rewind_to) = obj.get("$rewindTo").and_then(Value::as_str) {
-            match messages.iter().position(|(id, _)| id == rewind_to) {
-                Some(at) => messages.truncate(at),
-                None => messages.clear(),
-            }
+            messages.rewind_to(rewind_to);
             continue;
         }
         if let Some(patch) = obj.get("$patch").and_then(Value::as_object) {
-            gemini_chats_apply_patch(&mut messages, patch);
+            messages.apply_patch(patch);
             continue;
         }
         if let Some(id) = gemini_chats_message_id(obj) {
-            upsert(&mut messages, id, obj.clone());
+            messages.upsert(id, obj.clone());
         }
     }
     let mut events = Vec::new();
-    for (_, record) in &messages {
+    for (_, record) in &messages.rows {
         gemini_chats_message_events(record, &mut events);
     }
-    non_empty(events)
+    let events = non_empty(events)?;
+    Some((events, drift_counters))
+}
+
+/// rm-1377 (U2): insertion-ordered id -> record map with in-place
+/// replacement, mirroring the reader's `messagesMap` — now carrying a
+/// key -> position INDEX so every stream op is a hash lookup instead
+/// of a linear scan. The assess PoC (10424d06 F2) priced a 20,000-record
+/// journal at 4.52s in release purely from the O(n²) replace-position
+/// scan (`recordMessageTokens`/`recordToolCalls` re-append the full
+/// record after every tool turn, so replace-in-place fires roughly once
+/// per record; the re-append walks the whole list to find its id).
+/// Index invariant: ids in `rows` are unique — `upsert` replaces in
+/// place, the `$set` rebuild goes through `upsert`, and every
+/// order-changing op rebuilds the index — so `index` is exactly the
+/// reader's messagesMap and `rows` its iteration order.
+struct GeminiChatsMessages {
+    rows: Vec<(String, JsonObject)>,
+    index: HashMap<String, usize>,
+}
+
+impl GeminiChatsMessages {
+    fn new() -> Self {
+        GeminiChatsMessages {
+            rows: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.index.clear();
+    }
+
+    fn upsert(&mut self, id: String, record: JsonObject) {
+        match self.index.get(&id) {
+            Some(&at) => self.rows[at].1 = record,
+            None => {
+                self.index.insert(id.clone(), self.rows.len());
+                self.rows.push((id, record));
+            }
+        }
+    }
+
+    fn position(&self, id: &str) -> Option<usize> {
+        self.index.get(id).copied()
+    }
+
+    /// `{$rewindTo: id}`: truncate from that id onward; a gone id
+    /// clears everything.
+    fn rewind_to(&mut self, id: &str) {
+        match self.position(id) {
+            Some(at) => {
+                for (dropped, _) in self.rows.drain(at..) {
+                    self.index.remove(&dropped);
+                }
+            }
+            None => self.clear(),
+        }
+    }
+
+    fn reindex(&mut self) {
+        self.index = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(at, (id, _))| (id.clone(), at))
+            .collect();
+    }
+
+    fn remove_ids<'a>(&mut self, ids: impl Iterator<Item = &'a str>) {
+        let doomed: HashSet<&str> = ids.collect();
+        if doomed.is_empty() {
+            return;
+        }
+        self.rows.retain(|(id, _)| !doomed.contains(id.as_str()));
+        self.reindex();
+    }
+
+    /// `orderIds`: order the patched subset per the patch's id list,
+    /// first-occurrence rank, stable for ids it does not mention and
+    /// for repeats — identical ordering semantics to the linear
+    /// `position()`-per-comparison version this replaces.
+    fn reorder(&mut self, ordered: &[&str]) {
+        let mut rank: HashMap<&str, usize> = HashMap::new();
+        for (at, id) in ordered.iter().enumerate() {
+            rank.entry(*id).or_insert(at);
+        }
+        let mut untouched: Vec<(String, JsonObject)> = Vec::new();
+        let mut patched: Vec<(String, JsonObject)> = Vec::new();
+        for entry in self.rows.drain(..) {
+            if rank.contains_key(entry.0.as_str()) {
+                patched.push(entry);
+            } else {
+                untouched.push(entry);
+            }
+        }
+        patched.sort_by_key(|(id, _)| {
+            rank.get(id.as_str()).copied().unwrap_or(usize::MAX)
+        });
+        self.rows.extend(untouched);
+        self.rows.extend(patched);
+        self.reindex();
+    }
+
+    fn apply_patch(&mut self, patch: &JsonObject) {
+        if let Some(id) = string(patch.get("id")) {
+            self.patch_one(id, patch);
+        }
+        if let Some(updates) = patch.get("updates").and_then(Value::as_array) {
+            for update in updates.iter().filter_map(Value::as_object) {
+                if let Some(id) = string(update.get("id")) {
+                    self.patch_one(id, update);
+                }
+            }
+        }
+        if let Some(remove_ids) = patch.get("removeIds").and_then(Value::as_array) {
+            self.remove_ids(remove_ids.iter().filter_map(Value::as_str));
+        }
+        if let Some(order_ids) = patch.get("orderIds").and_then(Value::as_array) {
+            let ordered: Vec<&str> = order_ids.iter().filter_map(Value::as_str).collect();
+            self.reorder(&ordered);
+        }
+    }
+
+    fn patch_one(&mut self, id: &str, patch: &JsonObject) {
+        let Some(at) = self.position(id) else {
+            return;
+        };
+        let slot = &mut self.rows[at].1;
+        if let Some(content) = patch.get("content") {
+            slot.insert("content".to_string(), content.clone());
+        }
+        if let Some(tool_calls) = patch.get("toolCalls").and_then(Value::as_array) {
+            // The reader merges by call id (ToolCallPatch); replacing the
+            // whole array would drop calls the patch did not mention.
+            let calls = slot
+                .entry("toolCalls".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(existing) = calls.as_array_mut() {
+                for call in tool_calls {
+                    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                    let matched = if call_id.is_empty() {
+                        None
+                    } else {
+                        existing.iter().position(|current| {
+                            current.get("id").and_then(Value::as_str) == Some(call_id)
+                        })
+                    };
+                    match matched {
+                        Some(at) => existing[at] = call.clone(),
+                        None => existing.push(call.clone()),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Claim rule: the 0.63 writer always leads with the metadata record
 /// (`sessionId` + `projectHash` + `kind` of main|subagent, no `type`),
-/// EVERY id-bearing record must map to the writer's type enum, and the
-/// file must hold at least one recognizable MessageRecord — so legacy
-/// generic journals that open with session metadata
+/// and the file must hold at least one recognizable MessageRecord —
+/// so legacy generic journals that open with session metadata
 /// (`{"kind":"session",…}` carrying `assistant` role events) keep
 /// their generic-lane home, and an empty session (metadata line only)
 /// stays unclaimed exactly as before.
-fn is_gemini_chats_jsonl(objs: &[JsonObject]) -> bool {
+fn is_gemini_chats_jsonl(objs: &[JsonObject], drift_counters: &mut Vec<(String, usize)>) -> bool {
     let Some(first) = objs.first() else {
         return false;
     };
@@ -5944,11 +6215,29 @@ fn is_gemini_chats_jsonl(objs: &[JsonObject]) -> bool {
         if obj.contains_key("id") && !obj.contains_key("$set") && !obj.contains_key("$patch") {
             match gemini_chats_message_id(obj) {
                 Some(_) => message_records += 1,
-                // A typed record outside the writer's enum (e.g. an
-                // `assistant` role event) is another producer's
-                // journal that happens to open with session metadata —
-                // refuse the claim, generic lane keeps it.
-                None => return false,
+                // rm-1377 (writer-drift tolerance): an id-bearing record
+                // outside the CURRENT writer enum is drift from a newer
+                // upstream writer — the enum lives in
+                // chatRecordingTypes.ts and the writer has already
+                // drifted once since v0.63 (the $patch family). Refusing
+                // the claim here was the rm-715 regression class in
+                // miniature: one drifted record sank the WHOLE journal
+                // back to the generic lane and zeroed its usage. The
+                // metadata first line above is the claim anchor; a
+                // record under it that the reader does not recognize is
+                // SKIPPED WITH DISCLOSURE (the counter key is minted
+                // through the capped disclosure channel at the call
+                // site — journal-controlled type strings stay bounded),
+                // not a claim refusal. A foreign journal that merely
+                // opens with session metadata is still refused by the
+                // first-line rule — `kind` is main|subagent only.
+                None => {
+                    let kind = string(obj.get("type")).unwrap_or("none");
+                    drift_counters.push((
+                        format!("gemini_chats_skipped_record_type:{}", kind.chars().take(48).collect::<String>()),
+                        1,
+                    ));
+                }
             }
         }
     }
@@ -5984,76 +6273,7 @@ fn gemini_chats_message_id(record: &JsonObject) -> Option<String> {
 /// toolCalls rewrite, `updates` list, `removeIds`, `orderIds` (untouched
 /// entries keep their current order first, then the patched ids in
 /// patch order).
-fn gemini_chats_apply_patch(messages: &mut Vec<(String, JsonObject)>, patch: &JsonObject) {
-    if let Some(id) = string(patch.get("id")) {
-        gemini_chats_patch_one(messages, id, patch);
-    }
-    if let Some(updates) = patch.get("updates").and_then(Value::as_array) {
-        for update in updates.iter().filter_map(Value::as_object) {
-            if let Some(id) = string(update.get("id")) {
-                gemini_chats_patch_one(messages, id, update);
-            }
-        }
-    }
-    if let Some(remove_ids) = patch.get("removeIds").and_then(Value::as_array) {
-        for id in remove_ids.iter().filter_map(Value::as_str) {
-            messages.retain(|(existing, _)| existing != id);
-        }
-    }
-    if let Some(order_ids) = patch.get("orderIds").and_then(Value::as_array) {
-        let ordered: Vec<&str> = order_ids.iter().filter_map(Value::as_str).collect();
-        let mut untouched: Vec<(String, JsonObject)> = Vec::new();
-        let mut patched: Vec<(String, JsonObject)> = Vec::new();
-        for entry in messages.drain(..) {
-            if ordered.contains(&entry.0.as_str()) {
-                patched.push(entry);
-            } else {
-                untouched.push(entry);
-            }
-        }
-        patched.sort_by_key(|(id, _)| {
-            ordered
-                .iter()
-                .position(|ordered_id| *ordered_id == id.as_str())
-                .unwrap_or(usize::MAX)
-        });
-        messages.extend(untouched);
-        messages.extend(patched);
-    }
-}
 
-fn gemini_chats_patch_one(messages: &mut [(String, JsonObject)], id: &str, patch: &JsonObject) {
-    let Some(slot) = messages.iter_mut().find(|(existing, _)| existing == id) else {
-        return;
-    };
-    if let Some(content) = patch.get("content") {
-        slot.1.insert("content".to_string(), content.clone());
-    }
-    if let Some(tool_calls) = patch.get("toolCalls").and_then(Value::as_array) {
-        // The reader merges by call id (ToolCallPatch); replacing the
-        // whole array would drop calls the patch did not mention.
-        let calls = slot
-            .1
-            .entry("toolCalls".to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if let Some(existing) = calls.as_array_mut() {
-            for call in tool_calls {
-                let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
-                let matched = if call_id.is_empty() {
-                    None
-                } else {
-                    existing.iter().position(|current| {
-                        current.get("id").and_then(Value::as_str) == Some(call_id)
-                    })
-                };
-                match matched {
-                    Some(at) => existing[at] = call.clone(),
-                    None => existing.push(call.clone()),
-                }
-            }
-        }
-    }
-}
 
 /// One final-state MessageRecord -> Events. `info`/`error`/`warning`
 /// records are UI-synthetic (compression notices, slash-command
@@ -11204,4 +11424,216 @@ fn gemini_chats_lane_refuses_legacy_generic_metadata_journals() {
         )))
         .is_some()
     );
+}
+
+// rm-1377 (U1, second defense layer): upstream checkpoint truth — a
+// ToolCallData snapshot (toolCall + commitHash/messageId embedding the
+// whole clientHistory, google-gemini/gemini-cli checkpointUtils.ts) is
+// NOT a session. Discovery no longer walks the checkpoints dir (see
+// is_gemini_temp_session_file); this test pins the object lane's
+// refusal so an explicit-path parse (a checkpoint file handed straight
+// to the parser, any wrapper shape that smuggles one in) is also
+// refused WITH A COUNT instead of minting a phantom gemini_cli session
+// that double-counts the conversation it snapshots.
+#[test]
+fn gemini_checkpoint_snapshots_are_refused_with_a_count() {
+    // Upstream shape verbatim (checkpointing.md: "the conversation
+    // history and tool calls are saved in a JSON file ... checkpoints"):
+    // the tool call plus the ENTIRE conversation at that moment.
+    let snapshot = serde_json::json!({
+        "clientHistory": [
+            {"role": "user", "parts": [{"text": "rewrite this file"}]},
+            {"role": "model", "parts": [{"text": "done"}]}
+        ],
+        "toolCall": {"name": "replace", "args": {"path": "main.rs"}},
+        "commitHash": "9f8e7d6",
+        "messageId": "ad-312"
+    });
+    let (events, refused) = parse_gemini_value(&snapshot);
+    assert!(events.is_none(), "a checkpoint snapshot must not become events");
+    assert_eq!(refused, 1);
+    // Array form (a bare export list of snapshots): each one refused,
+    // nothing replayed from the embedded histories.
+    let other = serde_json::json!({
+        "history": [{"role": "user", "parts": [{"text": "another edit"}]}],
+        "toolCall": {"name": "edit", "args": {"path": "lib.rs"}},
+        "messageId": "ad-313"
+    });
+    let (events, refused) = parse_gemini_value(&serde_json::json!([snapshot, other]));
+    assert!(events.is_none());
+    assert_eq!(refused, 2);
+    // Nested wrapper (the `checkpoint` key the CU-18-era synthetic
+    // fixtures used): a checkpoint-shaped value under it is refused and
+    // counted, while the wrapper's own content still parses.
+    let wrapper = serde_json::json!({
+        "checkpoint": {
+            "clientHistory": [
+                {"role": "user", "parts": [{"text": "phantom"}]}
+            ],
+            "toolCall": {"name": "replace", "args": {}},
+            "commitHash": "abc123"
+        },
+        "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 7, "totalTokenCount": 18}
+    });
+    let (events, refused) = parse_gemini_value(&wrapper);
+    assert_eq!(refused, 1);
+    let events = events.expect("wrapper's own usageMetadata still parses");
+    assert!(events.iter().all(|event| event.role != "user"),
+        "the snapshot's embedded conversation must not leak in as user turns");
+    // The marker pair is required: a plain nested doc under the
+    // `checkpoint` key (the pre-rm-715 synthetic fixture shape, no
+    // toolCall/commitHash) still parses exactly as before — the CU-18
+    // contract for chats-dir single docs is untouched.
+    let legacy_wrapper = serde_json::json!({
+        "checkpoint": {
+            "model": "gemini-2.5-pro",
+            "conversation": [
+                {"role": "user", "parts": [{"text": "legacy wrapper turn"}]}
+            ],
+            "tokenUsage": {"promptTokenCount": 40, "totalTokenCount": 40}
+        }
+    });
+    let (events, refused) = parse_gemini_value(&legacy_wrapper);
+    assert_eq!(refused, 0);
+    let events = events.expect("legacy non-checkpoint wrapper still parses");
+    assert!(events.iter().any(|event| event.content.contains("legacy wrapper turn")));
+}
+
+// rm-1377 (U1, named refusal): an unclaimed checkpoint doc errors BY
+// NAME through the public parse surface instead of falling through to
+// the generic jsonl lane, which would resurrect the phantom off the
+// embedded clientHistory as a generic session.
+#[test]
+fn gemini_checkpoint_doc_parse_errors_by_name() {
+    let raw = concat!(
+        "{\"clientHistory\":[{\"role\":\"user\",\"parts\":[{\"text\":\"edit me\"}]}]",
+        ",\"toolCall\":{\"name\":\"replace\",\"args\":{}}",
+        ",\"commitHash\":\"9f8e7d6\",\"messageId\":\"ad-312\"}"
+    );
+    let err = parse_session_bytes(raw.as_bytes().to_vec(), "checkpoints/2026-10-13T08-01-00-000Z-main.rs-replace.json", "snap")
+        .expect_err("checkpoint doc must not parse");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("checkpoint"), "refusal must be named, got: {msg}");
+    assert!(msg.contains("rm-1377"), "named refusal expected, got: {msg}");
+}
+
+// rm-1377 (U3, writer-drift tolerance): the chats enum lives in
+// chatRecordingTypes.ts and has already drifted once since v0.63 (the
+// $patch family). A record outside the CURRENT enum, under a true
+// chats metadata first line, is drift from a newer writer — skipping
+// the whole claim was the rm-715 regression class in miniature (one
+// drifted record zeroed the whole journal's usage). It must be
+// SKIPPED WITH DISCLOSURE and the recognized records keep counting.
+#[test]
+fn gemini_chats_writer_drift_skips_unknown_record_types_with_disclosure() {
+    let raw = format!(
+        "{CHATS_METADATA}\n{}",
+        concat!(
+            r#"{"id":"m-user-1","timestamp":"2026-10-12T08:00:01.000Z","type":"user","content":"hello gemini"}"#,
+            "\n",
+            // A type the v0.63-era enum does not know — e.g. a newer
+            // upstream writer adding a reasoning carrier record.
+            r#"{"id":"m-think-1","timestamp":"2026-10-12T08:00:03.000Z","type":"thoughtSummary","content":"model deliberation"}"#,
+            "\n",
+            r#"{"id":"m-gen-1","timestamp":"2026-10-12T08:00:05.000Z","type":"gemini","content":"hi there","model":"gemini-2.5-pro","tokens":{"input":10,"output":2,"cached":0,"thoughts":0,"tool":0,"total":12}}"#,
+            "\n",
+            // Untyped drift (id-bearing record with no type key at all).
+            r#"{"id":"m-ghost","timestamp":"2026-10-12T08:00:06.000Z","content":"typeless drift"}"#,
+            "\n",
+        )
+    );
+    let (events, drift) =
+        parse_gemini_chats_jsonl_counted(&chats_objs(raw.as_str())).expect("drifted stream still claimed");
+    let contents: Vec<&str> = events
+        .iter()
+        .filter(|event| event.role != "meta")
+        .map(|event| event.content.as_str())
+        .collect();
+    assert_eq!(contents, vec!["hello gemini", "hi there"],
+        "recognized records keep counting; drifted ones are skipped");
+    assert!(events.iter().any(|event| event.role == "meta"), "usage still counted");
+    assert!(
+        drift.contains(&("gemini_chats_skipped_record_type:thoughtSummary".to_string(), 1)),
+        "typed drift disclosed, got {drift:?}"
+    );
+    assert!(
+        drift.contains(&("gemini_chats_skipped_record_type:none".to_string(), 1)),
+        "untyped drift disclosed, got {drift:?}"
+    );
+}
+
+// rm-1377 (U2, keyed upsert): the reader's messagesMap semantics —
+// replace-in-place by id — now run through a key -> position index
+// (GeminiChatsMessages). This pins the index invariants at a scale the
+// linear scan made quadratic: every op below walked the whole list
+// once per record (assess 10424d06: a 20k-record journal priced at
+// 4.52s in release purely from the re-append scan). Correctness
+// contract: no id is ever double-counted, order is preserved through
+// re-appends, and $set/$rewindTo/$patch rebuilds leave index and rows
+// consistent.
+#[test]
+fn gemini_chats_large_journal_keyed_upsert_keeps_exact_semantics() {
+    let mut raw = String::from(CHATS_METADATA);
+    raw.push('\n');
+    for n in 0..4_000 {
+        raw.push_str(&format!(
+            r#"{{"id":"m-user-{n}","timestamp":"2026-10-12T08:00:01.{n:03}Z","type":"user","content":"user turn {n}"}}"#
+        ));
+        raw.push('\n');
+    }
+    for n in 0..4_000 {
+        raw.push_str(&format!(
+            r#"{{"id":"m-gen-{n}","timestamp":"2026-10-12T08:00:02.{n:03}Z","type":"gemini","content":"model turn {n}","model":"gemini-2.5-pro","tokens":{{"input":10,"output":2,"cached":0,"thoughts":0,"tool":0,"total":12}}}}"#
+        ));
+        raw.push('\n');
+    }
+    // recordMessageTokens/recordToolCalls shape: every gemini turn
+    // re-appended once with the full record — replace-in-place must
+    // fire 4,000 times without duplicating anything.
+    for n in 0..4_000 {
+        raw.push_str(&format!(
+            r#"{{"id":"m-gen-{n}","timestamp":"2026-10-12T08:00:02.{n:03}Z","type":"gemini","content":"model turn {n} (tokens attached)","model":"gemini-2.5-pro","tokens":{{"input":10,"output":2,"cached":0,"thoughts":0,"tool":0,"total":12}}}}"#
+        ));
+        raw.push('\n');
+    }
+    // A trailing patch reordering the first three gemini turns and
+    // dropping the first user turn — exercises index rebuilds after
+    // the churn above.
+    raw.push_str(
+        r#"{"$patch":{"orderIds":["m-gen-2","m-gen-1","m-gen-0"],"removeIds":["m-user-0"]}}"#,
+    );
+    let events =
+        parse_gemini_chats_jsonl(&chats_objs(raw.as_str())).expect("large journal claimed");
+    // 4,000 user turns (one removed by the patch) + 4,000 model turns
+    // + 4,000 usage events for the gemini turns.
+    assert_eq!(events.len(), 3_999 + 4_000 + 4_000);
+    let user_turns: Vec<&Event> = events.iter().filter(|e| e.role == "user").collect();
+    assert_eq!(user_turns.len(), 3_999, "no double count, removal applied");
+    assert!(
+        !user_turns.iter().any(|e| e.content == "user turn 0"),
+        "m-user-0 removed by the patch"
+    );
+    let model_turns: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.role == "assistant")
+        .collect();
+    assert_eq!(model_turns.len(), 4_000, "re-appends replace, never duplicate");
+    assert!(model_turns.iter().all(|e| e.content.contains("(tokens attached)")),
+        "every id carries its FINAL record after re-append");
+    // Order semantics unchanged from the linear version this replaces
+    // (pinned by gemini_chats_order_ids_reorder_and_remove_ids_drop):
+    // untouched entries keep their order first, then the ordered trio
+    // in patch order at the end — m-gen-3..3999, then 2, 1, 0.
+    assert_eq!(model_turns[0].content, "model turn 3 (tokens attached)");
+    assert_eq!(model_turns[3_997].content, "model turn 2 (tokens attached)");
+    assert_eq!(model_turns[3_998].content, "model turn 1 (tokens attached)");
+    assert_eq!(model_turns[3_999].content, "model turn 0 (tokens attached)");
+    // Total usage folded from exactly 4,000 usage events.
+    let meta: Vec<&Event> = events.iter().filter(|e| e.role == "meta").collect();
+    assert_eq!(meta.len(), 4_000);
+    let total_input: i64 = meta
+        .iter()
+        .map(|e| e.usage.get("input_tokens").copied().unwrap_or(0))
+        .sum();
+    assert_eq!(total_input, 40_000);
 }

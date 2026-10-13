@@ -859,11 +859,26 @@ fn walk_session_files_cached(
         // a fifo wedges with no message and no timeout. Cline task dirs
         // stay admissible — the cold walk admits them as session roots
         // ahead of the regular-file gate (see :862/:947 arms).
+        //
+        // rm-1377: ADMISSION POLICY re-validates on replay for the same
+        // reason as file kind — the stored listing was filtered by the
+        // walker that wrote it (see `store_dir_listing` below), so a
+        // listing written by a pre-rm-1377 walker still carries the
+        // `~/.gemini/tmp/<hash>/checkpoints/*.json` paths it admitted
+        // then. Without this arm the phantom checkpoint sessions would
+        // keep serving from warm caches until the dir-listing lane
+        // invalidated on its own schedule; with it, the rm-1377
+        // exclusion is live on the first run after upgrade. The gate is
+        // the same expression the cold walk applies, so warm and cold
+        // walks stay identical (the rm-597 invariant).
         items.extend(
             listing
                 .files
                 .into_iter()
                 .filter(|path| is_cline_task_dir(path) || path.is_file())
+                .filter(|path| {
+                    !(is_gemini_temp_path(path) && !is_gemini_temp_session_file(path))
+                })
                 .filter(|path| file_targets.admit(path)),
         );
         for child in listing.dirs {
@@ -1153,13 +1168,28 @@ fn is_special_session_file(path: &Path) -> bool {
     true
 }
 
+/// Whether a file under a gemini-cli temp root is a SESSION the chats
+/// lane parses. rm-715 admitted both the `chats` journals and the
+/// `checkpoints` snapshots the same way; rm-1377 narrows admission to
+/// `chats` ONLY. Upstream truth (google-gemini/gemini-cli
+/// `checkpointUtils.ts` / `docs/cli/checkpointing.md`): a checkpoint is
+/// `{toolCall: {name, args}, commitHash?, messageId?, history?,
+/// clientHistory?}` — the tool call plus the ENTIRE conversation
+/// history at that moment, written per tool edit. Admitting the
+/// directory minted one phantom gemini_cli session per checkpoint and
+/// counted the conversation 1+N times (assess 10424d06 F1 PoC, proven
+/// parse-level and end-to-end: sessions 2 / $0.0034 with checkpoints vs
+/// 1 / $0.0033 control). The snapshot's conversation is counted once,
+/// from its chats journal; the parser's object lane refuses the shape
+/// by name (rm-1377) so an explicit-path parse is also disclosed, not
+/// silent.
 fn is_gemini_temp_session_file(path: &Path) -> bool {
     is_gemini_temp_path(path)
         && matches!(
             path.parent()
                 .and_then(Path::file_name)
                 .and_then(|name| name.to_str()),
-            Some("chats" | "checkpoints")
+            Some("chats")
         )
 }
 
