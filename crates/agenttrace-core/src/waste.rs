@@ -100,6 +100,11 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         "none" => 20.0,
         "poor" => 15.0,
         "good" => 5.0,
+        // rm-339 (run e88f2da2 cycle 3): an above-100% hit rate is a
+        // metering anomaly, not measured efficiency — it neither
+        // grades as waste (the reads may be real) nor as excellence;
+        // the rating discloses it instead.
+        "anomalous" => 0.0,
         _ => 0.0,
     };
     score += bloat.bloat_score as f64 * 0.25;
@@ -300,7 +305,17 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
     // ran on (a flex session's wasted input costs the flex input rate).
     let price = pricing::lookup_price_tiered(&metrics.model_used, metrics.service_tier.as_deref());
     let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
-    let (rating, suggestion) = if hit_rate >= 80.0 {
+    let (rating, suggestion) = if hit_rate > 100.0 {
+        // rm-339 (run e88f2da2 cycle 3): cache reads exceeding total
+        // input (hostile corpora reached 50000%) is a metering
+        // anomaly, not efficiency. Rate it "anomalous" so text and
+        // json disclose it instead of grading it "excellent"; the
+        // raw hit_rate stays visible for diagnosis.
+        (
+            "anomalous",
+            "cache hit rate above 100% - reads exceed total input; token metering anomaly, verify usage reporting",
+        )
+    } else if hit_rate >= 80.0 {
         (
             "excellent",
             "cache utilization excellent - keep current prompt structure",
@@ -573,6 +588,7 @@ fn waste_summary(report: &WasteReport, language: ReportLanguage) -> String {
 fn cache_suggestion(rating: &str, language: ReportLanguage) -> &'static str {
     if language == ReportLanguage::En {
         return match rating {
+            "anomalous" => "cache hit rate above 100% - reads exceed total input; token metering anomaly, verify usage reporting",
             "excellent" => "cache utilization excellent - keep current prompt structure",
             "good" => "moderate cache hit - place static system instructions at prompt prefix",
             "poor" => "low cache hit rate - enable prompt caching with static prefix content",
@@ -580,6 +596,7 @@ fn cache_suggestion(rating: &str, language: ReportLanguage) -> &'static str {
         };
     }
     match rating {
+        "anomalous" => "缓存命中率超过100% - 读取超过总输入，token计量异常，请核查用量上报",
         "excellent" => "缓存利用率优秀，保持当前提示词结构",
         "good" => "缓存命中率中等，将静态系统指令放在提示词前缀",
         "poor" => "缓存命中率较低，使用静态前缀启用提示词缓存",
@@ -647,6 +664,7 @@ fn action_text(action: &str, language: ReportLanguage) -> String {
 
 fn cache_rating_label(rating: &str, language: ReportLanguage) -> &'static str {
     match rating {
+        "anomalous" => t(language, "anomalous", "异常"),
         "excellent" => t(language, "excellent", "优秀"),
         "good" => t(language, "good", "良好"),
         "poor" => t(language, "poor", "较差"),
@@ -693,6 +711,47 @@ fn level_emoji(level: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_hit_rate_above_100_is_disclosed_not_excellent() {
+        // rm-339 corroborated arm (run e88f2da2 cycle 3) red-first:
+        // hostile corpora can report cache reads far above total
+        // input (cachehostile.jsonl: 5.0K read / 10 input = 50000%).
+        // Grading that "excellent" endorses a token-metering
+        // anomaly as efficiency; the rating must disclose it instead
+        // while keeping the raw value visible.
+        let session = Session {
+            name: "anom".to_string(),
+            path: "/tmp/anom.jsonl".to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                tokens_input: 10,
+                tokens_cache_r: 5_000,
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: crate::Diagnostics::default(),
+        };
+        let report = compute_waste_report(&session);
+        assert_eq!(
+            report.cache.rating, "anomalous",
+            "an above-100% hit rate is a disclosure, not a grade"
+        );
+        assert!(report.cache.hit_rate > 100.0, "raw value stays visible");
+        assert!(
+            report.cache.suggestion.contains("100%"),
+            "the suggestion names the anomaly: {}",
+            report.cache.suggestion
+        );
+        let json = waste_report_json(&report);
+        assert!(
+            json.contains("anomalous"),
+            "the json rating carries the disclosure too: {json}"
+        );
+    }
 
     #[test]
     fn waste_report_supports_chinese() {

@@ -1,7 +1,7 @@
 # Prevention rule: provider-reaped delegate attempts — redo from scratch on census match, adopt nothing unverified
 
 - **Class:** workflow / conductor delegate attempt recovery (infra-death forensics)
-- **Observed:** recurring fleet-wide; four instances in one cycle on 2026-10-06/07, run `460d0633` (repository-maintenance `347d61bc` cycle 1): assess `13c0b61c`, roadmap `bd772c10`, stewardship `5c42758d`, compound `70651ebb`. Prior cycles hit the same shape (run `b1ff12f8`: `39bffb00`, `54eda020`; run `adcef255d604`: `5da09688`; run `32192d92`: `98139ad7`).
+- **Observed:** recurring fleet-wide; four instances in one cycle on 2026-10-06/07, run `460d0633` (repository-maintenance `347d61bc` cycle 1): assess `13c0b61c`, roadmap `bd772c10`, stewardship `5c42758d`, compound `70651ebb`. Prior cycles hit the same shape (run `b1ff12f8`: `39bffb00`, `54eda020`; run `adcef255d604`: `5da09688`; run `32192d92`: `98139ad7`). Five more in one cycle on 2026-10-08, run `e88f2da2fbe9` cycle 3 — three of them DELTA-PRESENT adoptions, not zero-drift redos (see the dated Addendum below).
 - **Cost:** each dead attempt burns a full turn budget and forces a redo; the two failure modes that cost MORE than the redo are (a) hunting for phantom work that never happened, and (b) adopting a present-but-invalid artifact as if it were the dead attempt's result.
 
 ## What happened
@@ -81,3 +81,20 @@ and prioritize 51984e11 (message 4) were correctly redone from scratch — rules
 remain the fast path, and this extension adds two checks to run after they come back
 clean-or-dirty: **tree drift as candidate work, detached /tmp artifacts as candidate
 results.** Recorded in PR-Y of docs/stewardship/2026-10-08-cycle1-compound-record-run749cd29820f3.md.
+## Addendum (2026-10-08, run `e88f2da2fbe9` cycle 3 — five reaps, three delta-present adoptions)
+
+The 2026-10-06/07 four-instance cycle above was the ZERO-DRIFT class: porcelain census matches the prior handoff, nothing to adopt, redo from scratch. Cycle 3 of run `e88f2da2fbe9` (repository-maintenance `546703d4`, base `92149bd`) hit the class five times and produced the other two dispositions in bulk — including the first recorded COMPOUND-phase reap-after-write:
+
+| Phase | Attempt | Durable trail | Disposition |
+|---|---|---|---|
+| roadmap | `9060b4e3` | `M ROADMAP.md` +38 (band mint), written 15:07:54Z; reaped 15:09:23Z, 89 s later | delta-present ADOPT after leg-by-leg re-verification (redo `65bb1d3a` filed the result) |
+| stewardship | `8d760c28` | 4-line event log, no artifacts | zero-durable → redo `1109077635` from scratch |
+| implement | `d886218c` | 3-file code delta + `red-first.log` with 4 planted red tests | delta-present ADOPT then COMPLETE — rule 7 below |
+| compound | `884f0594` | banner + 3 row flips + cycle record, written 02:29:37Z; reaped 02:31:08Z, 91 s later | delta-present ADOPT by `4c62495c` — rule 8 below |
+| compound | `1e7485cb` | 5-line event log, 31 s, no file mtimes near it | zero-durable → redo (the present attempt) |
+
+Two refinements, both minted as numbered rules:
+
+7. **Adopt-then-run-the-reds (delta-present code adoption).** A reaped attempt's planted red tests are the cheapest oracle for whether its delta is complete. `d886218c`'s adopted implement delta was structurally sound but seeded the budget series' first-day baseline with `(NEG_INF, NEG_INF)`, making `first_seen` unreachable — two of its OWN planted reds stayed red against the adopted tree, because the reap had cut the attempt before any green run. The successor ran the dead attempt's reds against the adopted delta, caught the seed defect from them, and completed. An adopted delta is not trusted until the dead attempt's own red tests (or fresh equivalents planted to the same acceptance) run green against it — a green full suite alone is not enough, because the suite was green at the base too.
+
+8. **A referenced artifact is not a written artifact (delta-present documentation adoption).** The reaped compound attempt's banner and cycle record both cited "a dated addendum on this doc" — written 91 s before its death, never started (this file sat unmodified at HEAD). When adopting a dead attempt's documentation delta, sweep its own references for targets that do not exist in the tree yet: the citation list IS the TODO list. Closing this one surfaced a second lesson of the same shape — verify phase-attribution labels against the event logs before certifying a wall (`01e7fe06` was the targeted_tests attempt, not compound; the row now says `targeted`).
