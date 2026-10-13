@@ -1,0 +1,9 @@
+# rm-1021 (run 240079ac cycle 2): residents for the ROADMAP
+# commit-anchor resolvability gate (scripts/ci/check-roadmap-anchors.sh).
+# Each line: <sha> <reason>. A sha listed here is a citation that
+# legitimately names ANOTHER repository's commit and therefore cannot
+# resolve from this checkout — dated wall records are never rewritten
+# to carry markers, so the opt-out lives beside the gate.
+# Lines without a reason fail the gate.
+e07f4eba upstream open-telemetry/semantic-conventions-genai commit (2026-10-05, "Add clarification about content capture, recommend severity debug") cited in rm-493 evidence refreshes — foreign repo, never a this-repo sha
+2273752 dashboard-fleet foreign repo base cited in the 2026-10-06 cycle-2 roadmap banner (41067ca6 vapidPublic/ErrorBoundary cluster) — foreign repo, never a this-repo sha
