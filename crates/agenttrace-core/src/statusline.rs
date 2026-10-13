@@ -207,12 +207,23 @@ fn user_cache_dir() -> PathBuf {
 /// resolved against the CWD and a `.cache/agenttrace/statusline.jsonl`
 /// planted in the working directory was read into the budget view
 /// (live PoC: `$999.00 ... OVER by $989.00` from a planted journal).
+///
+/// Cycle-3 review F1 (2026-10-13, run 64e89da50d71, attempt ae97110b):
+/// the RELATIVE arm now matches the rm-248 rider — `HOME=rel-home`
+/// planted ./rel-home/.cache/agenttrace/statusline.jsonl (0600) in the
+/// CWD and `--statusline-report` read the planted journal back (live
+/// PoC: ae97110b-scratch/poc/). A set-but-empty OR RELATIVE `HOME` is
+/// unset-equivalent on BOTH arms, the same rule the rider pinned at
+/// the session_cache / doctor / pricing copies.
 fn resolve_user_cache_dir(
     home: Option<&std::ffi::OsStr>,
     xdg_cache_home: Option<&std::ffi::OsStr>,
 ) -> PathBuf {
+    let usable_home = home
+        .filter(|value| !value.is_empty())
+        .filter(|value| std::path::Path::new(value).is_absolute());
     if cfg!(target_os = "macos") {
-        if let Some(home) = home.filter(|value| !value.is_empty()) {
+        if let Some(home) = usable_home {
             return PathBuf::from(home).join("Library").join("Caches");
         }
     }
@@ -228,7 +239,7 @@ fn resolve_user_cache_dir(
     {
         return PathBuf::from(cache);
     }
-    if let Some(home) = home.filter(|value| !value.is_empty()) {
+    if let Some(home) = usable_home {
         return PathBuf::from(home).join(".cache");
     }
     std::env::temp_dir()
@@ -2046,6 +2057,27 @@ mod tests {
         // Both empty: the temp-dir fallback — always absolute.
         let both_empty = resolve_user_cache_dir(empty, empty);
         assert!(both_empty.is_absolute(), "{both_empty:?}");
+        // Cycle-3 review F1 (attempt ae97110b): a RELATIVE HOME is
+        // unset-equivalent here too — `HOME=rel-home` planted
+        // ./rel-home/.cache/agenttrace/statusline.jsonl (0600) in the
+        // CWD and `--statusline-report` read it back (live PoC:
+        // ae97110b-scratch/poc/), while the EMPTY arm above was
+        // already guarded. Same rule the rm-248 rider pinned at the
+        // session_cache / doctor / pricing copies.
+        let relative = Some(OsStr::new("rel-home"));
+        assert_eq!(
+            resolve_user_cache_dir(relative, None),
+            std::env::temp_dir(),
+            "a relative HOME must behave exactly like an unset one, not ./rel-home/.cache"
+        );
+        // A usable absolute HOME still wins over no XDG override.
+        assert_eq!(
+            resolve_user_cache_dir(Some(OsStr::new("/home/at-test")), None),
+            PathBuf::from("/home/at-test").join(".cache")
+        );
+        // Relative HOME + relative XDG: never a relative ladder end.
+        let both_relative = resolve_user_cache_dir(relative, Some(OsStr::new("rel-cache")));
+        assert!(both_relative.is_absolute(), "{both_relative:?}");
         // Empty HOME with a set XDG override: the override wins.
         assert_eq!(
             resolve_user_cache_dir(empty, Some(OsStr::new("/xdg-cache"))),

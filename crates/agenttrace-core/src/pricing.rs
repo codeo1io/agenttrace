@@ -2025,9 +2025,37 @@ fn write_pricing_header(out: &mut String, name_width: usize) {
 }
 
 fn user_cache_dir() -> PathBuf {
+    resolve_user_cache_dir(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+    )
+}
+
+/// Pure resolution core for [`user_cache_dir`]: the same rules
+/// without touching process environment state, so the
+/// empty/relative-env fallbacks are unit-testable without mutating
+/// (unsafe) globals (the `resolve_user_config_path` pattern from
+/// rm-683, shared with statusline).
+///
+/// rm-248 rider (2026-10-12, run 64e89da50d71 cycle 3): a
+/// set-but-empty OR RELATIVE `HOME` is treated as unset on BOTH arms,
+/// extending the empty-env rule statusline's copy already applies
+/// (review 95d74221 F2). Without the guard, `HOME=` joined the
+/// RELATIVE `.cache`, so the pricing cache (`pricing.json` under the
+/// same agenttrace root) would plant ./.cache/agenttrace in the
+/// working directory (live PoC on the sibling session-cache copy:
+/// /tmp/at-probe-8275/homeempty/), and a relative `HOME=rel-home`
+/// planted ./rel-home/.cache the same way.
+fn resolve_user_cache_dir(
+    home: Option<&std::ffi::OsStr>,
+    xdg_cache_home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    let usable_home = home
+        .filter(|value| !value.is_empty())
+        .filter(|value| std::path::Path::new(value).is_absolute());
     if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
+        if let Some(home) = usable_home {
+            return PathBuf::from(home).join("Library").join("Caches");
         }
     }
     // rm-248: the XDG Base Directory spec only defines ABSOLUTE
@@ -2036,13 +2064,14 @@ fn user_cache_dir() -> PathBuf {
     // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
     // agenttrace --overview` wrote ./rel-cache/agenttrace from a
     // scratch cwd).
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() && cache.is_absolute() {
-            return cache;
-        }
+    if let Some(cache) = xdg_cache_home
+        .filter(|value| !value.is_empty())
+        .filter(|value| std::path::Path::new(value).is_absolute())
+    {
+        return PathBuf::from(cache);
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".cache");
+    if let Some(home) = usable_home {
+        return PathBuf::from(home).join(".cache");
     }
     std::env::temp_dir()
 }
@@ -2109,6 +2138,52 @@ mod tests {
             None => std::env::remove_var("XDG_CACHE_HOME"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn user_cache_dir_treats_empty_and_relative_home_as_unset() {
+        // rm-248 rider (2026-10-12, run 64e89da50d71 cycle 3):
+        // statusline's resolve core already treated a set-but-empty
+        // HOME as unset (review 95d74221 F2), but pricing's inline
+        // copy did not — an empty or relative HOME resolved a RELATIVE
+        // cache root, so pricing.json could plant ./.cache/agenttrace
+        // in the CWD (live PoC on the byte-identical session-cache
+        // copy: /tmp/at-probe-8275/homeempty/). Both now behave
+        // exactly like an unset HOME: the temp-dir ladder end, always
+        // absolute.
+        use std::ffi::OsStr;
+        let empty = Some(OsStr::new(""));
+        let relative = Some(OsStr::new("rel-home"));
+        let absolute = Some(OsStr::new("/home/at-test"));
+        assert_eq!(
+            resolve_user_cache_dir(empty, None),
+            std::env::temp_dir(),
+            "an empty HOME must behave exactly like an unset one"
+        );
+        assert_eq!(
+            resolve_user_cache_dir(relative, None),
+            std::env::temp_dir(),
+            "a relative HOME must behave exactly like an unset one, not ./rel-home/.cache"
+        );
+        assert_eq!(
+            resolve_user_cache_dir(absolute, None),
+            PathBuf::from("/home/at-test").join(".cache")
+        );
+        assert_eq!(
+            resolve_user_cache_dir(empty, Some(OsStr::new("/xdg-cache"))),
+            PathBuf::from("/xdg-cache")
+        );
+        assert_eq!(
+            resolve_user_cache_dir(absolute, Some(OsStr::new("rel-cache"))),
+            PathBuf::from("/home/at-test").join(".cache")
+        );
+        assert_eq!(
+            resolve_user_cache_dir(absolute, empty),
+            PathBuf::from("/home/at-test").join(".cache")
+        );
+        let both_unusable = resolve_user_cache_dir(relative, Some(OsStr::new("rel-cache")));
+        assert!(both_unusable.is_absolute(), "{both_unusable:?}");
     }
 
     #[test]
