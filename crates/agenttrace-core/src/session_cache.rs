@@ -5,7 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 60;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 61;
+// Bumped 60 -> 61 (run 5694d1bc cycle 2 'recorded-zero is not free',
+// repository-maintenance ec4f7625, roadmap rm-1039): a present-zero
+// pi recorded cost (`usage.cost.total == Some(0.0)` — the pi
+// writer's catalog-gap default, provider-composer.js:107) no longer
+// participates in the upstream totals; its tokens stay in the
+// catalog formula as estimates with a
+// `+recorded_zero_cost_estimate:N` provenance suffix. A warm v60
+// entry keeps serving the pre-fix $0 totals over catalog-gap models
+// (the fleet PoC journal priced $0 baseline and $0 under a +$10/M
+// override; post-fix $0.13 / $11.36) with matching fingerprints, so
+// nothing regenerates them until each source file changes again
+// (rm-230 convention: parser-semantics changes that alter served
+// totals bump the schema so cached sessions regenerate under
+// corrected accounting). Minted at this tree's ceiling 60, one
+// invalidation either way.
 // Bumped 59 -> 60 (integration of run e486dc1adb9b cycle 2 'pi journal
 // accounting truth, part 2', conflict case 38b020c7f8f1463fb56f21772d627068,
 // candidate d9b3333 @ base 1511547): the batch's two units both change

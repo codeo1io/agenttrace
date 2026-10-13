@@ -548,6 +548,19 @@ pub fn update_pricing() -> anyhow::Result<usize> {
     Ok(count)
 }
 
+/// rm-1043: a nonzero per-million rate below half a cent rounds to
+/// "$0.00" at two decimals and reads as free on every rate-render
+/// surface (the bundled snapshot carries 26 such slots). Render the
+/// sub-cent sentinel "<0.01" instead — display only, cost math never
+/// touches this cell.
+fn per_m_rate_cell(rate: f64) -> String {
+    if rate > 0.0 && rate < 0.005 {
+        "<0.01".to_string()
+    } else {
+        format!("{rate:.2}")
+    }
+}
+
 pub fn render_model_pricing_list() -> String {
     let prices = list_pricing();
     let default = default_price();
@@ -567,19 +580,19 @@ pub fn render_model_pricing_list() -> String {
     out.push_str("Common/default pricing\n");
     write_pricing_header(&mut out, name_width);
     out.push_str(&format!(
-        "  {:<width$} ${:>8.2}  ${:>8.2}\n",
+        "  {:<width$} ${:>8}  ${:>8}\n",
         "default",
-        default.input,
-        default.output,
+        per_m_rate_cell(default.input),
+        per_m_rate_cell(default.output),
         width = name_width
     ));
     for &name in common_pricing_models() {
         if let Some(price) = prices.get(name) {
             out.push_str(&format!(
-                "  {:<width$} ${:>8.2}  ${:>8.2}\n",
+                "  {:<width$} ${:>8}  ${:>8}\n",
                 name,
-                price.input,
-                price.output,
+                per_m_rate_cell(price.input),
+                per_m_rate_cell(price.output),
                 width = name_width
             ));
         }
@@ -589,10 +602,10 @@ pub fn render_model_pricing_list() -> String {
     write_pricing_header(&mut out, name_width);
     for (name, price) in prices {
         out.push_str(&format!(
-            "  {:<width$} ${:>8.2}  ${:>8.2}\n",
+            "  {:<width$} ${:>8}  ${:>8}\n",
             name,
-            price.input,
-            price.output,
+            per_m_rate_cell(price.input),
+            per_m_rate_cell(price.output),
             width = name_width
         ));
     }
@@ -617,8 +630,12 @@ pub fn render_test_match() -> String {
     ] {
         let p = lookup_price(model);
         out.push_str(&format!(
-            "  {:<50} → in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
-            model, p.input, p.output, p.cw, p.cr
+            "  {:<50} → in=${:>7}/M  out=${:>7}/M  cw=${:>6}/M  cr=${:>6}/M\n",
+            model,
+            per_m_rate_cell(p.input),
+            per_m_rate_cell(p.output),
+            per_m_rate_cell(p.cw),
+            per_m_rate_cell(p.cr),
         ));
         // rm-610: disclose the flex-tier rates when the row carries
         // them, so the rate a `service_tier: "flex"` turn bills at is
@@ -626,11 +643,11 @@ pub fn render_test_match() -> String {
         // turns at the standard rates above).
         if let (Some(in_flex), Some(out_flex)) = (p.input_flex, p.output_flex) {
             out.push_str(&format!(
-                "      flex: in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
-                in_flex,
-                out_flex,
-                p.cw_flex.unwrap_or(p.cw),
-                p.cr_flex.unwrap_or(p.cr)
+                "      flex: in=${:>7}/M  out=${:>7}/M  cw=${:>6}/M  cr=${:>6}/M\n",
+                per_m_rate_cell(in_flex),
+                per_m_rate_cell(out_flex),
+                per_m_rate_cell(p.cw_flex.unwrap_or(p.cw)),
+                per_m_rate_cell(p.cr_flex.unwrap_or(p.cr)),
             ));
         }
     }
@@ -3141,6 +3158,32 @@ mod tests {
         assert!(
             text.contains("flex:"),
             "flex rates are disclosed on their own line"
+        );
+    }
+
+    // --- rm-1043: sub-cent rate sentinel -----------------------------
+
+    #[test]
+    fn sub_cent_rates_render_the_sentinel_not_free() {
+        // A nonzero per-million rate below half a cent rounds to
+        // "$0.00" at two decimals and reads as free on every
+        // rate-render surface; the sentinel shows instead. A true
+        // zero rate stays numeric — the sentinel is only for nonzero
+        // rates the 2-decimal render would erase.
+        assert_eq!(per_m_rate_cell(0.0), "0.00", "a true zero stays numeric");
+        assert_eq!(per_m_rate_cell(0.0016), "<0.01");
+        assert_eq!(per_m_rate_cell(0.0049), "<0.01");
+        assert_eq!(per_m_rate_cell(0.0051), "0.01");
+        assert_eq!(per_m_rate_cell(1.4), "1.40");
+        assert_eq!(per_m_rate_cell(35.0), "35.00");
+        // The bundled snapshot carries 26 slots below $0.005/M — the
+        // catalog table must surface the sentinel on at least one
+        // bundled row, and the flex-contract probe proves the numeric
+        // path is byte-stable above the threshold.
+        let rendered = render_model_pricing_list();
+        assert!(
+            rendered.lines().any(|line| line.contains("<0.01")),
+            "the bundled catalog has sub-cent slots; at least one row must render the sentinel"
         );
     }
 

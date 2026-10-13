@@ -1237,3 +1237,129 @@ fn present_zero_pi_usage_counts_as_measured_zeros_on_both_arms() {
         "absent usage never flags"
     );
 }
+
+// --- rm-1039: pi present-zero recorded cost falls through to estimates ---
+
+/// One cache_warm usage entry whose recorded cost is a PRESENT ZERO
+/// over real tokens — the exact shape the pi composer emits for an
+/// unpriced (catalog-gap) model (writer ground truth
+/// @earendil-works/pi-coding-agent dist/core/provider-composer.js:107;
+/// the live zai shard carries glm-5.3-highspeed all-zero beside the
+/// priced glm-5.3). Fleet census: 14,779 zero-cost-with-tokens
+/// messages over 202 mirrored pi journals priced $0.
+const USAGE_PRESENT_ZERO_COST: &str = concat!(
+    r#"{"type": "session", "version": 3, "id": "s-1", "timestamp": "2026-10-04T10:00:00.000Z", "cwd": "/tmp/x"}"#,
+    "\n",
+    r#"{"type": "message", "id": "11", "parentId": null, "timestamp": "2026-10-04T10:00:01.000Z", "message": {"role": "user", "content": "hi", "timestamp": 1733234401000}}"#,
+    "\n",
+    r#"{"type": "message", "id": "21", "parentId": "11", "timestamp": "2026-10-04T10:00:02.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}], "timestamp": 1733234401000, "usage": {"input": 100, "output": 50, "cacheRead": 0, "cacheWrite": 0}, "model": "claude-sonnet-4-5"}}"#,
+    "\n",
+    r#"{"type": "usage", "id": "31", "parentId": "21", "timestamp": "2026-10-04T10:00:05.000Z", "kind": "cache_warm", "provider": "anthropic", "model": "claude-sonnet-4-5", "usage": {"input": 0, "output": 0, "cacheRead": 50000, "cacheWrite": 0, "totalTokens": 50000, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.0}}}"#,
+);
+
+/// The mixed journal: a present-zero block AND a strictly positive
+/// recorded-cost block in one session — pins the two gates composing
+/// (nonzero still wins and excludes its tokens, rm-253; the zero
+/// block estimates and discloses).
+const USAGE_MIXED_ZERO_AND_RECORDED: &str = concat!(
+    r#"{"type": "session", "version": 3, "id": "s-1", "timestamp": "2026-10-04T10:00:00.000Z", "cwd": "/tmp/x"}"#,
+    "\n",
+    r#"{"type": "message", "id": "11", "parentId": null, "timestamp": "2026-10-04T10:00:01.000Z", "message": {"role": "user", "content": "hi", "timestamp": 1733234401000}}"#,
+    "\n",
+    r#"{"type": "usage", "id": "31", "parentId": "11", "timestamp": "2026-10-04T10:00:05.000Z", "kind": "cache_warm", "provider": "anthropic", "model": "claude-sonnet-4-5", "usage": {"input": 0, "output": 0, "cacheRead": 30000, "cacheWrite": 0, "totalTokens": 30000, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.0}}}"#,
+    "\n",
+    r#"{"type": "usage", "id": "41", "parentId": "11", "timestamp": "2026-10-04T10:00:07.000Z", "kind": "cache_warm", "provider": "anthropic", "model": "claude-sonnet-4-5", "usage": {"input": 0, "output": 0, "cacheRead": 20000, "cacheWrite": 0, "totalTokens": 20000, "cost": {"input": 0, "output": 0, "cacheRead": 0.02, "cacheWrite": 0, "total": 0.02}}}"#,
+);
+
+#[test]
+fn recorded_cost_present_zero_falls_through_to_estimate() {
+    // rm-1039 golden, arm A: a PRESENT-zero recorded cost is the pi
+    // writer's catalog-gap default, not provider truth — it must not
+    // participate in the upstream totals. Its tokens stay in the
+    // catalog formula (estimated), the estimate is disclosed in the
+    // provenance string, and no recorded-cost label rides the session.
+    let session = parsed("usage-present-zero-cost.jsonl", USAGE_PRESENT_ZERO_COST);
+    let metrics = &session.metrics;
+    assert_eq!(
+        metrics.upstream_cost_usd, 0.0,
+        "a present-zero recorded cost contributes nothing"
+    );
+    assert_eq!(metrics.recorded_zero_cost_events, 1);
+    let price = lookup_price("claude-sonnet-4-5");
+    let expected =
+        round4(100.0 / 1e6 * price.input + 50.0 / 1e6 * price.output + 50000.0 / 1e6 * price.cr);
+    assert!(
+        (metrics.cost_estimated - expected).abs() < 1e-9,
+        "the zero-cost block's tokens are catalog-priced: got {} want {}",
+        metrics.cost_estimated,
+        expected
+    );
+    assert!(
+        expected > 0.0,
+        "fixture must be priced (bundled claude rates), got {expected}"
+    );
+    assert_eq!(
+        metrics.provenance.tokens, "reported_by_agent+recorded_zero_cost_estimate:1",
+        "the estimate over a reported zero is disclosed: {}",
+        metrics.provenance.tokens
+    );
+    assert!(
+        !metrics
+            .provenance
+            .pricing_source
+            .ends_with(" + recorded cost"),
+        "no recorded component participated: {}",
+        metrics.provenance.pricing_source
+    );
+    assert_eq!(metrics.provenance.cost, "calculated_from_tokens");
+    assert_eq!(
+        metrics.tokens_cache_r, 50000,
+        "usage counting is untouched (rm-436/rm-408 arms byte-stable)"
+    );
+}
+
+#[test]
+fn recorded_cost_mixed_zero_and_positive_composes_the_two_gates() {
+    // rm-1039 golden, arm B composition: strictly positive recorded
+    // costs still win and exclude their tokens (rm-253), while the
+    // present-zero block in the same session estimates and discloses.
+    let session = parsed(
+        "usage-mixed-zero-recorded.jsonl",
+        USAGE_MIXED_ZERO_AND_RECORDED,
+    );
+    let metrics = &session.metrics;
+    assert_eq!(
+        metrics.upstream_cost_usd, 0.02,
+        "the strictly positive recorded cost still participates"
+    );
+    assert_eq!(metrics.recorded_zero_cost_events, 1);
+    let price = lookup_price("claude-sonnet-4-5");
+    let expected = round4(30000.0 / 1e6 * price.cr + 0.02);
+    assert!(
+        (metrics.cost_estimated - expected).abs() < 1e-9,
+        "only the zero block's tokens are catalog-priced, the 0.02 block rides along: got {} want {}",
+        metrics.cost_estimated,
+        expected
+    );
+    assert_eq!(
+        metrics.provenance.tokens, "reported_by_agent+recorded_zero_cost_estimate:1",
+        "suffix composes beside the recorded component: {}",
+        metrics.provenance.tokens
+    );
+    assert!(
+        metrics
+            .provenance
+            .pricing_source
+            .ends_with(" + recorded cost"),
+        "the nonzero recorded component still labels the source: {}",
+        metrics.provenance.pricing_source
+    );
+    assert_eq!(
+        metrics.provenance.cost,
+        "calculated_from_tokens_with_recorded_cost"
+    );
+    assert_eq!(
+        metrics.tokens_cache_r, 50000,
+        "both blocks still count tokens regardless of cost participation"
+    );
+}

@@ -572,6 +572,14 @@ pub struct Metrics {
     /// the text-estimate fallback (absent usage keeps that path).
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub zero_usage_events: usize,
+    /// rm-1039: pi recorded-cost blocks whose `usage.cost.total` is a
+    /// PRESENT ZERO — the pi writer's catalog-gap default (the composer
+    /// emits 0 for an unpriced model), not provider truth. Those events
+    /// do not participate in the upstream totals; their tokens are
+    /// catalog-priced as estimates and the count here discloses that
+    /// the session's cost is an estimate over a reported zero.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub recorded_zero_cost_events: usize,
     /// USD cost the source journal recorded for usage blocks (pi
     /// `type:"usage"` entries carrying `usage.cost.total`, rm-436).
     /// Those tokens are excluded from the catalog formula and added at
@@ -1271,6 +1279,28 @@ pub fn session_from_events(
             metrics.provenance.tokens, zero_usage_events
         );
     }
+    // rm-1039 disclosure: a PRESENT-zero recorded cost (pi
+    // `usage.cost.total == Some(0.0)`) is the writer's catalog-gap
+    // default, not provider truth — those events no longer join the
+    // upstream totals (the participation gates below pass only
+    // strictly positive costs, so their tokens stay in the catalog
+    // formula as estimates). Count them and flag the estimate in the
+    // provenance string, mirroring the zero-usage arm above.
+    let recorded_zero_cost_events = events
+        .iter()
+        .filter(|event| {
+            event
+                .recorded_cost_usd
+                .is_some_and(|cost| cost.is_finite() && cost == 0.0)
+        })
+        .count();
+    if recorded_zero_cost_events > 0 {
+        metrics.recorded_zero_cost_events = recorded_zero_cost_events;
+        metrics.provenance.tokens = format!(
+            "{}+recorded_zero_cost_estimate:{}",
+            metrics.provenance.tokens, recorded_zero_cost_events
+        );
+    }
     let display_name = session_display_name(name, &events);
     metrics.provenance.naming = if display_name != name {
         "first_user_request"
@@ -1659,10 +1689,15 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 // no token class at all (pi cache_warm with zeroed
                 // classes) — a PRESENT cost must not be silently
                 // zeroed for lacking tokens. The token exclusions
-                // below add zero for an empty map.
+                // below add zero for an empty map. rm-1039 narrows
+                // participation to strictly positive costs: a
+                // present-zero total is the pi writer's catalog-gap
+                // default (an unpriced model), not provider truth, so
+                // it adds nothing here and its tokens stay in the
+                // catalog formula as estimates.
                 if let Some(cost) = event
                     .recorded_cost_usd
-                    .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                    .filter(|cost| cost.is_finite() && *cost > 0.0)
                 {
                     metrics.upstream_cost_usd += cost;
                     upstream_priced_input =
@@ -1921,9 +1956,13 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .unwrap_or(0)
                     .max(0),
             );
+            // rm-1039: strictly positive participation here too — a
+            // present-zero recorded cost (the pi catalog-gap default)
+            // falls through to the block_price estimate below so
+            // attribution still sums to the session total.
             if event
                 .recorded_cost_usd
-                .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+                .is_some_and(|cost| cost.is_finite() && cost > 0.0)
             {
                 // Upstream-recorded cost already sits in the seed; credit
                 // the block's model with it so attribution sums to the
