@@ -6,7 +6,7 @@ use agenttrace_core::{
     attention_priority, attention_rank, average_health, canonical_sessions, clear_session_cache,
     compute_overview, compute_overview_iter, context_trends, cost_audit, data_health,
     delivery_evidence_with_git, format_cost, format_tokens, inspect_first, inspect_reason,
-    load_cached_sessions_from_cache, load_session_cache, load_sessions_with_progress,
+    load_cached_sessions_from_cache, load_session_cache_for_scan, load_sessions_with_progress,
     load_sessions_with_progress_from_cache_mode, mcp_governance, needs_attention, project_name,
     recommendations, resolve_project, session_capability, session_cost_audit,
     session_matches_time_range, total_tokens, ContextTrend, CostAudit, DataHealth,
@@ -459,7 +459,11 @@ impl App {
 
     fn new_loading(source_label: &str, reload_dir: String) -> Self {
         let dir = (!reload_dir.trim().is_empty()).then(|| std::path::Path::new(&reload_dir));
-        let mut cache = load_session_cache();
+        // rm-1054 follow-up (review ba3e8e68): a dir-scoped default lane must
+        // not read (or bank into) the operator's global cache — route through
+        // the scan front door, which yields the ephemeral in-memory lane for
+        // dir scope (and still honors an explicit cache-dir override).
+        let mut cache = load_session_cache_for_scan(dir);
         let sessions = load_cached_sessions_from_cache(dir, &mut cache);
         let mut app = Self::new(sessions, source_label, Some(reload_dir));
         app.language = saved_language();

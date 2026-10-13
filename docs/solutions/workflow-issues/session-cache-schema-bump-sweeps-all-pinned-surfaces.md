@@ -21,8 +21,8 @@
 2. `crates/agenttrace-core/tests/discovery_contract.rs:1255` — inside `rust_writes_and_reuses_go_compatible_session_cache` (fn at `:1183`): the cache-hit contract pin. Reads the **exported constant dynamically** (the rm-538 landing moved both discovery pins off literals), so it cannot drift numerically — it goes red when the write/read regeneration contract itself regresses.
 3. `crates/agenttrace-core/tests/discovery_contract.rs:1432` — inside `rust_refreshes_cache_entries_from_old_schema_version` (fn at `:1388`): the stale-schema sweep pin. Also dynamic; its planted fixture (`:1202`) carries an ancient `schema_version` and the test asserts regeneration to the live constant, so it stays adversarial at every bump.
 4. `crates/agenttrace-tui/src/tests.rs` — the planted-cache fixture in `ctrl_r_force_reload_clears_session_cache_before_loading`: planted at the **current** number by interpolating the exported `agenttrace_core::SESSION_CACHE_SCHEMA_VERSION` into the hand-written JSON (the rm-520/rm-521 landing moved it off a hand-pinned literal so it cannot rot on a bump), and the test asserts a **warm hit** (`cache_hits == 1`). Reintroduce a stale literal here and the planted entry looks stale — the warm-hit assertions go red in `cargo test -p agenttrace-tui`.
-5. `docs/guides/governance-reports.md` — a prose sentence carrying the number ("The session cache is schema 64 …"), which `scripts/ci/check-docs-commands.sh` verifies against the **live constant** by running the release binary.
-6. `crates/agenttrace-core/tests/usage_occurrence_contract.rs` — `warm_cache_replays_cold_disclosure_and_schema_64_invalidates_v32` (added with the rm-710 oracle at the run-73fe8e1e landing) carries the number in **three** places on purpose: the fn name, the `assert_eq!(SESSION_CACHE_SCHEMA_VERSION, 64, …)` pin, and its message. Unlike the dynamic pins this one is *intentionally literal* — it goes red at EVERY bump so the sweep cannot be forgotten; sweep all three together (and keep the degraded-fixture leg's `schema_version: 32` planted value below the live constant).
+5. `docs/guides/governance-reports.md` — a prose sentence carrying the number ("The session cache is schema 66 …"), which `scripts/ci/check-docs-commands.sh` verifies against the **live constant** by running the release binary.
+6. `crates/agenttrace-core/tests/usage_occurrence_contract.rs` — `warm_cache_replays_cold_disclosure_and_schema_66_invalidates_v32` (added with the rm-710 oracle at the run-73fe8e1e landing) carries the number in **three** places on purpose: the fn name, the `assert_eq!(SESSION_CACHE_SCHEMA_VERSION, 64, …)` pin, and its message. Unlike the dynamic pins this one is *intentionally literal* — it goes red at EVERY bump so the sweep cannot be forgotten; sweep all three together (and keep the degraded-fixture leg's `schema_version: 32` planted value below the live constant).
 
 Miss any one of the literal-bearing sites and the failure appears at a *later* gate than your edit: the tui fixture only in `cargo test -p agenttrace-tui`, and the governance sentence only in the CI docs gate against a release build — i.e. possibly after you already declared the phase green on focused tests. (The two discovery pins fail only on semantics regressions, not on the bump itself — which is exactly why the literal sites must be swept by hand.)
 
@@ -38,3 +38,23 @@ When a parser-semantics change bumps the schema (the rm-230 convention: cached s
 ## Why five sites and not one
 
 The pins are deliberate adversarial coverage: each one fails for a different regression (stale cache accepted, cache-hit regressed, planted cache trusted across a semantics change, docs drifting from code). The cost is this checklist — which is cheaper than any of the regressions it catches. Cite the test **names**, not just line numbers, when recording a sweep: anchors drift at every integration, and this file was re-anchored once already for exactly that reason.
+
+## Addendum 2026-10-15 — burned rungs (minted-but-unmerged lineages keep their numeral)
+
+The 64 → 66 jump (run abb3b091 cycle 3, rm-1385 + rm-1054) skipped 65 on purpose:
+rung 65 was already MINTED by an unmerged sibling lineage (7a63e9bb @002ca9a,
+schema 53 → 65, held uncommitted in its worktree at mint time). Reusing 65 here
+would have made two divergent cache formats share one schema_version — the very
+ambiguity the ladder exists to prevent.
+
+Rule (now part of the convention, applies to every future mint):
+
+1. **Census before mint** — sibling doc
+   `schema-version-mints-must-census-uncommitted-fleet-siblings.md` governs HOW.
+2. **A minted numeral stays burned even if its lineage never lands.** Never
+   renumber onto a minted-but-unmerged rung; skip past it and record the burn in
+   the oracle ladder narrative (see `usage_occurrence_contract.rs`
+   `warm_cache_replays_cold_disclosure_and_schema_66_invalidates_v32`) so the
+   gap is self-explaining at the next bump.
+3. Two rungs in one cycle is fine when the reason is a burn, not two independent
+   format changes — one invalidation event either way.

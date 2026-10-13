@@ -5,7 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 66;
+// Bumped 64 -> 66 (run abb3b0914e4840428e7505f677e96d78 cycle 3
+// 'warm-cache truth', rm-1385 LEAD + rm-1054, base cab6917): warm
+// loads zeroed `Metrics.timestamps` (the report JSON keeps them
+// serde-skipped), so quota attribution silently degraded from the
+// event-count basis to the span-seconds fallback between a cold and
+// a warm run over the same corpus — the 5h/weekly numbers moved on
+// cache warmth alone. Rung 66 round-trips the stamps as compact
+// unix-millis (`GoMetrics.EventUnixMillis`), so a warm load is
+// byte-equivalent to a cold parse for every quota window. Census at
+// mint: landed ceiling 64 (3e90993 lineage); 65 claimed by the
+// unmerged 7a63e9bb salvage lineage (002ca9a); 66 free. Rung 65 is
+// deliberately burned to keep the ladder monotonic across the
+// fleet. Companion arm rm-1054: dir-scoped scans no longer bank
+// into the operator's default cache (ephemeral lane), which needs
+// no schema change but rides the same invalidation event.
 // Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case
@@ -1033,6 +1048,15 @@ pub struct SessionCache {
     /// `MAX_SCHEMA_INVALIDATION_RECORDS`).
     schema_invalidations: Vec<Value>,
     dirty: bool,
+    /// rm-1054: a dir-scoped scan (`--dir`/`-d`) runs on a throwaway
+    /// lane — the operator's default warm cache is neither loaded nor
+    /// written, so ad-hoc fixture corpora can no longer evict
+    /// real-corpus entries under the entry/byte caps. An explicit
+    /// `AGENTTRACE_SESSION_CACHE_DIR` override opts back into banking
+    /// (the operator pointed the cache somewhere on purpose). Only
+    /// `load_session_cache_for_scan` sets this; `save_session_cache`
+    /// turns it into a no-op before touching the path.
+    ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1227,6 +1251,21 @@ struct GoMetrics {
     session_end: String,
     #[serde(default, rename = "NaiveUtcStamps")]
     naive_utc_stamps: usize,
+    /// rm-1385: the event timestamps round-trip as compact unix
+    /// millis so quota attribution keeps its event-count basis on a
+    /// warm load (schema 66). The report-facing `Metrics.timestamps`
+    /// stays serde-skipped — this carrier exists only for the cache
+    /// journal, stays empty when the parsed session had no stamps
+    /// (lane- or transcript-shaped sessions keep their legacy shape
+    /// byte-for-byte), and reconstructs the exact instants (millis
+    /// precision) so a warm load matches a cold parse for every
+    /// 5h/weekly window boundary.
+    #[serde(
+        default,
+        rename = "EventUnixMillis",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    event_unix_millis: Vec<i64>,
     #[serde(default, rename = "DurationSec")]
     duration_sec: f64,
     #[serde(default, rename = "CostEstimated")]
@@ -1958,6 +1997,25 @@ fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
         mod_time: file_mod_time_nanos(&metadata),
         size: metadata.len() as i64,
     })
+}
+
+/// rm-1054: the scope-aware front door for scan lanes. A
+/// dir-scoped scan never reads or writes the operator's default
+/// cache — it gets a throwaway in-memory lane so fixture corpora and
+/// ad-hoc `--dir` runs cannot evict real-corpus entries under the
+/// entry/byte caps. Setting `AGENTTRACE_SESSION_CACHE_DIR` is an
+/// explicit operator opt-in: the override is honored verbatim
+/// (scoped scans load and bank there, e.g. a corpus-specific cache
+/// directory). Home-scope scans (`dir == None`) are unchanged.
+pub fn load_session_cache_for_scan(dir: Option<&Path>) -> SessionCache {
+    if dir.is_some() && std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").is_none() {
+        SessionCache {
+            ephemeral: true,
+            ..SessionCache::default()
+        }
+    } else {
+        load_session_cache()
+    }
 }
 
 pub fn load_session_cache() -> SessionCache {
@@ -2840,6 +2898,13 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
     if cache.path.as_os_str().is_empty() {
         return Ok(());
     }
+    // rm-1054: the ephemeral lane never reaches the disk — see
+    // `load_session_cache_for_scan`. The path check above stays
+    // first so the default-constructed sentinel keeps its no-op
+    // semantics.
+    if cache.ephemeral {
+        return Ok(());
+    }
     if let Some(parent) = cache.path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -3112,6 +3177,11 @@ impl GoMetrics {
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
             naive_utc_stamps: metrics.naive_utc_stamps,
+            event_unix_millis: metrics
+                .timestamps
+                .iter()
+                .map(|stamp| stamp.timestamp_millis())
+                .collect(),
             duration_sec: metrics.duration_sec,
             cost_estimated: metrics.cost_estimated,
             credit_usd: metrics.credit_usd,
@@ -3155,7 +3225,12 @@ impl GoMetrics {
             tokens_reasoning: self.tokens_reasoning,
             tokens_cache_w: self.tokens_cache_w,
             tokens_cache_r: self.tokens_cache_r,
-            timestamps: Vec::new(),
+            timestamps: self
+                .event_unix_millis
+                .iter()
+                .filter_map(|millis| chrono::DateTime::from_timestamp_millis(*millis))
+                .map(|stamp| stamp.with_timezone(&chrono::Utc))
+                .collect(),
             gaps_sec: self.gaps_sec,
             model_used: self.model_used,
             service_tier: self.service_tier,
@@ -4238,6 +4313,221 @@ mod tests {
         });
         let legacy: GoMetrics = serde_json::from_value(legacy).expect("legacy entry parses");
         assert_eq!(legacy.tokens_reasoning, 0);
+    }
+
+    #[test]
+    fn event_timestamps_survive_the_cache_round_trip_exactly() {
+        // rm-1385: warm loads used to zero `Metrics.timestamps`, so
+        // quota attribution silently degraded from the event-count
+        // basis to the span-seconds fallback between a cold and a
+        // warm run over the same corpus — the 5h/weekly numbers
+        // moved on cache warmth alone. Schema 66 carries the stamps
+        // as compact unix millis and the reconstruction must be
+        // exact to the millisecond so every quota window boundary
+        // behaves identically warm and cold.
+        let t0 = chrono::DateTime::from_timestamp_millis(1_778_800_000_123).unwrap();
+        let t1 = chrono::DateTime::from_timestamp_millis(1_778_800_959_999).unwrap();
+        let t2 = chrono::DateTime::from_timestamp_millis(1_778_803_600_500).unwrap();
+        let metrics = Metrics {
+            timestamps: vec![t0, t1, t2],
+            ..Metrics::default()
+        };
+        let cached = GoMetrics::from_metrics(&metrics);
+        assert_eq!(
+            cached.event_unix_millis,
+            vec![1_778_800_000_123, 1_778_800_959_999, 1_778_803_600_500]
+        );
+        let restored: Metrics = cached.into_metrics();
+        assert_eq!(
+            restored.timestamps, metrics.timestamps,
+            "a warm load must equal a cold parse to the millisecond"
+        );
+
+        // Sessions without stamps keep the field empty: legacy lanes
+        // keep their journal shape byte-for-byte, and pre-rung JSON
+        // (no EventUnixMillis) deserializes to an empty carrier.
+        let empty = GoMetrics::from_metrics(&Metrics::default());
+        assert!(empty.event_unix_millis.is_empty());
+        let legacy: GoMetrics = serde_json::from_value(serde_json::json!({ "TokensInput": 5 }))
+            .expect("legacy entry parses");
+        assert!(legacy.event_unix_millis.is_empty());
+        let legacy_restored: Metrics = legacy.into_metrics();
+        assert!(legacy_restored.timestamps.is_empty());
+    }
+
+    #[test]
+    fn warm_quota_basis_matches_cold_across_the_journal_round_trip() {
+        // rm-1385 acceptance: two identical runs over the same corpus
+        // — one cold (parse), one warm (cache load) — must agree on
+        // the quota attribution basis. The stamps drive
+        // quota_cost_share's event filter (share = events inside the
+        // window / all events); replicating that filter over the
+        // cold and the warm metrics with a boundary that splits the
+        // stamps pins the parity the 5h/weekly report depends on.
+        let _env = crate::test_env::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-quota-parity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("quota-parity.jsonl");
+        fs::write(&file, b"session").expect("write session file");
+        let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let handle = fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open file");
+        handle.set_modified(stamp).expect("set deterministic mtime");
+        drop(handle);
+
+        // Events at 10:00, 11:59:59.999, and 15:00 (sub-second
+        // offsets pin the millis reconstruction — truncation or
+        // re-encoding drift would flip the window membership of at
+        // least one of them).
+        let stamps = [
+            chrono::DateTime::from_timestamp_millis(1_778_800_000_123).unwrap(),
+            chrono::DateTime::from_timestamp_millis(1_778_800_959_999).unwrap(),
+            chrono::DateTime::from_timestamp_millis(1_778_803_600_500).unwrap(),
+        ];
+        let session = Session {
+            name: "quota-parity".to_string(),
+            path: file.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                timestamps: stamps.to_vec(),
+                source_tool: "claude".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        // Point the override at a scratch DIRECTORY before the
+        // first load and keep it for the whole test:
+        // `session_cache_path()` treats the override as a directory
+        // and joins `sessions.json` (pointing it at the file would
+        // make the warm load read a nested, nonexistent path), and a
+        // default-constructed cache is the in-memory sentinel whose
+        // save is a deliberate no-op (empty path) — the scan lanes
+        // resolve the journal by loading, mirroring discovery.rs.
+        let prior_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", root.join("cache"));
+        let mut cache = load_session_cache();
+        store_session(&file, &session, &mut cache).expect("store entry");
+        save_session_cache(&mut cache).expect("save journal");
+
+        let mut warm = load_session_cache();
+        let restored =
+            cached_session(&file, &mut warm).expect("warm load must hit the just-written entry");
+        assert_eq!(
+            restored.metrics.timestamps, session.metrics.timestamps,
+            "warm timestamps must equal the cold parse"
+        );
+
+        // quota_cost_share's filter, replicated with a fixed window
+        // that splits the stamps: cold and warm must agree exactly.
+        let window_start = stamps[1];
+        let window_end = stamps[2];
+        let in_window = |source: &[chrono::DateTime<chrono::Utc>]| {
+            source
+                .iter()
+                .filter(|stamp| **stamp >= window_start && **stamp <= window_end)
+                .count()
+        };
+        let cold = in_window(&session.metrics.timestamps);
+        let warm = in_window(&restored.metrics.timestamps);
+        assert!(cold >= 1, "window must contain at least one cold event");
+        assert_eq!(cold, warm, "basis parity: same events inside the window");
+
+        match prior_cache {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dir_scoped_scan_runs_on_an_ephemeral_cache_lane() {
+        // rm-1054: a scan scoped to an explicit directory must not
+        // bank into the operator's default cache — otherwise fixture
+        // corpora and ad-hoc --dir runs evict real-corpus entries
+        // under the entry/byte caps (and a scoped --doctor run pays a
+        // global 67 MiB read for nothing). The default lane is
+        // pinned by pointing XDG_CACHE_HOME at a throwaway root and
+        // proving nothing lands there.
+        let _env = crate::test_env::lock_env();
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-ephemeral-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(root.join("corpus")).expect("create temp dirs");
+        let file = root.join("corpus").join("scoped.jsonl");
+        fs::write(&file, b"session").expect("write session file");
+        let scoped = root.join("corpus");
+
+        let prior_override = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
+        let prior_xdg = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", &root);
+
+        let mut cache = load_session_cache_for_scan(Some(&scoped));
+        assert!(cache.ephemeral, "scoped scan must take the ephemeral lane");
+        let session = Session {
+            name: "scoped".to_string(),
+            path: file.to_string_lossy().to_string(),
+            cwd: String::new(),
+            branch: String::new(),
+            metrics: Metrics {
+                source_tool: "claude".to_string(),
+                ..Metrics::default()
+            },
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        store_session(&file, &session, &mut cache).expect("store entry");
+        assert!(
+            cache.dirty,
+            "the ephemeral lane still accumulates in memory"
+        );
+        save_session_cache(&mut cache).expect("save is a no-op, not an error");
+        assert!(
+            !root.join("agenttrace").join("sessions.json").exists(),
+            "a scoped scan must not write the default cache"
+        );
+
+        // A home-scope scan with an explicit override keeps the
+        // ordinary lane (opt-in honored, no global file touched
+        // because the override points at a scratch root).
+        let override_dir = root.join("override");
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", &override_dir);
+        let scoped_with_override = load_session_cache_for_scan(Some(&scoped));
+        assert!(
+            !scoped_with_override.ephemeral,
+            "an explicit override opts back into banking"
+        );
+        let home_with_override = load_session_cache_for_scan(None);
+        assert!(
+            !home_with_override.ephemeral,
+            "home scope is never ephemeral"
+        );
+
+        match prior_xdg {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match prior_override {
+            Some(value) => std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", value),
+            None => std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR"),
+        }
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

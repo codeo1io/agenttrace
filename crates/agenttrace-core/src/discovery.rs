@@ -1,6 +1,7 @@
 use crate::session_cache::{
     cached_dir_listing, cached_file_mod_time_if_fresh, cached_session, delete_cached_session,
-    load_session_cache, save_session_cache, store_dir_listing, store_session, SessionCache,
+    load_session_cache_for_scan, save_session_cache, store_dir_listing, store_session,
+    SessionCache,
 };
 use crate::{
     merge_preserved_history, parse_file, preserve_derived_history, skip_sqlite_backed_file_dir,
@@ -333,7 +334,7 @@ pub fn load_sessions_with_progress(
     options: &LoadOptions,
     on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
-    let mut cache = load_session_cache();
+    let mut cache = load_session_cache_for_scan(dir);
     load_sessions_with_progress_from_cache(dir, options, &mut cache, on_progress)
 }
 

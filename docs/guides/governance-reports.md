@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 64 and the SQLite snapshot is schema 12; the
+The session cache is schema 66 and the SQLite snapshot is schema 12; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -416,7 +416,15 @@ number is never repriced, the zero side is disclosed, not resolved;
 minted 60 → 61 at the run's base 82e23b9, below the frontier — this
 tree's landed 62 and 63 rungs — so this integration, conflict case
 8fbcfcfd5e4d440b8e2890456aaacede, re-bases it onto the advanced
-ceiling as 63 → 64, one invalidation either way)
+ceiling as 63 → 64, one invalidation either way), to 66 when event
+timestamps began round-tripping through the journal as compact unix
+millis so quota attribution keeps its event-count basis on a warm
+load instead of silently degrading to the span-seconds fallback
+(run abb3b091 cycle 3, rm-1385 — rung 65 is the unmerged 7a63e9bb
+salvage lineage's mint and stays burned to keep the ladder
+monotonic; the same rung stopped dir-scoped scans from banking into
+the default cache, rm-1054 — the ephemeral lane needs no schema
+change but rides the same invalidation event)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
