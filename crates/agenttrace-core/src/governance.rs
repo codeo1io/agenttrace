@@ -595,7 +595,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             } else {
                 (
                     "catalog_estimate",
-                    "exact normalized model match in pricing catalog",
+                    "exact model match in pricing catalog (raw id or normalized family)",
                 )
             };
             let pricing_note = append_drift_note(
@@ -759,7 +759,7 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
     } else if pricing::has_specific_price(&model) {
         (
             "catalog_estimate",
-            "exact normalized model match in pricing catalog",
+            "exact model match in pricing catalog (raw id or normalized family)",
         )
     } else {
         (

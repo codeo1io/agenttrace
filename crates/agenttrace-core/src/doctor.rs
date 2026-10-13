@@ -1,3 +1,4 @@
+use crate::reports::guard_formula_cell;
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
     load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
@@ -1176,14 +1177,21 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.project_decode.unresolved
     ));
     for sample in &report.project_decode.samples {
-        out.push_str(&format!("    {sample}\n"));
+        // rm-897-family: sample strings are transcript-derived (project
+        // names reverse-decoded from `-`-encoded dirs), so the text lane
+        // routes them through the formula-cell guard; the `-f json` lane
+        // keeps them byte-raw for machines.
+        out.push_str(&format!("    {}\n", guard_formula_cell(sample)));
     }
     out.push_str(&format!(
         "Zero-usage reports: {} session(s), {} event(s) counted as measured zeros (rm-408)\n",
         report.zero_usage.sessions, report.zero_usage.events
     ));
     for sample in &report.zero_usage.samples {
-        out.push_str(&format!("    {sample}\n"));
+        // rm-897-family: same lane truth as project_decode samples —
+        // session names are transcript-derived; guard the text render,
+        // keep the JSON lane raw.
+        out.push_str(&format!("    {}\n", guard_formula_cell(sample)));
     }
     if !report.sqlite_duplicate_dbs.is_empty() {
         out.push_str(&format!(
@@ -1265,7 +1273,11 @@ fn doctor_report_text(report: &DoctorReport) -> String {
             dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
         ));
         for sample in &dir.failure_samples {
-            out.push_str(&format!("    failed: {sample}\n"));
+            // rm-897-family: failure samples interpolate file paths and
+            // parse-failure reasons (paths under provider homes carry
+            // host/project-controlled segments), so the text lane guards
+            // them too; the JSON lane stays byte-raw.
+            out.push_str(&format!("    failed: {}\n", guard_formula_cell(sample)));
         }
     }
     out.push_str("\nRecommendations:\n");
@@ -1850,6 +1862,68 @@ mod shell_quote_tests {
                 "sqlite3 '/tmp/my cache/agent'\\''s data/usage.v3.db' \"pragma integrity_check;\""
             ),
             "rm-858: pasted repair command must quote the interpolated path: {hint}"
+        );
+    }
+
+    #[test]
+    fn doctor_text_sample_lanes_neutralize_formula_introducers() {
+        // rm-897-family: all three sample lanes (project decode,
+        // zero-usage, per-directory failure samples) render through
+        // guard_formula_cell — a transcript-derived `=HYPERLINK(...)`
+        // sample must not reach the text lane raw, while `-f json`
+        // keeps the same sample byte-lossless for machines.
+        let hostile = "=HYPERLINK(\"http://evil\",\"x\")";
+        let mut report = DoctorReport::default();
+        report.project_decode.samples = vec![hostile.to_string()];
+        report.zero_usage.samples = vec![
+            format!("{hostile}: 3 block(s)"),
+            "run-20261014: 2 block(s)".to_string(),
+        ];
+        report.directories = vec![DoctorDirReport {
+            failure_samples: vec![format!("{hostile}.jsonl")],
+            ..DoctorDirReport::default()
+        }];
+        let text = doctor_report_text(&report);
+        assert!(
+            !text.contains(&format!("    {hostile}")),
+            "no raw formula-introducer sample may reach the text lane:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("    '{hostile}")),
+            "the guarded project_decode lane must render the ticked form:\n{text}"
+        );
+        assert!(
+            text.contains("failed: '=HYPERLINK"),
+            "the guarded failure-sample lane must render the ticked form:\n{text}"
+        );
+        // The boundary is introducer-LEADING strings: an inert sample
+        // (no leading =/+/-/@) passes through unchanged — the guard
+        // neutralizes paste hazards, it does not rewrite prose.
+        assert!(
+            text.contains("run-20261014: 2 block(s)"),
+            "inert samples pass through unmodified:\n{text}"
+        );
+        assert!(
+            !text.contains("'run-20261014"),
+            "inert samples must not gain a tick:\n{text}"
+        );
+        // The JSON lane stays byte-lossless (machine contract,
+        // rm-985 lane-truth family).
+        let json = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(
+            json.pointer("/project_decode/samples/0")
+                .and_then(|value| value.as_str()),
+            Some(hostile)
+        );
+        assert_eq!(
+            json.pointer("/zero_usage/samples/0")
+                .and_then(|value| value.as_str()),
+            Some(format!("{hostile}: 3 block(s)").as_str())
+        );
+        assert_eq!(
+            json.pointer("/directories/0/failure_samples/0")
+                .and_then(|value| value.as_str()),
+            Some(format!("{hostile}.jsonl").as_str())
         );
     }
 }

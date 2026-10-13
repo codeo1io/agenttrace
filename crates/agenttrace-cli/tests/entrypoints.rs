@@ -2945,3 +2945,97 @@ fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
         String::from_utf8_lossy(&range.stderr)
     );
 }
+
+#[test]
+fn keyword_host_lanes_refuse_foreign_flags_at_rc2() {
+    // rm-558: the statusline and upstream keyword hosts dispatch before
+    // action validation, so every flag placed with the keyword used to
+    // be parsed and then silently dropped — `--format json statusline`
+    // ran the stdin host with `-f` ignored, `--overview upstream`
+    // printed the drift report while `--overview` evaporated. Each
+    // host has a closed argument set; a foreign flag refuses at rc2
+    // naming the flag and the honored set.
+    let statusline_format = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--format", "json", "statusline"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert_eq!(
+        statusline_format.status.code(),
+        Some(2),
+        "--format json statusline must refuse, not silently drop -f"
+    );
+    let stderr = String::from_utf8_lossy(&statusline_format.stderr);
+    assert!(
+        stderr.contains("refusing instead of silently dropping"),
+        "refusal states its intent: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("--format"),
+        "refusal names the refused flag: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("honors exactly: nothing"),
+        "refusal spells the statusline contract: {stderr:?}"
+    );
+
+    let statusline_report_flag = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "statusline"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert_eq!(
+        statusline_report_flag.status.code(),
+        Some(2),
+        "--overview statusline must refuse (the report was silently swallowed pre-fix)"
+    );
+    assert!(
+        String::from_utf8_lossy(&statusline_report_flag.stderr).contains("--overview"),
+        "refusal names the swallowed report flag"
+    );
+
+    let upstream_flag = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "upstream"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert_eq!(
+        upstream_flag.status.code(),
+        Some(2),
+        "--overview upstream must refuse, not silently drop the flag"
+    );
+    let stderr = String::from_utf8_lossy(&upstream_flag.stderr);
+    assert!(
+        stderr.contains("--overview"),
+        "refusal names the refused flag: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("-f/--format, --fetch, and -o/--output"),
+        "refusal spells the upstream contract: {stderr:?}"
+    );
+
+    // The closed set stays open where it should: `upstream -f json`
+    // is a legitimate invocation and must NOT hit the refusal (it may
+    // still fail for repository reasons offline — any rc but 2 means
+    // dispatch proceeded past the keyword gate).
+    let upstream_allowed = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["-f", "json", "upstream"])
+        .output()
+        .expect("run agenttrace CLI");
+    assert_ne!(
+        upstream_allowed.status.code(),
+        Some(2),
+        "upstream -f json (before the keyword) is inside the closed set and must dispatch: {:?}",
+        String::from_utf8_lossy(&upstream_allowed.stderr)
+    );
+
+    // And the bare keyword is untouched: `statusline` with no stdin
+    // present (closed pipe) still runs the host lane itself.
+    let bare = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["statusline"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run agenttrace CLI");
+    assert_ne!(
+        bare.status.code(),
+        Some(2),
+        "the bare statusline keyword must never hit the refusal"
+    );
+}

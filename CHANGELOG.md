@@ -4,6 +4,58 @@
 
 ### Added
 
+- regional/vendor-qualified SKUs price at their own rows, not the family
+  twin's (rm-1053 + rm-245, run 4cee65a1 cycle 3): LiteLLM's catalog keys are
+  exact lookup ids — `us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0` is a
+  distinct priced SKU at 3.6/18.0 $/M, not a spelling of the base family at
+  3.0/15.0 — but every resolution lane (rate, context window, provider,
+  pricing-source label) normalized first, so exact regional ids collapsed
+  onto the family bucket (assess 2988affd PoC: a 1M-token us-gov session
+  billed $3.30/M input at the au. twin's rate — 9.1% under its own row's
+  $3.60 — and rendered provider `openrouter`, the gateway entry whose rate
+  never ran). The converter now retains every raw id that differs from its
+  normalized key in a separate raw lane (own rates, own providers, no
+  priority dedup), and all four consumers walk one shared exact-first
+  ladder: an exact SKU prices at its own row and attributes from that same
+  row (the rm-245 same-row invariant the pre-fix independent re-normalization
+  broke). Explicit user config still outranks the exact arm (review
+  947cb39d F2): an ALIASES entry keyed on the normalized family prices the
+  qualified id at the alias target (base semantics — `resolve_alias` fires on
+  the normalized spelling), and a pricing-file override keyed on the id's
+  exact spelling is now actually honored — base inserted user rows verbatim
+  but its normalize-first lookup could never reach them, silently billing
+  the family bucket — while only family-keyed override prices stay below the
+  exact arm, so a base-family override can no longer re-price a distinct
+  regional SKU. The cache axis follows the row too: an exact SKU whose row
+  carries no cache rates bills cache operations at its own row's zero, not
+  the family's cache rates. The normalized lane keeps its semantics untouched (deprecation
+  census, list_pricing, catalog-counting goldens), and `catalog_identity_of`
+  covers the raw lane so a snapshot that changes regional rates reprices
+  cached sessions.
+
+- doctor text sample lanes neutralize paste hazards (rm-897-family, run
+  4cee65a1 cycle 3): the doctor text report interpolated project-decode
+  samples, zero-usage session names, and per-directory failure samples raw —
+  all three are transcript-derived (project names reverse-decoded from
+  `-`-encoded dirs; failure samples interpolate host paths), so a session
+  named `=HYPERLINK("http://evil","x")` reached the terminal unguarded
+  (assess 2988affd PoC). All three lanes now render through the same
+  `guard_formula_cell` the report lanes use (leading `=`/`+`/`-`/`@`
+  introducers tick-prefixed); `-f json` keeps samples byte-lossless for
+  machines.
+
+- the statusline and upstream keyword hosts refuse foreign flags at rc2
+  (rm-558, run 4cee65a1 cycle 3): both host lanes dispatch before action
+  validation, so a flag placed with the keyword was parsed and then silently
+  dropped — `agenttrace --format json statusline` ran the stdin host with
+  `-f` ignored and `agenttrace --overview upstream` printed the drift report
+  while `--overview` evaporated. Each host has a closed argument set
+  (statusline: nothing; upstream: `-f/--format`, `--fetch`, `-o/--output`)
+  and a foreign flag now refuses loudly naming the flag, the honored set,
+  and the help route — the same discipline the mcp lane established
+  (rm-781). Flags after the keyword keep refusing through the rm-247/rm-505
+  tail guard.
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
