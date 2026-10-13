@@ -1,7 +1,7 @@
 use crate::{
-    cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
-    SqliteIngestReport, VERSION,
+    cache_dir::user_cache_dir, cached_session, find_session_files, known_session_dirs,
+    load_session_cache, load_sqlite_backed_sessions_reported, parse_file, save_session_cache,
+    store_session, Session, SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -1329,28 +1329,12 @@ fn session_cache_path() -> PathBuf {
     user_cache_dir().join("agenttrace").join("sessions.json")
 }
 
-fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
-    }
-    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
-    // $XDG_CACHE_HOME values; a relative one is treated as unset and
-    // falls through to the HOME-based default instead of scattering a
-    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
-    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
-    // scratch cwd).
-    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
-        if !cache.as_os_str().is_empty() && cache.is_absolute() {
-            return cache;
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".cache");
-    }
-    std::env::temp_dir()
-}
+// Cycle-4 U2 (run 6f281d46): the cache ladder lives in
+// `crate::cache_dir` — one shared resolver for doctor, session_cache,
+// pricing, and statusline. The copy this file carried resolved the
+// macOS `Library/Caches` arm BEFORE an absolute $XDG_CACHE_HOME (so
+// the rm-596 demo sandbox was unsatisfiable on macOS) and joined a
+// set-but-empty HOME into the RELATIVE `.cache` (a CWD-planted cache).
 
 fn decode_cache_entry_header(value: &Value) -> Option<CacheEntryHeader> {
     Some(CacheEntryHeader {

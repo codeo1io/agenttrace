@@ -2062,6 +2062,10 @@ mod tests {
         );
     }
 
+    // E0433 on windows-latest: the chmod-000 probe needs
+    // PermissionsExt, so the whole leg is unix-only (cycle-4 U1;
+    // sibling c63084be rm-993).
+    #[cfg(unix)]
     #[test]
     fn unreadable_permissions_are_disclosed_as_unreadable() {
         // rm-734 fixture class adopted onto the landed rm-753 report
