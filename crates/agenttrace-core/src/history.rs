@@ -57,7 +57,21 @@ pub fn history_path() -> PathBuf {
         // `.local/share` must not silently become the history artifact
         // location the PRIVACY artifact table describes.
         .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        // rm-1374: the HOME fallback gets the same admission the XDG arm
+        // already runs — an empty or relative $HOME is treated as unset
+        // (the spec defines the default as $HOME/.local/share and leaves
+        // it undefined without a usable HOME), so `HOME=` falls through
+        // to the system temp root instead of planting
+        // `.local/share/agenttrace/` under whatever directory the tool
+        // happens to run from. Control-proven at 904f0f3: `HOME= …
+        // --preserve-history` wrote `./.local/share/agenttrace/
+        // history.json` into the cwd.
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| !home.as_os_str().is_empty() && home.is_absolute())
+                .map(|home| home.join(".local/share"))
+        })
         .unwrap_or_else(std::env::temp_dir);
     base.join("agenttrace").join("history.json")
 }
@@ -822,5 +836,36 @@ fn history_path_ignores_relative_xdg_data_home() {
     assert_eq!(
         history_path(),
         std::path::PathBuf::from("/xdg/data/agenttrace/history.json")
+    );
+}
+
+#[test]
+fn history_path_treats_a_broken_home_as_unset() {
+    // rm-1374: an empty or relative $HOME is treated as unset on the
+    // data lane — the history root falls back to the system temp root
+    // instead of planting `.local/share/agenttrace` under the cwd
+    // (control-proven at 904f0f3: `HOME= agenttrace --overview
+    // --preserve-history` wrote ./.local/share/agenttrace/history.json
+    // into the working directory). Table: unset / empty / relative /
+    // absolute. The end-to-end pin over the built binary lives in the
+    // CLI suite (tests/history_home_contract.rs).
+    let _env = crate::test_env::lock_env();
+    std::env::remove_var("AGENTTRACE_HISTORY_DIR");
+    std::env::remove_var("XDG_DATA_HOME");
+
+    let temp_fallback = std::env::temp_dir().join("agenttrace").join("history.json");
+    std::env::remove_var("HOME");
+    assert_eq!(history_path(), temp_fallback);
+
+    std::env::set_var("HOME", "");
+    assert_eq!(history_path(), temp_fallback);
+
+    std::env::set_var("HOME", "relative-home");
+    assert_eq!(history_path(), temp_fallback);
+
+    std::env::set_var("HOME", "/home/agenttrace-rm1374");
+    assert_eq!(
+        history_path(),
+        std::path::PathBuf::from("/home/agenttrace-rm1374/.local/share/agenttrace/history.json")
     );
 }

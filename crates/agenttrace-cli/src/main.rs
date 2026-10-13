@@ -704,6 +704,14 @@ fn run() -> anyhow::Result<()> {
                 Some(&args.lang),
             );
         }
+        // rm-1012 rider (the rm-608 residual admission validate_explicit_dir
+        // used to carry): the TUI launch path consumed `-d` without the
+        // admission check the report, doctor, and mcp lanes run —
+        // `agenttrace -d /nonexistent` opened an empty TUI with rc0
+        // instead of the rc2 refusal `--doctor -d` already gives. Same
+        // helper, same exit code, same wording, so every `-d` consumer
+        // admits the explicit directory the same way.
+        validate_explicit_dir(args.dir.as_deref());
         return agenttrace_tui::run_with_language(
             args.dir.as_deref().unwrap_or(""),
             Some(&args.lang),
@@ -1819,8 +1827,9 @@ fn reject_demo_source_conflict(args: &Args) -> anyhow::Result<()> {
 /// files found in …" error as a genuinely empty directory — the two
 /// need different messages and different exit codes (2 = the request
 /// itself is wrong; 1 = nothing matched). `--doctor` previously
-/// skipped this entirely. The TUI launch path still consumes `-d`
-/// without this guard (rm-608 review residual; next-cycle rider).
+/// skipped this entirely, and the TUI launch path consumed `-d`
+/// without this guard until the rm-1012 rider closed that residual —
+/// every `-d` consumer now runs it.
 fn validate_explicit_dir(dir_arg: Option<&str>) {
     let Some(dir) = dir_arg else {
         return;
