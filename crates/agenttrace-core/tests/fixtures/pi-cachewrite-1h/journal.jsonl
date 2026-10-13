@@ -1,0 +1,4 @@
+{"id":"s-cw1h","timestamp":"2026-10-12T10:00:00Z","type":"session","version":3,"cwd":"/tmp","titleSource":"user"}
+{"timestamp":"2026-10-12T10:00:01Z","type":"model_change","model":"claude-sonnet-4-5"}
+{"timestamp":"2026-10-12T10:00:02Z","type":"message","message":{"role":"user","content":"hi"}}
+{"timestamp":"2026-10-12T10:00:05Z","type":"message","message":{"role":"assistant","usage":{"input":100,"output":50,"cacheWrite":200,"cacheWrite1h":300},"content":[{"type":"text","text":"yo"}]}}

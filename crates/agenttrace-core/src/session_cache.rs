@@ -5,7 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 60;
+// v61 (2026-10-12, run 90514a38 cycle 4, rm-1052 + rm-499): pi
+// recorded-zero disclosure + the cacheWrite1h class. A recorded $0
+// block — gateway unpriced passthrough — used to masquerade as a free
+// session while silently suppressing the catalog estimate; warm v60
+// entries keep serving the silent $0 and lack the 1h-tier cache-write
+// class, so every entry written before this integration regenerates
+// once (one invalidation either way per the c7c07e48/58fbbd6c
+// convention).
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 61;
 // Bumped 59 -> 60 (integration of run e486dc1adb9b cycle 2 'pi journal
 // accounting truth, part 2', conflict case 38b020c7f8f1463fb56f21772d627068,
 // candidate d9b3333 @ base 1511547): the batch's two units both change

@@ -1872,6 +1872,76 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     let mut model_attribution: BTreeMap<String, ModelAttribution> = BTreeMap::new();
     // rm-610: one model on several tiers prices per usage block too —
     // same per-block arm, tier-aware rates (see the loop below).
+    // rm-1052: recorded-wins must not be silent, in EITHER pricing arm.
+    // The recorded guard admits a well-formed 0.0 — at the wire, a
+    // gateway passthrough that never priced the call is
+    // indistinguishable from a subscription flat rate — so before the
+    // per-block/session-rate split, every recorded-cost block gets its
+    // suppressed catalog estimate computed and disclosed:
+    // `recorded_cost_suppressed_estimate_cents` carries the suppressed
+    // amount (cents), `recorded_cost_zero_blocks` counts
+    // gateway-unpriced blocks (recorded $0 on priced tokens). The
+    // recorded number stays authoritative (the rm-419 discipline) —
+    // disclosure, never repricing — mirroring rm-984's
+    // recorded-vs-estimated stance for the Cursor lane onto every
+    // recorded-cost arm.
+    for event in events.iter().filter(|event| {
+        event
+            .recorded_cost_usd
+            .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+    }) {
+        let recorded = event.recorded_cost_usd.unwrap_or(0.0);
+        let suppressed_price = if event.model_used.is_empty() || event.model_used == "unknown" {
+            // F5 (review 37f970af): price unattributed blocks at the
+            // same tier-aware session rate the session-rate arm bills
+            // at (catalog_price, rm-610) — never the untiered row, so
+            // the suppressed estimate cannot understate a single-tier
+            // session's real catalog price.
+            catalog_price.clone()
+        } else {
+            // rm-610: mirror the tier the turn actually ran on.
+            pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
+        };
+        let suppressed_estimate =
+            event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64 / 1e6
+                * suppressed_price.input
+                + event
+                    .usage
+                    .get("output_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as f64
+                    / 1e6
+                    * suppressed_price.output
+                + event
+                    .usage
+                    .get("cache_creation_input_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as f64
+                    / 1e6
+                    * suppressed_price.cw
+                + event
+                    .usage
+                    .get("cache_read_input_tokens")
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as f64
+                    / 1e6
+                    * suppressed_price.cr;
+        if suppressed_estimate - recorded > 0.005 {
+            *metrics
+                .disclosure_counters
+                .entry("recorded_cost_suppressed_estimate_cents".to_string())
+                .or_insert(0) += (round4(suppressed_estimate - recorded) * 100.0).round() as usize;
+            if recorded == 0.0 {
+                *metrics
+                    .disclosure_counters
+                    .entry("recorded_cost_zero_blocks".to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
     let token_priced = if usage_blocks_multi_model || usage_blocks_multi_tier {
         // Recorded costs were accumulated into upstream_cost_usd above;
         // start from them and add per-block catalog pricing for the rest.

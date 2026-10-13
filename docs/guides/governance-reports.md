@@ -102,7 +102,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 60 and the SQLite snapshot is schema 11; the
+The session cache is schema 61 and the SQLite snapshot is schema 11; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -383,7 +383,12 @@ present-but-zero pi usage block emits its measured zeros into
 e486dc1adb9b cycle 2, rm-253 + the rm-408 pi residual; minted 24 → 25
 at the run's base 1511547 and re-based at integration onto the
 advanced ceiling as 59 → 60, one invalidation either way, conflict
-case 38b020c7f8f1463fb56f21772d627068)
+case 38b020c7f8f1463fb56f21772d627068), and to 61 when pi's 1h-tier
+cache writes gained their own usage class and recorded-zero cost
+blocks began disclosing the catalog estimate they suppress (run
+90514a3833d04721a6a3ca40ea695423 cycle 4, rm-1052 + rm-499; the
+recorded number is never repriced — the zero side is disclosed, not
+resolved)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

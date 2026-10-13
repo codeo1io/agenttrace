@@ -2464,6 +2464,14 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                 // compaction and branch_summary stay separable.
                 let usage = oh_my_pi_usage(obj.get("usage"));
                 let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"));
+                if usage
+                    .as_ref()
+                    .is_some_and(|u| u.contains_key("cache_write_1h_tokens"))
+                {
+                    *counters
+                        .entry("pi_cache_write_1h_blocks".to_string())
+                        .or_insert(0) += 1;
+                }
                 if usage.is_some() || recorded_cost_usd.is_some() {
                     *counters
                         .entry(disclosure_key("pi_compaction_usage_counted", typ))
@@ -2502,6 +2510,18 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                     .unwrap_or_else(|| model.clone());
                 let usage = oh_my_pi_usage(obj.get("usage"));
                 let recorded_cost_usd = oh_my_pi_recorded_cost_usd(obj.get("usage"));
+                // F3 (review 37f970af): this standalone arm is the
+                // THIRD oh_my_pi_usage call site — count its 1h-tier
+                // blocks exactly like the message and compaction arms
+                // (rm-499), so no arm can carry cacheWrite1h silently.
+                if usage
+                    .as_ref()
+                    .is_some_and(|u| u.contains_key("cache_write_1h_tokens"))
+                {
+                    *counters
+                        .entry("pi_cache_write_1h_blocks".to_string())
+                        .or_insert(0) += 1;
+                }
                 // F-C (review 06e542d5): an entry whose usage block
                 // carries no token class at all can still record a
                 // real upstream cost — emit the meta event whenever
@@ -2730,6 +2750,14 @@ fn oh_my_pi_message_events(
     // face value instead of the catalog rate.
     let usage = oh_my_pi_usage(message.get("usage"));
     let recorded_cost_usd = oh_my_pi_recorded_cost_usd(message.get("usage"));
+    if usage
+        .as_ref()
+        .is_some_and(|u| u.contains_key("cache_write_1h_tokens"))
+    {
+        *counters
+            .entry("pi_cache_write_1h_blocks".to_string())
+            .or_insert(0) += 1;
+    }
     if usage.is_some() || recorded_cost_usd.is_some() {
         events.push(Event {
             role: "meta".to_string(),
@@ -2879,6 +2907,15 @@ fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     let output = first_present(obj, &["output", "output_tokens"]);
     let cache_read = first_present(obj, &["cacheRead", "cache_read_input_tokens"]);
     let cache_write = first_present(obj, &["cacheWrite", "cache_creation_input_tokens"]);
+    // rm-499: pi writes the 1h-tier cache-write under `cacheWrite1h`
+    // (77% of the live fleet corpus carries it). It is a distinct TTL
+    // tier, not a re-keying of the 5m cache write, so it gets its OWN
+    // canonical class — folding it into `cache_creation_input_tokens`
+    // would let a future pricing arm bill it at the 5m rate. Pricing
+    // stays gated (no catalog rate is consumed for this class);
+    // recognition plus the `pi_cache_write_1h_blocks` parse counter are
+    // the disclosure.
+    let cache_write_1h = first_present(obj, &["cacheWrite1h", "cache_write_1h_input_tokens"]);
     // rm-408 residual (pi arm): insert every RECOGNIZED class, zeros
     // included — the claude-family contract (usage_from_value_with
     // _keys) inserts a class whenever a wire key yields a number. The
@@ -2903,6 +2940,9 @@ fn oh_my_pi_usage(raw: Option<&Value>) -> Option<BTreeMap<String, i64>> {
     }
     if recognized(&["cacheWrite", "cache_creation_input_tokens"]) {
         usage.insert("cache_creation_input_tokens".to_string(), cache_write);
+    }
+    if recognized(&["cacheWrite1h", "cache_write_1h_input_tokens"]) {
+        usage.insert("cache_write_1h_tokens".to_string(), cache_write_1h);
     }
     // A PRESENT block whose recognized classes are all zero surfaces
     // as measured zeros — the event emits and lib's zero_usage_events
@@ -10658,4 +10698,27 @@ fn number_as_i64_counts_magnitude_clamps_on_the_disclosure_census() {
         Some(9_007_199_254_740_993i64)
     );
     assert_eq!(take_magnitude_clamp_count(), 0);
+}
+
+// rm-499: the 1h-tier cache write is a distinct canonical class —
+// never folded into the 5m cache write (a fold would let a future
+// pricing arm bill it at the 5m rate). Both wire spellings
+// (`cacheWrite1h`, `cache_write_1h_input_tokens`) resolve to it.
+#[test]
+fn oh_my_pi_usage_cache_write_1h_is_own_class() {
+    let value = serde_json::json!({
+        "input": 100,
+        "output": 50,
+        "cacheWrite": 200,
+        "cacheWrite1h": 300
+    });
+    let usage = oh_my_pi_usage(Some(&value)).expect("hybrid block yields usage");
+    assert_eq!(usage.get("input_tokens"), Some(&100));
+    assert_eq!(usage.get("cache_creation_input_tokens"), Some(&200));
+    assert_eq!(usage.get("cache_write_1h_tokens"), Some(&300));
+
+    let snake = serde_json::json!({ "cache_write_1h_input_tokens": 7 });
+    let usage = oh_my_pi_usage(Some(&snake)).expect("snake alias yields usage");
+    assert_eq!(usage.get("cache_write_1h_tokens"), Some(&7));
+    assert!(!usage.contains_key("cache_creation_input_tokens"));
 }
