@@ -62,8 +62,27 @@ fi
 # mid-range merged tags could stay sectionless forever (v0.8.1 shipped
 # that way: heading jump v0.9.0 -> v0.7.1). Lineage-scoped and
 # no-tag-fallback like the anchor above.
+#
+# rm-1071: the arm is FORK-SCOPED by the changelog release floor — the
+# oldest `## v` heading (v0.4.0 today). Merged semver tags BELOW the
+# floor are inherited upstream lineage (v0.0.4 and v0.3.0..v0.3.48 —
+# 49 tags from the pre-fork history), released by upstream's own
+# process and never covered by this changelog: they are skipped. Tags
+# at or above the floor are THIS repository's releases and must carry
+# a section or marker. The floor is read from the CHANGELOG itself, so
+# the verdict depends on neither which remotes a clone fetched nor
+# whether packed-refs consolidation made more inherited tags visible:
+# the same commit must give the same verdict everywhere (2026-10-12:
+# this gate flipped green->red on an identical tree when packed-refs
+# consolidation surfaced the inherited tags to the unscoped arm).
+fork_floor="$(grep -oE '^## v[0-9]+\.[0-9]+\.[0-9]+' "$changelog" | sed 's/^## v//' | sort -V | head -1 || true)"
 while IFS= read -r tag; do
   [[ -n "$tag" ]] || continue
+  tag_version="${tag#v}"
+  if [[ -n "$fork_floor" ]] && [[ "$tag_version" != "$fork_floor" ]] \
+     && [[ "$(printf '%s\n%s\n' "$fork_floor" "$tag_version" | sort -V | head -1)" == "$tag_version" ]]; then
+    continue  # below the fork's changelog floor: inherited upstream lineage
+  fi
   escaped_tag=${tag//./\\.}
   if grep -qE "^## ${escaped_tag}( |$)" "$changelog"; then
     continue
@@ -71,7 +90,7 @@ while IFS= read -r tag; do
   if grep -qF "<!-- no-changelog-section: $tag:" "$changelog"; then
     continue
   fi
-  fail "merged tag $tag has no CHANGELOG section: add a '## $tag' heading or an explicit '<!-- no-changelog-section: $tag: reason -->' marker"
+  fail "merged tag $tag has no CHANGELOG section: add a '## $tag' heading or an explicit '<!-- no-changelog-section: $tag: reason -->' marker (inherited upstream tags below the changelog floor v$fork_floor are out of scope)"
 done < <(git -C "$root" tag --merged HEAD 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
 
 # Asset integrity: every string value in the manifest that looks like a

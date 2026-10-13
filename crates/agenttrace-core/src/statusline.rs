@@ -19,7 +19,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -1011,17 +1011,34 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
             })
         });
     let mut context_windows: Vec<StatuslineSessionContextWindow> = Vec::new();
-    let mut context_seen: HashSet<String> = HashSet::new();
-    for capture in deduped.iter().rev() {
+    // rm-1074: rank the per-session picks by (captured_at, journal
+    // position) — the rm-955 discipline — so an out-of-order journal
+    // (clock skew, an older journal merged in) cannot surface a
+    // stale-by-clock context window as a session's current state.
+    // The emit pass walks the journal in reverse so the output order
+    // (newest session first) is identical to the position-only pick
+    // on an in-order journal.
+    let mut context_rank: HashMap<&str, (i64, usize)> = HashMap::new();
+    for (position, capture) in deduped.iter().enumerate() {
+        if capture.context_window().is_none() {
+            continue;
+        }
+        let rank = (capture.captured_at, position);
+        context_rank
+            .entry(capture.session_id().unwrap_or("(unknown)"))
+            .and_modify(|current| *current = (*current).max(rank))
+            .or_insert(rank);
+    }
+    for (position, capture) in deduped.iter().enumerate().rev() {
         let Some(window) = capture.context_window() else {
             continue;
         };
-        let session_id = capture.session_id().unwrap_or("(unknown)").to_string();
-        if !context_seen.insert(session_id.clone()) {
+        let session_id = capture.session_id().unwrap_or("(unknown)");
+        if context_rank.get(session_id) != Some(&(capture.captured_at, position)) {
             continue;
         }
         context_windows.push(StatuslineSessionContextWindow {
-            session_id,
+            session_id: session_id.to_string(),
             used_percentage: window.used_percentage,
             remaining_percentage: window.remaining_percentage,
             current_usage: window.current_usage,
@@ -1029,19 +1046,32 @@ pub fn statusline_insights(captures: &[CapturedStatusline]) -> StatuslineInsight
     }
 
     // rm-708: latest prompt correlation key per session, newest
-    // session first, mirroring `session_caches`.
+    // session first, mirroring `session_caches`. rm-1074: ranked by
+    // the same (captured_at, journal position) composite as the
+    // context-window arm above — the position-only pick was the
+    // rm-955 defect class for prompt ids too.
     let mut prompt_ids: Vec<StatuslineSessionPrompt> = Vec::new();
-    let mut prompt_seen: HashSet<String> = HashSet::new();
-    for capture in deduped.iter().rev() {
+    let mut prompt_rank: HashMap<&str, (i64, usize)> = HashMap::new();
+    for (position, capture) in deduped.iter().enumerate() {
+        if capture.prompt_id().is_none() {
+            continue;
+        }
+        let rank = (capture.captured_at, position);
+        prompt_rank
+            .entry(capture.session_id().unwrap_or("(unknown)"))
+            .and_modify(|current| *current = (*current).max(rank))
+            .or_insert(rank);
+    }
+    for (position, capture) in deduped.iter().enumerate().rev() {
         let Some(prompt_id) = capture.prompt_id() else {
             continue;
         };
-        let session_id = capture.session_id().unwrap_or("(unknown)").to_string();
-        if !prompt_seen.insert(session_id.clone()) {
+        let session_id = capture.session_id().unwrap_or("(unknown)");
+        if prompt_rank.get(session_id) != Some(&(capture.captured_at, position)) {
             continue;
         }
         prompt_ids.push(StatuslineSessionPrompt {
-            session_id,
+            session_id: session_id.to_string(),
             prompt_id: prompt_id.to_string(),
         });
     }
@@ -2884,7 +2914,12 @@ mod tests {
         // captured_at — so the exact out-of-order journal those probes
         // defend (clock skew, an older journal merged in) reported a
         // stale-by-clock window as current. The pick now ranks by
-        // (captured_at, journal position), the crossings discipline:
+        // (captured_at, journal position), the crossings discipline
+        // (rm-1074: every latest-state pick site in this module now
+        // ranks by it — the three-window state, the spend cap, the
+        // session caches, the per-session context windows, the prompt
+        // ids; the last two gained it in
+        // out_of_order_journal_picks_latest_context_and_prompt_by_captured_at)
         // here the journal's LAST capture carries the OLDER clock, and
         // the fresh-clock capture must still win both windows.
         let mut stale_clock_last_position = capture_at(FIXTURE, 1_760_000_100);
@@ -2904,6 +2939,47 @@ mod tests {
             insights.seven_day.and_then(|state| state.used_percentage),
             Some(46.0),
             "the greatest captured_at wins seven_day regardless of journal position"
+        );
+    }
+
+    #[test]
+    fn out_of_order_journal_picks_latest_context_and_prompt_by_captured_at() {
+        // rm-1074: the per-session context-window and prompt-id picks
+        // had the same position-only defect the rm-955 test above
+        // fixed for the rate-limit windows. Here sess-a's LATER
+        // journal position carries the OLDER clock — the fresh-clock
+        // capture must win both its window and its prompt id, sess-b
+        // (in order) is untouched, and the emit order stays
+        // newest-session-first by chosen position.
+        let mut fresh_clock_first = capture_at(FIXTURE, 1_760_090_000);
+        fresh_clock_first.payload["session_id"] = serde_json::json!("sess-a");
+        fresh_clock_first.payload["prompt_id"] = serde_json::json!("pid-a-fresh");
+        let mut other_session = capture_at(FIXTURE, 1_760_050_000);
+        other_session.payload["session_id"] = serde_json::json!("sess-b");
+        other_session.payload["context_window"]["used_percentage"] = serde_json::json!(55.0);
+        other_session.payload["prompt_id"] = serde_json::json!("pid-b");
+        let mut stale_clock_last = capture_at(FIXTURE, 1_760_000_100);
+        stale_clock_last.payload["session_id"] = serde_json::json!("sess-a");
+        stale_clock_last.payload["context_window"]["used_percentage"] = serde_json::json!(91.0);
+        stale_clock_last.payload["prompt_id"] = serde_json::json!("pid-a-stale");
+        let insights = statusline_insights(&[fresh_clock_first, other_session, stale_clock_last]);
+        assert_eq!(
+            insights
+                .context_windows
+                .iter()
+                .map(|w| (w.session_id.as_str(), w.used_percentage))
+                .collect::<Vec<_>>(),
+            vec![("sess-b", Some(55.0)), ("sess-a", Some(41.2))],
+            "the greatest captured_at wins the session's window regardless of journal position"
+        );
+        assert_eq!(
+            insights
+                .prompt_ids
+                .iter()
+                .map(|p| (p.session_id.as_str(), p.prompt_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("sess-b", "pid-b"), ("sess-a", "pid-a-fresh")],
+            "the greatest captured_at wins the session's prompt id regardless of journal position"
         );
     }
 
