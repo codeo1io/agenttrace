@@ -26,6 +26,14 @@ fail() {
 
 sh -n install.sh || fail "install.sh must remain valid POSIX sh"
 
+# rm-1016: never hardcode the installer's default pin here — derive it
+# from install.sh itself (the same extraction check-install-ref-drift.sh
+# uses), so bumping the pin (v0.9.0 → v0.10.1 → …) cannot redden this
+# gate while install.sh moves ahead.
+default_ref="$(grep -m1 -oE 'AGENTTRACE_SOURCE_REF:-[^}"]+' install.sh | head -1 | sed 's/.*:-//')"
+[ -n "$default_ref" ] ||
+	fail "cannot derive the default pinned ref from install.sh's REF= line (rm-1016)"
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -110,9 +118,9 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
-# The ref is the installer's pinned default (v0.9.0, rm-051) or whatever
-# AGENTTRACE_SOURCE_REF names, so the fallback never has to resolve
-# api.github.com in an offline run.
+# The ref is the installer's pinned default (derived from install.sh
+# above, rm-1016) or whatever AGENTTRACE_SOURCE_REF names, so the
+# fallback never has to resolve api.github.com in an offline run.
 shims="$tmp/shims"
 mkdir -p "$shims"
 cat >"$shims/git" <<FAKE_GIT
@@ -149,8 +157,8 @@ grep -q "pinned ref" "$out" ||
 	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
-grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
-	fail "test D: install receipt must record the default pinned ref (rm-051)"
+grep -q "^ref=$default_ref$" "$tmp/d-receipt" ||
+	fail "test D: install receipt must record the default pinned ref derived from install.sh ($default_ref; rm-051/rm-1016)"
 
 # — test E: the fallback clones a PINNED ref, never a moving default
 #   branch (rm-051) — this fake git refuses an unpinned clone and
@@ -194,9 +202,9 @@ if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
 	cat "$out" >&2
 	fail "test E: pinned source build must succeed"
 fi
-grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
-	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
-grep -q "pinned ref v0.9.0" "$out" ||
+grep -q "^clone --branch $default_ref$" "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch $default_ref (the pinned default ref)"
+grep -q "pinned ref $default_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"

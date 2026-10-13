@@ -2063,6 +2063,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unreadable_permissions_are_disclosed_as_unreadable() {
         // rm-734 fixture class adopted onto the landed rm-753 report
         // channel: a chmod-000 database is found-but-unreadable, not

@@ -186,7 +186,11 @@ jobs:
               else
                 echo "conformance gate: gated surface untouched — pack still runs (guards silent token drift)"
               fi
-              echo "$CHANGED" | sed 's/^/  changed: /'
+              # SC2001-clean prefixing (no sed): one "  changed:" line
+              # per path, byte-identical to the old sed pipeline.
+              while IFS= read -r changed_line; do
+                echo "  changed: $changed_line"
+              done <<<"$CHANGED"
             else
               echo "conformance gate: diff unavailable on this shallow checkout — pack runs unconditionally"
             fi
