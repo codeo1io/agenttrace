@@ -386,13 +386,18 @@ pub(super) fn status_width(width: u16) -> usize {
 /// the landed slice); the TUI applies the same predicate at its
 /// width-shaping helpers (`short`/`pad_display_width`) and the raw
 /// render sites, so every untrusted string that reaches a cell passes
-/// here. The set is deliberately the DIRECTIONAL subset — zero-width,
-/// so width math is unchanged; the non-directional Cf widening
-/// (U+FEFF & friends) is this row's still-open arm.
+/// here. rm-933 (slice 3): the set is now the full spoofing union
+/// ([`agenttrace_core::is_spoofing_format_control`]) — directional
+/// controls reordering text AND the invisible zero-width family
+/// (U+FEFF/U+2060/U+180E plus the plane-14 tag block U+E0000–U+E007F,
+/// added by the review-6f85e2c9 F1 fix) that hides payload in zero
+/// columns. Every member is zero-width, so width math is unchanged; the
+/// functional zero-width joiner family and soft hyphen stay
+/// visible-legitimate.
 pub(super) fn sanitize_display(value: &str) -> String {
     value
         .chars()
-        .filter(|ch| !agenttrace_core::is_bidi_format_control(*ch))
+        .filter(|ch| !agenttrace_core::is_spoofing_format_control(*ch))
         .collect()
 }
 
@@ -438,8 +443,18 @@ pub(super) fn pad_display_width(value: &str, width: usize) -> String {
     out
 }
 
+/// rm-933 (slice 3, review-6f85e2c9 F2): the ASCII-fallback report
+/// renderer composes the same spoofing union — directional and
+/// invisible controls (tag block included) are DROPPED, matching
+/// [`sanitize_display`]'s width-neutral contract (they render as
+/// nothing, so removal is the faithful rendering); box-drawing and
+/// dashes still fold to ASCII so narrow terminals keep the layout.
+/// Without this, a transcript-derived RLO or tag char reached the
+/// terminal raw through the fallback path even after slice-3's
+/// export-lane widening.
 pub(super) fn terminal_safe_report(text: &str) -> String {
     text.chars()
+        .filter(|ch| !agenttrace_core::is_spoofing_format_control(*ch))
         .map(|ch| match ch {
             '\n' | '\t' => ch,
             '━' | '─' | '═' | '—' | '–' => '-',
@@ -493,6 +508,43 @@ mod sanitize_tests {
             unicode_width::UnicodeWidthStr::width(sanitize_display(hostile).as_str()),
             unicode_width::UnicodeWidthStr::width(hostile)
         );
+    }
+
+    #[test]
+    fn sanitize_display_strips_invisible_and_tag_cf() {
+        // rm-933 slice 3 + review-6f85e2c9 F1: the invisible family and
+        // the plane-14 tag block ride the same display-boundary filter.
+        // U+E0080 (VS17, Mn — the Variation Selectors Supplement sharing
+        // plane 14) is functional orthography and must survive.
+        for ch in [
+            '\u{FEFF}',
+            '\u{2060}',
+            '\u{180E}',
+            '\u{E0000}',
+            '\u{E0001}',
+            '\u{E007F}',
+        ] {
+            let hostile = format!("a{ch}b");
+            assert_eq!(
+                sanitize_display(&hostile),
+                "ab",
+                "U+{:X} must be stripped",
+                ch as u32
+            );
+        }
+        let honest = "a\u{E0080}b\u{00AD}c";
+        assert_eq!(sanitize_display(honest), honest);
+    }
+
+    #[test]
+    fn terminal_safe_report_drops_the_spoofing_union() {
+        // review-6f85e2c9 F2: the ASCII fallback must not be the one
+        // lane where hostile Cf reaches the terminal raw — the union
+        // drops (zero-width renders as nothing) while the box-drawing
+        // fold and layout bytes keep working.
+        let hostile = "a\u{202E}b\u{FEFF}c\u{E0001}d━│";
+        assert_eq!(terminal_safe_report(hostile), "abcd-|");
+        assert_eq!(terminal_safe_report("x\n\ty"), "x\n\ty");
     }
 
     #[test]

@@ -1575,7 +1575,14 @@ pub(super) fn project_resolution_line(app: &App) -> String {
             } else {
                 short_path(&project.root, 56)
             };
-            format!("{} [{}] {root}", project.display_name, project.resolution)
+            format!(
+                "{} [{}] {root}",
+                // rm-933 (review-6f85e2c9 F2): display_name is cwd-
+                // derived (resolve_project Opaque arm) and rendered raw
+                // at :375/:1157-1160 — sanitize at the format site.
+                sanitize_display(&project.display_name),
+                project.resolution
+            )
         },
     );
     format!(
