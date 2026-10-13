@@ -29,6 +29,24 @@ sh -n install.sh || fail "install.sh must remain valid POSIX sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# rm-994-batch unit D: the expected pinned ref is DERIVED from
+# install.sh itself (single source of truth, rm-051) — the only
+# `REF=` assignment in the installer is the AGENTTRACE_SOURCE_REF
+# fallback near the top. A hardcoded expectation here already drifted
+# once (the gate expected v0.9.0 while install.sh pinned v0.10.1,
+# turning the Install runtime verification job red for 16 straight
+# runs); deriving keeps the gate honest through every future release
+# bump. The shape check below doubles as a canary: if install.sh ever
+# renames the variable or the override plumbing, this fails loudly
+# instead of silently testing the wrong ref.
+# The single quotes are deliberate: the sed program must MATCH the
+# literal ${AGENTTRACE_SOURCE_REF:-...} text, not expand it
+# (release.yml:175 idiom).
+# shellcheck disable=SC2016
+default_ref="$(sed -n 's/^REF="${AGENTTRACE_SOURCE_REF:-\([^"]*\)}"$/\1/p' install.sh)"
+[ -n "$default_ref" ] ||
+	fail "cannot derive the default pinned ref from install.sh (did the REF= line change shape?)"
+
 # — fixtures —
 ok_stub="$tmp/ok-stub"
 {
@@ -110,9 +128,10 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
-# The ref is the installer's pinned default (v0.9.0, rm-051) or whatever
-# AGENTTRACE_SOURCE_REF names, so the fallback never has to resolve
-# api.github.com in an offline run.
+# The ref is the installer's pinned default ($default_ref, derived
+# above from install.sh, rm-051) or whatever AGENTTRACE_SOURCE_REF
+# names, so the fallback never has to resolve api.github.com in an
+# offline run.
 shims="$tmp/shims"
 mkdir -p "$shims"
 cat >"$shims/git" <<FAKE_GIT
@@ -149,7 +168,7 @@ grep -q "pinned ref" "$out" ||
 	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
-grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
+grep -q "^ref=$default_ref\$" "$tmp/d-receipt" ||
 	fail "test D: install receipt must record the default pinned ref (rm-051)"
 
 # — test E: the fallback clones a PINNED ref, never a moving default
@@ -194,9 +213,9 @@ if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
 	cat "$out" >&2
 	fail "test E: pinned source build must succeed"
 fi
-grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
-	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
-grep -q "pinned ref v0.9.0" "$out" ||
+grep -q "^clone --branch $default_ref\$" "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch $default_ref (the pinned default ref)"
+grep -q "pinned ref $default_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"

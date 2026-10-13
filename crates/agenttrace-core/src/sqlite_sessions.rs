@@ -2063,6 +2063,12 @@ mod tests {
     }
 
     #[test]
+    // rm-993: the chmod-000 probe is Unix-only by nature and its
+    // std::os::unix PermissionsExt import does not exist on
+    // windows-latest (E0433 broke the core-test compile for 16 CI
+    // runs) — gate the whole test, same as the history.rs owner-only
+    // leg.
+    #[cfg(unix)]
     fn unreadable_permissions_are_disclosed_as_unreadable() {
         // rm-734 fixture class adopted onto the landed rm-753 report
         // channel: a chmod-000 database is found-but-unreadable, not

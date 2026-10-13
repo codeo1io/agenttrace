@@ -186,7 +186,15 @@ jobs:
               else
                 echo "conformance gate: gated surface untouched — pack still runs (guards silent token drift)"
               fi
-              echo "$CHANGED" | sed 's/^/  changed: /'
+              # rm-997: printf loop instead of `echo | sed` (shellcheck
+              # SC2001 in the Lint workflows job, landed 599319a).
+              # `printf '%s\n' "$CHANGED"` re-emits each diff line
+              # verbatim, so the output stays byte-identical to the sed
+              # form (empty-diff and spaces-in-path edges included).
+              printf '%s\n' "$CHANGED" |
+                while IFS= read -r changed_line; do
+                  printf '  changed: %s\n' "$changed_line"
+                done
             else
               echo "conformance gate: diff unavailable on this shallow checkout — pack runs unconditionally"
             fi

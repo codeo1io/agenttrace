@@ -46,7 +46,23 @@ require_json() {
 [[ -d "$source_dir" ]] || fail "real sessions directory does not exist: $source_dir"
 
 rm -rf "$out_dir"
+# rm-996: this directory receives COPIES of the operator's real
+# session transcripts and its default home is /tmp, traversable by
+# every local account. mkdir alone follows the caller's umask (0755
+# observed live on a leftover snapshot dir), so the mode is set
+# explicitly and asserted before the first transcript copy lands. An
+# AGENTTRACE_REAL_CLI_OUT override path gets the same owner-only
+# guarantee; only its LIFECYCLE stays with the caller — the
+# script-chosen /tmp default is trap-cleaned on exit so transcript
+# copies never linger after the run.
 mkdir -p "$out_dir"
+chmod 0700 "$out_dir"
+if [ -n "$(find "$out_dir" -maxdepth 0 -perm /077 -print)" ]; then
+  fail "smoke out_dir must be owner-only at creation: $out_dir"
+fi
+if [ -z "${AGENTTRACE_REAL_CLI_OUT:-}" ]; then
+  trap 'rm -rf -- "$out_dir"' EXIT
+fi
 
 snapshot_dir="$out_dir/real-session-snapshot"
 mkdir -p "$snapshot_dir"

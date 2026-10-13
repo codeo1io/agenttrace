@@ -3115,20 +3115,32 @@ impl GoAnomaly {
 }
 
 fn user_cache_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join("Library").join("Caches");
-        }
-    }
     // rm-248: the XDG Base Directory spec only defines ABSOLUTE
     // $XDG_CACHE_HOME values; a relative one is treated as unset and
     // falls through to the HOME-based default instead of scattering a
     // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
     // agenttrace --overview` wrote ./rel-cache/agenttrace from a
     // scratch cwd).
+    //
+    // rm-994: the absolute-XDG check runs BEFORE the macOS arm. An
+    // explicitly set absolute $XDG_CACHE_HOME is an operator
+    // instruction and is honored on every OS — predictability across
+    // platforms beats platform convention, and the `--doctor --demo`
+    // no-operator-home-paths contract is only satisfiable on macOS
+    // runners when a redirected cache root is honored there too (the
+    // macOS arm used to win and disclosed ~/Library/Caches paths in
+    // the demo report). macOS keeps ~/Library/Caches as the DEFAULT
+    // whenever no absolute XDG root is set; non-macOS builds are
+    // unaffected by the reorder (cfg! is compile-time). Same ladder
+    // as doctor.rs / pricing.rs / statusline.rs.
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
         if !cache.as_os_str().is_empty() && cache.is_absolute() {
             return cache;
+        }
+    }
+    if cfg!(target_os = "macos") {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            return home.join("Library").join("Caches");
         }
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {

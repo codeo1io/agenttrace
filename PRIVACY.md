@@ -6,7 +6,7 @@ Generated reports are written only to the output path you request with `-o`. Rev
 
 ## What agenttrace writes on disk
 
-Parsing and reporting persist derived data on this machine. The cache artifacts live under `~/.cache/agenttrace` (`XDG_CACHE_HOME` relocates that root — absolute paths only: the XDG Base Directory spec leaves a relative value undefined, so a relative `XDG_CACHE_HOME` is ignored and the `~/.cache` default is used, rather than creating a cache under whatever directory the tool happens to run from; the session cache, the SQLite snapshots, and the statusline journal additionally honor `AGENTTRACE_SESSION_CACHE_DIR`):
+Parsing and reporting persist derived data on this machine. The cache artifacts live under `~/.cache/agenttrace` (`XDG_CACHE_HOME` relocates that root — absolute paths only: the XDG Base Directory spec leaves a relative value undefined, so a relative `XDG_CACHE_HOME` is ignored and the default root is used, rather than creating a cache under whatever directory the tool happens to run from; on macOS the default root is `~/Library/Caches/agenttrace` — an explicitly set absolute `XDG_CACHE_HOME` still relocates it there too, so a redirected cache root behaves identically on every platform (rm-248, rm-994); the session cache, the SQLite snapshots, the statusline journal, and the pricing catalog additionally honor `AGENTTRACE_SESSION_CACHE_DIR`):
 
 | Artifact | What it holds | Purge |
 | --- | --- | --- |
