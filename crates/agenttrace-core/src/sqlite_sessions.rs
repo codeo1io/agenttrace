@@ -53,6 +53,18 @@ struct SqliteSessionAgg {
     /// stored total minus derived total (saturating), exposed so
     /// data_health can surface derived-aggregation drift.
     stored_totals_delta: i64,
+    /// rm-991 (cycle 2, run b5affead): opencode `session.agent` — the
+    /// upstream-recorded name of the agent that ran the session (live
+    /// host census 2026-10-12: 302/310 rows carry one). Empty string
+    /// when the column or value is absent; the `by_agent` rollup then
+    /// falls back to `source_tool` exactly as before.
+    agent_name: String,
+    /// rm-991: the writer-reported diff summary on the same row
+    /// (`summary_additions`/`summary_deletions`/`summary_files`),
+    /// read leniently per column — `None` when absent.
+    summary_additions: Option<i64>,
+    summary_deletions: Option<i64>,
+    summary_files: Option<i64>,
     source_tool: String,
     path: String,
     cwd: String,
@@ -714,8 +726,43 @@ fn opencode_sqlite_session_rows(
     } else {
         "null"
     };
+    // rm-991 (cycle 2, run b5affead): `session.agent` names WHO ran
+    // the session and `summary_*` carries the writer-reported diff
+    // summary. Guarded like the stored columns so an older schema
+    // without them still loads (unnamed, no summary) — the live host
+    // census found migration rows predating the columns.
+    let agent_select = if sqlite_has_column(db, "session", "agent") {
+        "agent"
+    } else {
+        "null"
+    };
+    let summary_columns = [
+        (
+            "summary_additions",
+            sqlite_has_column(db, "session", "summary_additions"),
+        ),
+        (
+            "summary_deletions",
+            sqlite_has_column(db, "session", "summary_deletions"),
+        ),
+        (
+            "summary_files",
+            sqlite_has_column(db, "session", "summary_files"),
+        ),
+    ];
+    let summary_select = summary_columns
+        .iter()
+        .map(|(column, present)| {
+            if *present {
+                (*column).to_string()
+            } else {
+                "null".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
-        "select id, title, time_created, time_updated, {directory}, {stored_select}, {parent_select} \
+        "select id, title, time_created, time_updated, {directory}, {stored_select}, {parent_select}, {agent_select}, {summary_select} \
          from session where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
     let mut stmt = match db.prepare(&sql) {
@@ -756,6 +803,13 @@ fn opencode_sqlite_session_rows(
                 // parent_id degrades to "no linkage" instead of failing
                 // (and thereby dropping) the whole session row.
                 parent_id: sqlite_value_as_text(row.get(11)?),
+                // rm-991: same leniency — a non-text agent name degrades
+                // to unnamed (by_agent falls back to the source-tool
+                // bucket) instead of dropping the session.
+                agent_name: sqlite_value_as_text(row.get(12)?).unwrap_or_default(),
+                summary_additions: sqlite_value_as_i64(row.get(13)?),
+                summary_deletions: sqlite_value_as_i64(row.get(14)?),
+                summary_files: sqlite_value_as_i64(row.get(15)?),
                 source_tool: "opencode_db".to_string(),
                 path: path.to_string_lossy().to_string(),
                 ..SqliteSessionAgg::default()
@@ -1213,6 +1267,15 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         session_end: unix_seconds_rfc3339(agg.end_unix),
         cost_estimated,
         stored_totals_delta: agg.stored_totals_delta,
+        // rm-991 (cycle 2, run b5affead): the upstream-recorded agent
+        // name and diff summary ride along on the metrics; the
+        // `by_agent` rollup splits on the name (falling back to
+        // `source_tool` when empty) and `files` provenance upgrades
+        // only when the writer actually reported a summary_files.
+        agent_name: agg.agent_name,
+        summary_additions: agg.summary_additions,
+        summary_deletions: agg.summary_deletions,
+        summary_files: agg.summary_files,
         provenance: crate::MetricProvenance {
             naming: String::new(),
             tokens: if agg.stored_totals_applied {
@@ -1226,7 +1289,11 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
             } else {
                 "unavailable".to_string()
             },
-            files: "unavailable".to_string(),
+            files: if agg.summary_files.is_some() {
+                "reported_by_agent".to_string()
+            } else {
+                "unavailable".to_string()
+            },
             cost: if agg.stored_cost_applied {
                 "reported_by_agent".to_string()
             } else if agg.usage_cost_set {

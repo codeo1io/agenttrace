@@ -25,6 +25,15 @@ pub struct CostAudit {
     /// untouched values.
     #[serde(skip_serializing_if = "usize_is_zero")]
     pub clamped_values: usize,
+    /// rm-990 (cycle 2, run b5affead): sessions the pi lane marked as
+    /// cancelled — `pi_run_aborted` disclosures minted from either the
+    /// message-level `stopReason:"aborted"` arm (the one that fires
+    /// on real journals) or the pi >=1.1.0 `agent_settled{aborted}`
+    /// entry. Zero (or an absent field once serialized) means no
+    /// cancelled run muddies the finished-run totals the audit
+    /// reasons about.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub aborted_sessions: usize,
     pub stored_estimated_cost_usd: f64,
     pub current_estimated_cost_usd: Option<f64>,
     pub pricing_coverage: PricingCoverage,
@@ -404,6 +413,19 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 .sum::<usize>()
         })
         .sum();
+    // rm-990: the cancelled-vs-finished split. Counted per SESSION
+    // (any abort signal present), not per signal — the audit reasons
+    // about runs, and one run can legitimately carry several abort
+    // signals (retry after escape).
+    let aborted_sessions: usize = sessions
+        .iter()
+        .filter(|session| {
+            session
+                .metrics
+                .disclosure_counters
+                .contains_key("pi_run_aborted")
+        })
+        .count();
     for session in sessions {
         let provider = session.metrics.source_tool.clone();
         let model = normalized_model(&session.metrics.model_used);
@@ -642,6 +664,7 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         pricing_source: pricing::pricing_source(),
         total_estimated_cost: stored_estimated_cost_usd,
         clamped_values,
+        aborted_sessions,
         stored_estimated_cost_usd,
         current_estimated_cost_usd,
         pricing_coverage: coverage,
