@@ -333,8 +333,88 @@ pub fn load_sessions_with_progress(
     options: &LoadOptions,
     on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
+    // rm-1063 (run 62250c06): an explicit scope that holds zero
+    // readable sources must never touch (parse or rewrite) the global
+    // cache store — resolve the scope before loading it. The empty
+    // report keeps the CLI's "no session files found" contract.
+    if dir.is_some_and(|scope| find_session_files(Some(scope)).is_empty()) {
+        return LoadReport::default();
+    }
     let mut cache = load_session_cache();
     load_sessions_with_progress_from_cache(dir, options, &mut cache, on_progress)
+}
+
+/// rm-1061 (run 62250c06): load the union of several explicit roots
+/// with ONE cache-store load. A session file that appears in more
+/// than one root — the multi-device synced-roots case — is counted
+/// once, keyed by (source, file name): the canonical-path identity
+/// the auto lane uses (rm-338) does not survive copies on synced
+/// trees, and Claude-derived journals key sessions by file name.
+/// Roots are consumed in the caller's order and first-seen wins, so
+/// the union is deterministic for a given root set and order.
+/// Counters describe the deduped union: `discovered`/`parsed` track
+/// distinct files, duplicate-root parses are folded out, and the
+/// sqlite/opencode ingest lanes stay empty because they are
+/// auto-discovery lanes (they only run without an explicit scope).
+pub fn load_sessions_from_roots(roots: &[&Path], options: &LoadOptions) -> LoadReport {
+    load_sessions_from_roots_with_progress(roots, options, |_| {})
+}
+
+pub fn load_sessions_from_roots_with_progress(
+    roots: &[&Path],
+    options: &LoadOptions,
+    mut on_progress: impl FnMut(LoadProgress),
+) -> LoadReport {
+    if roots.is_empty() {
+        return LoadReport::default();
+    }
+    if roots.len() == 1 {
+        return load_sessions_with_progress(Some(roots[0]), options, on_progress);
+    }
+    // rm-1063: a roots union that holds zero readable sources across
+    // every root defers the store exactly like the single-root path.
+    if roots
+        .iter()
+        .all(|root| find_session_files(Some(root)).is_empty())
+    {
+        return LoadReport::default();
+    }
+    let mut cache = load_session_cache();
+    let mut merged = LoadReport::default();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for root in roots {
+        let mut report = load_sessions_with_progress_from_cache(
+            Some(root),
+            options,
+            &mut cache,
+            &mut on_progress,
+        );
+        // duplicate files parsed in an earlier root are folded out of
+        // the union's counters (they contributed no retained session)
+        let before = report.sessions.len();
+        report.sessions.retain(|session| {
+            seen.insert((
+                session.metrics.source_tool.clone(),
+                Path::new(&session.path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ))
+        });
+        let retained = report.sessions.len();
+        let dropped = before - retained;
+        merged.sessions.append(&mut report.sessions);
+        merged.discovered += report.discovered.saturating_sub(dropped);
+        merged.parsed += retained;
+        merged.cache_hits += report.cache_hits.saturating_sub(dropped);
+        merged.skipped += report.skipped;
+        merged.opencode_fork_excluded += report.opencode_fork_excluded;
+        merged.parse_failures += report.parse_failures;
+        if merged.first_parse_failure.is_none() {
+            merged.first_parse_failure = report.first_parse_failure;
+        }
+    }
+    merged
 }
 
 pub fn load_sessions_with_progress_from_cache(

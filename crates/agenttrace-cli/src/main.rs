@@ -2,18 +2,18 @@ use agenttrace_core::{
     add_baseline_comparison, average_health, build_doctor_report, compute_overview,
     compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
     delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
-    fix_suggestions, inspect_first, list_pricing, load_sessions_with_options, lookup_price,
-    matches_numeric_filter, mcp_governance, parse_file, parse_numeric_filter, parse_stdin_bytes,
-    predict_cost_anomaly, pricing_cache_path, pricing_source, recommendations,
-    render_doctor_report, render_model_pricing_list, render_test_match,
-    render_waste_report_with_language, report_compare_json, report_json_with_language,
-    report_overview_html_with_context, report_overview_json_with_context,
-    report_overview_markdown_with_context, report_overview_svg_with_context,
-    report_overview_text_with_context, report_search_json, report_search_text,
-    report_text_with_language, sanitize_line_segment, search_sessions, session_capability,
-    session_start_cmp, tool_fail_rate, total_tokens, update_pricing, waste_report_json,
-    BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session, SvgCardTheme, TimeRange,
-    VERSION,
+    fix_suggestions, inspect_first, list_pricing, load_sessions_from_roots,
+    load_sessions_with_options, lookup_price, matches_numeric_filter, mcp_governance, parse_file,
+    parse_numeric_filter, parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path,
+    pricing_source, recommendations, render_doctor_report, render_model_pricing_list,
+    render_test_match, render_waste_report_with_language, report_compare_json,
+    report_json_with_language, report_overview_html_with_context,
+    report_overview_json_with_context, report_overview_markdown_with_context,
+    report_overview_svg_with_context, report_overview_text_with_context, report_search_json,
+    report_search_text, report_text_with_language, sanitize_line_segment, search_sessions,
+    session_capability, session_start_cmp, tool_fail_rate, total_tokens, update_pricing,
+    waste_report_json, BaselineThresholds, LoadOptions, LoadReport, ReportLanguage, Session,
+    SvgCardTheme, TimeRange, VERSION,
 };
 use anyhow::{bail, Context};
 use chrono::Utc;
@@ -56,9 +56,12 @@ struct Args {
     /// the static file adapts to the viewer; bytes stay deterministic.
     #[arg(long = "card-theme", default_value = "auto")]
     card_theme: SvgCardTheme,
-    /// Session directory to scan instead of auto-discovered agent homes
-    #[arg(short = 'd', long = "dir")]
-    dir: Option<String>,
+    /// Session directory to scan instead of auto-discovered agent
+    /// homes; repeatable (rm-1061, run 62250c06) — report lanes scan
+    /// the union of all roots (dedup by (source, file name)), while
+    /// single-dir lanes (mcp, doctor, tui) accept exactly one.
+    #[arg(short = 'd', long = "dir", value_name = "DIR")]
+    dirs: Vec<String>,
     /// Compare the inspected session against the healthy-baseline
     /// summary (narrative framed for `--model`).
     #[arg(long)]
@@ -406,7 +409,14 @@ fn run() -> anyhow::Result<()> {
         // `validate_explicit_dir` helper (which takes the Option
         // directly) subsumes this run's extracted
         // `validate_dir_flag_or_exit` twin — same rc2, same messages.
-        validate_explicit_dir(args.dir.as_deref());
+        for dir in &args.dirs {
+            validate_explicit_dir(Some(dir.as_str()));
+        }
+        if args.dirs.len() > 1 {
+            anyhow::bail!(
+                "the mcp lane accepts exactly one --dir (multi-root unions are a report-lane capability, rm-1061)"
+            );
+        }
         let resolved = config::resolve(&args)?;
         agenttrace_core::set_runtime_config(agenttrace_core::RuntimeConfigOverrides {
             history_dir: resolved.history_dir.clone(),
@@ -417,7 +427,7 @@ fn run() -> anyhow::Result<()> {
             // covers the session-cache capacity knob too.
             session_cache_entries: resolved.session_cache_entries,
         });
-        return mcp::serve(args.dir.as_deref().map(Path::new));
+        return mcp::serve(args.dirs.first().map(|dir| Path::new(dir.as_str())));
     }
     validate_primary_action(&args)?;
     validate_gate_thresholds(&args)?;
@@ -578,7 +588,12 @@ fn run() -> anyhow::Result<()> {
         // never silently ignored in favor of the DEFAULT agent homes.
         // Supplying both --dir and the positional is the same ambiguous
         // source conflict the rm-596 --demo guard rejects.
-        let doctor_dir = match (args.dir.as_deref(), args.path.as_deref()) {
+        if args.dirs.len() > 1 {
+            return Err(anyhow::anyhow!(
+                "--doctor: the doctor lane accepts exactly one --dir (multi-root unions are a report-lane capability, rm-1061)"
+            ));
+        }
+        let doctor_dir = match (args.dirs.first().map(String::as_str), args.path.as_deref()) {
             (Some(_), Some(_)) => {
                 return Err(anyhow::anyhow!(
                     "--doctor: pass either --dir or the positional scan root, not both"
@@ -696,8 +711,13 @@ fn run() -> anyhow::Result<()> {
                 Some(&args.lang),
             );
         }
+        if args.dirs.len() > 1 {
+            anyhow::bail!(
+                "the tui lane accepts exactly one --dir (multi-root unions are a report-lane capability, rm-1061)"
+            );
+        }
         return agenttrace_tui::run_with_language(
-            args.dir.as_deref().unwrap_or(""),
+            args.dirs.first().map(String::as_str).unwrap_or(""),
             Some(&args.lang),
         );
     }
@@ -1072,8 +1092,15 @@ fn run() -> anyhow::Result<()> {
             }
             let inspect = if args.demo {
                 "agenttrace --demo --overview -f json".to_string()
-            } else if let Some(dir) = args.dir.as_deref() {
-                format!("agenttrace -d {:?} --overview -f json", dir)
+            } else if !args.dirs.is_empty() {
+                format!(
+                    "agenttrace {} --overview -f json",
+                    args.dirs
+                        .iter()
+                        .map(|dir| format!("-d {dir:?}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
             } else {
                 "agenttrace --overview -f json".to_string()
             };
@@ -1144,10 +1171,14 @@ fn enforce_report_gates(args: &Args, sessions: &[Session]) {
             "agenttrace --demo {} -f json",
             governance_inspect_flag(args)
         )
-    } else if let Some(dir) = args.dir.as_deref() {
+    } else if !args.dirs.is_empty() {
         format!(
-            "agenttrace -d {:?} {} -f json",
-            dir,
+            "agenttrace {} {} -f json",
+            args.dirs
+                .iter()
+                .map(|dir| format!("-d {dir:?}"))
+                .collect::<Vec<_>>()
+                .join(" "),
             governance_inspect_flag(args)
         )
     } else {
@@ -1779,7 +1810,7 @@ fn reject_demo_source_conflict(args: &Args) -> anyhow::Result<()> {
     if args.path.is_some() {
         sources.push("a positional path");
     }
-    if args.dir.is_some() {
+    if !args.dirs.is_empty() {
         sources.push("-d/--dir");
     }
     if args.range != "all" {
@@ -1873,7 +1904,10 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         // arm is superseded and the distinct-words intent rides rm-212.
         admit_session_path(&path)?;
     }
-    let dir = args.dir.as_deref().map(PathBuf::from);
+    // rm-1061 (run 62250c06): `-d` is repeatable — report lanes scan
+    // the union of all roots and dedupe files that appear in more
+    // than one root (the multi-device synced-roots case).
+    let roots: Vec<PathBuf> = args.dirs.iter().map(PathBuf::from).collect();
     // Cycle-4 B2: a typo'd `-d` path used to produce the same
     // "No session files found in …" error as a genuinely empty
     // directory — the two need different messages and different exit
@@ -1881,19 +1915,36 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // rm-781: `validate_explicit_dir` (this landed helper) takes the
     // Option directly, so the `mcp` host lane admits `-d` the same
     // way before serving — same rc2, same messages.
-    validate_explicit_dir(args.dir.as_deref());
+    for root in &roots {
+        validate_explicit_dir(Some(root.to_string_lossy().as_ref()));
+    }
     let range = parse_range(args)?;
-    let report = load_sessions_with_options(
-        dir.as_deref(),
-        &LoadOptions {
-            since: range.since(Utc::now()),
-            project: args.project.clone(),
-            source: args.source.clone(),
-            model: args.model_filter.clone(),
-            include_history: args.include_history,
-            preserve_history: args.preserve_history,
-        },
-    );
+    let report = if roots.is_empty() {
+        load_sessions_with_options(
+            None,
+            &LoadOptions {
+                since: range.since(Utc::now()),
+                project: args.project.clone(),
+                source: args.source.clone(),
+                model: args.model_filter.clone(),
+                include_history: args.include_history,
+                preserve_history: args.preserve_history,
+            },
+        )
+    } else {
+        let root_refs: Vec<&Path> = roots.iter().map(|root| root.as_path()).collect();
+        load_sessions_from_roots(
+            &root_refs,
+            &LoadOptions {
+                since: range.since(Utc::now()),
+                project: args.project.clone(),
+                source: args.source.clone(),
+                model: args.model_filter.clone(),
+                include_history: args.include_history,
+                preserve_history: args.preserve_history,
+            },
+        )
+    };
     let sessions = report.sessions.clone();
     // rm-753: SQLite-backed ingestion failures are disclosed, never
     // silently swallowed — a discovered-but-unreadable agent database
@@ -1904,10 +1955,23 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     disclose_unlinked_subagents(report.unlinked_subagents);
     if sessions.is_empty() {
         if report.discovered == 0 {
-            match args.dir.as_deref() {
-                Some(dir) => bail!(
-                    "No session files found in {dir} (directory exists but holds no session files)"
-                ),
+            match args.dirs.first().map(String::as_str) {
+                Some(_) => {
+                    let listed = args
+                        .dirs
+                        .iter()
+                        .map(|dir| dir.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if args.dirs.len() > 1 {
+                        bail!(
+                            "No session files found in any of: {listed} (directories exist but hold no session files)"
+                        );
+                    }
+                    bail!(
+                        "No session files found in {listed} (directory exists but holds no session files)"
+                    )
+                }
                 None => {
                     // rm-753: a discovered-but-unreadable agent database
                     // must not be reported as "nothing found" — the
@@ -3075,7 +3139,7 @@ pub(crate) fn test_args(dir: Option<String>) -> Args {
         pricing_file: None,
         weekly_budget: None,
         budget: false,
-        dir,
+        dirs: dir.into_iter().collect(),
         compare: true,
         audit: false,
         recommend: false,
