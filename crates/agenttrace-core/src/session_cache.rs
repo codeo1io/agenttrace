@@ -1271,6 +1271,9 @@ pub(crate) fn cache_artifact_paths() -> Vec<PathBuf> {
         session_cache_lock_path(),
         sqlite_snapshot_path("hermes"),
         sqlite_snapshot_path("opencode"),
+        // rm-1004: the Cursor live-store lane snapshots through the
+        // same per-source ledger.
+        sqlite_snapshot_path("cursor"),
         crate::statusline::statusline_capture_path(),
         crate::pricing::pricing_cache_path(),
     ]
@@ -4866,8 +4869,8 @@ mod tests {
             .collect();
         assert_eq!(
             paths.len(),
-            6,
-            "registry: session cache, its advisory lock, two sqlite snapshots, statusline journal, pricing catalog"
+            7,
+            "registry: session cache, its advisory lock, three sqlite snapshots (hermes, opencode, cursor), statusline journal, pricing catalog"
         );
         for path in &paths {
             fs::write(path, b"x").expect("write artifact");

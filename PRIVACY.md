@@ -12,7 +12,7 @@ Parsing and reporting persist derived data on this machine. The cache artifacts 
 | --- | --- | --- |
 | `sessions.json` | parsed metrics per session file: session names, file paths, working directories, paths of files touched, token/cost/health summaries, plus a bounded `schema_invalidations` ledger disclosing cache schema upgrades (version numbers and drop counts only — no session content) | `agenttrace --clear-cache` |
 | `sessions.json.lock` | an advisory-lock sibling of `sessions.json` that serializes cache rewrites between concurrent agenttrace processes — its content is a `<pid>-<unique>` token that names the owning process (so a crashed writer's leftover is recognized and reclaimed, never user data) | `agenttrace --clear-cache` |
-| `hermes-sqlite.json`, `opencode-sqlite.json` | the same parsed metrics snapshotted from the Hermes and OpenCode SQLite session stores | `agenttrace --clear-cache` |
+| `hermes-sqlite.json`, `opencode-sqlite.json`, `cursor-sqlite.json` | the same parsed metrics snapshotted from the Hermes and OpenCode SQLite session stores and Cursor's read-only live stores (`state.vscdb`, `~/.cursor/chats/**/store.db`) | `agenttrace --clear-cache` |
 | `statusline.jsonl` | raw statusline payloads captured by the statusline hook: model names, token/cost summaries, rate-limit state (journal capped at 10 MiB; see the statusline section of the README) | `agenttrace --clear-cache` |
 | `pricing.json` | public LiteLLM model pricing metadata — no personal data; re-downloadable with `agenttrace --update-pricing` | `agenttrace --clear-cache` |
 

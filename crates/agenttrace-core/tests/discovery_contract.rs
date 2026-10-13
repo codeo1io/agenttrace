@@ -3028,31 +3028,61 @@ fn non_finite_costs_lower_health_confidence_and_stay_visible() {
 }
 
 #[test]
-fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
+fn zstd_rollouts_decode_in_process_with_named_errors() {
     // Pass-7 research / candidate-44 minimum (CU-16): Codex >=0.152
-    // writes rollouts as zstd frames (magic 28 B5 2F FD). The parser
-    // must name the format instead of the old misleading "not valid
-    // UTF-8" — this is the smallest step toward Codex coverage.
+    // writes rollouts as zstd frames (magic 28 B5 2F FD). rm-1005
+    // upgraded the floor: instead of naming the format and telling
+    // the user to decompress by hand, the parser inflates the frame
+    // IN-PROCESS (ruzstd, no host CLI) — so this pin now asserts the
+    // decode contract itself: a broken frame still fails naming the
+    // format (never the misleading "not valid UTF-8"), and a valid
+    // frame inside a `.jsonl`-named file parses even though the
+    // discovery walk's name filter would never admit a `.zst`.
     let root = temp_root("agenttrace-zstd-sniff");
     fs::create_dir_all(&root).expect("create dir");
     let rollout = root.join("rollout-2026-09-03.jsonl");
     fs::write(&rollout, [0x28u8, 0xB5, 0x2F, 0xFD, 0x00, 0x01]).expect("write zstd frame");
     let err = parse_file(&rollout)
-        .expect_err("zstd frame must not parse as JSONL")
+        .expect_err("a corrupt zstd frame must not parse as JSONL")
         .to_string();
     assert!(
-        err.contains("zstd-compressed"),
+        err.contains("zstd"),
         "error must name the format, got: {err}"
-    );
-    assert!(
-        err.contains("zstd -d"),
-        "error must offer the decompression recipe"
     );
     assert!(
         !err.contains("not valid UTF-8"),
         "the misleading UTF-8 error is gone"
     );
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(&root);
+
+    // A REAL frame in the same `.jsonl`-named file now decodes — the
+    // sniff is content-based, so the upstream layout (zstd body,
+    // jsonl name) just works. The frame is a legal single-RAW-block
+    // zstd frame assembled byte-by-byte (no host zstd binary needed):
+    // single-segment header, 4-byte frame content size, one raw block.
+    let plain = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex-legacy/rollout-with-usage.jsonl"),
+    )
+    .expect("plain corpus");
+    assert!(
+        plain.len() < (1 << 21),
+        "corpus fits one raw block (128 KiB max)"
+    );
+    let mut frame: Vec<u8> = vec![0x28, 0xB5, 0x2F, 0xFD, 0xA0];
+    frame.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+    let block_header: u32 = 1 | ((plain.len() as u32) << 3);
+    frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    frame.extend_from_slice(&plain);
+
+    let live_root = temp_root("agenttrace-zstd-live");
+    fs::create_dir_all(&live_root).expect("create dir");
+    let rollout = live_root.join("rollout-2026-09-03.jsonl");
+    fs::write(&rollout, &frame).expect("write valid frame");
+    let session = parse_file(&rollout).expect("valid zstd frame decodes in-process");
+    assert_eq!(session.metrics.source_tool, "codex_cli");
+    assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+    let _ = fs::remove_dir_all(live_root);
 }
 
 #[test]
