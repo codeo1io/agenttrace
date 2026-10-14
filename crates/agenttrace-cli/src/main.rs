@@ -1933,8 +1933,11 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
             // and an over-cap stream refuses by name instead of
             // growing without bound (the pre-fix PoC OOM'd at 200 MiB
             // under a 256 MiB VM cap).
+            // saturating_add: an absurd AGENTTRACE_STDIN_CAP_BYTES=u64::MAX
+            // must overflow neither debug (panic) nor release (wrap to 0
+            // and silently read nothing) — review-fix F4.
             io::stdin()
-                .take(cap + 1)
+                .take(cap.saturating_add(1))
                 .read_to_end(&mut raw)
                 .context("read session from stdin")?;
             if raw.len() as u64 > cap {
