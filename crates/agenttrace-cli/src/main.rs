@@ -951,6 +951,9 @@ fn run() -> anyhow::Result<()> {
     }
 
     if let Some(query) = args.search.as_deref() {
+        // rm-988: blank queries never reach here — validate_gate_thresholds
+        // rejects them up front (see below); the library arm keeps its own
+        // defensive empty-result contract for other callers.
         let results = search_sessions(&sessions, query, args.search_limit);
         let out = if args.format == "json" {
             report_search_json(&results)
@@ -2449,6 +2452,7 @@ fn render_test_match_json() -> anyhow::Result<String> {
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
         "gemini-2.5-pro",
+        "gpt-6-astra",
         "unknown-model-xyz",
     ];
     let rows: Vec<_> = models
@@ -2457,7 +2461,12 @@ fn render_test_match_json() -> anyhow::Result<String> {
             let price = lookup_price(model);
             // rm-610: flex-tier rates disclosed per row (null when the
             // row carries none — flex turns then bill at the standard
-            // rates above).
+            // rates above). rm-164 cycle-2 rider (run b5d391ec, merged
+            // at conflict case bc360d0d): the ultrafast slots join the
+            // same row shape so this lane keeps mirroring
+            // render_test_match's probe list and tier disclosure —
+            // the flex lane updated both surfaces, and the merged
+            // text-only ultrafast line had left this one behind.
             serde_json::json!({
                 "model": model,
                 "input_per_million": price.input,
@@ -2468,6 +2477,10 @@ fn render_test_match_json() -> anyhow::Result<String> {
                 "flex_output_per_million": price.output_flex,
                 "flex_cache_write_per_million": price.cw_flex,
                 "flex_cache_read_per_million": price.cr_flex,
+                "ultrafast_input_per_million": price.input_ultrafast,
+                "ultrafast_output_per_million": price.output_ultrafast,
+                "ultrafast_cache_write_per_million": price.cw_ultrafast,
+                "ultrafast_cache_read_per_million": price.cr_ultrafast,
             })
         })
         .collect();
@@ -3097,7 +3110,13 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     // --search '' -f json, rc 0). The library guard still matches
     // NOTHING on a blank query (search.rs pins that), but the user
     // cannot distinguish "no match" from "no query" — reject it here
-    // in the same dialect as the limit guards above.
+    // in the same dialect as the limit guards above. This guard runs
+    // before every action dispatch, so it also covers the bare
+    // `--search ''` shape that falls through to the interactive TUI
+    // (launch_guards::blank_search_query_rejects_loudly_instead_of_matching_nothing
+    // pins that leg; run b5d391ec's parallel rm-988 implementation
+    // added two in-run() duplicates of this check — superseded by the
+    // landed lane and removed at integration).
     if args
         .search
         .as_deref()

@@ -164,6 +164,24 @@ def trim(data):
             flex = value.get(flex_field)
             if isinstance(flex, (int, float)) and flex > 0:
                 entry[flex_field] = flex
+        # Ultrafast-tier rates ride along under the identical contract
+        # (rm-164 cycle-2 rider, run b5d391ec — restored at integration
+        # conflict case bc360d0d): without this arm the next refresh
+        # would silently strip the `*_ultrafast` fields the bundled
+        # snapshot and the pricing ingest both carry, regressing
+        # ultrafast turns back to standard-rate billing. Zero/absent
+        # values are omitted (same greppability rule as flex);
+        # `_above_272k_tokens_ultrafast` long-context variants are not
+        # carried (the rm-610 decision, held for the third tier family).
+        for ultrafast_field in (
+            "input_cost_per_token_ultrafast",
+            "output_cost_per_token_ultrafast",
+            "cache_creation_input_token_cost_ultrafast",
+            "cache_read_input_token_cost_ultrafast",
+        ):
+            ultrafast = value.get(ultrafast_field)
+            if isinstance(ultrafast, (int, float)) and ultrafast > 0:
+                entry[ultrafast_field] = ultrafast
         keep[key] = entry
     return keep
 

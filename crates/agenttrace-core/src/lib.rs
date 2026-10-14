@@ -2527,7 +2527,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         } else {
             session.metrics.agent_name.clone()
         };
-        // rm-991 (cycle 2, run b5affead): the opencode `session.agent`
+        // rm-991 (cycle 2, run b5affead — the landed lane this
+        // integration kept over run b5d391ec's stranded parallel
+        // implementation of the same unit): the opencode `session.agent`
         // column names WHO ran the session (live census 2026-10-12:
         // 302/310 rows). Keying on it splits the one `opencode_db`
         // bucket every opencode session used to collapse into; every

@@ -2549,15 +2549,17 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                 }
             }
             "agent_settled" => {
-                // rm-990 (cycle 2, run b5affead): pi >=1.1.0 (#10607)
-                // added `aborted` to the agent-settled event. The wire
-                // census that motivated this arm (23,174 journals on
-                // this host, 2026-10-12) found ZERO persisted entries
-                // of this type — the dist settles only on the
-                // in-process event stream, never the JSONL — but
-                // format v3 is additive-only, so the entry is
-                // consumed defensively: present -> counted, absent ->
-                // invisible (a journal without one is byte-identical
+                // rm-990 (cycle 2, run b5affead — the landed lane this
+                // integration kept over run b5d391ec's stranded
+                // parallel implementation of the same unit): pi >=1.1.0
+                // (#10607) added `aborted` to the agent-settled event.
+                // The wire census that motivated this arm (23,174
+                // journals on this host, 2026-10-12) found ZERO
+                // persisted entries of this type — the dist settles
+                // only on the in-process event stream, never the
+                // JSONL — but format v3 is additive-only, so the entry
+                // is consumed defensively: present -> counted, absent
+                // -> invisible (a journal without one is byte-identical
                 // to before this arm existed, including the
                 // pi_entry_skipped disclosure it used to mint). The
                 // arm that actually fires on real journals is the
