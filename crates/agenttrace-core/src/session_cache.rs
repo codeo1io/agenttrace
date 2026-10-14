@@ -1,11 +1,31 @@
-use crate::{Anomaly, Diagnostics, Metrics, Session, ToolWarning};
+use crate::{
+    Anomaly, Diagnostics, Metrics, Session, SessionFileDiff, SummaryDiffDivergence, ToolWarning,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+// Bumped 64 -> 65 (run b01c2b6abe28 cycle 2 'advisory closure +
+// OpenCode v2 delivery-evidence readiness', rm-1509 LEAD, worktree
+// run-b01c2b6abe28-b01c2b6a @ base 8bc0587): a SHAPE-ONLY rung —
+// Metrics began persisting the opencode v2 `session.summary_diffs`
+// per-file list (`SessionFileDiff[]`), its malformed-payload drop
+// counter, and the per-file-vs-`summary_*` divergence disclosure
+// read off the session table behind the column-presence probe. No
+// parser semantics moved (1.x JSONL lanes parse byte-identically;
+// pre-column sqlite stores read `None` and parse identically), but a
+// warm v64 entry replays `summary_diffs: None` with no divergence
+// and no drop count while a fresh parse of the same v2 database
+// surfaces all three — so the delivery-evidence line and the
+// divergence disclosure never reach a warm hit (rm-230 convention:
+// shape changes that alter reported content for unchanged files
+// bump the schema so cached sessions regenerate). Entries
+// regenerate once on next scan. The SQLite snapshot moves 12 -> 13
+// in the same unit (below) — the snapshot lane holds the same
+// sessions and has the same warm-hit hole.
 // Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case
@@ -859,7 +879,16 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
 // ledger; the bump also composes with the landed rm-753/rm-734
 // poison gate (fail-closed reads never bank) and the schema-11
 // eviction retires any v10 entry a pre-gate binary already banked.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 12;
+// Bumped 12 -> 13 (run b01c2b6abe28 cycle 2, rm-1509): the sqlite
+// lane now reads the opencode v2 `session.summary_diffs` json column
+// beside the `summary_*` integers. A v12 snapshot banked before the
+// column existed replays the same database with no per-file list, no
+// drop counter, and no divergence disclosure on an unchanged
+// (size, mtime) fingerprint — and because the summary block grew a
+// trailing column, the fixed read indices the snapshot was built on
+// no longer describe the fresh parse. One regeneration per database
+// retires the stale entry (rm-230 convention).
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 13;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -1219,6 +1248,17 @@ struct GoMetrics {
     summary_deletions: Option<i64>,
     #[serde(default, rename = "SummaryFiles")]
     summary_files: Option<i64>,
+    /// rm-1509 (cycle 2, run b01c2b6a): the OpenCode v2
+    /// `session.summary_diffs` per-file list and its two disclosure
+    /// riders — serde-default keeps older snapshots decodable (they
+    /// read `None`), and the snapshot schema bump regenerates them
+    /// in place anyway.
+    #[serde(default, rename = "SummaryDiffs")]
+    summary_diffs: Option<Vec<SessionFileDiff>>,
+    #[serde(default, rename = "SummaryDiffsDropped")]
+    summary_diffs_dropped: u32,
+    #[serde(default, rename = "SummaryDiffsDivergence")]
+    summary_diffs_divergence: Option<SummaryDiffDivergence>,
     #[serde(default, rename = "SourceTool")]
     source_tool: String,
     #[serde(default, rename = "SessionStart")]
@@ -3108,6 +3148,9 @@ impl GoMetrics {
             summary_additions: metrics.summary_additions,
             summary_deletions: metrics.summary_deletions,
             summary_files: metrics.summary_files,
+            summary_diffs: metrics.summary_diffs.clone(),
+            summary_diffs_dropped: metrics.summary_diffs_dropped,
+            summary_diffs_divergence: metrics.summary_diffs_divergence,
             source_tool: metrics.source_tool.clone(),
             session_start: metrics.session_start.clone(),
             session_end: metrics.session_end.clone(),
@@ -3163,6 +3206,9 @@ impl GoMetrics {
             summary_additions: self.summary_additions,
             summary_deletions: self.summary_deletions,
             summary_files: self.summary_files,
+            summary_diffs: self.summary_diffs,
+            summary_diffs_dropped: self.summary_diffs_dropped,
+            summary_diffs_divergence: self.summary_diffs_divergence,
             source_tool: self.source_tool,
             session_start: self.session_start,
             session_end: self.session_end,
@@ -3588,7 +3634,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_twelve_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_thirteen_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -3620,6 +3666,26 @@ mod tests {
                 summary_additions: Some(120),
                 summary_deletions: Some(8),
                 summary_files: Some(4),
+                // rm-1509 (cycle 2, run b01c2b6a): the v2 per-file
+                // list, its malformed-payload drop counter, and the
+                // divergence disclosure are SOURCE DATA — they must
+                // survive the snapshot round-trip or a warm hit would
+                // silently hide per-file delivery evidence the fresh
+                // parse surfaces (the divergence the schema bump to
+                // 13 evicts).
+                summary_diffs: Some(vec![SessionFileDiff {
+                    file: Some("src/a.rs".to_string()),
+                    additions: 120,
+                    deletions: 8,
+                    status: Some("modified".to_string()),
+                }]),
+                summary_diffs_dropped: 1,
+                summary_diffs_divergence: Some(SummaryDiffDivergence {
+                    per_file_additions: 120,
+                    per_file_deletions: 8,
+                    summary_additions: 121,
+                    summary_deletions: 9,
+                }),
                 provenance: crate::MetricProvenance {
                     tokens: "stored_session_totals".to_string(),
                     duration: "timestamp_span".to_string(),
@@ -3640,6 +3706,16 @@ mod tests {
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         let ledger_key = database.to_string_lossy().to_string();
+        // Version thirteen (rm-1509, cycle 2 of run b01c2b6a): the
+        // opencode v2 `session.summary_diffs` per-file list joined
+        // the snapshot payload beside the `summary_*` integers —
+        // with its malformed-payload drop counter and the
+        // per-file-vs-columns divergence disclosure, since a banked
+        // snapshot without them would replay `summary_diffs: None`
+        // while a fresh parse of the same v2 database surfaces the
+        // per-file evidence, so every older snapshot regenerates
+        // once, in place.
+        //
         // Version twelve (rm-991, cycle 2 of run b5affead): the
         // opencode `session.agent` name and the `summary_*` diff
         // columns joined the snapshot payload — a banked snapshot
@@ -3664,7 +3740,7 @@ mod tests {
         // and the raw parent row id; v8 (rm-548/rm-734) — the opencode
         // fork-exclusion count plus the poison-gate eviction; v7
         // (rm-198) — hermes tool outcome semantics.
-        assert_eq!(doc["schema_version"], 12);
+        assert_eq!(doc["schema_version"], 13);
         assert_eq!(
             doc["entries"][ledger_key.as_str()]["sessions"][0]["Metrics"]["Provenance"]["Tokens"]
                 .as_str(),
@@ -3676,7 +3752,7 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema twelve cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema thirteen cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
@@ -3696,6 +3772,24 @@ mod tests {
         assert_eq!(loaded[0].metrics.summary_additions, Some(120));
         assert_eq!(loaded[0].metrics.summary_deletions, Some(8));
         assert_eq!(loaded[0].metrics.summary_files, Some(4));
+        // rm-1509: the per-file list, drop counter, and divergence
+        // all round-trip — a warm hit is as honest as a cold parse.
+        let warm_diffs = loaded[0]
+            .metrics
+            .summary_diffs
+            .as_ref()
+            .expect("diffs ride");
+        assert_eq!(warm_diffs.len(), 1);
+        assert_eq!(warm_diffs[0].file.as_deref(), Some("src/a.rs"));
+        assert_eq!(warm_diffs[0].additions, 120);
+        assert_eq!(loaded[0].metrics.summary_diffs_dropped, 1);
+        let warm_divergence = loaded[0]
+            .metrics
+            .summary_diffs_divergence
+            .as_ref()
+            .expect("divergence rides");
+        assert_eq!(warm_divergence.per_file_additions, 120);
+        assert_eq!(warm_divergence.summary_additions, 121);
         assert_eq!(
             loaded[0].metrics.provenance.files, "reported_by_agent",
             "rm-991: the files provenance upgrade rides WITH the summary columns that earned it — \
@@ -3704,10 +3798,10 @@ mod tests {
              nor erases it on a warm hit"
         );
         let mut old = doc;
-        old["schema_version"] = serde_json::Value::from(11);
+        old["schema_version"] = serde_json::Value::from(12);
         fs::write(
             &snapshot,
-            serde_json::to_vec(&old).expect("schema ten json"),
+            serde_json::to_vec(&old).expect("schema twelve json"),
         )
         .expect("write old snapshot");
         assert!(load_sqlite_snapshot_from(&database, &snapshot).is_none());
