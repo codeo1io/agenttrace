@@ -51,7 +51,10 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
     // upstream PR #41357); they are no longer plain JSONL. Decode them
     // in-process — bounded, because a rollout is untrusted input and a
     // frame may decompress arbitrarily large — and keep the named-format
-    // failure wording for frames we still cannot use (rm-992).
+    // failure wording for bytes we still cannot use (rm-992). A rollout
+    // may carry CONCATENATED frames (Codex appends by materializing and
+    // re-encoding; upstream's own reader tolerates them), so the decode
+    // runs to true EOF, never just the first frame (rm-1516).
     let raw = if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
         decode_zstd_rollout_bounded(raw, label)?
     } else {
@@ -64,48 +67,130 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
 
 /// Output cap for in-process zstd rollout decode (rm-992). Compressed
 /// rollouts are untrusted input, so decode stops and discloses at this
-/// bound instead of allocating whatever the frame claims — the same
+/// bound instead of allocating whatever the frames claim — the same
 /// 64 MiB order as the transport bound in `pricing.rs` (upstream #318
-/// precedent). A rollout past the cap is refused loudly; the operator
-/// can always decompress manually and re-run.
+/// precedent). The cap bounds the TOTAL decompressed output across all
+/// concatenated frames, not each frame separately, so a multi-frame
+/// rollout cannot smuggle past it a frame at a time (rm-1516). A rollout
+/// past the cap is refused loudly; the operator can always decompress
+/// manually and re-run.
 const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Decode one zstd-compressed Codex rollout, bounded by
-/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`]. Every failure keeps the named-format
-/// wording (never a generic UTF-8 error): a corrupt frame names the decode
-/// failure, an empty frame says so, and an over-cap frame names the cap.
+/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`] of TOTAL decompressed output.
+/// A rollout is not guaranteed to be a single frame: Codex appends by
+/// materializing the journal and re-encoding it, and upstream's own
+/// reader explicitly tolerates CONCATENATED zstd frames
+/// (codex-rs `seekable_reader.rs`, "a known first-frame size is a lower
+/// bound even for concatenated zstd frames") while every codex read
+/// path rides libzstd's multi-frame-default `Decoder`. `ruzstd`'s
+/// `StreamingDecoder` is single-frame BY CONTRACT ("the calling code
+/// needs to recreate the instance of the decoder"), so this loop
+/// recreates the decoder per frame until the input is exhausted (rm-1516
+/// — the loop used to stop after frame 1 and silently drop every later
+/// frame's records, a half-journal truncation with zero disclosure).
+/// Every failure keeps the named-format wording (never a generic UTF-8
+/// error): a corrupt frame names the decode failure and its byte offset,
+/// trailing bytes that are not a frame are refused with their offset
+/// (exactly like `zstd -d`, which fails such files with `unsupported
+/// format` instead of parsing a prefix), skippable frames are skipped
+/// (also like `zstd -d`), an empty decode says so, and an over-cap file
+/// names the cap.
 fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
-    let mut decoder = match ruzstd::decoding::StreamingDecoder::new(&raw[..]) {
-        Ok(decoder) => decoder,
-        Err(err) => bail!(
-            "session file {} is zstd-compressed (Codex rollout format) but the frame failed to decode: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-            label,
-            err
-        ),
-    };
+    let total_len = raw.len();
+    // `rest` always points at the next not-yet-decoded frame; each
+    // iteration recovers the exact end-of-frame position from the slice
+    // the decoder itself advanced (`into_parts`), so no byte-offset
+    // arithmetic can drift.
+    let mut rest: &[u8] = &raw[..];
     let mut decoded: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = match decoder.read(&mut chunk) {
-            Ok(n) => n,
+    let mut frame_no: usize = 0;
+    while !rest.is_empty() {
+        let offset = total_len - rest.len();
+        frame_no += 1;
+        let mut decoder = match ruzstd::decoding::StreamingDecoder::new(rest) {
+            Ok(decoder) => decoder,
+            // Skippable frames (magic 184D2A50..=184D2A5F) carry no
+            // data; `zstd -d` steps over them, so the loop does too.
+            // The failed header read consumed the 8 magic+size bytes
+            // from the decoder's own copy of the slice, so advance past
+            // them plus the declared body here.
+            Err(ruzstd::decoding::errors::FrameDecoderError::ReadFrameHeaderError(
+                ruzstd::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
+            )) => {
+                // Compare in body-space and require the 8 header bytes
+                // to be present: `8 + length` alone wraps on 32-bit targets
+                // when `length` sits near u32::MAX, before any bail could
+                // run (review finding 3), and a <8-byte remainder must
+                // bail outright rather than risk the slice below.
+                if rest.len() < 8 || length as usize > rest.len() - 8 {
+                    bail!(
+                        "session file {} is zstd-compressed (Codex rollout format) but a skippable frame at byte {} declares more bytes than the file holds; the file is truncated — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                        label,
+                        offset
+                    );
+                }
+                // Guarded above: 8 + length <= rest.len() here, so the
+                // sum cannot wrap past the slice on any target width.
+                let skipped = 8 + length as usize;
+                rest = &rest[skipped..];
+                frame_no -= 1; // a skipped frame decodes nothing
+                continue;
+            }
+            // Bytes after the last frame that do not start a frame:
+            // `zstd -d` refuses the whole file here ("unsupported
+            // format"), so half-decoding a prefix must not pass either.
+            Err(ruzstd::decoding::errors::FrameDecoderError::ReadFrameHeaderError(
+                ruzstd::decoding::errors::ReadFrameHeaderError::BadMagicNumber(_),
+            ))
+            | Err(ruzstd::decoding::errors::FrameDecoderError::ReadFrameHeaderError(
+                ruzstd::decoding::errors::ReadFrameHeaderError::MagicNumberReadError(_),
+            )) => {
+                bail!(
+                    "session file {} is zstd-compressed (Codex rollout format) but has trailing bytes after the last frame: byte {} onward is not a zstd frame; `zstd -d` refuses this file too — decompress what did decode manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                    label,
+                    offset
+                );
+            }
             Err(err) => bail!(
-                "session file {} is zstd-compressed (Codex rollout format) but decoding failed mid-stream: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                "session file {} is zstd-compressed (Codex rollout format) but frame {} (at byte {}) failed to decode: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
                 label,
+                frame_no,
+                offset,
                 err
             ),
         };
-        if n == 0 {
-            break;
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let n = match decoder.read(&mut chunk) {
+                Ok(n) => n,
+                Err(err) => bail!(
+                    "session file {} is zstd-compressed (Codex rollout format) but decoding failed mid-stream in frame {} (at byte {}): {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                    label,
+                    frame_no,
+                    offset,
+                    err
+                ),
+            };
+            if n == 0 {
+                break;
+            }
+            if decoded.len() + n > ZSTD_ROLLOUT_DECODE_MAX_BYTES {
+                bail!(
+                    "session file {} is zstd-compressed (Codex rollout format) and would decompress past the {} cap ({} bytes decoded so far, still in frame {}); refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                    label,
+                    "64 MiB",
+                    decoded.len(),
+                    frame_no
+                );
+            }
+            decoded.extend_from_slice(&chunk[..n]);
         }
-        if decoded.len() + n > ZSTD_ROLLOUT_DECODE_MAX_BYTES {
-            bail!(
-                "session file {} is zstd-compressed (Codex rollout format) and would decompress past the {} cap; refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-                label,
-                "64 MiB"
-            );
-        }
-        decoded.extend_from_slice(&chunk[..n]);
+        // Recover the exact end-of-frame position: the decoder advanced
+        // the slice it consumed, and `into_parts` hands that slice back,
+        // so the next iteration starts precisely at the next frame.
+        rest = decoder.into_parts().0;
     }
     if decoded.is_empty() {
         bail!(
