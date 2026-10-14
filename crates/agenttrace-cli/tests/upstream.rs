@@ -54,6 +54,15 @@ fn run_cli(cwd: &Path, args: &[&str]) -> Output {
     for (key, value) in GIT_ENV {
         command.env(key, value);
     }
+    // rm-1373: fence git discovery at the scratch parent (temp_dir) —
+    // every fixture this file plants lives BELOW it, and git stops
+    // ascending at a ceiling directory without checking it, so planted
+    // repositories are still discovered while host state ABOVE the
+    // ceiling (the conductor delegate TMPDIR lives inside a git repo)
+    // can never leak into the outside-a-repository assertions. This is
+    // git's own knob, so the CLI's `git rev-parse --show-toplevel`
+    // probe and agenttrace-core's find_git_root agree on the boundary.
+    command.env("GIT_CEILING_DIRECTORIES", std::env::temp_dir());
     command.output().expect("run agenttrace CLI")
 }
 

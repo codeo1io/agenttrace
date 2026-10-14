@@ -77,6 +77,66 @@ fn version_wins_over_invalid_lang() {
 }
 
 #[test]
+fn tui_launch_with_a_nonexistent_dir_fails_fast_before_the_tui() {
+    // rm-1012 rider (the rm-608 residual the validate_explicit_dir
+    // comment carried): `agenttrace -d /nonexistent` used to open an
+    // empty TUI with rc0 — the report, doctor, and mcp lanes had the
+    // admission check and the TUI launch path did not. It must exit
+    // rc2 naming -d, the same refusal `--doctor -d` gives, and must
+    // fire before any TUI launch is attempted.
+    let (code, stdout, stderr) = run_with_pipes(&["-d", "/nonexistent-agenttrace-rm1012"]);
+    assert_eq!(
+        code, 2,
+        "TUI -d admission must refuse a nonexistent dir with rc2; stderr: {stderr}"
+    );
+    let message = format!("{stdout}{stderr}");
+    assert!(
+        message.contains("session directory does not exist"),
+        "error must name the admission failure, got: {message}"
+    );
+    assert!(
+        message.contains("/nonexistent-agenttrace-rm1012"),
+        "error must name the offending -d value, got: {message}"
+    );
+    assert!(
+        message.contains("-d"),
+        "error must point at -d/--dir, got: {message}"
+    );
+    let lowered = message.to_ascii_lowercase();
+    assert!(
+        !lowered.contains("not a terminal"),
+        "the guard must fire before TUI launch, got: {message}"
+    );
+}
+
+#[test]
+fn tui_launch_with_a_file_dir_fails_fast_before_the_tui() {
+    // rm-1012 rider, file arm: -d pointing at a regular file must get
+    // the same rc2 refusal the --doctor lane gives, not an empty TUI.
+    let scratch =
+        std::env::temp_dir().join(format!("agenttrace-rm1012-file-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+    let file = scratch.join("plain-file");
+    std::fs::write(&file, "not a directory").expect("plant file");
+    let (code, stdout, stderr) = run_with_pipes(&["-d", file.to_str().expect("utf8 path")]);
+    let _ = std::fs::remove_dir_all(&scratch);
+    assert_eq!(
+        code, 2,
+        "TUI -d admission must refuse a file-valued dir with rc2; stderr: {stderr}"
+    );
+    let message = format!("{stdout}{stderr}");
+    assert!(
+        message.contains("not a directory"),
+        "error must name the file arm, got: {message}"
+    );
+    let lowered = message.to_ascii_lowercase();
+    assert!(
+        !lowered.contains("not a terminal"),
+        "the guard must fire before TUI launch, got: {message}"
+    );
+}
+
+#[test]
 fn tui_launch_fails_cleanly_when_stdout_is_not_a_terminal() {
     // The README quickstart (`agenttrace`) panicked with exit 101 and a
     // Rust backtrace whenever stdout was a pipe. It must exit with a

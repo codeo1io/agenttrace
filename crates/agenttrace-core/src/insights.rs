@@ -693,7 +693,24 @@ fn git_root(path: &Path) -> Option<PathBuf> {
 // as `cwd`, the honest answer for a path that deep.
 const GIT_ROOT_MAX_DEPTH: usize = 64;
 
+/// rm-1373: `GIT_CEILING_DIRECTORIES` — git's own discovery fence, a
+/// colon-separated list of absolute paths the walk never rises into
+/// (the starting directory itself is still examined). Empty or
+/// relative entries are ignored; this reader mirrors both rules.
+fn git_ceiling_dirs() -> Vec<PathBuf> {
+    let Some(raw) = std::env::var_os("GIT_CEILING_DIRECTORIES") else {
+        return Vec::new();
+    };
+    raw.to_string_lossy()
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect()
+}
+
 fn find_git_root(path: &Path) -> Option<PathBuf> {
+    let ceilings = git_ceiling_dirs();
     let mut current = if path.is_dir() { path } else { path.parent()? };
     let mut depth = 0;
     loop {
@@ -708,7 +725,31 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
         if depth >= GIT_ROOT_MAX_DEPTH {
             return None;
         }
-        current = current.parent()?;
+        // rm-1373 fence, git's barrier exactly: the walk never RISES to
+        // a ceiling directory. `next` being a ceiling is the ancestor
+        // case — git stops without ever checking the ceiling, so an
+        // ancestor `.git` above the fence is host state, not this
+        // session's project. `current` being a ceiling can only be the
+        // start directory (every later `current` was a vetted `next`):
+        // git always examines the start itself ("It will not exclude
+        // the current working directory" — proven live: `rev-parse`
+        // from inside a repo listed in the ceiling still reports it)
+        // but never lets a fenced start leak upward. Honoring git's own
+        // knob keeps agenttrace's attribution in agreement with what
+        // git would report for the same cwd (an operator fencing git
+        // off slow network mounts fences this walk too; repos below any
+        // ceiling are still discovered, so real-repo behavior is
+        // unchanged). The per-path memo in `git_root` treats the
+        // ceiling as fixed for the process, the same reading git gives
+        // its own environment.
+        let next = current.parent()?;
+        if ceilings
+            .iter()
+            .any(|ceiling| ceiling == next || ceiling == current)
+        {
+            return None;
+        }
+        current = next;
     }
 }
 
@@ -1055,12 +1096,47 @@ mod tests {
     fn unique_decode_root(label: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "at-{}-{:?}-{}-{label}",
             std::process::id(),
             std::thread::current().id(),
             seq
-        ))
+        ));
+        // rm-1373: fence git-repo discovery AT this root by appending it to
+        // GIT_CEILING_DIRECTORIES — find_git_root honors git's own knob —
+        // so the decode/verification walk can never attribute a fixture
+        // session to host state ABOVE the scratch. (The conductor delegate
+        // TMPDIR lives inside a git repo, which used to flip these tests
+        // host-dependently: `insights::tests::decode 2-failed/1-pass`.) The
+        // list only ever GROWS: each entry is one test's own unique
+        // subtree, so a fence leaked from a finished test is inert for
+        // every other fixture, and appending — never overwriting — keeps
+        // concurrently-running siblings fenced. Inert pre-fix, decisive
+        // post-fix, so the red-first shape survives.
+        {
+            let _env = crate::test_env::lock_env();
+            append_git_ceiling_fence(&root);
+        }
+        root
+    }
+
+    /// Adds one ceiling entry (see `unique_decode_root`): append-only, so
+    /// sibling fixtures keep their fences while this one lands.
+    fn append_git_ceiling_fence(dir: &std::path::Path) {
+        let entry = dir.to_string_lossy().to_string();
+        let mut fences: Vec<String> = std::env::var_os("GIT_CEILING_DIRECTORIES")
+            .map(|raw| {
+                raw.to_string_lossy()
+                    .split(':')
+                    .filter(|fence| !fence.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !fences.contains(&entry) {
+            fences.push(entry);
+            std::env::set_var("GIT_CEILING_DIRECTORIES", fences.join(":"));
+        }
     }
 
     #[test]
@@ -1131,6 +1207,82 @@ mod tests {
         assert!(project_matches(&session, "my-rep"));
         assert!(project_matches(&session, "projectfilter"));
         assert!(!project_matches(&session, "zzz-nomatch"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_ceiling_bounds_ancestor_trust_to_the_fenced_tree() {
+        // rm-1373 host-shape pin: the suite used to be host-conditional —
+        // with TMPDIR inside a git repo (the conductor delegate env),
+        // find_git_root verified sessions against the OUTER repo, and
+        // ".hermes" won over "my-repo" 2-for-2 in the decode tests plus
+        // upstream.rs's outside-a-repo pin (1050/3 vs 1053/0 across a
+        // TMPDIR swap, red reproduced live at 904f0f3). The fence is now
+        // git's own: with GIT_CEILING_DIRECTORIES bounding discovery, an
+        // ancestor `.git` ABOVE the fence is host state and must not be
+        // trusted — while the SAME `.git` stays trusted for an unfenced
+        // sibling, pinning that ancestor trust for unfenced (real-repo)
+        // walks is unchanged product behavior. Red pre-fix (the fenced
+        // arm resolved to the planted ancestor repo), green post-fix.
+        let root = unique_decode_root("ceilingpin");
+        let hostile = root.join("hostile");
+        fs::create_dir_all(hostile.join(".git")).expect("plant ancestor repo");
+        let fenced = hostile.join("fenced").join("my-repo");
+        fs::create_dir_all(&fenced).expect("plant fenced session dir");
+        let open = hostile.join("open").join("my-repo");
+        fs::create_dir_all(&open).expect("plant unfenced control dir");
+        {
+            let _env = crate::test_env::lock_env();
+            append_git_ceiling_fence(&fenced);
+        }
+
+        let pinned = resolve_project(&session_at(&fenced.to_string_lossy(), "/x.jsonl"));
+        assert_eq!(
+            pinned.display_name, "my-repo",
+            "fenced arm must not resolve above the ceiling"
+        );
+        assert_eq!(pinned.resolution, "cwd");
+
+        let control = resolve_project(&session_at(&open.to_string_lossy(), "/y.jsonl"));
+        assert_eq!(
+            control.display_name, "hostile",
+            "unfenced control must still trust ancestors"
+        );
+        assert_eq!(control.resolution, "git_root");
+
+        // Start-at-ceiling exemption (git: "It will not exclude the
+        // current working directory"): a session INSIDE a fenced
+        // repository still attributes to it, and a fenced start with no
+        // `.git` of its own never leaks up past the fence to the hostile
+        // ancestor — the two arms a naive "never check a ceiling"
+        // reading gets wrong (proved live against `git rev-parse` at
+        // this HEAD: cwd==ceiling inside a repo reports the repo rc0; a
+        // fenced empty dir under a repo reports not-a-repository rc128).
+        let repo_ceiling = hostile.join("atrepo");
+        fs::create_dir_all(repo_ceiling.join(".git")).expect("plant repo at ceiling");
+        {
+            let _env = crate::test_env::lock_env();
+            append_git_ceiling_fence(&repo_ceiling);
+        }
+        let at_repo = resolve_project(&session_at(&repo_ceiling.to_string_lossy(), "/z.jsonl"));
+        assert_eq!(
+            at_repo.display_name, "atrepo",
+            "a start that IS a ceiling is still examined and its repo wins"
+        );
+        assert_eq!(at_repo.resolution, "git_root");
+
+        let bare_ceiling = hostile.join("fence2");
+        fs::create_dir_all(&bare_ceiling).expect("plant fenced empty dir");
+        {
+            let _env = crate::test_env::lock_env();
+            append_git_ceiling_fence(&bare_ceiling);
+        }
+        let at_bare = resolve_project(&session_at(&bare_ceiling.to_string_lossy(), "/w.jsonl"));
+        assert_eq!(
+            at_bare.display_name, "fence2",
+            "a fenced start must not leak attribution above the fence"
+        );
+        assert_eq!(at_bare.resolution, "cwd");
         let _ = fs::remove_dir_all(root);
     }
 
