@@ -5,7 +5,38 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 62;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+// Bumped 62 -> 65 (run 7a63e9bb cycle 3 'gemini-cli lane truth: phantom
+// checkpoints out, linear scans out, writer drift tolerated', attempt
+// 2d4e9c67 @ base 38f29a6, rm-1377 LEAD): two arms of the batch change
+// what UNCHANGED files serve. (1) Discovery stops admitting
+// `~/.gemini/tmp/<hash>/checkpoints/*.json` — each such doc is an
+// upstream ToolCallData snapshot (toolCall + commitHash/messageId
+// embedding the whole clientHistory), so the directory minted one
+// phantom gemini_cli session per checkpoint and counted the
+// conversation 1+N times (assess 10424d06 F1: sessions 2 / $0.0034 with
+// checkpoints vs 1 / $0.0033 control). Warm v62 caches hold those
+// sessions as parsed entries under matching fingerprints, and the
+// stored dir listings were written by the pre-1377 walker (the listing
+// replays its own admission filter — rm-1377 re-validates the gemini
+// gate on replay, so the file LIST corrects live, while the parsed
+// entries need the rung per the rm-230 convention: parser-semantics
+// changes that alter reported totals for unchanged files bump the
+// schema so cached sessions regenerate under corrected accounting).
+// (2) The chats claim rule now tolerates writer drift: an id-bearing
+// record outside the current writer enum is skipped WITH DISCLOSURE
+// (gemini_chats_skipped_record_type:*) instead of sinking the claim,
+// so a drifted journal that v62 refused to the generic lane (silent
+// zero) now counts under the chats lane — its served totals change.
+// SEAM: this worktree's base 38f29a6 carries the landed 62; the fleet
+// census at mint time (live conductor worktrees, 2026-10-14) shows the
+// frontier at 64 (integration of run 90514a38, rm-1052) with 63 held
+// by the pre-integration family (runs e62e2630/b12ec8fd/d94b2eec) — 65
+// is minted as the lowest rung unique above that frontier
+// (e944a060/0a55a397 convention), one invalidation either way: if this
+// stack meets the landed 64 first, 65 sits directly above it on the
+// ladder; the gate reconciles by rung order, never renumber.
+// Entries regenerate once on next scan.
 // Bumped 59 -> 62 (run 4309a268 cycle 1 'silent-zero closeout',
 // attempt 97c41efd @ base b798247, rm-715 LEAD): gemini-cli >= 0.63
 // chats record streams (~/.gemini/tmp/<hash>/chats/session-*.jsonl)
