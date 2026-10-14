@@ -47,18 +47,72 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
         );
     }
     // Codex ≥0.152 stores rollouts as zstd frames (magic 28 B5 2F FD,
-    // upstream PR #41357); they are no longer plain JSONL. Name the
-    // format instead of failing with a generic "not valid UTF-8"
-    // (pass-7 research, candidate 44 minimum).
-    if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        bail!(
-            "session file {} is zstd-compressed (Codex rollout format); decompress it to JSONL first (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-            label
-        );
-    }
+    // upstream PR #41357); they are no longer plain JSONL. Decode them
+    // in-process — bounded, because a rollout is untrusted input and a
+    // frame may decompress arbitrarily large — and keep the named-format
+    // failure wording for frames we still cannot use (rm-992).
+    let raw = if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        decode_zstd_rollout_bounded(raw, label)?
+    } else {
+        raw
+    };
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
     parse_raw_session(name, label, &raw)
+}
+
+/// Output cap for in-process zstd rollout decode (rm-992). Compressed
+/// rollouts are untrusted input, so decode stops and discloses at this
+/// bound instead of allocating whatever the frame claims — the same
+/// 64 MiB order as the transport bound in `pricing.rs` (upstream #318
+/// precedent). A rollout past the cap is refused loudly; the operator
+/// can always decompress manually and re-run.
+const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Decode one zstd-compressed Codex rollout, bounded by
+/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`]. Every failure keeps the named-format
+/// wording (never a generic UTF-8 error): a corrupt frame names the decode
+/// failure, an empty frame says so, and an over-cap frame names the cap.
+fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = match ruzstd::decoding::StreamingDecoder::new(&raw[..]) {
+        Ok(decoder) => decoder,
+        Err(err) => bail!(
+            "session file {} is zstd-compressed (Codex rollout format) but the frame failed to decode: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+            label,
+            err
+        ),
+    };
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = match decoder.read(&mut chunk) {
+            Ok(n) => n,
+            Err(err) => bail!(
+                "session file {} is zstd-compressed (Codex rollout format) but decoding failed mid-stream: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                label,
+                err
+            ),
+        };
+        if n == 0 {
+            break;
+        }
+        if decoded.len() + n > ZSTD_ROLLOUT_DECODE_MAX_BYTES {
+            bail!(
+                "session file {} is zstd-compressed (Codex rollout format) and would decompress past the {} cap; refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                label,
+                "64 MiB"
+            );
+        }
+        decoded.extend_from_slice(&chunk[..n]);
+    }
+    if decoded.is_empty() {
+        bail!(
+            "session file {} is zstd-compressed (Codex rollout format) but decompressed to 0 bytes; nothing to parse",
+            label
+        );
+    }
+    Ok(decoded)
 }
 
 /// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):

@@ -4,6 +4,18 @@
 
 ### Added
 
+- codex rollouts decode in-process, bounded (rm-992, run dae397f3 cycle 2):
+  Codex ≥0.163 writes rollout transcripts as zstd frames (upstream #53732),
+  and the parser's magic-byte bail left every new default-channel rollout as a
+  manual-decompress instruction. `parse_session_bytes` now decodes zstd
+  frames in-process via the pure-Rust `ruzstd` decoder, bounded at 64 MiB of
+  decompressed output per file — a frame past the cap is refused loudly (a
+  named error carrying the cap and the manual `zstd -d` recovery path), a
+  corrupt frame names the decode failure instead of surfacing as an opaque
+  UTF-8 error, and an empty frame says so. Piped stdin (`agenttrace … -`)
+  shares the same decode lane. A new golden fixture pair under
+  `tests/fixtures/codex-zstd/` pins decode-parity with the uncompressed twin
+  and the over-cap refusal.
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
