@@ -778,6 +778,16 @@ pub struct Overview {
     /// member sessions (`magnitude_clamped:*` counters) — rendered
     /// beside the total cost so a clamped $42.7T cannot look clean.
     pub clamped_values: usize,
+    /// rm-1500: count of member sessions whose `cost_estimated` is
+    /// non-finite (poisoned or overflowing pricing inputs — e.g. a NaN
+    /// REAL column read back from a sqlite lane). Their cost is
+    /// EXCLUDED from every aggregate fold below (total, agent, model,
+    /// provider, task-type, project, branch) and disclosed here and
+    /// beside the rendered total, using the same `non_finite_costs`
+    /// vocabulary as the insights data-health census (pass-8 F8-5) so
+    /// `--overview` and the insights report agree on the exclusion —
+    /// a poisoned session must never read as clean zero-spend.
+    pub non_finite_costs: usize,
     pub healthy: usize,
     pub warning: usize,
     pub critical: usize,
@@ -2514,7 +2524,17 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
     let mut overview = Overview::default();
     for session in sessions {
         overview.total_sessions += 1;
-        overview.total_cost += session.metrics.cost_estimated;
+        // rm-1500: skip-while-counting at every cost fold below — one
+        // poisoned session must never read as clean zero-spend (and never
+        // silently propagate through the attribution split either).
+        let session_cost = session.metrics.cost_estimated;
+        let cost_finite = session_cost.is_finite();
+        if !cost_finite {
+            overview.non_finite_costs += 1;
+        }
+        if cost_finite {
+            overview.total_cost += session_cost;
+        }
         if session.health >= 80 {
             overview.healthy += 1;
         } else if session.health >= 50 {
@@ -2537,7 +2557,11 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         // byte-identical to before (same source_tool fallback).
         let agent_entry = overview.by_agent.entry(agent).or_default();
         agent_entry.sessions += 1;
-        agent_entry.cost += session.metrics.cost_estimated;
+        // rm-1500: the agent rollup skips poisoned costs like every
+        // other fold (counted in overview.non_finite_costs).
+        if cost_finite {
+            agent_entry.cost += session_cost;
+        }
 
         let model = if session.metrics.model_used.is_empty() {
             "unknown".to_string()
@@ -2555,8 +2579,8 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         // pre-batch rollup guaranteed and agenttrace.overview.v1 machine
         // consumers sum against. Unattributed sessions (single- or
         // multi-model) keep the one-bucket full-cost behavior.
-        if session.metrics.model_attribution.is_empty() {
-            model_entry.cost += session.metrics.cost_estimated;
+        if session.metrics.model_attribution.is_empty() && cost_finite {
+            model_entry.cost += session_cost;
         }
 
         // rm-949 (cycle 3): the per-model attribution costs are priced
@@ -2591,7 +2615,7 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .values()
             .map(|attribution| attribution.cost_usd)
             .sum();
-        if attributed_total > 0.0 {
+        if attributed_total > 0.0 && cost_finite {
             let scale = 1.0e4_f64;
             let total_units = (session.metrics.cost_estimated * scale).round() as i64;
             let attribution_items: Vec<_> = session.metrics.model_attribution.iter().collect();
@@ -2655,7 +2679,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .unwrap_or_else(|| "unknown".to_string());
         let provider_entry = overview.by_provider.entry(provider).or_default();
         provider_entry.sessions += 1;
-        provider_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            provider_entry.cost += session_cost;
+        }
 
         // rm-726: surface the magnitude-clamp census beside the total.
         overview.clamped_values += session
@@ -2671,7 +2697,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .entry(infer_task_type(session).to_string())
             .or_default();
         task_type_entry.sessions += 1;
-        task_type_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            task_type_entry.cost += session_cost;
+        }
         // rm-541: token sums saturate, never `+=`. These per-session totals
         // arrive from untrusted logs (a hostile journal pins i64::MAX), so
         // a bare `+=` aborted debug builds with `attempt to add with
@@ -2697,7 +2725,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .entry(project_name(session))
             .or_default();
         project_entry.sessions += 1;
-        project_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            project_entry.cost += session_cost;
+        }
 
         // rm-585 (spend-by-branch, first cut): branch values come only
         // from the claude-code lane's gitBranch envelope. Missing,
@@ -2714,7 +2744,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         };
         let branch_entry = overview.by_branch.entry(branch_bucket).or_default();
         branch_entry.sessions += 1;
-        branch_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            branch_entry.cost += session_cost;
+        }
 
         for anomaly in &session.anomalies {
             overview.anomalies_top.push(AnomalyTop {
@@ -2850,7 +2882,11 @@ fn quota_window(
             if share > 0.0 {
                 sessions_contributing += 1;
             }
-            spend_usd += session.metrics.cost_estimated * share;
+            // rm-1500: share distribution skips poisoned costs; the
+            // session is already counted in overview.non_finite_costs.
+            if session.metrics.cost_estimated.is_finite() {
+                spend_usd += session.metrics.cost_estimated * share;
+            }
         }
     }
     QuotaWindow {
@@ -3108,7 +3144,10 @@ pub fn format_count(value: usize) -> String {
 
 pub fn format_cost(value: f64) -> String {
     if !value.is_finite() {
-        return "$0.0000".to_string();
+        // rm-1500: non-finite is a null marker on human lanes — never
+        // "$0.0000", which reads as a clean zero-spend session. The JSON
+        // lanes serialize the raw f64 (null) per the insights contract.
+        return "—".to_string();
     }
     let value = value + 0.0;
     let abs = value.abs();

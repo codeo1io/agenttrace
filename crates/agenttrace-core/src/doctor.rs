@@ -677,6 +677,16 @@ impl DoctorDisclosureFold {
         for (key, count) in &session.metrics.line_skips {
             *self.dropped_lines.entry(key.clone()).or_insert(0) += count;
         }
+        // rm-1500: --doctor must agree with --overview (and the insights
+        // data-health census) that a non-finite cost session exists — it
+        // is excluded from cost aggregates there and disclosed here under
+        // the same `non_finite_costs` vocabulary.
+        if !session.metrics.cost_estimated.is_finite() {
+            *self
+                .disclosures
+                .entry("non_finite_costs".to_string())
+                .or_insert(0) += 1;
+        }
     }
 }
 
