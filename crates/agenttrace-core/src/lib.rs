@@ -61,7 +61,8 @@ pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
     list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
+    pricing_source_for, provider_for, render_model_pricing_list, render_test_match, update_pricing,
+    Price,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
@@ -2779,18 +2780,53 @@ struct QuotaWindow {
 /// a cost on — the last event timestamp when the parse carried one
 /// (fresh parses), else the parsed `session_end` (warm-cache rows,
 /// which lose the event-timestamp vector to its serde skip).
-fn quota_cutoff(sessions: &[Session]) -> Option<DateTime<Utc>> {
-    sessions
-        .iter()
-        .filter_map(|session| {
-            session
-                .metrics
-                .timestamps
-                .last()
-                .copied()
-                .or_else(|| parse_ts(&session.metrics.session_end))
-        })
-        .max()
+///
+/// rm-1402 (run f2fccaa9 cycle 3, assess 53af6c9e F3): the cutoff is
+/// the newest PLAUSIBLE instant, never an unbounded max(). A
+/// future-dated last event or `session_end` (hostile meter, clock
+/// skew, one fabricated journal line) used to anchor every rolling
+/// window in the future, pushing all real events outside the
+/// trailing spans — the assess PoC corpus billed $0.0045 against an
+/// honest $1.52, hiding 99.7% of the spend. Instants after `now`
+/// are discarded at a disclosed clock-skew guard: the anchor falls
+/// back to the newest at-or-before-now instant the session still
+/// carries (an earlier event timestamp, or a warm-cache
+/// `session_start`), and sessions with no plausible instant are
+/// counted as discarded, never silently dropped. Returns
+/// `(cutoff, future_discarded_sessions)`.
+fn quota_cutoff(sessions: &[Session]) -> (Option<DateTime<Utc>>, usize) {
+    let now = Utc::now();
+    let mut cutoff: Option<DateTime<Utc>> = None;
+    let mut future_discarded = 0usize;
+    for session in sessions {
+        let anchor = match session
+            .metrics
+            .timestamps
+            .last()
+            .copied()
+            .or_else(|| parse_ts(&session.metrics.session_end))
+        {
+            Some(ts) => ts,
+            None => continue,
+        };
+        if anchor <= now {
+            cutoff = Some(cutoff.map_or(anchor, |c: DateTime<Utc>| c.max(anchor)));
+            continue;
+        }
+        future_discarded += 1;
+        let rescued = session
+            .metrics
+            .timestamps
+            .iter()
+            .rev()
+            .find(|ts| **ts <= now)
+            .copied()
+            .or_else(|| parse_ts(&session.metrics.session_start).filter(|ts| *ts <= now));
+        if let Some(ts) = rescued {
+            cutoff = Some(cutoff.map_or(ts, |c: DateTime<Utc>| c.max(ts)));
+        }
+    }
+    (cutoff, future_discarded)
 }
 
 /// The share of a session's cost that sits inside `[start, end]`.
@@ -2910,7 +2946,7 @@ fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json
 /// masquerade as a live quota. Schema `agenttrace.quota/1` is stable:
 /// the README "Quota view" section documents every key.
 pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
-    let cutoff = quota_cutoff(sessions);
+    let (cutoff, future_discarded) = quota_cutoff(sessions);
     let (event_basis, span_basis, unplaced) = quota_attribution_census(sessions);
     let (five_hour, weekly) = match cutoff {
         Some(cutoff) => (
@@ -2930,7 +2966,8 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
                 "corpus": {
                     "sessions": sessions.len(),
                     "cutoff_utc": serde_json::Value::Null,
-                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time",
+                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time; rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+                    "future_discarded_sessions": future_discarded,
                     "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
                     "attribution": {
                         "event_timestamps": event_basis,
@@ -2954,7 +2991,8 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
         "corpus": {
             "sessions": sessions.len(),
             "cutoff_utc": quota_ts(&five_hour.end),
-            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end)",
+            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+            "future_discarded_sessions": future_discarded,
             "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
             "attribution": {
                 "event_timestamps": event_basis,
@@ -3019,6 +3057,16 @@ fn render_quota_text(report: &serde_json::Value) -> String {
         "  attribution     event-timestamp share ({}), start/end span share ({} warm-cache), unplaced ({})\n",
         attribution["event_timestamps"], attribution["session_span"], attribution["unplaced"],
     ));
+    // rm-1402: the clock-skew guard must be visible in the text lane
+    // too — a discarded future timestamp is a disclosure, not a
+    // silent edit of the corpus.
+    if let Some(discarded) = corpus["future_discarded_sessions"].as_u64() {
+        if discarded > 0 {
+            out.push_str(&format!(
+                "  clock skew       {discarded} session(s) carry timestamps after now — discarded; the cutoff is the newest at-or-before-now instant\n"
+            ));
+        }
+    }
     out.push_str(
         "  limits          unknown — agenttrace reads no credentials and knows no plan limits\n",
     );
@@ -4897,5 +4945,119 @@ mod quota_tests {
             err.to_string().contains("-f text and -f json only"),
             "format guard names the supported lanes: {err}"
         );
+    }
+
+    #[test]
+    fn quota_cutoff_clamps_future_skewed_timestamps() {
+        // rm-1402 (run f2fccaa9 cycle 3, assess 53af6c9e F3): the
+        // cutoff used to be an unbounded max() over every last-event /
+        // session_end instant, so ONE future-dated journal line
+        // (clock skew or a hostile meter) anchored the rolling
+        // windows in the future and every real event fell OUTSIDE the
+        // trailing spans — the PoC corpus billed $0.0045 against an
+        // honest $1.52 (99.7% of spend hidden). The cutoff is now the
+        // newest PLAUSIBLE instant: timestamps after now are
+        // discarded at a disclosed clock-skew guard, and the discard
+        // count rides `corpus.future_discarded_sessions`.
+        //
+        // 2099 stays implausibly future for the life of this pin; the
+        // real events use fixed past stamps so the corpus is
+        // deterministic regardless of when the test runs.
+        let sessions = vec![
+            quota_session(
+                "real",
+                &["2026-10-12T10:00:00Z", "2026-10-12T10:30:00Z"],
+                1.52,
+            ),
+            quota_session(
+                "skewed",
+                &["2099-06-01T00:00:00Z", "2099-06-01T01:00:00Z"],
+                0.0045,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(
+            report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z",
+            "the cutoff is the newest timestamp at-or-before now, never the 2099 skew"
+        );
+        assert_eq!(
+            report["corpus"]["future_discarded_sessions"], 1,
+            "the clamp firing is disclosed in the corpus block"
+        );
+        assert!(
+            report["corpus"]["cutoff_basis"]
+                .as_str()
+                .expect("cutoff basis string")
+                .contains("clock-skew guard"),
+            "the basis names the clock-skew guard"
+        );
+        assert_eq!(
+            report["five_hour"]["spend_usd"], 1.52,
+            "both real events sit inside the 5h window; the skewed line bills 0"
+        );
+        assert_eq!(
+            report["weekly"]["spend_usd"], 1.52,
+            "the honest weekly number is restored (pre-fix: $0.0045, 99.7% hidden)"
+        );
+        assert_eq!(
+            report["weekly"]["sessions_contributing"], 1,
+            "only the plausible session contributes"
+        );
+    }
+
+    #[test]
+    fn quota_future_only_corpus_discloses_null_cutoff() {
+        // Every session in the future: the clamp discards them all,
+        // so the corpus has NO plausible cutoff — undefined windows
+        // with a discard count, never a future-anchored zero-spend
+        // masquerade and never a silent empty report.
+        let sessions = vec![
+            quota_session("hostile", &["2099-06-01T00:00:00Z"], 5.0),
+            quota_span_session(
+                "hostile-span",
+                "2099-06-02T00:00:00Z",
+                "2099-06-02T06:00:00Z",
+                7.0,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert!(
+            report["corpus"]["cutoff_utc"].is_null(),
+            "no plausible cutoff"
+        );
+        assert_eq!(report["corpus"]["future_discarded_sessions"], 2);
+        assert!(report["five_hour"].is_null() && report["weekly"].is_null());
+        let text = render_quota_view("text", &sessions).expect("text lane renders");
+        assert!(
+            text.contains("no session carries placeable time"),
+            "fully future corpus renders the undefined-cutoff lane: {text}"
+        );
+    }
+
+    #[test]
+    fn quota_span_sessions_honor_the_future_clamp() {
+        // Warm-cache sessions place by session_end; a future session_end
+        // must hit the same clock-skew guard as event timestamps, while
+        // a real span keeps its TTL-correct share beside it.
+        let sessions = vec![
+            quota_span_session(
+                "real-span",
+                "2026-10-12T04:30:00Z",
+                "2026-10-12T10:30:00Z",
+                6.0,
+            ),
+            quota_span_session(
+                "future-span",
+                "2099-06-01T00:00:00Z",
+                "2099-06-01T06:00:00Z",
+                1.0,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z");
+        assert_eq!(report["corpus"]["future_discarded_sessions"], 1);
+        // 6h span, 5h window overlap: $6.00 x 5/6 = $5.00, weekly $6.00.
+        assert_eq!(report["five_hour"]["spend_usd"], 5.0);
+        assert_eq!(report["weekly"]["spend_usd"], 6.0);
     }
 }

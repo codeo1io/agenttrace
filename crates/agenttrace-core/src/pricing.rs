@@ -147,8 +147,11 @@ pub fn lookup_price(model: &str) -> Price {
 /// published behavior (codeburn #1642), not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
-    let model = resolve_alias(model, &catalog.aliases);
-    let mut price = lookup_price_in(&model, &catalog.entries);
+    // rm-1053 (run f2fccaa9 cycle 3, assess 53af6c9e F1): resolve
+    // through the raw-first ladder (see `resolution_ladder`) — a
+    // region/vendor-qualified id must bill at its own catalog row
+    // before the base-model collapse is consulted.
+    let mut price = lookup_price_in(model, &catalog.aliases, &catalog.entries);
     if service_tier == Some("flex") {
         if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
             price.input = input;
@@ -169,10 +172,9 @@ pub fn has_specific_price(model: &str) -> bool {
         return false;
     }
     let catalog = pricing_catalog();
-    let model = resolve_alias(model, &catalog.aliases);
-    match_variants(&model)
-        .into_iter()
-        .any(|variant| catalog.entries.contains_key(&variant))
+    // rm-1053: raw-first ladder, so a qualified id counts as priced
+    // through its own row too.
+    matching_catalog_key_for(model, &catalog.aliases, &catalog.entries).is_some()
 }
 
 pub fn list_pricing() -> BTreeMap<String, Price> {
@@ -440,9 +442,13 @@ pub fn provider_for(model: &str) -> Option<String> {
 }
 
 fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
-    let normalized = normalize_model(model);
-    let resolved = resolve_alias(&normalized, &catalog.aliases);
-    let key = matching_catalog_key(&resolved, &catalog.entries)?;
+    // rm-1053: the same raw-first ladder the rate lookup uses, so the
+    // provider rides the row that served the rate. (This used to
+    // normalize the id a second time — normalize of a normalize — so
+    // a dated, versioned, regional id resolved to a different key
+    // than its own rate did, and by-provider attributed the wrong
+    // vendor for exactly those rows.)
+    let key = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries)?;
     catalog
         .providers
         .get(&key)
@@ -457,7 +463,12 @@ fn pricing_source_for_catalog(
 ) -> String {
     let normalized = normalize_model(model);
     let resolved = resolve_alias(&normalized, &catalog.aliases);
-    let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
+    // rm-1053: raw-first ladder — a qualified id's own row is found
+    // before the base collapse resolves. `resolved` stays
+    // alias-of-normalized: the override arms below detect whether an
+    // alias actually moved the id, which raw-form resolution would
+    // misreport for every qualified id.
+    let Some(key) = matching_catalog_key_for(model, &catalog.aliases, &catalog.entries) else {
         return "built-in fallback".to_string();
     };
     if override_models.contains(&key) {
@@ -626,6 +637,16 @@ pub fn render_test_match() -> String {
         "anthropic/claude-sonnet-4-6",
         "vertex_ai/claude-opus-4-5@20251101",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        // rm-1053: the regional-twin probe family — every one of
+        // these must show its OWN row's rates, not the base-model
+        // collapse winner (us $3.30, global $3.00, us-gov $3.60,
+        // bedrock GovCloud $3.60 input per M).
+        "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "bedrock/us-gov-east-1/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "azure/us-gov/gpt-5.1",
         "openai/gpt-4.1",
         "gpt-5.6",
         "gpt-4.1-mini-2025-04-14",
@@ -937,12 +958,21 @@ fn write_pricing_cache_at(path: &Path, raw: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn lookup_price_in(model: &str, entries: &BTreeMap<String, Price>) -> Price {
-    if let Some(key) = matching_catalog_key(model, entries) {
+fn lookup_price_in(
+    model: &str,
+    aliases: &BTreeMap<String, String>,
+    entries: &BTreeMap<String, Price>,
+) -> Price {
+    // rm-1053 (run f2fccaa9 cycle 3): catalog first, on the raw-first
+    // ladder — the id exactly as the session recorded it wins before
+    // any normalization collapses it onto a base-model row. Only a
+    // model the catalog does not know at all falls to the built-in
+    // table, which keeps the alias-resolved ladder it always had.
+    if let Some(key) = matching_catalog_key_for(model, aliases, entries) {
         return entries.get(&key).cloned().unwrap_or_default();
     }
     let builtin = builtin_pricing();
-    for variant in match_variants(model) {
+    for variant in match_variants(&resolve_alias(model, aliases)) {
         if let Some(price) = builtin.get(&variant) {
             return price.clone();
         }
@@ -954,6 +984,75 @@ fn matching_catalog_key(model: &str, entries: &BTreeMap<String, Price>) -> Optio
     match_variants(model)
         .into_iter()
         .find(|variant| entries.contains_key(variant))
+}
+
+/// rm-1053: the ordered id ladder for catalog resolution. The id
+/// EXACTLY as the session recorded it leads, so a region/vendor-
+/// qualified catalog row (kept under its raw id by
+/// `qualified_catalog_id` during conversion) wins before
+/// normalization collapses the id onto the base-model row; the
+/// alias-resolved variants follow. Rate, provider, and pricing-source
+/// lookups all resolve through this one ladder, so they can never
+/// disagree about which row served a given session id.
+fn resolution_ladder(model: &str, aliases: &BTreeMap<String, String>) -> Vec<String> {
+    let resolved = resolve_alias(model, aliases);
+    let mut ladder: Vec<String> = Vec::with_capacity(8);
+    for variant in match_variants(model)
+        .into_iter()
+        .chain(match_variants(&resolved))
+    {
+        if !ladder.contains(&variant) {
+            ladder.push(variant);
+        }
+    }
+    // rm-1053: catalog ids are canonicalized to lowercase at
+    // conversion (see `qualified_catalog_id`), so a mixed-case
+    // deployment id ("anyscale/meta-llama/Meta-Llama-3-70B-Instruct")
+    // must still hit its own row — the lowercased raw form slots in
+    // right after the exact raw form, before any normalized variant.
+    let lower = model.trim().to_ascii_lowercase();
+    if !lower.is_empty() && !ladder.contains(&lower) {
+        ladder.insert(1, lower);
+    }
+    ladder
+}
+
+fn matching_catalog_key_for(
+    model: &str,
+    aliases: &BTreeMap<String, String>,
+    entries: &BTreeMap<String, Price>,
+) -> Option<String> {
+    resolution_ladder(model, aliases)
+        .into_iter()
+        .find(|variant| entries.contains_key(variant))
+}
+
+/// rm-1053: the catalog id a region/vendor-qualified LiteLLM key must
+/// keep under its own raw name, or `None` when the key is a plain
+/// base identity (or a true duplicate of one) and belongs to the
+/// provider-priority base collapse unchanged. Matches the qualifier
+/// classes `normalize_model` strips: any '/'-path deployment id, and
+/// the dotted regional prefixes in front of a vendor marker
+/// (`us.`/`eu.`/`global.`/`au.`/`apac.`/`jp.`/`us-gov.` before
+/// `.anthropic.`/`.google.`/`.meta.`/`.amazon.`).
+fn qualified_catalog_id(key: &str, normalized: &str) -> Option<String> {
+    let canonical = key.trim().to_ascii_lowercase();
+    if canonical == normalized {
+        return None;
+    }
+    if canonical.contains('/') {
+        // Path-qualified deployment ids: openrouter/anthropic/…,
+        // vertex_ai/…@default, bedrock/<region>/…, azure/us-gov/….
+        return Some(canonical);
+    }
+    for marker in [".anthropic.", ".google.", ".meta.", ".amazon."] {
+        if let Some(idx) = canonical.find(marker) {
+            if idx > 0 {
+                return Some(canonical);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -1226,6 +1325,20 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         };
     };
     let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    // rm-1053 (run f2fccaa9 cycle 3, assess 53af6c9e F1): region/
+    // vendor-qualified LiteLLM ids are their own SKUs, not duplicates
+    // of the base model — `us.anthropic.…`, `us-gov.anthropic.…`,
+    // `bedrock/us-gov-east-1/…`, `azure/us-gov/…` carry regional list
+    // prices the base identity does not (the assess PoC: global
+    // billed the us sibling's $3.30 against its own $3.00 row;
+    // us-gov under-billed $3.60 as $3.30). Retain each qualified row
+    // under its own raw id so a session naming the qualified form
+    // bills at THAT row, while the same key still votes in the base
+    // collapse below exactly as before — plain session ids keep the
+    // base winners they have always had. True duplicates (same
+    // vendor, dated snapshots of one model) stay collapsed by
+    // provider priority; see `qualified_catalog_id`.
+    let mut qualified: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -1275,10 +1388,36 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             continue;
         }
         let priority = provider_priority(&model.provider);
+        if let Some(qualified_id) = qualified_catalog_id(&key, &normalized) {
+            match qualified.get(&qualified_id) {
+                Some((existing, _, _)) if *existing >= priority => {}
+                _ => {
+                    qualified.insert(
+                        qualified_id,
+                        (priority, price.clone(), model.provider.clone()),
+                    );
+                }
+            }
+        }
         match selected.get(&normalized) {
             Some((existing, _, _)) if *existing >= priority => {}
             _ => {
                 selected.insert(normalized, (priority, price, model.provider));
+            }
+        }
+    }
+    // Qualified ids cannot collide with base identities in the real
+    // catalog (base ids carry no path prefix and no regional marker;
+    // tests/regional_pricing_contract.rs sweeps the whole bundled
+    // snapshot and fails loudly if a refresh ever makes one collide),
+    // so this merge is additive in practice. The priority guard stays
+    // the same dedup discipline the collapse itself uses, so even a
+    // pathological collision resolves deterministically.
+    for (name, (priority, price, provider)) in qualified {
+        match selected.get(&name) {
+            Some((existing, _, _)) if *existing >= priority => {}
+            _ => {
+                selected.insert(name, (priority, price, provider));
             }
         }
     }

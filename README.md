@@ -376,6 +376,19 @@ credentials — both windows are rolling and the JSON says so in
 `corpus.window_anchor`, and `corpus.cutoff_utc` discloses the corpus age
 so a stale corpus cannot masquerade as a live quota.
 
+The cutoff is the newest **plausible** instant, never an unbounded max:
+timestamps after now (hostile journals reached the year 2031) are
+discarded at a clock-skew guard (rm-1402), because one future-dated
+line would otherwise anchor both windows in the future and hide every
+real event outside them — a poisoned corpus billed $0.0045 against an
+honest $1.52. The guard's effect is disclosed, not silent:
+`corpus.future_discarded_sessions` counts the discarded sessions and
+`corpus.cutoff_basis` names the clamp, a session whose anchor is
+implausibly future falls back to the newest at-or-before-now instant it
+still carries, and a corpus with no plausible instant renders undefined
+windows with the discard count rather than a future-anchored zero-spend
+masquerade.
+
 `-f json` emits the stable `agenttrace.quota/1` schema; the default text
 lane summarizes the same numbers. The view is corpus-scope: `--range`,
 `--sample`, and the history flags do not apply to it and are refused
@@ -446,11 +459,11 @@ fails when the README table drifts from the binary's actual flag count
 | `-m <MODEL>` | `default` | Reference model for `--compare` framing (cost-rate attribution in the comparison narrative; not a session filter — see `--model-filter`) |
 | `-o <OUTPUT>` |  | Write the report to this path instead of stdout (the report is also kept on stdout — a tee, not a redirect). Regular paths stage atomically through a temp sibling (rm-250); terminal sinks like /dev/null and /dev/stdout write through directly, while fifo/socket/block-device targets are refused with a disclosed reason instead of being replaced (rm-489). Missing parent directories are created recursively (mkdir -p semantics); when a parent cannot be created, the error names the directory and the requested target (rm-784) |
 | `--latest` |  | Restrict the view to the single most recent session (works with `--waste` and report actions) |
-| `--waste` |  | Render the token-waste report: redundant context, loop cost, and unused tool output, with a per-reason breakdown |
-| `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes |
+| `--waste` |  | Render the token-waste report: redundant context, loop cost, and unused tool output, with a per-reason breakdown. The cache-efficiency grade runs on the cache-INCLUSIVE basis — reads / (reads + fresh input) — because `tokens_input` is the parser's fresh-only (cache-exclusive) basis, on which reads routinely exceed input; the raw exclusive ratio stays disclosed (`hit_rate_exclusive_percent` in `-f json`) instead of being graded as an anomaly (rm-339) |
+| `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes. Region/vendor-qualified ids (e.g. `us.anthropic.…`, `bedrock/us-gov-east-1/…`) are their own catalog rows and bill at their own regional rates (rm-1053) |
 | `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |
 | `--test-match` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification) |
-| `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range` and the other view filters do not apply and are refused loudly |
+| `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. The cutoff clamps at the newest at-or-before-now instant — future-dated timestamps are discarded at a disclosed clock-skew guard (rm-1402) so a hostile or skewed journal line cannot hide the real spend. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range` and the other view filters do not apply and are refused loudly |
 | `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
 | `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
 | `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
