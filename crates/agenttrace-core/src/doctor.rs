@@ -31,6 +31,9 @@ pub struct DoctorReport {
     /// `pi_branches`, `pi_entry_skipped:<type>`,
     /// `pi_message_role:<role>`, and the other INFORMATIONAL
     /// `disclosure_counters` (`kimi_usage_alias:…`,
+    /// `locally_defined_model_pricing:<slug>` +
+    /// `locally_defined_priced_cents` — usage priced at the fabricated
+    /// builtin default, rm-1426),
     /// `duplicate_spelling_normalized`,
     /// `model_label_non_assistant_ignored`, …): journal facts the
     /// accounting deliberately does not count, kept visible. Since

@@ -4,6 +4,22 @@
 
 ### Added
 
+- locally-defined model pricing is disclosed, not silently fabricated (rm-1426,
+  run 7ee18a0d cycle 3): codex `model_catalog_json` / private-proxy deployments
+  record slugs no pricing row backs — bare `glm-5.2` is absent from the bundled
+  snapshot, live LiteLLM and the builtin table while ~90 prefixed `zai/glm-5.2`
+  carrier rows exist — so every lookup priced such usage at the builtin default
+  ($3.00/$15.00 per Mtok) with zero indication. `pricing::is_default_fallback`
+  classifies the slug (variant-ladder-accurate, unlike the exact-key
+  `has_specific_price`); `analyze` now mints
+  `locally_defined_model_pricing:{slug}` occurrence counters and a
+  `locally_defined_priced_cents` total (both arms: per-block and the
+  single-model catalog formula; upstream-recorded cost excluded, staying in the
+  rm-1052 lane) into the metrics disclosure channel — insights
+  `data_health.disclosures` and doctor's per-session fold render them with no
+  further plumbing. An `AGENTTRACE_PRICING_FILE` row for the slug is the
+  operator escape hatch and flips the disclosure off.
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously

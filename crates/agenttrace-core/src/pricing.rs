@@ -175,6 +175,65 @@ pub fn has_specific_price(model: &str) -> bool {
         .any(|variant| catalog.entries.contains_key(&variant))
 }
 
+/// rm-1426: true when no pricing row NAMES this deployment's model, so any
+/// quoted price is fabricated for it. Two arms, both silent before this:
+/// (a) nothing matches and `lookup_price_in` answers the builtin default
+/// ($3.00/$15.00 per Mtok — the `builtin.get("default")` fall-through);
+/// (b) `convert_litellm` collapses carrier prefixes onto bare slugs
+/// (`zai/glm-5.2` -> `glm-5.2`), so a locally-defined slug that shares a
+/// name with ANY public carrier row is priced from whichever carrier wins
+/// `provider_priority` (research 2026-10-14: bare `glm-5.2`, the codex
+/// `model_catalog_json` / CLIProxyAPI deployment slug, prices at a foreign
+/// carrier's $0.152/$12.00 while the ~90 real carrier rows disagree and
+/// the operator is privately billed at different rates). Neither arm is
+/// the model's own price. Confirmed — false — when an exact published row
+/// (bare key or the carrier-prefixed slug as recorded), an operator alias,
+/// an `AGENTTRACE_PRICING_FILE` row (see `PRICING_OVERRIDE_MODELS`), or an
+/// exact builtin row names the model; `""`/`"default"`/`"unknown"` stay
+/// out (missing identity is a different disclosure). Callers disclose
+/// (`locally_defined_model_pricing:{slug}`, plus the dollars at the
+/// fabricated rate), never silently bill; rm-1052 is the sibling rule for
+/// recorded-zero providers.
+pub fn is_locally_defined(model: &str) -> bool {
+    if matches!(model.trim(), "" | "default" | "unknown") {
+        return false;
+    }
+    let catalog = pricing_catalog();
+    // Operator or built-in SKU alias mapping this slug onto a named row.
+    if resolve_alias(model, &catalog.aliases) != model {
+        return false;
+    }
+    let normalized = normalize_model(model);
+    // Exact published row — the bare key, or the slug carrying its own
+    // carrier prefix as the session recorded it.
+    if raw_snapshot_keys().contains(model) || raw_snapshot_keys().contains(&normalized) {
+        return false;
+    }
+    // Operator override file binds this slug (the pricing-catalog loader
+    // records every model an accepted override file names).
+    if pricing_override_models().contains(&normalized) {
+        return false;
+    }
+    // Curated builtin row naming this exact model.
+    if builtin_pricing().contains_key(&normalized) {
+        return false;
+    }
+    true
+}
+
+/// Exact keys as published in the bundled snapshot, BEFORE
+/// `convert_litellm` normalizes/collapses carrier prefixes. rm-1426 uses
+/// this to tell a row that names the deployment's own slug from a foreign
+/// carrier's row that merely shares the collapsed name.
+fn raw_snapshot_keys() -> &'static BTreeSet<String> {
+    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        serde_json::from_str::<BTreeMap<String, serde_json::Value>>(PRICING_SNAPSHOT_JSON)
+            .map(|rows| rows.into_keys().collect())
+            .unwrap_or_default()
+    })
+}
+
 pub fn list_pricing() -> BTreeMap<String, Price> {
     let mut entries = builtin_pricing();
     entries.remove("default");
