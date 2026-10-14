@@ -6996,19 +6996,63 @@ fn cline_unix_timestamp(value: i64) -> String {
 }
 
 fn timestamp_millis(ms: i64) -> String {
-    let secs = ms / 1000;
-    let nsec = ((ms % 1000) * 1_000_000) as u32;
+    // rm-1501: euclidean div/rem keep pre-epoch (negative) instants exact —
+    // truncating `/`/`%` fed a negative remainder into a wrapping `as u32`
+    // nanos field, so every pre-1970 timestamp rendered as "".
+    let secs = ms.div_euclid(1000);
+    let nsec = ms.rem_euclid(1000) as u32 * 1_000_000;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
         .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default()
 }
 
 fn timestamp_millis_nanos(ms: i64) -> String {
-    let secs = ms / 1000;
-    let nsec = ((ms % 1000) * 1_000_000) as u32;
+    // rm-1501: same euclidean fix as `timestamp_millis`.
+    let secs = ms.div_euclid(1000);
+    let nsec = ms.rem_euclid(1000) as u32 * 1_000_000;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
         .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod rm_1501_tests {
+    //! rm-1501 — pre-epoch (negative) millisecond timestamps must render
+    //! as real pre-1970 instants, not silently vanish as empty strings.
+    //! Root cause: truncating `/` and `%` on negative `i64` fed a wrapping
+    //! `as u32` nanos field, so `from_timestamp` returned `None`.
+    use super::{timestamp_millis, timestamp_millis_nanos};
+
+    #[test]
+    fn pre_epoch_millis_render_pre_1970_instants() {
+        assert_eq!(
+            timestamp_millis(-1),
+            "1969-12-31T23:59:59.999Z",
+            "-1 ms is one millisecond before the epoch"
+        );
+        assert_eq!(
+            timestamp_millis(-86_400_000),
+            "1969-12-31T00:00:00.000Z",
+            "a full pre-epoch day must not render empty"
+        );
+        // Post-epoch behavior is pinned unchanged.
+        assert_eq!(timestamp_millis(1), "1970-01-01T00:00:00.001Z");
+        assert_eq!(timestamp_millis(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn pre_epoch_millis_nanos_render_pre_1970_instants() {
+        assert_eq!(
+            timestamp_millis_nanos(-1),
+            "1969-12-31T23:59:59.999000000Z",
+            "nanos arm: -1 ms = 999,000,000 ns before the epoch"
+        );
+        assert_eq!(
+            timestamp_millis_nanos(-86_400_000),
+            "1969-12-31T00:00:00.000000000Z"
+        );
+        assert_eq!(timestamp_millis_nanos(1), "1970-01-01T00:00:00.001000000Z");
+    }
 }
 
 fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {
