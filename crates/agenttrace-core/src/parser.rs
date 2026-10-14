@@ -2519,6 +2519,38 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                     });
                 }
             }
+            // rm-990 (stranded cycle-1 batch, run b5d391ec cycle 2):
+            // pi >= 1.1.0 settles EVERY agent run with
+            // {type:"agent_settled", aborted:bool} once (dist
+            // agent-session.js writes it when the run loop ends; the
+            // Esc-cancelled outcome carries aborted:true). Before
+            // this arm those entries fell to pi_entry_skipped below
+            // and a cancelled run was indistinguishable from a
+            // finished one on every surface — the spend of an
+            // aborted run still counts (its usage entries are real),
+            // so the honest fix is counting the OUTCOME, not zeroing
+            // the tokens. Counted per outcome into the session's
+            // disclosure counters: data_health/--doctor surface
+            // `pi_agent_settled:<outcome>` corpus-wide, and the
+            // governance report flags aborted runs per session.
+            // Absence-tolerant: journals from older writers never
+            // emit the type and see no change. The optional
+            // durationMs field is deliberately NOT read (cut-first
+            // stop-rule, same discipline as the schema-deferred arms
+            // above).
+            "agent_settled" => {
+                let outcome = match obj.get("aborted").and_then(Value::as_bool) {
+                    Some(true) => "aborted",
+                    Some(false) => "finished",
+                    // The settle still happened; the outcome flag is
+                    // missing or non-boolean — counted separately
+                    // rather than guessed into either bucket.
+                    None => "unknown",
+                };
+                *counters
+                    .entry(disclosure_key("pi_agent_settled", outcome))
+                    .or_insert(0) += 1;
+            }
             other => {
                 // rm-436 counter family (rm-437 evidence): every other
                 // documented-but-uncounted entry type stays visible as

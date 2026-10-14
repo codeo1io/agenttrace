@@ -111,6 +111,84 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 #[test]
+fn pi_agent_settled_counts_outcomes_and_splits_cancelled_from_finished() {
+    // rm-990 (stranded cycle-1 batch, run b5d391ec cycle 2): pi >=
+    // 1.1.0 settles EVERY agent run once — the shipped dist emits
+    // {type:"agent_settled", aborted:bool} when the run loop ends
+    // (agent-session.js, verified against the 1.1.0 install on this
+    // host, 2026-10-12), and the Esc-cancelled outcome carries
+    // aborted:true. Before the parser arm landed, those entries fell
+    // to `pi_entry_skipped:agent_settled` and a cancelled run was
+    // indistinguishable from a finished one on every surface. No
+    // 1.1.0 journal existed on this host at fixture time, so the
+    // journal below is synthesized to the shipped emitter's exact
+    // keys (header + one user message so the parse is non-empty,
+    // then one settle per outcome plus a flag-absent line).
+    let journal = concat!(
+        "{\"id\":\"00000000-0000-4000-8000-0000000000a1\",\"timestamp\":\"2026-10-12T01:00:00.000Z\",\"type\":\"session\",\"version\":3,\"cwd\":\"/redacted/project\"}\n",
+        "{\"id\":\"00000000-0000-4000-8000-0000000000a2\",\"timestamp\":\"2026-10-12T01:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"timestamp\":\"2026-10-12T01:00:01.000Z\"},\"type\":\"message\"}\n",
+        "{\"id\":\"00000000-0000-4000-8000-0000000000s1\",\"timestamp\":\"2026-10-12T01:00:05.000Z\",\"type\":\"agent_settled\",\"aborted\":true}\n",
+        "{\"id\":\"00000000-0000-4000-8000-0000000000s2\",\"timestamp\":\"2026-10-12T01:00:10.000Z\",\"type\":\"agent_settled\",\"aborted\":false}\n",
+        "{\"id\":\"00000000-0000-4000-8000-0000000000s3\",\"timestamp\":\"2026-10-12T01:00:15.000Z\",\"type\":\"agent_settled\"}\n",
+    );
+    let session = parse_raw_session("pi-v3", "synthetic:pi-1.1.0-agent-settled.jsonl", journal)
+        .expect("1.1.0-shaped journal must parse (v3 header + message + settles)");
+    let counters = &session.metrics.disclosure_counters;
+    assert_eq!(
+        counters.get("pi_agent_settled:aborted"),
+        Some(&1),
+        "aborted:true settle"
+    );
+    assert_eq!(
+        counters.get("pi_agent_settled:finished"),
+        Some(&1),
+        "aborted:false settle"
+    );
+    assert_eq!(
+        counters.get("pi_agent_settled:unknown"),
+        Some(&1),
+        "flag-absent settle counts as unknown, never guessed"
+    );
+    assert_eq!(
+        counters.get("pi_entry_skipped:agent_settled"),
+        None,
+        "the settled entries must leave the skipped family — they are parsed now"
+    );
+    // Governance surface: the cancelled/finished split reaches the
+    // report reader, not only data_health/--doctor counters.
+    let recommendations = agenttrace_core::recommendations(std::slice::from_ref(&session));
+    let aborted = recommendations
+        .iter()
+        .find(|item| item.id == "aborted-runs")
+        .expect("a session with aborted runs gets the split on the governance surface");
+    assert!(
+        aborted.evidence.iter().any(|line| line == "aborted_runs=1"),
+        "evidence names the aborted count: {:?}",
+        aborted.evidence
+    );
+    // Absence tolerance: the 1.0.2-era fixture has no settle entries
+    // and must see no counters, no recommendation, no drift — the
+    // arm is purely additive on the wire.
+    let legacy =
+        parse_raw_session("pi-v3", PI_V3, &fixture(PI_V3)).expect("legacy fixture still parses");
+    assert!(
+        legacy
+            .metrics
+            .disclosure_counters
+            .keys()
+            .all(|key| !key.starts_with("pi_agent_settled")),
+        "legacy journals never grow settle counters: {:?}",
+        legacy.metrics.disclosure_counters
+    );
+    assert!(
+        !agenttrace_core::recommendations(std::slice::from_ref(&legacy))
+            .iter()
+            .any(|item| item.id == "aborted-runs"),
+        "no aborted runs, no recommendation"
+    );
+}
+
+#[test]
 fn pi_v3_journal_header_contract() {
     let header = header_object(PI_V3);
     require_key(PI_V3, &header, "type");

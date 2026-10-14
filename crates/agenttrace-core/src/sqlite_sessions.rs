@@ -16,6 +16,21 @@ struct RoleCounts {
 #[derive(Debug, Default)]
 struct SqliteSessionAgg {
     id: String,
+    /// rm-991 (stranded cycle-1 batch, run b5d391ec cycle 2):
+    /// opencode `session.agent` — the named internal agent that ran
+    /// the session (build/plan/worker/…). `None` for hermes rows and
+    /// for opencode schemas without the column; read leniently so a
+    /// wrong-typed value degrades to "unattributed" instead of
+    /// dropping the session row.
+    agent_name: Option<String>,
+    /// rm-991: opencode summarizer counters (`summary_additions`,
+    /// `summary_deletions`, `summary_files`) — corpus-edit facts the
+    /// upstream row records; surfaced on Metrics so `--inspect`-class
+    /// JSON shows them without inventing a rollup that does not exist
+    /// yet. `None` when the columns are absent or NULL.
+    summary_additions: Option<i64>,
+    summary_deletions: Option<i64>,
+    summary_files: Option<i64>,
     /// rm-791: opencode `session.parent_id` — links a subagent child row
     /// to its parent row within the same database. `None` for hermes rows
     /// and for opencode schemas without the column.
@@ -714,8 +729,46 @@ fn opencode_sqlite_session_rows(
     } else {
         "null"
     };
+    // rm-991 (stranded cycle-1 batch, run b5d391ec cycle 2): the db's
+    // own attribution and summarizer columns, guarded the same way so
+    // a v2-era or older database without them still loads (live host
+    // db 2026-10-12: 305/310 sessions carry `agent`, 297/310 carry
+    // the summary triple — the columns are real and populated, not
+    // speculative). Missing columns become null and the row indices
+    // stay stable across schemas.
+    let agent_select = if sqlite_has_column(db, "session", "agent") {
+        "agent"
+    } else {
+        "null"
+    };
+    let summary_columns = [
+        (
+            "summary_additions",
+            sqlite_has_column(db, "session", "summary_additions"),
+        ),
+        (
+            "summary_deletions",
+            sqlite_has_column(db, "session", "summary_deletions"),
+        ),
+        (
+            "summary_files",
+            sqlite_has_column(db, "session", "summary_files"),
+        ),
+    ];
+    let summary_select = summary_columns
+        .iter()
+        .map(|(column, present)| {
+            if *present {
+                (*column).to_string()
+            } else {
+                "null".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
-        "select id, title, time_created, time_updated, {directory}, {stored_select}, {parent_select} \
+        "select id, title, time_created, time_updated, {directory}, {stored_select}, {parent_select}, \
+         {agent_select}, {summary_select} \
          from session where (?1 is null or time_created >= ?1 or time_created is null or time_created <= 0)"
     );
     let mut stmt = match db.prepare(&sql) {
@@ -756,6 +809,13 @@ fn opencode_sqlite_session_rows(
                 // parent_id degrades to "no linkage" instead of failing
                 // (and thereby dropping) the whole session row.
                 parent_id: sqlite_value_as_text(row.get(11)?),
+                // rm-991: same leniency — a wrong-typed agent or
+                // summary value degrades to unattributed / absent,
+                // never drops the row.
+                agent_name: sqlite_value_as_text(row.get(12)?),
+                summary_additions: sqlite_value_as_i64(row.get(13)?),
+                summary_deletions: sqlite_value_as_i64(row.get(14)?),
+                summary_files: sqlite_value_as_i64(row.get(15)?),
                 source_tool: "opencode_db".to_string(),
                 path: path.to_string_lossy().to_string(),
                 ..SqliteSessionAgg::default()
@@ -1249,6 +1309,15 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     // load (subagents.rs) — never a stale link on its own.
     metrics.session_key = agg.id.clone();
     metrics.parent_session = agg.parent_id.unwrap_or_default();
+    // rm-991: the db's own attribution + summarizer facts ride on Metrics
+    // (serde-default, so warm snapshots from before this field load
+    // unchanged and need no schema bump — same pattern as parent_session).
+    // `agent_name` feeds the overview `by_agent` split; the summary triple
+    // is carried for the inspect-class surfaces and future rollups.
+    metrics.agent_name = agg.agent_name.clone().unwrap_or_default();
+    metrics.summary_additions = agg.summary_additions.unwrap_or(0);
+    metrics.summary_deletions = agg.summary_deletions.unwrap_or(0);
+    metrics.summary_files = agg.summary_files.unwrap_or(0);
     let anomalies = detect_anomalies(&metrics);
     // Research candidate 34: OpenCode fills `title` with a
     // `New session - <timestamp>` placeholder on every session it does
@@ -1411,6 +1480,147 @@ mod tests {
             ..SqliteSessionAgg::default()
         });
         assert_eq!(session.cwd, "/work/sqlite");
+    }
+
+    /// rm-991 (stranded cycle-1 batch, run b5d391ec cycle 2): two
+    /// golden schemas over the SAME read-only query —
+    ///
+    /// - legacy (pre-agent) opencode `session` table: the guarded
+    ///   columns are absent; every session still loads, attribution
+    ///   stays "unattributed" (empty `agent_name`), summary counters
+    ///   stay zero, and the overview `by_agent` key is the plain
+    ///   source tool — byte-identical behavior to before this row.
+    /// - current live schema (verified on the fleet host db,
+    ///   2026-10-12: 305/310 sessions carry `agent`, 297/310 the
+    ///   summary triple): `agent` splits the by_agent rollup into
+    ///   `opencode_db:<agent>` buckets, and the summarizer counters
+    ///   land on Metrics for the inspect-class surfaces.
+    ///
+    /// The wrong-typed-value leg pins the lenient readers: a corrupt
+    /// agent cell degrades to unattributed instead of dropping the
+    /// session row (the drop class rm-753 closed for session rows).
+    #[test]
+    fn opencode_agent_and_summary_columns_load_across_schemas() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm991-agent-columns-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("opencode.db");
+        let db = Connection::open(&path).expect("open fixture db");
+        // Legacy schema: cost/token columns only — no parent_id, no
+        // agent, no summary triple. This is the pre-1.18-era shape the
+        // guarded SELECT must keep loading.
+        db.execute_batch(
+            r#"
+            create table session (
+                id text primary key,
+                title text,
+                time_created integer,
+                time_updated integer,
+                directory text,
+                cost real,
+                tokens_input integer,
+                tokens_output integer,
+                tokens_reasoning integer,
+                tokens_cache_read integer,
+                tokens_cache_write integer
+            );
+            insert into session values
+                ('legacy-1', 'Legacy session', 1700000000000, 1700000600000, '/w/legacy', null, 10, 20, 0, 0, 0);
+            "#,
+        )
+        .expect("seed legacy schema");
+        let (aggs, failures, _) = opencode_sqlite_session_rows(&db, &path, None);
+        assert!(failures.is_clean(), "legacy schema must load clean");
+        let legacy = aggs.get("legacy-1").expect("legacy row loads");
+        assert_eq!(legacy.agent_name, None);
+        assert_eq!(legacy.summary_additions, None);
+        let legacy_session = session_from_sqlite_agg(SqliteSessionAgg {
+            id: "legacy-1".to_string(),
+            ..SqliteSessionAgg::default()
+        });
+        assert_eq!(legacy_session.metrics.agent_name, "");
+        assert_eq!(legacy_session.metrics.summary_additions, 0);
+
+        // Current schema: agent + parent_id + summary triple, one
+        // clean attributed row, one unattributed row, one WRONG-TYPED
+        // agent cell (a BLOB bypasses column affinity — the leniency
+        // leg rm-893 pinned for messages, here for the agent column).
+        let path2 = dir.join("opencode2.db");
+        let db2 = Connection::open(&path2).expect("open fixture db 2");
+        db2.execute_batch(
+            r#"
+            create table session (
+                id text primary key,
+                title text,
+                time_created integer,
+                time_updated integer,
+                directory text,
+                cost real,
+                tokens_input integer,
+                tokens_output integer,
+                tokens_reasoning integer,
+                tokens_cache_read integer,
+                tokens_cache_write integer,
+                parent_id text,
+                agent text,
+                summary_additions integer,
+                summary_deletions integer,
+                summary_files integer
+            );
+            insert into session (id, title, time_created, time_updated, directory, agent, summary_additions, summary_deletions, summary_files) values
+                ('cur-1', 'Build session', 1700000000000, 1700000600000, '/w/cur', 'build', 120, 30, 7),
+                ('cur-2', 'Anonymous session', 1700000700000, 1700001200000, '/w/cur', null, null, null, null),
+                ('cur-3', 'Corrupt agent cell', 1700001400000, 1700002000000, '/w/cur', x'00ff', 1, 0, 1);
+            "#,
+        )
+        .expect("seed current schema");
+        let (aggs2, failures2, _) = opencode_sqlite_session_rows(&db2, &path2, None);
+        assert!(failures2.is_clean(), "current schema must load clean");
+        let attributed = aggs2.get("cur-1").expect("attributed row loads");
+        assert_eq!(attributed.agent_name.as_deref(), Some("build"));
+        assert_eq!(attributed.summary_additions, Some(120));
+        assert_eq!(attributed.summary_deletions, Some(30));
+        assert_eq!(attributed.summary_files, Some(7));
+        assert_eq!(
+            aggs2.get("cur-2").and_then(|row| row.agent_name.clone()),
+            None,
+            "NULL agent stays unattributed"
+        );
+        assert_eq!(
+            aggs2.get("cur-3").and_then(|row| row.agent_name.clone()),
+            None,
+            "wrong-typed agent degrades to unattributed, row survives"
+        );
+
+        // The rollup split: attributed sessions fold under
+        // `opencode_db:<agent>`, unattributed keep the plain source
+        // tool, and the sum of bucket session counts still equals the
+        // total (additive split, no double counting).
+        let sessions: Vec<crate::Session> = aggs2
+            .into_values()
+            .map(|mut agg| {
+                agg.source_tool = "opencode_db".to_string();
+                agg.path = path2.to_string_lossy().to_string();
+                session_from_sqlite_agg(agg)
+            })
+            .collect();
+        let overview = crate::compute_overview(&sessions);
+        assert_eq!(overview.total_sessions, 3);
+        assert_eq!(
+            overview.by_agent.get("opencode_db:build").unwrap().sessions,
+            1
+        );
+        assert_eq!(overview.by_agent.get("opencode_db").unwrap().sessions, 2);
+        let bucket_total: usize = overview.by_agent.values().map(|group| group.sessions).sum();
+        assert_eq!(bucket_total, 3, "split must stay additive");
+        let build_session = sessions
+            .iter()
+            .find(|session| session.metrics.agent_name == "build")
+            .expect("build session carries agent_name on Metrics");
+        assert_eq!(build_session.metrics.summary_additions, 120);
+        assert_eq!(build_session.metrics.summary_files, 7);
     }
 
     #[test]

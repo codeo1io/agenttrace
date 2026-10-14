@@ -916,6 +916,16 @@ fn run() -> anyhow::Result<()> {
     }
 
     if let Some(query) = args.search.as_deref() {
+        // rm-988 (stranded cycle-1 batch, run b5d391ec cycle 2): a
+        // blank query used to fall through to search_sessions'
+        // defensive empty result — rc 0, count 0 — indistinguishable
+        // from "nothing matched" (assess PoC, 2026-10-12). Reject in
+        // the same dialect as --sample (main.rs:425): the caller
+        // almost certainly quoted the flag wrong, and silence here
+        // shaped the output instead of surfacing the mistake.
+        if query.trim().is_empty() {
+            bail!("--search requires a non-empty query");
+        }
         let results = search_sessions(&sessions, query, args.search_limit);
         let out = if args.format == "json" {
             report_search_json(&results)
@@ -2849,6 +2859,19 @@ fn validate_primary_action(args: &Args) -> anyhow::Result<()> {
         bail!(
             "--baseline cannot be combined with --compare: --baseline gates --overview -f json only"
         );
+    }
+    // rm-988 (stranded cycle-1 batch, run b5d391ec cycle 2): a blank
+    // --search was invisible to the action table below (blank query
+    // => not-an-action), so it fell through to the interactive TUI —
+    // or, next to another action, was silently dropped (rc 0, the
+    // other action rendered, --search ignored). Reject it here where
+    // the table is built, in the --sample dialect above.
+    if args
+        .search
+        .as_deref()
+        .is_some_and(|query| query.trim().is_empty())
+    {
+        bail!("--search requires a non-empty query");
     }
     let actions = [
         args.compare,

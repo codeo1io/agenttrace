@@ -164,6 +164,34 @@ fn range_with_a_session_action_still_works_piped() {
 }
 
 #[test]
+fn blank_search_query_rejects_loudly_instead_of_matching_nothing() {
+    // rm-988 (stranded cycle-1 batch, run b5d391ec cycle 2): a blank
+    // `--search` used to fall through to the library's defensive
+    // empty result — rc 0, `"count": 0` — indistinguishable from "no
+    // history matches" (assess PoC, 2026-10-12). Same silent-shaping
+    // failure class as the flags rm-593/rm-735 reject loudly. Both the
+    // empty string and whitespace-only must reject with a nonzero rc,
+    // an error (not a panic), and a message that names --search. The
+    // demo corpus keeps the probe hermetic and fast.
+    for (name, query) in [("empty", ""), ("whitespace", "   ")] {
+        let (code, stdout, stderr) = run_with_pipes(&["--demo", "--search", query]);
+        let message = format!("{stdout}{stderr}");
+        assert_ne!(
+            code, 0,
+            "--search with {name} query must not report success; stdout: {stdout}"
+        );
+        assert_ne!(
+            code, 101,
+            "must fail with an error, not a panic; stderr: {stderr}"
+        );
+        assert!(
+            message.contains("--search"),
+            "error must name --search (got: {message})"
+        );
+    }
+}
+
+#[test]
 fn demo_with_any_explicit_session_source_fails_loudly_not_silently() {
     // rm-735 (assess F2, run 06cc5c7d): `--demo` used to silently
     // substitute the bundled demo corpus for every explicit session

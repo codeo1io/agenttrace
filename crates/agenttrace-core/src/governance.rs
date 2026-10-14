@@ -791,6 +791,46 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
 pub fn recommendations(sessions: &[Session]) -> Vec<Recommendation> {
     let mut items = Vec::new();
     for session in sessions {
+        // rm-990 (stranded cycle-1 batch, run b5d391ec cycle 2): pi
+        // >= 1.1.0 journals settle every agent run with an
+        // `agent_settled` entry and the parser now counts the outcome
+        // (`pi_agent_settled:aborted|finished|unknown` disclosure
+        // counters). A session with aborted runs is not unhealthy —
+        // the spend is real and stays counted — but the governance
+        // reader deserves the split on this surface too, not only in
+        // data_health/--doctor: cancelled runs bias every per-session
+        // average (turns, tokens, cost) the same way partial data
+        // always does, and knowing WHICH sessions ended cancelled is
+        // the input to any "exclude aborted runs" analysis.
+        if let Some(aborted) = session
+            .metrics
+            .disclosure_counters
+            .get("pi_agent_settled:aborted")
+            .filter(|count| **count > 0)
+        {
+            items.push(recommendation(
+                "aborted-runs",
+                "low",
+                "agent_settled",
+                "Account for cancelled agent runs when comparing sessions",
+                format!(
+                    "{aborted} agent run(s) in this session settled aborted (Esc-cancelled in \
+                     pi); their spend is included in this report's totals.",
+                ),
+                vec![
+                    format!("session={}", session.name),
+                    format!("aborted_runs={aborted}"),
+                    "source=pi_agent_settled:aborted disclosure counter".to_string(),
+                ],
+                0.0,
+                0,
+                "high",
+                "No action required for accounting — the tokens are real. When \
+                 comparing sessions or averages, either exclude aborted runs or \
+                 normalize per finished run.",
+                "agenttrace --audit --diagnostics -f json",
+            ));
+        }
         let loop_cost = session.diagnostics.loop_cost.total_loop_cost;
         if loop_cost > 0.0 {
             items.push(recommendation(

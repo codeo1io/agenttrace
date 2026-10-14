@@ -663,6 +663,25 @@ pub struct Metrics {
     /// `attribute_subagents` after load.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent_session: String,
+    /// rm-991 (stranded cycle-1 batch, run b5d391ec cycle 2): opencode
+    /// `session.agent` — the named internal agent that ran the session
+    /// (build/plan/worker/…). Empty for lanes without the concept. The
+    /// overview `by_agent` rollup splits on it (`<source_tool>:<agent>`)
+    /// so the db's own attribution is visible instead of folded away.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_name: String,
+    /// rm-991: opencode summarizer counters from the session row
+    /// (`summary_additions`/`-deletions`/`-files`) — corpus-edit facts
+    /// surfaced by inspect-class JSON serialization; zero when the
+    /// columns are absent (older/v2-era schemas).
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub summary_additions: i64,
+    /// rm-991: see `summary_additions`.
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub summary_deletions: i64,
+    /// rm-991: see `summary_additions`.
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub summary_files: i64,
     /// rm-790: per-source row identity for DB-resident lanes (opencode
     /// `session.id`, hermes sessions `id`); empty for transcript lanes.
     /// Joins the derived-history session id preimage so two sessions
@@ -2428,7 +2447,21 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         } else {
             overview.critical += 1;
         }
-        let agent = session.metrics.source_tool.clone();
+        // rm-991 (stranded cycle-1 batch, run b5d391ec cycle 2): when
+        // the session row carries the db's own attribution (opencode
+        // `session.agent`), the rollup splits on it — `opencode_db:build`
+        // beside plain `opencode_db` — so 305/310 real-world sessions
+        // stop folding into one anonymous bucket. Lanes without the
+        // concept keep the source-tool key; the split is additive, so
+        // sum(by_agent[].sessions) still equals total_sessions.
+        let agent = if session.metrics.agent_name.is_empty() {
+            session.metrics.source_tool.clone()
+        } else {
+            format!(
+                "{}:{}",
+                session.metrics.source_tool, session.metrics.agent_name
+            )
+        };
         let agent_entry = overview.by_agent.entry(agent).or_default();
         agent_entry.sessions += 1;
         agent_entry.cost += session.metrics.cost_estimated;

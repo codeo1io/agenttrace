@@ -8,6 +8,11 @@ use std::collections::BTreeSet;
 pub fn search_sessions(sessions: &[Session], query: &str, limit: usize) -> Vec<SearchResult> {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
+        // A blank query matches nothing, so the CLI rejects it loudly
+        // before ever calling this (agenttrace-cli main.rs, the
+        // rm-988 dialect of --sample). This defensive empty return
+        // keeps the library function total for any other caller;
+        // the CLI guard is the rejection surface, never this arm.
         return Vec::new();
     }
     let mut results = Vec::new();
