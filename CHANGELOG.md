@@ -4,6 +4,50 @@
 
 ### Added
 
+- stdin sessions read through a named cap (rm-503, run 80e8beb6 cycle 1, batch
+  "bounded inputs, honest docs"): the `-` lane drained stdin without bound —
+  `cat /dev/zero | agenttrace --overview -` grew the process until the
+  allocator died (`read session from stdin: out of memory`, proven live under
+  a 256 MiB VM cap). The read now stops at 256 MiB (default): an over-cap
+  stream fails rc1 with a named `stdin session exceeds the read cap` error
+  carrying the effective cap, and `AGENTTRACE_STDIN_CAP_BYTES` raises or
+  lowers it (best-effort like every `AGENTTRACE_*` knob — an unparseable or
+  non-positive value falls back to the default instead of failing the run
+  over a typo). The cap fires on byte count alone, pre-parse, so a hostile
+  stream need not be valid JSON to be refused. Parity with the file path is
+  pinned by test (same fixture, byte-identical `--overview` output).
+
+- `--quota` refuses the view-filter family (rm-598, same batch): `--project`,
+  `--source`, and `--model-filter` flow into the discovery loader's view
+  filters, so under the corpus-scope quota view they silently emptied the
+  corpus — `--demo --quota --project nomatch` rendered "no session carries
+  placeable time" at exit 0 while the unfiltered view carried real windows,
+  the exact measured-zero masquerade the `--range` guard refuses. All three
+  now exit with a refusal naming the flag and `--quota` in the same voice as
+  the `--range` arm; the `check-docs-commands` gate exercises every pair
+  plus the unfiltered control (the first quota legs in the gate).
+
+- gemini chats journal upsert is indexed (rm-715, same batch): the upstream
+  reader's `messagesMap` is a map, but the journal replayer used a linear
+  `find` per appended record — every append rescanned the whole journal,
+  measured at 9.5 s for a 20k-record hostile append journal (quadratic). A
+  position index carries the same O(1) replace-or-append the reader has;
+  structural records (`$set`, `$rewindTo`, `$patch`) rewrite the vector
+  wholesale and rebuild the index, so the rare path pays O(n) and the common
+  append path never pays a rescan. A hostile 20k-record journal now parses
+  well under the test's linear bound (7.7 s red → 2.6 s green for the whole
+  contract suite).
+
+- delivery-evidence git probe drain is byte-capped (rm-731, same batch): the
+  probe's helper thread `read_to_end`'d the whole `git log --all` stream —
+  the 10 s timeout bounded the wait, never the buffer, so a pathological
+  repository log grew the drain without bound. The drain now stops at 64 KiB
+  and an overrun degrades the root to the documented heuristic (a truncated
+  commit census would silently bias the recency heuristic, so overflow means
+  unavailable, never partial). The bound is disclosed in the report's
+  `methodology` string alongside the timeout ("bounded at 10 seconds per
+  repository root and drains at most 64 KiB of log output"), pinned by test.
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
@@ -224,6 +268,23 @@
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
 ### Fixed
+
+- README flag docs tell the truth (rm-503/rm-598/rm-085/rm-1052 doc arms, run
+  80e8beb6 cycle 1, batch "bounded inputs, honest docs"): the README showed
+  `--since` in its view-filter prose — a flag that never existed (`--since`
+  is a usage error; the shipped filter is `--range`), so a documented filter
+  readers copy-pasted failed; the flag table's `-m` row now says there is no
+  `--model` long form (`--model` is a usage error — `-m` is the compare
+  reference model, `--model-filter` the session filter); `--lang`'s row
+  states its real coverage lane by lane (honored by single-session renders,
+  `--diagnostics`, `--inspect`, `--latest`, `--waste`, `--compare`, and the
+  TUI; English-only on the corpus rollups and the quota/search/insights/
+  governance text lanes for now); the `--quota` row names the flags it
+  refuses; and the estimates paragraph discloses the recorded-cost
+  suppression counter's honest gap — the suppressed estimate prices the same
+  four buckets as the formula, so 1h-tier cache writes (Claude's
+  `ephemeral_1h_input_tokens`) are outside it and the counter is a lower
+  bound until tier-aware pricing lands (rm-176).
 
 - **rm-1052 / rm-499 — pi cost truth: a recorded $0 no longer masquerades as a free session, and the 1h-tier cache write is counted.** The pi v3 recorded-cost arm kept recorded-wins (the rm-419 discipline — the recorded number stays authoritative) but a well-formed `cost.total == 0` — at the wire, a gateway passthrough that never priced the call is indistinguishable from a subscription flat rate — silently suppressed the catalog estimate for the whole block (598/600 sampled fleet journals carry exactly this zero). Every recorded-cost block now computes its suppressed catalog estimate — tier-aware (rm-610) when the block carries its own model — and discloses the divergence in both pricing arms (per-block and session-rate, so no session shape can hide it) via two informational counters: `recorded_cost_suppressed_estimate_cents` (the suppressed amount) and `recorded_cost_zero_blocks` (gateway-unpriced blocks, recorded $0 on priced tokens); a recorded cost that matches the catalog discloses nothing (negative control pinned). Alongside, pi's 1h-tier cache write (`cacheWrite1h`, carried by 77% of the live fleet corpus) gains its own `cache_write_1h_tokens` usage class — never folded into the 5m `cache_creation_input_tokens` class, since a fold would let a future pricing arm bill the 1h tier at the 5m rate — disclosed via the `pi_cache_write_1h_blocks` counter at all three `oh_my_pi_usage` call sites (message, compaction, and the standalone `type:"usage"` arm, added at the review fix); 1h-tier pricing itself stays gated until the catalog carries tier rates. PoC: a pi journal with 100k in / 50k out on claude-sonnet-4-5 and `cost.total == 0` reported `$0.0000, no markers` — now reports cost $0 (recorded, unchanged) with `recorded_cost_suppressed_estimate_cents = 105` ($1.05 suppressed) and `recorded_cost_zero_blocks = 1`; `cacheWrite1h: 99999` dropped silently, now surfaces its own class and counter. Session-cache schema bumped to 64 at this integration: the run minted 60 → 61 straight at its base 82e23b9, below the frontier — this tree had landed 62 (run 4309a268's gemini chats rung) and 63 (run b5affead's agent/summary-name rung, conflict case fbe92e4b80db45d0a2fb2b5c020b81a4) mid-run — so the rung re-bases onto the advanced ceiling as 63 → 64 per the landed-rung-keeps-numeral convention (c7c07e48/58fbbd6c), one invalidation either way (a warm pre-rung entry keeps serving the silent $0 and drops the 1h-tier class); conflict case 8fbcfcfd5e4d440b8e2890456aaacede. Pins: `recorded_zero_discloses_suppressed_catalog_estimate` + `recorded_cost_matching_catalog_discloses_nothing` (pi_usage_tree_accounting.rs), `pi_cache_write_1h_blocks_disclosed` + the `pi-cachewrite-1h` fixture (pi_journal_contract.rs), `pi_cache_write_1h_counts_standalone_usage_entries` (the standalone `type:"usage"` arm — the third call site, added at the review fix), `oh_my_pi_usage_cache_write_1h_is_own_class` (parser.rs unit), oracle `warm_cache_replays_cold_disclosure_and_schema_64_invalidates_v32` (usage_occurrence_contract.rs).
 

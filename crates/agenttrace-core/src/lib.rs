@@ -1909,6 +1909,16 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // disclosure, never repricing — mirroring rm-984's
     // recorded-vs-estimated stance for the Cursor lane onto every
     // recorded-cost arm.
+    // rm-1052 rider (run 80e8beb6 cycle 1): the counter is a LOWER
+    // BOUND on suppressed spend, and the docs must say so. The
+    // suppressed estimate prices the same four buckets as the
+    // estimate formula (input/output/cache-write/cache-read) —
+    // Claude's 1h-tier cache writes (`ephemeral_1h_input_tokens`)
+    // have no catalog rate yet (tier-aware pricing is rm-176), so a
+    // 1h-dominated gateway block suppresses an estimate that never
+    // counted its 1h bytes. The recorded number stays authoritative;
+    // the gap is disclosed in README's estimates paragraph, not
+    // hidden behind a tidy counter.
     for event in events.iter().filter(|event| {
         event
             .recorded_cost_usd

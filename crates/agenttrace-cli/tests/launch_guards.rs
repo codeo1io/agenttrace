@@ -561,3 +561,39 @@ fn nonempty_search_keeps_working_after_the_rejection() {
     );
     std::fs::remove_dir_all(&scratch).ok();
 }
+
+/// rm-598 quota-scope rider (run 80e8beb6 cycle 1, batch "bounded
+/// inputs, honest docs"): the view-filter family silently emptied the
+/// corpus under `--quota` — live PoC at cab6917: `--demo --quota
+/// --project nomatch` rendered "no session carries placeable time"
+/// at rc0 while the unfiltered view carried real 5h/7d windows, the
+/// measured-zero masquerade the `--range` guard refuses. The filters
+/// must be refused in the same voice, never swallowed.
+#[test]
+fn quota_refuses_the_view_filter_family() {
+    let work = std::env::temp_dir().join(format!(
+        "agenttrace-rm598-quota-filters-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    for filter in ["--project", "--source", "--model-filter"] {
+        let (code, _stdout, stderr) =
+            run_isolated(&["--demo", "--quota", filter, "nomatch"], &work);
+        assert_ne!(
+            code, 0,
+            "{filter} must not be silently swallowed under --quota"
+        );
+        assert!(
+            stderr.contains(&format!("{filter} does not apply to --quota")),
+            "{filter} refusal must name the pair in the guard's voice, got: {stderr}"
+        );
+    }
+    // Control: the unfiltered corpus-scope view still renders.
+    let (code, stdout, _stderr) = run_isolated(&["--demo", "--quota"], &work);
+    assert_eq!(code, 0, "the unfiltered quota view must keep working");
+    assert!(
+        stdout.contains("Quota view"),
+        "control run must render the quota windows, got: {stdout}"
+    );
+    std::fs::remove_dir_all(&work).ok();
+}

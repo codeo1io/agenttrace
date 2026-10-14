@@ -36,7 +36,10 @@ mod config;
 struct Args {
     /// Session file to analyze (`-` reads one session stream from
     /// stdin through the same parser; stdin sessions are ephemeral and
-    /// never touch the session cache)
+    /// never touch the session cache; the read is capped at 256 MiB
+    /// by default — an over-cap stream fails with a named error
+    /// instead of reading without bound, and AGENTTRACE_STDIN_CAP_BYTES
+    /// overrides the cap)
     path: Option<String>,
     /// Output format for the requested view: text (default), json, csv,
     /// markdown/md, html, svg (the shareable usage card; requires
@@ -1798,6 +1801,31 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
     load_sessions_report(args).map(|(sessions, _)| sessions)
 }
 
+/// rm-503 cap arm (run 80e8beb6 cycle 1, batch "bounded inputs,
+/// honest docs"): the `-` lane is an untrusted byte stream — the
+/// original read drained it with an unbounded `read_to_end`, so a
+/// hostile or accidental pipe (`cat /dev/zero | agenttrace --overview
+/// -`) grew the process until the allocator died (`read session from
+/// stdin: out of memory`, assess 146452bd live PoC under a 256 MiB VM
+/// cap). The read is bounded at [`STDIN_SESSION_MAX_BYTES`] and an
+/// over-cap stream fails with a named error carrying the effective
+/// cap. The bound is a knob, not a format contract:
+/// `AGENTTRACE_STDIN_CAP_BYTES` overrides it (best-effort like every
+/// other `AGENTTRACE_*` knob — unparseable or non-positive values
+/// fall back to the default rather than failing the run over a
+/// typo'd cap).
+const STDIN_SESSION_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Effective stdin read cap for this run (see
+/// [`STDIN_SESSION_MAX_BYTES`]).
+fn stdin_session_cap_bytes() -> u64 {
+    std::env::var("AGENTTRACE_STDIN_CAP_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(STDIN_SESSION_MAX_BYTES)
+}
+
 /// rm-735: `--demo` is itself a session source — it substitutes the
 /// bundled demo corpus for discovery. Combined with an explicit
 /// session source (a positional path, `-d/--dir`, or a `--range`
@@ -1898,10 +1926,24 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         // read nor write), which `--help` discloses. `-d` stays a
         // separate multi-session lane and is out of scope here.
         if path == "-" {
+            let cap = stdin_session_cap_bytes();
             let mut raw = Vec::new();
+            // rm-503 cap arm: take cap + 1 so overflow is detectable
+            // in a single read — the extra byte is the whole signal —
+            // and an over-cap stream refuses by name instead of
+            // growing without bound (the pre-fix PoC OOM'd at 200 MiB
+            // under a 256 MiB VM cap).
             io::stdin()
+                .take(cap + 1)
                 .read_to_end(&mut raw)
                 .context("read session from stdin")?;
+            if raw.len() as u64 > cap {
+                bail!(
+                    "stdin session exceeds the read cap: more than {cap} bytes on \
+                     stdin (set AGENTTRACE_STDIN_CAP_BYTES to raise or lower the cap; \
+                     default {STDIN_SESSION_MAX_BYTES})"
+                );
+            }
             return Ok((
                 prepare_explicit_sessions(vec![parse_stdin_bytes(raw)?], args)?,
                 None,
@@ -2824,6 +2866,34 @@ fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
         bail!(
             "--range does not apply to --quota: the quota view is corpus-scope (every discovered session bills the window); drop --range to see the full-corpus windows"
         );
+    }
+    // rm-598 quota-scope rider (run 80e8beb6 cycle 1, batch "bounded
+    // inputs, honest docs"): `--project`, `--source`, and
+    // `--model-filter` flow into the discovery loader's view filters,
+    // so on `--quota` they silently emptied the corpus — the same
+    // measured-zero masquerade the `--range` arm above refuses (live
+    // PoC at cab6917: `--demo --quota --project nomatch` rendered
+    // "no session carries placeable time" at rc0 while the
+    // unfiltered view carried real windows). Same guard family, same
+    // voice: the view-filter set cannot narrow a corpus-scope window.
+    if args.quota {
+        let mut filters = Vec::new();
+        if !args.project.is_empty() {
+            filters.push("--project");
+        }
+        if !args.source.is_empty() {
+            filters.push("--source");
+        }
+        if !args.model_filter.is_empty() {
+            filters.push("--model-filter");
+        }
+        if !filters.is_empty() {
+            let pair = filters.join("/");
+            let verb = if filters.len() == 1 { "does" } else { "do" };
+            bail!(
+                "{pair} {verb} not apply to --quota: the quota view is corpus-scope (every discovered session bills the window); drop the filter(s) to see the full-corpus windows"
+            );
+        }
     }
     if args.range != "all" && !has_session_action(args) {
         bail!(

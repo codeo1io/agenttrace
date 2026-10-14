@@ -243,3 +243,37 @@ fn old_usage_metadata_shape_still_counts() {
     assert_eq!(session.metrics.tokens_output, 200);
     assert_eq!(session.metrics.tokens_cache_r, 300);
 }
+
+/// rm-715 perf rider (run 80e8beb6 cycle 1, batch "bounded inputs,
+/// honest docs"): a hostile append-only journal must parse in linear
+/// time. At cab6917 every appended record rescanned the whole message
+/// vector (`Vec::find` upsert) — measured 9.5 s for 20k records; the
+/// indexed upsert parses the same journal in well under a second on
+/// this fleet's debug builds. The bound is deliberately generous
+/// (5 s, >15x the post-fix wall) so a loaded CI box never flakes,
+/// while the O(n^2) shape still cannot pass it.
+#[test]
+fn hostile_append_journal_parses_within_the_linear_bound() {
+    const RECORDS: i64 = 20_000;
+    let mut journal = String::with_capacity(RECORDS as usize * 200);
+    journal.push_str(METADATA_LINE);
+    journal.push('\n');
+    for i in 0..RECORDS {
+        journal.push_str(&format!(
+            "{{\"id\":\"m-gen-{i}\",\"timestamp\":\"2026-10-12T08:00:00.000Z\",\"type\":\"gemini\",\"content\":\"turn {i}\",\"model\":\"gemini-2.5-pro\",\"tokens\":{{\"input\":1,\"output\":2,\"cached\":0,\"thoughts\":0,\"tool\":0,\"total\":3}}}}\n"
+        ));
+    }
+    let started = std::time::Instant::now();
+    let session = parse_one("session-hostile.jsonl", &journal);
+    let elapsed = started.elapsed();
+    // Correctness alongside timing: every record bills exactly once —
+    // an upsert that appends instead of replacing would double it.
+    assert_eq!(session.metrics.source_tool, "gemini_cli");
+    assert_eq!(session.metrics.tokens_input, RECORDS);
+    assert_eq!(session.metrics.tokens_output, RECORDS * 2);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "20k-record gemini chats journal parsed in {elapsed:?} — the upsert \
+         regressed to a per-record rescan (O(n^2) measured 9.5 s at cab6917)"
+    );
+}
