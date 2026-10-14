@@ -2945,3 +2945,45 @@ fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
         String::from_utf8_lossy(&range.stderr)
     );
 }
+
+#[test]
+fn cli_quota_refused_formats_name_the_quota_contract() {
+    // rm-1410 (run 34b5228913eb cycle 2): `--quota` composes with
+    // exactly two formats — the text summary and the stable
+    // `agenttrace.quota/1` json schema. Every other `-f` spelling used
+    // to be intercepted by the GENERIC format-applicability guards
+    // ("csv format requires --overview or --sessions"), steering
+    // quota users toward actions the quota view refuses to pair with
+    // (rm-246) while the quota lane's own bail never got to speak.
+    // The quota-aware guard names the quota contract itself — under
+    // the --demo selector and on the default discovered-corpus lane
+    // (the "real" selector; the guard fires before any discovery, so
+    // the bare form is safe here) — and never steers to
+    // --overview/--sessions.
+    for format in ["csv", "tsv", "html", "markdown", "md", "svg", "otel"] {
+        for (source, label) in [(Some("--demo"), "demo"), (None, "default-discovery")] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+            cmd.arg("--quota");
+            if let Some(selector) = source {
+                cmd.arg(selector);
+            }
+            let out = cmd
+                .args(["-f", format])
+                .output()
+                .expect("run agenttrace CLI");
+            assert!(
+                !out.status.success(),
+                "--quota -f {format} ({label}) must exit non-zero"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("--quota supports -f text and -f json only"),
+                "the refusal names the quota contract ({label}): {stderr:?}"
+            );
+            assert!(
+                !stderr.contains("--overview") && !stderr.contains("--sessions"),
+                "the refusal must not steer to other report actions ({label}): {stderr:?}"
+            );
+        }
+    }
+}

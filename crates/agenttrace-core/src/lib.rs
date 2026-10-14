@@ -2971,17 +2971,24 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
 /// numbers as a compact human summary. Any other format is rejected
 /// loudly — the quota view has no csv/markdown/html rendering, and a
 /// silent text fallback would look like a supported one.
+/// rm-1410 (run 34b5228913eb cycle 2): the quota view's format
+/// contract, stated once — the CLI's quota-aware format guard prints
+/// this BEFORE the corpus load, and `render_quota_view`'s own
+/// defense-in-depth arm below prints the same string for direct
+/// library callers, so the message cannot drift between the two
+/// sites.
+pub fn quota_format_contract_message(format: &str) -> String {
+    format!(
+        "--quota supports -f text and -f json only (got {format:?}); the quota view has no {format} rendering"
+    )
+}
+
 pub fn render_quota_view(format: &str, sessions: &[Session]) -> anyhow::Result<String> {
     let report = quota_report(sessions);
     match format {
-        "json" => Ok(format!(
-            "{}\n",
-            serde_json::to_string_pretty(&report)?
-        )),
+        "json" => Ok(format!("{}\n", serde_json::to_string_pretty(&report)?)),
         "text" => Ok(render_quota_text(&report)),
-        other => anyhow::bail!(
-            "--quota supports -f text and -f json only (got {other:?}); the quota view has no {other} rendering"
-        ),
+        other => anyhow::bail!("{}", quota_format_contract_message(other)),
     }
 }
 

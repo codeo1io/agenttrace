@@ -435,6 +435,23 @@ fn run() -> anyhow::Result<()> {
     if args.sample == Some(0) {
         bail!("--sample must be at least 1");
     }
+    // rm-1410 (run 34b5228913eb cycle 2): `--quota` renders through
+    // its own view with exactly two composable formats — the text
+    // summary and the stable `agenttrace.quota/1` json schema — but
+    // the generic format-applicability guards below do not count
+    // `--quota` among their actions, so `--quota -f csv` bailed with
+    // "csv format requires --overview or --sessions", steering the
+    // user toward actions the quota view refuses to pair with
+    // (rm-246), while the quota lane's own bail never got to speak.
+    // Refuse in the guard family's own voice BEFORE the corpus load,
+    // with the same contract string the renderer's defense-in-depth
+    // arm prints (one source of truth in core).
+    if args.quota && !matches!(args.format.as_str(), "text" | "json") {
+        bail!(
+            "{}",
+            agenttrace_core::quota_format_contract_message(&args.format)
+        );
+    }
     if matches!(args.format.as_str(), "markdown" | "md" | "html")
         && !(args.overview
             || args.audit
