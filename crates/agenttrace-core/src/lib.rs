@@ -79,9 +79,9 @@ pub use runtime_config::{
 pub use search::{report_search_json, report_search_text, search_sessions};
 pub use session_cache::{
     cached_session, clear_session_cache, effective_session_cache_entries, load_cached_sessions,
-    load_cached_sessions_from_cache, load_session_cache, save_session_cache,
-    session_cache_entries_source, session_cache_path, store_session, SessionCache,
-    MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
+    load_cached_sessions_from_cache, load_session_cache, load_session_cache_for_scan,
+    save_session_cache, session_cache_entries_source, session_cache_path, store_session,
+    SessionCache, MAX_CONFIGURABLE_SESSION_CACHE_ENTRIES, MAX_SESSION_CACHE_ENTRIES,
     MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION,
 };
 pub use sqlite_sessions::{
@@ -524,6 +524,11 @@ pub struct Metrics {
     pub tokens_reasoning: i64,
     pub tokens_cache_w: i64,
     pub tokens_cache_r: i64,
+    /// rm-1385: skipped at this serde surface to keep the report JSON
+    /// compact, but round-tripped by the session cache (schema 66,
+    /// `GoMetrics::EventUnixMillis`) so quota attribution keeps its
+    /// event-count basis on a warm load instead of silently degrading
+    /// to the span-seconds fallback.
     #[serde(skip)]
     pub timestamps: Vec<DateTime<Utc>>,
     pub gaps_sec: Vec<f64>,
@@ -2794,8 +2799,9 @@ fn quota_cutoff(sessions: &[Session]) -> Option<DateTime<Utc>> {
 }
 
 /// The share of a session's cost that sits inside `[start, end]`.
-/// Fresh parses carry the full event-timestamp vector, so the share is
-/// the fraction of events inside the window; warm-cache rows keep only
+/// Fresh parses and schema 66+ warm rows carry the full event-timestamp
+/// vector, so the share is the fraction of events inside the window;
+/// warm rows rehydrated from a pre-schema-66 journal keep only
 /// `session_start`/`session_end`, so the share is the fraction of the
 /// session's span inside the window (an instant session counts fully
 /// when its instant is inside). `None` when the row carries no
@@ -2930,14 +2936,14 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
                 "corpus": {
                     "sessions": sessions.len(),
                     "cutoff_utc": serde_json::Value::Null,
-                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time",
+                    "cutoff_basis": "newest event timestamp across the loaded corpus (pre-schema-66 cached sessions: newest session_end); null when no session carries placeable time",
                     "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
                     "attribution": {
                         "event_timestamps": event_basis,
                         "session_span": span_basis,
                         "unplaced": unplaced,
                     },
-                    "attribution_basis": "a session's cost enters a window pro rata: the share of its event timestamps inside the window (fresh parses), or the share of its start-end span inside the window (warm-cache rows, which do not carry event timestamps); unplaced rows are counted and disclosed but billed at zero",
+                    "attribution_basis": "a session's cost enters a window pro rata: the share of its event timestamps inside the window (fresh parses and schema 66+ warm rows), or the share of its start-end span inside the window (pre-schema-66 warm rows, which carry no event timestamps); unplaced rows are counted and disclosed but billed at zero",
                 },
             })
         }
@@ -2954,14 +2960,14 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
         "corpus": {
             "sessions": sessions.len(),
             "cutoff_utc": quota_ts(&five_hour.end),
-            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end)",
+            "cutoff_basis": "newest event timestamp across the loaded corpus (pre-schema-66 cached sessions: newest session_end)",
             "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
             "attribution": {
                 "event_timestamps": event_basis,
                 "session_span": span_basis,
                 "unplaced": unplaced,
             },
-            "attribution_basis": "a session's cost enters a window pro rata: the share of its event timestamps inside the window (fresh parses), or the share of its start-end span inside the window (warm-cache rows, which do not carry event timestamps); unplaced rows are counted and disclosed but billed at zero",
+            "attribution_basis": "a session's cost enters a window pro rata: the share of its event timestamps inside the window (fresh parses and schema 66+ warm rows), or the share of its start-end span inside the window (pre-schema-66 warm rows, which carry no event timestamps); unplaced rows are counted and disclosed but billed at zero",
         },
     })
 }
@@ -3016,7 +3022,7 @@ fn render_quota_text(report: &serde_json::Value) -> String {
     }
     let attribution = &corpus["attribution"];
     out.push_str(&format!(
-        "  attribution     event-timestamp share ({}), start/end span share ({} warm-cache), unplaced ({})\n",
+        "  attribution     event-timestamp share ({}), start/end span share ({} pre-schema-66 warm-cache), unplaced ({})\n",
         attribution["event_timestamps"], attribution["session_span"], attribution["unplaced"],
     ));
     out.push_str(

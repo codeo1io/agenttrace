@@ -1,7 +1,7 @@
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
-    load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
-    SqliteIngestReport, VERSION,
+    load_session_cache_for_scan, load_sqlite_backed_sessions_reported, parse_file,
+    save_session_cache, store_session, Session, SqliteIngestReport, VERSION,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -639,7 +639,7 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // rides the disclosure channel instead of dying silently. An
     // explicit `--dir` keeps every file (the exclusion is
     // aggregation-only, same rule as the loader).
-    let mut cache = crate::session_cache::load_session_cache();
+    let mut cache = load_session_cache();
     let (files, opencode_fork_excluded) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
     // A cache write failure must never fail the doctor (the cache is
@@ -734,7 +734,7 @@ fn doctor_directories(
         );
         return Vec::new();
     }
-    let mut cache = load_session_cache();
+    let mut cache = load_session_cache_for_scan(dir);
     let mut dirs: Vec<DoctorDirReport> = Vec::new();
     if let Some(dir) = dir {
         let abs = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
