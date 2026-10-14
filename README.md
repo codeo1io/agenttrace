@@ -374,10 +374,16 @@ payload to a local journal (`~/.cache/agenttrace/statusline.jsonl`, capped at
 relocate it). The parsed-session cache is bounded by entries and
 bytes; raise or lower the entry bound with `session_cache_entries` in
 the config file or the `AGENTTRACE_SESSION_CACHE_ENTRIES` environment
-variable (both clamped to [1, 1,000,000], default 20,000) — `--doctor`
-discloses the bound actually in force, which layer supplied it, and how
+variable (both clamped to [1, 1,000,000], default 20,000), and the
+serialized-byte bound with `session_cache_bytes` in the config file or
+the `AGENTTRACE_CACHE_BYTES` environment variable (whole bytes,
+accepted in [1 MiB, 1 GiB], default 64 MiB; out-of-range values are
+rejected with a one-time stderr warning rather than clamped) — `--doctor`
+discloses both bounds actually in force, which layer supplied them, how
 many session files the last scan re-parsed from source instead of the
-cache. Cache files are written owner-only (`0600` on Unix) and
+cache, and the journal's coverage of the corpus (the
+`cache coverage` line plus `cache pinned at the …-byte bound` when the
+journal is saturated, rm-967). Cache files are written owner-only (`0600` on Unix) and
 compacted through transient `.tmp.<pid>.<seq>` siblings that the next cache
 load reclaims if a crash leaves one behind (see PRIVACY.md). The command
 never fails the host — bad or empty input still

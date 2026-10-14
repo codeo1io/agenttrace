@@ -68,6 +68,28 @@ pub struct DoctorReport {
     /// rm-298 capacity arm: which layer supplied the entry bound —
     /// `"config file"`, `"env"`, or `"default"`.
     pub cache_entry_bound_source: String,
+    /// rm-967: the serialized-byte bound actually in force this run
+    /// (`cache_limits` renders it as `bytes<=N`; the
+    /// `session_cache_bytes` config key / `AGENTTRACE_CACHE_BYTES`
+    /// env knob when set, else the built-in 64 MiB default). Kept
+    /// numeric so JSON consumers can compare it against
+    /// `cache_size_bytes`.
+    pub cache_byte_bound: usize,
+    /// rm-967: which layer supplied the byte bound — `"config file"`,
+    /// `"env"`, or `"default"`.
+    pub cache_byte_bound_source: String,
+    /// rm-967 coverage disclosure: the share of discovered session
+    /// files the journal can serve — `100 × cache_entries /
+    /// session_files`. `None` when no session files were discovered
+    /// (demo mode, or an empty corpus): 0% of nothing is noise, not
+    /// saturation.
+    pub cache_coverage_percent: Option<f64>,
+    /// rm-967 saturation disclosure: the journal is pinned at its
+    /// byte bound — at or beyond 99% of `cache_byte_bound`. When
+    /// true, coverage loss is the bound, not staleness: raising the
+    /// bound (`AGENTTRACE_CACHE_BYTES`) or pointing the cache at a
+    /// corpus it fits are the two moves.
+    pub cache_saturated: bool,
     /// rm-298 capacity arm: discovered session files this scan could
     /// NOT serve from the cache (no entry, or size/mtime stale) and
     /// therefore re-parses from source — the recurring CPU cost the
@@ -261,6 +283,24 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     // numbers the entry-bound knob exists to tune.
     let entry_bound = crate::session_cache::effective_session_cache_entries();
     let entry_bound_source = crate::session_cache::session_cache_entries_source();
+    // rm-967: the byte bound in force and its layer, plus the two
+    // disclosures that make saturation legible — coverage (the share
+    // of this scan's corpus the journal served) and pinned-at-bound
+    // state (computed after the walk persists fresh parses, below).
+    // 99% reads as saturated so an operator tuning right at the
+    // ceiling still sees the lever.
+    let byte_bound = crate::session_cache::effective_session_cache_bytes();
+    let byte_bound_source = crate::session_cache::session_cache_bytes_source();
+    // rm-967: coverage is the share of THIS scan's corpus the journal
+    // actually serves (`cached_valid`, fingerprint-valid hits) — not
+    // `cache_entries` over files, which a journal warmed against
+    // other corpora (a shared `AGENTTRACE_SESSION_CACHE_DIR`) would
+    // inflate past 100%. Same number as the row's 2440/17,322 signal
+    // on a single-corpus journal.
+    let cache_coverage_percent = match files.len() {
+        0 => None,
+        total => Some(100.0 * cached_valid as f64 / total as f64),
+    };
     let reparsed_this_scan = files.len().saturating_sub(cached_valid);
     let mode = if demo {
         "demo sessions"
@@ -274,6 +314,28 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
     // carries the mutable reports through the directory walk.
     let mut scan = DoctorScanState::default();
     let directories = doctor_directories(dir, demo, &files, &sessions, &sqlite_ingest, &mut scan);
+    // rm-967: the directory walk persists fresh parses to the journal
+    // (the rm-367 stage-a save inside `doctor_dir_report`, which loads
+    // and stores through its own handle) and that save may have
+    // compacted the document under the effective byte bound — re-read
+    // the size so the saturation disclosure reflects the journal on
+    // disk, not the pre-walk one (a first scan under a new, smaller
+    // bound would otherwise report the stale size, and a journal the
+    // walk just capped would read as unsaturated). Demo mode never
+    // writes, so it keeps the synthetic zero — the demo cache path is
+    // the operator's real default path, and a host cache on disk must
+    // not leak into the demo report.
+    let cache_size_bytes = if demo {
+        cache_size_bytes
+    } else {
+        std::fs::metadata(&cache.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(cache_size_bytes)
+    };
+    // rm-967 saturation: pinned at the bound — at or beyond 99% of it
+    // (`u128` keeps the product from overflowing on 32-bit
+    // `u64 × 100` paths).
+    let cache_saturated = cache_size_bytes as u128 * 100 >= byte_bound as u128 * 99;
     let DoctorScanState {
         mut project_decode,
         zero_usage,
@@ -307,13 +369,13 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         cache_dirs: cache.dirs,
         cached_valid,
         cache_size_bytes,
-        cache_limits: format!(
-            "entries<={}, bytes<={}",
-            entry_bound,
-            crate::session_cache::MAX_SESSION_CACHE_BYTES
-        ),
+        cache_limits: format!("entries<={}, bytes<={}", entry_bound, byte_bound),
         cache_entry_bound: entry_bound,
         cache_entry_bound_source: entry_bound_source.to_string(),
+        cache_byte_bound: byte_bound,
+        cache_byte_bound_source: byte_bound_source.to_string(),
+        cache_coverage_percent,
+        cache_saturated,
         reparsed_this_scan,
         cache_invalidation_note: cache.invalidation_note.clone(),
         sessions: files.len() + sessions.len(),
@@ -1089,6 +1151,16 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
     if report.cached_valid == 0 {
         recommendations.push("No reusable parsed session entries for this scan. Cached directory listings may still speed discovery; the next TUI startup should reuse parsed sessions incrementally.".to_string());
     }
+    // rm-967: a journal pinned at its byte bound is the state where
+    // coverage loss is capacity, not staleness — the one case where
+    // "raise the bound" is the correct advice, so it gets its own
+    // line with the lever named.
+    if report.cache_saturated {
+        recommendations.push(format!(
+            "session cache is pinned at its {}-byte bound ({}/{} session file(s) served by the journal); raise AGENTTRACE_CACHE_BYTES to lift coverage, or accept the bound and keep the corpus small",
+            report.cache_byte_bound, report.cached_valid, report.session_files
+        ));
+    }
     // rm-381 disclosure: attribution made under host-state ambiguity, or not
     // made at all, is surfaced instead of silently decided.
     let decode = &report.project_decode;
@@ -1131,9 +1203,22 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.reparsed_this_scan, report.session_files
     ));
     out.push_str(&format!(
-        "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first; entry bound from {})\n",
-        report.cache_size_bytes, report.cache_limits, report.cache_entry_bound_source
+        "  cache size {} bytes, hard bounds: {} (oldest-source entries evicted first; entry bound from {}; byte bound from {})\n",
+        report.cache_size_bytes, report.cache_limits, report.cache_entry_bound_source,
+        report.cache_byte_bound_source
     ));
+    if let Some(coverage) = report.cache_coverage_percent {
+        out.push_str(&format!(
+            "  cache coverage: {} of {} session file(s) served by the journal ({:.1}% of the corpus; rm-967)\n",
+            report.cached_valid, report.session_files, coverage
+        ));
+    }
+    if report.cache_saturated {
+        out.push_str(&format!(
+            "  cache pinned at the {}-byte bound — coverage loss is the bound, not staleness (raise AGENTTRACE_CACHE_BYTES or move the cache to a corpus it fits)\n",
+            report.cache_byte_bound
+        ));
+    }
     if let Some(note) = &report.cache_invalidation_note {
         out.push_str(&format!("  cache disclosure: {note}\n"));
     }
@@ -1462,6 +1547,108 @@ mod tests {
         assert!(report.cache_limits.contains("entries<=1500"));
         assert!(doctor_report_text(&report).contains("entry bound from env"));
         std::env::remove_var("AGENTTRACE_SESSION_CACHE_ENTRIES");
+    }
+
+    #[test]
+    fn cache_byte_bound_disclosure_tracks_the_knob() {
+        // rm-967 lever (b): the doctor discloses the byte bound in
+        // force and the layer it came from, in the same `cache_limits`
+        // string the entry bound rides. Live red pin: the pristine
+        // --doctor JSON (live-pre/doctor-pre-cold.json, this session)
+        // carries no cache_byte_bound at all.
+        let _env = crate::test_env::lock_env();
+        std::env::remove_var("AGENTTRACE_CACHE_BYTES");
+        let report = build_doctor_report(None, true);
+        assert_eq!(
+            report.cache_byte_bound,
+            crate::session_cache::MAX_SESSION_CACHE_BYTES
+        );
+        assert_eq!(report.cache_byte_bound_source, "default");
+        assert!(report
+            .cache_limits
+            .contains(&format!("bytes<={}", report.cache_byte_bound)));
+        let text = doctor_report_text(&report);
+        assert!(text.contains("byte bound from default"), "{text}");
+        assert!(!text.contains("cache coverage"), "{text}");
+        assert!(!text.contains("cache pinned at"), "{text}");
+
+        std::env::set_var("AGENTTRACE_CACHE_BYTES", "268435456");
+        let report = build_doctor_report(None, true);
+        assert_eq!(report.cache_byte_bound, 268_435_456);
+        assert_eq!(report.cache_byte_bound_source, "env");
+        assert!(report.cache_limits.contains("bytes<=268435456"));
+        assert!(doctor_report_text(&report).contains("byte bound from env"));
+        // An illegal value never reaches the disclosure.
+        std::env::set_var("AGENTTRACE_CACHE_BYTES", "0");
+        let report = build_doctor_report(None, true);
+        assert_eq!(
+            report.cache_byte_bound,
+            crate::session_cache::MAX_SESSION_CACHE_BYTES
+        );
+        assert_eq!(report.cache_byte_bound_source, "default");
+        std::env::remove_var("AGENTTRACE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn cache_coverage_and_saturation_disclosures_render() {
+        // rm-967 disclosure arm: coverage (journal entries over
+        // discovered session files), the byte bound in force, and the
+        // pinned-at-bound saturation state are first-class doctor
+        // fields — the row's 14%-of-files / 67,101,327-of-64 MiB
+        // signal becomes machine- and human-readable instead of a
+        // roadmap footnote. Built from the hermetic demo report, then
+        // steered onto the row's live numbers by direct field writes
+        // (the renderer must reflect the fields, not recompute them).
+        let _env = crate::test_env::lock_env();
+        std::env::remove_var("AGENTTRACE_CACHE_BYTES");
+        let mut report = build_doctor_report(None, true);
+        assert_eq!(report.cache_coverage_percent, None, "0 session files");
+        assert!(!report.cache_saturated, "empty cache cannot be pinned");
+        report.session_files = 17_322;
+        report.cache_entries = 2_440;
+        report.cached_valid = 2_440;
+        report.cache_size_bytes = 67_101_327;
+        report.cache_byte_bound = 67_108_864;
+        report.cache_byte_bound_source = "default".to_string();
+        report.cache_coverage_percent = Some(14.090_616_258_494_983);
+        report.cache_saturated = true;
+
+        let text = doctor_report_text(&report);
+        assert!(
+            text.contains("cache coverage: 2440 of 17322 session file(s) served by the journal"),
+            "{text}"
+        );
+        assert!(text.contains("14.1% of the corpus; rm-967"), "{text}");
+        assert!(text.contains("byte bound from default"), "{text}");
+        assert!(
+            text.contains("cache pinned at the 67108864-byte bound"),
+            "{text}"
+        );
+
+        let json = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(
+            json["cache_coverage_percent"],
+            serde_json::json!(14.090_616_258_494_983)
+        );
+        assert_eq!(json["cache_byte_bound"], serde_json::json!(67_108_864));
+        assert_eq!(
+            json["cache_byte_bound_source"],
+            serde_json::json!("default")
+        );
+        assert_eq!(json["cache_saturated"], serde_json::json!(true));
+
+        let recommendations = doctor_recommendations(&report, None, false);
+        let joined = recommendations.join("\n");
+        assert!(
+            joined.contains("pinned at its 67108864-byte bound"),
+            "{joined}"
+        );
+        assert!(joined.contains("raise AGENTTRACE_CACHE_BYTES"), "{joined}");
+        // The saturation recommendation is absent when the cache has
+        // headroom — the demo report carries a zero-size cache.
+        let calm = build_doctor_report(None, true);
+        let calm_recs = doctor_recommendations(&calm, None, false).join("\n");
+        assert!(!calm_recs.contains("pinned at its"), "{calm_recs}");
     }
 
     #[test]

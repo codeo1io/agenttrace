@@ -416,6 +416,8 @@ fn run() -> anyhow::Result<()> {
             // report lane below installs, so the parity rm-781 pins
             // covers the session-cache capacity knob too.
             session_cache_entries: resolved.session_cache_entries,
+            // rm-967 lever b: same parity for the byte-bound knob.
+            session_cache_bytes: resolved.session_cache_bytes,
         });
         return mcp::serve(args.dir.as_deref().map(Path::new));
     }
@@ -500,6 +502,10 @@ fn run() -> anyhow::Result<()> {
         // knob; when unset here core falls back to
         // AGENTTRACE_SESSION_CACHE_ENTRIES, then the built-in default.
         session_cache_entries: resolved.session_cache_entries,
+        // rm-967 lever b: same layering for the serialized-byte
+        // bound — config file > AGENTTRACE_CACHE_BYTES > 64 MiB
+        // default.
+        session_cache_bytes: resolved.session_cache_bytes,
     });
 
     // rm-301: stdout purity under machine formats. The side-effect

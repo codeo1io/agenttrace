@@ -49,6 +49,11 @@ pub struct ConfigFile {
     /// [1, 1_000_000] by core at read time; validated here so a typo'd
     /// file fails loudly at parse instead of silently clamping.
     pub session_cache_entries: Option<usize>,
+    /// Session-cache serialized-byte bound (rm-967 lever b; overrides
+    /// `AGENTTRACE_CACHE_BYTES`). Clamped into
+    /// [1 MiB, 1 GiB] by core at read time; validated here so a typo'd
+    /// file fails loudly at parse instead of silently clamping.
+    pub session_cache_bytes: Option<usize>,
 }
 
 impl ConfigFile {
@@ -67,11 +72,15 @@ impl ConfigFile {
         if upper.session_cache_entries.is_some() {
             self.session_cache_entries = upper.session_cache_entries;
         }
+        if upper.session_cache_bytes.is_some() {
+            self.session_cache_bytes = upper.session_cache_bytes;
+        }
         self
     }
 }
 
-const SUPPORTED_KEYS: &str = "history_dir, pricing_file, weekly_budget_usd, session_cache_entries";
+const SUPPORTED_KEYS: &str =
+    "history_dir, pricing_file, weekly_budget_usd, session_cache_entries, session_cache_bytes";
 
 /// The user-level configuration path:
 /// `$XDG_CONFIG_HOME/agenttrace/config.toml` or
@@ -152,7 +161,11 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
         // match below.
         if matches!(
             key,
-            "history_dir" | "pricing_file" | "weekly_budget_usd" | "session_cache_entries"
+            "history_dir"
+                | "pricing_file"
+                | "weekly_budget_usd"
+                | "session_cache_entries"
+                | "session_cache_bytes"
         ) && !seen.insert(key.to_string())
         {
             bail!(
@@ -204,6 +217,33 @@ pub fn parse_config(text: &str, path: &Path) -> anyhow::Result<ConfigFile> {
             ("session_cache_entries", Scalar::String(text)) => {
                 bail!(
                     "{shown}:{number}: session_cache_entries expects a whole \
+                     number, got the string `{}`",
+                    text.display()
+                );
+            }
+            ("session_cache_bytes", Scalar::Number(bytes)) => {
+                // Integral and inside the knob's legal band (rm-967
+                // lever b): the core resolver clamps defensively, but a
+                // config file is authored once — reject the
+                // out-of-range value loudly at parse time instead of
+                // silently clamping the author's intent. The floor is
+                // one MiB (below it the serialized document frame
+                // crowds out the entries); the ceiling one GiB (past
+                // it the whole-document read/write dominates the
+                // memory budget the bound exists to protect).
+                let ceiling = agenttrace_core::MAX_CONFIGURABLE_SESSION_CACHE_BYTES as f64;
+                let floor = agenttrace_core::MIN_CONFIGURED_SESSION_CACHE_BYTES as f64;
+                if bytes.fract() != 0.0 || bytes < floor || bytes > ceiling {
+                    bail!(
+                        "{shown}:{number}: session_cache_bytes must be a whole \
+                         number between {floor} and {ceiling}, got `{bytes}`"
+                    );
+                }
+                file.session_cache_bytes = Some(bytes as usize);
+            }
+            ("session_cache_bytes", Scalar::String(text)) => {
+                bail!(
+                    "{shown}:{number}: session_cache_bytes expects a whole \
                      number, got the string `{}`",
                     text.display()
                 );
@@ -310,6 +350,9 @@ pub struct ResolvedConfig {
     /// Winning session-cache entry bound (rm-298 capacity arm; no CLI
     /// flag — config file > env > default).
     pub session_cache_entries: Option<usize>,
+    /// Winning session-cache serialized-byte bound (rm-967 lever b;
+    /// no CLI flag — config file > env > default).
+    pub session_cache_bytes: Option<usize>,
     /// Env-knob values for display only: when no layer set the knob,
     /// these remain the effective level-5 values core falls back to.
     pub env_history_dir: Option<PathBuf>,
@@ -319,9 +362,16 @@ pub struct ResolvedConfig {
     /// role (kept as the string the environment holds; the effective
     /// number is core's to resolve and `--doctor` renders it).
     pub env_session_cache_entries: Option<String>,
+    /// `AGENTTRACE_CACHE_BYTES` raw value (rm-967), same display-only
+    /// role — but unlike the entry knob an illegal byte value is
+    /// REJECTED by core (never clamped), so an out-of-range value
+    /// must not reach this disclosure as if it were effective; the
+    /// resolver ignores it and the effective source falls back to
+    /// `default` (the one-time stderr warning is core's trace of it).
+    pub env_session_cache_bytes: Option<String>,
     /// Where each winning knob came from (`CLI flag`, `config file`,
     /// `env`, or `default`).
-    pub sources: [(&'static str, &'static str); 4],
+    pub sources: [(&'static str, &'static str); 5],
 }
 
 /// Resolve the configuration for this invocation: discover the user
@@ -400,6 +450,7 @@ pub fn resolve_with_paths(
         .or_else(|| merged.pricing_file.clone());
     let weekly_budget = args.weekly_budget.or(merged.weekly_budget_usd);
     let session_cache_entries = merged.session_cache_entries;
+    let session_cache_bytes = merged.session_cache_bytes;
 
     let source_for = |flag: bool, file: bool, env: bool| -> &'static str {
         if flag {
@@ -419,6 +470,7 @@ pub fn resolve_with_paths(
     let env_history_dir = std::env::var_os("AGENTTRACE_HISTORY_DIR").map(PathBuf::from);
     let env_pricing_file = std::env::var_os("AGENTTRACE_PRICING_FILE").map(PathBuf::from);
     let env_session_cache_entries = std::env::var("AGENTTRACE_SESSION_CACHE_ENTRIES").ok();
+    let env_session_cache_bytes = std::env::var("AGENTTRACE_CACHE_BYTES").ok();
     let sources = [
         (
             "history_dir",
@@ -459,6 +511,29 @@ pub fn resolve_with_paths(
                     .is_some(),
             ),
         ),
+        (
+            "session_cache_bytes",
+            source_for(
+                false,
+                layers
+                    .iter()
+                    .any(|layer| layer.file.session_cache_bytes.is_some()),
+                // Only an in-range parse counts: core REJECTS an
+                // out-of-range env byte knob (no clamping), so the
+                // disclosure must not credit `env` for a value core
+                // will ignore.
+                env_session_cache_bytes
+                    .as_deref()
+                    .and_then(|raw| {
+                        let bytes = raw.trim().parse::<usize>().ok()?;
+                        (agenttrace_core::MIN_CONFIGURED_SESSION_CACHE_BYTES
+                            ..=agenttrace_core::MAX_CONFIGURABLE_SESSION_CACHE_BYTES)
+                            .contains(&bytes)
+                            .then_some(bytes)
+                    })
+                    .is_some(),
+            ),
+        ),
     ];
 
     Ok(ResolvedConfig {
@@ -468,9 +543,11 @@ pub fn resolve_with_paths(
         pricing_file,
         weekly_budget,
         session_cache_entries,
+        session_cache_bytes,
         env_history_dir,
         env_pricing_file,
         env_session_cache_entries,
+        env_session_cache_bytes,
         sources,
     })
 }
@@ -504,6 +581,25 @@ fn session_cache_entries_effective(config: &ResolvedConfig) -> Option<(usize, us
                 raw,
             )
         })
+}
+
+/// Effective session-cache byte bound for disclosure (rm-967 lever b):
+/// the winning configured value, with NO clamping — unlike the entry
+/// knob, an out-of-band byte request is REJECTED, not clamped (both
+/// file layers are validated in-range at parse time; the env value is
+/// filtered here, which is exactly what core's resolver does). An
+/// ignored knob therefore renders `(unset)` with source `default`,
+/// leaving core's one-time stderr warning as the only trace of it.
+fn session_cache_bytes_effective(config: &ResolvedConfig) -> Option<usize> {
+    config.session_cache_bytes.or_else(|| {
+        config.env_session_cache_bytes.as_deref().and_then(|raw| {
+            let bytes = raw.trim().parse::<usize>().ok()?;
+            (agenttrace_core::MIN_CONFIGURED_SESSION_CACHE_BYTES
+                ..=agenttrace_core::MAX_CONFIGURABLE_SESSION_CACHE_BYTES)
+                .contains(&bytes)
+                .then_some(bytes)
+        })
+    })
 }
 
 pub fn disclosure_json(config: &ResolvedConfig) -> String {
@@ -556,6 +652,15 @@ pub fn disclosure_json(config: &ResolvedConfig) -> String {
                     _ => config.sources[3].1.to_string(),
                 }
                 .as_str(),
+            ),
+            knob(
+                "session_cache_bytes",
+                session_cache_bytes_effective(config)
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+                // Never clamped (rm-967 rejects out-of-band values), so
+                // the source needs no annotation.
+                config.sources[4].1,
             ),
         ],
     });
@@ -625,6 +730,13 @@ pub fn disclosure_text(config: &ResolvedConfig) -> String {
                 .map(|(effective, _)| effective.to_string())
                 .unwrap_or_else(|| "(unset)".to_string()),
             session_cache_source.as_str(),
+        ),
+        (
+            config.sources[4].0,
+            session_cache_bytes_effective(config)
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "(unset)".to_string()),
+            config.sources[4].1,
         ),
     ];
     for (key, value, source) in knobs {
@@ -799,6 +911,142 @@ mod tests {
     }
 
     #[test]
+    fn session_cache_bytes_parses_whole_numbers_in_range() {
+        // rm-967 lever (b): the config-file layer of the byte-bound
+        // knob, mirroring the entry knob's parse discipline — a bare
+        // integer parses; out-of-range, fractional, and string values
+        // fail loudly with the accepted range (a config file is
+        // authored once; the env layer rejects silently instead).
+        let dir = std::env::temp_dir().join(format!("at-config-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let parsed = parse_config("session_cache_bytes = 268435456\n", &path).expect("parse");
+        assert_eq!(parsed.session_cache_bytes, Some(268_435_456));
+
+        let floor = parse_config(
+            &format!(
+                "session_cache_bytes = {}\n",
+                agenttrace_core::MIN_CONFIGURED_SESSION_CACHE_BYTES
+            ),
+            &path,
+        )
+        .expect("floor parses");
+        assert_eq!(
+            floor.session_cache_bytes,
+            Some(agenttrace_core::MIN_CONFIGURED_SESSION_CACHE_BYTES)
+        );
+
+        for raw in [
+            "session_cache_bytes = 0\n",
+            "session_cache_bytes = -3\n",
+            "session_cache_bytes = 12.5\n",
+            "session_cache_bytes = 1048575\n",
+            "session_cache_bytes = 999999999999\n",
+            "session_cache_bytes = \"many\"\n",
+        ] {
+            let error = parse_config(raw, &path).unwrap_err().to_string();
+            assert!(
+                error.contains("session_cache_bytes")
+                    && (error.contains("expects a whole number")
+                        || error.contains("must be a whole number")),
+                "{raw} -> {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn disclosure_reports_effective_session_cache_bytes() {
+        // rm-967: the CLI disclosure renders the byte knob's effective
+        // value and its layer, mirroring the entry knob. An out-of-range
+        // env value is REJECTED (never clamped), so the source falls
+        // back to "default" and the value renders unset — the
+        // one-time stderr warning from core is the only trace of the
+        // ignored knob.
+        let env_layer = ResolvedConfig {
+            layers: vec![],
+            absent: vec![],
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            session_cache_entries: None,
+            env_history_dir: None,
+            env_pricing_file: None,
+            env_session_cache_entries: None,
+            session_cache_bytes: None,
+            env_session_cache_bytes: Some("268435456".to_string()),
+            sources: [
+                ("history_dir", "default"),
+                ("pricing_file", "default"),
+                ("weekly_budget", "default"),
+                ("session_cache_entries", "default"),
+                ("session_cache_bytes", "env"),
+            ],
+        };
+        let json = disclosure_json(&env_layer);
+        let flat_json: String = json.split_whitespace().collect();
+        assert!(
+            flat_json.contains("\"key\":\"session_cache_bytes\",\"value\":268435456"),
+            "{json}"
+        );
+        assert!(!json.contains("clamped"), "{json}");
+        let text = disclosure_text(&env_layer);
+        assert!(
+            text.contains("session_cache_bytes: 268435456 (env)"),
+            "{text}"
+        );
+
+        let rejected_env = ResolvedConfig {
+            layers: vec![],
+            absent: vec![],
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            session_cache_entries: None,
+            env_history_dir: None,
+            env_pricing_file: None,
+            env_session_cache_entries: None,
+            session_cache_bytes: None,
+            env_session_cache_bytes: Some("0".to_string()),
+            sources: [
+                ("history_dir", "default"),
+                ("pricing_file", "default"),
+                ("weekly_budget", "default"),
+                ("session_cache_entries", "default"),
+                ("session_cache_bytes", "default"),
+            ],
+        };
+        let text = disclosure_text(&rejected_env);
+        assert!(
+            text.contains("session_cache_bytes: (unset) (default)"),
+            "rejected env knob must not leak into the disclosure: {text}"
+        );
+
+        let config_layer = ResolvedConfig {
+            layers: vec![],
+            absent: vec![],
+            history_dir: None,
+            pricing_file: None,
+            weekly_budget: None,
+            session_cache_entries: None,
+            env_history_dir: None,
+            env_pricing_file: None,
+            env_session_cache_entries: None,
+            session_cache_bytes: Some(524_288_000),
+            env_session_cache_bytes: None,
+            sources: [
+                ("history_dir", "default"),
+                ("pricing_file", "default"),
+                ("weekly_budget", "default"),
+                ("session_cache_entries", "default"),
+                ("session_cache_bytes", "config file"),
+            ],
+        };
+        assert!(
+            disclosure_text(&config_layer).contains("session_cache_bytes: 524288000 (config file)")
+        );
+    }
+
+    #[test]
     fn disclosure_reports_clamped_effective_session_cache_entries() {
         // Review-fix 123c2cd0 (finding ac089711-3): the CLI disclosure
         // reports the clamped effective bound, matching `--doctor` and
@@ -814,11 +1062,14 @@ mod tests {
             env_history_dir: None,
             env_pricing_file: None,
             env_session_cache_entries: Some("999999999".to_string()),
+            session_cache_bytes: None,
+            env_session_cache_bytes: None,
             sources: [
                 ("history_dir", "default"),
                 ("pricing_file", "default"),
                 ("weekly_budget", "default"),
                 ("AGENTTRACE_SESSION_CACHE_ENTRIES", "env"),
+                ("session_cache_bytes", "default"),
             ],
         };
         let json = disclosure_json(&clamped);
@@ -849,11 +1100,14 @@ mod tests {
             env_history_dir: None,
             env_pricing_file: None,
             env_session_cache_entries: None,
+            session_cache_bytes: None,
+            env_session_cache_bytes: None,
             sources: [
                 ("history_dir", "default"),
                 ("pricing_file", "default"),
                 ("weekly_budget", "default"),
                 ("session_cache_entries", "config file"),
+                ("session_cache_bytes", "default"),
             ],
         };
         assert!(!disclosure_json(&in_range).contains("clamped"));
@@ -867,6 +1121,7 @@ mod tests {
             pricing_file: Some(PathBuf::from("/user-pricing.json")),
             weekly_budget_usd: Some(10.0),
             session_cache_entries: Some(40_000),
+            session_cache_bytes: None,
         };
         let project = ConfigFile {
             history_dir: Some(PathBuf::from("/project-history")),
