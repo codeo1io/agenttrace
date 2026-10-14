@@ -236,7 +236,7 @@ pub fn resolve_project(session: &Session) -> ProjectIdentity {
     }
     match decode_agent_project_dir(&session.path) {
         // The landed rm-381 walk: the whole encoded name verified.
-        ProjectDecode::Path(path) => resolved_from_path(&path),
+        ProjectDecode::Path(path) => resolved_from_decoded(&path),
         // rm-240: the official format truncates encoded names over 200
         // chars to 200 and suffixes a hash of the full path. The hash
         // cannot be inverted, but it is stable — keep it in the identity
@@ -301,6 +301,60 @@ fn resolved_from_path(raw: &str) -> ProjectIdentity {
         display_name,
         root,
         resolution,
+    }
+}
+
+/// Identity for a project whose root was recovered from an encoded project
+/// directory name (the Claude Code / Cursor `projects/<encoded>` layout).
+///
+/// The encoded name is itself the project claim, so attribution may never
+/// climb above it: `git_root` walking ancestors would let an unrelated
+/// host-wide checkout (for example a dot-nested tooling directory that
+/// happens to be a git repository, such as `~/.hermes` on delegate hosts)
+/// capture attribution for any project hosted beneath it — identity would
+/// then depend on unrelated host state (rm-381/rm-382). A `.git` DIRECTORY
+/// at the decoded root is the project's own repository and reports
+/// `git_root`. A `.git` FILE is a linked-worktree marker (`gitdir: …`):
+/// it resolves to the MAIN checkout via `worktree_main_root`, exactly like
+/// the cwd arm's `find_git_root`, so cwd-bearing and cwd-less sessions of
+/// one worktree keep a single identity (review fix F1, run 14fd8b0d).
+/// Attribution still never climbs above the decoded directory: the main
+/// root comes from the marker's own content — one file read, no ancestor
+/// walk — and an unparseable marker falls back to the worktree itself,
+/// the same fallback `find_git_root` applies on the cwd arm.
+fn resolved_from_decoded(raw: &str) -> ProjectIdentity {
+    if raw.is_empty() {
+        return ProjectIdentity {
+            id: "unknown".to_string(),
+            display_name: "unknown".to_string(),
+            root: String::new(),
+            resolution: "unattributed".to_string(),
+        };
+    }
+    let path = lexical_normalize(Path::new(raw));
+    let marker = path.join(".git");
+    let (root, resolution) = if marker.is_dir() {
+        (path.clone(), "git_root")
+    } else if marker.is_file() {
+        (
+            worktree_main_root(&marker).unwrap_or_else(|| path.clone()),
+            "git_root",
+        )
+    } else {
+        (path.clone(), "decoded_project_dir")
+    };
+    let display_name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let root = root.to_string_lossy().to_string();
+    ProjectIdentity {
+        id: root.clone(),
+        display_name,
+        root,
+        resolution: resolution.to_string(),
     }
 }
 
@@ -1088,6 +1142,41 @@ mod tests {
         let decoded = resolve_project(&session_at("", &transcript.to_string_lossy()));
         assert_eq!(decoded.id, main.id);
 
+        // Review fix F1 (run 14fd8b0d independent_review): the decoded arm
+        // must group a LINKED WORKTREE (`.git` file) under the main checkout
+        // exactly like the cwd arm above — before the fix the decoded arm
+        // returned the worktree itself, splitting one project across two
+        // identities depending on whether the journal carried a cwd.
+        let encoded_wt = worktree.to_string_lossy().replace('/', "-");
+        let transcript_wt = root
+            .join("projects")
+            .join(&encoded_wt)
+            .join("session.jsonl");
+        let decoded_wt = resolve_project(&session_at("", &transcript_wt.to_string_lossy()));
+        assert_eq!(decoded_wt.id, main.id);
+        assert_eq!(decoded_wt.display_name, main.display_name);
+        assert_eq!(decoded_wt.resolution, "git_root");
+
+        // Parity on the fallback: an unparseable marker leaves BOTH arms at
+        // the worktree itself (find_git_root's `unwrap_or_else` fallback),
+        // never `unknown` and never an unrelated ancestor.
+        let corrupt = root.join("worktrees").join("z9z9").join("my-repo");
+        fs::create_dir_all(&corrupt).unwrap();
+        fs::write(corrupt.join(".git"), "not a gitdir marker\n").unwrap();
+        assert_eq!(
+            resolve_project(&session_at(&corrupt.to_string_lossy(), "/x.jsonl")).id,
+            corrupt.to_string_lossy().to_string()
+        );
+        let encoded_corrupt = corrupt.to_string_lossy().replace('/', "-");
+        let transcript_corrupt = root
+            .join("projects")
+            .join(&encoded_corrupt)
+            .join("session.jsonl");
+        let decoded_corrupt =
+            resolve_project(&session_at("", &transcript_corrupt.to_string_lossy()));
+        assert_eq!(decoded_corrupt.id, corrupt.to_string_lossy().to_string());
+        assert_eq!(decoded_corrupt.resolution, "git_root");
+
         // rm-240: an encoded dir that verifies nowhere is an opaque name
         // (CLAUDE_CODE_PROJECT_DIR_NAME-style names encode no path) — it
         // keeps its own stable identity instead of collapsing into
@@ -1304,6 +1393,59 @@ mod tests {
             project_decode_status(&session),
             ProjectDecodeStatus::Resolved { .. }
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decode_does_not_climb_into_host_ancestor_git_repos() {
+        // rm-381/rm-382 host-layout regression: the encoded project name is
+        // the project claim, so attribution may never climb above it. On
+        // real hosts a dot-nested tooling directory above TMPDIR can itself
+        // be a git repository (delegate hosts keep `~/.hermes` as one), and
+        // the old Path arm ran `git_root` over the decoded directory — any
+        // project hosted beneath that ancestor was captured by it, making
+        // identity depend on unrelated host state (red-first: both decode
+        // tests failed under TMPDIR=~/.hermes/tmp/delegate/… with
+        // display_name `.hermes`). The cwd-first arm keeps its documented
+        // climb: a session with a live cwd inside a git work tree still
+        // resolves to that work tree's root.
+        let root = unique_decode_root("hostrepo");
+        fs::create_dir_all(&root).expect("create decode root");
+        fs::create_dir_all(root.join(".git")).expect("plant host git repo at ancestor");
+        let true_repo = root.join("hosted/my-repo");
+        fs::create_dir_all(&true_repo).expect("create hosted project");
+        let encoded = true_repo.to_string_lossy().replace('/', "-");
+        let transcript = root
+            .join("projects")
+            .join(&encoded)
+            .join("s.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let session = session_at("", &transcript);
+
+        // Decoded session: attribution stays inside the decoded project.
+        let decoded = resolve_project(&session);
+        assert_eq!(decoded.display_name, "my-repo");
+        assert_eq!(
+            decoded.root,
+            lexical_normalize(&true_repo).to_string_lossy().to_string()
+        );
+        assert_eq!(decoded.resolution, "decoded_project_dir");
+        assert!(matches!(
+            project_decode_status(&session),
+            ProjectDecodeStatus::Resolved { .. }
+        ));
+
+        // Boundary pin: the cwd-first arm still climbs to the git work tree
+        // root — a session with a live cwd in the hosted project resolves
+        // to the planted ancestor repo, not to the cwd directory.
+        let cwd_session = session_at(&true_repo.to_string_lossy(), &transcript);
+        let via_cwd = resolve_project(&cwd_session);
+        assert_eq!(
+            via_cwd.root,
+            lexical_normalize(&root).to_string_lossy().to_string()
+        );
+        assert_eq!(via_cwd.resolution, "git_root");
         let _ = fs::remove_dir_all(root);
     }
 
