@@ -1115,6 +1115,27 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
     recommendations
 }
 
+/// rm-1395: the ONE render choke-point for the doctor text lane's
+/// transcript-derived sample families (the rm-408 zero-usage session
+/// names — minted from `session.name`, itself derived from the
+/// transcript's first user message — and the rm-381 project-decode
+/// samples). Both render as `    {sample}`, and four leading spaces are
+/// no defense: a spreadsheet paste treats the first non-whitespace
+/// character as the cell start, so a `=HYPERLINK(…)` first user
+/// message re-armed as a live formula (assess 77d65419 live PoC,
+/// doctor-text.txt:21; rm-897's executed sweep never enumerated the
+/// doctor leaf). Both loops below route through the same
+/// `guard_formula_cell` the CSV (rm-540), markdown (rm-897) and TSV
+/// lanes use; the guard is text-render-only, so the JSON lane stays
+/// byte-lossless by construction and benign names render byte-identical
+/// (the numeric exemption keeps number-like samples bare).
+fn push_guarded_sample_line(out: &mut String, sample: &str) {
+    out.push_str(&format!(
+        "    {}\n",
+        crate::reports::guard_formula_cell(sample)
+    ));
+}
+
 fn doctor_report_text(report: &DoctorReport) -> String {
     let mut out = String::new();
     out.push_str("AGENTTRACE Doctor\n");
@@ -1176,14 +1197,14 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.project_decode.unresolved
     ));
     for sample in &report.project_decode.samples {
-        out.push_str(&format!("    {sample}\n"));
+        push_guarded_sample_line(&mut out, sample);
     }
     out.push_str(&format!(
         "Zero-usage reports: {} session(s), {} event(s) counted as measured zeros (rm-408)\n",
         report.zero_usage.sessions, report.zero_usage.events
     ));
     for sample in &report.zero_usage.samples {
-        out.push_str(&format!("    {sample}\n"));
+        push_guarded_sample_line(&mut out, sample);
     }
     if !report.sqlite_duplicate_dbs.is_empty() {
         out.push_str(&format!(
