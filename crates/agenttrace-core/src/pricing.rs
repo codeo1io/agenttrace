@@ -1003,6 +1003,18 @@ fn lookup_price_in(model: &str, entries: &BTreeMap<String, Price>) -> Price {
     if let Some(key) = matching_catalog_key(model, entries) {
         return entries.get(&key).cloned().unwrap_or_default();
     }
+    // rm-1511: variant candidates used to be consulted against the builtin
+    // table only, so effort-suffixed ids (claude-sonnet-5-5-medium) billed at
+    // the builtin default even when the exact base (claude-sonnet-5-5) sat in
+    // the catalog. Try every variant against the catalog first; the builtin
+    // default stays the last resort.
+    for variant in match_variants(model) {
+        if variant != model {
+            if let Some(key) = matching_catalog_key(&variant, entries) {
+                return entries.get(&key).cloned().unwrap_or_default();
+            }
+        }
+    }
     let builtin = builtin_pricing();
     for variant in match_variants(model) {
         if let Some(price) = builtin.get(&variant) {
@@ -1408,7 +1420,74 @@ fn match_variants(raw: &str) -> Vec<String> {
             variants.push("deepseek-r1".to_string());
         }
     }
+    // rm-1511: clients (Antigravity CLI emits claude-sonnet-5-5-medium / -low)
+    // append a reasoning-effort tier to the model id. No catalog (bundled or
+    // upstream) carries effort-suffixed keys, but the exact base does — strip
+    // the tier as a candidate so the base rate beats the builtin default. The
+    // raw id keeps the suffix (see `effort_tier_of`), so tier-aware lanes lose
+    // nothing.
+    if let Some(base) = strip_effort_suffix(&normalized) {
+        variants.push(base);
+    }
     variants
+}
+
+/// Effort tiers clients append to model ids (rm-1511): `-low/-medium/-high`
+/// (Antigravity style) and `-thinking` / `:thinking` (models.dev style).
+const EFFORT_TIERS: [(&str, &str); 5] = [
+    ("-medium", "medium"),
+    ("-high", "high"),
+    ("-low", "low"),
+    ("-thinking", "thinking"),
+    (":thinking", "thinking"),
+];
+
+/// The reasoning-effort tier a client suffixed onto a model id, if any
+/// (`claude-sonnet-5-5-medium` -> `medium`). Pricing resolution strips the
+/// tier; this re-derives it so tier-aware lanes keep their input.
+pub fn effort_tier_of(model: &str) -> Option<&'static str> {
+    let normalized = normalize_model(model);
+    EFFORT_TIERS
+        .iter()
+        .find(|(marker, _)| normalized.ends_with(marker) && normalized.len() > marker.len())
+        .map(|(_, tier)| *tier)
+}
+
+fn strip_effort_suffix(normalized: &str) -> Option<String> {
+    let (marker, _) = EFFORT_TIERS
+        .iter()
+        .find(|(marker, _)| normalized.ends_with(marker) && normalized.len() > marker.len())?;
+    let base = normalized[..normalized.len() - marker.len()].trim_end_matches(['-', ':']);
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_string())
+    }
+}
+
+/// For a model id with NO specific catalog price, the in-catalog base id
+/// hiding under a single unrecognized trailing `-token`, if one exists
+/// (`claude-sonnet-5-5-ultra` -> `claude-sonnet-5-5`). rm-1511 disclosure:
+/// such sessions price at the builtin default while the exact base was
+/// available, and the data-health lane names them instead of only counting.
+pub fn specific_base_for_unpriced(model: &str) -> Option<String> {
+    if has_specific_price(model) {
+        return None;
+    }
+    let normalized = normalize_model(model);
+    if let Some(base) = strip_effort_suffix(&normalized) {
+        if has_specific_price(&base) {
+            return Some(base);
+        }
+        return None;
+    }
+    let (head, tail) = normalized.rsplit_once('-')?;
+    let tail_is_token =
+        !tail.is_empty() && tail.len() <= 10 && tail.chars().all(|c| c.is_ascii_alphabetic());
+    if tail_is_token && has_specific_price(head) {
+        return Some(head.to_string());
+    }
+    None
 }
 
 fn normalize_model(raw: &str) -> String {
