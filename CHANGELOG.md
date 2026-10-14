@@ -4,6 +4,30 @@
 
 ### Added
 
+- batch service-tier pricing (rm-164, run 499a64a9 cycle 2): LiteLLM publishes
+  `*_batches` rate sets — the async batch-discount family, exactly 0.5x standard on
+  every carrier — and the bundled snapshot carried none of them, so every
+  `service_tier: "batch"` turn silently billed at standard rates. The snapshot
+  refresh (source `_snapshot.date` 2026-10-14, 3130→3168 chat models: +38 added,
+  14 rate-mutated, 67 window-only-changed, 466 retained-by-union, 0 manual drops)
+  now keeps the bare batch fields (311 input carriers; `*_above_272k_tokens_batches`
+  deliberately dropped, the rm-610 no-long-context-tier decision held for the
+  fourth family), `Price` gains the four `*_batches` slots with the flex/ultrafast
+  semantics (absent means "no published batch rate" — standard rates, disclosed,
+  never silently repriced), `lookup_price_tiered` accepts both wire spellings
+  (`batch`, `batches`), tiered sessions record and disclose the tier billed on,
+  and `--test-match`/`list-models` print the batch row. Contract:
+  `pricing_batches_contract.rs`. Refresh collateral: `claude-sonnet-4-5`'s
+  `max_input_tokens` test pin moved 1M → 200k (upstream unified the split
+  data, verified against the refreshed snapshot), the three svg-card goldens
+  re-pinned (footer now discloses 79 of 1545 priced models past vendor
+  deprecation), and the sparkline wall-clock leak scan is scoped to
+  corpus-derived content — the naive whole-document scan tripped whenever
+  the UTC date equaled the bundle's snapshot date (same-day collision on
+  the legitimate pricing disclosure).
+  Cargo.lock: rustls 0.23.45 → 0.23.46 (rm-018) — closes the four standing
+  RUSTSEC-2026-0346..0349 advisories for the workspace
+  (`cargo deny --all-features check advisories` green).
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously

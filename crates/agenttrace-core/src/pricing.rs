@@ -17,7 +17,7 @@ const PRICING_URL: &str =
 /// drop note) and keep `PRICING_SNAPSHOT_DATE` in sync with the date it
 /// prints.
 const PRICING_SNAPSHOT_JSON: &str = include_str!("pricing_snapshot.json");
-const PRICING_SNAPSHOT_DATE: &str = "2026-10-08";
+const PRICING_SNAPSHOT_DATE: &str = "2026-10-14";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static PRICING_CATALOG: OnceLock<PricingCatalog> = OnceLock::new();
 static PRICING_OVERRIDE_MODELS: OnceLock<BTreeSet<String>> = OnceLock::new();
@@ -99,6 +99,26 @@ pub struct Price {
     pub cw_ultrafast: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cr_ultrafast: Option<f64>,
+    /// Batch-tier rates (LiteLLM `*_batches`, rm-164 2026-10-15
+    /// refresh): the rate a turn that ran on
+    /// `service_tier: "batch"` bills at — the async batch-discount
+    /// family (exactly 0.5x standard on every carrier LiteLLM
+    /// published at fetch time). Same semantics as flex/ultrafast:
+    /// absent means "no published batch rate" and a batch turn of
+    /// such a model bills at the standard rates — disclosed, never
+    /// zero and never silently repriced. Both wire spellings
+    /// (`batch`, `batches`) resolve to these slots.
+    /// `_above_272k_tokens_batches` variants are deliberately not
+    /// ingested (the rm-610 flex decision, held for the fourth tier
+    /// family).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_batches: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_batches: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cw_batches: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cr_batches: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,22 +181,37 @@ struct LiteLlmModel {
     cache_write_cost_ultrafast: Option<f64>,
     #[serde(default, rename = "cache_read_input_token_cost_ultrafast")]
     cache_read_cost_ultrafast: Option<f64>,
+    // Batch-tier rates (rm-164 2026-10-15 refresh): same ingestion
+    // shape as flex/ultrafast; `_above_272k_tokens_batches`
+    // variants deliberately not ingested (no long-context tier
+    // extraction — the rm-610 decision, held for the fourth tier
+    // family too).
+    #[serde(default, rename = "input_cost_per_token_batches")]
+    input_cost_batches: Option<f64>,
+    #[serde(default, rename = "output_cost_per_token_batches")]
+    output_cost_batches: Option<f64>,
+    #[serde(default, rename = "cache_creation_input_token_cost_batches")]
+    cache_write_cost_batches: Option<f64>,
+    #[serde(default, rename = "cache_read_input_token_cost_batches")]
+    cache_read_cost_batches: Option<f64>,
 }
 
 pub fn lookup_price(model: &str) -> Price {
     lookup_price_tiered(model, None)
 }
 
-/// rm-610 (flex) + cycle-2 rider (ultrafast): resolve a model's
-/// rates for the service tier the turn actually ran on.
-/// `Some("flex")`/`Some("ultrafast")` bills at the entry's tier
-/// slots when the catalog row carries them — input AND output must
-/// both be present, and a missing cache slot falls back to that
-/// standard rate — while every other tier (None, "default",
-/// "priority", ...) bills at the standard rates. A model without
-/// tier rates bills tiered turns at the standard rates: that is the
-/// published behavior (codeburn #1642, held for the third tier
-/// family), not a guess.
+/// rm-610 (flex) + cycle-2 rider (ultrafast) + 2026-10-15 refresh
+/// (batches): resolve a model's rates for the service tier the turn
+/// actually ran on. `Some("flex")`/`Some("ultrafast")` bills at the
+/// entry's tier slots when the catalog row carries them — input AND
+/// output must both be present, and a missing cache slot falls back
+/// to that standard rate — while every other tier (None, "default",
+/// "priority", ...) bills at the standard rates. The batch family
+/// accepts both wire spellings (`batch`, `batches` — the LiteLLM
+/// field suffix is plural, the OpenAI service_tier value singular).
+/// A model without tier rates bills tiered turns at the standard
+/// rates: that is the published behavior (codeburn #1642, held for
+/// every tier family), not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
     let model = resolve_alias(model, &catalog.aliases);
@@ -193,6 +228,12 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
             price.output_ultrafast,
             price.cw_ultrafast,
             price.cr_ultrafast,
+        ),
+        Some("batch" | "batches") => (
+            price.input_batches,
+            price.output_batches,
+            price.cw_batches,
+            price.cr_batches,
         ),
         _ => return price,
     };
@@ -409,9 +450,9 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         );
         // rm-610: a None slot must hash differently from Some(value) —
         // the flag byte keeps gained/lost tier pricing from colliding
-        // with a value change (flex and, since the cycle-2 rider,
-        // ultrafast — a gained ultrafast slot must reprice cached
-        // sessions the same way).
+        // with a value change (flex, ultrafast since the cycle-2
+        // rider, batches since the 2026-10-15 refresh — a gained tier
+        // slot must reprice cached sessions the same way).
         for tier in [
             price.input_flex,
             price.output_flex,
@@ -421,6 +462,10 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
             price.output_ultrafast,
             price.cw_ultrafast,
             price.cr_ultrafast,
+            price.input_batches,
+            price.output_batches,
+            price.cw_batches,
+            price.cr_batches,
         ] {
             hash = fnv1a(&[tier.is_some() as u8], hash);
             if let Some(value) = tier {
@@ -712,6 +757,18 @@ pub fn render_test_match() -> String {
                 out_uf,
                 p.cw_ultrafast.unwrap_or(p.cw),
                 p.cr_ultrafast.unwrap_or(p.cr)
+            ));
+        }
+        // Batch-tier rates (rm-164 2026-10-15 refresh): same probe
+        // answerability — the rate a `service_tier: "batch"` turn
+        // bills at is printable from list-models for every carrier.
+        if let (Some(in_b), Some(out_b)) = (p.input_batches, p.output_batches) {
+            out.push_str(&format!(
+                "      batch: in=${:>7.2}/M  out=${:>7.2}/M  cw=${:>6.2}/M  cr=${:>6.2}/M\n",
+                in_b,
+                out_b,
+                p.cw_batches.unwrap_or(p.cw),
+                p.cr_batches.unwrap_or(p.cr)
             ));
         }
     }
@@ -1209,6 +1266,10 @@ fn validate_override_price(model: &str, price: &Price) -> Result<(), String> {
         ("output_ultrafast", price.output_ultrafast),
         ("cw_ultrafast", price.cw_ultrafast),
         ("cr_ultrafast", price.cr_ultrafast),
+        ("input_batches", price.input_batches),
+        ("output_batches", price.output_batches),
+        ("cw_batches", price.cw_batches),
+        ("cr_batches", price.cr_batches),
     ] {
         if let Some(value) = value {
             if !value.is_finite() {
@@ -1335,6 +1396,13 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             output_ultrafast: tier_slot(model.output_cost_ultrafast),
             cw_ultrafast: tier_slot(model.cache_write_cost_ultrafast),
             cr_ultrafast: tier_slot(model.cache_read_cost_ultrafast),
+            // Batch-tier slots (rm-164 2026-10-15 refresh): scaled and
+            // filtered identically — zero/absent means "no published
+            // rate".
+            input_batches: tier_slot(model.input_cost_batches),
+            output_batches: tier_slot(model.output_cost_batches),
+            cw_batches: tier_slot(model.cache_write_cost_batches),
+            cr_batches: tier_slot(model.cache_read_cost_batches),
         };
         // Hostile or overflowing catalog rates must not reach costing:
         // the 1e6 scaling can turn a near-f64-max per-token cost into
@@ -2926,10 +2994,14 @@ mod tests {
             with_deprecation > 100,
             "expected a substantial deprecated-model cohort, got {with_deprecation}"
         );
-        // The 1M-window default class (rm-231's motivating case).
+        // rm-231's motivating class, pinned to a concrete row. The
+        // 2026-10-14 LiteLLM source unified sonnet-4-5's split data
+        // (the bare keys carried a stale 1M window while every
+        // versioned twin already said 200k); the row now resolves to
+        // the vendor's 200k standard window.
         assert_eq!(
             catalog.entries["claude-sonnet-4-5"].max_input_tokens,
-            Some(1_000_000)
+            Some(200_000)
         );
     }
 

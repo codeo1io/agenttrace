@@ -182,6 +182,19 @@ def trim(data):
             ultrafast = value.get(ultrafast_field)
             if isinstance(ultrafast, (int, float)) and ultrafast > 0:
                 entry[ultrafast_field] = ultrafast
+        # Batch-tier rates (rm-164 2026-10-15 refresh): same
+        # keep-only-the-four-bare-fields rule as flex/ultrafast — the
+        # `*_above_272k_tokens_batches` variants are deliberately
+        # dropped (no long-context tier extraction, rm-610 decision).
+        for batches_field in (
+            "input_cost_per_token_batches",
+            "output_cost_per_token_batches",
+            "cache_creation_input_token_cost_batches",
+            "cache_read_input_token_cost_batches",
+        ):
+            batches = value.get(batches_field)
+            if isinstance(batches, (int, float)) and batches > 0:
+                entry[batches_field] = batches
         keep[key] = entry
     return keep
 
