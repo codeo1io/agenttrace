@@ -1236,8 +1236,9 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
     DeliveryEvidence {
         methodology: if inspect_git {
             format!(
-                "Read-only local Git heuristic: commit timestamps are matched to session start/end with a 2-minute lead and 5-minute tail. It does not prove authorship, merge-to-main, or business value. The local git log probe is bounded at {} seconds per repository root; a probe that overruns the bound is treated as unavailable and its root degrades to the tool-authority heuristic.",
-                GIT_PROBE_TIMEOUT.as_secs()
+                "Read-only local Git heuristic: commit timestamps are matched to session start/end with a 2-minute lead and 5-minute tail. It does not prove authorship, merge-to-main, or business value. The local git log probe is bounded at {} seconds per repository root and drains at most {} KiB of log output; a probe that overruns either bound is treated as unavailable and its root degrades to the tool-authority heuristic.",
+                GIT_PROBE_TIMEOUT.as_secs(),
+                GIT_PROBE_DRAIN_MAX_BYTES / 1024
             )
         } else {
             "Lightweight heuristic based on observed tool authority only. Run --delivery-evidence for read-only local Git timestamp correlation.".to_string()
@@ -1275,6 +1276,20 @@ fn git_commits_by_root(sessions: &[Session]) -> BTreeMap<String, Vec<GitCommit>>
 /// `methodology` string.
 const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// rm-731 drain arm (run 80e8beb6 cycle 1, batch "bounded inputs,
+/// honest docs"): the probe's helper thread used to `read_to_end`
+/// the WHOLE `git log --all` stream — the timeout bounded the wait,
+/// never the buffer, so a hostile or pathological repository (a log
+/// with millions of lines) grew the drain without bound. The drain
+/// now stops at [`GIT_PROBE_DRAIN_MAX_BYTES`] and an overrun degrades
+/// the root to the documented heuristic (a truncated commit census
+/// would silently bias the recency heuristic, so overflow means
+/// unavailable, never partial). ~6k commits fit under the cap — one
+/// timestamp per `git log --format=%ct` line — which covers every
+/// real project root; the bound is disclosed in the report's
+/// `methodology` string alongside the timeout.
+const GIT_PROBE_DRAIN_MAX_BYTES: usize = 64 * 1024;
+
 /// Wait for a spawned child with a wall-clock deadline. Returns the
 /// exit status when the child finishes inside the bound; kills the
 /// child and returns `None` when the deadline passes. Callers that
@@ -1310,16 +1325,23 @@ fn git_commits(root: &str) -> Option<Vec<GitCommit>> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take();
-    let (drain_tx, drain_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // rm-731 drain arm: the drain thread is bounded twice — read at
+    // most GIT_PROBE_DRAIN_MAX_BYTES + 1 bytes (the extra byte detects
+    // overflow in one read; bytes past the cap die with the pipe), and
+    // the recv below only gets the remainder of the probe budget.
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     // The handle is deliberately not joined: the reader exits once its
     // pipe EOFs (or with the process), and the bounded recv below is the
     // only wait this probe performs on it.
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
+        let mut overflow = false;
         if let Some(stream) = stdout.as_mut() {
-            let _ = stream.read_to_end(&mut bytes);
+            let mut capped = stream.take(GIT_PROBE_DRAIN_MAX_BYTES as u64 + 1);
+            let _ = capped.read_to_end(&mut bytes);
+            overflow = bytes.len() > GIT_PROBE_DRAIN_MAX_BYTES;
         }
-        let _ = drain_tx.send(bytes);
+        let _ = drain_tx.send((bytes, overflow));
     });
     let started = std::time::Instant::now();
     let status = wait_child_bounded(&mut child, GIT_PROBE_TIMEOUT)?;
@@ -1334,7 +1356,14 @@ fn git_commits(root: &str) -> Option<Vec<GitCommit>> {
     // what remains of the probe's ten-second budget and degrades to the
     // documented heuristic instead of hanging.
     let remaining = GIT_PROBE_TIMEOUT.saturating_sub(started.elapsed());
-    let stdout = drain_rx.recv_timeout(remaining).ok()?;
+    let (stdout, overflow) = drain_rx.recv_timeout(remaining).ok()?;
+    if overflow {
+        // A log that overran the drain cap cannot yield a complete
+        // commit census — degrade to the documented heuristic rather
+        // than price a truncated one (the cap is disclosed in the
+        // report's methodology string).
+        return None;
+    }
     Some(
         String::from_utf8_lossy(&stdout)
             .lines()
@@ -2485,6 +2514,66 @@ mod tests {
             "methodology must disclose the probe bound: {}",
             report.methodology
         );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn git_probe_degrades_when_the_log_overruns_the_drain_cap() {
+        // rm-731 drain arm (run 80e8beb6 cycle 1, batch "bounded
+        // inputs, honest docs"): a helper whose `git log` output
+        // overruns the drain cap must degrade the root to the
+        // documented heuristic instead of buffering an unbounded log
+        // — a truncated census would silently bias the recency
+        // heuristic. Control arm: the same shim delegates ordinary
+        // roots to real git, which still drains under the cap and
+        // yields commits. Mirrors the pipe-holder sibling's shim
+        // pattern (marker keyed on the -C root arg).
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = crate::test_env::lock_env();
+        let marker = "agenttrace-gov-drain-cap";
+        let root = std::env::temp_dir().join(format!("{marker}-root"));
+        let shim_dir = root.join("shim");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        // 7,000 lines of 11-byte timestamps = ~77 KiB > the 64 KiB
+        // drain cap; one line per commit mirrors `git log --format=%ct`.
+        std::fs::write(
+            shim_dir.join("git"),
+            format!(
+                "#!/bin/sh\ncase \"$2\" in\n  *{marker}*) i=0\n    while [ $i -lt 7000 ]; do\n      echo 1000000000\n      i=$((i + 1))\n    done ;;\n  *) exec /usr/bin/git \"$@\" ;;\nesac\n"
+            ),
+        )
+        .expect("write git shim");
+        std::fs::set_permissions(shim_dir.join("git"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod git shim");
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
+        );
+        let started = std::time::Instant::now();
+        let overflow = git_commits(root.to_str().expect("utf-8 root"));
+        let overflow_elapsed = started.elapsed();
+        // Control: the crate root is a real git repository, and the
+        // shim delegates it to /usr/bin/git — it must still yield
+        // commits under the cap (also proves the shim only diverts
+        // the marker root).
+        let control = git_commits(env!("CARGO_MANIFEST_DIR"));
+        if let Some(path) = previous_path {
+            std::env::set_var("PATH", path);
+        }
+        assert!(
+            overflow.is_none(),
+            "an over-cap git log must degrade to the heuristic, got {} commits",
+            overflow.map(|drained| drained.len()).unwrap_or(0)
+        );
+        assert!(
+            overflow_elapsed < GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+            "the overflow arm must stay inside the probe bounds (took {overflow_elapsed:?})"
+        );
+        assert!(
+            control.is_some(),
+            "the control root must still yield commits through real git"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn slow_tool_recommendation_cites_max_p95_entry() {

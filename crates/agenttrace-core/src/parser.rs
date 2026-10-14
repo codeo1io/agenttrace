@@ -3,6 +3,7 @@ use anyhow::{bail, Context};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -6001,23 +6002,25 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         return None;
     }
     // Insertion-ordered id -> record map with in-place replacement,
-    // mirroring the reader's `messagesMap`.
+    // mirroring the reader's `messagesMap`. rm-715 perf rider (run
+    // 80e8beb6 cycle 1, batch "bounded inputs, honest docs"): the
+    // upstream messagesMap is a MAP — the previous linear `find` made
+    // every appended record rescan the whole journal (measured 9.5 s
+    // for a 20k-record hostile journal at cab6917). The position
+    // index carries the same O(1) upsert the reader has; structural
+    // records ($set/$rewindTo/$patch) rewrite the vector wholesale,
+    // so the index is rebuilt after each — the rare path pays O(n),
+    // and the common append path never pays a rescan again.
     let mut messages: Vec<(String, JsonObject)> = Vec::new();
-    let upsert =
-        |messages: &mut Vec<(String, JsonObject)>, id: String, record: JsonObject| match messages
-            .iter_mut()
-            .find(|(existing, _)| *existing == id)
-        {
-            Some(slot) => slot.1 = record,
-            None => messages.push((id, record)),
-        };
+    let mut index: HashMap<String, usize> = HashMap::new();
     for obj in objs {
         if let Some(set) = obj.get("$set").and_then(Value::as_object) {
             if let Some(replacement) = set.get("messages").and_then(Value::as_array) {
                 messages.clear();
+                index.clear();
                 for record in replacement.iter().filter_map(Value::as_object) {
                     if let Some(id) = gemini_chats_message_id(record) {
-                        upsert(&mut messages, id, record.clone());
+                        gemini_chats_upsert(&mut messages, &mut index, id, record.clone());
                     }
                 }
             }
@@ -6030,14 +6033,16 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 Some(at) => messages.truncate(at),
                 None => messages.clear(),
             }
+            index = gemini_chats_reindex(&messages);
             continue;
         }
         if let Some(patch) = obj.get("$patch").and_then(Value::as_object) {
             gemini_chats_apply_patch(&mut messages, patch);
+            index = gemini_chats_reindex(&messages);
             continue;
         }
         if let Some(id) = gemini_chats_message_id(obj) {
-            upsert(&mut messages, id, obj.clone());
+            gemini_chats_upsert(&mut messages, &mut index, id, obj.clone());
         }
     }
     let mut events = Vec::new();
@@ -6045,6 +6050,35 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         gemini_chats_message_events(record, &mut events);
     }
     non_empty(events)
+}
+
+/// O(1) id upsert for [`parse_gemini_chats_jsonl`] — replace in
+/// place when the reader would (pushMessage re-appends the full record
+/// with tokens/toolCalls attached), append at the tail otherwise.
+fn gemini_chats_upsert(
+    messages: &mut Vec<(String, JsonObject)>,
+    index: &mut HashMap<String, usize>,
+    id: String,
+    record: JsonObject,
+) {
+    match index.get(&id) {
+        Some(slot) => messages[*slot].1 = record,
+        None => {
+            index.insert(id.clone(), messages.len());
+            messages.push((id, record));
+        }
+    }
+}
+
+/// Rebuild the id -> position index after a structural record
+/// (`$set`/`$rewindTo`/`$patch`) rewrites the message vector — order
+/// is the vector's, positions are fresh.
+fn gemini_chats_reindex(messages: &[(String, JsonObject)]) -> HashMap<String, usize> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(slot, (id, _))| (id.clone(), slot))
+        .collect()
 }
 
 /// Claim rule: the 0.63 writer always leads with the metadata record

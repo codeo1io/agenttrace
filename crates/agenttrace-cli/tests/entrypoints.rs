@@ -1693,6 +1693,97 @@ fn stdin_dash_empty_input_fails_like_an_empty_file() {
     let _ = std::fs::remove_file(&empty);
 }
 
+/// rm-503 cap arm (run 80e8beb6 cycle 1, batch "bounded inputs,
+/// honest docs"): the `-` lane once drained stdin without bound
+/// (assess 146452bd: 200 MiB of `/dev/zero` under a 256 MiB VM cap
+/// died with `read session from stdin: out of memory`). The read is
+/// capped — a stream past the cap fails with a NAMED error carrying
+/// the effective cap and the override knob, never an allocator
+/// death. The knob is child-scoped, so this test never touches host
+/// env.
+#[test]
+fn stdin_dash_over_cap_stream_fails_with_the_named_cap_error() {
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+    let base = std::fs::read(&fixture).expect("fixture must be readable");
+    // ~10 KiB stream: well past the 1 KiB cap. The cap fires on byte
+    // count alone, pre-parse — a hostile stream need not be valid
+    // JSON to eat the allocator.
+    let payload = base.repeat(16);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--overview", "-"])
+        .env("AGENTTRACE_STDIN_CAP_BYTES", "1024")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn agenttrace for over-cap stdin probe");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(&payload)
+        .expect("pipe fixture bytes");
+    let out = child
+        .wait_with_output()
+        .expect("collect over-cap stdin run");
+    assert_eq!(
+        Some(1),
+        out.status.code(),
+        "an over-cap stdin stream must fail rc1, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stdin session exceeds the read cap"),
+        "the over-cap failure must be the named cap error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("AGENTTRACE_STDIN_CAP_BYTES"),
+        "the cap error must name the override knob, got: {stderr}"
+    );
+}
+
+/// The knob bounds the stream, never breaks it: a cap above the
+/// payload keeps the byte-identical stdin lane (same output as the
+/// file path, the rm-503 parity invariant).
+#[test]
+fn stdin_dash_within_the_knob_cap_still_parses() {
+    let fixture = generated_fixture("detailed-tool-steps.jsonl");
+    let payload = std::fs::read(&fixture).expect("fixture must be readable");
+    let via_stdin = {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+            .args(["--overview", "-"])
+            .env(
+                "AGENTTRACE_STDIN_CAP_BYTES",
+                (payload.len() + 4096).to_string(),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn agenttrace for within-cap stdin probe");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(&payload)
+            .expect("pipe fixture bytes");
+        child
+            .wait_with_output()
+            .expect("collect within-cap stdin run")
+    };
+    assert!(
+        via_stdin.status.success(),
+        "a within-cap stream must parse: {}",
+        String::from_utf8_lossy(&via_stdin.stderr)
+    );
+    assert_eq!(
+        via_stdin.stdout,
+        stdin_dash_overview_bytes(&fixture),
+        "the knob must bound the stream without changing a byte of output"
+    );
+}
+
 #[test]
 fn keyword_host_commands_have_real_help_routes() {
     // rm-505: `statusline` and `upstream` are documented host keywords,

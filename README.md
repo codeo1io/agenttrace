@@ -170,7 +170,7 @@ agenttrace --overview -f csv
 ```
 
 Session columns: `session,health,data,source,model,cost,tokens,fail,anomalies,zero_usage_events,subagents,subagent_cost,parent_session`.
-The `subagents`/`subagent_cost` columns mirror the TSV's SUBAGENTS/SUBAGENT_COST rollup columns and `parent_session` names the parent transcript on subagent rows (empty otherwise), so no format hides the subagent picture another format shows. Rollups are corpus-scope: they reflect every child in the loaded corpus, not only rows surviving the active view filters (`--since`/`--project` etc.). When `--limit` drops rows, the table ends with a `# truncated: showing N of M matching sessions (--limit L)` marker row — a capped statement never reads as the whole corpus. In the same position, `--sessions -f json` wraps the rows as `{matched_sessions, returned_sessions, truncated, limit, sessions: [...]}` instead of a bare array, so a `jq '.sessions | length'` consumer can always tell a capped list from the corpus (and `jq '. | length' == 5` becomes an error, not a silent 5).
+The `subagents`/`subagent_cost` columns mirror the TSV's SUBAGENTS/SUBAGENT_COST rollup columns and `parent_session` names the parent transcript on subagent rows (empty otherwise), so no format hides the subagent picture another format shows. Rollups are corpus-scope: they reflect every child in the loaded corpus, not only rows surviving the active view filters (`--range`/`--project` etc.). When `--limit` drops rows, the table ends with a `# truncated: showing N of M matching sessions (--limit L)` marker row — a capped statement never reads as the whole corpus. In the same position, `--sessions -f json` wraps the rows as `{matched_sessions, returned_sessions, truncated, limit, sessions: [...]}` instead of a bare array, so a `jq '.sessions | length'` consumer can always tell a capped list from the corpus (and `jq '. | length' == 5` becomes an error, not a silent 5).
 `zero_usage_events` carries the rm-408 disclosure: transcripts that
 REPORT `{input_tokens: 0, output_tokens: 0, …}` are counted as measured
 zeros and flagged `zero_usage_reported` in provenance instead of reading
@@ -299,7 +299,13 @@ agenttrace --statusline-report -f json
 prioritized recommendations, MCP governance, context trends, and delivery
 signals in JSON, Markdown, and HTML output. All cost and delivery fields are
 explicitly estimates or heuristics; they are not provider billing or proof that
-a commit reached `main`.
+a commit reached `main`. When a gateway records its own cost, agenttrace
+uses it and counts — never silently — the estimates it suppresses; one
+honest gap in that counter: the suppressed estimate prices the same four
+buckets as the estimate formula (input/output/cache-write/cache-read), so
+1h-tier cache writes (Claude's `ephemeral_1h_input_tokens`) are not in it
+and a 1h-dominated gateway block can suppress less than its true catalog
+cost — the counter is a lower bound until tier-aware pricing lands (rm-176).
 
 ### Flags go before the session path
 
@@ -317,6 +323,17 @@ agenttrace -f json sessions.jsonl    # -f json works
 it never filters aggregates, audit totals, or recommendations. Governance
 reports are unbounded by default — use `--sample N` for an explicitly
 disclosed bound.
+
+### Reading a session from stdin
+
+`agenttrace -` (with report flags before it, e.g. `agenttrace --overview -`)
+reads one session stream from stdin through the same parser as a named
+file — stdin sessions are ephemeral and never touch the session cache. The
+read is bounded at 256 MiB by default (rm-503): a stream past the cap fails
+with a named `stdin session exceeds the read cap` error instead of growing
+the process until the allocator dies, and `AGENTTRACE_STDIN_CAP_BYTES`
+raises or lowers the cap (an unparseable or non-positive value falls back
+to the default rather than failing the run over a typo'd knob).
 
 ### `--demo` never silently replaces an explicit session source
 
@@ -443,14 +460,14 @@ fails when the README table drifts from the binary's actual flag count
 | `--sessions` |  | List sessions as rows (TSV text by default, explicitly requestable with `-f tsv`; `--format` json/csv for machine use). The TSV ends with the subagent rollup columns SUBAGENTS and SUBAGENT_COST — attributed spawned work, kept separate from the session's own COST/TOKENS cells; rollups are corpus-scope (every child in the loaded corpus, not just rows surviving the view filters), `--limit` truncation is disclosed in-band for json/csv and on stderr, and csv carries the subagents/subagent_cost/parent_session parity columns |
 | `--diagnostics` |  | Render per-session diagnostics: findings, evidence, fix suggestions, and next actions |
 | `--inspect <INSPECT>` |  | Inspect a single session by its `--sessions` list index (1-based) instead of the whole corpus |
-| `-m <MODEL>` | `default` | Reference model for `--compare` framing (cost-rate attribution in the comparison narrative; not a session filter — see `--model-filter`) |
+| `-m <MODEL>` | `default` | Reference model for `--compare` framing (cost-rate attribution in the comparison narrative; not a session filter — see `--model-filter`). Short flag only — there is no `--model` long form; `--model` is a usage error, and the session filter is `--model-filter` |
 | `-o <OUTPUT>` |  | Write the report to this path instead of stdout (the report is also kept on stdout — a tee, not a redirect). Regular paths stage atomically through a temp sibling (rm-250); terminal sinks like /dev/null and /dev/stdout write through directly, while fifo/socket/block-device targets are refused with a disclosed reason instead of being replaced (rm-489). Missing parent directories are created recursively (mkdir -p semantics); when a parent cannot be created, the error names the directory and the requested target (rm-784) |
 | `--latest` |  | Restrict the view to the single most recent session (works with `--waste` and report actions) |
 | `--waste` |  | Render the token-waste report: redundant context, loop cost, and unused tool output, with a per-reason breakdown |
 | `--list-models` |  | List the models the pricing catalog knows, with rate coverage; `--test-match` shows the resolution probes |
 | `--update-pricing` |  | Refresh the vendored pricing-catalog snapshots from their upstream sources, then report the drift |
 | `--test-match` |  | Print the catalog-resolution table for a probe set of model identifiers (alias and rate-match verification) |
-| `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range` and the other view filters do not apply and are refused loudly |
+| `--quota` |  | Show the plan-window quota view (rm-201): current 5h and 7d ROLLING spend windows over the discovered corpus, TTL-correct (a session's cost enters a window pro rata by its event timestamps; warm-cache sessions by their start-to-end span), with `resets_at` full-decay horizons and a corpus-cutoff disclosure. `-f json` emits the stable `agenttrace.quota/1` schema, the default a text summary; every other format is rejected loudly. Limits are disclosed-unknown — agenttrace reads no credentials and no plan data. Corpus-scope: `--range`, `--project`, `--source`, `--model-filter`, and the sample/history flags do not apply to it and are refused loudly |
 | `--statusline-report` |  | Report on the Claude Code statusline capture journal (candidate 53, cycle 7): limit-pressure windows, reset crossings, and per-session prompt-cache miss causes recorded by `agenttrace statusline` |
 | `--fetch` |  | `agenttrace upstream`: refresh the remote-tracking refs from the network via `git fetch` (and probe the npm registry) before reporting fork-vs-upstream drift. Without it, `agenttrace upstream` is fully offline (rm-024) |
 | `--config <PATH>` |  | Explicit configuration file (rm-384). Layered above the project and user config files; a missing file is an error |
@@ -471,7 +488,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--baseline-max-cost-delta-pct <BASELINE_MAX_COST_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session cost drift, in percent |
 | `--baseline-max-token-delta-pct <BASELINE_MAX_TOKEN_DELTA_PCT>` | `0` | Baseline gate: maximum allowed session token drift, in percent |
 | `--no-baseline-gate` |  | Opt out of the baseline regression gate: keep the comparison in the report but do not fail the run (exit 2) on a threshold breach (pass-7 P7-3) |
-| `--lang <en|zh>` | `en` | Report language for text and TUI surfaces: en (default) or zh |
+| `--lang <en|zh>` | `en` | Report language for text and TUI surfaces: en (default) or zh. Honored by the single-session report (bare `agenttrace FILE`), `--diagnostics`, `--inspect`, `--latest`, `--waste`, `--compare`, and the TUI; the corpus rollups (`--overview`, `--sessions`) and the quota, `--search`, insights (`--recommend`, `--context-trends`), and governance (`--audit`, `--mcp-governance`, `--delivery-evidence`) text lanes render English-only for now (rm-085) |
 | `--range <RANGE>` | `all` | Time range filter for every report: today, 7d, 30d, or all (default all). A session counts when it had activity in the window, even one that started before it |
 | `--project <PROJECT>` | `""` | Filter sessions by project slug substring |
 | `--source <SOURCE>` | `""` | Filter sessions by source tool substring (e.g. claude-code, codex, pi) |
