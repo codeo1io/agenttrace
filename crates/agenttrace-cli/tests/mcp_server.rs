@@ -527,6 +527,64 @@ fn protocol_version_is_negotiated_never_echoed() {
 }
 
 #[test]
+fn disclosure_survives_a_failing_stderr_lane() {
+    // rm-780 residual: the unsupported-protocol disclosure is the
+    // server talking about itself on stderr. A host whose stderr lane
+    // fails every write (closed, or full) must not lose the server:
+    // the old eprintln! panicked on the first failed write, killing
+    // the process on its own disclosure path. /dev/full fails every
+    // write with ENOSPC — the same write-failure class — so the
+    // initialize answer must still arrive and the server must still
+    // exit rc0 on stdin EOF.
+    if !Path::new("/dev/full").exists() {
+        return; // POSIX host device; CI runs it, exotic hosts skip.
+    }
+    let (home, cache) = seed_home("stderr-full", false);
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-99-99","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}"#,
+        "\n",
+    );
+    let dev_full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["mcp"])
+        .env("HOME", &home)
+        .env("AGENTTRACE_SESSION_CACHE_DIR", &cache)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("AGENTTRACE_PRICING_FILE")
+        .env_remove("AGENTTRACE_HISTORY_DIR")
+        .current_dir(home.parent().expect("seeded root"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(dev_full))
+        .spawn()
+        .expect("spawn agenttrace");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin piped")
+        .write_all(requests.as_bytes())
+        .expect("write request script");
+    let output = child.wait_with_output().expect("collect output");
+    assert_eq!(
+        Some(0),
+        output.status.code(),
+        "the server exits rc0 on EOF even when stderr cannot be written"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response: Value = serde_json::from_str(stdout.lines().next().unwrap_or_default())
+        .expect("initialize is still answered despite the failing stderr lane");
+    assert_eq!(
+        Some("2026-07-28"),
+        response["result"]["protocolVersion"].as_str(),
+        "the newest supported revision is still served"
+    );
+    let _ = std::fs::remove_dir_all(home.parent().expect("root"));
+}
+
+#[test]
 fn hostile_wire_lines_answer_32700_and_stay_up() {
     // rm-782 (assess F2): one non-UTF-8 line used to kill the whole
     // server with rc1 and no response (`lines()` surfaced InvalidData

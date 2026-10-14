@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
+# Cycle 3 (rm-369 extension): fall back to the repo-root release binary
+# instead of /tmp/agenttrace — a shared /tmp path can hold a days-old
+# binary or, on this fleet, a directory that passes [[ -x ]] and then
+# fails at exec; either way the gate silently stops testing this tree.
+# AGENTTRACE_BIN still wins when set (CI exports it job-wide).
+repo_root="$(git rev-parse --show-toplevel)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 fail() {

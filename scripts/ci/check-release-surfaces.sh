@@ -10,6 +10,20 @@ workspace_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)
 [[ "$workspace_version" = "0.0.0-dev" ]] ||
 	fail "workspace must use the development-version placeholder"
 
+# rm-369 extension: a gate script must never default its binary to a
+# shared /tmp path — a stale or foreign (fleet-observed: directory-
+# shaped) /tmp/agenttrace silently validates the wrong tree. The
+# repo-root release build is the default; AGENTTRACE_BIN remains the
+# explicit override. The searched literal is assembled at runtime
+# (variable split) so this guard's own source text never matches
+# itself, and -F keeps it a plain string rather than a regex: the
+# violation is the shell-default shape "colon dash", which a naive
+# single-character pattern silently misses.
+tmp_lit='/tmp'
+if grep -R -n -F -- "AGENTTRACE_BIN:-${tmp_lit}/" scripts/; then
+	fail "gate scripts must default to the repo-root release binary, not /tmp (rm-369)"
+fi
+
 grep -q "Homebrew-tap-" README.md ||
 	fail "README must link to the Homebrew tap without claiming an unpublished version"
 grep -q "Homebrew-tap-" README.zh-CN.md ||
