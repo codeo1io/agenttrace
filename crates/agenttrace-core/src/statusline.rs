@@ -1194,6 +1194,10 @@ pub struct StatuslineJournalStats {
     pub captures_with_prompt_id: usize,
     pub captures_pre_first_input: usize,
     pub captures_unknown_payload: usize,
+    /// Non-empty journal lines that failed to parse — counted so a
+    /// lines-vs-samples discrepancy has a visible cause
+    /// ("Statusline budget truth" batch, run 80336dfb).
+    pub unparsable_lines: usize,
 }
 
 /// `serde(skip_serializing_if)` helper for the rm-922 truncation
@@ -1249,8 +1253,13 @@ fn statusline_journal_stats_from_buffer(
     let mut captures_with_prompt_id = 0;
     let mut captures_pre_first_input = 0;
     let mut captures_unknown_payload = 0;
+    let mut unparsable_lines = 0;
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let Ok(capture) = serde_json::from_str::<CapturedStatusline>(line) else {
+            // "Statusline budget truth" (run 80336dfb): a torn or
+            // corrupt line still counts in `lines`; it lands here
+            // too so a lines-vs-samples discrepancy is disclosed.
+            unparsable_lines += 1;
             continue;
         };
         if !capture.payload.is_object() {
@@ -1276,6 +1285,7 @@ fn statusline_journal_stats_from_buffer(
         captures_with_prompt_id,
         captures_pre_first_input,
         captures_unknown_payload,
+        unparsable_lines,
     }
 }
 
@@ -1301,10 +1311,24 @@ pub fn render_statusline_report(
     if format == "json" {
         let mut value = serde_json::json!({ "journal": stats, "insights": insights });
         if let Some(budget) = weekly_budget {
+            // "Statusline budget truth" (run 80336dfb): the fold
+            // above already discards hostile samples, so a negative
+            // `remaining` can only mean genuine over-spend — floor it
+            // into [0, budget] so the machine field never mirrors a
+            // junk-driven total. The upper bound rides `.max(0.0)` so
+            // a hostile `--weekly-budget -5` cannot panic the clamp.
+            let remaining_usd = (budget - series.total).max(0.0).min(budget.max(0.0));
             value["budget"] = serde_json::json!({
                 "weekly_budget_usd": budget,
                 "spend_7d_usd": series.total,
-                "remaining_usd": budget - series.total,
+                "remaining_usd": remaining_usd,
+                // "Statusline budget truth" (run 80336dfb): the same
+                // hostile-sample disclosure the --budget json arm
+                // carries — discards are counted, never silent.
+                "negative_capture_cost_samples":
+                    series.negative_capture_cost_samples,
+                "invalid_capture_cost_samples":
+                    series.invalid_capture_cost_samples,
                 // rm-771: the baseline-unknown bias, so machine
                 // consumers see why the 7d total can under-count.
                 "first_day_baseline_unknown_sessions":
@@ -1368,6 +1392,19 @@ fn render_statusline_report_text(
             STATUSLINE_READ_CAP_BYTES / (1024 * 1024),
             stats.capped_away_bytes,
             stats.bytes
+        ));
+    }
+    // "Statusline budget truth" (run 80336dfb): a non-empty line
+    // that failed to parse still counts toward `lines` above —
+    // disclose it so a lines-vs-captures gap has a visible cause
+    // instead of reading as silently lost data. The JSON arm carries
+    // the same fact as the `unparsable_lines` field on the serialized
+    // journal stats.
+    if stats.unparsable_lines > 0 {
+        out.push_str(&format!(
+            "  {} unparsable journal line{} — counted in the totals above, excluded from every capture stat\n",
+            stats.unparsable_lines,
+            if stats.unparsable_lines == 1 { "" } else { "s" },
         ));
     }
     // rm-708: prompt-key diagnostics. Absence until the first user
@@ -1465,6 +1502,20 @@ fn render_statusline_report_text(
                 "Budget baseline: {} session(s) started before the journal — \
                  ${:.2} pre-journal spend excluded from the 7d total\n",
                 series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
+            ));
+        }
+        // "Statusline budget truth" (run 80336dfb): hostile cost
+        // samples were discarded from the 7d spend above — this arm
+        // discloses the same fact the --budget view carries.
+        let hostile_cost_samples =
+            series.negative_capture_cost_samples + series.invalid_capture_cost_samples;
+        if hostile_cost_samples > 0 {
+            out.push_str(&format!(
+                "Budget: {} hostile cost sample{} discarded ({} negative, {} not a finite number) — excluded from the 7d spend\n",
+                hostile_cost_samples,
+                if hostile_cost_samples == 1 { "" } else { "s" },
+                series.negative_capture_cost_samples,
+                series.invalid_capture_cost_samples,
             ));
         }
     }
@@ -1567,11 +1618,36 @@ fn render_statusline_report_text(
 
 // --- rm-385: weekly budget telemetry (cycle 1) -------------------------
 
-/// The `cost.total_cost_usd` sample a capture carries, if any. The
-/// payload gates this field at v2.1.251+, so older captures simply
-/// contribute nothing rather than failing the aggregation.
-fn capture_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
-    capture.payload.get("cost")?.get("total_cost_usd")?.as_f64()
+/// Classified `cost.total_cost_usd` sample ("Statusline budget
+/// truth" batch, run 80336dfb). The payload gates this field at
+/// v2.1.251+ (rm-385), so a capture that simply carries no sample
+/// yields `None`; a sample that is present but hostile is classified
+/// so its discard is disclosed, never silent.
+enum CaptureCostSample {
+    /// Finite, non-negative spend — enters the day fold.
+    Spend(f64),
+    /// Finite but negative: a hostile or transient capture (editor
+    /// hook, corrupted plugin payload) must never buy budget headroom.
+    /// The magnitude is intentionally not carried — only the count is
+    /// disclosed; keeping the value would invite rendering it.
+    Negative,
+    /// Present but not a finite number — `1e400` parses to `null` in
+    /// the JSON tree, and strings/booleans are equally unusable.
+    Invalid,
+}
+
+fn capture_cost_sample(capture: &CapturedStatusline) -> Option<CaptureCostSample> {
+    let node = capture.payload.get("cost")?.get("total_cost_usd")?;
+    match node.as_f64() {
+        Some(v) if v.is_finite() => {
+            if v >= 0.0 {
+                Some(CaptureCostSample::Spend(v))
+            } else {
+                Some(CaptureCostSample::Negative)
+            }
+        }
+        _ => Some(CaptureCostSample::Invalid),
+    }
 }
 
 fn utc_day(epoch: i64) -> String {
@@ -1629,6 +1705,17 @@ pub struct StatuslineBudgetSeries {
     /// Sum of those sessions' first observed cumulative values — the
     /// excluded pre-journal bias, rounded to cents (rm-771 arm 1).
     pub first_day_baseline_unknown_usd: f64,
+    /// Captures whose cost node carried a finite negative
+    /// `total_cost_usd` — discarded before the day fold and disclosed
+    /// here: a negative cumulative must never buy budget headroom
+    /// ("Statusline budget truth" batch, run 80336dfb).
+    pub negative_capture_cost_samples: usize,
+    /// Captures whose cost node exists but is not a finite number
+    /// (`1e400` arrives as `null`; strings and booleans likewise) —
+    /// discarded and disclosed here so a lines-vs-daily discrepancy
+    /// has a visible cause. Not window-scoped: the discard decision
+    /// happens before day keying.
+    pub invalid_capture_cost_samples: usize,
 }
 
 pub fn statusline_budget_series(
@@ -1645,32 +1732,51 @@ pub fn statusline_budget_series(
     // retained journal — the session began mid-window, or the 10 MiB
     // retention cap (rm-385) dropped its true first days (rm-771).
     let mut per_session: BTreeMap<&str, BTreeMap<String, (f64, f64)>> = BTreeMap::new();
+    let mut negative_capture_cost_samples = 0usize;
+    let mut invalid_capture_cost_samples = 0usize;
     for capture in captures {
-        if let Some(cost) = capture_cost_usd(capture) {
-            let day = utc_day(capture.captured_at);
-            if day.is_empty() {
+        // "Statusline budget truth" (run 80336dfb): classify the cost
+        // node BEFORE the fold. A hostile negative or a
+        // non-representable value (1e400 parses to `null`) is
+        // discarded with a disclosed count instead of silently
+        // entering the series — a negative cumulative must never buy
+        // budget headroom, and a junk cost must never vanish without
+        // a trace.
+        let cost = match capture_cost_sample(capture) {
+            Some(CaptureCostSample::Spend(cost)) => cost,
+            Some(CaptureCostSample::Negative) => {
+                negative_capture_cost_samples += 1;
                 continue;
             }
-            // Captures without a session id cannot be attributed to a
-            // cost series; skipping them keeps the sum conservative.
-            let Some(session) = capture.session_id() else {
+            Some(CaptureCostSample::Invalid) => {
+                invalid_capture_cost_samples += 1;
                 continue;
-            };
-            let entry = per_session
-                .entry(session)
-                .or_default()
-                .entry(day)
-                // Seed with the first observed cost itself: the
-                // witness must be that value, not -inf (a -inf seed
-                // can never be lowered into, so `first_seen` stayed
-                // -inf and the baseline-unknown arm never fired).
-                .or_insert((cost, cost));
-            if cost < entry.0 {
-                entry.0 = cost;
             }
-            if cost > entry.1 {
-                entry.1 = cost;
-            }
+            None => continue,
+        };
+        let day = utc_day(capture.captured_at);
+        if day.is_empty() {
+            continue;
+        }
+        // Captures without a session id cannot be attributed to a
+        // cost series; skipping them keeps the sum conservative.
+        let Some(session) = capture.session_id() else {
+            continue;
+        };
+        let entry = per_session
+            .entry(session)
+            .or_default()
+            .entry(day)
+            // Seed with the first observed cost itself: the
+            // witness must be that value, not -inf (a -inf seed
+            // can never be lowered into, so `first_seen` stayed
+            // -inf and the baseline-unknown arm never fired).
+            .or_insert((cost, cost));
+        if cost < entry.0 {
+            entry.0 = cost;
+        }
+        if cost > entry.1 {
+            entry.1 = cost;
         }
     }
     let mut daily: BTreeMap<String, f64> = BTreeMap::new();
@@ -1731,6 +1837,8 @@ pub fn statusline_budget_series(
             // bias — F3 scopes the counters to the (empty) window.
             first_day_baseline_unknown_sessions: 0,
             first_day_baseline_unknown_usd: 0.0,
+            negative_capture_cost_samples,
+            invalid_capture_cost_samples,
         };
     }
     let window_start = today - Duration::days(days as i64 - 1);
@@ -1790,6 +1898,8 @@ pub fn statusline_budget_series(
         excluded_older_days,
         first_day_baseline_unknown_sessions: baseline_unknown_sessions,
         first_day_baseline_unknown_usd: (baseline_unknown_usd * 100.0).round() / 100.0,
+        negative_capture_cost_samples,
+        invalid_capture_cost_samples,
     }
 }
 
@@ -1825,6 +1935,11 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
                 }))
                 .collect::<Vec<_>>(),
             "spend_7d_usd": series.total,
+            // "Statusline budget truth" (run 80336dfb): hostile cost
+            // samples are discarded from every spend number in this
+            // object and disclosed here — never silently.
+            "negative_capture_cost_samples": series.negative_capture_cost_samples,
+            "invalid_capture_cost_samples": series.invalid_capture_cost_samples,
             // rm-917: stale sampled days the calendar window excluded.
             "excluded_older_days": series.excluded_older_days,
             // rm-771: sessions that predate the journal are excluded
@@ -1837,7 +1952,11 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
         });
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
-            value["remaining_usd"] = serde_json::json!(budget - series.total);
+            // "Statusline budget truth" (run 80336dfb): floored into
+            // [0, budget] — same contract as the --statusline-report
+            // budget block; the text arm below keeps its OVER verdict.
+            value["remaining_usd"] =
+                serde_json::json!((budget - series.total).max(0.0).min(budget.max(0.0)));
         }
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
     }
@@ -1876,6 +1995,25 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "  first-day baseline unknown for {} session(s) — \
              ${:.2} of pre-journal spend excluded from the 7d total\n",
             series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
+        ));
+    }
+    // "Statusline budget truth" (run 80336dfb): hostile cost samples
+    // (finite negatives, non-representable values like 1e400) are
+    // excluded from the 7d total above — disclosed here, never
+    // dropped silently.
+    let hostile_cost_samples =
+        series.negative_capture_cost_samples + series.invalid_capture_cost_samples;
+    if hostile_cost_samples > 0 {
+        out.push_str(&format!(
+            "  {} hostile cost sample{} discarded ({} negative, {} not a finite number) — excluded from the 7d total\n",
+            hostile_cost_samples,
+            if hostile_cost_samples == 1 {
+                ""
+            } else {
+                "s"
+            },
+            series.negative_capture_cost_samples,
+            series.invalid_capture_cost_samples,
         ));
     }
     match weekly_budget {
@@ -2048,6 +2186,7 @@ mod tests {
                 captures_with_prompt_id: 0,
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &statusline_insights(&[]),
             Some(5.0),
@@ -2295,6 +2434,7 @@ mod tests {
                 captures_with_prompt_id: 0,
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &statusline_insights(&[]),
             Some(10.0),
@@ -2505,6 +2645,7 @@ mod tests {
                 captures_with_prompt_id: 0,
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &statusline_insights(&captures),
             budget,
@@ -2544,6 +2685,7 @@ mod tests {
                 captures_with_prompt_id: 0,
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &statusline_insights(&[]),
             budget,
@@ -2566,6 +2708,7 @@ mod tests {
                 captures_with_prompt_id: 0,
                 captures_pre_first_input: 2,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &statusline_insights(&captures),
             None,
@@ -2953,6 +3096,7 @@ mod tests {
                 captures_with_prompt_id: 0,
                 captures_pre_first_input: 1,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &insights,
             None,
@@ -3142,6 +3286,7 @@ mod tests {
                 captures_with_prompt_id: 1,
                 captures_pre_first_input: 0,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &insights,
             None,
@@ -3180,6 +3325,7 @@ mod tests {
                 captures_with_prompt_id: 0,
                 captures_pre_first_input: 1,
                 captures_unknown_payload: 0,
+                unparsable_lines: 0,
             },
             &statusline_insights(&period_only),
             None,
