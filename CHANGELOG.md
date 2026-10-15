@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Guarded the `--diagnostics` text lane against spreadsheet-formula payloads: `session.diagnostics` JSON dump string leaves now carry the `'` paste-marker like the report and doctor lanes, while the `-f json` machine lane stays byte-lossless by design (#rm-540).
 
 ### Added
 

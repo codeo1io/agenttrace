@@ -522,3 +522,59 @@ fn upstream_report_honors_dash_o() {
     assert_eq!(file, text, "file twin matches stdout byte-for-byte");
     let _ = std::fs::remove_dir_all(&fixture.root);
 }
+
+#[test]
+fn diagnostics_lane_neutralizes_the_hostile_formula_corpus() {
+    let bin = env!("CARGO_BIN_EXE_agenttrace");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/agenttrace-core/tests/fixtures/formula-lane/hostile-tool.jsonl")
+        .canonicalize()
+        .expect("hostile-tool.jsonl fixture exists");
+    let home = std::env::temp_dir().join("at-diag-lane-home");
+    let _ = std::fs::create_dir_all(&home);
+
+    // Human TEXT lane (default format): every spreadsheet-formula leaf inside
+    // the session.diagnostics dump must carry the paste guard marker.
+    let out = Command::new(bin)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("HOME", &home)
+        .args([
+            "--diagnostics",
+            fixture.to_str().expect("utf8 fixture path"),
+        ])
+        .output()
+        .expect("spawn agenttrace --diagnostics");
+    assert!(out.status.success(), "text lane exited {:?}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("\"'+cmd|"),
+        "guarded `+cmd|` leaf missing from diagnostics dump:\n{}",
+        text
+    );
+    assert!(
+        !text.contains("\"+cmd|"),
+        "raw `+cmd|` leaf leaked into the human diagnostics lane:\n{}",
+        text
+    );
+
+    // Machine JSON lane (-f json): byte-lossless by design for downstream
+    // tooling (lane boundary pinned by the governance precedent).
+    let out = Command::new(bin)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("HOME", &home)
+        .args([
+            "--diagnostics",
+            "-f",
+            "json",
+            fixture.to_str().expect("utf8 fixture path"),
+        ])
+        .output()
+        .expect("spawn agenttrace --diagnostics -f json");
+    assert!(out.status.success(), "json lane exited {:?}", out.status);
+    let machine = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        machine.contains("\"+cmd|"),
+        "machine JSON lane must stay byte-lossless (raw leaf expected):\n{}",
+        machine
+    );
+}
