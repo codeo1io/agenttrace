@@ -2814,7 +2814,8 @@ fn render_diagnostics(
     }
     let mut out = report_text_with_language(session, language);
     out.push_str("\nDiagnostics\n-----------\n");
-    out.push_str(&serde_json::to_string_pretty(&session.diagnostics)?);
+    let guarded = guard_formula_json_leaves(&serde_json::to_value(&session.diagnostics)?);
+    out.push_str(&serde_json::to_string_pretty(&guarded)?);
     if alert.triggered {
         out.push_str(&format!(
             "\nCost alert [{}]: {}",
