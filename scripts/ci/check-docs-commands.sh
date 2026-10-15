@@ -71,6 +71,43 @@ set -e
 grep -q 'Gate failed:' "$out_dir/docs/gate.stderr" \
   || fail "documented CI gate command should explain gate failures on stderr"
 
+# rm-598 (run 80e8beb6 cycle 1): the quota view is corpus-scope — the
+# view-filter family cannot narrow it. The filters flow into the
+# discovery loader, so before the guard they silently emptied the
+# window (a measured-zero masquerade: "no session carries placeable
+# time" at exit 0). Each pair must now refuse loudly, naming the flag
+# and --quota, in the same voice as the --range arm beside it.
+for flag in --project --source --model-filter; do
+  set +e
+  "$bin" --demo --quota "$flag" nomatch \
+    >"$out_dir/docs/quota-filter.stdout" 2>"$out_dir/docs/quota-filter.stderr"
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] \
+    || fail "--quota must refuse $flag (corpus-scope guard), got exit 0"
+  grep -q -- "$flag" "$out_dir/docs/quota-filter.stderr" \
+    || fail "--quota $flag refusal must name the flag in stderr"
+done
+# Control: the unfiltered corpus-scope view still renders its windows.
+"$bin" --demo --quota >"$out_dir/docs/quota.txt"
+grep -q 'Quota view' "$out_dir/docs/quota.txt" \
+  || fail "--quota must render the corpus-scope windows"
+
+# rm-503 (run 80e8beb6 cycle 1): the stdin lane reads through a named
+# cap. An over-cap stream (here 2 KiB against a 1 KiB knob) must fail
+# rc1 with the named cap error — never a silent truncation, never an
+# allocator death. The knob is scoped to the child, not this gate run.
+set +e
+head -c 2048 /dev/zero \
+  | AGENTTRACE_STDIN_CAP_BYTES=1024 "$bin" --overview - \
+    >"$out_dir/docs/stdin-cap.stdout" 2>"$out_dir/docs/stdin-cap.stderr"
+status=$?
+set -e
+[[ "$status" -eq 1 ]] \
+  || fail "over-cap stdin must fail rc1 with the named cap error, got $status"
+grep -q 'stdin session exceeds the read cap' "$out_dir/docs/stdin-cap.stderr" \
+  || fail "over-cap stdin refusal must be the named cap error"
+
 # Pass-8 F8-1/F8-7 docs contract (CU-15): the docs must tell the truth
 # the code pins. A guide that claims schema 4 (code says 6) or a 24h
 # automatic refresh (the code is network-free outside --update-pricing)

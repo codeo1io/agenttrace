@@ -68,6 +68,13 @@ pub struct ModelCostAudit {
     pub component_cost_usd: Option<PriceBreakdown>,
     pub estimated_cost_usd: Option<f64>,
     pub stored_estimated_cost_usd: f64,
+    /// Vendor-recorded cost carried by these sessions (upstream
+    /// `usage` cost totals), when any (rm-570). The audit's
+    /// comparison carries these dollars at face value on the rm-520
+    /// same-basis re-price — or withholds the re-price entirely when
+    /// the recorded token split is not reproducible (rm-578); the
+    /// `pricing_note` names the recorded/estimate-only split.
+    pub recorded_cost_usd: Option<f64>,
     pub pricing_status: String,
     pub pricing_note: String,
 }
@@ -106,6 +113,11 @@ pub struct SessionCostAudit {
     pub component_cost_usd: Option<PriceBreakdown>,
     pub estimated_cost_usd: Option<f64>,
     pub stored_estimated_cost_usd: f64,
+    /// Vendor-recorded cost this session carries, when any (rm-570).
+    /// It rides the current-rate comparison at face value on the
+    /// rm-520 same-basis re-price — or withholds the re-price when
+    /// the recorded token split is not reproducible (rm-578).
+    pub recorded_cost_usd: Option<f64>,
     pub pricing_status: String,
     pub pricing_note: String,
 }
@@ -399,6 +411,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         // re-prices tier-aware; a mix cannot carry one rate row and is
         // disclosed as such instead of silently pricing standard.
         tiers: BTreeSet<Option<String>>,
+        // rm-570 (run e88f2da2 cycle 3): how many sessions carry
+        // vendor-recorded dollars — the disclosure counter for the F1
+        // split note below. The dollars themselves ride
+        // `recorded.usd` (rm-520's basis) so the two can never drift.
+        recorded_sessions: usize,
     }
     let mut rows: BTreeMap<(String, String), Aggregate> = BTreeMap::new();
     let mut coverage = PricingCoverage::default();
@@ -479,6 +496,12 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
             .cache_read
             .saturating_add(session.metrics.upstream_priced_cache_r);
         row.recorded.usd += session.metrics.upstream_cost_usd;
+        // rm-570 (run e88f2da2 cycle 3): count the sessions carrying
+        // vendor-recorded dollars — the F1 split note below needs the
+        // recorded/estimate-only session split.
+        if session.metrics.upstream_cost_usd > 0.0 {
+            row.recorded_sessions += 1;
+        }
         if model == "multiple" && is_per_block_multiple(session) {
             row.per_block_multiple += 1;
         }
@@ -607,6 +630,46 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 row.recorded.usd,
                 !row.split_lost,
             );
+            // rm-570 (run e88f2da2 cycle 3, review 9af53c3f F1): name
+            // the recorded/estimate-only split on every row that
+            // carries vendor-recorded dollars — how many sessions
+            // recorded cost, and how much of the stored total is an
+            // ingest estimate — so the aggregate basis is disclosed
+            // rather than implied ("$0.0700 vendor-recorded" alone
+            // would imply the whole stored total is vendor-recorded).
+            // Informational only: the comparison mechanics stay
+            // rm-520/578's — same-basis re-price when the split
+            // survives, withholding when it does not.
+            let pricing_note = if row.recorded.usd > 0.0 {
+                let estimate_only_sessions = row.sessions - row.recorded_sessions;
+                let estimate_only_usd = (row.cost - row.recorded.usd).max(0.0);
+                let mut split: Vec<String> = Vec::new();
+                if estimate_only_sessions > 0 {
+                    split.push(format!("{} estimate-only session(s)", estimate_only_sessions));
+                }
+                if estimate_only_usd > 0.005 {
+                    split.push(format!(
+                        "${:.4} of the stored total estimated at ingest",
+                        estimate_only_usd
+                    ));
+                }
+                if split.is_empty() {
+                    format!(
+                        "{pricing_note}; {} of {} session(s) carry ${:.4} vendor-recorded cost",
+                        row.recorded_sessions, row.sessions, row.recorded.usd
+                    )
+                } else {
+                    format!(
+                        "{pricing_note}; {} of {} session(s) carry ${:.4} vendor-recorded cost ({})",
+                        row.recorded_sessions,
+                        row.sessions,
+                        row.recorded.usd,
+                        split.join(" and ")
+                    )
+                }
+            } else {
+                pricing_note
+            };
             let (rates_per_million_usd, component_cost_usd, estimated_cost_usd) = current
                 .map(|(_, rates, components)| {
                     // The current-rate total carries the recorded
@@ -636,6 +699,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
                 component_cost_usd,
                 estimated_cost_usd,
                 stored_estimated_cost_usd: round4(row.cost),
+                recorded_cost_usd: if row.recorded.usd > 0.0 {
+                    Some(round4(row.recorded.usd))
+                } else {
+                    None
+                },
                 pricing_status: pricing_status.to_string(),
                 pricing_note,
             }
@@ -728,6 +796,14 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
             &recorded,
         )
     };
+    // rm-570 (run e88f2da2 cycle 3): mark vendor-recorded dollars on
+    // the audit contract. The comparison mechanics stay rm-520/578's
+    // — same-basis re-price when the split survives, withholding when
+    // it does not — the marker only discloses the recorded dollars
+    // (supersedes the candidate's "never re-price a recorded row"
+    // rule, which would also hide genuine catalog drift on the
+    // unrecorded half of a mixed session).
+    let recorded_basis = recorded_usd > 0.0;
     let (pricing_status, pricing_note) = if model == "multiple" {
         if is_per_block_multiple(session) {
             // rm-521: per-block pricing (rm-438) priced every usage
@@ -776,6 +852,24 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         recorded_usd,
         split_reproducible,
     );
+    // rm-570 (run e88f2da2 cycle 3): name the recorded dollars on the
+    // note so a recorded-cost session's contract is disclosed — they
+    // ride the comparison at face value on the same-basis re-price
+    // (or the re-price is withheld when the split was lost, which
+    // `append_drift_note` already says).
+    let pricing_note = if recorded_basis {
+        if split_reproducible {
+            format!(
+                "{pricing_note}; ${:.4} vendor-recorded cost \
+                 (rides the comparison at face value)",
+                recorded_usd
+            )
+        } else {
+            format!("{pricing_note}; ${:.4} vendor-recorded cost", recorded_usd)
+        }
+    } else {
+        pricing_note
+    };
     let pricing_source = if !split_reproducible {
         // rm-578: cause-neutral for the same reason as the row-level
         // string — the cache is one cause of the shape, not the only
@@ -811,6 +905,11 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
         component_cost_usd,
         estimated_cost_usd,
         stored_estimated_cost_usd: round4(session.metrics.cost_estimated),
+        recorded_cost_usd: if recorded_basis {
+            Some(round4(session.metrics.upstream_cost_usd))
+        } else {
+            None
+        },
         pricing_status: pricing_status.to_string(),
         pricing_note,
     }
@@ -1137,8 +1236,9 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
     DeliveryEvidence {
         methodology: if inspect_git {
             format!(
-                "Read-only local Git heuristic: commit timestamps are matched to session start/end with a 2-minute lead and 5-minute tail. It does not prove authorship, merge-to-main, or business value. The local git log probe is bounded at {} seconds per repository root; a probe that overruns the bound is treated as unavailable and its root degrades to the tool-authority heuristic.",
-                GIT_PROBE_TIMEOUT.as_secs()
+                "Read-only local Git heuristic: commit timestamps are matched to session start/end with a 2-minute lead and 5-minute tail. It does not prove authorship, merge-to-main, or business value. The local git log probe is bounded at {} seconds per repository root and drains at most {} KiB of log output; a probe that overruns either bound is treated as unavailable and its root degrades to the tool-authority heuristic.",
+                GIT_PROBE_TIMEOUT.as_secs(),
+                GIT_PROBE_DRAIN_MAX_BYTES / 1024
             )
         } else {
             "Lightweight heuristic based on observed tool authority only. Run --delivery-evidence for read-only local Git timestamp correlation.".to_string()
@@ -1176,6 +1276,20 @@ fn git_commits_by_root(sessions: &[Session]) -> BTreeMap<String, Vec<GitCommit>>
 /// `methodology` string.
 const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// rm-731 drain arm (run 80e8beb6 cycle 1, batch "bounded inputs,
+/// honest docs"): the probe's helper thread used to `read_to_end`
+/// the WHOLE `git log --all` stream — the timeout bounded the wait,
+/// never the buffer, so a hostile or pathological repository (a log
+/// with millions of lines) grew the drain without bound. The drain
+/// now stops at [`GIT_PROBE_DRAIN_MAX_BYTES`] and an overrun degrades
+/// the root to the documented heuristic (a truncated commit census
+/// would silently bias the recency heuristic, so overflow means
+/// unavailable, never partial). ~6k commits fit under the cap — one
+/// timestamp per `git log --format=%ct` line — which covers every
+/// real project root; the bound is disclosed in the report's
+/// `methodology` string alongside the timeout.
+const GIT_PROBE_DRAIN_MAX_BYTES: usize = 64 * 1024;
+
 /// Wait for a spawned child with a wall-clock deadline. Returns the
 /// exit status when the child finishes inside the bound; kills the
 /// child and returns `None` when the deadline passes. Callers that
@@ -1211,16 +1325,23 @@ fn git_commits(root: &str) -> Option<Vec<GitCommit>> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take();
-    let (drain_tx, drain_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // rm-731 drain arm: the drain thread is bounded twice — read at
+    // most GIT_PROBE_DRAIN_MAX_BYTES + 1 bytes (the extra byte detects
+    // overflow in one read; bytes past the cap die with the pipe), and
+    // the recv below only gets the remainder of the probe budget.
+    let (drain_tx, drain_rx) = std::sync::mpsc::channel::<(Vec<u8>, bool)>();
     // The handle is deliberately not joined: the reader exits once its
     // pipe EOFs (or with the process), and the bounded recv below is the
     // only wait this probe performs on it.
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
+        let mut overflow = false;
         if let Some(stream) = stdout.as_mut() {
-            let _ = stream.read_to_end(&mut bytes);
+            let mut capped = stream.take(GIT_PROBE_DRAIN_MAX_BYTES as u64 + 1);
+            let _ = capped.read_to_end(&mut bytes);
+            overflow = bytes.len() > GIT_PROBE_DRAIN_MAX_BYTES;
         }
-        let _ = drain_tx.send(bytes);
+        let _ = drain_tx.send((bytes, overflow));
     });
     let started = std::time::Instant::now();
     let status = wait_child_bounded(&mut child, GIT_PROBE_TIMEOUT)?;
@@ -1235,7 +1356,14 @@ fn git_commits(root: &str) -> Option<Vec<GitCommit>> {
     // what remains of the probe's ten-second budget and degrades to the
     // documented heuristic instead of hanging.
     let remaining = GIT_PROBE_TIMEOUT.saturating_sub(started.elapsed());
-    let stdout = drain_rx.recv_timeout(remaining).ok()?;
+    let (stdout, overflow) = drain_rx.recv_timeout(remaining).ok()?;
+    if overflow {
+        // A log that overran the drain cap cannot yield a complete
+        // commit census — degrade to the documented heuristic rather
+        // than price a truncated one (the cap is disclosed in the
+        // report's methodology string).
+        return None;
+    }
     Some(
         String::from_utf8_lossy(&stdout)
             .lines()
@@ -1555,6 +1683,229 @@ mod tests {
         assert!(!audit.pricing_note.contains("current rates recalculate"));
         assert!(audit.pricing_note.contains("no same-basis re-price"));
         assert_eq!(audit.estimated_cost_usd, None);
+    }
+
+    #[test]
+    fn cost_audit_recorded_row_reprices_on_the_recorded_basis() {
+        // rm-570 (run e88f2da2 cycle 3) red-first, re-anchored on the
+        // landed rm-520/578 contract: the journal recorded this
+        // session's cost (usage cost.total → upstream_cost_usd), so
+        // pricing the whole token breakdown at current catalog rates
+        // and alarming about the difference is phantom drift (the
+        // 0.07 recorded / ~0.13 catalog PoC). The landed fix compares
+        // on the same basis — catalog rates only on unrecorded tokens
+        // (none here) plus the recorded dollars at face value — and
+        // the row discloses its recorded dollars via
+        // recorded_cost_usd and the note's recorded split.
+        let mut recorded = session("recorded");
+        recorded.metrics.model_used = "claude-sonnet-4-5".to_string();
+        recorded.metrics.tokens_input = 38_500;
+        recorded.metrics.tokens_output = 950;
+        recorded.metrics.cost_estimated = 0.07;
+        recorded.metrics.upstream_cost_usd = 0.07;
+        recorded.metrics.upstream_priced_input = 38_500;
+        recorded.metrics.upstream_priced_output = 950;
+        let audit = cost_audit(&[recorded]);
+        let row = &audit.by_provider_model[0];
+        assert!((row.stored_estimated_cost_usd - 0.07).abs() < 1e-9);
+        assert!((row.recorded_cost_usd.expect("recorded cost disclosed") - 0.07).abs() < 1e-9);
+        let current = row.estimated_cost_usd.expect("comparison present");
+        assert!(
+            (current - 0.07).abs() < 1e-4,
+            "recorded dollars ride the comparison at face value, not a full catalog re-price: {current}"
+        );
+        assert!(
+            row.pricing_note
+                .contains("1 of 1 session(s) carry $0.0700 vendor-recorded cost"),
+            "the note names the recorded dollars: {}",
+            row.pricing_note
+        );
+        assert!(
+            !row.pricing_note.contains("recalculate a different total"),
+            "no phantom drift on a recorded-basis row: {}",
+            row.pricing_note
+        );
+        let top = audit.current_estimated_cost_usd.expect("sum present");
+        assert!((top - 0.07).abs() < 1e-4, "top level agrees: {top}");
+    }
+
+    #[test]
+    fn cost_audit_estimate_only_rows_still_reprice_at_current_rates() {
+        // rm-570 regression arm: estimate-only sessions keep the
+        // current-rates comparison and the drift note.
+        let mut plain = session("estimate-only");
+        plain.metrics.model_used = "claude-sonnet-4-5".to_string();
+        plain.metrics.tokens_input = 38_500;
+        plain.metrics.tokens_output = 950;
+        plain.metrics.cost_estimated = 0.05;
+        let audit = cost_audit(&[plain]);
+        let row = &audit.by_provider_model[0];
+        let current = row.estimated_cost_usd.expect("re-priced");
+        assert!(
+            (current - 0.05).abs() > 0.01,
+            "estimate-only keeps the catalog comparison: {current}"
+        );
+        assert!(row.pricing_note.contains("recalculate a different total"));
+        assert!(
+            row.recorded_cost_usd.is_none(),
+            "no recorded dollars, no recorded marker"
+        );
+    }
+
+    #[test]
+    fn cost_audit_mixed_row_names_the_split_and_withholds_the_reprice() {
+        // rm-570 mixed-row arm (review 9af53c3f F1), re-anchored on
+        // the landed contract: one recorded session ($0.07, its
+        // usage entry carried no token classes — a split-lost
+        // recorded basis, rm-578) + one estimate-only session on the
+        // same (provider, model) row. The landed rule withholds the
+        // current-rate column for the whole row (re-pricing would
+        // double-count the recorded dollars) — the phantom-drift
+        // alarm rm-570 chased is absent the honest way — and the
+        // note must NAME the split so the semantics are disclosed
+        // rather than implied: how many sessions carry recorded
+        // dollars and how much of the stored total is an ingest
+        // estimate. The live shape: the parser drops pi
+        // message-inline usage cost, manufacturing estimate-only
+        // sessions that co-locate with recorded ones under the same
+        // provider+model.
+        let mut recorded = session("mixed-recorded");
+        recorded.metrics.model_used = "claude-sonnet-4-5".to_string();
+        recorded.metrics.tokens_input = 38_500;
+        recorded.metrics.tokens_output = 950;
+        recorded.metrics.cost_estimated = 0.07;
+        recorded.metrics.upstream_cost_usd = 0.07;
+        let mut estimate_only = session("mixed-estimate-only");
+        estimate_only.metrics.model_used = "claude-sonnet-4-5".to_string();
+        estimate_only.metrics.tokens_input = 38_500;
+        estimate_only.metrics.tokens_output = 950;
+        estimate_only.metrics.cost_estimated = 0.05;
+        let audit = cost_audit(&[recorded, estimate_only]);
+        assert_eq!(audit.by_provider_model.len(), 1, "same row");
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.sessions, 2);
+        assert!((row.stored_estimated_cost_usd - 0.12).abs() < 1e-9);
+        assert!((row.recorded_cost_usd.expect("recorded cost") - 0.07).abs() < 1e-9);
+        // rm-578: the recorded member's token split was lost, so the
+        // row's current-rate column is withheld — a catalog re-price
+        // of the estimate-only member would double-count the
+        // recorded dollars (which `cost_audit_estimate_only_rows_`
+        // `still_reprice_at_current_rates` proves happens on
+        // estimate-ONLY rows).
+        assert_eq!(
+            row.estimated_cost_usd, None,
+            "split-lost recorded member withholds the row re-price"
+        );
+        assert_eq!(
+            row.pricing_source,
+            "unavailable: recorded-cost token split not reproducible"
+        );
+        assert!(
+            row.pricing_note.contains("1 of 2 session(s)"),
+            "the note names the session split: {}",
+            row.pricing_note
+        );
+        assert!(
+            row.pricing_note.contains("1 estimate-only session(s)"),
+            "estimate-only sessions are disclosed: {}",
+            row.pricing_note
+        );
+        assert!(
+            row.pricing_note
+                .contains("$0.0500 of the stored total estimated at ingest"),
+            "estimate-at-ingest dollars are disclosed: {}",
+            row.pricing_note
+        );
+        assert!(
+            !row.pricing_note.contains("recalculate a different total"),
+            "no drift note on a withheld row: {}",
+            row.pricing_note
+        );
+        assert_eq!(
+            audit.current_estimated_cost_usd, None,
+            "top level stays silent with a withheld row"
+        );
+    }
+
+    #[test]
+    fn cost_audit_recorded_row_with_estimate_at_ingest_dollars_names_the_split() {
+        // rm-570 mixed shape as it manifests live (review 9af53c3f
+        // F1's mixed-row-poc.jsonl), re-anchored on the landed
+        // contract: the pi journal parses to ONE session carrying a
+        // $0.07 vendor-recorded usage entry (no token classes —
+        // split lost, rm-578) AND ~$13.50 of tokens with no recorded
+        // cost, so the recorded dollars and the estimate-at-ingest
+        // dollars share a single (provider, model) row and a single
+        // stored total. The row's re-price is withheld, and the note
+        // must name the DOLLAR split too — "1 of 1 session(s) carry
+        // $0.0700" alone would imply the whole $13.57 stored total
+        // is vendor-recorded.
+        let mut mixed = session("recorded-plus-estimate");
+        mixed.metrics.model_used = "claude-sonnet-4-5".to_string();
+        mixed.metrics.tokens_input = 4_038_500;
+        mixed.metrics.tokens_output = 100_950;
+        mixed.metrics.cost_estimated = 13.57;
+        mixed.metrics.upstream_cost_usd = 0.07;
+        let audit = cost_audit(&[mixed]);
+        assert_eq!(audit.by_provider_model.len(), 1);
+        let row = &audit.by_provider_model[0];
+        assert_eq!(row.sessions, 1);
+        assert_eq!(row.estimated_cost_usd, None, "split lost: withheld");
+        assert!(
+            row.pricing_note.contains(
+                "no same-basis re-price available — the recorded-cost token split is unavailable"
+            ),
+            "withholding is explained: {}",
+            row.pricing_note
+        );
+        assert!(
+            row.pricing_note.contains(
+                "1 of 1 session(s) carry $0.0700 vendor-recorded cost ($13.5000 of the stored total estimated at ingest)"
+            ),
+            "the note names the dollar split: {}",
+            row.pricing_note
+        );
+        assert!(
+            !row.pricing_note.contains("recalculate a different total"),
+            "no drift note on a recorded-basis row: {}",
+            row.pricing_note
+        );
+    }
+
+    #[test]
+    fn session_cost_audit_recorded_cost_rides_the_comparison_at_face_value() {
+        // rm-570 session-level arm, re-anchored on the landed
+        // contract: same recorded-cost rule for --audit <session> —
+        // the recorded dollars ride the current-rate comparison at
+        // face value (rm-520 basis), are disclosed on the note and
+        // via recorded_cost_usd, and never false-trip the drift note.
+        let mut recorded = session("recorded-session");
+        recorded.metrics.model_used = "claude-sonnet-4-5".to_string();
+        recorded.metrics.tokens_input = 38_500;
+        recorded.metrics.tokens_output = 950;
+        recorded.metrics.cost_estimated = 0.07;
+        recorded.metrics.upstream_cost_usd = 0.07;
+        recorded.metrics.upstream_priced_input = 38_500;
+        recorded.metrics.upstream_priced_output = 950;
+        let audit = session_cost_audit(&recorded);
+        let current = audit.estimated_cost_usd.expect("comparison present");
+        assert!(
+            (current - 0.07).abs() < 1e-4,
+            "recorded dollars ride the comparison at face value: {current}"
+        );
+        assert!(
+            audit
+                .pricing_note
+                .contains("$0.0700 vendor-recorded cost (rides the comparison at face value)"),
+            "the note discloses the recorded dollars: {}",
+            audit.pricing_note
+        );
+        assert!(
+            !audit.pricing_note.contains("recalculate a different total"),
+            "no phantom drift on a recorded-basis session: {}",
+            audit.pricing_note
+        );
+        assert!((audit.recorded_cost_usd.expect("recorded marker") - 0.07).abs() < 1e-9);
     }
 
     #[test]
@@ -2163,6 +2514,66 @@ mod tests {
             "methodology must disclose the probe bound: {}",
             report.methodology
         );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn git_probe_degrades_when_the_log_overruns_the_drain_cap() {
+        // rm-731 drain arm (run 80e8beb6 cycle 1, batch "bounded
+        // inputs, honest docs"): a helper whose `git log` output
+        // overruns the drain cap must degrade the root to the
+        // documented heuristic instead of buffering an unbounded log
+        // — a truncated census would silently bias the recency
+        // heuristic. Control arm: the same shim delegates ordinary
+        // roots to real git, which still drains under the cap and
+        // yields commits. Mirrors the pipe-holder sibling's shim
+        // pattern (marker keyed on the -C root arg).
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = crate::test_env::lock_env();
+        let marker = "agenttrace-gov-drain-cap";
+        let root = std::env::temp_dir().join(format!("{marker}-root"));
+        let shim_dir = root.join("shim");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        // 7,000 lines of 11-byte timestamps = ~77 KiB > the 64 KiB
+        // drain cap; one line per commit mirrors `git log --format=%ct`.
+        std::fs::write(
+            shim_dir.join("git"),
+            format!(
+                "#!/bin/sh\ncase \"$2\" in\n  *{marker}*) i=0\n    while [ $i -lt 7000 ]; do\n      echo 1000000000\n      i=$((i + 1))\n    done ;;\n  *) exec /usr/bin/git \"$@\" ;;\nesac\n"
+            ),
+        )
+        .expect("write git shim");
+        std::fs::set_permissions(shim_dir.join("git"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod git shim");
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
+        );
+        let started = std::time::Instant::now();
+        let overflow = git_commits(root.to_str().expect("utf-8 root"));
+        let overflow_elapsed = started.elapsed();
+        // Control: the crate root is a real git repository, and the
+        // shim delegates it to /usr/bin/git — it must still yield
+        // commits under the cap (also proves the shim only diverts
+        // the marker root).
+        let control = git_commits(env!("CARGO_MANIFEST_DIR"));
+        if let Some(path) = previous_path {
+            std::env::set_var("PATH", path);
+        }
+        assert!(
+            overflow.is_none(),
+            "an over-cap git log must degrade to the heuristic, got {} commits",
+            overflow.map(|drained| drained.len()).unwrap_or(0)
+        );
+        assert!(
+            overflow_elapsed < GIT_PROBE_TIMEOUT + std::time::Duration::from_secs(5),
+            "the overflow arm must stay inside the probe bounds (took {overflow_elapsed:?})"
+        );
+        assert!(
+            control.is_some(),
+            "the control root must still yield commits through real git"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn slow_tool_recommendation_cites_max_p95_entry() {

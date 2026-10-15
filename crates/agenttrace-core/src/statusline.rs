@@ -1305,6 +1305,12 @@ pub fn render_statusline_report(
                 "weekly_budget_usd": budget,
                 "spend_7d_usd": series.total,
                 "remaining_usd": budget - series.total,
+                // rm-771: the baseline-unknown bias, so machine
+                // consumers see why the 7d total can under-count.
+                "first_day_baseline_unknown_sessions":
+                    series.first_day_baseline_unknown_sessions,
+                "first_day_baseline_unknown_usd":
+                    series.first_day_baseline_unknown_usd,
             });
         }
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
@@ -1452,6 +1458,15 @@ fn render_statusline_report_text(
                 series.total
             ));
         }
+        // rm-771: when sessions predate the journal, say so — the
+        // spend line is otherwise silently an under-count.
+        if series.first_day_baseline_unknown_sessions > 0 {
+            out.push_str(&format!(
+                "Budget baseline: {} session(s) started before the journal — \
+                 ${:.2} pre-journal spend excluded from the 7d total\n",
+                series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
+            ));
+        }
     }
     // rm-037: context pressure per session — the payload's
     // pre-calculated utilization plus the last-API token counts
@@ -1577,6 +1592,19 @@ fn utc_day(epoch: i64) -> String {
 /// calendar days ending today (UTC), never the newest `days` *sampled*
 /// days, so a stale journal cannot charge the weekly envelope a
 /// weeks-old sum.
+///
+/// rm-771 (run e88f2da2 cycle 3): a session whose first RETAINED
+/// sample already carries a nonzero cumulative cost cannot be proven
+/// to have started on that day — its pre-journal spend is excluded
+/// from the rises and disclosed as a baseline-unknown bias instead of
+/// being booked into the first retained day (the 26x overstatement
+/// class: `--weekly-budget 10` printed "OVER by $42.00" on a true
+/// $2.00 window burn). Sessions observed from a zero baseline keep
+/// the original full-rise accounting. The disclosure counters are
+/// scoped to the same calendar window as `daily`/`total` (review
+/// 9af53c3f F3): a session whose first retained day the window
+/// already dropped whole never biased the windowed number and is
+/// not counted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatuslineBudgetSeries {
     /// UTC day (`YYYY-MM-DD`) -> spend in USD, ascending: one bucket
@@ -1590,6 +1618,17 @@ pub struct StatuslineBudgetSeries {
     /// calendar window — excluded from `daily`/`total` and disclosed
     /// by the budget views so a stale journal is visible, not silent.
     pub excluded_older_days: usize,
+    /// Sessions whose first retained sample already carried a
+    /// nonzero cumulative cost; their pre-journal spend is excluded
+    /// from `daily`/`total` and disclosed here (rm-771 arm 1).
+    /// Scoped to the same calendar window as `daily`/`total` (review
+    /// 9af53c3f F3): a session whose first retained day the window
+    /// already dropped whole never biased the windowed total and is
+    /// not counted.
+    pub first_day_baseline_unknown_sessions: usize,
+    /// Sum of those sessions' first observed cumulative values — the
+    /// excluded pre-journal bias, rounded to cents (rm-771 arm 1).
+    pub first_day_baseline_unknown_usd: f64,
 }
 
 pub fn statusline_budget_series(
@@ -1599,8 +1638,13 @@ pub fn statusline_budget_series(
 ) -> StatuslineBudgetSeries {
     use std::collections::BTreeMap;
 
-    // session -> day -> max cumulative cost seen that day.
-    let mut per_session: BTreeMap<&str, BTreeMap<String, f64>> = BTreeMap::new();
+    // session -> day -> (first observed cumulative, max cumulative).
+    // The first observed value of the session's earliest retained day
+    // is the baseline witness: 0.0 proves the journal saw the session
+    // from its start; anything above 0.0 means spend predates the
+    // retained journal — the session began mid-window, or the 10 MiB
+    // retention cap (rm-385) dropped its true first days (rm-771).
+    let mut per_session: BTreeMap<&str, BTreeMap<String, (f64, f64)>> = BTreeMap::new();
     for capture in captures {
         if let Some(cost) = capture_cost_usd(capture) {
             let day = utc_day(capture.captured_at);
@@ -1616,19 +1660,42 @@ pub fn statusline_budget_series(
                 .entry(session)
                 .or_default()
                 .entry(day)
-                .or_insert(f64::NEG_INFINITY);
-            if cost > *entry {
-                *entry = cost;
+                // Seed with the first observed cost itself: the
+                // witness must be that value, not -inf (a -inf seed
+                // can never be lowered into, so `first_seen` stayed
+                // -inf and the baseline-unknown arm never fired).
+                .or_insert((cost, cost));
+            if cost < entry.0 {
+                entry.0 = cost;
+            }
+            if cost > entry.1 {
+                entry.1 = cost;
             }
         }
     }
     let mut daily: BTreeMap<String, f64> = BTreeMap::new();
+    // (first retained day, excluded carry) per baseline-unknown
+    // session — collected here, counted against the trailing window
+    // below (review 9af53c3f F3).
+    let mut baseline_unknown: Vec<(String, f64)> = Vec::new();
     for samples in per_session.values() {
-        let mut previous = 0.0;
-        for (day, cumulative) in samples {
-            let rise = (cumulative - previous).max(0.0);
+        let mut previous: Option<f64> = None;
+        for (day, (first_seen, day_max)) in samples {
+            // rm-771: the session's first retained day seeds the
+            // baseline. A nonzero witness cannot prove the session
+            // started at zero that day, so its value is excluded from
+            // the rise (the day contributes only the delta observed
+            // between its own samples) and disclosed as a bias term.
+            let rise = match previous {
+                None if *first_seen > 0.0 => {
+                    baseline_unknown.push((day.clone(), *first_seen));
+                    (day_max - first_seen).max(0.0)
+                }
+                None => *day_max,
+                Some(prev) => (day_max - prev).max(0.0),
+            };
             *daily.entry(day.clone()).or_insert(0.0) += rise;
-            previous = *cumulative;
+            previous = Some(*day_max);
         }
     }
     // rm-917 (run d02291d0, composed at integration over the
@@ -1660,6 +1727,10 @@ pub fn statusline_budget_series(
             daily: Vec::new(),
             total: 0.0,
             excluded_older_days: daily.len(),
+            // rm-771: an empty window counts no baseline-unknown
+            // bias — F3 scopes the counters to the (empty) window.
+            first_day_baseline_unknown_sessions: 0,
+            first_day_baseline_unknown_usd: 0.0,
         };
     }
     let window_start = today - Duration::days(days as i64 - 1);
@@ -1687,6 +1758,26 @@ pub fn statusline_budget_series(
         // never verdicts off stale samples.
         Vec::new()
     };
+    // Review 9af53c3f F3 (rm-771, re-anchored onto rm-917's calendar
+    // window at integration): scope the baseline-unknown counters to
+    // the same window as `daily`/`total`. A session whose first
+    // retained day is OLDER than the calendar window was dropped
+    // whole by the window filter — its carry never touched the
+    // windowed total — so counting it overstated the window's bias
+    // while both render sites said "excluded from the 7d total".
+    // Only an unprovable first day INSIDE the window biases the
+    // windowed number and is disclosed (a future-dated first day is
+    // outside the today-bounded window the same way and counts
+    // nothing).
+    let window_days: HashSet<&str> = window.iter().map(|(day, _)| day.as_str()).collect();
+    let mut baseline_unknown_sessions = 0usize;
+    let mut baseline_unknown_usd = 0.0f64;
+    for (day, carry) in &baseline_unknown {
+        if window_days.contains(day.as_str()) {
+            baseline_unknown_sessions += 1;
+            baseline_unknown_usd += *carry;
+        }
+    }
     // Review 5b9a9470 F4: an empty window's f64 reduction is lowered
     // by LLVM to the additive identity -0.0 in optimized builds, which
     // rendered as "$-0.00" at both budget display sites (the fresh-
@@ -1697,6 +1788,8 @@ pub fn statusline_budget_series(
         daily: window,
         total,
         excluded_older_days,
+        first_day_baseline_unknown_sessions: baseline_unknown_sessions,
+        first_day_baseline_unknown_usd: (baseline_unknown_usd * 100.0).round() / 100.0,
     }
 }
 
@@ -1734,6 +1827,13 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "spend_7d_usd": series.total,
             // rm-917: stale sampled days the calendar window excluded.
             "excluded_older_days": series.excluded_older_days,
+            // rm-771: sessions that predate the journal are excluded
+            // from the 7d total; expose the bias so the number is
+            // interpretable (0 / 0.0 when every session was observed
+            // from a zero baseline).
+            "first_day_baseline_unknown_sessions":
+                series.first_day_baseline_unknown_sessions,
+            "first_day_baseline_unknown_usd": series.first_day_baseline_unknown_usd,
         });
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
@@ -1769,6 +1869,13 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             } else {
                 "s"
             }
+        ));
+    }
+    if series.first_day_baseline_unknown_sessions > 0 {
+        out.push_str(&format!(
+            "  first-day baseline unknown for {} session(s) — \
+             ${:.2} of pre-journal spend excluded from the 7d total\n",
+            series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
         ));
     }
     match weekly_budget {
@@ -1891,7 +1998,11 @@ mod tests {
         // rm-917: the window is the trailing 7 CALENDAR days ending
         // today. Days inside the window with no samples render as
         // explicit $0.00 rows; days outside it are excluded from the
-        // sum entirely.
+        // sum entirely. rm-771 (composed at integration): the
+        // session's first RETAINED sample (D-5) already carries
+        // $2.00 — an unprovable pre-journal baseline, excluded from
+        // the day's rise and disclosed — so only the D-5→today rise
+        // of $3.00 is provable window spend.
         let captures = vec![
             budget_capture("A", epoch_on_day_offset(5, 100), 2.00),
             budget_capture("A", epoch_on_day_offset(0, 100), 5.00),
@@ -1908,13 +2019,15 @@ mod tests {
                 series.daily
             );
             let expect_spend = match 6 - i as i64 {
-                5 => 2.00, // first sample contributes itself
+                5 => 0.00, // rm-771: the first sample's $2.00 carry is a baseline, not a rise
                 0 => 3.00, // rise from 2.00 to 5.00
                 _ => 0.00,
             };
             assert!((spend - expect_spend).abs() < 1e-9, "{:?}", series.daily);
         }
-        assert!((series.total - 5.00).abs() < 1e-9, "{series:?}");
+        assert!((series.total - 3.00).abs() < 1e-9, "{series:?}");
+        assert_eq!(series.first_day_baseline_unknown_sessions, 1, "{series:?}");
+        assert!((series.first_day_baseline_unknown_usd - 2.00).abs() < 1e-9);
     }
 
     #[test]
@@ -1971,7 +2084,16 @@ mod tests {
             let rendered = render_budget_view("json", budget).expect("render budget view");
             let value: Value = serde_json::from_str(rendered.trim()).expect("budget JSON parses");
             let object = value.as_object().expect("top level is an object");
-            for key in ["journal", "daily", "spend_7d_usd"] {
+            for key in [
+                "journal",
+                "daily",
+                "spend_7d_usd",
+                // rm-771: the baseline-unknown bias is always present
+                // (0 / 0.0 when every session was observed from a
+                // zero baseline) so the spend stays interpretable.
+                "first_day_baseline_unknown_sessions",
+                "first_day_baseline_unknown_usd",
+            ] {
                 assert!(object.contains_key(key), "missing {key}: {rendered}");
             }
             assert_eq!(
@@ -2001,9 +2123,14 @@ mod tests {
 
     #[test]
     fn budget_series_rises_per_day_and_windows_to_the_calendar_week() {
-        // Day -10: session A burns 0 -> 2.00; day -9: A continues to
-        // 3.50 while B starts fresh at 1.00 (epoch reset contributes
-        // only itself). Days -8..-1: A restarts its counter and burns
+        // Day -10: session A's first retained capture is 2.00 — rm-771:
+        // the journal cannot prove A started that day, so the 2.00 is
+        // pre-journal baseline (excluded, disclosed when the window
+        // retains day -10), and day -10 contributes only the delta it
+        // observed (none beyond the baseline). Day -9: A continues to
+        // 3.50 (rise 1.50 from the retained baseline) while B's first
+        // capture is 1.00 — same rule: excluded as B's baseline,
+        // disclosed. Days -8..-1: A restarts its counter and burns
         // 0.25 per day (cumulative 0.25, 0.50, ...) — a reset that
         // never rises again burns nothing. The window is the seven
         // CALENDAR days ending at `now`: with `now` pinned, days
@@ -2044,16 +2171,27 @@ mod tests {
         // calendar window (-10, -9, -8, -7) are excluded and
         // disclosed, not billed.
         assert_eq!(series.excluded_older_days, 4, "{series:?}");
-        // The full-journal variant still sums all the burn: day -8
-        // contributes 0 (the reset), so only the SEVEN tail days burn
-        // 0.25 — 2.00 + 1.50 + 1.00 + 7×0.25 = 6.25 (tomorrow's $99
-        // future capture excluded by the upper bound; rm-917
-        // zero-fills the 20 unsampled in-window days).
+        // Review 9af53c3f F3 (rm-771, on the rm-917 calendar window):
+        // the baseline-unknown counters scope to the window. A's
+        // first retained day (day -10) and B's (day -9) both sit
+        // outside the trailing 7 calendar days, so neither session's
+        // unprovable carry biases the windowed total and neither is
+        // counted — "excluded from the 7d total" stays literally
+        // true.
+        assert_eq!(series.first_day_baseline_unknown_sessions, 0, "{series:?}");
+        assert!(series.first_day_baseline_unknown_usd.abs() < 1e-9);
+        // The full-journal variant sums only the provable burn: the
+        // day -9 rise of 1.50 plus the 7 × 0.25 tail (the 2.00/1.00
+        // baselines are excluded, not booked as same-day spend) —
+        // and inside a window that RETAINS days -10/-9 both
+        // baseline-unknown sessions are disclosed again. Day -8 is a
+        // counter RESET (contributes 0), and tomorrow's $99 future
+        // capture is excluded by the today-bounded upper bound;
+        // rm-917 zero-fills the unsampled in-window days.
         let full = statusline_budget_series(&captures, 30, now);
-        assert!(
-            (full.total - (2.00 + 1.50 + 1.00 + 7.0 * 0.25)).abs() < 1e-9,
-            "{full:?}"
-        );
+        assert!((full.total - (1.50 + 7.0 * 0.25)).abs() < 1e-9, "{full:?}");
+        assert_eq!(full.first_day_baseline_unknown_sessions, 2);
+        assert!((full.first_day_baseline_unknown_usd - 3.00).abs() < 1e-9);
         let now_day = now.date_naive().format("%Y-%m-%d").to_string();
         assert!(
             series
@@ -2064,6 +2202,159 @@ mod tests {
             "future-dated capture billed into a window: {:?}",
             series.daily
         );
+    }
+
+    #[test]
+    fn budget_series_first_day_baseline_unknown_not_booked() {
+        // rm-771 (run e88f2da2 cycle 3) red-first, arm 3: the PoC
+        // corpus (delegate spool poc-mirror/budget-overstate/) is a
+        // session whose FIRST retained capture already carries a
+        // $50.00 cumulative cost — the journal cannot prove the
+        // session started on that day, so the $50 is pre-journal
+        // spend, not a same-day rise. Booking it as a rise overstated
+        // the 7d burn 26x (`--weekly-budget 10` printed "OVER by
+        // $42.00" on a true $2.00 burn). Re-anchored onto rm-917's
+        // calendar window at integration: the two retained days sit
+        // inside a pinned trailing week whose gap days zero-fill.
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
+        let day = |n: i64| now.timestamp() + n * 86_400;
+        let captures = vec![
+            budget_capture("s", day(-1) + 100, 50.00),
+            budget_capture("s", day(0) + 100, 52.00),
+        ];
+        let series = statusline_budget_series(&captures, 7, now);
+        assert!(
+            (series.total - 2.0).abs() < 1e-9,
+            "only the observed rise counts: {series:?}"
+        );
+        assert_eq!(series.daily.len(), 7, "{:?}", series.daily);
+        assert!(
+            (series.daily[5].1 - 0.0).abs() < 1e-9 && (series.daily[6].1 - 2.0).abs() < 1e-9,
+            "the first retained day contributes only the delta it
+             observed itself: {:?}",
+            series.daily
+        );
+        assert_eq!(series.first_day_baseline_unknown_sessions, 1, "{series:?}");
+        assert!((series.first_day_baseline_unknown_usd - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn budget_series_zero_start_keeps_full_rise() {
+        // rm-771 compatibility arm: a session observed from a zero
+        // baseline is proven to have started inside the journal, so
+        // its full first-day rise still counts — and nothing is
+        // disclosed as baseline-unknown.
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
+        let day = |n: i64| now.timestamp() + n * 86_400;
+        let captures = vec![
+            budget_capture("z", day(-1) + 100, 0.0),
+            budget_capture("z", day(-1) + 200, 3.00),
+            budget_capture("z", day(0) + 100, 5.00),
+        ];
+        let series = statusline_budget_series(&captures, 7, now);
+        assert!((series.total - 5.0).abs() < 1e-9, "{series:?}");
+        assert_eq!(series.first_day_baseline_unknown_sessions, 0, "{series:?}");
+    }
+
+    #[test]
+    fn budget_over_state_comes_from_observed_rise_not_the_carry() {
+        // rm-771 arm 3, literal over-budget form: a session whose
+        // journal opens at cumulative $50.00 and rises to $62.00
+        // genuinely burned $12.00 inside the window, so against a
+        // $10.00 weekly budget the honest render is "OVER by
+        // $2.00" — from the observed rise ONLY, with the $50.00
+        // pre-journal carry excluded and disclosed. (On the same
+        // journal pre-fix, the carry was booked as same-day spend
+        // and the render said "OVER by $52.00" — the 26x
+        // overstatement class of the durable PoC corpus, whose own
+        // $50 -> $52 shape pins the under-budget complement:
+        // $2.00 spend, $8.00 remaining.)
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
+        let day = |n: i64| now.timestamp() + n * 86_400;
+        let captures = vec![
+            budget_capture("s", day(-1) + 100, 50.00),
+            budget_capture("s", day(0) + 100, 62.00),
+        ];
+        let series = statusline_budget_series(&captures, 7, now);
+        assert!((series.total - 12.0).abs() < 1e-9, "{series:?}");
+        // Hermetic render: `render_statusline_report_text` takes the
+        // series directly, so the literal arm-3 string is pinned
+        // without touching the host journal.
+        let text = render_statusline_report_text(
+            &StatuslineJournalStats {
+                path: "journal".to_string(),
+                exists: true,
+                lines: 2,
+                bytes: 196,
+                retained_max_bytes: 10_485_760,
+                capped_away_bytes: 0,
+                read_truncated: false,
+                captures_with_prompt_id: 0,
+                captures_pre_first_input: 0,
+                captures_unknown_payload: 0,
+            },
+            &statusline_insights(&[]),
+            Some(10.0),
+            &series,
+        );
+        assert!(
+            text.contains("Budget: 7d spend $12.00 of $10.00 — OVER by $2.00"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 session(s) started before the journal"),
+            "{text}"
+        );
+        assert!(text.contains("$50.00 pre-journal spend excluded"), "{text}");
+        assert_eq!(series.first_day_baseline_unknown_sessions, 1);
+        assert!((series.first_day_baseline_unknown_usd - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn budget_series_baseline_unknown_counters_scope_to_the_trailing_window() {
+        // Review 9af53c3f F3 (rm-771): the baseline-unknown counters
+        // describe the bias OF THE WINDOWED TOTAL, so they must be
+        // scoped to the same window as `daily`/`total` — the rm-917
+        // CALENDAR window since integration. A session whose first
+        // retained day is older than the calendar window contributed
+        // no unprovable dollars to the windowed number (the window
+        // filter dropped its first day whole), and counting it
+        // overstated the disclosed bias — "…of pre-journal spend
+        // excluded from the 7d total" named dollars that never
+        // touched the 7d total.
+        use chrono::TimeZone;
+        // `now` pinned to 2026-10-09: the trailing 7 calendar days
+        // keep 10-03..10-09; the 30-day variant reaches back to
+        // 09-09 and retains both first days.
+        let now = Utc.with_ymd_and_hms(2026, 10, 9, 12, 0, 0).unwrap();
+        let day = |n: i64| now.timestamp() + n * 86_400;
+        let mut captures = Vec::new();
+        // "old": first retained capture (day -15, OUTSIDE the 7-day
+        // window) already carries a $40.00 cumulative — pre-journal
+        // carry, but the flat 40.00 tail burns nothing; day 0 rises
+        // to 41.00.
+        for n in -15..=-8 {
+            captures.push(budget_capture("old", day(n) + 100, 40.00));
+        }
+        captures.push(budget_capture("old", day(0) + 100, 41.00));
+        // "new": first retained capture (day 0, INSIDE the window)
+        // at $3.00, rising to $4.50 the same day.
+        captures.push(budget_capture("new", day(0) + 200, 3.00));
+        captures.push(budget_capture("new", day(0) + 300, 4.50));
+        let series = statusline_budget_series(&captures, 7, now);
+        assert_eq!(series.daily.len(), 7, "{:?}", series.daily);
+        assert!((series.total - 2.50).abs() < 1e-9, "{series:?}");
+        // Only the in-window first day biases the windowed total.
+        assert_eq!(series.first_day_baseline_unknown_sessions, 1, "{series:?}");
+        assert!((series.first_day_baseline_unknown_usd - 3.00).abs() < 1e-9);
+        // A window that retains day -15 discloses both carries
+        // again — the counters follow the window, not the journal.
+        let full = statusline_budget_series(&captures, 30, now);
+        assert_eq!(full.first_day_baseline_unknown_sessions, 2, "{full:?}");
+        assert!((full.first_day_baseline_unknown_usd - 43.00).abs() < 1e-9);
     }
 
     #[test]
@@ -2219,8 +2510,17 @@ mod tests {
             budget,
             &series,
         );
-        assert!(text.contains("Budget: 7d spend $3.00 of $10.00"), "{text}");
-        assert!(text.contains("$7.00 remaining"), "{text}");
+        // rm-771: the session's journal OPENS at a cumulative $2.00,
+        // so only the observed $1.00 rise is provable 7d spend; the
+        // $2.00 pre-journal baseline is excluded and disclosed
+        // instead of booked into the first captured day.
+        assert!(text.contains("Budget: 7d spend $1.00 of $10.00"), "{text}");
+        assert!(text.contains("$9.00 remaining"), "{text}");
+        assert!(
+            text.contains("1 session(s) started before the journal"),
+            "{text}"
+        );
+        assert!(text.contains("$2.00 pre-journal spend excluded"), "{text}");
         // rm-917: a journal with nothing inside the calendar window
         // discloses instead of verdicting.
         let stale_series = statusline_budget_series(

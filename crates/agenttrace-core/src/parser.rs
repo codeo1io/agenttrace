@@ -3,6 +3,7 @@ use anyhow::{bail, Context};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -47,18 +48,72 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
         );
     }
     // Codex ≥0.152 stores rollouts as zstd frames (magic 28 B5 2F FD,
-    // upstream PR #41357); they are no longer plain JSONL. Name the
-    // format instead of failing with a generic "not valid UTF-8"
-    // (pass-7 research, candidate 44 minimum).
-    if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        bail!(
-            "session file {} is zstd-compressed (Codex rollout format); decompress it to JSONL first (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
-            label
-        );
-    }
+    // upstream PR #41357); they are no longer plain JSONL. Decode them
+    // in-process — bounded, because a rollout is untrusted input and a
+    // frame may decompress arbitrarily large — and keep the named-format
+    // failure wording for frames we still cannot use (rm-992).
+    let raw = if raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        decode_zstd_rollout_bounded(raw, label)?
+    } else {
+        raw
+    };
     let raw = String::from_utf8(raw)
         .with_context(|| format!("read session file {} (not valid UTF-8)", label))?;
     parse_raw_session(name, label, &raw)
+}
+
+/// Output cap for in-process zstd rollout decode (rm-992). Compressed
+/// rollouts are untrusted input, so decode stops and discloses at this
+/// bound instead of allocating whatever the frame claims — the same
+/// 64 MiB order as the transport bound in `pricing.rs` (upstream #318
+/// precedent). A rollout past the cap is refused loudly; the operator
+/// can always decompress manually and re-run.
+const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Decode one zstd-compressed Codex rollout, bounded by
+/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`]. Every failure keeps the named-format
+/// wording (never a generic UTF-8 error): a corrupt frame names the decode
+/// failure, an empty frame says so, and an over-cap frame names the cap.
+fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = match ruzstd::decoding::StreamingDecoder::new(&raw[..]) {
+        Ok(decoder) => decoder,
+        Err(err) => bail!(
+            "session file {} is zstd-compressed (Codex rollout format) but the frame failed to decode: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+            label,
+            err
+        ),
+    };
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = match decoder.read(&mut chunk) {
+            Ok(n) => n,
+            Err(err) => bail!(
+                "session file {} is zstd-compressed (Codex rollout format) but decoding failed mid-stream: {}; decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                label,
+                err
+            ),
+        };
+        if n == 0 {
+            break;
+        }
+        if decoded.len() + n > ZSTD_ROLLOUT_DECODE_MAX_BYTES {
+            bail!(
+                "session file {} is zstd-compressed (Codex rollout format) and would decompress past the {} cap; refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
+                label,
+                "64 MiB"
+            );
+        }
+        decoded.extend_from_slice(&chunk[..n]);
+    }
+    if decoded.is_empty() {
+        bail!(
+            "session file {} is zstd-compressed (Codex rollout format) but decompressed to 0 bytes; nothing to parse",
+            label
+        );
+    }
+    Ok(decoded)
 }
 
 /// Parse one session stream piped on stdin (rm-503, `agenttrace … -`):
@@ -454,8 +509,20 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if let Some(value) = parsed_value {
-        if let Some(events) = parse_opencode_storage_value(path, &value) {
-            return session_from_events(name, path, events);
+        let mut opencode_admission = OpencodeAdmissionStats::default();
+        if let Some(events) = parse_opencode_storage_value(path, &value, &mut opencode_admission) {
+            let mut session = session_from_events(name, path, events)?;
+            if opencode_admission.capped_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_files_capped".to_string(),
+                    opencode_admission.capped_files,
+                );
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_bytes_capped".to_string(),
+                    opencode_admission.capped_bytes as usize,
+                );
+            }
+            return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
             return session_from_events(name, path, events);
@@ -2549,15 +2616,17 @@ fn parse_oh_my_pi_jsonl(path: &str, objs: &[JsonObject]) -> anyhow::Result<Vec<E
                 }
             }
             "agent_settled" => {
-                // rm-990 (cycle 2, run b5affead): pi >=1.1.0 (#10607)
-                // added `aborted` to the agent-settled event. The wire
-                // census that motivated this arm (23,174 journals on
-                // this host, 2026-10-12) found ZERO persisted entries
-                // of this type — the dist settles only on the
-                // in-process event stream, never the JSONL — but
-                // format v3 is additive-only, so the entry is
-                // consumed defensively: present -> counted, absent ->
-                // invisible (a journal without one is byte-identical
+                // rm-990 (cycle 2, run b5affead — the landed lane this
+                // integration kept over run b5d391ec's stranded
+                // parallel implementation of the same unit): pi >=1.1.0
+                // (#10607) added `aborted` to the agent-settled event.
+                // The wire census that motivated this arm (23,174
+                // journals on this host, 2026-10-12) found ZERO
+                // persisted entries of this type — the dist settles
+                // only on the in-process event stream, never the
+                // JSONL — but format v3 is additive-only, so the entry
+                // is consumed defensively: present -> counted, absent
+                // -> invisible (a journal without one is byte-identical
                 // to before this arm existed, including the
                 // pi_entry_skipped disclosure it used to mint). The
                 // arm that actually fires on real journals is the
@@ -5945,23 +6014,25 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         return None;
     }
     // Insertion-ordered id -> record map with in-place replacement,
-    // mirroring the reader's `messagesMap`.
+    // mirroring the reader's `messagesMap`. rm-715 perf rider (run
+    // 80e8beb6 cycle 1, batch "bounded inputs, honest docs"): the
+    // upstream messagesMap is a MAP — the previous linear `find` made
+    // every appended record rescan the whole journal (measured 9.5 s
+    // for a 20k-record hostile journal at cab6917). The position
+    // index carries the same O(1) upsert the reader has; structural
+    // records ($set/$rewindTo/$patch) rewrite the vector wholesale,
+    // so the index is rebuilt after each — the rare path pays O(n),
+    // and the common append path never pays a rescan again.
     let mut messages: Vec<(String, JsonObject)> = Vec::new();
-    let upsert =
-        |messages: &mut Vec<(String, JsonObject)>, id: String, record: JsonObject| match messages
-            .iter_mut()
-            .find(|(existing, _)| *existing == id)
-        {
-            Some(slot) => slot.1 = record,
-            None => messages.push((id, record)),
-        };
+    let mut index: HashMap<String, usize> = HashMap::new();
     for obj in objs {
         if let Some(set) = obj.get("$set").and_then(Value::as_object) {
             if let Some(replacement) = set.get("messages").and_then(Value::as_array) {
                 messages.clear();
+                index.clear();
                 for record in replacement.iter().filter_map(Value::as_object) {
                     if let Some(id) = gemini_chats_message_id(record) {
-                        upsert(&mut messages, id, record.clone());
+                        gemini_chats_upsert(&mut messages, &mut index, id, record.clone());
                     }
                 }
             }
@@ -5974,14 +6045,16 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                 Some(at) => messages.truncate(at),
                 None => messages.clear(),
             }
+            index = gemini_chats_reindex(&messages);
             continue;
         }
         if let Some(patch) = obj.get("$patch").and_then(Value::as_object) {
             gemini_chats_apply_patch(&mut messages, patch);
+            index = gemini_chats_reindex(&messages);
             continue;
         }
         if let Some(id) = gemini_chats_message_id(obj) {
-            upsert(&mut messages, id, obj.clone());
+            gemini_chats_upsert(&mut messages, &mut index, id, obj.clone());
         }
     }
     let mut events = Vec::new();
@@ -5989,6 +6062,35 @@ fn parse_gemini_chats_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
         gemini_chats_message_events(record, &mut events);
     }
     non_empty(events)
+}
+
+/// O(1) id upsert for [`parse_gemini_chats_jsonl`] — replace in
+/// place when the reader would (pushMessage re-appends the full record
+/// with tokens/toolCalls attached), append at the tail otherwise.
+fn gemini_chats_upsert(
+    messages: &mut Vec<(String, JsonObject)>,
+    index: &mut HashMap<String, usize>,
+    id: String,
+    record: JsonObject,
+) {
+    match index.get(&id) {
+        Some(slot) => messages[*slot].1 = record,
+        None => {
+            index.insert(id.clone(), messages.len());
+            messages.push((id, record));
+        }
+    }
+}
+
+/// Rebuild the id -> position index after a structural record
+/// (`$set`/`$rewindTo`/`$patch`) rewrites the message vector — order
+/// is the vector's, positions are fresh.
+fn gemini_chats_reindex(messages: &[(String, JsonObject)]) -> HashMap<String, usize> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(slot, (id, _))| (id.clone(), slot))
+        .collect()
 }
 
 /// Claim rule: the 0.63 writer always leads with the metadata record
@@ -6270,12 +6372,16 @@ struct OpenCodeRecord {
     doc: Map<String, Value>,
 }
 
-fn parse_opencode_storage_value(path: &str, value: &Value) -> Option<Vec<Event>> {
+fn parse_opencode_storage_value(
+    path: &str,
+    value: &Value,
+    admission: &mut OpencodeAdmissionStats,
+) -> Option<Vec<Event>> {
     let doc = value.as_object()?;
     if !is_opencode_storage_session_doc(path, doc) {
         return None;
     }
-    parse_opencode_storage_session(path, doc).ok()
+    parse_opencode_storage_session(path, doc, admission).ok()
 }
 
 fn is_opencode_storage_session_doc(path: &str, doc: &Map<String, Value>) -> bool {
@@ -6328,6 +6434,7 @@ fn rel_from_root(root: &Path, path: &Path) -> Option<String> {
 fn parse_opencode_storage_session(
     path: &str,
     session: &Map<String, Value>,
+    admission_out: &mut OpencodeAdmissionStats,
 ) -> anyhow::Result<Vec<Event>> {
     let session_id = string(session.get("id")).unwrap_or("");
     if session_id.is_empty() {
@@ -6335,8 +6442,15 @@ fn parse_opencode_storage_session(
     }
     let storage_root = opencode_storage_root_from_session_file(path)
         .with_context(|| format!("opencode: unsupported storage path {path}"))?;
-    let mut messages = read_opencode_records(&storage_root.join("message").join(session_id));
-    if messages.is_empty() {
+    let mut admission = OpencodeAdmissionStats::default();
+    let (mut messages, message_admission) =
+        read_opencode_records(&storage_root.join("message").join(session_id));
+    admission.accumulate(message_admission);
+    // rm-1437: an empty event set is expected when every transcript was
+    // stat-capped away — bail into the unsupported lane only when we have no
+    // such explanation, so a fully-capped session still parses and carries its
+    // disclosure instead of masquerading as a foreign format.
+    if messages.is_empty() && admission.capped_files == 0 {
         bail!("opencode: no messages found for session {}", session_id);
     }
     sort_opencode_records(&mut messages);
@@ -6358,12 +6472,19 @@ fn parse_opencode_storage_session(
         // consumed no billing class, so the rescue still fires and the
         // step's input/output survives.
         let message_fold = add_opencode_tokens(&mut usage, msg.doc.get("tokens"), true);
-        let (events, part_usage) =
-            parse_opencode_message(&storage_root, &msg.doc, &model, message_fold);
+        let (events, part_usage) = parse_opencode_message(
+            &storage_root,
+            &msg.doc,
+            &model,
+            message_fold,
+            &mut admission,
+        );
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
-    if body.is_empty() {
+    // rm-1437: same relaxation as the messages gate — a fully stat-capped
+    // corpus legitimately yields no parseable events; disclose, don't bail.
+    if body.is_empty() && admission.capped_files == 0 {
         bail!("opencode: no parseable events for session {}", session_id);
     }
 
@@ -6382,6 +6503,7 @@ fn parse_opencode_storage_session(
         });
     }
     events.extend(body);
+    admission_out.accumulate(admission);
     Ok(events)
 }
 
@@ -6396,14 +6518,49 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn read_opencode_records(dir: &Path) -> Vec<OpenCodeRecord> {
+/// rm-1437: admission disclosure for the opencode transcript lane. Whole-file
+/// reads are stat-capped; over-cap files are skipped and reported through
+/// [`Metrics::line_skips`] so `--doctor` surfaces them next to the other skip
+/// classes and data-health confidence degrades honestly (the rm-526 loss
+/// channel — a skipped transcript is lost data, not a value-preserving
+/// adjustment, so it does NOT ride `disclosure_counters`).
+#[derive(Debug, Default, Clone, Copy)]
+struct OpencodeAdmissionStats {
+    capped_files: usize,
+    capped_bytes: u64,
+}
+
+impl OpencodeAdmissionStats {
+    fn accumulate(&mut self, other: OpencodeAdmissionStats) {
+        self.capped_files += other.capped_files;
+        self.capped_bytes += other.capped_bytes;
+    }
+}
+
+/// rm-1437: per-file read cap for opencode message/part transcripts, mirroring
+/// the statusline journal lane's `capped_away_bytes` discipline (rm-821): the
+/// metadata length is checked BEFORE the read so an oversized transcript is
+/// never admitted into memory. Legitimate transcripts are KB-scale; 10 MiB
+/// matches the fleet's transcript-side read caps.
+const OPENCODE_TRANSCRIPT_READ_CAP_BYTES: u64 = 10 * 1024 * 1024;
+
+fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionStats) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), OpencodeAdmissionStats::default());
     };
     let mut records = Vec::new();
+    let mut admission = OpencodeAdmissionStats::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        // rm-1437: stat before read — over-cap transcripts are skipped and
+        // disclosed instead of being admitted into memory.
+        let file_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if file_len > OPENCODE_TRANSCRIPT_READ_CAP_BYTES {
+            admission.capped_files += 1;
+            admission.capped_bytes += file_len;
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -6414,7 +6571,7 @@ fn read_opencode_records(dir: &Path) -> Vec<OpenCodeRecord> {
         };
         records.push(OpenCodeRecord { path, doc });
     }
-    records
+    (records, admission)
 }
 
 fn sort_opencode_records(records: &mut [OpenCodeRecord]) {
@@ -6431,11 +6588,14 @@ fn parse_opencode_message(
     msg: &Map<String, Value>,
     model: &str,
     message_fold: OpencodeTokensFold,
+    admission: &mut OpencodeAdmissionStats,
 ) -> (Vec<Event>, BTreeMap<String, i64>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
     let msg_id = string(msg.get("id")).unwrap_or("");
-    let mut parts = read_opencode_records(&storage_root.join("part").join(msg_id));
+    let (mut parts, part_admission) =
+        read_opencode_records(&storage_root.join("part").join(msg_id));
+    admission.accumulate(part_admission);
     sort_opencode_records(&mut parts);
 
     let mut events = Vec::new();
@@ -6994,19 +7154,63 @@ fn cline_unix_timestamp(value: i64) -> String {
 }
 
 fn timestamp_millis(ms: i64) -> String {
-    let secs = ms / 1000;
-    let nsec = ((ms % 1000) * 1_000_000) as u32;
+    // rm-1501: euclidean div/rem keep pre-epoch (negative) instants exact —
+    // truncating `/`/`%` fed a negative remainder into a wrapping `as u32`
+    // nanos field, so every pre-1970 timestamp rendered as "".
+    let secs = ms.div_euclid(1000);
+    let nsec = ms.rem_euclid(1000) as u32 * 1_000_000;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
         .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default()
 }
 
 fn timestamp_millis_nanos(ms: i64) -> String {
-    let secs = ms / 1000;
-    let nsec = ((ms % 1000) * 1_000_000) as u32;
+    // rm-1501: same euclidean fix as `timestamp_millis`.
+    let secs = ms.div_euclid(1000);
+    let nsec = ms.rem_euclid(1000) as u32 * 1_000_000;
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsec)
         .map(|ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod rm_1501_tests {
+    //! rm-1501 — pre-epoch (negative) millisecond timestamps must render
+    //! as real pre-1970 instants, not silently vanish as empty strings.
+    //! Root cause: truncating `/` and `%` on negative `i64` fed a wrapping
+    //! `as u32` nanos field, so `from_timestamp` returned `None`.
+    use super::{timestamp_millis, timestamp_millis_nanos};
+
+    #[test]
+    fn pre_epoch_millis_render_pre_1970_instants() {
+        assert_eq!(
+            timestamp_millis(-1),
+            "1969-12-31T23:59:59.999Z",
+            "-1 ms is one millisecond before the epoch"
+        );
+        assert_eq!(
+            timestamp_millis(-86_400_000),
+            "1969-12-31T00:00:00.000Z",
+            "a full pre-epoch day must not render empty"
+        );
+        // Post-epoch behavior is pinned unchanged.
+        assert_eq!(timestamp_millis(1), "1970-01-01T00:00:00.001Z");
+        assert_eq!(timestamp_millis(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn pre_epoch_millis_nanos_render_pre_1970_instants() {
+        assert_eq!(
+            timestamp_millis_nanos(-1),
+            "1969-12-31T23:59:59.999000000Z",
+            "nanos arm: -1 ms = 999,000,000 ns before the epoch"
+        );
+        assert_eq!(
+            timestamp_millis_nanos(-86_400_000),
+            "1969-12-31T00:00:00.000000000Z"
+        );
+        assert_eq!(timestamp_millis_nanos(1), "1970-01-01T00:00:00.001000000Z");
+    }
 }
 
 fn gemini_usage(value: &Value) -> Option<BTreeMap<String, i64>> {

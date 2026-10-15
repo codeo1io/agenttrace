@@ -810,7 +810,11 @@ pub fn report_scope(
             });
         entry.sessions += 1;
         entry.tokens = entry.tokens.saturating_add(total_tokens(session));
-        entry.estimated_cost += session.metrics.cost_estimated;
+        // rm-1500: skip poisoned costs in the per-source estimate; the
+        // corpus-wide census lives in the data-health `non_finite_costs`.
+        if session.metrics.cost_estimated.is_finite() {
+            entry.estimated_cost += session.metrics.cost_estimated;
+        }
     }
     ReportScope {
         generated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

@@ -36,7 +36,10 @@ mod config;
 struct Args {
     /// Session file to analyze (`-` reads one session stream from
     /// stdin through the same parser; stdin sessions are ephemeral and
-    /// never touch the session cache)
+    /// never touch the session cache; the read is capped at 256 MiB
+    /// by default — an over-cap stream fails with a named error
+    /// instead of reading without bound, and AGENTTRACE_STDIN_CAP_BYTES
+    /// overrides the cap)
     path: Option<String>,
     /// Output format for the requested view: text (default), json, csv,
     /// markdown/md, html, svg (the shareable usage card; requires
@@ -951,6 +954,9 @@ fn run() -> anyhow::Result<()> {
     }
 
     if let Some(query) = args.search.as_deref() {
+        // rm-988: blank queries never reach here — validate_gate_thresholds
+        // rejects them up front (see below); the library arm keeps its own
+        // defensive empty-result contract for other callers.
         let results = search_sessions(&sessions, query, args.search_limit);
         let out = if args.format == "json" {
             report_search_json(&results)
@@ -1817,6 +1823,31 @@ fn load_sessions(args: &Args) -> anyhow::Result<Vec<Session>> {
     load_sessions_report(args).map(|(sessions, _)| sessions)
 }
 
+/// rm-503 cap arm (run 80e8beb6 cycle 1, batch "bounded inputs,
+/// honest docs"): the `-` lane is an untrusted byte stream — the
+/// original read drained it with an unbounded `read_to_end`, so a
+/// hostile or accidental pipe (`cat /dev/zero | agenttrace --overview
+/// -`) grew the process until the allocator died (`read session from
+/// stdin: out of memory`, assess 146452bd live PoC under a 256 MiB VM
+/// cap). The read is bounded at [`STDIN_SESSION_MAX_BYTES`] and an
+/// over-cap stream fails with a named error carrying the effective
+/// cap. The bound is a knob, not a format contract:
+/// `AGENTTRACE_STDIN_CAP_BYTES` overrides it (best-effort like every
+/// other `AGENTTRACE_*` knob — unparseable or non-positive values
+/// fall back to the default rather than failing the run over a
+/// typo'd cap).
+const STDIN_SESSION_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Effective stdin read cap for this run (see
+/// [`STDIN_SESSION_MAX_BYTES`]).
+fn stdin_session_cap_bytes() -> u64 {
+    std::env::var("AGENTTRACE_STDIN_CAP_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(STDIN_SESSION_MAX_BYTES)
+}
+
 /// rm-735: `--demo` is itself a session source — it substitutes the
 /// bundled demo corpus for discovery. Combined with an explicit
 /// session source (a positional path, `-d/--dir`, or a `--range`
@@ -1917,10 +1948,27 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
         // read nor write), which `--help` discloses. `-d` stays a
         // separate multi-session lane and is out of scope here.
         if path == "-" {
+            let cap = stdin_session_cap_bytes();
             let mut raw = Vec::new();
+            // rm-503 cap arm: take cap + 1 so overflow is detectable
+            // in a single read — the extra byte is the whole signal —
+            // and an over-cap stream refuses by name instead of
+            // growing without bound (the pre-fix PoC OOM'd at 200 MiB
+            // under a 256 MiB VM cap).
+            // saturating_add: an absurd AGENTTRACE_STDIN_CAP_BYTES=u64::MAX
+            // must overflow neither debug (panic) nor release (wrap to 0
+            // and silently read nothing) — review-fix F4.
             io::stdin()
+                .take(cap.saturating_add(1))
                 .read_to_end(&mut raw)
                 .context("read session from stdin")?;
+            if raw.len() as u64 > cap {
+                bail!(
+                    "stdin session exceeds the read cap: more than {cap} bytes on \
+                     stdin (set AGENTTRACE_STDIN_CAP_BYTES to raise or lower the cap; \
+                     default {STDIN_SESSION_MAX_BYTES})"
+                );
+            }
             return Ok((
                 prepare_explicit_sessions(vec![parse_stdin_bytes(raw)?], args)?,
                 None,
@@ -2443,12 +2491,24 @@ fn render_test_match_json() -> anyhow::Result<String> {
         "anthropic/claude-sonnet-4-6",
         "vertex_ai/claude-opus-4-5@20251101",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        // rm-1053 (run f2fccaa9 cycle 3): the regional-twin probe
+        // family, mirrored from render_test_match — the two lanes
+        // keep one probe list (the ultrafast rider hit exactly this
+        // drift: the text lane gained the row and this one was left
+        // behind, merged at conflict case bc360d0d).
+        "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "bedrock/us-gov-east-1/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "azure/us-gov/gpt-5.1",
         "openai/gpt-4.1",
         "gpt-5.6",
         "gpt-4.1-mini-2025-04-14",
         "deepseek-chat",
         "deepseek/deepseek-v3.2",
         "gemini-2.5-pro",
+        "gpt-6-astra",
         "unknown-model-xyz",
     ];
     let rows: Vec<_> = models
@@ -2457,7 +2517,12 @@ fn render_test_match_json() -> anyhow::Result<String> {
             let price = lookup_price(model);
             // rm-610: flex-tier rates disclosed per row (null when the
             // row carries none — flex turns then bill at the standard
-            // rates above).
+            // rates above). rm-164 cycle-2 rider (run b5d391ec, merged
+            // at conflict case bc360d0d): the ultrafast slots join the
+            // same row shape so this lane keeps mirroring
+            // render_test_match's probe list and tier disclosure —
+            // the flex lane updated both surfaces, and the merged
+            // text-only ultrafast line had left this one behind.
             serde_json::json!({
                 "model": model,
                 "input_per_million": price.input,
@@ -2468,6 +2533,10 @@ fn render_test_match_json() -> anyhow::Result<String> {
                 "flex_output_per_million": price.output_flex,
                 "flex_cache_write_per_million": price.cw_flex,
                 "flex_cache_read_per_million": price.cr_flex,
+                "ultrafast_input_per_million": price.input_ultrafast,
+                "ultrafast_output_per_million": price.output_ultrafast,
+                "ultrafast_cache_write_per_million": price.cw_ultrafast,
+                "ultrafast_cache_read_per_million": price.cr_ultrafast,
             })
         })
         .collect();
@@ -2745,7 +2814,8 @@ fn render_diagnostics(
     }
     let mut out = report_text_with_language(session, language);
     out.push_str("\nDiagnostics\n-----------\n");
-    out.push_str(&serde_json::to_string_pretty(&session.diagnostics)?);
+    let guarded = guard_formula_json_leaves(&serde_json::to_value(&session.diagnostics)?);
+    out.push_str(&serde_json::to_string_pretty(&guarded)?);
     if alert.triggered {
         out.push_str(&format!(
             "\nCost alert [{}]: {}",
@@ -2843,6 +2913,34 @@ fn validate_range_applicability(args: &Args) -> anyhow::Result<()> {
         bail!(
             "--range does not apply to --quota: the quota view is corpus-scope (every discovered session bills the window); drop --range to see the full-corpus windows"
         );
+    }
+    // rm-598 quota-scope rider (run 80e8beb6 cycle 1, batch "bounded
+    // inputs, honest docs"): `--project`, `--source`, and
+    // `--model-filter` flow into the discovery loader's view filters,
+    // so on `--quota` they silently emptied the corpus — the same
+    // measured-zero masquerade the `--range` arm above refuses (live
+    // PoC at cab6917: `--demo --quota --project nomatch` rendered
+    // "no session carries placeable time" at rc0 while the
+    // unfiltered view carried real windows). Same guard family, same
+    // voice: the view-filter set cannot narrow a corpus-scope window.
+    if args.quota {
+        let mut filters = Vec::new();
+        if !args.project.is_empty() {
+            filters.push("--project");
+        }
+        if !args.source.is_empty() {
+            filters.push("--source");
+        }
+        if !args.model_filter.is_empty() {
+            filters.push("--model-filter");
+        }
+        if !filters.is_empty() {
+            let pair = filters.join("/");
+            let verb = if filters.len() == 1 { "does" } else { "do" };
+            bail!(
+                "{pair} {verb} not apply to --quota: the quota view is corpus-scope (every discovered session bills the window); drop the filter(s) to see the full-corpus windows"
+            );
+        }
     }
     if args.range != "all" && !has_session_action(args) {
         bail!(
@@ -3097,7 +3195,13 @@ fn validate_gate_thresholds(args: &Args) -> anyhow::Result<()> {
     // --search '' -f json, rc 0). The library guard still matches
     // NOTHING on a blank query (search.rs pins that), but the user
     // cannot distinguish "no match" from "no query" — reject it here
-    // in the same dialect as the limit guards above.
+    // in the same dialect as the limit guards above. This guard runs
+    // before every action dispatch, so it also covers the bare
+    // `--search ''` shape that falls through to the interactive TUI
+    // (launch_guards::blank_search_query_rejects_loudly_instead_of_matching_nothing
+    // pins that leg; run b5d391ec's parallel rm-988 implementation
+    // added two in-run() duplicates of this check — superseded by the
+    // landed lane and removed at integration).
     if args
         .search
         .as_deref()

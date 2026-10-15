@@ -1508,6 +1508,12 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
             overview.clamped_values
         ));
     }
+    if overview.non_finite_costs > 0 {
+        out.push_str(&format!(
+            "  ⚠️  Non-finite costs:         {} (excluded from every cost aggregate — run --diagnostics)\n",
+            overview.non_finite_costs
+        ));
+    }
     out.push('\n');
 
     let timelines = overview_incident_timelines(&ordered, 3);
@@ -2511,6 +2517,7 @@ fn overview_summary(overview: &Overview, sessions: &[Session]) -> Value {
     let trend = analyze_health_trend_full(sessions);
     json!({
         "total_sessions": overview.total_sessions,
+        "non_finite_costs": overview.non_finite_costs,
         "healthy": overview.healthy,
         "warning": overview.warning,
         "critical": overview.critical,

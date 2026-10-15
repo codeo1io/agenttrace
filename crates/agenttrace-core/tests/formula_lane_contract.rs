@@ -336,3 +336,112 @@ fn waste_tool_bloat_row_neutralizes_the_hostile_tool_name() {
         "benign tool name must stay bare (no paste-marker): {benign_report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Doctor text-report lanes (rm-897 residual; run a64735b75a46 cycle 3)
+// ---------------------------------------------------------------------------
+//
+// Provenance pins:
+// * formula-lane/=2+5_cmd.jsonl — the hostile-name session fixture above.
+// * formula-lane/=2+5_zero_usage.jsonl — the same session with the assistant
+//   usage block zeroed (every token class 0) so the session lands in the
+//   zero-usage census (rm-408: present-but-zero counts as measured). Derived
+//   at base 3e90993 by zeroing the usage object of =2+5_cmd.jsonl.
+//
+// The doctor TEXT report renders three corpus-controlled values at line
+// start: zero-usage sample names, pre-rendered project-decode Resolved lines
+// (their dir-derived prefix leads the line), and duplicate sqlite db paths.
+// Paste-safety demands the same `'` marker the cell lanes get; the JSON
+// surface stays byte-lossless BY DESIGN (asserted below as the contrast).
+
+fn copy_fixture_to(dir: &std::path::Path, fixture: &str, as_name: &str) -> std::path::PathBuf {
+    let src = Path::new(fixture);
+    let dst = dir.join(as_name);
+    std::fs::copy(src, &dst)
+        .unwrap_or_else(|error| panic!("copy {fixture} into {}: {error}", dir.display()));
+    dst
+}
+
+#[test]
+fn doctor_zero_usage_sample_lane_gets_formula_guard() {
+    let tmp = std::env::temp_dir().join("at-doc-guard-zero");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir zero-usage corpus");
+    copy_fixture_to(
+        &tmp,
+        "tests/fixtures/formula-lane/=2+5_zero_usage.jsonl",
+        "session.jsonl",
+    );
+    let report = agenttrace_core::build_doctor_report(Some(&tmp), false);
+    assert!(
+        !report.zero_usage.samples.is_empty(),
+        "fixture must land in the zero-usage census: {:?}",
+        report.zero_usage.samples
+    );
+    let text = agenttrace_core::doctor_report_text(&report);
+    // RED-FIRST: the sample line must carry the paste marker before the payload.
+    assert_every_occurrence_preceded(&text, "=HYPERLINK(", "'");
+    assert!(
+        text.contains("'=HYPERLINK(\"http://evil.example\",\"click-me\")"),
+        "guarded zero-usage sample must preserve the payload after the marker:\n{text}"
+    );
+}
+
+// Defense-in-depth pin for the decode-sample render loop: today's mint
+// sites bake fixed prefixes ("truncated:"/"opaque:"/"ambiguous:"/
+// "unresolved:"), so live corpora cannot lead these lines with corpus
+// bytes. The render loop still guards baked lines so a future arm change
+// cannot silently reopen the lane (rm-897 residual discipline).
+#[test]
+fn doctor_project_decode_sample_render_stays_guarded() {
+    let mut report = agenttrace_core::DoctorReport::default();
+    report.project_decode.samples = vec![
+        "opaque: benign-name kept as its own stable identity".to_string(),
+        "=2+5 hostile baked line".to_string(),
+    ];
+    let text = agenttrace_core::doctor_report_text(&report);
+    assert_every_occurrence_preceded(&text, "=2+5", "'");
+    assert!(
+        text.contains("'=2+5 hostile baked line"),
+        "future regressive arm output must be neutralized at render:\n{text}"
+    );
+    assert!(
+        text.contains("opaque: benign-name"),
+        "benign fixed-prefix lines must stay bare (no marker):\n{text}"
+    );
+}
+
+#[test]
+fn doctor_duplicate_db_lane_gets_formula_guard_and_json_stays_raw() {
+    // Synthetic duplicate entry: the render lane is the unit under guard
+    // (dedup ingest needs a real sqlite corpus; JSON rawness is the design).
+    let mut report = agenttrace_core::DoctorReport::default();
+    report
+        .sqlite_duplicate_dbs
+        .push(agenttrace_core::SqliteDuplicateDb {
+            path: "=2+5.db".to_string(),
+            duplicate_sessions: 2,
+        });
+    let text = agenttrace_core::doctor_report_text(&report);
+    assert!(
+        text.contains("'=2+5.db"),
+        "guarded duplicate-db line must carry the marker:\n{text}"
+    );
+
+    // Contrast: the same hostile session flows through the JSON surface with
+    // NO marker — machine lanes stay byte-lossless BY DESIGN.
+    let tmp = std::env::temp_dir().join("at-doc-guard-json");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir json corpus");
+    copy_fixture_to(
+        &tmp,
+        "tests/fixtures/formula-lane/=2+5_zero_usage.jsonl",
+        "session.jsonl",
+    );
+    let json = agenttrace_core::render_doctor_report(Some(&tmp), false, "json")
+        .expect("render json doctor report");
+    assert!(
+        json.contains("=HYPERLINK(") && !json.contains("'=HYPERLINK("),
+        "JSON surface must stay raw (payload present, marker absent):\n{json}"
+    );
+}

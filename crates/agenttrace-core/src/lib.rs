@@ -42,7 +42,9 @@ pub use discovery::{
     load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
     KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
 };
-pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
+pub use doctor::{
+    build_doctor_report, doctor_report_text, render_doctor_report, DoctorDirReport, DoctorReport,
+};
 pub use governance::{
     context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance,
     recommendations, session_cost_audit, ContextTrend, ContextTrendTotals, CostAudit,
@@ -61,7 +63,8 @@ pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
     list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
+    pricing_source_for, provider_for, render_model_pricing_list, render_test_match, update_pricing,
+    Price,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
@@ -778,6 +781,16 @@ pub struct Overview {
     /// member sessions (`magnitude_clamped:*` counters) — rendered
     /// beside the total cost so a clamped $42.7T cannot look clean.
     pub clamped_values: usize,
+    /// rm-1500: count of member sessions whose `cost_estimated` is
+    /// non-finite (poisoned or overflowing pricing inputs — e.g. a NaN
+    /// REAL column read back from a sqlite lane). Their cost is
+    /// EXCLUDED from every aggregate fold below (total, agent, model,
+    /// provider, task-type, project, branch) and disclosed here and
+    /// beside the rendered total, using the same `non_finite_costs`
+    /// vocabulary as the insights data-health census (pass-8 F8-5) so
+    /// `--overview` and the insights report agree on the exclusion —
+    /// a poisoned session must never read as clean zero-spend.
+    pub non_finite_costs: usize,
     pub healthy: usize,
     pub warning: usize,
     pub critical: usize,
@@ -1909,6 +1922,16 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // disclosure, never repricing — mirroring rm-984's
     // recorded-vs-estimated stance for the Cursor lane onto every
     // recorded-cost arm.
+    // rm-1052 rider (run 80e8beb6 cycle 1): the counter is a LOWER
+    // BOUND on suppressed spend, and the docs must say so. The
+    // suppressed estimate prices the same four buckets as the
+    // estimate formula (input/output/cache-write/cache-read) —
+    // Claude's 1h-tier cache writes (`ephemeral_1h_input_tokens`)
+    // have no catalog rate yet (tier-aware pricing is rm-176), so a
+    // 1h-dominated gateway block suppresses an estimate that never
+    // counted its 1h bytes. The recorded number stays authoritative;
+    // the gap is disclosed in README's estimates paragraph, not
+    // hidden behind a tidy counter.
     for event in events.iter().filter(|event| {
         event
             .recorded_cost_usd
@@ -2514,7 +2537,17 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
     let mut overview = Overview::default();
     for session in sessions {
         overview.total_sessions += 1;
-        overview.total_cost += session.metrics.cost_estimated;
+        // rm-1500: skip-while-counting at every cost fold below — one
+        // poisoned session must never read as clean zero-spend (and never
+        // silently propagate through the attribution split either).
+        let session_cost = session.metrics.cost_estimated;
+        let cost_finite = session_cost.is_finite();
+        if !cost_finite {
+            overview.non_finite_costs += 1;
+        }
+        if cost_finite {
+            overview.total_cost += session_cost;
+        }
         if session.health >= 80 {
             overview.healthy += 1;
         } else if session.health >= 50 {
@@ -2527,7 +2560,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         } else {
             session.metrics.agent_name.clone()
         };
-        // rm-991 (cycle 2, run b5affead): the opencode `session.agent`
+        // rm-991 (cycle 2, run b5affead — the landed lane this
+        // integration kept over run b5d391ec's stranded parallel
+        // implementation of the same unit): the opencode `session.agent`
         // column names WHO ran the session (live census 2026-10-12:
         // 302/310 rows). Keying on it splits the one `opencode_db`
         // bucket every opencode session used to collapse into; every
@@ -2535,7 +2570,11 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         // byte-identical to before (same source_tool fallback).
         let agent_entry = overview.by_agent.entry(agent).or_default();
         agent_entry.sessions += 1;
-        agent_entry.cost += session.metrics.cost_estimated;
+        // rm-1500: the agent rollup skips poisoned costs like every
+        // other fold (counted in overview.non_finite_costs).
+        if cost_finite {
+            agent_entry.cost += session_cost;
+        }
 
         let model = if session.metrics.model_used.is_empty() {
             "unknown".to_string()
@@ -2553,8 +2592,8 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         // pre-batch rollup guaranteed and agenttrace.overview.v1 machine
         // consumers sum against. Unattributed sessions (single- or
         // multi-model) keep the one-bucket full-cost behavior.
-        if session.metrics.model_attribution.is_empty() {
-            model_entry.cost += session.metrics.cost_estimated;
+        if session.metrics.model_attribution.is_empty() && cost_finite {
+            model_entry.cost += session_cost;
         }
 
         // rm-949 (cycle 3): the per-model attribution costs are priced
@@ -2589,7 +2628,7 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .values()
             .map(|attribution| attribution.cost_usd)
             .sum();
-        if attributed_total > 0.0 {
+        if attributed_total > 0.0 && cost_finite {
             let scale = 1.0e4_f64;
             let total_units = (session.metrics.cost_estimated * scale).round() as i64;
             let attribution_items: Vec<_> = session.metrics.model_attribution.iter().collect();
@@ -2653,7 +2692,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .unwrap_or_else(|| "unknown".to_string());
         let provider_entry = overview.by_provider.entry(provider).or_default();
         provider_entry.sessions += 1;
-        provider_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            provider_entry.cost += session_cost;
+        }
 
         // rm-726: surface the magnitude-clamp census beside the total.
         overview.clamped_values += session
@@ -2669,7 +2710,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .entry(infer_task_type(session).to_string())
             .or_default();
         task_type_entry.sessions += 1;
-        task_type_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            task_type_entry.cost += session_cost;
+        }
         // rm-541: token sums saturate, never `+=`. These per-session totals
         // arrive from untrusted logs (a hostile journal pins i64::MAX), so
         // a bare `+=` aborted debug builds with `attempt to add with
@@ -2695,7 +2738,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
             .entry(project_name(session))
             .or_default();
         project_entry.sessions += 1;
-        project_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            project_entry.cost += session_cost;
+        }
 
         // rm-585 (spend-by-branch, first cut): branch values come only
         // from the claude-code lane's gitBranch envelope. Missing,
@@ -2712,7 +2757,9 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         };
         let branch_entry = overview.by_branch.entry(branch_bucket).or_default();
         branch_entry.sessions += 1;
-        branch_entry.cost += session.metrics.cost_estimated;
+        if cost_finite {
+            branch_entry.cost += session_cost;
+        }
 
         for anomaly in &session.anomalies {
             overview.anomalies_top.push(AnomalyTop {
@@ -2779,18 +2826,53 @@ struct QuotaWindow {
 /// a cost on — the last event timestamp when the parse carried one
 /// (fresh parses), else the parsed `session_end` (warm-cache rows,
 /// which lose the event-timestamp vector to its serde skip).
-fn quota_cutoff(sessions: &[Session]) -> Option<DateTime<Utc>> {
-    sessions
-        .iter()
-        .filter_map(|session| {
-            session
-                .metrics
-                .timestamps
-                .last()
-                .copied()
-                .or_else(|| parse_ts(&session.metrics.session_end))
-        })
-        .max()
+///
+/// rm-1402 (run f2fccaa9 cycle 3, assess 53af6c9e F3): the cutoff is
+/// the newest PLAUSIBLE instant, never an unbounded max(). A
+/// future-dated last event or `session_end` (hostile meter, clock
+/// skew, one fabricated journal line) used to anchor every rolling
+/// window in the future, pushing all real events outside the
+/// trailing spans — the assess PoC corpus billed $0.0045 against an
+/// honest $1.52, hiding 99.7% of the spend. Instants after `now`
+/// are discarded at a disclosed clock-skew guard: the anchor falls
+/// back to the newest at-or-before-now instant the session still
+/// carries (an earlier event timestamp, or a warm-cache
+/// `session_start`), and sessions with no plausible instant are
+/// counted as discarded, never silently dropped. Returns
+/// `(cutoff, future_discarded_sessions)`.
+fn quota_cutoff(sessions: &[Session]) -> (Option<DateTime<Utc>>, usize) {
+    let now = Utc::now();
+    let mut cutoff: Option<DateTime<Utc>> = None;
+    let mut future_discarded = 0usize;
+    for session in sessions {
+        let anchor = match session
+            .metrics
+            .timestamps
+            .last()
+            .copied()
+            .or_else(|| parse_ts(&session.metrics.session_end))
+        {
+            Some(ts) => ts,
+            None => continue,
+        };
+        if anchor <= now {
+            cutoff = Some(cutoff.map_or(anchor, |c: DateTime<Utc>| c.max(anchor)));
+            continue;
+        }
+        future_discarded += 1;
+        let rescued = session
+            .metrics
+            .timestamps
+            .iter()
+            .rev()
+            .find(|ts| **ts <= now)
+            .copied()
+            .or_else(|| parse_ts(&session.metrics.session_start).filter(|ts| *ts <= now));
+        if let Some(ts) = rescued {
+            cutoff = Some(cutoff.map_or(ts, |c: DateTime<Utc>| c.max(ts)));
+        }
+    }
+    (cutoff, future_discarded)
 }
 
 /// The share of a session's cost that sits inside `[start, end]`.
@@ -2848,7 +2930,11 @@ fn quota_window(
             if share > 0.0 {
                 sessions_contributing += 1;
             }
-            spend_usd += session.metrics.cost_estimated * share;
+            // rm-1500: share distribution skips poisoned costs; the
+            // session is already counted in overview.non_finite_costs.
+            if session.metrics.cost_estimated.is_finite() {
+                spend_usd += session.metrics.cost_estimated * share;
+            }
         }
     }
     QuotaWindow {
@@ -2910,7 +2996,7 @@ fn quota_window_json(window: &QuotaWindow, span: chrono::Duration) -> serde_json
 /// masquerade as a live quota. Schema `agenttrace.quota/1` is stable:
 /// the README "Quota view" section documents every key.
 pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
-    let cutoff = quota_cutoff(sessions);
+    let (cutoff, future_discarded) = quota_cutoff(sessions);
     let (event_basis, span_basis, unplaced) = quota_attribution_census(sessions);
     let (five_hour, weekly) = match cutoff {
         Some(cutoff) => (
@@ -2930,7 +3016,8 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
                 "corpus": {
                     "sessions": sessions.len(),
                     "cutoff_utc": serde_json::Value::Null,
-                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time",
+                    "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); null when no session carries placeable time; rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+                    "future_discarded_sessions": future_discarded,
                     "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
                     "attribution": {
                         "event_timestamps": event_basis,
@@ -2954,7 +3041,8 @@ pub fn quota_report(sessions: &[Session]) -> serde_json::Value {
         "corpus": {
             "sessions": sessions.len(),
             "cutoff_utc": quota_ts(&five_hour.end),
-            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end)",
+            "cutoff_basis": "newest event timestamp across the loaded corpus (cached sessions: newest session_end); rm-1402: timestamps after now are discarded at a clock-skew guard, so the cutoff is always the newest at-or-before-now instant",
+            "future_discarded_sessions": future_discarded,
             "window_anchor": "rolling: both windows end at the corpus cutoff; provider plan anchors (first-use 5h start, weekly 7am UTC Monday) are not knowable without credentials",
             "attribution": {
                 "event_timestamps": event_basis,
@@ -3019,6 +3107,16 @@ fn render_quota_text(report: &serde_json::Value) -> String {
         "  attribution     event-timestamp share ({}), start/end span share ({} warm-cache), unplaced ({})\n",
         attribution["event_timestamps"], attribution["session_span"], attribution["unplaced"],
     ));
+    // rm-1402: the clock-skew guard must be visible in the text lane
+    // too — a discarded future timestamp is a disclosure, not a
+    // silent edit of the corpus.
+    if let Some(discarded) = corpus["future_discarded_sessions"].as_u64() {
+        if discarded > 0 {
+            out.push_str(&format!(
+                "  clock skew       {discarded} session(s) carry timestamps after now — discarded; the cutoff is the newest at-or-before-now instant\n"
+            ));
+        }
+    }
     out.push_str(
         "  limits          unknown — agenttrace reads no credentials and knows no plan limits\n",
     );
@@ -3106,7 +3204,10 @@ pub fn format_count(value: usize) -> String {
 
 pub fn format_cost(value: f64) -> String {
     if !value.is_finite() {
-        return "$0.0000".to_string();
+        // rm-1500: non-finite is a null marker on human lanes — never
+        // "$0.0000", which reads as a clean zero-spend session. The JSON
+        // lanes serialize the raw f64 (null) per the insights contract.
+        return "—".to_string();
     }
     let value = value + 0.0;
     let abs = value.abs();
@@ -4897,5 +4998,119 @@ mod quota_tests {
             err.to_string().contains("-f text and -f json only"),
             "format guard names the supported lanes: {err}"
         );
+    }
+
+    #[test]
+    fn quota_cutoff_clamps_future_skewed_timestamps() {
+        // rm-1402 (run f2fccaa9 cycle 3, assess 53af6c9e F3): the
+        // cutoff used to be an unbounded max() over every last-event /
+        // session_end instant, so ONE future-dated journal line
+        // (clock skew or a hostile meter) anchored the rolling
+        // windows in the future and every real event fell OUTSIDE the
+        // trailing spans — the PoC corpus billed $0.0045 against an
+        // honest $1.52 (99.7% of spend hidden). The cutoff is now the
+        // newest PLAUSIBLE instant: timestamps after now are
+        // discarded at a disclosed clock-skew guard, and the discard
+        // count rides `corpus.future_discarded_sessions`.
+        //
+        // 2099 stays implausibly future for the life of this pin; the
+        // real events use fixed past stamps so the corpus is
+        // deterministic regardless of when the test runs.
+        let sessions = vec![
+            quota_session(
+                "real",
+                &["2026-10-12T10:00:00Z", "2026-10-12T10:30:00Z"],
+                1.52,
+            ),
+            quota_session(
+                "skewed",
+                &["2099-06-01T00:00:00Z", "2099-06-01T01:00:00Z"],
+                0.0045,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(
+            report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z",
+            "the cutoff is the newest timestamp at-or-before now, never the 2099 skew"
+        );
+        assert_eq!(
+            report["corpus"]["future_discarded_sessions"], 1,
+            "the clamp firing is disclosed in the corpus block"
+        );
+        assert!(
+            report["corpus"]["cutoff_basis"]
+                .as_str()
+                .expect("cutoff basis string")
+                .contains("clock-skew guard"),
+            "the basis names the clock-skew guard"
+        );
+        assert_eq!(
+            report["five_hour"]["spend_usd"], 1.52,
+            "both real events sit inside the 5h window; the skewed line bills 0"
+        );
+        assert_eq!(
+            report["weekly"]["spend_usd"], 1.52,
+            "the honest weekly number is restored (pre-fix: $0.0045, 99.7% hidden)"
+        );
+        assert_eq!(
+            report["weekly"]["sessions_contributing"], 1,
+            "only the plausible session contributes"
+        );
+    }
+
+    #[test]
+    fn quota_future_only_corpus_discloses_null_cutoff() {
+        // Every session in the future: the clamp discards them all,
+        // so the corpus has NO plausible cutoff — undefined windows
+        // with a discard count, never a future-anchored zero-spend
+        // masquerade and never a silent empty report.
+        let sessions = vec![
+            quota_session("hostile", &["2099-06-01T00:00:00Z"], 5.0),
+            quota_span_session(
+                "hostile-span",
+                "2099-06-02T00:00:00Z",
+                "2099-06-02T06:00:00Z",
+                7.0,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert!(
+            report["corpus"]["cutoff_utc"].is_null(),
+            "no plausible cutoff"
+        );
+        assert_eq!(report["corpus"]["future_discarded_sessions"], 2);
+        assert!(report["five_hour"].is_null() && report["weekly"].is_null());
+        let text = render_quota_view("text", &sessions).expect("text lane renders");
+        assert!(
+            text.contains("no session carries placeable time"),
+            "fully future corpus renders the undefined-cutoff lane: {text}"
+        );
+    }
+
+    #[test]
+    fn quota_span_sessions_honor_the_future_clamp() {
+        // Warm-cache sessions place by session_end; a future session_end
+        // must hit the same clock-skew guard as event timestamps, while
+        // a real span keeps its TTL-correct share beside it.
+        let sessions = vec![
+            quota_span_session(
+                "real-span",
+                "2026-10-12T04:30:00Z",
+                "2026-10-12T10:30:00Z",
+                6.0,
+            ),
+            quota_span_session(
+                "future-span",
+                "2099-06-01T00:00:00Z",
+                "2099-06-01T06:00:00Z",
+                1.0,
+            ),
+        ];
+        let report = quota_report(&sessions);
+        assert_eq!(report["corpus"]["cutoff_utc"], "2026-10-12T10:30:00Z");
+        assert_eq!(report["corpus"]["future_discarded_sessions"], 1);
+        // 6h span, 5h window overlap: $6.00 x 5/6 = $5.00, weekly $6.00.
+        assert_eq!(report["five_hour"]["spend_usd"], 5.0);
+        assert_eq!(report["weekly"]["spend_usd"], 6.0);
     }
 }
