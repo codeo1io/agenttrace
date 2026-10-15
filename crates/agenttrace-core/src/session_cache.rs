@@ -7,7 +7,27 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 66;
+// Bumped 65 -> 66 (run 65afcf5718e6 cycle 1 'parser disclosure truth
+// + parity', rm-1907 + rm-1908 LEAD batch, worktree
+// run-65afcf5718e6-65afcf57 @ base 1da731b): PARSER-SEMANTICS rung.
+// Antigravity journals with opaque model carriers now resolve through
+// the ccusage-mirrored numeric-ID ladder — `modelConfigId` numbers
+// (JSON numbers, folded to `default` before) and MODEL_PLACEHOLDER_M*
+// enums land on the named family row and mint
+// `antigravity_model:id_resolved:*` / `no_catalog_row:*`
+// disclosures, so `model_used` and the disclosure map both move for
+// unchanged files. Claude 2.1.300/.301 journals gain the
+// shape-parity census (`claude_system_row:*`,
+// `claude_resume_summary:leaf`, `claude_unmatched_type:*`,
+// `claude_cache_write_split:*`, `claude_usage_unmatched_key:*`) and
+// the nested cache_creation object now folds its 5m+1h total onto
+// the numeric spelling's class when that key is absent (rm-230
+// convention: parser-semantics changes that alter reported content
+// for unchanged files bump the schema so cached sessions regenerate
+// under corrected accounting — a warm v65 entry would keep serving
+// `default` models and the silent-shape omissions). Entries
+// regenerate once on next scan.
 // Bumped 64 -> 65 (run b01c2b6abe28 cycle 2 'advisory closure +
 // OpenCode v2 delivery-evidence readiness', rm-1509 LEAD, worktree
 // run-b01c2b6abe28-b01c2b6a @ base 8bc0587): a SHAPE-ONLY rung —

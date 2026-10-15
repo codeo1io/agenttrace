@@ -1,0 +1,21 @@
+{
+  "trajectoryId": "a10c0a11-0000-4000-8000-00000000aa01",
+  "steps": [
+    {
+      "type": "CORTEX_STEP_TYPE_USER_INPUT",
+      "status": "COMPLETED",
+      "metadata": {"createdAt": "2026-10-14T08:00:00Z"},
+      "userInput": {"userResponse": "numeric config id session"}
+    },
+    {
+      "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+      "status": "COMPLETED",
+      "metadata": {"createdAt": "2026-10-14T08:00:05Z"},
+      "plannerResponse": {
+        "response": "One generation, numeric carrier.",
+        "usageStats": {"inputTokens": 1000, "outputTokens": 500},
+        "modelConfigId": 1417
+      }
+    }
+  ]
+}
