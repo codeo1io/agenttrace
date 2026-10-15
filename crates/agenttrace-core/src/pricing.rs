@@ -440,8 +440,14 @@ pub fn provider_for(model: &str) -> Option<String> {
 }
 
 fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
-    let normalized = normalize_model(model);
-    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    // rm-1053: resolve exactly like the rate path — one raw-first
+    // alias pass feeding `matching_catalog_key` — so the provider and
+    // the rate always cite the same catalog row. The old explicit
+    // pre-normalization stacked with the one inside `resolve_alias`
+    // (normalize(normalize(model))), which on dated+versioned ids
+    // landed on a different row than the one that priced the session
+    // and printed "anthropic" for a bedrock_converse row.
+    let resolved = resolve_alias(model, &catalog.aliases);
     let key = matching_catalog_key(&resolved, &catalog.entries)?;
     catalog
         .providers
@@ -455,8 +461,13 @@ fn pricing_source_for_catalog(
     catalog: &PricingCatalog,
     override_models: &BTreeSet<String>,
 ) -> String {
-    let normalized = normalize_model(model);
-    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    // rm-1053: resolve exactly like the rate path — one raw-first
+    // alias pass feeding `matching_catalog_key` — so the provenance
+    // label and any override/deprecation disclosure describe the SAME
+    // row that priced the session. `aliased` is true only when the
+    // alias map redirected the id (raw-first passthrough of an
+    // unnormalized id is not an alias).
+    let (resolved, aliased) = resolve_alias_detail(model, &catalog.aliases);
     let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
         return "built-in fallback".to_string();
     };
@@ -476,7 +487,7 @@ fn pricing_source_for_catalog(
                 )
             })
             .unwrap_or_else(|| "user override".to_string())
-    } else if normalized != resolved {
+    } else if aliased {
         // rm-511: an alias override supplies identity, not a rate — the
         // session still prices at catalog rates, so a vendor-retired
         // target carries the plain-catalog arm's retirement disclosure,
@@ -1186,18 +1197,38 @@ fn absurd_rate_error(model: &str, field: &str, value: f64) -> String {
     )
 }
 
-fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
-    let mut current = normalize_model(model);
-    for _ in 0..8 {
-        let Some(next) = aliases.get(&current) else {
-            break;
-        };
-        if next == &current {
-            break;
+/// rm-1053: raw-first alias resolution. The caller's exact id is
+/// tried against the alias map before any normalization reshapes it,
+/// and an id the map has no opinion about comes back UNCHANGED so
+/// downstream matchers (`match_variants`, which tries the exact form
+/// before the normalized one) can hit region/vendor-qualified catalog
+/// rows keyed under their raw ids. The normalized form is the second
+/// seed, so aliases keyed by normalized ids (override files, codex
+/// SKU aliases) keep resolving exactly as before. Returns the
+/// resolved id plus whether the alias map redirected it.
+fn resolve_alias_detail(model: &str, aliases: &BTreeMap<String, String>) -> (String, bool) {
+    for seed in [model.to_string(), normalize_model(model)] {
+        let mut current = seed;
+        let mut redirected = false;
+        for _ in 0..8 {
+            let Some(next) = aliases.get(&current) else {
+                break;
+            };
+            if next == &current {
+                break;
+            }
+            current = next.clone();
+            redirected = true;
         }
-        current = next.clone();
+        if redirected {
+            return (current, true);
+        }
     }
-    current
+    (model.to_string(), false)
+}
+
+fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
+    resolve_alias_detail(model, aliases).0
 }
 
 /// Catalog key -> price entries plus the model-key -> provider-label
@@ -1226,6 +1257,13 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         };
     };
     let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    // rm-1053: qualified rows (region prefix, vendor path, `@`-dated)
+    // whose raw id differs from their normalized key. They still
+    // compete for the normalized key below (winner selection is
+    // untouched) but are ALSO retained under the exact id a session
+    // reports, where the raw-first matcher finds them before any
+    // normalized variant.
+    let mut qualified: Vec<(String, Price, String)> = Vec::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -1275,6 +1313,9 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             continue;
         }
         let priority = provider_priority(&model.provider);
+        if key != normalized {
+            qualified.push((key.clone(), price.clone(), model.provider.clone()));
+        }
         match selected.get(&normalized) {
             Some((existing, _, _)) if *existing >= priority => {}
             _ => {
@@ -1287,6 +1328,21 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
     for (name, (_, price, provider)) in selected {
         providers.insert(name.clone(), provider);
         entries.insert(name, price);
+    }
+    // rm-1053: normalization collapses every region of a model family
+    // onto one key and the winner selection above prices ALL of them
+    // at one region's rates — a `us-gov.` session billed at the `au.`
+    // rate is a false number. Qualified rows therefore ALSO stand
+    // under their raw ids: the rate, the provider, and the
+    // pricing-source label for that exact id then all cite that one
+    // row. Insertion skips raw ids that already carry a normalized
+    // winner, so normalized-form lookups keep today's rows.
+    for (raw, price, provider) in qualified {
+        if entries.contains_key(&raw) {
+            continue;
+        }
+        providers.insert(raw.clone(), provider);
+        entries.insert(raw, price);
     }
     ConvertedCatalog { entries, providers }
 }
@@ -1355,8 +1411,24 @@ fn normalize_model(raw: &str) -> String {
             }
         }
     }
-    value = strip_date_suffix(&value);
-    value = strip_version_suffix(&value);
+    // rm-1053: strip suffixes to a fixed point. A single
+    // strip-date-then-strip-version pass is NOT idempotent on
+    // dated+versioned ids (`claude-sonnet-4-5-20250929-v1:0` ->
+    // `…-20250929-v1` on pass one, `claude-sonnet-4-5` on pass two:
+    // the `:0` shields the date on the first pass because the version
+    // strip has not run yet), and a consumer that normalized an
+    // already-normalized id silently resolved a different catalog row
+    // than the rate lookup. Looping both strips until the value stops
+    // changing makes `normalize_model(normalize_model(x)) ==
+    // normalize_model(x)` hold by construction — each strip only
+    // shortens the string, so the loop terminates.
+    loop {
+        let stripped = strip_version_suffix(&strip_date_suffix(&value));
+        if stripped == value {
+            break;
+        }
+        value = stripped;
+    }
     while value.contains("--") {
         value = value.replace("--", "-");
     }
@@ -2802,6 +2874,217 @@ mod tests {
             Some("vendor-x"),
             "provider label must round-trip with its entry"
         );
+    }
+
+    #[test]
+    fn normalize_model_is_idempotent_across_the_dated_and_versioned_family() {
+        // rm-1053: normalization must be a fixed point. The pre-fix
+        // pipeline ran strip-date-then-strip-version exactly once, so
+        // `claude-sonnet-4-5-20250929-v1:0` normalized to
+        // `claude-sonnet-4-5-20250929-v1` on pass one (the `:0` shields
+        // the date suffix because the version strip has not removed it
+        // yet) and to `claude-sonnet-4-5` on pass two. Any consumer that
+        // normalized an already-normalized id silently resolved a
+        // different catalog row than a consumer that normalized once.
+        // Pinned across every key the bundled snapshot ships, so a new
+        // suffix shape cannot reintroduce the drift silently.
+        let raw = serde_json::from_str::<serde_json::Value>(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/pricing_snapshot.json"
+        )))
+        .expect("bundled snapshot parses");
+        let keys = raw
+            .as_object()
+            .expect("snapshot is an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!keys.is_empty(), "snapshot unexpectedly empty");
+        for key in &keys {
+            let once = normalize_model(key);
+            assert_eq!(
+                normalize_model(&once),
+                once,
+                "normalize_model is not idempotent at snapshot key {key}: {once} -> {}",
+                normalize_model(&once)
+            );
+        }
+        // Explicit family probes beyond the snapshot: the dated+
+        // versioned collision shapes, the bedrock path form, an
+        // at-separated date, and a no-op id must all be fixed points.
+        for probe in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4-5-20250929-v1:0",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "vertex_ai/claude-sonnet-4-5@20250929",
+            "model-20250101-v2:0",
+            "claude-sonnet-4-5",
+        ] {
+            let once = normalize_model(probe);
+            assert_eq!(
+                normalize_model(&once),
+                once,
+                "normalize_model is not idempotent at probe {probe}: {once} -> {}",
+                normalize_model(&once)
+            );
+        }
+    }
+
+    #[test]
+    fn convert_litellm_retains_region_and_vendor_qualified_rows_under_their_raw_ids() {
+        // rm-1053: normalization collapses every region of a model
+        // family onto one key and the winner selection then prices ALL
+        // of them at one region's rates (first-sorted `au.` won the
+        // sonnet-4-5 dated key at $3.30/M). A `us-gov.` session
+        // billed at the `au.` rate is a false number, so a qualified
+        // row must ALSO stand under the raw id a session actually
+        // reports, where the raw-first matcher finds it before any
+        // normalized variant. Winner selection for normalized keys is
+        // untouched: normalized-form lookups keep the same rows.
+        let fixture = serde_json::json!({
+            "au.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.0000033,
+                "output_cost_per_token": 0.0000165,
+                "mode": "chat",
+                "litellm_provider": "bedrock_converse"
+            },
+            "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.0000036,
+                "output_cost_per_token": 0.000018,
+                "mode": "chat",
+                "litellm_provider": "bedrock_converse"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&fixture)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        // The raw ids stand in the catalog with their own rates ...
+        let us_gov = converted
+            .entries
+            .get("us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .expect("us-gov qualified row survives under its raw id");
+        assert!((us_gov.input - 3.6).abs() < 1e-9);
+        assert!((us_gov.output - 18.0).abs() < 1e-9);
+        let au = converted
+            .entries
+            .get("au.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .expect("au qualified row survives under its raw id");
+        assert!((au.input - 3.3).abs() < 1e-9);
+        // ... and the normalized winner row still exists with the
+        // first-sorted winner's rates. Idempotent normalization strips
+        // the dated+versioned raw id all the way to the base form, so
+        // the winner selection happens under `claude-sonnet-4-5`.
+        let normalized = converted
+            .entries
+            .get("claude-sonnet-4-5")
+            .expect("normalized winner row is preserved");
+        assert!((normalized.input - 3.3).abs() < 1e-9);
+        // Provider coverage stays in lockstep with the entries.
+        assert_eq!(
+            converted.entries.keys().collect::<Vec<_>>(),
+            converted.providers.keys().collect::<Vec<_>>(),
+            "retained raw rows must carry their provider labels"
+        );
+        assert_eq!(
+            converted
+                .providers
+                .get("us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0")
+                .map(String::as_str),
+            Some("bedrock_converse")
+        );
+    }
+
+    #[test]
+    fn region_qualified_ids_price_and_attribute_from_their_own_catalog_row() {
+        // rm-1053 (assess F2 refresh, cycle 5): four regional fixtures
+        // of one model family all rendered $19.80 — the load-time
+        // collapse priced us-gov at the au rate ($19.80 vs true $21.60)
+        // and the provider path, which normalized the id twice,
+        // printed "anthropic" while the rate came from a
+        // bedrock_converse row. Both surfaces must cite ONE row: the
+        // exact id's own snapshot row.
+        let catalog = fallback_catalog();
+        let cases = [
+            // (session model id, $/Mtok in, $/Mtok out, provider)
+            (
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                3.3,
+                16.5,
+                "bedrock_converse",
+            ),
+            (
+                "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                3.3,
+                16.5,
+                "bedrock_converse",
+            ),
+            (
+                "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                3.3,
+                16.5,
+                "bedrock_converse",
+            ),
+            (
+                "jp.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                3.3,
+                16.5,
+                "bedrock_converse",
+            ),
+            (
+                "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                3.6,
+                18.0,
+                "bedrock_converse",
+            ),
+            (
+                "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                3.0,
+                15.0,
+                "bedrock_converse",
+            ),
+            (
+                "bedrock/us-gov-east-1/anthropic.claude-sonnet-4-5-20250929-v1:0",
+                3.6,
+                18.0,
+                "bedrock",
+            ),
+            // Undecorated family ids keep the base row.
+            ("claude-sonnet-4-5-20250929-v1:0", 3.0, 15.0, "bedrock"),
+            ("claude-sonnet-4-5", 3.0, 15.0, "anthropic"),
+        ];
+        for (model, input, output, provider) in cases {
+            let resolved = resolve_alias(model, &catalog.aliases);
+            let price = lookup_price_in(&resolved, &catalog.entries);
+            assert!(
+                (price.input - input).abs() < 1e-9 && (price.output - output).abs() < 1e-9,
+                "{model} priced from the wrong row: got ({}, {}), expected ({input}, {output})",
+                price.input,
+                price.output
+            );
+            assert_eq!(
+                provider_for_in(model, &catalog),
+                Some(provider.to_string()),
+                "{model} attributed to the wrong provider"
+            );
+            // The single-row invariant: the rate path and the provider
+            // path resolve the SAME catalog key — the model's own raw
+            // id for qualified rows, its normalized winner otherwise.
+            let key = matching_catalog_key(&resolved, &catalog.entries).expect("row key resolves");
+            assert_eq!(
+                catalog.providers.get(&key).map(String::as_str),
+                Some(provider),
+                "resolved row {key} must carry the provider printed for {model}"
+            );
+            assert!(
+                (catalog.entries[&key].input - input).abs() < 1e-9
+                    && (catalog.entries[&key].output - output).abs() < 1e-9,
+                "resolved row {key} must carry the rate billed for {model}"
+            );
+        }
     }
 
     /// rm-404: PRIVACY.md must enumerate the pricing download URL, derived

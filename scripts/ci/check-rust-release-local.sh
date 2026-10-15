@@ -4,6 +4,21 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+# rm-1408: fleet CI runs cargo with incremental compilation inherited
+# from the caller's ambient CARGO_INCREMENTAL. An ambient
+# CARGO_INCREMENTAL=1 breaks this gate two ways: every invocation
+# recompiles because this worktree's fingerprints disagree with the
+# caller's incremental cache, and "cargo test"/"cargo build --release"
+# leave *.fingerprint + incremental/ directories next to the artifacts
+# under CARGO_TARGET_DIR — metadata the release gate never declared
+# itself to consume (rm-377-class stale-binary false-greens). Export
+# the hermetic default explicitly so the gate behaves the same in a
+# dev shell (which may export CARGO_INCREMENTAL=1 for IDE builds) and
+# in the fleet harness. The export applies to every cargo invocation
+# below (fmt/clippy/test/build/metadata) and to the child gates that
+# inherit the environment.
+export CARGO_INCREMENTAL=0
+
 # rm-391: write only under this invocation's own unique subdirectory. The
 # old `rm -rf "$AGENTTRACE_CI_OUT"` destroyed sibling gate artifacts when
 # the env var pointed at a shared directory (two release-local checks, or a
