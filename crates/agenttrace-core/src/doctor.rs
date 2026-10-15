@@ -1,3 +1,4 @@
+use crate::reports::guard_formula_cell;
 use crate::{
     cached_session, find_session_files, known_session_dirs, load_session_cache,
     load_sqlite_backed_sessions_reported, parse_file, save_session_cache, store_session, Session,
@@ -1125,7 +1126,7 @@ fn doctor_recommendations(report: &DoctorReport, dir: Option<&Path>, demo: bool)
     recommendations
 }
 
-fn doctor_report_text(report: &DoctorReport) -> String {
+pub fn doctor_report_text(report: &DoctorReport) -> String {
     let mut out = String::new();
     out.push_str("AGENTTRACE Doctor\n");
     out.push_str(&format!("Version: {}\n", report.version));
@@ -1186,14 +1187,14 @@ fn doctor_report_text(report: &DoctorReport) -> String {
         report.project_decode.unresolved
     ));
     for sample in &report.project_decode.samples {
-        out.push_str(&format!("    {sample}\n"));
+        out.push_str(&format!("    {}\n", guard_formula_cell(sample)));
     }
     out.push_str(&format!(
         "Zero-usage reports: {} session(s), {} event(s) counted as measured zeros (rm-408)\n",
         report.zero_usage.sessions, report.zero_usage.events
     ));
     for sample in &report.zero_usage.samples {
-        out.push_str(&format!("    {sample}\n"));
+        out.push_str(&format!("    {}\n", guard_formula_cell(sample)));
     }
     if !report.sqlite_duplicate_dbs.is_empty() {
         out.push_str(&format!(
@@ -1203,7 +1204,8 @@ fn doctor_report_text(report: &DoctorReport) -> String {
                 .iter()
                 .map(|db| format!(
                     "    {} — {} duplicate session(s) suppressed, canonical db kept\n",
-                    db.path, db.duplicate_sessions
+                    guard_formula_cell(&db.path),
+                    db.duplicate_sessions
                 ))
                 .collect::<String>()
         ));

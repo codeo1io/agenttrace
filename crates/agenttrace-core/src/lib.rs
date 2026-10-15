@@ -42,7 +42,9 @@ pub use discovery::{
     load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
     KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
 };
-pub use doctor::{build_doctor_report, render_doctor_report, DoctorDirReport, DoctorReport};
+pub use doctor::{
+    build_doctor_report, doctor_report_text, render_doctor_report, DoctorDirReport, DoctorReport,
+};
 pub use governance::{
     context_trends, cost_audit, delivery_evidence, delivery_evidence_with_git, mcp_governance,
     recommendations, session_cost_audit, ContextTrend, ContextTrendTotals, CostAudit,
