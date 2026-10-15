@@ -93,6 +93,21 @@ pub struct PricingCatalog {
     /// (rm-245). Read-only attribution data: provenance and freshness
     /// semantics stay with pricing_source_for and are untouched here.
     pub providers: BTreeMap<String, String>,
+    /// rm-1053: regional/vendor-qualified SKUs retained under their RAW
+    /// source ids (`us-gov.anthropic.…`, `bedrock/us-gov-east-1/…`,
+    /// `openai/…`), each at its own rates. Kept SEPARATE from
+    /// `entries` on purpose: the normalized lane keeps its semantics
+    /// for the deprecation census, `list_pricing`, and every
+    /// catalog-counting golden, while the lookups consult this lane
+    /// exact-id-first so an exact regional SKU prices at its own row
+    /// instead of collapsing onto the family twin. Covered by
+    /// `catalog_identity_of`, so a snapshot that changes regional
+    /// rates reprices cached sessions.
+    pub raw_entries: BTreeMap<String, Price>,
+    /// Provider labels for the raw lane — each row's OWN provider, no
+    /// family priority dedup. Attribution for an exact-hit SKU reads
+    /// here, so rate and provenance describe the same row (rm-245).
+    pub raw_providers: BTreeMap<String, String>,
     /// The catalog's own vintage as YYYYMMDD (rm-419): the bundled
     /// snapshot's pinned date, a cached catalog's fetch date, or today
     /// for a just-refreshed remote fetch. Deprecation disclosure
@@ -137,6 +152,81 @@ pub fn lookup_price(model: &str) -> Price {
     lookup_price_tiered(model, None)
 }
 
+/// rm-1053: the exact raw-id catalog key for a session-reported
+/// model, when the catalog retains one. LiteLLM's keys are exact
+/// lookup ids — `us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0`
+/// is a DISTINCT priced SKU from its base family, not a spelling of
+/// it — so resolution consults the retained raw id BEFORE any
+/// normalization, and every consumer (rate, context window,
+/// provider, pricing-source label) walks this same ladder first, so
+/// a session's rate and its provenance can never describe two
+/// different rows (the rm-245 invariant the pre-fix independent
+/// re-normalization broke).
+/// Review fix (947cb39d F2, rm-511 precedence): explicit user config
+/// outranks the exact-catalog arm — honoring a mapping the user
+/// typed does not recreate the silent-collapse class this fix
+/// removes. Two lanes, both resolved the way base resolved them:
+/// (A) ALIASES — `resolve_alias` normalizes first and then follows
+/// the chain, so the spelling an alias actually fires on is the
+/// NORMALIZED family key; when the chain moves the key, the id
+/// prices and attributes at the alias target (a raw-keyed alias
+/// never fired at base and still does not). (B) PRICES — a
+/// pricing-file override keyed on the id's exact spelling:
+/// `apply_pricing_overrides` inserts user rows VERBATIM while
+/// catalog keys are normalized, so an exact-string hit on a
+/// retained id can only be user config; base's normalize-first
+/// lookup could never reach it (it silently billed the family
+/// bucket), and the exact arm honors it now. Family-keyed override
+/// prices still price BELOW the exact arm: an override keyed by a
+/// normalized family name is not this id's row, and silently
+/// re-pricing a regional SKU from it would recreate the collapse
+/// class this fix removes.
+enum UserConfigRow {
+    /// The alias chain fired on the normalized key: price at the target.
+    Alias(String),
+    /// A verbatim override row for this exact id.
+    Override(Price),
+}
+
+fn user_config_row(model: &str, catalog: &PricingCatalog) -> Option<UserConfigRow> {
+    let m = model.trim();
+    if matches!(m, "" | "default" | "unknown") {
+        return None;
+    }
+    let resolved = resolve_alias(m, &catalog.aliases);
+    if resolved != normalize_model(m) {
+        return Some(UserConfigRow::Alias(resolved));
+    }
+    // (B) fires only on a RETAINED id's exact spelling: snapshot
+    // family buckets are normalized keys and a retained id never
+    // equals its own normalized key, so an entries hit on a retained
+    // spelling can only be the user-inserted override row (an
+    // ordinary name that IS its own normalized key stays on the
+    // normal ladder, where overrides have always been honored).
+    if catalog.raw_entries.contains_key(m) {
+        if let Some(row) = catalog.entries.get(m) {
+            return Some(UserConfigRow::Override(row.clone()));
+        }
+    }
+    None
+}
+
+fn exact_retained_key<'a>(model: &str, catalog: &'a PricingCatalog) -> Option<&'a str> {
+    if matches!(model.trim(), "" | "default" | "unknown") {
+        return None;
+    }
+    catalog
+        .raw_entries
+        .get_key_value(model)
+        .map(|(key, _)| key.as_str())
+        .or_else(|| {
+            catalog
+                .raw_entries
+                .get_key_value(model.trim())
+                .map(|(key, _)| key.as_str())
+        })
+}
+
 /// rm-610: resolve a model's rates for the service tier the turn
 /// actually ran on. `Some("flex")` bills at the entry's `*_flex`
 /// slots when the catalog row carries them — input AND output must
@@ -146,9 +236,34 @@ pub fn lookup_price(model: &str) -> Price {
 /// flex rates bills flex turns at the standard rates: that is the
 /// published behavior (codeburn #1642), not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
-    let catalog = pricing_catalog();
-    let model = resolve_alias(model, &catalog.aliases);
-    let mut price = lookup_price_in(&model, &catalog.entries);
+    lookup_price_tiered_in(model, pricing_catalog(), service_tier)
+}
+
+fn lookup_price_tiered_in(
+    model: &str,
+    catalog: &PricingCatalog,
+    service_tier: Option<&str>,
+) -> Price {
+    let mut price = match user_config_row(model, catalog) {
+        // review fix (947cb39d F2): explicit user config outranks the
+        // exact arm — an alias chain that fires on the normalized key
+        // prices at its target, and a verbatim override row IS this
+        // id's row. Family-keyed overrides stay below the arm.
+        Some(UserConfigRow::Alias(target)) => lookup_price_in(&target, &catalog.entries),
+        Some(UserConfigRow::Override(row)) => row,
+        None => match exact_retained_key(model, catalog) {
+            // rm-1053: an exact regional/vendor SKU prices at its OWN row
+            // — LiteLLM's keys are exact lookup ids, not spellings of the
+            // base family. The tier slots still apply, so a flex turn on a
+            // regional SKU bills at that SKU's flex rates when published
+            // and at its standard row otherwise.
+            Some(key) => catalog.raw_entries.get(key).cloned().unwrap_or_default(),
+            None => {
+                let model = resolve_alias(model, &catalog.aliases);
+                lookup_price_in(&model, &catalog.entries)
+            }
+        },
+    };
     if service_tier == Some("flex") {
         if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
             price.input = input;
@@ -165,10 +280,22 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
 }
 
 pub fn has_specific_price(model: &str) -> bool {
+    has_specific_price_in(model, pricing_catalog())
+}
+
+fn has_specific_price_in(model: &str, catalog: &PricingCatalog) -> bool {
     if matches!(model.trim(), "" | "default" | "unknown") {
         return false;
     }
-    let catalog = pricing_catalog();
+    // rm-1053: an exact retained SKU is priced by definition — report
+    // that instead of routing it into the fallback bucket.
+    // 947cb39d F2 coherence: a user-config lane (alias target or
+    // verbatim override row) prices through that row — the exact arm
+    // must not claim it here either, or `known` would diverge from
+    // the row that actually prices the turn.
+    if user_config_row(model, catalog).is_none() && exact_retained_key(model, catalog).is_some() {
+        return true;
+    }
     let model = resolve_alias(model, &catalog.aliases);
     match_variants(&model)
         .into_iter()
@@ -317,6 +444,23 @@ pub fn lookup_context_window(model: &str) -> Option<u64> {
 }
 
 fn lookup_context_window_in(model: &str, catalog: &PricingCatalog) -> Option<u64> {
+    // rm-1053: the exact SKU's own window wins when its row carries
+    // one; a windowless raw row falls through to the family ladder so
+    // capability lookup stays maximal (regional twins rarely publish
+    // one, and the base family's window is still true of the SKU).
+    // 947cb39d F2: user-config lanes (alias target, verbatim override)
+    // skip the exact arm here too — capability follows the row that
+    // prices the turn.
+    if user_config_row(model, catalog).is_none() {
+        if let Some(window) = exact_retained_key(model, catalog).and_then(|key| {
+            catalog
+                .raw_entries
+                .get(key)
+                .and_then(|price| price.max_input_tokens.filter(|window| *window > 0))
+        }) {
+            return Some(window);
+        }
+    }
     let resolved = resolve_alias(model, &catalog.aliases);
     let key = matching_catalog_key(&resolved, &catalog.entries)?;
     catalog
@@ -387,6 +531,43 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         hash = fnv1a(model.as_bytes(), hash);
         hash = fnv1a(provider.as_bytes(), hash);
     }
+    // rm-1053: the raw-id lane changes what a session reporting an
+    // exact regional/vendor SKU BILLS, so it is digest material —
+    // without it, sessions cached pre-retention would keep serving
+    // their collapsed costs instead of repricing at the SKU's own
+    // row. The lane markers keep a raw key from colliding with an
+    // identically-named normalized entry, and the raw provider loop
+    // extends the rm-613 promise to this lane: a catalog whose
+    // regional rows rebrand flips the digest even when every rate is
+    // byte-identical.
+    for (model, price) in &catalog.raw_entries {
+        hash = fnv1a(model.as_bytes(), hash);
+        hash = fnv1a(b"rm-1053-raw", hash);
+        for value in [price.input, price.output, price.cw, price.cr] {
+            hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+        }
+        hash = fnv1a(&price.max_input_tokens.unwrap_or(0).to_le_bytes(), hash);
+        hash = fnv1a(
+            price.deprecation_date.as_deref().unwrap_or("").as_bytes(),
+            hash,
+        );
+        for flex in [
+            price.input_flex,
+            price.output_flex,
+            price.cw_flex,
+            price.cr_flex,
+        ] {
+            hash = fnv1a(&[flex.is_some() as u8], hash);
+            if let Some(value) = flex {
+                hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+            }
+        }
+    }
+    for (model, provider) in &catalog.raw_providers {
+        hash = fnv1a(model.as_bytes(), hash);
+        hash = fnv1a(b"rm-1053-raw-provider", hash);
+        hash = fnv1a(provider.as_bytes(), hash);
+    }
     format!("{hash:016x}")
 }
 
@@ -440,8 +621,35 @@ pub fn provider_for(model: &str) -> Option<String> {
 }
 
 fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
-    let normalized = normalize_model(model);
-    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    // rm-1053: attribution walks the SAME exact-first ladder the rate
+    // walks. The pre-fix path re-derived the key with its own
+    // normalize+alias pass, so a regional SKU priced at its own row
+    // could report the base twin's provider (and, on a live catalog,
+    // a gateway provider whose rate never ran). An exact SKU reports
+    // the provider of the row that priced it; the base family keeps
+    // the priority winner's provider.
+    //
+    // 947cb39d F2 coherence: a user-config lane prices through its
+    // own row (alias target, or a verbatim override — override rows
+    // carry no provider of their own, so attribution follows the
+    // family the id resolves onto), so attribution skips the exact
+    // arm for those keys too — provider and rate must describe the
+    // same row.
+    if user_config_row(model, catalog).is_none() {
+        if let Some(key) = exact_retained_key(model, catalog) {
+            return catalog
+                .raw_providers
+                .get(key)
+                .cloned()
+                .filter(|provider| !provider.trim().is_empty());
+        }
+    }
+    // 947cb39d F2 coherence: resolve from the RAW id (resolve_alias
+    // normalizes first, single pass) — the same resolution the rate
+    // ladder used — so an alias keyed on a dated family follows its
+    // target here too; pre-normalizing first would strip the dated
+    // suffix a second time and lose the key.
+    let resolved = resolve_alias(model, &catalog.aliases);
     let key = matching_catalog_key(&resolved, &catalog.entries)?;
     catalog
         .providers
@@ -455,8 +663,52 @@ fn pricing_source_for_catalog(
     catalog: &PricingCatalog,
     override_models: &BTreeSet<String>,
 ) -> String {
+    // rm-1053: an exact retained SKU reports from its own row — the
+    // source line describes the row that priced the session, so it
+    // walks the same exact-first ladder, and its deprecation
+    // disclosure reads the raw row's own date. 947cb39d F2: the
+    // user-config lanes outrank the arm — a verbatim override row is
+    // labeled as one (base could never reach it; the exact arm honors
+    // it now, and the label must say so), while an alias-fired key
+    // walks the normalized body below so the rm-511 alias label
+    // still fires. Family-keyed overrides stay below the exact arm:
+    // an override keyed by a normalized family name is not this id's
+    // row, and silently re-pricing a distinct regional SKU from it
+    // would recreate the collapse class this fix removes.
+    let user_row = user_config_row(model, catalog);
+    if let Some(UserConfigRow::Override(row)) = &user_row {
+        return catalog
+            .reference_date
+            .filter(|reference| past_deprecated(row, *reference))
+            .map(|_| {
+                format!(
+                    "user override; model deprecated {}",
+                    row.deprecation_date.as_deref().unwrap_or("unknown date")
+                )
+            })
+            .unwrap_or_else(|| "user override".to_string());
+    }
+    if user_row.is_none() {
+        if let Some(exact) = exact_retained_key(model, catalog) {
+            if let Some(reference) = catalog.reference_date {
+                if let Some(price) = catalog.raw_entries.get(exact) {
+                    if past_deprecated(price, reference) {
+                        return format!(
+                            "{}; model deprecated {} (rate unverified)",
+                            catalog_source(catalog),
+                            price.deprecation_date.as_deref().unwrap_or("unknown date")
+                        );
+                    }
+                }
+            }
+            return catalog_source(catalog);
+        }
+    }
     let normalized = normalize_model(model);
-    let resolved = resolve_alias(&normalized, &catalog.aliases);
+    // 947cb39d F2: single-pass resolution from the RAW id (same as
+    // the rate ladder and provider_for_in) — the alias branch below
+    // compares against `normalized` for the moved-key predicate.
+    let resolved = resolve_alias(model, &catalog.aliases);
     let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
         return "built-in fallback".to_string();
     };
@@ -554,6 +806,8 @@ pub fn update_pricing() -> anyhow::Result<usize> {
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
         providers: converted.providers,
+        raw_entries: converted.raw_entries,
+        raw_providers: converted.raw_providers,
         reference_date: today_ymd(),
     };
     let override_models = apply_pricing_overrides(&mut catalog);
@@ -750,6 +1004,8 @@ fn fallback_catalog() -> PricingCatalog {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
     }
@@ -758,6 +1014,8 @@ fn fallback_catalog() -> PricingCatalog {
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
         providers: converted.providers,
+        raw_entries: converted.raw_entries,
+        raw_providers: converted.raw_providers,
         reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
     }
 }
@@ -815,6 +1073,8 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
         providers: converted.providers,
+        raw_entries: converted.raw_entries,
+        raw_providers: converted.raw_providers,
         // A cached catalog's vintage is its fetch date (rm-419); when
         // the provenance stamp is missing (pre-rm-167 cache) fall back
         // to the bundled snapshot date as a conservative anchor.
@@ -1208,6 +1468,11 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
 struct ConvertedCatalog {
     entries: BTreeMap<String, Price>,
     providers: BTreeMap<String, String>,
+    /// rm-1053: the raw-id lane — regional/vendor-qualified SKUs at
+    /// their own rates and providers, keyed by their exact source
+    /// ids, immune to the family dedup `entries` applies.
+    raw_entries: BTreeMap<String, Price>,
+    raw_providers: BTreeMap<String, String>,
 }
 
 /// Per-token flex rate -> per-million flex slot, dropping absent,
@@ -1223,9 +1488,13 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         return ConvertedCatalog {
             entries: BTreeMap::new(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
         };
     };
     let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    let mut raw_entries = BTreeMap::new();
+    let mut raw_providers = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -1274,6 +1543,16 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         {
             continue;
         }
+        // rm-1053: retain the qualified raw id at its own row BEFORE
+        // the family dedup below can collapse it. A raw id that
+        // differs from its normalized key names a distinct SKU
+        // (regional twin, vendor-qualified gateway row), and that SKU
+        // must stay reachable by its exact id whether or not it wins
+        // the dedup — the exact-first ladder in the lookups reads it.
+        if key.as_str() != normalized {
+            raw_entries.insert(key.clone(), price.clone());
+            raw_providers.insert(key.clone(), model.provider.clone());
+        }
         let priority = provider_priority(&model.provider);
         match selected.get(&normalized) {
             Some((existing, _, _)) if *existing >= priority => {}
@@ -1288,7 +1567,12 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         providers.insert(name.clone(), provider);
         entries.insert(name, price);
     }
-    ConvertedCatalog { entries, providers }
+    ConvertedCatalog {
+        entries,
+        providers,
+        raw_entries,
+        raw_providers,
+    }
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -2379,6 +2663,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: source.to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2497,6 +2783,8 @@ mod tests {
             aliases: BTreeMap::from([("alias-model".to_string(), "catalog-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         let overrides = BTreeSet::from(["override-model".to_string()]);
@@ -2532,6 +2820,8 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "retired-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         // Plain catalog arm.
@@ -2559,6 +2849,8 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2570,6 +2862,8 @@ mod tests {
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2617,6 +2911,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -2810,6 +3106,8 @@ mod tests {
             aliases: BTreeMap::from([("wide-alias".to_string(), "wide-model".to_string())]),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2857,6 +3155,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "snapshot".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         let overrides = BTreeSet::new();
@@ -2899,6 +3199,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
         assert_eq!(
@@ -2910,6 +3212,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         assert_eq!(
@@ -2937,6 +3241,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         let same_content = PricingCatalog {
@@ -3052,6 +3358,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "cache".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: Some(2026_1004),
         };
 
@@ -3199,6 +3507,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "test".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         apply_codex_sku_aliases(&mut catalog);
@@ -3218,6 +3528,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "test".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         apply_codex_sku_entries(&mut catalog);
@@ -3241,6 +3553,8 @@ mod tests {
             aliases: BTreeMap::new(),
             source: "test".to_string(),
             providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
             reference_date: None,
         };
         apply_codex_sku_entries(&mut shipped);
@@ -3404,6 +3718,8 @@ mod tests {
                 aliases: BTreeMap::new(),
                 source: "test".to_string(),
                 providers: BTreeMap::from([("m".to_string(), provider.to_string())]),
+                raw_entries: BTreeMap::new(),
+                raw_providers: BTreeMap::new(),
                 reference_date: None,
             }
         }
@@ -3422,6 +3738,428 @@ mod tests {
         assert_ne!(
             base, provider_flip,
             "a rate-identical provider flip changes attribution and must change the digest (rm-613)"
+        );
+    }
+
+    // --- rm-1053: exact raw-id resolution over the normalized ladder ----
+
+    #[test]
+    fn regional_sku_prices_at_its_own_row_exact_first() {
+        // Assess 2988affd PoC: a us-gov session BILLED $3.30/M input
+        // because the variant ladder collapsed it onto the regional
+        // twin bucket (won alphabetically by the au. row); its own
+        // snapshot row says 3.6/18.0, eu. says 3.3/16.5, base says
+        // 3.0/15.0. Exact ids price at their own rows now.
+        let usgov = "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let eu = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let base = "claude-sonnet-4-5";
+        fn close(actual: f64, expected: f64, lane: &str) {
+            assert!(
+                (actual - expected).abs() < 1e-9,
+                "{lane}: {actual} vs {expected}"
+            );
+        }
+        for (model, input, output) in [(usgov, 3.6, 18.0), (eu, 3.3, 16.5), (base, 3.0, 15.0)] {
+            let price = lookup_price_tiered(model, None);
+            close(price.input, input, model);
+            close(price.output, output, model);
+            assert!(
+                has_specific_price(model),
+                "{model} is priced by its exact row"
+            );
+        }
+        // The padded spelling resolves through the same ladder
+        // (trimmed probe), and placeholders stay fallback-priced.
+        let padded = lookup_price_tiered(&format!("  {usgov}  "), None);
+        close(padded.input, 3.6, "padded us-gov");
+        assert!(!has_specific_price(""), "placeholder stays unpriced");
+    }
+
+    #[test]
+    fn raw_lane_retains_regional_twins_by_exact_id() {
+        let converted = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+        let usgov = "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let price = converted
+            .raw_entries
+            .get(usgov)
+            .expect("the us-gov twin must be retained under its exact id");
+        assert!(
+            (price.input - 3.6).abs() < 1e-9 && (price.output - 18.0).abs() < 1e-9,
+            "retained at its own rates, not the family bucket's"
+        );
+        assert_eq!(
+            converted.raw_providers.get(usgov).map(String::as_str),
+            Some("bedrock_converse"),
+            "the raw lane keeps each row's own provider, no priority dedup"
+        );
+        // Retention is exactly the qualified spellings: an id equal to
+        // its normalized key lives in `entries`, never here.
+        assert!(converted
+            .raw_entries
+            .contains_key("eu.anthropic.claude-sonnet-4-5-20250929-v1:0"));
+        assert!(!converted.raw_entries.contains_key("claude-sonnet-4-5"));
+        // The normalized lane is untouched by retention: census and
+        // list_pricing semantics stay put.
+        assert!(converted.entries.contains_key("claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn provider_attribution_walks_the_exact_first_ladder() {
+        // Synthetic family mirroring the snapshot's regional-twin
+        // shape: a retained us-gov SKU at 3.6/18.0 whose normalized
+        // family bucket sits at 3.3/16.5. Attribution must name the
+        // row that PRICES the session, never the family winner.
+        let exact = "us-gov.anthropic.model-x-20250929-v1:0";
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([
+                (
+                    "model-x".to_string(),
+                    Price {
+                        input: 3.0,
+                        output: 15.0,
+                        max_input_tokens: Some(200_000),
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "model-x-20250929-v1".to_string(),
+                    Price {
+                        input: 3.3,
+                        output: 16.5,
+                        max_input_tokens: Some(200_000),
+                        ..Price::default()
+                    },
+                ),
+            ]),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::from([
+                ("model-x".to_string(), "openai".to_string()),
+                ("model-x-20250929-v1".to_string(), "openai".to_string()),
+            ]),
+            raw_entries: BTreeMap::from([(
+                exact.to_string(),
+                Price {
+                    input: 3.6,
+                    output: 18.0,
+                    max_input_tokens: Some(64_000),
+                    deprecation_date: Some("2025-12-31".to_string()),
+                    ..Price::default()
+                },
+            )]),
+            raw_providers: BTreeMap::from([(exact.to_string(), "bedrock_converse".to_string())]),
+            reference_date: Some(20261001),
+        };
+        assert_eq!(
+            provider_for_in(exact, &catalog).as_deref(),
+            Some("bedrock_converse"),
+            "an exact SKU reports the provider of the row that priced it"
+        );
+        // The base family keeps the priority winner's provider, and
+        // placeholders still claim nothing.
+        assert_eq!(
+            provider_for_in("model-x-20250929-v1", &catalog).as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            provider_for_in("model-x", &catalog).as_deref(),
+            Some("openai")
+        );
+        assert_eq!(provider_for_in("totally-unknown", &catalog), None);
+        // The source label walks the same ladder: deprecation reads
+        // the raw row's own date, and a normalized-family override
+        // never re-prices a distinct SKU (name-scoped by design).
+        let source = pricing_source_for_catalog(exact, &catalog, &BTreeSet::new());
+        assert!(
+            source.contains("model deprecated 2025-12-31"),
+            "raw row's own deprecation date must disclose: {source}"
+        );
+        let overridden =
+            pricing_source_for_catalog(exact, &catalog, &BTreeSet::from(["model-x".to_string()]));
+        assert_eq!(
+            overridden, source,
+            "overrides are normalized-lane; the exact arm fires first"
+        );
+        // The context window prefers the exact row's own window and
+        // falls through to the family when the raw row carries none.
+        assert_eq!(lookup_context_window_in(exact, &catalog), Some(64_000));
+        let mut windowless = catalog.clone();
+        windowless
+            .raw_entries
+            .get_mut(exact)
+            .unwrap()
+            .max_input_tokens = None;
+        assert_eq!(
+            lookup_context_window_in(exact, &windowless),
+            Some(200_000),
+            "windowless raw row falls through to the family ladder"
+        );
+    }
+
+    #[test]
+    fn user_aliases_and_overrides_outrank_the_exact_arm() {
+        // Review 947cb39d F2: explicit user config beats the catalog's
+        // exact row on both user lanes — an ALIASES entry keyed on the
+        // NORMALIZED family (the only spelling resolve_alias fires on)
+        // prices and attributes the qualified id at its target (base
+        // semantics), and a pricing-file override row (inserted
+        // VERBATIM by apply_pricing_overrides) is honored for the
+        // exact id. Family-keyed overrides stay below the arm (pinned
+        // in provider_attribution_walks_the_exact_first_ladder).
+        let exact = "us-gov.anthropic.model-x-20250929-v1:0";
+        fn catalog_with(
+            exact: &str,
+            entries: &[(&str, f64, f64)],
+            aliases: &[(&str, &str)],
+        ) -> PricingCatalog {
+            PricingCatalog {
+                entries: entries
+                    .iter()
+                    .map(|(name, input, output)| {
+                        (
+                            name.to_string(),
+                            Price {
+                                input: *input,
+                                output: *output,
+                                ..Price::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                aliases: aliases
+                    .iter()
+                    .map(|(from, to)| (from.to_string(), to.to_string()))
+                    .collect(),
+                source: "test".to_string(),
+                providers: BTreeMap::from([
+                    ("model-x-20250929-v1".to_string(), "openai".to_string()),
+                    ("model-x-target".to_string(), "openai-target".to_string()),
+                ]),
+                raw_entries: BTreeMap::from([(
+                    exact.to_string(),
+                    Price {
+                        input: 3.6,
+                        output: 18.0,
+                        ..Price::default()
+                    },
+                )]),
+                raw_providers: BTreeMap::from([(
+                    exact.to_string(),
+                    "bedrock_converse".to_string(),
+                )]),
+                reference_date: None,
+            }
+        }
+        // Control: without user config the exact arm prices the row.
+        let plain = catalog_with(exact, &[("model-x-20250929-v1", 3.3, 16.5)], &[]);
+        let price = lookup_price_tiered_in(exact, &plain, None);
+        assert!((price.input - 3.6).abs() < 1e-9, "control: own row");
+
+        // Lane A — alias keyed on the normalized family.
+        let aliased = catalog_with(
+            exact,
+            &[
+                ("model-x-20250929-v1", 3.3, 16.5),
+                ("model-x-target", 4.2, 21.0),
+            ],
+            &[("model-x-20250929-v1", "model-x-target")],
+        );
+        let price = lookup_price_tiered_in(exact, &aliased, None);
+        assert!(
+            (price.input - 4.2).abs() < 1e-9 && (price.output - 21.0).abs() < 1e-9,
+            "alias target prices the qualified id: {} / {}",
+            price.input,
+            price.output
+        );
+        assert_eq!(
+            provider_for_in(exact, &aliased).as_deref(),
+            Some("openai-target"),
+            "attribution follows the row the alias routed the id onto"
+        );
+
+        // Lane B — verbatim override row (apply_pricing_overrides
+        // inserts user PRICES under their exact spelling; base could
+        // never reach one for a qualified id).
+        let mut overridden = plain.clone();
+        overridden.entries.insert(
+            exact.to_string(),
+            Price {
+                input: 9.9,
+                output: 49.5,
+                ..Price::default()
+            },
+        );
+        let price = lookup_price_tiered_in(exact, &overridden, None);
+        assert!(
+            (price.input - 9.9).abs() < 1e-9 && (price.output - 49.5).abs() < 1e-9,
+            "verbatim override row wins over the exact catalog row"
+        );
+        assert_eq!(
+            pricing_source_for_catalog(exact, &overridden, &BTreeSet::new()),
+            "user override",
+            "the honored override is labeled as one, hint or no hint"
+        );
+        assert_eq!(
+            pricing_source_for_catalog(exact, &overridden, &BTreeSet::from([exact.to_string()])),
+            "user override"
+        );
+    }
+
+    #[test]
+    fn exact_rows_without_cache_rates_bill_cache_ops_at_zero() {
+        // Review 947cb39d F4: the cache axis follows the exact row —
+        // a regional SKU whose own row publishes no cache rates bills
+        // cache operations at its own row's zero, never the family
+        // twin's cache rates.
+        // the family key is deliberately normalization-stable ("model-x"):
+        // a dated family key (…-20250929-v1) itself normalizes past this
+        // fixture's entries (strip_date_suffix + strip_version_suffix) and
+        // prices at the fallback — base ladder behavior, not this test's
+        // subject (first version of this fixture tripped on exactly that).
+        let exact = "us-gov.anthropic.model-x:0";
+        let catalog = PricingCatalog {
+            entries: BTreeMap::from([(
+                "model-x".to_string(),
+                Price {
+                    input: 3.3,
+                    output: 16.5,
+                    cw: 1.0e-6,
+                    cr: 0.1e-6,
+                    ..Price::default()
+                },
+            )]),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            raw_entries: BTreeMap::from([(
+                exact.to_string(),
+                Price {
+                    input: 3.6,
+                    output: 18.0,
+                    ..Price::default()
+                },
+            )]),
+            raw_providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        let price = lookup_price_tiered_in(exact, &catalog, None);
+        assert!(
+            (price.cw - 0.0).abs() < 1e-12,
+            "cache creation at its own row's zero"
+        );
+        assert!(
+            (price.cr - 0.0).abs() < 1e-12,
+            "cache read at its own row's zero"
+        );
+        let family = lookup_price_tiered_in("model-x", &catalog, None);
+        assert!(
+            (family.cw - 1.0e-6).abs() < 1e-12,
+            "the family keeps its cache rates"
+        );
+    }
+
+    #[test]
+    fn catalog_identity_covers_the_raw_lane() {
+        fn raw_catalog(input: f64, provider: &str) -> PricingCatalog {
+            PricingCatalog {
+                entries: BTreeMap::from([(
+                    "model-x".to_string(),
+                    Price {
+                        input: 3.0,
+                        ..Price::default()
+                    },
+                )]),
+                aliases: BTreeMap::new(),
+                source: "test".to_string(),
+                providers: BTreeMap::new(),
+                raw_entries: BTreeMap::from([(
+                    "us-gov.anthropic.model-x".to_string(),
+                    Price {
+                        input,
+                        ..Price::default()
+                    },
+                )]),
+                raw_providers: BTreeMap::from([(
+                    "us-gov.anthropic.model-x".to_string(),
+                    provider.to_string(),
+                )]),
+                reference_date: None,
+            }
+        }
+        let base = catalog_identity_of(&raw_catalog(3.6, "bedrock_converse"));
+        assert_ne!(
+            base,
+            catalog_identity_of(&raw_catalog(4.0, "bedrock_converse")),
+            "a re-priced regional row must reprice cached sessions"
+        );
+        assert_ne!(
+            base,
+            catalog_identity_of(&raw_catalog(3.6, "vertex_ai-language-models")),
+            "a rate-identical raw provider flip changes attribution and must flip the digest"
+        );
+        // And a catalog with no raw lane still digests to a stable
+        // value — the lane markers only pay when the lane is in use.
+        let empty = PricingCatalog {
+            entries: BTreeMap::from([(
+                "model-x".to_string(),
+                Price {
+                    input: 3.0,
+                    ..Price::default()
+                },
+            )]),
+            aliases: BTreeMap::new(),
+            source: "test".to_string(),
+            providers: BTreeMap::new(),
+            raw_entries: BTreeMap::new(),
+            raw_providers: BTreeMap::new(),
+            reference_date: None,
+        };
+        assert_eq!(
+            catalog_identity_of(&empty),
+            catalog_identity_of(&empty),
+            "digest stays deterministic"
+        );
+    }
+
+    #[test]
+    fn regional_resolution_is_single_pass_by_construction() {
+        // normalize_model is NOT idempotent across the dated+versioned
+        // family: one pass keeps "-20250929-v1" (the version suffix
+        // shields the date suffix from that pass), a second pass
+        // strips both down to the base family. That divergence is WHY
+        // resolution must never re-normalize a key it already resolved
+        // — the pre-fix provider path did exactly that, which is how a
+        // regional SKU priced at one row while citing another family's
+        // provider. This pins both facts: the divergence is real and
+        // live, and every retained regional id resolves exact-first,
+        // so no priced SKU ever walks the second pass.
+        let raw_ids = [
+            "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "bedrock/us-gov-east-1/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ];
+        for id in raw_ids {
+            let once = normalize_model(id);
+            let twice = normalize_model(&once);
+            assert_ne!(
+                once, twice,
+                "{id}: the dated+versioned family must still expose the divergence"
+            );
+        }
+        let catalog = fallback_catalog();
+        for id in raw_ids {
+            assert_eq!(
+                exact_retained_key(id, &catalog),
+                Some(id),
+                "{id} must be retained raw, so resolution never normalizes it"
+            );
+        }
+        assert!(
+            catalog
+                .entries
+                .contains_key("claude-sonnet-4-5-20250929-v1"),
+            "the collapsed twin bucket still exists in the normalized lane — the ladder is what protects exact ids from it"
         );
     }
 }

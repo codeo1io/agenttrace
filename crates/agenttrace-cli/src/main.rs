@@ -360,6 +360,21 @@ fn run() -> anyhow::Result<()> {
     // otherwise `agenttrace --statusline-report statusline` runs the host and
     // appends a bogus capture to the real journal before the report renders.
     if args.path.as_deref() == Some("statusline") && !args.statusline_report {
+        // rm-558: the keyword host lanes dispatch before action
+        // validation, so every flag after the keyword was parsed and
+        // then SILENTLY DROPPED — `agenttrace statusline --format json`
+        // ran the stdin host with `-f` ignored and
+        // `agenttrace statusline --overview` swallowed the report
+        // request entirely. The statusline host consumes the whole
+        // stdin stream and honors NO flags: name the foreign flag(s)
+        // at rc2 instead of guessing behind the user's back (same
+        // discipline as the mcp lane's rm-781 refusal).
+        refuse_inapplicable_keyword_flags(
+            &args,
+            "statusline",
+            &[],
+            &["- the statusline lane honors exactly: nothing — it consumes the whole stdin stream from the statusLine host"],
+        );
         return agenttrace_core::run_statusline_host();
     }
     // `agenttrace upstream` is a repository status host command (rm-024,
@@ -369,6 +384,17 @@ fn run() -> anyhow::Result<()> {
     // offline unless --fetch explicitly opts into the network.
     // rm-573: --statusline-report also wins over the upstream keyword lane.
     if args.path.as_deref() == Some("upstream") && !args.statusline_report {
+        // rm-558: same keyword-shadowing class as the statusline lane
+        // — `agenttrace upstream --overview` printed the drift report
+        // while `--overview` evaporated. Upstream honors exactly
+        // `-f/--format`, `--fetch`, and `-o/--output`; everything else
+        // refuses loudly at rc2.
+        refuse_inapplicable_keyword_flags(
+            &args,
+            "upstream",
+            &["--format", "--output", "--fetch"],
+            &["- the upstream lane honors exactly: -f/--format, --fetch, and -o/--output"],
+        );
         let report = upstream::status_report(&args.format, args.fetch)?;
         // rm-625: the drift report rides the same dispatch choke point
         // as every other report lane (control bytes sanitized outside
@@ -1189,6 +1215,116 @@ fn enforce_report_gates(args: &Args, sessions: &[Session]) {
         format!("agenttrace {} -f json", governance_inspect_flag(args))
     };
     eprintln!("- inspect: `{inspect}`");
+    std::process::exit(2);
+}
+
+/// rm-558: the statusline and upstream keyword host lanes had no
+/// refusal arm at all — unlike the mcp lane (rm-781), every flag
+/// placed with the keyword was parsed by clap and then silently
+/// dropped, because both lanes dispatch before action validation.
+/// (Wall anchor rm-558 "keyword-host dispatch"; the rm-455 MCP-server
+/// row is title-disjoint — re-anchored per review 947cb39d F1.)
+/// Each host has a closed argument set (`allowed`, canonical long
+/// names); any other report/render/gate/corpus flag refuses loudly at
+/// rc2 with the flag named, the honored set spelled out (`contract`
+/// lines), and the help route. `--version` returned before dispatch
+/// and `--statusline-report` overrode the keyword before this point,
+/// so neither appears in the enumeration.
+fn refuse_inapplicable_keyword_flags(
+    args: &Args,
+    keyword: &str,
+    allowed: &[&str],
+    contract: &[&str],
+) {
+    let mut refused: Vec<&str> = Vec::new();
+    let mut flag = |set: bool, name: &'static str| {
+        if set && !allowed.contains(&name) {
+            refused.push(name);
+        }
+    };
+    // Value flags: refused whenever they differ from clap's default
+    // (an explicitly-passed no-op value is indistinguishable from the
+    // default and harmless either way) — same convention as the mcp
+    // lane's refusal.
+    flag(args.format != "text", "--format");
+    flag(args.model != "default", "--model");
+    flag(args.lang != "en", "--lang");
+    flag(args.card_theme != SvgCardTheme::Auto, "--card-theme");
+    flag(args.range != "all", "--range");
+    flag(!args.project.is_empty(), "--project");
+    flag(!args.source.is_empty(), "--source");
+    flag(!args.model_filter.is_empty(), "--model-filter");
+    flag(!args.query.is_empty(), "--query");
+    flag(!args.health.is_empty(), "--health");
+    flag(!args.cost.is_empty(), "--cost");
+    flag(!args.anomaly.is_empty(), "--anomaly");
+    flag(args.sort != "recent", "--sort");
+    flag(args.order != "desc", "--order");
+    flag(args.limit != 20, "--limit");
+    flag(args.search_limit != 20, "--search-limit");
+    flag(args.search.is_some(), "--search");
+    flag(args.fail_under_health != 0, "--fail-under-health");
+    flag(args.fail_on_critical, "--fail-on-critical");
+    flag(args.max_tool_fail_rate.is_some(), "--max-tool-fail-rate");
+    flag(args.baseline.is_some(), "--baseline");
+    flag(
+        args.baseline_max_duration_delta_pct != 0.0,
+        "--baseline-max-duration-delta-pct",
+    );
+    flag(
+        args.baseline_max_cost_delta_pct != 0.0,
+        "--baseline-max-cost-delta-pct",
+    );
+    flag(
+        args.baseline_max_token_delta_pct != 0.0,
+        "--baseline-max-token-delta-pct",
+    );
+    flag(args.no_baseline_gate, "--no-baseline-gate");
+    // Corpus/config flags the two hosts never read: both consume
+    // stdin or repository state, not an explicit session corpus or a
+    // layered-config file.
+    flag(args.dir.is_some(), "--dir");
+    flag(args.config.is_some(), "--config");
+    flag(args.history_dir.is_some(), "--history-dir");
+    flag(args.pricing_file.is_some(), "--pricing-file");
+    // Boolean report/render/gate actions that cannot reach either host.
+    flag(args.compare, "--compare");
+    flag(args.audit, "--audit");
+    flag(args.recommend, "--recommend");
+    flag(args.mcp_governance, "--mcp-governance");
+    flag(args.context_trends, "--context-trends");
+    flag(args.delivery_evidence, "--delivery-evidence");
+    flag(args.overview, "--overview");
+    flag(args.sessions, "--sessions");
+    flag(args.diagnostics, "--diagnostics");
+    flag(args.inspect.is_some(), "--inspect");
+    flag(args.output.is_some(), "--output");
+    flag(args.latest, "--latest");
+    flag(args.waste, "--waste");
+    flag(args.list_models, "--list-models");
+    flag(args.update_pricing, "--update-pricing");
+    flag(args.test_match, "--test-match");
+    flag(args.quota, "--quota");
+    flag(args.fetch, "--fetch");
+    flag(args.weekly_budget.is_some(), "--weekly-budget");
+    flag(args.budget, "--budget");
+    flag(args.demo, "--demo");
+    flag(args.doctor, "--doctor");
+    flag(args.sample.is_some(), "--sample");
+    flag(args.clear_cache, "--clear-cache");
+    flag(args.preserve_history, "--preserve-history");
+    flag(args.include_history, "--include-history");
+    if refused.is_empty() {
+        return;
+    }
+    eprintln!(
+        "agenttrace: flag(s) {} cannot apply to the `{keyword}` host command; refusing instead of silently dropping",
+        refused.join(", ")
+    );
+    for line in contract {
+        eprintln!("{line}");
+    }
+    eprintln!("- run `agenttrace {keyword} --help` for the keyword contract");
     std::process::exit(2);
 }
 
