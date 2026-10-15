@@ -152,3 +152,37 @@ campaign-local numeral); renumbered to Rule 8 at its integration merge,
 where Rule 7 was already taken by run cf755698's fixture-root rule above —
 the cross-campaign collision convention both rules record.
 
+2026-10-16 postscript (run ff5c1cd8 cycle 4, compound 78c3277a): the stall
+this rule documented is FIXED for the doctor lane — rm-367 stages (b)(c)(d)
+landed the per-root wall-clock budget (`AGENTTRACE_DOCTOR_ROOT_BUDGET_MS`,
+default 60 s), per-root parsed-byte cap (`AGENTTRACE_DOCTOR_ROOT_MAX_BYTES`,
+default 512 MiB), and bounded SQLite ingest, with truncation always
+disclosed (`scan_partial`, `skipped_budget`/`skipped_size`,
+`sqlite_partial_dbs`); the operator home that red rc=124 at BOTH timeout
+240 and timeout 900 now completes rc 0 in 4m1.4 s real / 3m0 s user
+(implement 1f2cb8e6, salvaged dc7bcac; contract
+`doctor_scan_budget_contract`). The isolation guidance stands — the
+output-contract gate's doctor probe still runs in a scoped throwaway home
+(rm-1425) — for determinism now, not only speed: `DoctorReport` embeds
+the cache path in its JSON, so a `$HOME`-derived probe can never be
+byte-stable.
+
+## Rule 11 — a dead attempt's scratch logs describe a past tree, not this one (2026-10-16)
+
+Run ff5c1cd8 cycle-4 targeted-tests forensics: reaped attempt 406ede47's
+`focused-battery.log` showed the batch's new contract test FAILING TO
+COMPILE — 16× E0609 "no field `sqlite_partial_dbs` on type
+`DoctorReport`" — while the live tree HAS the field (`doctor.rs:159`,
+declared `pub` inside the struct at `doctor.rs:71`) and agenttrace-core
+declares no `[features]` section that could gate it. The log was a stale
+artifact from a pre-batch tree, not a defect. Rule: before treating a
+reaped or dead attempt's log as evidence of a current red, re-derive the
+claim against the live tree — grep for the symbol the error says is
+missing, check feature gates, and sanity-check counts against the batch
+manifest (the dead log's 392-test core leg vs the batch tree's 399).
+Logs are observations of the tree they ran on; the tree is the only
+authority. Numbered 11 at mint: sibling run 5c144613's unlanded band
+(mtime-earlier, 2026-10-15) already claims Rules 9–10 (TMPDIR outside
+every `.git` ancestor; pristine-base triage) — theirs keep 9–10 at any
+fold where both land, this stays 11 (the Rule 7→8 renumber precedent).
+
