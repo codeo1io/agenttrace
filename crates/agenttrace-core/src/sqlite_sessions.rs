@@ -1,4 +1,7 @@
-use crate::{detect_anomalies, health_score, token_cost, Metrics, Session};
+use crate::{
+    detect_anomalies, health_score, token_cost, Metrics, Session, SessionFileDiff,
+    SummaryDiffDivergence,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -65,6 +68,18 @@ struct SqliteSessionAgg {
     summary_additions: Option<i64>,
     summary_deletions: Option<i64>,
     summary_files: Option<i64>,
+    /// rm-1509 (cycle 2, run b01c2b6a): the OpenCode v2
+    /// `session.summary_diffs` json column — the writer's per-file
+    /// diff list (`FileDiff.LegacyInfo[]` upstream), decoded
+    /// leniently. `None` when the column or value is absent (1.x
+    /// stores), and `None` plus a counted drop below when the payload
+    /// exists but fails to decode. Patch bodies are deliberately not
+    /// carried: delivery evidence reports counts and paths.
+    summary_diffs: Option<Vec<SessionFileDiff>>,
+    /// rm-1509: 1 when this row's `summary_diffs` payload failed to
+    /// decode — disclosed on Metrics, never a hard error and never a
+    /// silently re-derived value.
+    summary_diffs_dropped: u32,
     source_tool: String,
     path: String,
     cwd: String,
@@ -751,6 +766,14 @@ fn opencode_sqlite_session_rows(
             "summary_files",
             sqlite_has_column(db, "session", "summary_files"),
         ),
+        // rm-1509 (run b01c2b6a): the OpenCode v2 per-file diff
+        // list — MUST stay last: it extends the summary block so the
+        // fixed read indices for the integer columns are unchanged
+        // (summary_diffs reads index 16).
+        (
+            "summary_diffs",
+            sqlite_has_column(db, "session", "summary_diffs"),
+        ),
     ];
     let summary_select = summary_columns
         .iter()
@@ -783,6 +806,19 @@ fn opencode_sqlite_session_rows(
     let since_millis = since.map(|value| value.timestamp_millis());
     let rows = match stmt.query_map([since_millis], |row| {
         let id = row.get::<_, String>(0)?;
+        // rm-1509: decode the v2 per-file list before building the
+        // aggregate — one session row maps to one aggregate, so the
+        // drop count lands per-session by construction. A payload
+        // that fails to decode is COUNTED, never a hard error and
+        // never silently re-derived.
+        let (summary_diffs, summary_diffs_dropped) = match sqlite_value_as_text(row.get(16)?)
+            .as_deref()
+            .map(serde_json::from_str::<Vec<SessionFileDiff>>)
+        {
+            Some(Ok(list)) => (Some(list), 0),
+            Some(Err(_)) => (None, 1),
+            None => (None, 0),
+        };
         Ok((
             id.clone(),
             SqliteSessionAgg {
@@ -812,6 +848,12 @@ fn opencode_sqlite_session_rows(
                 summary_additions: sqlite_value_as_i64(row.get(13)?),
                 summary_deletions: sqlite_value_as_i64(row.get(14)?),
                 summary_files: sqlite_value_as_i64(row.get(15)?),
+                // rm-1509: `summary_diffs` — index 16 is always
+                // valid: the SELECT null-pads when the column is
+                // absent, so 1.x stores read `None` and parse
+                // byte-identically.
+                summary_diffs,
+                summary_diffs_dropped,
                 source_tool: "opencode_db".to_string(),
                 path: path.to_string_lossy().to_string(),
                 ..SqliteSessionAgg::default()
@@ -1220,7 +1262,48 @@ fn hermes_tool_outcome_counts(
     out
 }
 
+/// rm-1509 (cycle 2, run b01c2b6a): the OpenCode v2 divergence check
+/// — the `summary_diffs` per-file sums against the integer `summary_*`
+/// columns of the same session row. `Some` only when both sides are
+/// known, the per-file list carries at least one entry, and the sums
+/// disagree: a writer that recorded both shapes disagreed with
+/// itself, and the divergence is disclosed on Metrics (and in
+/// delivery evidence), never silently reconciled into either side —
+/// the same recorded-vs-derived failure class ccusage #1883 closed
+/// with a float tolerance. An explicitly empty list (`[]`, sums 0/0)
+/// never flags: the writer marked no files, and absence is not a
+/// disagreement. Sums are saturating — a hostile payload of
+/// i64::MAX entries cannot overflow the disclosure arithmetic.
+fn summary_diffs_divergence(agg: &SqliteSessionAgg) -> Option<SummaryDiffDivergence> {
+    let diffs = agg.summary_diffs.as_ref()?;
+    if diffs.is_empty() {
+        return None;
+    }
+    let (additions, deletions) = diffs
+        .iter()
+        .fold((0i64, 0i64), |(additions, deletions), diff| {
+            (
+                additions.saturating_add(diff.additions),
+                deletions.saturating_add(diff.deletions),
+            )
+        });
+    let summary_additions = agg.summary_additions?;
+    let summary_deletions = agg.summary_deletions?;
+    if additions == summary_additions && deletions == summary_deletions {
+        return None;
+    }
+    Some(SummaryDiffDivergence {
+        per_file_additions: additions,
+        per_file_deletions: deletions,
+        summary_additions,
+        summary_deletions,
+    })
+}
+
 fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
+    // rm-1509: per-file sums vs the integer columns, computed before
+    // the aggregate is partially moved into the Metrics literal below.
+    let summary_diffs_divergence = summary_diffs_divergence(&agg);
     let mut models = agg.models;
     if models.is_empty() && !agg.model.is_empty() {
         models.insert(agg.model.clone());
@@ -1278,6 +1361,9 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         summary_additions: agg.summary_additions,
         summary_deletions: agg.summary_deletions,
         summary_files: agg.summary_files,
+        summary_diffs: agg.summary_diffs,
+        summary_diffs_dropped: agg.summary_diffs_dropped,
+        summary_diffs_divergence,
         provenance: crate::MetricProvenance {
             naming: String::new(),
             tokens: if agg.stored_totals_applied {

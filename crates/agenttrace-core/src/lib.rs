@@ -480,6 +480,40 @@ fn json_value_string(value: Option<&Value>) -> String {
     }
 }
 
+/// rm-1509 (cycle 2, run b01c2b6a): one entry of the OpenCode v2
+/// `session.summary_diffs` payload — upstream type
+/// `FileDiff.LegacyInfo` (anomalyco/opencode
+/// packages/schema/src/file-diff.ts): the writer's per-file diff
+/// accounting beside the integer summary columns. The upstream
+/// `patch` body is deliberately not mirrored; the delivery lane
+/// reports counts and paths, not patch text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionFileDiff {
+    /// The touched path, when the writer recorded one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    pub additions: i64,
+    pub deletions: i64,
+    /// Upstream: "added" | "deleted" | "modified" — recorded as
+    /// free text, never enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// rm-1509 (cycle 2, run b01c2b6a): the `summary_diffs` per-file sums vs the
+/// integer `summary_*` columns of the same session row. Constructed only when
+/// both sides are present and they disagree — divergence is disclosed, never
+/// silently reconciled (same class as ccusage #1883: exact-match assumptions
+/// between recorded and derived totals pick wrong sides).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryDiffDivergence {
+    pub per_file_additions: i64,
+    pub per_file_deletions: i64,
+    pub summary_additions: i64,
+    pub summary_deletions: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetricProvenance {
@@ -560,6 +594,26 @@ pub struct Metrics {
     pub summary_deletions: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_files: Option<i64>,
+    /// rm-1509 (cycle 2, run b01c2b6a): the OpenCode v2
+    /// `session.summary_diffs` json column — the writer's per-file
+    /// diff list (`FileDiff.LegacyInfo[]` upstream,
+    /// packages/schema/src/file-diff.ts), read behind the same
+    /// column-presence probe as the `summary_*` integers so 1.x
+    /// stores parse identically. `None` when the column is absent
+    /// or the row's value is NULL. The `patch` body is deliberately
+    /// not carried: delivery evidence reports counts and paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_diffs: Option<Vec<SessionFileDiff>>,
+    /// rm-1509: rows whose `summary_diffs` payload failed to decode
+    /// (not json / wrong shape). Counted, never silently dropped.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub summary_diffs_dropped: u32,
+    /// rm-1509: per-file sums vs the integer `summary_*` columns on
+    /// the same row — `Some` only when both sides are known and they
+    /// disagree. Divergence is disclosed, never silently reconciled
+    /// (same class as ccusage #1883: recorded vs derived totals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_diffs_divergence: Option<SummaryDiffDivergence>,
     pub source_tool: String,
     pub session_start: String,
     pub session_end: String,
@@ -701,6 +755,10 @@ pub struct Metrics {
 }
 
 fn i64_is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
+fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
