@@ -123,15 +123,17 @@ enum AnyValue {
 /// lane (same U+FFFD substitution for C0/C1/DEL); when that lane lands
 /// this folds into its shared helper. rm-936: the fold landed — the Cc
 /// test now composes with the shared Cf predicate
-/// ([`crate::statusline::is_bidi_format_control`]) so span names and
-/// attribute values cannot carry directional controls either.
+/// ([`crate::statusline::is_spoofing_format_control`]) so span names and
+/// attribute values cannot carry directional controls either. rm-933
+/// (slice 3) widens that composition to the full spoofing union
+/// (invisible zero-width included).
 fn sanitize_otel_string(value: &str) -> String {
     value
         .chars()
         .map(|c| {
             let code = c as u32;
             if c.is_control()
-                || crate::statusline::is_bidi_format_control(c)
+                || crate::statusline::is_spoofing_format_control(c)
                 || (0x80..=0x9f).contains(&code)
             {
                 '\u{FFFD}'

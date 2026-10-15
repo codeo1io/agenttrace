@@ -1336,17 +1336,13 @@ fn dispatch_sanitize(format: &str, out: String) -> String {
         // document would corrupt string lengths for downstream tooling.
         // rm-936 carve-out: serde does NOT encode Unicode Cf directional
         // controls (U+202E-class), so they would ride this lane raw and
-        // reorder adjacent text in every downstream renderer. Neutralize
-        // ONLY that class; every other character passes untouched.
-        out.chars()
-            .map(|c| {
-                if agenttrace_core::is_bidi_format_control(c) {
-                    '\u{FFFD}'
-                } else {
-                    c
-                }
-            })
-            .collect()
+        // reorder adjacent text in every downstream renderer. rm-933
+        // (slice 3) replaces the lossy U+FFFD substitution with a
+        // lossless \uXXXX escape and widens the set to the full spoofing
+        // union (directional + invisible zero-width): the serialized
+        // stream carries no raw spoofing bytes, yet decodes back to the
+        // original character — JSON data stays exact.
+        agenttrace_core::escape_spoofing_json(&out)
     } else {
         agenttrace_core::sanitize_output_document(&out)
     }

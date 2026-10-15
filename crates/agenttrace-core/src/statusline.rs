@@ -406,10 +406,11 @@ fn render_status_line(payload: &Value) -> String {
 /// the embedding/override initiators and pops (U+202A-202E), the
 /// left/right marks (U+200E-200F), the isolate initiators and pops
 /// (U+2066-2069), and the Arabic letter mark (U+061C). The
-/// NON-directional Cf members (U+FEFF, U+2060, U+00AD, U+180E) do not
-/// reorder anything and are deliberately OUT of this predicate's set —
-/// the display/hiding tricks they enable are a separate, still-open
-/// lane on this row.
+/// NON-directional Cf members do not reorder anything and stay OUT of
+/// this predicate's set — the invisible-spoofing subset that hides
+/// content instead of reordering it lives in
+/// [`is_invisible_spoofing_control`], and render lanes compose the two
+/// via [`is_spoofing_format_control`].
 pub fn is_bidi_format_control(c: char) -> bool {
     matches!(
         c,
@@ -417,11 +418,42 @@ pub fn is_bidi_format_control(c: char) -> bool {
     )
 }
 
+/// rm-933 (slice 3): the invisible-spoofing Cf subset — characters that
+/// hide or splice content without reordering it. Zero-width no-break
+/// space / BOM (U+FEFF), word joiner (U+2060), Mongolian vowel
+/// separator (U+180E), and — since the review-6f85e2c9 F1 fix, which
+/// the acceptance clause always demanded — the plane-14 Tags block
+/// (U+E0000–U+E007F, category Cf) ride verbatim through structural
+/// escapers (serde passes Cf raw) yet render as nothing, so they can
+/// smuggle invisible payload into any transcript-derived field while
+/// keeping visible text unchanged. Tag characters exist to be consumed
+/// by higher protocols (language tags, U+E0001), never displayed;
+/// U+E007F CANCEL TAG exists to erase what precedes it. The Variation
+/// Selectors Supplement sharing plane 14 (U+E0080–U+E01EF, category
+/// Mn) is functional orthography and stays OUT (bounds-pinned).
+/// Deliberately EXCLUDED, each pinned by test: U+00AD soft hyphen
+/// (legitimate typography), U+200B ZWSP / U+200C ZWNJ / U+200D ZWJ
+/// (functional joiners in real scripts — the zero-width family a
+/// display sanitizer must not eat), and every printable.
+pub fn is_invisible_spoofing_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{FEFF}' | '\u{2060}' | '\u{180E}' | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// rm-933 (slice 3): the union predicate every render boundary composes —
+/// reordering tricks ([`is_bidi_format_control`]) OR invisible-spoofing
+/// tricks ([`is_invisible_spoofing_control`]).
+pub fn is_spoofing_format_control(c: char) -> bool {
+    is_bidi_format_control(c) || is_invisible_spoofing_control(c)
+}
+
 pub fn sanitize_line_segment(segment: &str) -> String {
     segment
         .chars()
         .map(|c| {
-            if c.is_control() || is_bidi_format_control(c) {
+            if c.is_control() || is_spoofing_format_control(c) {
                 '\u{FFFD}'
             } else {
                 c
@@ -440,14 +472,19 @@ pub fn sanitize_line_segment(segment: &str) -> String {
 /// transcript-derived sequences. rm-936 adds the Cf bidi/format set to the
 /// same substitution (see [`is_bidi_format_control`]) — serde and every
 /// structural escaper pass those through raw, so this boundary is where
-/// they die in every non-JSON lane. Idempotent by construction: U+FFFD is
+/// they die in every non-JSON lane. rm-933 (slice 3) composes the full
+/// spoofing union ([`is_spoofing_format_control`]) so the invisible
+/// zero-width family dies here too. Idempotent by construction: U+FFFD is
 /// printable, so already-sanitized documents (including cells that
 /// first went through the rm-383/rm-540 line sanitizer) pass through
 /// unchanged — the two layers compose instead of corrupting.
 pub fn sanitize_output_document(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if (c.is_control() || is_bidi_format_control(c)) && c != '\n' && c != '\r' && c != '\t'
+            if (c.is_control() || is_spoofing_format_control(c))
+                && c != '\n'
+                && c != '\r'
+                && c != '\t'
             {
                 '\u{FFFD}'
             } else {
@@ -455,6 +492,46 @@ pub fn sanitize_output_document(text: &str) -> String {
             }
         })
         .collect()
+}
+
+/// rm-933 (slice 3): JSON-lane counterpart of [`sanitize_output_document`].
+/// JSON output is machine-consumed, so the right treatment for a spoofing
+/// character is NOT the lossy U+FFFD substitution the render lanes use but
+/// a LOSSLESS `\uXXXX` escape: every char matched by
+/// [`is_spoofing_format_control`] becomes its ASCII `\uXXXX` JSON escape —
+/// the byte stream carries no raw spoofing Cf (the thing a naive terminal
+/// would render), while `serde_json`/`jq` decode the string back to the
+/// original char, so the data survives verbatim. Raw control bytes never
+/// reach this helper (serde already escaped them), and inserting a `\uXXXX`
+/// sequence inside a JSON string literal is structurally safe: the escape
+/// resolves to the very char it replaced. BMP members (the whole set before
+/// the review-6f85e2c9 F1 widening) emit one escape; the plane-14 tag block
+/// is NON-BMP and a JSON `\u` escape carries exactly four hex digits, so
+/// those chars must emit their UTF-16 SURROGATE PAIR as two escapes — a
+/// five-digit `\uE0001` would decode to U+E000 plus a literal `1`, silently
+/// corrupting the lossless contract. Idempotent: the output contains no
+/// characters the predicate matches.
+pub fn escape_spoofing_json(text: &str) -> String {
+    if !text.chars().any(is_spoofing_format_control) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if is_spoofing_format_control(c) {
+            let code = c as u32;
+            if code <= 0xFFFF {
+                out.push_str(&format!("\\u{:04X}", code));
+            } else {
+                let offset = code - 0x1_0000;
+                let high = 0xD800 + (offset >> 10);
+                let low = 0xDC00 + (offset & 0x3FF);
+                out.push_str(&format!("\\u{:04X}\\u{:04X}", high, low));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Appends one capture to the journal, compacting it first when the
@@ -1923,6 +2000,59 @@ mod tests {
         assert!(!is_bidi_format_control('\u{1B}')); // Cc: is_control's job
         assert!(!is_bidi_format_control('\u{00AD}')); // Cf but not directional
         assert!(!is_bidi_format_control('\u{0A0}')); // Zl layout, not Cf
+    }
+
+    #[test]
+    fn rm933_is_invisible_spoofing_control_bounds() {
+        // The invisible-spoofing subset: zero-width, no legitimate in-band-text use.
+        for c in ['\u{FEFF}', '\u{2060}', '\u{180E}'] {
+            assert!(is_invisible_spoofing_control(c), "{c:?} must be flagged");
+            assert!(is_spoofing_format_control(c), "{c:?} in the union");
+        }
+        // Deliberately-excluded Cf, each pinned: soft hyphen is legitimate
+        // typography; the zero-width joiner family is functional in real
+        // scripts; printables untouched by definition.
+        for c in [
+            '\u{00AD}', '\u{200B}', '\u{200C}', '\u{200D}', 'a', '\u{FFFD}', '\u{1B}',
+        ] {
+            assert!(!is_invisible_spoofing_control(c), "{c:?} stays out");
+        }
+        // The union subsumes the directional set; the excluded family stays out.
+        assert!(is_spoofing_format_control('\u{202E}'));
+        assert!(is_spoofing_format_control('\u{061C}'));
+        assert!(!is_spoofing_format_control('\u{00AD}'));
+        assert!(!is_spoofing_format_control('\u{200B}'));
+    }
+
+    #[test]
+    fn rm933_line_segment_kills_invisible_spoofing() {
+        let out = sanitize_line_segment("a\u{FEFF}b\u{2060}c\u{180E}d\u{202E}e\u{00AD}f");
+        assert_eq!(out, "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{00AD}f");
+        // Idempotence across the widened set.
+        assert_eq!(sanitize_line_segment(&out), out);
+    }
+
+    #[test]
+    fn rm933_document_keeps_layout_kills_invisible_spoofing() {
+        let doc = "x\u{FEFF}y\n\t z\u{2060}w\r\u{180E}q\u{202E}r";
+        let out = sanitize_output_document(doc);
+        assert_eq!(out, "x\u{FFFD}y\n\t z\u{FFFD}w\r\u{FFFD}q\u{FFFD}r");
+        assert_eq!(sanitize_output_document(&out), out);
+    }
+
+    #[test]
+    fn rm933_escape_spoofing_json_is_lossless_and_raw_free() {
+        let raw = "n\u{202E}a\u{FEFF}b\u{2060}c\u{180E}d\u{00AD}e";
+        let esc = escape_spoofing_json(raw);
+        assert_eq!(esc, "n\\u202Ea\\uFEFFb\\u2060c\\u180Ed\u{00AD}e");
+        // No raw spoofing char survives in the byte stream…
+        assert!(!esc.chars().any(is_spoofing_format_control));
+        // …and serde decodes the escape back to the original char (lossless).
+        let decoded: String = serde_json::from_str(&format!("\"{}\"", esc)).unwrap();
+        assert_eq!(decoded, raw);
+        // Idempotence + the clean fast path.
+        assert_eq!(escape_spoofing_json(&esc), esc);
+        assert_eq!(escape_spoofing_json("plain text 100%"), "plain text 100%");
     }
 
     #[test]
