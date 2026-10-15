@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 64 and the SQLite snapshot is schema 12; the
+The session cache is schema 64 and the SQLite snapshot is schema 13; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -447,7 +447,18 @@ by-agent rollup collapses back onto the source-tool bucket) while a
 fresh parse of the same database splits it, so every older snapshot
 regenerates once, in place (rm-991, run b5affead cycle 2; the JSONL
 session cache moved for the same reason — 62 → 63 at this integration,
-the run's 60 → 61 mint re-based onto the advanced ceiling). Older versions are discarded and
+the run's 60 → 61 mint re-based onto the advanced ceiling), and to 13 when
+opencode step-finish parts began contributing their gateway-recorded cost
+(`part.data.cost`) — recorded dollars displace the token-derived estimate
+(a session-row `stored_cost` still outranks them; a recorded $0 on priced
+tokens displaces nothing — the catalog estimate stands, disclosed via
+`recorded_cost_zero_blocks`), so a snapshot banked
+before the lane read `cost` replays $0.00 or a wrong-model alias price on
+gateway-routed sessions (e.g. cliproxyapi/hermes-router, a model the bundled
+catalog cannot price) while a fresh parse of the same database bills the
+recorded dollars, and every older snapshot regenerates once, in place
+(rm-1399, run c2f2765c cycle 2; the JSONL session cache is untouched — this
+rung moves no JSONL-lane accounting). Older versions are discarded and
 rebuilt on the next load; the migration is read-only and does not modify
 source session files. Cache entries whose source file has disappeared are
 pruned the next time the cache loads, and the JSONL-backed session cache is

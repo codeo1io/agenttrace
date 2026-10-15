@@ -39,6 +39,37 @@ struct SqliteSessionAgg {
     message_tokens: usize,
     usage_cost: f64,
     usage_cost_set: bool,
+    /// Cost the opencode gateway recorded on step-finish part rows
+    /// (`data.cost`), summed across the parts carrying a usable one
+    /// (rm-1399). Gateway-routed sessions run models the bundled
+    /// catalog cannot price reliably — the token-derived estimate can
+    /// be $0 or a wrong-guess — so these recorded dollars are the
+    /// lane's billing truth.
+    recorded_step_cost: f64,
+    /// How many step-finish parts contributed to
+    /// `recorded_step_cost` (parse-time disclosure count).
+    recorded_step_cost_parts: usize,
+    /// Set when `recorded_step_cost` displaced the token-derived
+    /// estimate at finalize — never when the session row already
+    /// carried an authoritative `stored_cost`.
+    step_cost_applied: bool,
+    /// Review fix (independent_review bb46560c F1): step-finish parts
+    /// carrying a recorded `cost: 0.0` on priced tokens (any non-zero
+    /// token field) — at the wire a gateway that never priced the
+    /// call is indistinguishable from a free tier, so the zero is NOT
+    /// authoritative. The minted acceptance keeps the catalog
+    /// estimate there ("catalog estimate only when
+    /// absent/zero-with-tokens"); these parts are counted only for
+    /// disclosure (`recorded_cost_zero_blocks`, the rm-1052 pi-lane
+    /// vocabulary) instead of silently billing $0.
+    recorded_cost_zero_parts: usize,
+    /// Review fix (bb46560c F4): the catalog estimate displaced by
+    /// recorded dollars at finalize — retained (disclosed as
+    /// `recorded_cost_displaced_estimate_cents`) so the estimated
+    /// side of the recorded-vs-estimated disclosure (acceptance 2,
+    /// rm-795's divergence-oracle seam) survives the displacement
+    /// instead of being destroyed.
+    displaced_estimate_usd: f64,
     /// Authoritative per-session totals recorded on the upstream session
     /// row (opencode schema); present only when the columns exist and are
     /// non-null. When set they displace message-derived aggregation.
@@ -589,6 +620,10 @@ fn query_opencode_sqlite_sessions(
                 agg.events = agg.user_messages + agg.assistant_turns + agg.tool_calls_total;
             }
             apply_opencode_stored_totals(&mut agg);
+            // rm-1399: part-recorded dollars apply only after the
+            // session-row totals — a stored whole-row `cost` stays the
+            // most authoritative source.
+            apply_opencode_recorded_step_cost(&mut agg);
             session_from_sqlite_agg(agg)
         })
         .collect();
@@ -1012,6 +1047,12 @@ fn add_opencode_sqlite_parts(
         };
         match string(doc.get("type")) {
             "step-finish" => {
+                // rm-1399: the recorded cost is read unconditionally —
+                // `cost` never appears on message rows, so unlike the
+                // token map there is nothing to double count; the
+                // tokens stay gated on the message lane not having
+                // spoken.
+                add_opencode_step_finish_cost(agg, &doc);
                 if agg.message_tokens == 0 {
                     add_opencode_step_finish_tokens(agg, &doc);
                 }
@@ -1060,6 +1101,92 @@ fn add_opencode_step_finish_tokens(
         agg.usage_cost += token_cost_raw(input, output, cache_write, cache_read, &agg.model);
         agg.usage_cost_set = true;
     }
+}
+
+/// rm-1399: opencode step-finish parts carry the cost the provider
+/// computed for that step (`data.cost`, opencode 1.19 schema — live
+/// host sample `{tokens:{total:31107,input:1685,output:302,reasoning:0,
+/// cache:{write:0,read:29120}},cost:0.0048786}`). The message-derived
+/// estimate for a gateway-routed session (cliproxyapi/hermes-router)
+/// is at best a catalog guess — sometimes $0, sometimes a wrong-model
+/// alias — while the real dollars sit unread in rows this loader
+/// already parses. Corrupt values (negative, non-finite) are ignored
+/// rather than trusted, mirroring the session-row `stored_cost`
+/// discipline; each accepted part is counted for parse-time
+/// disclosure. Review fix (bb46560c F1): a recorded `0.0` is accepted
+/// only as a DISCLOSURE, never as billing truth — free-tier and
+/// unpriced are indistinguishable at the wire, and the minted
+/// acceptance ("catalog estimate only when absent/zero-with-tokens")
+/// keeps the estimate authoritative for zero-with-tokens parts
+/// (counted in `recorded_cost_zero_parts`, rm-1052 vocabulary).
+fn add_opencode_step_finish_cost(agg: &mut SqliteSessionAgg, doc: &serde_json::Map<String, Value>) {
+    let Some(cost) = doc.get("cost").and_then(Value::as_f64) else {
+        return;
+    };
+    if !cost.is_finite() || cost < 0.0 {
+        return;
+    }
+    if cost == 0.0 {
+        if opencode_part_tokens_priced(doc) {
+            agg.recorded_cost_zero_parts += 1;
+        }
+        return;
+    }
+    agg.recorded_step_cost += cost;
+    agg.recorded_step_cost_parts += 1;
+}
+
+/// Review fix (bb46560c F1): the zero-block disclosure counts recorded
+/// $0 on PRICED tokens — any non-zero field in the part's token map —
+/// mirroring rm-1052's "priced tokens" guard (lib.rs), so a zero on a
+/// token-less part stays inert instead of inflating the counter.
+fn opencode_part_tokens_priced(doc: &serde_json::Map<String, Value>) -> bool {
+    let Some(tokens) = doc.get("tokens").and_then(Value::as_object) else {
+        return false;
+    };
+    let cache = tokens.get("cache").and_then(Value::as_object);
+    number_as_i64(tokens.get("input")) > 0
+        || number_as_i64(tokens.get("output")) > 0
+        || number_as_i64(tokens.get("reasoning")) > 0
+        || cache
+            .map(|cache| {
+                number_as_i64(cache.get("read")) > 0 || number_as_i64(cache.get("write")) > 0
+            })
+            .unwrap_or(false)
+}
+
+/// rm-1399: recorded-cost precedence for the opencode lane. The
+/// gateway-computed dollars on step-finish parts displace the
+/// token-derived estimate entirely (rm-436 semantics: an
+/// upstream-recorded cost is honored at face value) — but only when
+/// the session row did not already carry an authoritative whole-row
+/// `cost`, and never when a saturated accumulation (an adversarial
+/// sum drifted to infinity) would be trusted. Review fixes (bb46560c
+/// F1/F4): only REAL dollars displace — recorded zeros never enter
+/// `recorded_step_cost`, so a zero-only session keeps its catalog
+/// estimate (disclosed via `recorded_cost_zero_parts`) — and the
+/// estimate a displacement overwrites is retained in
+/// `displaced_estimate_usd` for the recorded-vs-estimated disclosure.
+fn apply_opencode_recorded_step_cost(agg: &mut SqliteSessionAgg) {
+    if agg.stored_cost_applied || agg.recorded_step_cost_parts == 0 {
+        return;
+    }
+    if !agg.recorded_step_cost.is_finite() || agg.recorded_step_cost < 0.0 {
+        return;
+    }
+    // F1: unreachable via add_opencode_step_finish_cost (zeros are
+    // never accumulated), kept explicit so a future caller cannot
+    // reintroduce the silent $0 billing the review flagged.
+    if agg.recorded_step_cost == 0.0 {
+        return;
+    }
+    // F4: retain the displaced estimate before overwriting it.
+    if agg.usage_cost_set {
+        agg.displaced_estimate_usd = agg.usage_cost;
+    }
+    agg.usage_cost = agg.recorded_step_cost;
+    agg.usage_cost_set = true;
+    agg.step_cost_applied = true;
 }
 
 fn add_opencode_tokens_from_map(
@@ -1296,6 +1423,11 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
             },
             cost: if agg.stored_cost_applied {
                 "reported_by_agent".to_string()
+            } else if agg.step_cost_applied {
+                // rm-1399: the same recorded-cost vocabulary the Event
+                // lane uses (lib.rs) — tokens from the parts, cost at
+                // face value.
+                "calculated_from_tokens_with_recorded_cost".to_string()
             } else if agg.usage_cost_set {
                 "calculated_per_message_tokens".to_string()
             } else {
@@ -1308,6 +1440,39 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
     if agg.end_unix > agg.start_unix {
         metrics.duration_sec = agg.end_unix - agg.start_unix;
         metrics.provenance.duration = "timestamp_span".to_string();
+    }
+    // rm-1399: gateway-recorded dollars ride the recorded-cost basis
+    // (rm-436/rm-520 family) at face value, with NO `upstream_priced_*`
+    // split: a gateway's rate is not reproducible from any catalog, so
+    // the audit's same-basis re-price stays withheld (rm-578's
+    // conservative arm) instead of false-tripping a drift note on
+    // every recorded-cost session. The parse-time counter keeps the
+    // contributing part count visible.
+    if agg.step_cost_applied {
+        metrics.upstream_cost_usd = agg.recorded_step_cost;
+        metrics
+            .disclosure_counters
+            .entry("opencode_step_cost_parts".to_string())
+            .or_insert(agg.recorded_step_cost_parts);
+        // Review fix (bb46560c F4): the estimated side of the
+        // recorded-vs-estimated disclosure — the catalog estimate the
+        // recorded dollars displaced, retained in cents (rm-1052's
+        // cents convention; the recorded side is `upstream_cost_usd`).
+        if agg.displaced_estimate_usd.is_finite() && agg.displaced_estimate_usd > 0.0 {
+            metrics.disclosure_counters.insert(
+                "recorded_cost_displaced_estimate_cents".to_string(),
+                (crate::round4(agg.displaced_estimate_usd) * 100.0).round() as usize,
+            );
+        }
+    }
+    // Review fix (bb46560c F1): gateway-unpriced parts (recorded $0
+    // on priced tokens) are disclosed even when the catalog estimate
+    // stands — the zero arm must never be silent.
+    if agg.recorded_cost_zero_parts > 0 {
+        metrics
+            .disclosure_counters
+            .entry("recorded_cost_zero_blocks".to_string())
+            .or_insert(agg.recorded_cost_zero_parts);
     }
     // rm-790: the source row id makes the derived-history identity per-row
     // (two same-second sessions from one database no longer hash to one
@@ -1934,6 +2099,311 @@ mod tests {
         }
         db.execute_batch(&parts_sql).expect("seed parts");
         path
+    }
+
+    /// rm-1399 fixture: opencode databases whose step-finish parts
+    /// carry the gateway-recorded cost (`part.data.cost`, the live
+    /// 1.19 schema — live host sample `{tokens:{...},cost:0.0048786}`).
+    /// Five sessions cover the whole precedence matrix: a
+    /// gateway-routed model the catalog cannot price, a catalog
+    /// model whose recorded cost must displace its estimate, a
+    /// session row already carrying an authoritative whole-row cost,
+    /// a legacy part without any cost, and a corrupt negative cost.
+    fn opencode_step_cost_fixture(dir: &Path) -> PathBuf {
+        let path = dir.join("opencode.db");
+        let db = Connection::open(&path).expect("open fixture db");
+        db.execute_batch(
+            r#"
+            create table session (
+                id text primary key, title text, time_created integer, time_updated integer,
+                directory text, cost real,
+                tokens_input integer, tokens_output integer, tokens_reasoning integer,
+                tokens_cache_read integer, tokens_cache_write integer
+            );
+            create table message (id text primary key, session_id text, data text);
+            create table part (
+                id text primary key, message_id text, session_id text, data text, time_created integer
+            );
+            insert into session (id, title, time_created, time_updated, directory, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write) values
+                ('s-gw',     'gateway',  1762000000000, 1762000000001, '/w/gw',  null, null, null, null, null, null),
+                ('s-cat',    'catalog',  1762000100000, 1762000100001, '/w/cat', null, null, null, null, null, null),
+                ('s-stored', 'stored',   1762000200000, 1762000200001, '/w/st',  9.9, 100, 50, 0, 0, 0),
+                ('s-nocost', 'legacy',   1762000300000, 1762000300001, '/w/nc',  null, null, null, null, null, null),
+                ('s-neg',    'negative', 1762000400000, 1762000400001, '/w/neg', null, null, null, null, null, null),
+                ('s-zero',   'zeroblocks', 1762000500000, 1762000500001, '/w/z', null, null, null, null, null, null),
+                ('s-mix',    'mixed',    1762000600000, 1762000600001, '/w/mix', null, null, null, null, null, null);
+            insert into message (id, session_id, data) values
+                ('m-gw',  's-gw',     '{"role":"assistant","model":{"providerID":"cliproxyapi","modelID":"hermes-router"}}'),
+                ('m-cat', 's-cat',    '{"role":"assistant","modelID":"claude-sonnet-4"}'),
+                ('m-st',  's-stored', '{"role":"assistant","modelID":"claude-sonnet-4"}'),
+                ('m-nc',  's-nocost', '{"role":"assistant","modelID":"claude-sonnet-4"}'),
+                ('m-neg', 's-neg',    '{"role":"assistant","modelID":"claude-sonnet-4"}'),
+                ('m-zero', 's-zero',   '{"role":"assistant","modelID":"claude-sonnet-4"}'),
+                ('m-mix',  's-mix',    '{"role":"assistant","modelID":"claude-sonnet-4"}');
+            insert into part (id, message_id, session_id, data, time_created) values
+                ('p-gw1',  'm-gw',  's-gw',     '{"type":"step-finish","tokens":{"total":31107,"input":1685,"output":302,"reasoning":0,"cache":{"write":0,"read":29120}},"cost":0.004}', 1762000000002),
+                ('p-gw2',  'm-gw',  's-gw',     '{"type":"step-finish","tokens":{"total":200,"input":100,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}', 1762000000003),
+                ('p-cat',  'm-cat', 's-cat',    '{"type":"step-finish","tokens":{"total":500,"input":400,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.25}', 1762000100002),
+                ('p-st',   'm-st',  's-stored', '{"type":"step-finish","tokens":{"total":500,"input":400,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.004}', 1762000200002),
+                ('p-nc',   'm-nc',  's-nocost', '{"type":"step-finish","tokens":{"total":500,"input":400,"output":100,"reasoning":0,"cache":{"write":0,"read":0}}}', 1762000300002),
+                ('p-neg1', 'm-neg', 's-neg',    '{"type":"step-finish","tokens":{"total":50,"input":40,"output":10,"reasoning":0,"cache":{"write":0,"read":0}},"cost":-5}', 1762000400002),
+                ('p-neg2', 'm-neg', 's-neg',    '{"type":"step-finish","tokens":{"total":50,"input":40,"output":10,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.002}', 1762000400003),
+                ('p-z1',   'm-zero','s-zero',   '{"type":"step-finish","tokens":{"total":500,"input":400,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}', 1762000500002),
+                ('p-z2',   'm-zero','s-zero',   '{"type":"step-finish","tokens":{"total":200,"input":100,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.0}', 1762000500003),
+                ('p-mx1',  'm-mix', 's-mix',    '{"type":"step-finish","tokens":{"total":500,"input":400,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.5}', 1762000600002),
+                ('p-mx2',  'm-mix', 's-mix',    '{"type":"step-finish","tokens":{"total":200,"input":100,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.0}', 1762000600003);
+            "#,
+        )
+        .expect("seed step-cost fixture");
+        path
+    }
+
+    #[test]
+    fn opencode_step_finish_recorded_cost_bills_the_full_precedence_matrix() {
+        // rm-1399: opencode step-finish parts carry the cost the
+        // provider computed for that step (live host: gateway model
+        // cliproxyapi/hermes-router, `cost:0.0048786` beside the token
+        // map). The bundled catalog cannot price a gateway model, so
+        // the token-derived estimate billed those sessions $0.00 while
+        // the real dollars sat unread in rows this loader already
+        // parses. Recorded cost now displaces the estimate (rm-436
+        // face value) and rides the recorded-cost basis for the
+        // governance audit — after the session-row `stored_cost`,
+        // which stays the most authoritative source.
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm1399-precedence-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = opencode_step_cost_fixture(&dir);
+        let (sessions, failures, _) = query_opencode_sqlite_sessions(&path, None);
+        assert_eq!(
+            sessions.len(),
+            7,
+            "all seven sessions must load: {failures:?}"
+        );
+        let find = |start_unix: f64| {
+            let start = unix_seconds_rfc3339(start_unix);
+            sessions
+                .iter()
+                .find(|session| session.metrics.session_start == start)
+                .unwrap_or_else(|| panic!("no session at {start}"))
+        };
+
+        // Gateway session: recorded 0.004 + 0.001 displaces the $0
+        // catalog-less estimate; tokens from the same parts still
+        // counted; basis disclosed for the audit (no upstream_priced
+        // split — the gateway rate is unreproducible, rm-578 arm).
+        let gw = find(1762000000.0);
+        assert_eq!(gw.metrics.model_used, "hermes-router");
+        assert!(
+            (gw.metrics.cost_estimated - 0.005).abs() < 1e-9,
+            "gateway session must bill its recorded dollars, got {}",
+            gw.metrics.cost_estimated
+        );
+        assert_eq!(
+            gw.metrics.provenance.cost,
+            "calculated_from_tokens_with_recorded_cost"
+        );
+        assert!((gw.metrics.upstream_cost_usd - 0.005).abs() < 1e-9);
+        assert_eq!(
+            gw.metrics
+                .disclosure_counters
+                .get("opencode_step_cost_parts"),
+            Some(&2),
+            "both contributing parts are disclosed"
+        );
+        assert_eq!(gw.metrics.tokens_input, 1785);
+        assert_eq!(gw.metrics.tokens_output, 402);
+        assert_eq!(gw.metrics.tokens_cache_r, 29120);
+        assert!(
+            !gw.metrics
+                .disclosure_counters
+                .contains_key("recorded_cost_zero_blocks"),
+            "every gateway part carried real dollars here"
+        );
+
+        // Catalog model: recorded cost displaces its own estimate too —
+        // the gateway's negotiated rate is the billing truth either way.
+        let cat = find(1762000100.0);
+        assert_eq!(cat.metrics.model_used, "claude-sonnet-4");
+        assert!((cat.metrics.cost_estimated - 0.25).abs() < 1e-9);
+        assert_eq!(
+            cat.metrics.provenance.cost,
+            "calculated_from_tokens_with_recorded_cost"
+        );
+        // Review pin (bb46560c F4): the displaced catalog estimate is
+        // retained in cents — the estimated side of the
+        // recorded-vs-estimated disclosure survives the displacement.
+        let displaced_cat = (crate::round4(token_cost_raw(400, 100, 0, 0, "claude-sonnet-4"))
+            * 100.0)
+            .round() as usize;
+        assert_eq!(
+            cat.metrics
+                .disclosure_counters
+                .get("recorded_cost_displaced_estimate_cents"),
+            Some(&displaced_cat),
+            "the displaced estimate must be retained for rm-795's oracle"
+        );
+
+        // Session-row stored cost outranks part-recorded cost (0.004
+        // ignored, 9.9 kept, no recorded-cost basis at all).
+        let stored = find(1762000200.0);
+        assert!((stored.metrics.cost_estimated - 9.9).abs() < 1e-9);
+        assert_eq!(stored.metrics.provenance.cost, "reported_by_agent");
+        assert_eq!(stored.metrics.upstream_cost_usd, 0.0);
+        assert_eq!(stored.metrics.provenance.tokens, "stored_session_totals");
+
+        // Corrupt negative part cost is ignored, not trusted: only the
+        // usable 0.002 is billed and only one part is disclosed.
+        let neg = find(1762000400.0);
+        assert!((neg.metrics.cost_estimated - 0.002).abs() < 1e-9);
+        assert_eq!(
+            neg.metrics
+                .disclosure_counters
+                .get("opencode_step_cost_parts"),
+            Some(&1)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_step_finish_without_cost_keeps_the_legacy_estimate() {
+        // rm-1399 acceptance: a part without `cost` changes nothing —
+        // tokens re-priced at the session model's catalog rate, the
+        // legacy provenance string, no recorded-cost basis, no
+        // disclosure counter. Byte-identical lane behavior.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-rm1399-legacy-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = opencode_step_cost_fixture(&dir);
+        let (sessions, _, _) = query_opencode_sqlite_sessions(&path, None);
+        let start = unix_seconds_rfc3339(1762000300.0);
+        let nc = sessions
+            .iter()
+            .find(|session| session.metrics.session_start == start)
+            .expect("legacy session");
+        let expected = crate::round4(token_cost_raw(400, 100, 0, 0, "claude-sonnet-4"));
+        assert_eq!(
+            nc.metrics.cost_estimated, expected,
+            "no recorded cost — the catalog estimate stands unchanged"
+        );
+        assert_eq!(nc.metrics.provenance.cost, "calculated_per_message_tokens");
+        assert_eq!(nc.metrics.upstream_cost_usd, 0.0);
+        assert!(!nc
+            .metrics
+            .disclosure_counters
+            .contains_key("opencode_step_cost_parts"));
+        assert_eq!(nc.metrics.tokens_input, 400);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_recorded_zero_with_tokens_keeps_the_estimate_and_discloses() {
+        // Review fix (independent_review bb46560c F1/F4, rm-1399). F1:
+        // a recorded $0 on priced tokens is a gateway that never
+        // priced the call — free-tier and unpriced are
+        // indistinguishable at the wire — so the minted acceptance
+        // ("catalog estimate only when absent/zero-with-tokens") keeps
+        // the catalog estimate authoritative there. The old code
+        // accumulated the zero as a recorded part and billed $0.0000
+        // as "recorded"; now the estimate stands and the zero is
+        // DISCLOSED via `recorded_cost_zero_blocks` (the rm-1052
+        // pi-lane vocabulary). F4: when real recorded dollars do
+        // displace an estimate, the displaced estimate is retained
+        // (`recorded_cost_displaced_estimate_cents`) instead of being
+        // destroyed, so acceptance (2)'s recorded-vs-estimated render
+        // and rm-795's divergence oracle keep an estimated side.
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-rm1399-zeroblocks-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = opencode_step_cost_fixture(&dir);
+        let (sessions, failures, _) = query_opencode_sqlite_sessions(&path, None);
+        assert!(
+            failures.unreadable.is_none() && failures.dropped == 0,
+            "{failures:?}"
+        );
+        let find = |start_unix: f64| {
+            let start = unix_seconds_rfc3339(start_unix);
+            sessions
+                .iter()
+                .find(|session| session.metrics.session_start == start)
+                .unwrap_or_else(|| panic!("no session at {start}"))
+        };
+
+        // Zero-with-tokens session: both parts carry cost:0 on priced
+        // tokens. The catalog estimate (500 input + 200 output at the
+        // session model's rate) must stand — NOT a billed $0 with a
+        // recorded-cost basis — and both zero parts are disclosed.
+        let zero = find(1762000500.0);
+        let expected = crate::round4(token_cost_raw(500, 200, 0, 0, "claude-sonnet-4"));
+        assert_eq!(
+            zero.metrics.cost_estimated, expected,
+            "zero-with-tokens must keep the catalog estimate, not bill $0"
+        );
+        assert_eq!(
+            zero.metrics.provenance.cost,
+            "calculated_per_message_tokens"
+        );
+        assert_eq!(zero.metrics.upstream_cost_usd, 0.0);
+        assert!(!zero
+            .metrics
+            .disclosure_counters
+            .contains_key("opencode_step_cost_parts"));
+        assert_eq!(
+            zero.metrics
+                .disclosure_counters
+                .get("recorded_cost_zero_blocks"),
+            Some(&2),
+            "both gateway-unpriced parts are disclosed"
+        );
+        assert!(!zero
+            .metrics
+            .disclosure_counters
+            .contains_key("recorded_cost_displaced_estimate_cents"));
+
+        // Mixed session: one part records real dollars (0.5), one
+        // records a zero on priced tokens. The real dollars win, the
+        // zero part is still disclosed, and the displaced estimate
+        // (all tokens at the catalog rate) is retained in cents.
+        let mix = find(1762000600.0);
+        assert!((mix.metrics.cost_estimated - 0.5).abs() < 1e-9);
+        assert_eq!(
+            mix.metrics.provenance.cost,
+            "calculated_from_tokens_with_recorded_cost"
+        );
+        assert!((mix.metrics.upstream_cost_usd - 0.5).abs() < 1e-9);
+        assert_eq!(
+            mix.metrics
+                .disclosure_counters
+                .get("opencode_step_cost_parts"),
+            Some(&1),
+            "only the real-dollar part contributes"
+        );
+        assert_eq!(
+            mix.metrics
+                .disclosure_counters
+                .get("recorded_cost_zero_blocks"),
+            Some(&1),
+            "the zero part is disclosed beside the recorded dollars"
+        );
+        let displaced = (crate::round4(token_cost_raw(500, 200, 0, 0, "claude-sonnet-4")) * 100.0)
+            .round() as usize;
+        assert_eq!(
+            mix.metrics
+                .disclosure_counters
+                .get("recorded_cost_displaced_estimate_cents"),
+            Some(&displaced),
+            "the displaced catalog estimate survives for the divergence oracle"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

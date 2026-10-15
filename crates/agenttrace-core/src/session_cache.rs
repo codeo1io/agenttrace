@@ -859,7 +859,28 @@ pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
 // ledger; the bump also composes with the landed rm-753/rm-734
 // poison gate (fail-closed reads never bank) and the schema-11
 // eviction retires any v10 entry a pre-gate binary already banked.
-const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 12;
+// Bumped 12 → 13 (rm-1399, repository-maintenance run c2f2765c
+// cycle 2, batch 'local-evidence integrity + gateway cost truth'):
+// opencode step-finish parts began contributing their
+// gateway-recorded cost (`part.data.cost`) — recorded dollars
+// displace the token-derived estimate (a session-row `stored_cost`
+// still outranks them) and ride `upstream_cost_usd` with the
+// `opencode_step_cost_parts` disclosure counter. Review fix
+// (independent_review bb46560c): only NON-ZERO part costs displace —
+// a recorded $0 on priced tokens keeps the catalog estimate
+// (disclosed via `recorded_cost_zero_blocks`, rm-1052 vocabulary)
+// and a displacement retains the displaced estimate
+// (`recorded_cost_displaced_estimate_cents`). v13 ships these
+// semantics: the zero arm was corrected before any v13 snapshot
+// existed outside the uncommitted batch, so no further bump. A warm
+// v12 snapshot keeps serving the old estimate — $0.00 or a
+// wrong-model alias price for gateway-routed sessions like
+// cliproxyapi/hermes-router — so every snapshot banked before the
+// lane read `cost` regenerates once, in place (rm-230 convention:
+// a loader-semantics change that alters reported totals for
+// unchanged databases bumps the snapshot schema). The JSONL session
+// cache stays at 64 — this rung moves no JSONL-lane accounting.
+const SQLITE_SNAPSHOT_SCHEMA_VERSION: i64 = 13;
 
 /// Orphaned temp files (crashed writers) are swept when the cache loads.
 /// Live writers finish quickly; one hour is generous enough that a sweep
@@ -3588,7 +3609,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_snapshot_schema_twelve_round_trips_provenance_and_rejects_older_schemas() {
+    fn sqlite_snapshot_schema_thirteen_round_trips_provenance_and_rejects_older_schemas() {
         let root = std::env::temp_dir().join(format!(
             "agenttrace-sqlite-schema-{}-{:?}",
             std::process::id(),
@@ -3640,6 +3661,16 @@ mod tests {
         let raw = fs::read_to_string(&snapshot).expect("read snapshot");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("snapshot json");
         let ledger_key = database.to_string_lossy().to_string();
+        // Version thirteen (rm-1399, repository-maintenance run
+        // c2f2765c cycle 2): opencode step-finish part rows began
+        // contributing their gateway-recorded cost — a banked
+        // snapshot from before the lane read `part.data.cost`
+        // replays the token-derived estimate ($0.00 or a
+        // wrong-model alias price on gateway-routed sessions) while
+        // a fresh parse of the same database bills the recorded
+        // dollars, so every older snapshot regenerates once, in
+        // place.
+        //
         // Version twelve (rm-991, cycle 2 of run b5affead): the
         // opencode `session.agent` name and the `summary_*` diff
         // columns joined the snapshot payload — a banked snapshot
@@ -3664,7 +3695,7 @@ mod tests {
         // and the raw parent row id; v8 (rm-548/rm-734) — the opencode
         // fork-exclusion count plus the poison-gate eviction; v7
         // (rm-198) — hermes tool outcome semantics.
-        assert_eq!(doc["schema_version"], 12);
+        assert_eq!(doc["schema_version"], 13);
         assert_eq!(
             doc["entries"][ledger_key.as_str()]["sessions"][0]["Metrics"]["Provenance"]["Tokens"]
                 .as_str(),
@@ -3676,7 +3707,7 @@ mod tests {
             "the stored-versus-derived delta must survive the snapshot cache"
         );
         let loaded =
-            load_sqlite_snapshot_from(&database, &snapshot).expect("schema twelve cache hit");
+            load_sqlite_snapshot_from(&database, &snapshot).expect("schema thirteen cache hit");
         let (loaded, _) = loaded;
         assert_eq!(loaded[0].metrics.provenance.duration, "timestamp_span");
         assert_eq!(loaded[0].metrics.stored_totals_delta, 720);
