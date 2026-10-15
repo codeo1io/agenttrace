@@ -4,6 +4,46 @@
 
 ### Added
 
+- codex MultiAgent V2 replayed prefixes are counted once per family (rm-402,
+  run aa36ecb0 cycle 3; review af521003 fixes): a multi-agent child rollout
+  opens by replaying the parent's transcript as its own context, so a corpus
+  that summed per-rollout usage billed the replay twice (acceptance PoC:
+  parent final 1,400 + child-from-zero 1,700 = 3,100 reported vs 1,700 true,
+  +82%). Corpus assembly now fingerprints each rollout's opening
+  `response_item` payloads; members of a family sharing a byte-identical
+  opening (2+ items and at least 384 bytes of shared transcript — short
+  identical openings are prompt retries or templated first turns, not
+  replays) inherit the earliest starter's final cumulative token snapshot
+  as a saturating baseline, keeping only their own delta — the prefix stays
+  counted once, attributed to the parent. The earliest starter is resolved
+  from the rollout file's own first timestamp (re-derived from disk, so the
+  session cache's dropped `metrics.timestamps` cannot invert the roles on a
+  warm run), with the canonical path as a deterministic tie-break. A child
+  whose final snapshot falls below the parent's on any field (concurrent
+  spawn) is left intact and disclosed via
+  `codex_multiagent_replay_skipped_below_baseline` instead of being
+  saturated to zero under a replay label. Children priced from
+  upstream-recorded costs are skipped (token recompute would be dishonest)
+  and disclosed via `codex_multiagent_replay_skipped_upstream_priced`;
+  adjusted children carry `codex_multiagent_replayed_child_adjusted` and
+  `codex_multiagent_replayed_tokens_dropped` through the existing
+  disclosure-counter channel, and their rebased cost uses the same per-Mtok
+  catalog formula the analyze pass applies (each class /1e6 at its own
+  rate). The TUI reconciles at both load sites and discloses adjusted
+  children in its Ready summary. Corpora without a family — including every
+  single-file codex corpus — are untouched.
+
+- statusline budget series excludes future-dated journal samples and
+  discloses them (rm-727, run aa36ecb0 cycle 3): a future-dated journal
+  capture (clock skew, hostile edit) must never bill into a statusline
+  budget window. The budget window is now the calendar range ending at
+  today — future-only sampled days fall outside it, are counted in a new
+  `excluded_future_days` disclosure (JSON + rendered line), and the
+  degenerate zero-day window labels its exclusions by side instead of
+  reporting a future-only journal as excluded-as-older. Far-future samples
+  cannot evict real sampled days from the window (pinned by test against
+  the row's literal 12-25 PoC shape).
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
@@ -225,6 +265,17 @@
 
 ### Fixed
 
+- `--fetch` before the `statusline`/`mcp` keywords now fails loudly instead of
+  being silently swallowed (rm-558, run aa36ecb0 cycle 3): the offline
+  keyword lanes dispatch the host command before the rm-505 trailing-flag
+  guard ever runs, so `agenttrace --fetch statusline` looked like an honored
+  flag while the fully-offline host command ignored it — the exact
+  keyword-shadowing class rm-573 closed for report flags. The keyword lanes
+  now pre-flight positional-report-only flags and exit with a named usage
+  error naming the flag and the lane; the `upstream` keyword legitimately
+  consumes `--fetch` (network is its purpose) and stays quiet. Report- and
+  diagnostics-side journal readers are pinned read-only so an invocation
+  requesting a report can never grow the journal it is summarizing.
 - statusline context-window truths now parse `context_window()` exactly once per capture: the peak-utilization fold and the per-session latest-window list share a single pre-parsed vector instead of each cloning + serde-parsing the payload (rm-921 residual, run 4401a380 cycle 2; pinned by `context_window_parsed_once_per_capture`).
 - `tests/otel_export` fixture directories are now unique per call (atomic per-process suffix instead of the constant `line!()`), closing the intra-process window where one suite's truncating fixture rewrite could be observed mid-write by another suite's parse (rm-1065, run 4401a380 cycle 2; pinned by `fixture_dirs_are_unique_per_call`).
 - the Codex plugin version sync gate is green in full clones again: the 49 merged legacy tags (v0.0.4 and the v0.3.x line) that predate per-release CHANGELOG sections now carry explicit `no-changelog-section` markers (rm-1064, run 4401a380 cycle 2).
