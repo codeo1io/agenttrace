@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-/tmp/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
 fail() {
   echo "check-deterministic-output: $*" >&2
   exit 1
 }
+
+# rm-377 (2026-10-14): the binary default must be the repo's own release
+# build, not /tmp/agenttrace — /tmp persists across sessions on the CI fleet
+# and a days-old /tmp/agenttrace silently validated gate runs (observed
+# 2026-10-03 in check-docs-commands, recurred 2026-10-14 when the gate
+# battery passed against an Oct-13 build). AGENTTRACE_BIN still overrides
+# for A/B against a pinned build.
+repo_root="$(git rev-parse --show-toplevel)" \
+  || fail "must run inside the agenttrace repository (or set AGENTTRACE_BIN)"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir/determinism"
