@@ -17,6 +17,14 @@
 //! - `ses-diff-malformed` — payload is not JSON (must count, not drop);
 //! - `ses-diff-empty`     — `[]` decodes to an empty list (still Some).
 //!
+//! Fixture `opencode-summary-diffs/hostile.db` rows (review fix F1/F5,
+//! attempt 03ec687a):
+//! - `ses-diff-hostile` — two i64::MAX per-file additions: every sum
+//!   (divergence fold AND the delivery-evidence line) must saturate,
+//!   never overflow (debug panic) or wrap (release negative);
+//! - `ses-diff-blob`    — the payload is present but stored in BLOB
+//!   storage class: counted as dropped, never silently absent.
+//!
 //! The rm-991 contract (`opencode_agent_summary.rs`) stays the
 //! authority for the legacy column set; the fixtures there are
 //! untouched and must keep parsing byte-identically.
@@ -244,6 +252,57 @@ fn delivery_evidence_carries_per_file_and_divergence_lines() {
         "divergence disclosure line missing: {:?}",
         divergent.evidence
     );
+}
+
+#[test]
+fn hostile_magnitudes_saturate_across_both_sums() {
+    // Review fix F1: the live CLI PoC planted exactly this shape (two
+    // i64::MAX additions) and `--delivery-evidence` panicked debug
+    // builds with 'attempt to add with overflow' (release wrapped to
+    // -2). Both disclosure surfaces must saturate, and they must
+    // agree with each other: the divergence fold saturates to
+    // i64::MAX, the integer column records i64::MAX, so equality
+    // holds and no divergence is flagged.
+    let sessions = loaded("opencode-summary-diffs/hostile.db");
+    let hostile = session_named(&sessions, "ses-diff-hostile");
+    assert_eq!(hostile.metrics.summary_diffs.as_ref().unwrap().len(), 2);
+    assert!(
+        hostile.metrics.summary_diffs_divergence.is_none(),
+        "saturated per-file sums must equal the i64::MAX summary column"
+    );
+    let report = delivery_evidence(&sessions);
+    let record = report
+        .sessions
+        .iter()
+        .find(|record| record.session.contains("hostile saturates"))
+        .expect("hostile record");
+    assert!(
+        record.evidence.iter().any(|line| line
+            == "writer-reported per-file diff summary: 2 files (+9223372036854775807/-2)"),
+        "evidence sums must pin at i64::MAX: {:?}",
+        record.evidence
+    );
+}
+
+#[test]
+fn blob_storage_payload_counts_as_dropped() {
+    // Review fix F5: SQLite columns are dynamically typed — a payload
+    // present in BLOB storage (valid JSON bytes, wrong storage class)
+    // must be COUNTED as dropped, not read as absent. Only SQL NULL
+    // is absence.
+    let sessions = loaded("opencode-summary-diffs/hostile.db");
+    let blob = session_named(&sessions, "ses-diff-blob");
+    assert!(
+        blob.metrics.summary_diffs.is_none(),
+        "non-TEXT payload does not decode"
+    );
+    assert_eq!(
+        blob.metrics.summary_diffs_dropped, 1,
+        "present-but-BLOB payload is COUNTED"
+    );
+    assert!(blob.metrics.summary_diffs_divergence.is_none());
+    // The session itself survives.
+    assert!((blob.metrics.cost_estimated - 0.0).abs() < 1e-9);
 }
 
 #[test]

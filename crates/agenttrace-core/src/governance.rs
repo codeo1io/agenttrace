@@ -1228,8 +1228,24 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
             .as_ref()
             .filter(|diffs| !diffs.is_empty())
         {
-            let additions: i64 = diffs.iter().map(|diff| diff.additions).sum();
-            let deletions: i64 = diffs.iter().map(|diff| diff.deletions).sum();
+            // Review fix F1 (attempt 03ec687a): the evidence line
+            // sums SATURATE, exactly like `summary_diffs_divergence`
+            // in sqlite_sessions.rs — a hostile payload of i64::MAX
+            // per-file entries must disclose pinned maxima, never
+            // overflow the disclosure arithmetic (the plain `.sum()`
+            // here panicked debug builds and wrapped negative in
+            // release). Keeping both sites on the same saturating
+            // fold also means the evidence line and the divergence
+            // disclosure can never disagree with each other.
+            let (additions, deletions) =
+                diffs
+                    .iter()
+                    .fold((0i64, 0i64), |(additions, deletions), diff| {
+                        (
+                            additions.saturating_add(diff.additions),
+                            deletions.saturating_add(diff.deletions),
+                        )
+                    });
             evidence.push(format!(
                 "writer-reported per-file diff summary: {} files (+{}/-{})",
                 diffs.len(),
@@ -2358,6 +2374,46 @@ mod tests {
         assert_eq!(report.sessions[0].confidence, "medium");
         assert!(report.confidence_note.contains("not attributable"));
         assert!(report.confidence_note.contains("time-window heuristic"));
+    }
+
+    #[test]
+    fn delivery_evidence_saturates_hostile_per_file_sums() {
+        // Review fix F1 (attempt 03ec687a): the per-file evidence sums
+        // must SATURATE. Before the fix this exact shape panicked debug
+        // builds ('attempt to add with overflow', rc 101 — the live CLI
+        // PoC planted two i64::MAX additions) and wrapped to -2 in
+        // release, contradicting the CHANGELOG's saturation claim. The
+        // pinned expectation: both maxima disclose as i64::MAX and the
+        // deletions sum normally alongside them.
+        let mut value = session("hostile");
+        value.metrics.summary_diffs = Some(vec![
+            crate::SessionFileDiff {
+                file: Some("src/a.rs".to_string()),
+                additions: i64::MAX,
+                deletions: 1,
+                status: None,
+            },
+            crate::SessionFileDiff {
+                file: Some("src/b.rs".to_string()),
+                additions: i64::MAX,
+                deletions: 1,
+                status: None,
+            },
+        ]);
+        let report = delivery_evidence(&[value]);
+        let line = report.sessions[0]
+            .evidence
+            .iter()
+            .find(|line| line.contains("writer-reported per-file diff summary"))
+            .expect("per-file summary evidence line");
+        assert_eq!(
+            line.as_str(),
+            format!(
+                "writer-reported per-file diff summary: 2 files (+{}/-2)",
+                i64::MAX
+            ),
+            "saturating sums must pin at i64::MAX, never overflow or wrap"
+        );
     }
 
     #[test]

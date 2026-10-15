@@ -810,14 +810,24 @@ fn opencode_sqlite_session_rows(
         // aggregate — one session row maps to one aggregate, so the
         // drop count lands per-session by construction. A payload
         // that fails to decode is COUNTED, never a hard error and
-        // never silently re-derived.
-        let (summary_diffs, summary_diffs_dropped) = match sqlite_value_as_text(row.get(16)?)
-            .as_deref()
-            .map(serde_json::from_str::<Vec<SessionFileDiff>>)
-        {
-            Some(Ok(list)) => (Some(list), 0),
-            Some(Err(_)) => (None, 1),
-            None => (None, 0),
+        // never silently re-derived. Review fix F5 (attempt
+        // 03ec687a): SQLite columns are dynamically typed, so a
+        // PRESENT-but-non-TEXT payload (BLOB/INTEGER/REAL storage)
+        // is counted as dropped too — reading it as absent would
+        // neither surface it nor count it, against this lane's
+        // posture. Only SQL NULL reads as absent.
+        let (summary_diffs, summary_diffs_dropped) = {
+            let payload: Option<rusqlite::types::Value> = row.get(16)?;
+            match payload {
+                None => (None, 0),
+                Some(rusqlite::types::Value::Text(text)) => {
+                    match serde_json::from_str::<Vec<SessionFileDiff>>(&text) {
+                        Ok(list) => (Some(list), 0),
+                        Err(_) => (None, 1),
+                    }
+                }
+                Some(_) => (None, 1),
+            }
         };
         Ok((
             id.clone(),
