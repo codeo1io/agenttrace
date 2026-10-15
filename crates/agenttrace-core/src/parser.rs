@@ -6249,7 +6249,10 @@ fn is_opencode_storage_session_file(path: &str) -> bool {
 }
 
 fn opencode_storage_rel(path: &str) -> Option<String> {
-    if let Ok(root) = std::env::var("OPENCODE_DATA_DIR") {
+    // var_os parity with discovery::opencode_storage_roots (rm-1428): a
+    // non-UTF-8 OPENCODE_DATA_DIR must still resolve here — env::var silently
+    // degraded it to the marker heuristic below while discovery found the root.
+    if let Some(root) = std::env::var_os("OPENCODE_DATA_DIR") {
         if !root.is_empty() {
             if let Some(rel) = rel_from_root(Path::new(&root), Path::new(path)) {
                 return Some(rel);
@@ -8037,6 +8040,73 @@ fn session_name(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_storage_rel_accepts_non_utf8_data_dir() {
+        // rm-1428 (red-first): discovery resolves OPENCODE_DATA_DIR with var_os
+        // (discovery.rs opencode_storage_roots); this parser used env::var, so a
+        // non-UTF-8 override value silently degraded to the "/opencode/storage"
+        // path-marker heuristic — the same file classified differently in the
+        // two halves of ingestion. The override dir is non-UTF-8 on disk; the
+        // parser only ever sees the UTF-8 symlink handle.
+        use std::os::unix::ffi::OsStringExt;
+        let base = std::env::temp_dir().join(format!("at_rm1428_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let data_dir = base.join(std::ffi::OsString::from_vec(b"data\xff".to_vec()));
+        let file = data_dir
+            .join("storage")
+            .join("session")
+            .join("proj-1")
+            .join("ses.json");
+        std::fs::create_dir_all(file.parent().unwrap()).expect("mkdir non-utf8 data dir");
+        std::fs::write(&file, b"{}\n").expect("write fixture session");
+        let link = base.join("link-to-session.json");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink fixture");
+
+        let prior = std::env::var_os("OPENCODE_DATA_DIR");
+        std::env::set_var("OPENCODE_DATA_DIR", &data_dir);
+        let resolved = opencode_storage_rel(&link.to_string_lossy());
+        match prior {
+            Some(v) => std::env::set_var("OPENCODE_DATA_DIR", v),
+            None => std::env::remove_var("OPENCODE_DATA_DIR"),
+        }
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("storage/session/proj-1/ses.json"),
+            "non-UTF-8 OPENCODE_DATA_DIR must resolve like discovery (var_os parity)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cap_session_cwd_backs_off_to_char_boundaries() {
+        // rm-1429 pin: truncation must never split a multi-byte character
+        // (regression class: tokscale #1440 — a sibling tracker's byte-tail
+        // slices panicked on multi-byte model names; the same class would
+        // panic on truncation).
+        let raw = format!("{}{}", "a".repeat(4095), "模型"); // 4095 + 6 bytes
+        let (capped, truncated) = cap_session_cwd(&raw);
+        assert!(truncated);
+        assert_eq!(
+            capped.len(),
+            4095,
+            "caps at the last whole character <= 4096 bytes"
+        );
+        assert!(capped.chars().all(|c| c == 'a'));
+
+        let exact = "a".repeat(4096);
+        let (capped, truncated) = cap_session_cwd(&exact);
+        assert!(!truncated);
+        assert_eq!(capped, exact);
+
+        let all_cjk = "好".repeat(1366); // 4098 bytes; the cut lands mid-char -> back off to 4095
+        let (capped, truncated) = cap_session_cwd(&all_cjk);
+        assert!(truncated);
+        assert_eq!(capped.chars().count(), 1365);
+        assert!(capped.chars().all(|c| c == '好'));
+    }
 
     #[test]
     fn codex_total_usage_rewind_after_compaction_counts_forward() {

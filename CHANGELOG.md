@@ -225,6 +225,13 @@
 
 ### Fixed
 
+- opencode `OPENCODE_DATA_DIR` overrides are read as an OS string (rm-1428,
+  run 8d2e5dd6 cycle 3): the parser used `env::var`, so a non-UTF-8 data-dir
+  value silently degraded to the `/opencode/storage` path-marker fallback
+  while discovery — reading the same variable with `var_os` — still found the
+  root: sessions could be located but misclassified. Both halves of ingestion
+  now resolve the override identically.
+
 - blank/whitespace `--search` is rejected instead of silently matching nothing
   (rm-988, run b5affead cycle 2): `--search ''` (or a whitespace-only paste)
   exited 0 with `{"query":"","count":0,"results":[]}` — an unquoted empty

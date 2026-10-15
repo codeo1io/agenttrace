@@ -2220,6 +2220,10 @@ pub(super) fn detail_diagnosis_text(session: &Session, language: Language) -> St
 }
 
 pub(super) fn short_path(path: &str, max: usize) -> String {
+    // Display-only tilde collapse: a non-UTF-8 HOME renders lossily here by
+    // design; ingestion-side root overrides must read var_os (rm-1428).
+    // Display-only tilde collapse for the statusline: a non-UTF-8 HOME renders
+    // lossily by design here. Ingestion-side root overrides read var_os (rm-1428).
     let home = std::env::var("HOME").ok();
     let display = home
         .as_deref()

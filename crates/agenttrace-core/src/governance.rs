@@ -2124,10 +2124,14 @@ mod tests {
         std::fs::set_permissions(shim_dir.join("git"), std::fs::Permissions::from_mode(0o755))
             .expect("chmod git shim");
         let previous_path = std::env::var_os("PATH");
-        std::env::set_var(
-            "PATH",
-            format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
-        );
+        // Build the override as an OsString so a non-UTF-8 PATH survives the
+        // prepend intact (var_os consistency with the capture above; rm-1428).
+        let mut shim_path: std::ffi::OsString = shim_dir.as_os_str().to_owned();
+        shim_path.push(":");
+        if let Some(prior) = &previous_path {
+            shim_path.push(prior);
+        }
+        std::env::set_var("PATH", shim_path);
         let started = std::time::Instant::now();
         let commits = git_commits(root.to_str().expect("utf-8 root"));
         if let Some(path) = previous_path {

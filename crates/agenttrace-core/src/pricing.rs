@@ -2053,6 +2053,37 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn normalize_model_survives_hostile_multi_byte_names() {
+        // rm-1429 pin (regression oracle: tokscale #1440 — a sibling tracker's
+        // `&name[name.len() - 8..]` byte-tail slice panicked on multi-byte model
+        // names). Every arm below must stay character-boundary-safe and return
+        // the expected normalized form — no panic, no mojibake.
+        // Byte-tail shape: len() - 8 lands mid-character — no slicing may panic.
+        assert_eq!(
+            normalize_model("sonnet-4-5-模型模型"),
+            "sonnet-4-5-模型模型"
+        );
+
+        // Path/marker/date/version arms with multi-byte payloads.
+        assert_eq!(
+            normalize_model("openrouter/anthropic/claude-3.7-sonnet"),
+            "claude-3.7-sonnet"
+        );
+        assert_eq!(normalize_model("claude-模型-2026-01-02"), "claude-模型");
+        assert_eq!(normalize_model("gpt-4o-🚀:v2"), "gpt-4o-🚀");
+        assert_eq!(normalize_model("gemini-2.5-pro@2026.03"), "gemini-2.5-pro");
+        assert_eq!(normalize_model("claude-3-é@1"), "claude-3-é");
+        assert_eq!(normalize_model("中文.anthropic.claude"), "claude");
+        assert_eq!(normalize_model("provider/20rescue"), "provider/20rescue");
+
+        assert_eq!(strip_date_suffix("模型-9999"), "模型");
+        assert_eq!(strip_date_suffix("a-2026-01-02"), "a");
+        assert_eq!(strip_version_suffix("模型:12.5"), "模型");
+        assert_eq!(strip_version_suffix("a@v3.1"), "a");
+        assert_eq!(strip_version_suffix("🚀"), "🚀");
+    }
+
+    #[test]
     fn pricing_cache_path_honors_session_cache_env() {
         // rm-575: the pricing catalog joins the session cache's
         // relocation contract. A non-empty AGENTTRACE_SESSION_CACHE_DIR
