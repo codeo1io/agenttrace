@@ -8,7 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn fixture_dir(tag: &str, lines: &[String]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("at-csv-{tag}"));
+    // rm-369: the conductor fleet runs many sibling worktrees against
+    // one shared /tmp; a fixed `at-csv-{tag}` name lets a sibling's
+    // cleanup sweep delete this dir mid-test (observed live as a
+    // determinism-test failure). The pid suffix keeps every process on
+    // its own dir; within-process reuse across the two runs of the
+    // determinism test is unchanged.
+    let dir = std::env::temp_dir().join(format!("at-csv-{tag}-{}", std::process::id()));
     fs::create_dir_all(&dir).expect("mkdir fixture dir");
     fs::write(dir.join("session.jsonl"), lines.join("\n") + "\n").expect("write fixture");
     dir

@@ -1873,6 +1873,7 @@ fn waste_report_format_matrix_pins_every_machine_surface() {
     );
 }
 
+#[cfg(unix)] // rm-1388: symlink alias corpus — std::os::unix::fs::symlink
 #[test]
 fn cli_alias_paths_report_one_session() {
     // rm-597 (run 250cfd64, cycle 4; minted campaign-locally as rm-511,
@@ -2204,7 +2205,7 @@ fn output_to_dev_stdout_lands_the_report_on_stdout() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(unix)] // rm-1388: fifo special-target refusal — std::os::unix::fs::FileTypeExt + mkfifo
 #[test]
 fn output_to_fifo_is_refused_and_never_replaces_the_pipe() {
     // rm-489 (re-based at integration, conflict case

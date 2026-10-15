@@ -257,3 +257,72 @@ fn fixture_codex_flex_journal() -> String {
     )
     .to_string()
 }
+
+fn fixture_journal_with(model: &str) -> String {
+    format!(
+        concat!(
+            "{{\"id\":\"h1\",\"timestamp\":\"2026-10-05T10:00:00.000Z\",\"type\":\"session\",\"version\":3,\"cwd\":\"/tmp/warm\"}}\n",
+            "{{\"id\":\"e1\",\"parentId\":\"h1\",\"timestamp\":\"2026-10-05T10:00:01.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"go\"}}]}}}}\n",
+            "{{\"id\":\"e2\",\"parentId\":\"e1\",\"timestamp\":\"2026-10-05T10:00:02.000Z\",\"type\":\"message\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}],\"model\":\"{model}\",\"usage\":{{\"input\":1000000,\"output\":1000000,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":2000000}}}}}}\n"
+        ),
+        model = model
+    )
+}
+
+#[test]
+fn catalog_keyed_alias_overrides_reprice_the_raw_row() {
+    // Review F1 (run 7bb862e4 cycle 3, independent_review fbc04223):
+    // `claude-sonnet-4-5` keys a catalog row, so the rm-1053 raw-first
+    // lookup ignored a user AGENTTRACE_PRICING_FILE alias on it —
+    // billing the untouched base row ($18.00 for 1M/1M) while the CLI
+    // header disclosed "+ user overrides applied (0 model(s),
+    // 1 alias(es))". rm-511: an alias supplies identity — it must win.
+    // Both redirect targets are themselves catalog rows: the plain
+    // opus row (5.0/25.0 -> $30.00) and the us regional twin
+    // (3.3/16.5 -> $19.80).
+    let root = unique_root("alias-f1");
+    let journal = root.join("corpus/journal.jsonl");
+    fs::write(&journal, fixture_journal_with("claude-sonnet-4-5")).expect("write fixture");
+    let opus_redirect = root.join("alias-opus.json");
+    fs::write(
+        &opus_redirect,
+        "{\"aliases\":{\"claude-sonnet-4-5\":\"claude-opus-4-6\"}}",
+    )
+    .expect("write opus redirect");
+    let twin_redirect = root.join("alias-twin.json");
+    fs::write(
+        &twin_redirect,
+        "{\"aliases\":{\"claude-sonnet-4-5\":\"us.anthropic.claude-sonnet-4-5-20250929-v1:0\"}}",
+    )
+    .expect("write twin redirect");
+
+    let baseline = run_agenttrace(&root, None);
+    assert_eq!(baseline.cost, 18.0, "1M/1M on the base sonnet row is $18");
+    let opus = run_agenttrace(&root, Some(&opus_redirect));
+    assert_eq!(
+        opus.cost, 30.0,
+        "alias -> opus must reprice onto the opus row (was silently $18.00 — review F1)"
+    );
+    assert!(
+        opus.pricing_source.contains("alias") || opus.pricing_source.contains("override"),
+        "the alias override must stay disclosed in the provenance, got {}",
+        opus.pricing_source
+    );
+    let twin = run_agenttrace(&root, Some(&twin_redirect));
+    assert_eq!(
+        twin.cost, 19.8,
+        "alias -> us twin must reprice onto the twin row (was silently $18.00 — review F1)"
+    );
+    // rm-1053 stays intact: the raw twin id, with no alias, bills its
+    // own row.
+    let twin_root = unique_root("alias-f1-twin");
+    fs::write(
+        twin_root.join("corpus/journal.jsonl"),
+        fixture_journal_with("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+    )
+    .expect("write twin fixture");
+    let twin_raw = run_agenttrace(&twin_root, None);
+    assert_eq!(twin_raw.cost, 19.8, "the raw twin id keeps its own row");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(twin_root);
+}

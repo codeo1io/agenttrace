@@ -193,7 +193,13 @@ fn workbuddy_torn_tail_discloses_through_both_channels() {
     // pin isolates the disclosure, not an undercount.
     let torn_tail = r#"{"type":"function_call_result","output":"do"#;
     let corpus = format!("{head}\n{message}\n{torn_tail}\n");
-    let path = std::env::temp_dir().join("at-torn-tail-workbuddy.jsonl");
+    // rm-369: pid-suffixed — sibling worktrees share /tmp and a fixed
+    // name invites a mid-test sweep (observed live). See csv_export's
+    // fixture_dir note.
+    let path = std::env::temp_dir().join(format!(
+        "at-torn-tail-workbuddy-{}.jsonl",
+        std::process::id()
+    ));
     fs::write(&path, corpus).expect("write fixture");
     let session = parse_file(&path).expect("torn workbuddy journal still parses");
     assert_eq!(session.metrics.source_tool, "workbuddy");
@@ -220,7 +226,10 @@ fn workbuddy_torn_tail_discloses_through_both_channels() {
 
     // The intact twin discloses nothing — the skip is the reader's truth,
     // not the format's.
-    let intact_path = std::env::temp_dir().join("at-torn-tail-workbuddy-intact.jsonl");
+    let intact_path = std::env::temp_dir().join(format!(
+        "at-torn-tail-workbuddy-intact-{}.jsonl",
+        std::process::id()
+    ));
     fs::write(
         &intact_path,
         format!(

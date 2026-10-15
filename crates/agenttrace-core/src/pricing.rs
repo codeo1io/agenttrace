@@ -145,10 +145,39 @@ pub fn lookup_price(model: &str) -> Price {
 /// "priority", ...) bills at the standard rates. A model without
 /// flex rates bills flex turns at the standard rates: that is the
 /// published behavior (codeburn #1642), not a guess.
+/// rm-1053 (run 7bb862e4 cycle 3) + review F1 (independent_review
+/// fbc04223): the id a rate lookup should consult for `model`. A user
+/// alias override wins even when its source id already keys a catalog
+/// row (rm-511: an alias supplies identity — post-dual-insert nearly
+/// every normalized shorthand keys one); the raw-key fast path serves
+/// the no-alias case only, where it keeps region-prefixed ids (`us.`,
+/// `au.`, `eu.`, `jp.`, `us-gov.anthropic.*`) on their own rows
+/// instead of letting normalize_model collapse them onto the base
+/// model. `resolve_alias` always starts from `normalize_model(model)`,
+/// so an alias key under that normalized id is exactly a redirect.
+fn rate_lookup_key<'a>(model: &'a str, catalog: &PricingCatalog) -> std::borrow::Cow<'a, str> {
+    let trimmed = model.trim();
+    let redirected = catalog.aliases.contains_key(&normalize_model(trimmed));
+    if !redirected && catalog.entries.contains_key(trimmed) {
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+    std::borrow::Cow::Owned(resolve_alias(trimmed, &catalog.aliases))
+}
+
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
-    let model = resolve_alias(model, &catalog.aliases);
-    let mut price = lookup_price_in(&model, &catalog.entries);
+    // rm-1053 (query side): raw-first. resolve_alias applies
+    // normalize_model unconditionally, which used to rewrite the id
+    // BEFORE lookup_price_in could try it — so match_variants' raw arm
+    // only ever saw the normalized string and regional twins
+    // (us./au./eu./jp./us-gov.anthropic.*) could never hit their own
+    // rows. An id that already keys a catalog row prices at that row;
+    // alias resolution stays the path for everything else. Review F1:
+    // a user ALIAS redirect (rm-511 — an alias supplies identity, even
+    // when its source id keys a catalog row) outranks the raw key, so
+    // the decision routes through `rate_lookup_key` above.
+    let model = rate_lookup_key(model, catalog);
+    let mut price = lookup_price_in(model.as_ref(), &catalog.entries);
     if service_tier == Some("flex") {
         if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
             price.input = input;
@@ -169,6 +198,16 @@ pub fn has_specific_price(model: &str) -> bool {
         return false;
     }
     let catalog = pricing_catalog();
+    // rm-1053: keep has_specific_price in lockstep with
+    // lookup_price_tiered — the raw id is a catalog key exactly when
+    // the lookup above will price it at its own row. Review F1: a user
+    // alias redirect outranks the raw key (rm-511), same precedence
+    // as `rate_lookup_key`.
+    if !catalog.aliases.contains_key(&normalize_model(model))
+        && catalog.entries.contains_key(model.trim())
+    {
+        return true;
+    }
     let model = resolve_alias(model, &catalog.aliases);
     match_variants(&model)
         .into_iter()
@@ -440,7 +479,26 @@ pub fn provider_for(model: &str) -> Option<String> {
 }
 
 fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
-    let normalized = normalize_model(model);
+    // rm-1053: provider attribution must come from the SAME row that
+    // prices the id. Try the raw id against the catalog first — the
+    // regional twin rows carry their own provider labels — and only
+    // then fall back to the normalized + alias-resolved key. Review
+    // F1: a user alias redirect (rm-511) outranks the raw row here
+    // too, in lockstep with `rate_lookup_key`.
+    let trimmed = model.trim();
+    if !catalog.aliases.contains_key(&normalize_model(trimmed)) {
+        if let Some(key) = matching_catalog_key(trimmed, &catalog.entries) {
+            if let Some(provider) = catalog
+                .providers
+                .get(key.as_str())
+                .cloned()
+                .filter(|provider| !provider.trim().is_empty())
+            {
+                return Some(provider);
+            }
+        }
+    }
+    let normalized = normalize_model(trimmed);
     let resolved = resolve_alias(&normalized, &catalog.aliases);
     let key = matching_catalog_key(&resolved, &catalog.entries)?;
     catalog
@@ -1275,11 +1333,31 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             continue;
         }
         let priority = provider_priority(&model.provider);
-        match selected.get(&normalized) {
-            Some((existing, _, _)) if *existing >= priority => {}
-            _ => {
-                selected.insert(normalized, (priority, price, model.provider));
+        let insert_row = |selected: &mut BTreeMap<String, (i32, Price, String)>, name: &str| {
+            match selected.get(name) {
+                // Legacy normalized-key rule: an equal or higher priority
+                // already sitting at this key wins, so equal-priority
+                // twins keep the first-seen row (deterministic — the
+                // snapshot map iterates in sorted key order).
+                Some((existing, _, _)) if *existing >= priority => {}
+                _ => {
+                    selected.insert(
+                        name.to_string(),
+                        (priority, price.clone(), model.provider.clone()),
+                    );
+                }
             }
+        };
+        // rm-1053 (build side): insert under the RAW snapshot key first.
+        // LiteLLM carries regional twins (us./au./eu./jp./us-gov.anthropic.*)
+        // as distinct rows with distinct rates; keying every row by its
+        // normalized name collapsed them onto one entry whose surviving
+        // rate was set by source iteration order, not by the query. The
+        // normalized key stays as a fallback tier for ids that arrive
+        // without the region marker, so no legacy lookup loses its row.
+        insert_row(&mut selected, &key);
+        if key != normalized {
+            insert_row(&mut selected, &normalized);
         }
     }
     let mut entries = BTreeMap::new();
@@ -2717,6 +2795,166 @@ mod tests {
             "an alias onto a retired model keeps the retirement disclosure \
              (pricing_source_reported the catalog source with no clause before rm-511)"
         );
+    }
+
+    #[test]
+    fn alias_overrides_win_over_catalog_keyed_ids() {
+        // Review F1 (run 7bb862e4 cycle 3, independent_review fbc04223):
+        // the rm-1053 raw-first arms consulted the raw catalog key
+        // BEFORE resolve_alias, so a user AGENTTRACE_PRICING_FILE alias
+        // whose source id already keys a catalog row (post-dual-insert
+        // every normalized shorthand does) was silently ignored while
+        // the CLI header disclosed "+ user overrides applied (...
+        // 1 alias(es))". rm-511: an alias supplies identity — it must
+        // outrank the raw-key fast path. The raw path stays for the
+        // no-alias case only, where it keeps region-prefixed ids on
+        // their own rows (rm-1053).
+        let entries = BTreeMap::from([
+            (
+                "claude-sonnet-4-5".to_string(),
+                Price {
+                    input: 3.0,
+                    output: 15.0,
+                    ..Price::default()
+                },
+            ),
+            (
+                "claude-opus-4-6".to_string(),
+                Price {
+                    input: 5.0,
+                    output: 25.0,
+                    ..Price::default()
+                },
+            ),
+            (
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                Price {
+                    input: 3.3,
+                    output: 16.5,
+                    ..Price::default()
+                },
+            ),
+        ]);
+        let providers: BTreeMap<String, String> = BTreeMap::from([
+            ("claude-sonnet-4-5".to_string(), "sonnet-row".to_string()),
+            ("claude-opus-4-6".to_string(), "opus-row".to_string()),
+            (
+                "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                "us-twin-row".to_string(),
+            ),
+        ]);
+        let overridden = PricingCatalog {
+            aliases: BTreeMap::from([
+                // The defeated class: source id IS a catalog key.
+                (
+                    "claude-sonnet-4-5".to_string(),
+                    "claude-opus-4-6".to_string(),
+                ),
+                // The always-worked class: source id is not a key.
+                (
+                    "my-alias".to_string(),
+                    "us.anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                ),
+            ]),
+            entries: entries.clone(),
+            source: "cache".to_string(),
+            providers: providers.clone(),
+            reference_date: Some(2026_1004),
+        };
+        // F1 proper: a catalog-keyed source id attributes (and prices)
+        // at the alias TARGET row, not its own.
+        assert_eq!(
+            provider_for_in("claude-sonnet-4-5", &overridden).as_deref(),
+            Some("opus-row"),
+            "a user alias on a catalog-keyed id must win over the raw row"
+        );
+        // rm-1053 preserved against alias capture: the alias keys the
+        // EXACT normalized id (`claude-sonnet-4-5`), while the twin
+        // normalizes to `claude-sonnet-4-5-20250929-v1` (the `:` in the
+        // raw id defeats the date-suffix strip, and the version strip
+        // keeps `-v1`) — no redirect fires, so the twin keeps its own
+        // row even while the base is aliased (pre-batch resolve_alias
+        // parity; the redirect test is resolve_alias's own first hop).
+        assert_eq!(
+            provider_for_in("us.anthropic.claude-sonnet-4-5-20250929-v1:0", &overridden).as_deref(),
+            Some("us-twin-row"),
+            "the twin normalizes past the alias key and keeps its own row"
+        );
+        // The non-keyed source class keeps working.
+        assert_eq!(
+            provider_for_in("my-alias", &overridden).as_deref(),
+            Some("us-twin-row")
+        );
+        // rm-1053 preserved: with NO alias on the normalized id, the
+        // regional twin attributes from its own row.
+        let unaliased = PricingCatalog {
+            aliases: BTreeMap::new(),
+            entries,
+            source: "cache".to_string(),
+            providers,
+            reference_date: Some(2026_1004),
+        };
+        assert_eq!(
+            provider_for_in("us.anthropic.claude-sonnet-4-5-20250929-v1:0", &unaliased).as_deref(),
+            Some("us-twin-row"),
+            "without an alias the twin keeps its own row (rm-1053)"
+        );
+    }
+
+    #[test]
+    fn rate_lookup_key_alias_precedence_matrix() {
+        // Review F1, decision level: the raw fast path fires only when
+        // NO user alias redirects the (normalized) id; a redirect
+        // always defers to resolve_alias, and an unknown or mixed-case
+        // id still normalizes through the alias-resolved path.
+        let catalog = PricingCatalog {
+            aliases: BTreeMap::from([(
+                "claude-sonnet-4-5".to_string(),
+                "claude-opus-4-6".to_string(),
+            )]),
+            entries: BTreeMap::from([
+                (
+                    "claude-sonnet-4-5".to_string(),
+                    Price {
+                        input: 3.0,
+                        output: 15.0,
+                        ..Price::default()
+                    },
+                ),
+                (
+                    "claude-opus-4-6".to_string(),
+                    Price {
+                        input: 5.0,
+                        output: 25.0,
+                        ..Price::default()
+                    },
+                ),
+            ]),
+            source: "cache".to_string(),
+            providers: BTreeMap::new(),
+            reference_date: Some(2026_1004),
+        };
+        // The redirect wins over the raw catalog key.
+        assert_eq!(
+            rate_lookup_key("claude-sonnet-4-5", &catalog),
+            "claude-opus-4-6"
+        );
+        // An untouched raw key stays on the raw fast path.
+        assert_eq!(
+            rate_lookup_key("claude-opus-4-6", &catalog),
+            "claude-opus-4-6"
+        );
+        // A mixed-case id that misses the raw key normalizes through.
+        assert_eq!(
+            rate_lookup_key("  CLAUDE-OPUS-4-6  ", &catalog),
+            "claude-opus-4-6"
+        );
+        // And the priced lookup consumes the key exactly as decided.
+        let price = lookup_price_in(
+            rate_lookup_key("claude-sonnet-4-5", &catalog).as_ref(),
+            &catalog.entries,
+        );
+        assert_eq!((price.input, price.output), (5.0, 25.0));
     }
 
     #[test]

@@ -121,11 +121,12 @@ fn mixed_session_counts_only_the_zero_blocks() {
 // This is the review's PoC pinned as a regression: on a tree where the
 // const is still 22 the hand-written v22 entry below IS served and the
 // first assertion fails.
+#[cfg(unix)] // rm-1388: mtime-nanosecond fingerprint — std::os::unix::fs::MetadataExt
 #[test]
 fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     use std::os::unix::fs::MetadataExt;
 
-    let root = std::env::temp_dir().join("at-zero-usage-stale-v22");
+    let root = std::env::temp_dir().join(format!("at-zero-usage-stale-v22-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let sessions_dir = root.join("sessions");
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");

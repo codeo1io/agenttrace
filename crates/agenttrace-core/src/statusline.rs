@@ -4241,26 +4241,60 @@ mod tests {
         ));
         fs::remove_dir_all(&root).ok();
         fs::create_dir_all(&root).expect("create temp root");
+        // Review F6 (run 7bb862e4 cycle 3): the staged race-exe below
+        // is a full copy of this test binary; before this guard a
+        // panic between staging and the tail cleanup stranded it in
+        // the tempdir. The guard removes the fixture root on every
+        // exit path — assertion panics included — and the explicit
+        // tail cleanup stays (idempotent, and keeps the happy path
+        // self-describing).
+        struct FixtureRootGuard<'a>(&'a std::path::Path);
+        impl Drop for FixtureRootGuard<'_> {
+            fn drop(&mut self) {
+                fs::remove_dir_all(self.0).ok();
+            }
+        }
+        let _fixture_root = FixtureRootGuard(&root);
         // Child runs are matched by the leaf name as a substring filter —
         // unique in this binary. (`--exact` with a constructed module path
         // is a trap: module_path!() carries a crate-name prefix libtest does
         // not use, and the mismatched child silently runs zero tests and
         // "passes" instantly.)
         let test_name = "journal_appends_survive_parallel_compaction";
-        let exe = std::env::current_exe().expect("test binary path");
+        // rm-204: the conductor fleet rebuilds sibling worktrees against
+        // one shared CARGO_TARGET_DIR, and a rebuild can transiently
+        // remove or replace exactly the binary current_exe() points at —
+        // spawn() then fails with NotFound and the race test flakes
+        // (observed live). Prefer re-exec of a private copy (immune to the
+        // concurrent rebuild, still the very same binary); if the copy
+        // cannot be staged or spawned (a platform locking the running
+        // image, a noexec tmp), fall back per-spawn to the original path —
+        // the race this test guards against is a fleet-shared-target
+        // phenomenon.
+        let live_exe = std::env::current_exe().expect("test binary path");
+        let staged_exe = root.join("race-exe");
+        let staged_ok = std::fs::copy(&live_exe, &staged_exe).is_ok();
         let spawn = |role: String| {
-            let mut command = std::process::Command::new(&exe);
-            command
-                .arg(test_name)
-                .env("AGENTTRACE_JOURNAL_CHILD_ROLE", role)
-                .env("AGENTTRACE_JOURNAL_ROOT", &root)
-                .env("AGENTTRACE_SESSION_CACHE_DIR", &root)
-                // Captured (not inherited) so child libtest chatter stays
-                // out of the parent's output and stderr is available for
-                // the failure message below.
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            command.spawn().expect("spawn journal race child")
+            let command = |exe: &std::path::Path| {
+                let mut command = std::process::Command::new(exe);
+                command
+                    .arg(test_name)
+                    .env("AGENTTRACE_JOURNAL_CHILD_ROLE", role.clone())
+                    .env("AGENTTRACE_JOURNAL_ROOT", &root)
+                    .env("AGENTTRACE_SESSION_CACHE_DIR", &root)
+                    // Captured (not inherited) so child libtest chatter stays
+                    // out of the parent's output and stderr is available for
+                    // the failure message below.
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                command.spawn()
+            };
+            if staged_ok {
+                if let Ok(child) = command(&staged_exe) {
+                    return child;
+                }
+            }
+            command(&live_exe).expect("spawn journal race child (staged and live both failed)")
         };
         const WRITERS: usize = 3;
         const HAMMER: usize = 500;
@@ -4344,6 +4378,45 @@ mod tests {
             *last = index;
         }
         fs::remove_dir_all(&root).ok();
+    }
+
+    // Review F6 (run 7bb862e4 cycle 3), panic-path pin: the
+    // FixtureRootGuard inside the cross-process race test above must
+    // clean the fixture root — staged race-exe included — even when the
+    // test unwinds on a failed assertion, because a stranded copy is a
+    // full test binary left in the tempdir. Deterministic re-pin of the
+    // Drop-on-panic behavior in isolation.
+    #[test]
+    fn statusline_guard_cleans_staged_exe_on_panic() {
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-journal-guard-panic-{}-{}",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id()).replace(char::is_alphabetic, "")
+        ));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create guard-panic temp root");
+        fs::write(root.join("race-exe"), b"staged race-exe bytes")
+            .expect("stage a stand-in race-exe");
+        struct FixtureRootGuard<'a>(&'a std::path::Path);
+        impl Drop for FixtureRootGuard<'_> {
+            fn drop(&mut self) {
+                fs::remove_dir_all(self.0).ok();
+            }
+        }
+        // Silence the hook for the intentional unwind so the pinned
+        // panic does not read as a failure in the captured output.
+        let prior_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let unwind = std::panic::catch_unwind(|| {
+            let _fixture_root = FixtureRootGuard(&root);
+            panic!("intentional unwind: the guard must still run");
+        });
+        std::panic::set_hook(prior_hook);
+        assert!(unwind.is_err(), "the pinned scenario is a panic");
+        assert!(
+            !root.exists(),
+            "guard removed the staged-exe fixture root on the panic path"
+        );
     }
 
     // rm-166 mechanism, pinned deterministically: a compaction renames a
