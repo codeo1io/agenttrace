@@ -49,9 +49,14 @@ fi
 # Pass 2: the keep-a-changelog lens. A consumer that keeps only the FIRST
 # block per section kind (what the duplication used to break) must see
 # every Unreleased entry: count bullets visible to that consumer against
-# the section total.
+# the section total. rm-1390 (run bbf61fbd cycle 3): the lens matched only
+# the bare `## Unreleased` spelling, so a DATED header (`## Unreleased
+# (2026-10-14)`) turned the whole pass into a vacuous rc0 "all 0
+# entries" — the exact shape of the assess vac3 PoC. The lens now
+# matches the header by prefix, dated or not.
 counts="$(awk '
-	/^## / { unreleased = ($0 == "## Unreleased"); active = 1; next }
+	/^## Unreleased/ { unreleased = 1; active = 1; next }
+	/^## / { unreleased = 0; active = 1; next }
 	unreleased && /^### / {
 		if (!($0 in seen)) { seen[$0] = 1; active = 1 } else { active = 0 }
 	}
@@ -66,4 +71,14 @@ total="${counts##* }"
 [ "$visible" -eq "$total" ] ||
 	fail "a first-per-kind parse of Unreleased hides entries: $visible visible of $total — duplicate section headings"
 
-echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries"
+# Pass 3 (rm-1390): a PRESENT-but-vacuous Unreleased section is the same
+# standing red as a malformed one. The header claims a landing lane; a
+# section over zero entry bullets claims it falsely. Only enforced when
+# the section exists — rm-1036 deliberately does not require an
+# Unreleased header at all.
+if grep -q '^## Unreleased' "$changelog"; then
+	[ "$total" -ge 1 ] ||
+		fail "Unreleased section is present but carries no entries (rm-1390): a header over zero bullets claims a landing lane that does not exist — land the entries, date the section, or drop the header"
+fi
+
+echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries (non-vacuous)"

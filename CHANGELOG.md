@@ -4,6 +4,19 @@
 
 ### Added
 
+- Implausible token magnitudes are pinned to bill-as-parsed-with-disclosure
+  (rm-600 verify-arm, run bbf61fbd cycle 3): the cycle's hostile-corpus PoC
+  ($1.69e14 overview total rendered from repeated i64::MAX usage rows) proved
+  the 1e12 plausibility bound discloses but never gates cost. That compound
+  is now pinned end to end by
+  `implausible_magnitudes_bill_as_parsed_with_disclosure`: a value above the
+  plausibility bound but inside i64 prices exactly as parsed (finite,
+  provenance `calculated_from_tokens`, no saturation) while the magnitude
+  census discloses it on BOTH channels — the session's
+  `magnitude_clamped:above_plausibility_bound` counter and the overview's
+  `clamped_values`. Clamping would fabricate a cost the transcript does not
+  contain; the pin makes any future clamp a deliberate, reviewed change.
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
@@ -224,6 +237,38 @@
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
 ### Fixed
+
+- Regional pricing twins bill their own catalog row (rm-1053, run bbf61fbd
+  cycle 3): LiteLLM prices regional and hosted twins under exact ids
+  (`bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0`,
+  `us.anthropic.claude-sonnet-4-5-20250929-v1:0`) that all normalize onto one
+  shared slot, and `convert_litellm` stored only each slot's winner — a session
+  reporting a twin's exact id billed the winner's rates (the cycle's live PoC:
+  $3.0/M input instead of the twin's own $3.6/M, −16.7%) while provider and
+  provenance collapsed onto the base row ("anthropic" for a bedrock twin).
+  Slot losers now survive conversion as exact-key rows probed BEFORE the
+  normalize/alias ladder, and rate, provider, and pricing source all resolve
+  raw-first off the same row; listings, census, and the `entries` surface stay
+  byte-identical, and a user override naming an exact twin id corrects that
+  row alone (the shared slot's winner is untouched). The pricing identity
+  digest folds the exact rows in, so warm cached sessions re-price once under
+  the corrected rates. Pinned by `regional_twins_bill_their_own_exact_row`,
+  `exact_key_overrides_correct_the_twin_row`,
+  `vendored_snapshot_pins_the_regional_twin_rates`,
+  `catalog_identity_covers_exact_rows`, and
+  `normalize_model_reaches_a_fixpoint_within_two_passes` (census-documented:
+  ids without a version separator are strictly idempotent; the 66-key dated
+  `:`/`@` family reaches its fixpoint in two passes — pre-existing, out of
+  scope to collapse).
+- The changelog structure gate can no longer pass vacuously (rm-1390, run
+  bbf61fbd cycle 3): the keep-a-changelog lens matched only the bare
+  `## Unreleased` spelling, so a DATED header (`## Unreleased (2026-10-14)`)
+  turned the entry-count check into "0 visible of 0 total" — rc0 over a
+  section a first-per-kind consumer cannot see (the cycle's assess PoC). The
+  lens now matches the header by prefix, dated or not, and a present-but-empty
+  Unreleased section fails outright: a header over zero entry bullets claims a
+  landing lane that does not exist. Only enforced when the section exists —
+  rm-1036 deliberately does not require an Unreleased header at all.
 
 - The statusline weekly-budget total no longer books a session's pre-journal cumulative cost as same-day spend (rm-1370, run e88f2da2 cycle 3, batch "honest dollars"; row renumbered at integration from the campaign-local rm-771 per the fleet mint-mtime rulings — mapping on the wall mint note, dated in-tree comments keep rm-771): when the first retained capture for a session is already non-zero, the journal cannot prove the session started that day, so the first retained day contributes only the delta it observed itself and the excluded carry is disclosed — `Budget baseline: N session(s) started before the journal — $X.XX pre-journal spend excluded from the 7d total` in `--statusline-report`, `first-day baseline unknown for N session(s) — $X.XX of pre-journal spend excluded from the 7d total` in `--budget`, and new `first_day_baseline_unknown_sessions` / `first_day_baseline_unknown_usd` keys — always present in `--budget -f json`, and in `--statusline-report -f json` once a weekly budget resolves (the statusline budget block itself is emitted only then) — 0/0.0 when every session was observed from a zero baseline. The counters are scoped to the same trailing window as the total (review 9af53c3f F3): a session whose first retained day is older than the window never biased the 7d number and is not counted. The assess PoC's 26x overstatement (`budget $10.00 - OVER by $42.00` on a true $2 seven-day burn) now renders the honest state, and the `--statusline-report` budget block agrees with `--budget` on `spend_7d_usd`/`remaining_usd`. A session observed from a zero baseline still counts its full first-day rise. Pinned red-first by `budget_series_first_day_baseline_unknown_not_booked` (series math), `budget_view_renders_spend_budget_and_unconfigured_state` (re-derived text pin) and `budget_over_state_comes_from_observed_rise_not_the_carry` (literal `OVER by $2.00` from the observed rise with the $50.00 carry excluded), plus review pin `budget_series_baseline_unknown_counters_scope_to_the_trailing_window`.
 - The cost audit carries vendor-recorded cost on the recorded basis instead of re-pricing it as catalog drift (rm-570, run e88f2da2 cycle 3, batch "honest dollars", folded at integration onto the landed rm-520/rm-578 same-basis contract): a session whose journal carries an upstream-recorded cost (`usage.cost.total`, e.g. the pi standalone-usage entry shape) previously flowed through `current_cost_estimate`'s full catalog re-pricing, so an estimate-only drift note (`current rates recalculate a different total than the stored estimate`) fired on sessions whose dollars were never estimated — the stored number is the vendor's. The landed mechanics were kept over the run's own "never re-price a recorded row" rule (superseding landed decision rm-520/578, which already prices recorded classes exactly once and withholds the re-price entirely when the recorded token split is not reproducible — the run's rule would additionally hide genuine catalog drift on the unrecorded half of a mixed row), while the run's disclosure contract was adopted on top: a new `recorded_cost_usd` field on `--audit` rows and `--audit <session>` carries the recorded total, and every row holding recorded dollars names the aggregate split in its `pricing_note` — e.g. `1 of 1 session(s) carry $0.0700 vendor-recorded cost ($13.5000 of the stored total estimated at ingest)` — so a bare `$0.0700 vendor-recorded` cannot imply the whole stored total is vendor-recorded (review 9af53c3f F1); session notes read `$0.0700 vendor-recorded cost (rides the comparison at face value)` when the split survives, and split-lost rows keep the rm-578 withholding (`unavailable: recorded-cost token split not reproducible`) with the split named beside it. Estimate-only rows still re-price at current rates exactly as before. Pinned red-first by `cost_audit_recorded_row_reprices_on_the_recorded_basis` (recorded dollars ride the comparison at face value, no drift note) and `cost_audit_estimate_only_rows_still_reprice_at_current_rates`, plus review pins `cost_audit_mixed_row_names_the_split_and_withholds_the_reprice` and `cost_audit_recorded_row_with_estimate_at_ingest_dollars_names_the_split`, and session-level `session_cost_audit_recorded_cost_rides_the_comparison_at_face_value`.

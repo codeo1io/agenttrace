@@ -3857,6 +3857,58 @@ mod tests {
     }
 
     #[test]
+    fn implausible_magnitudes_bill_as_parsed_with_disclosure() {
+        // rm-600 verify-arm (run bbf61fbd cycle 3): a usage value above
+        // IMPLAUSIBLE_TOKEN_MAGNITUDE but inside i64 — the assess F7
+        // hostile-corpus shape — is priced AS PARSED (rm-726 census:
+        // clamping the value would fabricate a cost the transcript
+        // does not contain), and the compound behavior is exactly:
+        // cost = value × catalog rate, finite, provenance
+        // un-clamped, and the magnitude census disclosed on both the
+        // session's disclosure channel and the overview's
+        // clamped_values counter. This pin makes every leg of that
+        // compound a deliberate change: if a future cycle clamps or
+        // rejects the value instead, this test is the one that turns
+        // red first.
+        let tokens = 4_219_692_706_861_134i64; // 4.2e15: > 1e12 bound, ≪ i64::MAX
+        let session = session_from_events(
+            "hostile",
+            "hostile.jsonl",
+            vec![Event {
+                role: "session_meta".to_string(),
+                model_used: "claude-sonnet-4-5".to_string(),
+                usage: BTreeMap::from([("input_tokens".to_string(), tokens)]),
+                ..Event::default()
+            }],
+        )
+        .expect("session");
+        // The value survives arithmetic un-clamped and exact.
+        assert_eq!(session.metrics.tokens_input, tokens);
+        assert_eq!(
+            session.metrics.provenance.cost, "calculated_from_tokens",
+            "accumulation did not saturate, so the provenance must not claim a clamp"
+        );
+        let price = pricing::lookup_price_tiered("claude-sonnet-4-5", None);
+        assert_eq!(
+            session.metrics.cost_estimated,
+            round4(tokens as f64 / 1e6 * price.input),
+            "cost is exactly the parsed magnitude × the catalog rate, on the
+             same round4 the accumulation applies (the assess F7 figure's mechanism)"
+        );
+        assert!(session.metrics.cost_estimated.is_finite());
+        // And the magnitude census discloses it on both channels.
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("magnitude_clamped:above_plausibility_bound"),
+            Some(&1)
+        );
+        let overview = compute_overview(std::slice::from_ref(&session));
+        assert_eq!(overview.clamped_values, 1);
+    }
+
+    #[test]
     fn total_tokens_saturates_instead_of_wrapping_negative() {
         let session = session_from_events("saturate", "saturate.jsonl", vec![Event::default()])
             .expect("session");

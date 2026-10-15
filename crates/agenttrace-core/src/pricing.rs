@@ -84,6 +84,12 @@ pub struct Price {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExactKeyRow {
+    pub price: Price,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PricingCatalog {
     pub entries: BTreeMap<String, Price>,
     pub aliases: BTreeMap<String, String>,
@@ -99,6 +105,18 @@ pub struct PricingCatalog {
     /// compares model deprecation dates against THIS — never the wall
     /// clock — so report bytes stay stable for a given catalog.
     pub reference_date: Option<u32>,
+    /// rm-1053: rows that lost their normalized slot to a higher-
+    /// priority sibling but are still priced rows in their own right
+    /// (regional twins like `bedrock/us-gov-west-1/anthropic.…`,
+    /// hosted variants, concrete-region commitment tiers), keyed by
+    /// their EXACT catalog id. Probed BEFORE the normalized ladder,
+    /// so a session reporting the exact id bills that row's rates —
+    /// not the winner of the slot the id normalizes onto. Slot
+    /// winners are deliberately absent: their raw ids already
+    /// resolve to them through the ladder, and keeping them out is
+    /// what makes the census, listings, and override behavior over
+    /// `entries` byte-identical to the pre-exact world.
+    pub exact: BTreeMap<String, ExactKeyRow>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,8 +165,7 @@ pub fn lookup_price(model: &str) -> Price {
 /// published behavior (codeburn #1642), not a guess.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
-    let model = resolve_alias(model, &catalog.aliases);
-    let mut price = lookup_price_in(&model, &catalog.entries);
+    let mut price = resolve_price_in(model, catalog);
     if service_tier == Some("flex") {
         if let (Some(input), Some(output)) = (price.input_flex, price.output_flex) {
             price.input = input;
@@ -162,6 +179,25 @@ pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
         }
     }
     price
+}
+
+/// Raw-first resolution (rm-1053): an EXACT catalog id prices at its
+/// own row — a regional twin (`bedrock/us-gov-west-1/anthropic…`)
+/// bills its own rates, not the winner of the normalized slot it
+/// collapses onto. Everything else walks the alias-then-variant
+/// ladder exactly as before. `provider_for_in` and
+/// `pricing_source_for_catalog` route through the same order, so
+/// rate, provider, and provenance can never disagree about which
+/// row a model resolved to. The exact probe precedes alias
+/// resolution on purpose: an alias is keyed on the ambiguous
+/// normalized slot, while an exact key is the catalog's own claim
+/// for the reported id.
+fn resolve_price_in(model: &str, catalog: &PricingCatalog) -> Price {
+    if let Some(row) = catalog.exact.get(model) {
+        return row.price.clone();
+    }
+    let model = resolve_alias(model, &catalog.aliases);
+    lookup_price_in(&model, &catalog.entries)
 }
 
 pub fn has_specific_price(model: &str) -> bool {
@@ -387,6 +423,32 @@ pub(crate) fn catalog_identity_of(catalog: &PricingCatalog) -> String {
         hash = fnv1a(model.as_bytes(), hash);
         hash = fnv1a(provider.as_bytes(), hash);
     }
+    // rm-1053: exact-key rows price sessions too — a refreshed snapshot
+    // that changes ONLY a regional twin's rate (slot winner untouched)
+    // must move this digest, or warm sessions priced under the old twin
+    // row would replay stale costs instead of re-pricing (the session
+    // cache stamps this identity onto every stored entry).
+    for (key, row) in &catalog.exact {
+        hash = fnv1a(key.as_bytes(), hash);
+        hash = fnv1a(row.provider.as_bytes(), hash);
+        for value in [
+            row.price.input,
+            row.price.output,
+            row.price.cw,
+            row.price.cr,
+        ] {
+            hash = fnv1a(&value.to_bits().to_le_bytes(), hash);
+        }
+        hash = fnv1a(&row.price.max_input_tokens.unwrap_or(0).to_le_bytes(), hash);
+        hash = fnv1a(
+            row.price
+                .deprecation_date
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+            hash,
+        );
+    }
     format!("{hash:016x}")
 }
 
@@ -440,6 +502,13 @@ pub fn provider_for(model: &str) -> Option<String> {
 }
 
 fn provider_for_in(model: &str, catalog: &PricingCatalog) -> Option<String> {
+    // rm-1053: an exact catalog id claims its own row's provider —
+    // the regional twin's "bedrock", not the slot winner's
+    // "anthropic" — mirroring the raw-first rate lookup so the two
+    // never disagree.
+    if let Some(row) = catalog.exact.get(model) {
+        return Some(row.provider.clone()).filter(|p| !p.trim().is_empty());
+    }
     let normalized = normalize_model(model);
     let resolved = resolve_alias(&normalized, &catalog.aliases);
     let key = matching_catalog_key(&resolved, &catalog.entries)?;
@@ -456,6 +525,48 @@ fn pricing_source_for_catalog(
     override_models: &BTreeSet<String>,
 ) -> String {
     let normalized = normalize_model(model);
+    // rm-1053: an exact catalog id resolves to its own row before any
+    // normalization or alias ladder — the same raw-first order the
+    // rate lookup takes — so provenance names the row that actually
+    // priced the session (a regional twin says the catalog source,
+    // not an alias redirect it never took).
+    if let Some(row) = catalog.exact.get(model) {
+        return if override_models.contains(model) {
+            // rm-419 semantics carried to the exact row: a user-set
+            // rate keeps the vendor retirement disclosure without the
+            // "unverified" qualifier (the rate is the user's own).
+            catalog
+                .reference_date
+                .filter(|reference| past_deprecated(&row.price, *reference))
+                .map(|_| {
+                    format!(
+                        "user override; model deprecated {}",
+                        row.price
+                            .deprecation_date
+                            .as_deref()
+                            .unwrap_or("unknown date")
+                    )
+                })
+                .unwrap_or_else(|| "user override".to_string())
+        } else if let Some(reference) = catalog.reference_date {
+            // Same retirement disclosure as the plain-catalog arm,
+            // read off the exact row this model resolved to.
+            if past_deprecated(&row.price, reference) {
+                format!(
+                    "{}; model deprecated {} (rate unverified)",
+                    catalog_source(catalog),
+                    row.price
+                        .deprecation_date
+                        .as_deref()
+                        .unwrap_or("unknown date")
+                )
+            } else {
+                catalog_source(catalog)
+            }
+        } else {
+            catalog_source(catalog)
+        };
+    }
     let resolved = resolve_alias(&normalized, &catalog.aliases);
     let Some(key) = matching_catalog_key(&resolved, &catalog.entries) else {
         return "built-in fallback".to_string();
@@ -554,6 +665,7 @@ pub fn update_pricing() -> anyhow::Result<usize> {
         aliases: BTreeMap::new(),
         source: "remote".to_string(),
         providers: converted.providers,
+        exact: converted.exact,
         reference_date: today_ymd(),
     };
     let override_models = apply_pricing_overrides(&mut catalog);
@@ -750,6 +862,7 @@ fn fallback_catalog() -> PricingCatalog {
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
             providers: BTreeMap::new(),
+            exact: BTreeMap::new(),
             reference_date: None,
         };
     }
@@ -758,6 +871,7 @@ fn fallback_catalog() -> PricingCatalog {
         aliases: BTreeMap::new(),
         source: "snapshot".to_string(),
         providers: converted.providers,
+        exact: converted.exact,
         reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
     }
 }
@@ -776,10 +890,19 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
             // descriptive fields the override leaves unset; an override
             // that sets `max_input_tokens: 0` still clears the window
             // on purpose (0 is filtered out at lookup time).
+            let normalized = normalize_model(&name);
             if override_price.max_input_tokens.is_none()
                 || override_price.deprecation_date.is_none()
             {
-                if let Some(catalog_price) = catalog.entries.get(&name) {
+                // rm-1053: an override naming an exact catalog id (a
+                // regional twin) backfills its descriptive fields from
+                // that row; any other name backfills from the slot it
+                // normalizes onto, as before.
+                let existing = catalog
+                    .entries
+                    .get(&normalized)
+                    .or_else(|| catalog.exact.get(&name).map(|row| &row.price));
+                if let Some(catalog_price) = existing {
                     if override_price.max_input_tokens.is_none() {
                         override_price.max_input_tokens = catalog_price.max_input_tokens;
                     }
@@ -789,7 +912,16 @@ fn apply_pricing_overrides(catalog: &mut PricingCatalog) -> BTreeSet<String> {
                 }
             }
             override_models.insert(name.clone());
-            catalog.entries.insert(name, override_price);
+            if let Some(row) = catalog.exact.get_mut(&name) {
+                // rm-1053: the raw name IS an exact catalog key, so the
+                // row stored under it is the one the user named —
+                // correct it alone and leave the shared slot's winner
+                // untouched.
+                row.price = override_price;
+            } else {
+                override_models.insert(normalized.clone());
+                catalog.entries.insert(normalized, override_price);
+            }
         }
         catalog.aliases.extend(aliases);
     }
@@ -815,6 +947,7 @@ fn load_pricing_cache() -> Option<PricingCatalog> {
         aliases: BTreeMap::new(),
         source: if stale { "cache(stale)" } else { "cache" }.to_string(),
         providers: converted.providers,
+        exact: converted.exact,
         // A cached catalog's vintage is its fetch date (rm-419); when
         // the provenance stamp is missing (pre-rm-167 cache) fall back
         // to the bundled snapshot date as a conservative anchor.
@@ -1021,7 +1154,13 @@ fn parse_pricing_overrides(raw: &[u8]) -> Result<PricingOverrideMaps, String> {
     let mut prices = BTreeMap::new();
     for (model, price) in overrides.prices {
         validate_override_price(&model, &price)?;
-        prices.insert(normalize_model(&model), price);
+        // rm-1053: keep the RAW name. Normalizing here used to silently
+        // redirect a rate written against an exact catalog id (a
+        // regional twin like `bedrock/us-gov-west-1/anthropic…`) onto
+        // the shared slot it normalizes onto — the winner row the user
+        // did NOT name. apply_pricing_overrides now normalizes only
+        // when the raw name is not an exact catalog key.
+        prices.insert(model, price);
     }
     let aliases: BTreeMap<String, String> = overrides
         .aliases
@@ -1208,6 +1347,7 @@ fn resolve_alias(model: &str, aliases: &BTreeMap<String, String>) -> String {
 struct ConvertedCatalog {
     entries: BTreeMap<String, Price>,
     providers: BTreeMap<String, String>,
+    exact: BTreeMap<String, ExactKeyRow>,
 }
 
 /// Per-token flex rate -> per-million flex slot, dropping absent,
@@ -1223,9 +1363,15 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
         return ConvertedCatalog {
             entries: BTreeMap::new(),
             providers: BTreeMap::new(),
+            exact: BTreeMap::new(),
         };
     };
-    let mut selected: BTreeMap<String, (i32, Price, String)> = BTreeMap::new();
+    // Slot -> (priority, winning raw key, rate, provider). The raw
+    // key rides along (rm-1053) so the loop below can tell a slot
+    // winner from a twin that lost the slot — losers become
+    // exact-key rows instead of vanishing.
+    let mut selected: BTreeMap<String, (i32, String, Price, String)> = BTreeMap::new();
+    let mut exact: BTreeMap<String, ExactKeyRow> = BTreeMap::new();
     for (key, value) in source {
         let Ok(model) = serde_json::from_value::<LiteLlmModel>(value) else {
             continue;
@@ -1275,20 +1421,39 @@ fn convert_litellm(raw: &[u8]) -> ConvertedCatalog {
             continue;
         }
         let priority = provider_priority(&model.provider);
+        let provider = model.provider.clone();
         match selected.get(&normalized) {
-            Some((existing, _, _)) if *existing >= priority => {}
+            Some((existing, _, _, _)) if *existing >= priority => {
+                // rm-1053: this row lost its normalized slot to a
+                // higher-priority (or equal-priority, first-sorted)
+                // sibling, but its exact catalog id is still a priced
+                // row in its own right — a regional twin must bill its
+                // own rates, not the slot winner's. Record it for
+                // raw-first resolution.
+                exact.insert(
+                    key.clone(),
+                    ExactKeyRow {
+                        price: price.clone(),
+                        provider: provider.clone(),
+                    },
+                );
+            }
             _ => {
-                selected.insert(normalized, (priority, price, model.provider));
+                selected.insert(normalized, (priority, key.clone(), price, provider));
             }
         }
     }
     let mut entries = BTreeMap::new();
     let mut providers = BTreeMap::new();
-    for (name, (_, price, provider)) in selected {
+    for (name, (_, _, price, provider)) in selected {
         providers.insert(name.clone(), provider);
         entries.insert(name, price);
     }
-    ConvertedCatalog { entries, providers }
+    ConvertedCatalog {
+        entries,
+        providers,
+        exact,
+    }
 }
 
 fn provider_priority(provider: &str) -> i32 {
@@ -2298,12 +2463,15 @@ mod tests {
     }
 
     #[test]
-    fn user_pricing_overrides_normalize_models_and_aliases() {
+    fn user_pricing_overrides_keep_raw_names_and_normalize_aliases() {
         let (prices, aliases) = parse_pricing_overrides(
             br#"{"prices":{"Provider/My-Model":{"input":1,"output":2,"cw":3,"cr":4}},"aliases":{"MY-ALIAS":"Provider/My-Model"}}"#,
         )
         .expect("pricing overrides");
-        assert!(prices.contains_key("my-model"));
+        assert!(
+            prices.contains_key("Provider/My-Model"),
+            "rm-1053: parse keeps the raw price name — normalizing here used to redirect a twin-keyed override onto the shared slot"
+        );
         assert_eq!(
             aliases.get("my-alias").map(String::as_str),
             Some("my-model")
@@ -2450,6 +2618,7 @@ mod tests {
     #[test]
     fn pricing_source_labels_carry_no_wall_clock() {
         let catalog = |source: &str| PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::new(),
             aliases: BTreeMap::new(),
             source: source.to_string(),
@@ -2565,6 +2734,7 @@ mod tests {
     #[test]
     fn pricing_source_is_specific_to_the_price_that_matched() {
         let catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([
                 ("catalog-model".to_string(), Price::default()),
                 ("override-model".to_string(), Price::default()),
@@ -2603,6 +2773,7 @@ mod tests {
             ..Price::default()
         };
         let catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([("retired-model".to_string(), retired())]),
             aliases: BTreeMap::from([("my-alias".to_string(), "retired-model".to_string())]),
             source: "cache".to_string(),
@@ -2630,6 +2801,7 @@ mod tests {
         // A non-deprecated alias target stays qualifier-free, and a
         // catalog without a vintage can declare nothing deprecated.
         let fresh = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([("fresh-model".to_string(), Price::default())]),
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
@@ -2641,6 +2813,7 @@ mod tests {
             "LiteLLM (cached catalog) via user override alias"
         );
         let undated = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([("fresh-model".to_string(), Price::default())]),
             aliases: BTreeMap::from([("my-alias".to_string(), "fresh-model".to_string())]),
             source: "cache".to_string(),
@@ -2676,6 +2849,7 @@ mod tests {
         .expect("write override file");
 
         let mut catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([
                 (
                     "wide-retired".to_string(),
@@ -2804,6 +2978,249 @@ mod tests {
         );
     }
 
+    /// rm-1053 fixture: the live PoC's real collision shape. The bare
+    /// `:0`-suffixed anthropic key (provider priority 10) and the
+    /// bedrock regional twins (priority 5) all normalize onto the
+    /// SAME two slots, and the twins lose both — that is exactly the
+    /// shape that used to make their rates vanish at conversion time.
+    fn twin_catalog() -> PricingCatalog {
+        let fixture = serde_json::json!({
+            "anthropic.claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.000003,
+                "output_cost_per_token": 0.000015,
+                "mode": "chat",
+                "litellm_provider": "anthropic"
+            },
+            "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.0000036,
+                "output_cost_per_token": 0.000018,
+                "mode": "chat",
+                "litellm_provider": "bedrock"
+            },
+            "bedrock/us-gov-west-1/claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.00000345,
+                "output_cost_per_token": 0.00001725,
+                "mode": "chat",
+                "litellm_provider": "bedrock"
+            },
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {
+                "input_cost_per_token": 0.0000033,
+                "output_cost_per_token": 0.0000165,
+                "deprecation_date": "2025-08-01",
+                "mode": "chat",
+                "litellm_provider": "bedrock_converse"
+            }
+        });
+        let converted = convert_litellm(
+            serde_json::to_vec(&fixture)
+                .expect("serialize catalog")
+                .as_slice(),
+        );
+        PricingCatalog {
+            exact: converted.exact,
+            entries: converted.entries,
+            aliases: BTreeMap::new(),
+            source: "snapshot".to_string(),
+            providers: converted.providers,
+            reference_date: iso_to_ymd(PRICING_SNAPSHOT_DATE),
+        }
+    }
+
+    #[test]
+    fn regional_twins_bill_their_own_exact_row() {
+        // rm-1053: a session reporting a regional twin's exact catalog
+        // id must bill that row's rates, not the winner of the shared
+        // slot the id normalizes onto (the live PoC billed the bedrock
+        // us-gov-west-1 twin at the winner's $3.0/M — −16.7%).
+        let catalog = twin_catalog();
+        let twin = "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        // Conformance half: conversion keeps exactly the pre-exact
+        // world's two winner slots — census, listings, and override
+        // behavior over `entries` stay byte-identical.
+        assert_eq!(catalog.entries.len(), 2, "two slots survive conversion");
+        let slot_a = "anthropic.claude-sonnet-4-5-20250929-v1";
+        let slot_b = "claude-sonnet-4-5-20250929-v1";
+        let base = &catalog.entries[slot_a];
+        assert_eq!(base.input, 0.000003 * 1e6);
+        assert_eq!(base.output, 0.000015 * 1e6);
+        assert_eq!(catalog.providers[slot_a], "anthropic");
+        assert!(
+            !catalog.exact.contains_key(slot_a) && !catalog.exact.contains_key(slot_b),
+            "slot winners stay out of the exact map: their raw ids already resolve through the ladder"
+        );
+        // Fix half: the twin resolves raw-first to its OWN row, and
+        // rate, provider, and provenance all claim that same row.
+        let price = resolve_price_in(twin, &catalog);
+        assert_eq!(price.input, 0.0000036 * 1e6);
+        assert_eq!(price.output, 0.000018 * 1e6);
+        assert_eq!(provider_for_in(twin, &catalog).as_deref(), Some("bedrock"));
+        assert_eq!(
+            pricing_source_for_catalog(twin, &catalog, &BTreeSet::new()),
+            format!("LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled)"),
+            "the exact row claims the plain catalog source — no alias arm, no fallback"
+        );
+        // The marker-family twin too, including its own rates, provider,
+        // and the retirement disclosure read off the exact row.
+        let twin2 = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let price2 = resolve_price_in(twin2, &catalog);
+        assert_eq!(price2.input, 0.0000033 * 1e6);
+        assert_eq!(price2.output, 0.0000165 * 1e6);
+        assert_eq!(
+            provider_for_in(twin2, &catalog).as_deref(),
+            Some("bedrock_converse")
+        );
+        assert_eq!(
+            pricing_source_for_catalog(twin2, &catalog, &BTreeSet::new()),
+            format!(
+                "LiteLLM snapshot {PRICING_SNAPSHOT_DATE} (bundled); \
+                 model deprecated 2025-08-01 (rate unverified)"
+            )
+        );
+        // A raw id that is NOT an exact catalog key still walks the
+        // ladder to the shared slot's winner (same spelling in a
+        // region absent from this fixture).
+        let absent_twin = "bedrock/eu-central-1/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let winner = resolve_price_in(absent_twin, &catalog);
+        assert_eq!(winner.input, 0.000003 * 1e6);
+        assert_eq!(winner.output, 0.000015 * 1e6);
+    }
+
+    #[test]
+    fn exact_key_overrides_correct_the_twin_row() {
+        // A user rate naming an exact twin key corrects THAT row — the
+        // shared slot it lost is not the row being corrected — and the
+        // direct user-rate arm of pricing_source_for_catalog keeps its
+        // rm-419 semantics on the exact lane.
+        let mut catalog = twin_catalog();
+        let twin = "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let root = std::env::temp_dir().join(format!(
+            "agenttrace-pricing-exact-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp dir");
+        let override_file = root.join("pricing.json");
+        std::fs::write(
+            &override_file,
+            serde_json::json!({
+                "prices": {
+                    twin: {"input": 4.0, "output": 20.0, "cw": 0, "cr": 0}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write override file");
+
+        let _env = crate::test_env::lock_env();
+        let prior_file = std::env::var_os("AGENTTRACE_PRICING_FILE");
+        std::env::set_var("AGENTTRACE_PRICING_FILE", &override_file);
+        let override_models = apply_pricing_overrides(&mut catalog);
+        match prior_file {
+            Some(value) => std::env::set_var("AGENTTRACE_PRICING_FILE", value),
+            None => std::env::remove_var("AGENTTRACE_PRICING_FILE"),
+        }
+        drop(_env);
+        let _ = std::fs::remove_dir_all(root);
+
+        assert_eq!(
+            override_models.iter().next().map(String::as_str),
+            Some(twin)
+        );
+        let price = resolve_price_in(twin, &catalog);
+        assert_eq!((price.input, price.output), (4.0, 20.0));
+        assert_eq!(
+            pricing_source_for_catalog(twin, &catalog, &override_models),
+            "user override"
+        );
+        // The shared slot's winner is untouched by a twin-scoped override.
+        assert_eq!(
+            catalog.entries["anthropic.claude-sonnet-4-5-20250929-v1"].input,
+            0.000003 * 1e6
+        );
+    }
+
+    #[test]
+    fn vendored_snapshot_pins_the_regional_twin_rates() {
+        // The cycle-3 live PoC pinned on the bundled snapshot itself:
+        // the bedrock us-gov-west-1 twin must bill $3.6/M in / $18/M
+        // out (the row stored under that exact key), while the shared
+        // slot keeps the winner's $3.0/$15.0 — the −16.7% misbill is
+        // the exact regression this guards.
+        let converted = convert_litellm(PRICING_SNAPSHOT_JSON.as_bytes());
+        let twin = "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let row = converted
+            .exact
+            .get(twin)
+            .expect("the twin survives conversion as an exact-key row");
+        assert_eq!(row.price.input, 0.0000036 * 1e6);
+        assert_eq!(row.price.output, 0.000018 * 1e6);
+        assert_eq!(row.provider, "bedrock");
+        let base = converted
+            .entries
+            .get("anthropic.claude-sonnet-4-5-20250929-v1")
+            .expect("the shared slot's winner survives");
+        assert_eq!(base.input, 0.000003 * 1e6);
+        assert_eq!(base.output, 0.000015 * 1e6);
+    }
+
+    #[test]
+    fn normalize_model_reaches_a_fixpoint_within_two_passes() {
+        // The exact-key lane stores normalize_model outputs (winner
+        // slots) beside raw ids (exact keys) and never re-normalizes a
+        // stored key — so the algebra it depends on is not strict
+        // one-pass idempotence but a BOUNDED fixpoint. Census taken
+        // 2026-10-14 over the vendored snapshot: every key without a
+        // version separator (':' / '@') is strictly idempotent; the
+        // 66 composed-suffix keys (`-YYYYMMDD-vN:0`, `@001`) shed the
+        // version tag on pass one and the date only on pass two. That
+        // two-pass family is PRE-EXISTING and out of this cycle's
+        // scope: collapsing it would move 66 slot assignments and the
+        // deprecation census with them. This pin makes any drift in
+        // either direction a deliberate, reviewed change.
+        let snapshot: serde_json::Value =
+            serde_json::from_str(PRICING_SNAPSHOT_JSON).expect("bundled snapshot parses");
+        let mut keys: Vec<&str> = snapshot
+            .as_object()
+            .expect("snapshot is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.extend([
+            "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "bedrock/us-gov-west-1/claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4-5",
+            "gpt-5.6",
+            "gpt-5.6-codex",
+            "gpt-reserve",
+        ]);
+        let mut composed_family = 0;
+        for key in keys {
+            let once = normalize_model(key);
+            let twice = normalize_model(&once);
+            if key.contains(':') || key.contains('@') {
+                // Composed-suffix family: two passes are enough.
+                assert_eq!(
+                    twice,
+                    normalize_model(&twice),
+                    "third pass must be a no-op for {key:?}"
+                );
+                if once != twice {
+                    composed_family += 1;
+                }
+            } else {
+                assert_eq!(once, twice, "normalize must be idempotent for {key:?}");
+            }
+        }
+        assert!(
+            composed_family > 50,
+            "the composed-suffix two-pass family is a known, census-documented shape ({composed_family} keys here); \
+             a shrink means normalize_model changed — re-derive the census comment above"
+        );
+    }
+
     /// rm-404: PRIVACY.md must enumerate the pricing download URL, derived
     /// from this module's own `PRICING_URL` const so the pin cannot drift
     /// from the code that performs the download (mirrors rm-086's
@@ -2866,6 +3283,7 @@ mod tests {
         // caller can take the labeled fallback ladder. A zero window
         // (malformed source) must behave like an absent one.
         let catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([
                 (
                     "wide-model".to_string(),
@@ -2913,6 +3331,7 @@ mod tests {
         // retired (per the catalog's own vintage) says so at the rate's
         // provenance line; a future-dated deprecation does not.
         let catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([
                 (
                     "retired-model".to_string(),
@@ -2961,6 +3380,7 @@ mod tests {
         // the catalog's own vintage. Catalogs without a vintage (the
         // built-in fallback) keep the legacy label byte-identical.
         let catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([
                 (
                     "retired-model".to_string(),
@@ -2981,6 +3401,7 @@ mod tests {
             "LiteLLM (cached catalog); 1 of 2 priced models past vendor deprecation"
         );
         let unvintaged = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: catalog.entries.clone(),
             aliases: BTreeMap::new(),
             source: "builtin".to_string(),
@@ -3001,6 +3422,7 @@ mod tests {
         // cache vs cache(stale) flips with file age, not content, so
         // counting it would trigger pointless full re-prices.
         let base = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([(
                 "model-a".to_string(),
                 Price {
@@ -3015,6 +3437,7 @@ mod tests {
             reference_date: None,
         };
         let same_content = PricingCatalog {
+            exact: BTreeMap::new(),
             source: "cache(stale)".to_string(),
             reference_date: Some(2026_1004),
             ..base.clone()
@@ -3025,6 +3448,7 @@ mod tests {
             "source and reference_date must not affect the identity"
         );
         let repriced = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([(
                 "model-a".to_string(),
                 Price {
@@ -3037,11 +3461,13 @@ mod tests {
         };
         assert_ne!(catalog_identity_of(&base), catalog_identity_of(&repriced));
         let aliased = PricingCatalog {
+            exact: BTreeMap::new(),
             aliases: BTreeMap::from([("alias".to_string(), "model-a".to_string())]),
             ..base.clone()
         };
         assert_ne!(catalog_identity_of(&base), catalog_identity_of(&aliased));
         let windowed = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([(
                 "model-a".to_string(),
                 Price {
@@ -3103,6 +3529,7 @@ mod tests {
         .expect("write override file");
 
         let mut catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([
                 (
                     "wide-retired".to_string(),
@@ -3270,6 +3697,7 @@ mod tests {
         );
         // A redirect retires itself when a real row ships.
         let mut catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([("gpt-reserve".to_string(), Price::default())]),
             aliases: BTreeMap::new(),
             source: "test".to_string(),
@@ -3289,6 +3717,7 @@ mod tests {
         // mode:"responses" (excluded by the chat filter), lifted
         // code-side with drop-on-upstream-ship discipline.
         let mut catalog = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::new(),
             aliases: BTreeMap::new(),
             source: "test".to_string(),
@@ -3306,6 +3735,7 @@ mod tests {
         // Retire: an upstream chat row (or a user override merged
         // earlier) is never clobbered by the vend.
         let mut shipped = PricingCatalog {
+            exact: BTreeMap::new(),
             entries: BTreeMap::from([(
                 "gpt-5.3-codex".to_string(),
                 Price {
@@ -3467,6 +3897,7 @@ mod tests {
     fn catalog_identity_covers_flex_and_providers() {
         fn catalog_with(input_flex: Option<f64>, provider: &str) -> PricingCatalog {
             PricingCatalog {
+                exact: BTreeMap::new(),
                 entries: BTreeMap::from([(
                     "m".to_string(),
                     Price {
@@ -3497,6 +3928,53 @@ mod tests {
         assert_ne!(
             base, provider_flip,
             "a rate-identical provider flip changes attribution and must change the digest (rm-613)"
+        );
+    }
+
+    // --- rm-1053: catalog identity covers exact-key twin rows ----------
+
+    #[test]
+    fn catalog_identity_covers_exact_rows() {
+        fn catalog_with_twin_rate(input: f64) -> PricingCatalog {
+            PricingCatalog {
+                exact: BTreeMap::from([(
+                    "bedrock/us-gov-west-1/anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                    ExactKeyRow {
+                        price: Price {
+                            input,
+                            output: 18.0,
+                            ..Price::default()
+                        },
+                        provider: "bedrock".to_string(),
+                    },
+                )]),
+                entries: BTreeMap::from([(
+                    "anthropic.claude-sonnet-4-5-20250929-v1".to_string(),
+                    Price {
+                        input: 3.0,
+                        output: 15.0,
+                        ..Price::default()
+                    },
+                )]),
+                aliases: BTreeMap::new(),
+                source: "test".to_string(),
+                providers: BTreeMap::new(),
+                reference_date: None,
+            }
+        }
+        let base = catalog_identity_of(&catalog_with_twin_rate(3.6));
+        let twin_repriced = catalog_identity_of(&catalog_with_twin_rate(3.7));
+        assert_ne!(
+            base, twin_repriced,
+            "a snapshot that changes only a twin's rate (slot winner untouched) must reprice warm sessions (rm-1053)"
+        );
+        let twin_gone = catalog_identity_of(&PricingCatalog {
+            exact: BTreeMap::new(),
+            ..catalog_with_twin_rate(3.6)
+        });
+        assert_ne!(
+            base, twin_gone,
+            "losing an exact row entirely must change the digest too"
         );
     }
 }
