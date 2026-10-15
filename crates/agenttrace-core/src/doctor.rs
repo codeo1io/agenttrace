@@ -330,7 +330,8 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             crate::pricing::bundled_snapshot_date(),
             crate::pricing::bundled_snapshot_model_count(),
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
-        ) + &doctor_deprecation_suffix(),
+        ) + &doctor_deprecation_suffix()
+            + &doctor_duplicate_collapse_suffix(),
         sqlite_read_failures: sqlite_ingest.unreadable,
         recommendations: Vec::new(),
     };
@@ -579,6 +580,23 @@ fn snapshot_age_phrase(age_days: i64) -> String {
     } else {
         format!("{age_days} days old")
     }
+}
+
+/// Duplicate-key collapse disclosure for the doctor pricing line
+/// (rm-1419): the bundled LiteLLM snapshot contains families of raw
+/// spellings that normalize onto one catalog key. The loader resolves
+/// each family by an explicit precedence rule (provider priority, then
+/// shortest raw spelling, then lexicographic) and keeps every losing
+/// spelling as its own exact-match row — so this suffix discloses
+/// resolved ambiguity, never lost data.
+fn doctor_duplicate_collapse_suffix() -> String {
+    let (resolved, families, _ledger) = crate::pricing::bundled_snapshot_duplicate_collapses();
+    if resolved == 0 {
+        return String::new();
+    }
+    format!(
+        "; {resolved} duplicate catalog keys across {families} families resolved by rule (priority, then shortest spelling)"
+    )
 }
 
 /// Deprecation disclosure for the doctor pricing line (rm-419):

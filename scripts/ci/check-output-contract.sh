@@ -20,10 +20,35 @@ require_json() {
     || fail "invalid JSON: $path"
 }
 
+# rm-1419 rider: never default to the shared /tmp/agenttrace binary or
+# the shared /tmp/agenttrace-ci out dir (rm-369 precedent; env overrides
+# still win for A/B against a pinned build). The repo root derives from
+# the script's own location, not `git rev-parse`, so an out-of-repo
+# invocation with AGENTTRACE_BIN set works — the git guard used to
+# fail it before the env was ever consulted (rm-1419 review F5).
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)" \
+  || fail "cannot locate the agenttrace repository from the script path"
+bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+if [[ -n "${AGENTTRACE_CI_OUT:-}" ]]; then
+  out_dir="$AGENTTRACE_CI_OUT"
+else
+  out_dir="$(mktemp -d /tmp/agenttrace-output-contract.XXXXXX)"
+  trap 'rm -rf "$out_dir"' EXIT
+fi
+
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 mkdir -p "$out_dir"
 
-"$bin" --doctor -f json >"$out_dir/doctor.json"
+# rm-444/rm-1419: scope the doctor leg to a repo fixture corpus and an
+# isolated HOME — the bare `--doctor` walked the operator's real HOME
+# and banked a session entry into ~/.cache/agenttrace (observed
+# 2026-10-14, assess d4605575). Command/flag surface stays exercised
+# (--doctor, -f json); only the input scope changes.
+doctor_home="$out_dir/doctor-home"
+mkdir -p "$doctor_home"
+HOME="$doctor_home" \
+  "$bin" --doctor -d "$repo_root/crates/agenttrace-core/tests/fixtures/pi-oh-my-pi" \
+  -f json >"$out_dir/doctor.json"
 require_file "$out_dir/doctor.json"
 require_json "$out_dir/doctor.json"
 
