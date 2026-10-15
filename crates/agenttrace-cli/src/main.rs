@@ -1940,8 +1940,11 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
                     None,
                 ));
             }
+            // rm-1434: the top-level printer at main.rs:333 already
+            // prefixes "Error: " — this literal must not repeat it (the
+            // doubled-prefix render was pinned red-first in entrypoints.rs).
             bail!(
-                "Error loading {}: positional path must be a session file",
+                "loading {}: positional path must be a session file",
                 path.display()
             );
         }

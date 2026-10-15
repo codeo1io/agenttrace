@@ -2307,6 +2307,54 @@ fn error_stderr_carries_the_anyhow_cause_chain() {
     );
 }
 
+// rm-1434: the positional-path guard literal at main.rs opened with
+// "Error " while the top-level printer also prefixes "Error: ", so
+// `--overview <dir>` rendered a doubled prefix ("Error: Error loading
+// a-dir: …", PoC banked in delegate/9ced39ae…-scratch/dx/). The
+// literal must not carry its own prefix; exit code and the remaining
+// text are pinned unchanged.
+#[test]
+fn error_prefix_is_not_doubled_for_non_session_positional() {
+    // The path must exist and be a directory to reach the positional
+    // guard (a missing path bails earlier with its own message).
+    let dir = std::env::temp_dir().join("agenttrace-rm1434-not-a-session");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .arg("--overview")
+        .arg(&dir)
+        .output()
+        .expect("run agenttrace with a non-session positional");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let expected = format!(
+        "Error: loading {}: positional path must be a session file",
+        dir.display()
+    );
+    assert_eq!(out.status.code(), Some(1), "exit code unchanged: {stderr}");
+    assert_eq!(
+        stderr.trim_end(),
+        expected,
+        "single prefix, rest of the message unchanged"
+    );
+    let _ = std::fs::remove_dir(&dir);
+}
+
+// rm-1434 guard: the printer owns the "Error: " prefix — no bail!/
+// context/anyhow! literal may open with "Error " again.
+#[test]
+fn bail_literals_never_duplicate_the_error_prefix() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .expect("read main.rs");
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.contains("bail!(\"Error ")
+            || trimmed.contains(".context(\"Error ")
+            || trimmed.contains("anyhow!(\"Error ")
+        {
+            panic!("doubled error prefix reintroduced: {trimmed}");
+        }
+    }
+}
+
 // rm-610, second leg: the cause-chain join must not change how
 // single-layer (uncontextualized) errors render — the missing -d
 // message keeps its plain form with no dangling separator glue.
