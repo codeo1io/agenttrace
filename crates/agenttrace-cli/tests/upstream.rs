@@ -246,10 +246,41 @@ fn missing_upstream_remote_fails_with_setup_hint() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// rm-A3 (run b01c2b6a): `std::env::temp_dir()` is only *usually* outside a git
+/// repository. Delegate runtimes set TMPDIR to paths inside trees that carry a
+/// `.git` ancestor (e.g. `.../.hermes/tmp/delegate`), which made this suite
+/// report the scratch dir as a repository and fail the assertion below. Probe
+/// the conventional temp roots and pick the first one with no `.git` at or
+/// above it, so the "outside a git repository" precondition holds on every
+/// fleet host instead of only on pristine ones.
+fn non_repo_temp_parent() -> PathBuf {
+    let mut candidates: Vec<PathBuf> = vec![std::env::temp_dir()];
+    candidates.push(PathBuf::from("/var/tmp"));
+    candidates.push(PathBuf::from("/tmp"));
+    for root in candidates {
+        let mut ancestor: Option<&Path> = Some(root.as_path());
+        let mut inside_repository = false;
+        while let Some(dir) = ancestor {
+            if dir.join(".git").exists() {
+                inside_repository = true;
+                break;
+            }
+            ancestor = dir.parent();
+        }
+        if !inside_repository {
+            return root;
+        }
+    }
+    panic!(
+        "no scratch parent outside a git repository: temp_dir={:?}, /var/tmp and /tmp are inside repositories",
+        std::env::temp_dir()
+    );
+}
+
 #[test]
 fn outside_a_git_repository_fails() {
     let root =
-        std::env::temp_dir().join(format!("agenttrace-upstream-nogit-{}", std::process::id()));
+        non_repo_temp_parent().join(format!("agenttrace-upstream-nogit-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create plain dir");
 

@@ -1215,6 +1215,37 @@ fn delivery_evidence_inner(sessions: &[Session], inspect_git: bool) -> DeliveryE
         if inspect_git && matching_commits.is_empty() && !project.root.is_empty() {
             evidence.push("no overlapping local commit found; this does not rule out uncommitted, remote, non-code, or later-delivered work".to_string());
         }
+        // rm-1509 (cycle 2, run b01c2b6a): the OpenCode v2
+        // `session.summary_diffs` per-file list is writer-reported
+        // delivery evidence — surfaced as counts and paths (no patch
+        // bodies). When the per-file sums disagree with the integer
+        // `summary_*` columns on the same row, the divergence is
+        // disclosed on its own line, never silently reconciled into
+        // either side.
+        if let Some(diffs) = session
+            .metrics
+            .summary_diffs
+            .as_ref()
+            .filter(|diffs| !diffs.is_empty())
+        {
+            let additions: i64 = diffs.iter().map(|diff| diff.additions).sum();
+            let deletions: i64 = diffs.iter().map(|diff| diff.deletions).sum();
+            evidence.push(format!(
+                "writer-reported per-file diff summary: {} files (+{}/-{})",
+                diffs.len(),
+                additions,
+                deletions
+            ));
+        }
+        if let Some(divergence) = &session.metrics.summary_diffs_divergence {
+            evidence.push(format!(
+                "per-file diff sums diverge from the row's summary columns: +{} vs +{} additions, -{} vs -{} deletions",
+                divergence.per_file_additions,
+                divergence.summary_additions,
+                divergence.per_file_deletions,
+                divergence.summary_deletions
+            ));
+        }
         match level {
             "strong" => summary.strong += 1,
             "medium" => summary.medium += 1,
