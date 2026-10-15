@@ -90,8 +90,13 @@ grep -q "cargo build --release -p agenttrace --target" .github/workflows/release
 	fail "release workflow must build Rust release binaries"
 grep -q "dtolnay/rust-toolchain" .github/workflows/release.yml ||
 	fail "release workflow must set up Rust"
-grep -q "gh release create" .github/workflows/release.yml ||
-	fail "release workflow must publish GitHub releases"
+# rm-169: the create call moved behind scripts/release/publish-release.sh so
+# the publish step is idempotent; assert the delegation AND that the script
+# still performs the create.
+grep -q "publish-release.sh" .github/workflows/release.yml ||
+	fail "release workflow must publish GitHub releases (via scripts/release/publish-release.sh)"
+grep -q "gh release create" scripts/release/publish-release.sh ||
+	fail "publish-release.sh must create the GitHub release"
 
 if grep -R -Eqi "go install github.com/luoyuctl/agenttrace|go build .*cmd/agenttrace|setup-go|go-version-file" \
 	README.md README.zh-CN.md CONTRIBUTING.md docs/maintainers/launch-kit.md docs/maintainers/demo-playbook.md docs/guides/parser-guide.md docs/maintainers/agentops-prompt-rules.md install.sh install.ps1 .github homebrew skills; then

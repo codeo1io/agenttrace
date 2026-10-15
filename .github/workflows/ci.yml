@@ -92,6 +92,17 @@ jobs:
         # match install.sh's AGENTTRACE_SOURCE_REF default (rm-017 chain).
         run: scripts/ci/check-release-pins.sh
 
+      - name: Release idempotency selftest
+        # rm-169: the release publish path must be safe to re-run; the
+        # selftest exercises publish-release.sh against a PATH-shimmed gh
+        # and pins the guard wiring in the release/changelog workflows.
+        run: scripts/release/idempotency-selftest.sh
+
+      - name: MSRV floor gate
+        # rm-386: advertised rust-version must not fall below the locked
+        # dep floor, and the msrv lane selector must match the manifest.
+        run: scripts/ci/check-msrv-floor.sh
+
       - name: Codex plugin version sync
         run: |
           # rm-163: the tag anchor needs tags; a fetch-depth:1 checkout has
@@ -154,7 +165,10 @@ jobs:
       - name: Check
         # The repo pins rust-toolchain.toml (rm-173), which outranks the
         # action's toolchain input; the explicit +1.89 selector makes the
-        # floor the version that actually compiles here.
+        # floor the version that actually compiles here. Floor truth:
+        # workspace code needs 1.89 (std::fs::File::lock, rm-166), locked
+        # deps need 1.88.0 — scripts/ci/check-msrv-floor.sh guards the
+        # drift in both directions (rm-386).
         run: cargo +1.89 check --locked -p agenttrace-core -p agenttrace-tui -p agenttrace
 
   conformance:

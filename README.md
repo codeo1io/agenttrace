@@ -580,6 +580,11 @@ cargo build --release -p agenttrace
 target/release/agenttrace --doctor
 ```
 
+The minimum supported Rust version is 1.89 (set by the workspace's own use
+of `std::fs::File::lock`, with the locked dependency floor at 1.88.0);
+`rust-version` in Cargo.toml carries the number, the `msrv` CI job proves it
+builds, and `scripts/ci/check-msrv-floor.sh` guards the drift.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution flow.
 
 ## License

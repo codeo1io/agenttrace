@@ -155,7 +155,22 @@ jobs:
           cat ./*.sha256 > checksums.txt
           sort -o checksums.txt checksums.txt
 
+      - name: Check for existing release
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # rm-169: re-run safety. A re-run of this job must not re-attest or
+          # re-create; publish-release.sh re-probes and reconciles assets.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "release $GITHUB_REF_NAME already exists"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Attest release assets
+        if: steps.existing_release.outputs.exists != 'true'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
           subject-path: dist/agenttrace-*
@@ -163,11 +178,9 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+        # rm-169: idempotent publish — create, reconcile missing assets, or
+        # no-op; scripts/release/idempotency-selftest.sh proves all branches.
+        run: scripts/release/publish-release.sh "$GITHUB_REF_NAME" dist
 
       - name: Pack npm launcher
         run: |
