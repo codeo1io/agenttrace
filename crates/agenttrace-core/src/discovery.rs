@@ -66,6 +66,11 @@ pub struct LoadReport {
     /// `--overview -d dir -o dir/bad.jsonl` silently overwrites the
     /// unparseable input (a `.orig` twin is not a recovery path).
     pub parse_failure_paths: Vec<PathBuf>,
+    /// rm-1417: sessions folded into a same-conversation representative
+    /// by the cross-file conversation merge (gemini chats/checkpoints
+    /// mirror families). Disclosed per-session via the
+    /// `cross_file_sessions_merged` counter on the surviving session.
+    pub cross_file_merged: usize,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -476,6 +481,14 @@ pub fn load_sessions_with_progress_from_cache_mode(
         sqlite_ingest = ingest;
         opencode_fork_excluded += sqlite_ingest.fork_excluded;
     }
+    // rm-1417 (run 942ed30a cycle 3): one conversation, one session. A
+    // gemini tmp root can hold the live conversation under chats/ AND
+    // its checkpoint snapshots under checkpoints/ — cumulative usage
+    // snapshots of the SAME conversation that used to render as two
+    // sessions and double-count every cumulative field. Merge mirror
+    // families here, before attribution and history preserve see the
+    // corpus, so downstream passes operate on the merged shape.
+    let cross_file_merged = merge_cross_file_conversations(&mut sessions);
     if options.preserve_history {
         // rm-787: attribute BEFORE preserving so the derived record
         // carries the subagent rollups the live view showed. The
@@ -539,6 +552,7 @@ pub fn load_sessions_with_progress_from_cache_mode(
         first_parse_failure,
         parse_failure_paths,
         unlinked_subagents,
+        cross_file_merged,
     }
 }
 
@@ -1163,6 +1177,366 @@ fn is_gemini_temp_session_file(path: &Path) -> bool {
         )
 }
 
+/// rm-1417 (run 942ed30a cycle 3): identity key of a gemini temp
+/// conversation — the `~/.gemini/tmp/<root>/` directory. One tmp root
+/// holds ONE conversation's mirror family (the live chat under chats/
+/// and its checkpoint snapshots under checkpoints/), so the root is the
+/// stable cross-file identity; the family directory is NOT part of the
+/// key (that is what made the mirror render twice).
+fn gemini_conversation_root(path: &Path) -> Option<&Path> {
+    if !is_gemini_temp_session_file(path) {
+        return None;
+    }
+    // .../.gemini/tmp/<root>/(chats|checkpoints)/file.json
+    let family_dir = path.parent()?; // (chats|checkpoints)
+    let root = family_dir.parent()?; // <root>
+    let tmp = root.parent()?; // tmp
+    let gemini_dir = tmp.parent()?; // .gemini
+    let names_ok = tmp.file_name().is_some_and(|n| n == "tmp")
+        && gemini_dir.file_name().is_some_and(|n| n == ".gemini");
+    names_ok.then_some(root)
+}
+
+/// rm-1417: fold one same-conversation member's metrics into the
+/// representative. Cumulative usage snapshots of one conversation
+/// appear in several files, so every cumulative field takes the
+/// per-field MAX across members — never a sum, which would double-count
+/// the same usage. Per-conversation activity counts max with the most
+/// complete snapshot; timestamps/gaps union (the conversation spans
+/// both members' spans). Cost is REPRICED from the merged token totals:
+/// at the representative's model for single-model families (the live
+/// conversation's model — the most complete picture of what the
+/// conversation ran), and per attribution entry for MULTI-MODEL
+/// families (review fix F1 — a "multiple" repricing bills the builtin
+/// default); a saturated token class (rm-046 clamp) keeps the clamped
+/// provenance. The merge is disclosed by the caller, never a silent
+/// drop.
+fn merge_cross_file_metrics(repr: &mut crate::Metrics, other: &crate::Metrics) {
+    let max_map = |into: &mut std::collections::BTreeMap<String, usize>,
+                   from: &std::collections::BTreeMap<String, usize>| {
+        for (key, count) in from {
+            into.entry(key.clone())
+                .and_modify(|c| *c = (*c).max(*count))
+                .or_insert(*count);
+        }
+    };
+    max_map(&mut repr.tool_usage, &other.tool_usage);
+    max_map(&mut repr.file_usage, &other.file_usage);
+    max_map(&mut repr.tool_arg_usage, &other.tool_arg_usage);
+    max_map(&mut repr.tool_authority, &other.tool_authority);
+    if repr.highest_authority.is_empty() {
+        repr.highest_authority = other.highest_authority.clone();
+    }
+    repr.user_messages = repr.user_messages.max(other.user_messages);
+    repr.assistant_turns = repr.assistant_turns.max(other.assistant_turns);
+    repr.tool_results = repr.tool_results.max(other.tool_results);
+    repr.tool_calls_total = repr.tool_calls_total.max(other.tool_calls_total);
+    repr.tool_calls_ok = repr.tool_calls_ok.max(other.tool_calls_ok);
+    repr.tool_calls_fail = repr.tool_calls_fail.max(other.tool_calls_fail);
+    repr.reasoning_blocks = repr.reasoning_blocks.max(other.reasoning_blocks);
+    repr.reasoning_chars = repr.reasoning_chars.max(other.reasoning_chars);
+    repr.reasoning_redact = repr.reasoning_redact.max(other.reasoning_redact);
+    repr.events_total = repr.events_total.max(other.events_total);
+    repr.tokens_input = repr.tokens_input.max(other.tokens_input);
+    repr.tokens_output = repr.tokens_output.max(other.tokens_output);
+    repr.tokens_reasoning = repr.tokens_reasoning.max(other.tokens_reasoning);
+    repr.tokens_cache_w = repr.tokens_cache_w.max(other.tokens_cache_w);
+    repr.tokens_cache_r = repr.tokens_cache_r.max(other.tokens_cache_r);
+    repr.credit_usd = repr.credit_usd.max(other.credit_usd);
+    if other.session_start < repr.session_start {
+        repr.session_start = other.session_start.clone();
+    }
+    if other.session_end > repr.session_end {
+        repr.session_end = other.session_end.clone();
+    }
+    for ts in &other.timestamps {
+        if !repr.timestamps.contains(ts) {
+            repr.timestamps.push(*ts);
+        }
+    }
+    repr.timestamps.sort_unstable();
+    for gap in &other.gaps_sec {
+        if !repr.gaps_sec.contains(gap) {
+            repr.gaps_sec.push(*gap);
+        }
+    }
+    repr.gaps_sec
+        .sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if repr.upstream_cost_usd < other.upstream_cost_usd {
+        repr.upstream_cost_usd = other.upstream_cost_usd;
+    }
+    repr.zero_usage_events = repr.zero_usage_events.max(other.zero_usage_events);
+    repr.naive_utc_stamps = repr.naive_utc_stamps.max(other.naive_utc_stamps);
+    repr.duration_sec = repr.duration_sec.max(other.duration_sec);
+    // Review fix F2 (independent review 09b3e188): the member's
+    // non-priced cumulative channels must fold too, or the merged
+    // session silently understates them. Parse-loss line skips max per
+    // reason (counters of the same conversation's lost lines — a sum
+    // would double-count the same loss), reasoning-lens entries union
+    // (the same block measured by two snapshots is one entry), opencode
+    // diff summaries max per field, and the stored-totals drift keeps
+    // the larger magnitude.
+    max_map(&mut repr.line_skips, &other.line_skips);
+    for len in &other.reasoning_lens {
+        if !repr.reasoning_lens.contains(len) {
+            repr.reasoning_lens.push(*len);
+        }
+    }
+    repr.reasoning_lens.sort_unstable();
+    let max_option = |a: Option<i64>, b: Option<i64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    };
+    repr.summary_additions = max_option(repr.summary_additions, other.summary_additions);
+    repr.summary_deletions = max_option(repr.summary_deletions, other.summary_deletions);
+    repr.summary_files = max_option(repr.summary_files, other.summary_files);
+    repr.stored_totals_delta = repr.stored_totals_delta.max(other.stored_totals_delta);
+
+    // Review fix F1 (independent review 09b3e188): a mirror family can
+    // be MULTI-MODEL — parse_gemini_object threads one mutable model,
+    // so a mid-conversation model switch finalizes the chats file as
+    // model_used "multiple" with per-model attribution, and the
+    // canonical session prices that per attribution entry. Repricing
+    // the merged totals at the representative's model would bill the
+    // "multiple" lookup at the builtin default (claude-opus-4.7). Fold
+    // attribution with the same cumulative-MAX rule — an unattributed
+    // member contributes its totals under its own model key — then
+    // reprice per entry and stamp the canonical multi-model
+    // provenance. A family whose fold leaves ONE model key keeps the
+    // single-model shape (no attribution minted, repriced at the
+    // representative's model); a degenerate "multiple" with no keys
+    // at all prices at the lookup default exactly as before.
+    let family_multi_model = !repr.model_attribution.is_empty()
+        || !other.model_attribution.is_empty()
+        || repr.model_used == "multiple"
+        || other.model_used == "multiple";
+    let mut attribution: std::collections::BTreeMap<String, crate::ModelAttribution> =
+        std::collections::BTreeMap::new();
+    if family_multi_model {
+        let fold_attribution =
+            |attribution: &mut std::collections::BTreeMap<String, crate::ModelAttribution>,
+             member: &crate::Metrics| {
+                if !member.model_attribution.is_empty() {
+                    for (model, entry) in &member.model_attribution {
+                        let slot = attribution.entry(model.clone()).or_default();
+                        slot.input_tokens = slot.input_tokens.max(entry.input_tokens);
+                        slot.output_tokens = slot.output_tokens.max(entry.output_tokens);
+                        slot.cache_w = slot.cache_w.max(entry.cache_w);
+                        slot.cache_r = slot.cache_r.max(entry.cache_r);
+                        slot.cost_usd = slot.cost_usd.max(entry.cost_usd);
+                    }
+                } else if !member.model_used.is_empty()
+                    && member.model_used != "multiple"
+                    && member.model_used != "unknown"
+                {
+                    // single-model member: its cumulative totals ride its
+                    // own model key
+                    let slot = attribution.entry(member.model_used.clone()).or_default();
+                    slot.input_tokens = slot.input_tokens.max(member.tokens_input);
+                    slot.output_tokens = slot.output_tokens.max(member.tokens_output);
+                    slot.cache_w = slot.cache_w.max(member.tokens_cache_w);
+                    slot.cache_r = slot.cache_r.max(member.tokens_cache_r);
+                }
+            };
+        fold_attribution(&mut attribution, repr);
+        fold_attribution(&mut attribution, other);
+    }
+    let repriced_multi_model = attribution.len() > 1;
+    // Reprice from the merged token totals. Single-model arm: analyze's
+    // four-class formula at the representative's model (gemini mirror
+    // families carry no credits or recorded-cost rows on this lane).
+    // Multi-model arm: each model's merged tokens at that model's own
+    // rates, seeded with the merged upstream-recorded total like
+    // analyze's per-block rule.
+    let token_priced = if repriced_multi_model {
+        let mut per_model_cost = repr.upstream_cost_usd;
+        for (model, entry) in &mut attribution {
+            let price = crate::pricing::lookup_price_tiered(model, None);
+            let cost = entry.input_tokens as f64 / 1e6 * price.input
+                + entry.output_tokens as f64 / 1e6 * price.output
+                + entry.cache_w as f64 / 1e6 * price.cw
+                + entry.cache_r as f64 / 1e6 * price.cr;
+            per_model_cost += cost;
+            entry.cost_usd = crate::round4(cost.max(entry.cost_usd));
+        }
+        per_model_cost
+    } else {
+        let price = crate::pricing::lookup_price_tiered(&repr.model_used, None);
+        repr.tokens_input as f64 / 1e6 * price.input
+            + repr.tokens_output as f64 / 1e6 * price.output
+            + repr.tokens_cache_w as f64 / 1e6 * price.cw
+            + repr.tokens_cache_r as f64 / 1e6 * price.cr
+    };
+    repr.cost_estimated = crate::round4(if repr.credit_usd > 0.0 {
+        token_priced.max(repr.credit_usd)
+    } else {
+        token_priced
+    });
+    let saturated = [
+        repr.tokens_input,
+        repr.tokens_output,
+        repr.tokens_reasoning,
+        repr.tokens_cache_w,
+        repr.tokens_cache_r,
+    ]
+    .contains(&i64::MAX);
+    if saturated {
+        repr.provenance.cost = "calculated_from_tokens_clamped".to_string();
+    } else if repr.credit_usd > 0.0 && repr.credit_usd >= token_priced {
+        repr.provenance.cost = "calculated_from_copilot_credits".to_string();
+    } else if repriced_multi_model {
+        repr.provenance.cost = "calculated_per_message_tokens".to_string();
+    } else {
+        repr.provenance.cost = "calculated_from_tokens".to_string();
+    }
+    if repriced_multi_model {
+        repr.model_used = "multiple".to_string();
+        repr.model_attribution = attribution;
+    }
+    repr.provenance.tokens = "cumulative max across merged same-conversation files".to_string();
+    for (key, count) in &other.disclosure_counters {
+        *repr.disclosure_counters.entry(key.clone()).or_insert(0) += count;
+    }
+}
+
+/// rm-1417: merge gemini mirror families in a loaded corpus. A tmp root
+/// with members in more than one family directory (chats/ plus
+/// checkpoints/) is one conversation rendered per file — fold the
+/// family into the chats member (the live conversation) with cumulative
+/// MAX metrics and a disclosed `cross_file_sessions_merged` counter.
+/// Identity stays SCOPED: a root with MORE THAN ONE chats file is
+/// ambiguous (two conversations sharing a tmp dir is not the layout
+/// gemini writes) — nothing merges there; and a family with only
+/// checkpoint snapshots still merges (representative = the first
+/// checkpoint in discovery order). Returns the number of sessions
+/// folded away.
+fn merge_cross_file_conversations(sessions: &mut Vec<Session>) -> usize {
+    // Map conversation root -> (indices of members, number of chats-lane
+    // members). Retain original order via indices.
+    let mut families: std::collections::BTreeMap<PathBuf, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, session) in sessions.iter().enumerate() {
+        let path = Path::new(&session.path);
+        if let Some(root) = gemini_conversation_root(path) {
+            families.entry(root.to_path_buf()).or_default().push(index);
+        }
+    }
+    let mut fold: Vec<(usize /*repr*/, usize /*member*/)> = Vec::new();
+    for indices in families.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let chats_members = indices
+            .iter()
+            .filter(|i| {
+                Path::new(&sessions[**i].path)
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|n| n.to_str())
+                    == Some("chats")
+            })
+            .count();
+        // Scoped fallback: an ambiguous root (multiple live chats under
+        // one tmp dir) never merges — per-file keys only.
+        if chats_members > 1 {
+            continue;
+        }
+        let repr_index = indices
+            .iter()
+            .copied()
+            .find(|i| {
+                Path::new(&sessions[*i].path)
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|n| n.to_str())
+                    == Some("chats")
+            })
+            .or_else(|| indices.first().copied())
+            .expect("family holds at least one member");
+        for member in indices {
+            if *member != repr_index {
+                fold.push((repr_index, *member));
+            }
+        }
+    }
+    if fold.is_empty() {
+        return 0;
+    }
+    let folded = fold.len();
+    // Apply folds onto representatives (a representative may absorb
+    // several members).
+    for (repr_index, member_index) in &fold {
+        let (repr, member) = if repr_index < member_index {
+            let (left, right) = sessions.split_at_mut(*member_index);
+            (&mut left[*repr_index], &right[0])
+        } else {
+            let (left, right) = sessions.split_at_mut(*repr_index);
+            (&mut right[0], &left[*member_index])
+        };
+        // Review fix F2 (independent review 09b3e188): `diagnostics` is a
+        // per-snapshot ANALYSIS (fingerprints/latencies/steps index into
+        // their own member's event order), so it is not additive — but
+        // dropping the folded member's loses the more complete picture
+        // when the chats file is windowed down and the checkpoint
+        // snapshot is the fuller member. Carry the richer member's
+        // analysis; events_total before the metrics fold is the
+        // completeness measure (it is maxed inside the fold).
+        let member_richer = member.metrics.events_total > repr.metrics.events_total;
+        merge_cross_file_metrics(&mut repr.metrics, &member.metrics);
+        if member_richer {
+            repr.diagnostics = member.diagnostics.clone();
+        }
+        let anomaly_key =
+            |a: &crate::Anomaly| (a.kind.clone(), a.severity.clone(), a.detail.clone());
+        let mut anomaly_keys: Vec<_> = repr.anomalies.iter().map(anomaly_key).collect();
+        for anomaly in &member.anomalies {
+            let key = anomaly_key(anomaly);
+            if !anomaly_keys.contains(&key) {
+                anomaly_keys.push(key);
+                repr.anomalies.push(anomaly.clone());
+            }
+        }
+        repr.health = repr.health.min(member.health);
+        let warning_key = |w: &crate::ToolWarning| {
+            (
+                w.tool_name.clone(),
+                w.pattern.clone(),
+                w.count,
+                w.detail.clone(),
+                w.severity.clone(),
+            )
+        };
+        let mut warning_keys: Vec<_> = repr.tool_warnings.iter().map(warning_key).collect();
+        for warning in &member.tool_warnings {
+            let key = warning_key(warning);
+            if !warning_keys.contains(&key) {
+                warning_keys.push(key);
+                repr.tool_warnings.push(warning.clone());
+            }
+        }
+    }
+    // Disclose: one counter per folded member on the representative.
+    for (repr_index, _member) in &fold {
+        *sessions[*repr_index]
+            .metrics
+            .disclosure_counters
+            .entry("cross_file_sessions_merged".to_string())
+            .or_insert(0) += 1;
+    }
+    // Drop folded members, preserving corpus order.
+    let folded_set: std::collections::BTreeSet<usize> = fold.iter().map(|(_, m)| *m).collect();
+    let mut write = 0;
+    for read in 0..sessions.len() {
+        if !folded_set.contains(&read) {
+            sessions.swap(read, write);
+            write += 1;
+        }
+    }
+    sessions.truncate(write);
+    folded
+}
+
 fn is_open_code_storage_root(path: &Path) -> bool {
     path.to_string_lossy()
         .replace('\\', "/")
@@ -1307,5 +1681,175 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+/// rm-1417 review-fix unit pins (independent review 09b3e188, attempt
+/// 97ef8844). The corpus-level arms live in tests/ingest_truth_batch.rs;
+/// these pin the merge itself per finding.
+#[cfg(test)]
+mod cross_file_merge_tests {
+    use super::*;
+
+    fn entry(input: i64, output: i64) -> crate::ModelAttribution {
+        crate::ModelAttribution {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
+    fn priced(model: &str, input: i64, output: i64) -> f64 {
+        let price = crate::pricing::lookup_price_tiered(model, None);
+        input as f64 / 1e6 * price.input + output as f64 / 1e6 * price.output
+    }
+
+    /// Independent review 09b3e188 F1 (red-first): a MULTI-MODEL mirror
+    /// family must be repriced per attribution entry, never at the
+    /// `"multiple"` lookup's builtin default, and the member's per-model
+    /// snapshot folds per key with cumulative MAX.
+    #[test]
+    fn multi_model_mirror_reprices_per_attribution_entry() {
+        let mut repr = crate::Metrics {
+            model_used: "multiple".to_string(),
+            tokens_input: 1500,
+            tokens_output: 300,
+            ..Default::default()
+        };
+        repr.model_attribution
+            .insert("gemini-2.5-pro".to_string(), entry(1000, 200));
+        repr.model_attribution
+            .insert("gemini-2.5-flash".to_string(), entry(500, 100));
+        let other = crate::Metrics {
+            // single-model member: no attribution map, its totals ride its
+            // own model key
+            model_used: "gemini-2.5-flash".to_string(),
+            tokens_input: 900,
+            tokens_output: 150,
+            ..Default::default()
+        };
+        merge_cross_file_metrics(&mut repr, &other);
+        assert_eq!(repr.model_used, "multiple");
+        let pro = repr
+            .model_attribution
+            .get("gemini-2.5-pro")
+            .expect("pro attribution survives the fold");
+        assert_eq!((pro.input_tokens, pro.output_tokens), (1000, 200));
+        let flash = repr
+            .model_attribution
+            .get("gemini-2.5-flash")
+            .expect("flash attribution survives the fold");
+        assert_eq!(
+            (flash.input_tokens, flash.output_tokens),
+            (900, 150),
+            "per-key cumulative MAX: the member's fuller flash snapshot wins"
+        );
+        assert_eq!(
+            repr.cost_estimated,
+            crate::round4(
+                priced("gemini-2.5-pro", 1000, 200) + priced("gemini-2.5-flash", 900, 150)
+            ),
+            "multi-model families price each model's tokens at that model's rates"
+        );
+        assert_eq!(repr.provenance.cost, "calculated_per_message_tokens");
+    }
+
+    /// Independent review 09b3e188 F1 regression pin: the SINGLE-model
+    /// mirror keeps its pre-existing serialized shape (no attribution
+    /// minted, repriced at the representative's model).
+    #[test]
+    fn single_model_mirror_keeps_shape_and_reprice() {
+        let mut repr = crate::Metrics {
+            model_used: "gemini-2.5-pro".to_string(),
+            tokens_input: 1200,
+            tokens_output: 240,
+            ..Default::default()
+        };
+        let other = crate::Metrics {
+            model_used: "gemini-2.5-pro".to_string(),
+            tokens_input: 900,
+            tokens_output: 150,
+            ..Default::default()
+        };
+        merge_cross_file_metrics(&mut repr, &other);
+        assert!(repr.model_attribution.is_empty());
+        assert_eq!(repr.model_used, "gemini-2.5-pro");
+        assert_eq!(repr.provenance.cost, "calculated_from_tokens");
+        assert_eq!(
+            repr.cost_estimated,
+            crate::round4(priced("gemini-2.5-pro", 1200, 240))
+        );
+    }
+
+    /// Independent review 09b3e188 F2 (red-first): the merge must fold the
+    /// member-side non-priced cumulative channels too — parse-loss line
+    /// skips max per reason, reasoning lens entries union, opencode diff
+    /// summaries max per field, stored-totals drift keeps the larger
+    /// magnitude. The first cut dropped them wholesale.
+    #[test]
+    fn merge_folds_member_side_counters_not_just_totals() {
+        let mut repr = crate::Metrics {
+            model_used: "gemini-2.5-pro".to_string(),
+            tokens_input: 1000,
+            tokens_output: 200,
+            reasoning_lens: vec![120, 340],
+            stored_totals_delta: 3,
+            ..Default::default()
+        };
+        repr.line_skips.insert("event_schema".to_string(), 2);
+        repr.summary_additions = Some(40);
+        let mut other = crate::Metrics {
+            model_used: "gemini-2.5-pro".to_string(),
+            tokens_input: 800,
+            tokens_output: 90,
+            reasoning_lens: vec![340, 512],
+            stored_totals_delta: 9,
+            ..Default::default()
+        };
+        other.line_skips.insert("event_schema".to_string(), 5);
+        other.line_skips.insert("non_event".to_string(), 1);
+        other.summary_additions = Some(65);
+        other.summary_deletions = Some(12);
+        merge_cross_file_metrics(&mut repr, &other);
+        assert_eq!(repr.line_skips.get("event_schema"), Some(&5));
+        assert_eq!(repr.line_skips.get("non_event"), Some(&1));
+        assert_eq!(repr.reasoning_lens, vec![120, 340, 512]);
+        assert_eq!(repr.summary_additions, Some(65));
+        assert_eq!(repr.summary_deletions, Some(12));
+        assert_eq!(repr.stored_totals_delta, 9);
+    }
+
+    /// Independent review 09b3e188 F2 (red-first): `diagnostics` is a
+    /// per-snapshot ANALYSIS (fingerprints/steps index into their own
+    /// member's event order), so it is not additive — but it must also not
+    /// be dropped: when the folded member is the more complete snapshot
+    /// (the windowed-chats case), its analysis is the one that survives.
+    #[test]
+    fn merge_carries_the_more_complete_member_diagnostics() {
+        let mk_events = |count: usize| {
+            (0..count)
+                .map(|i| crate::Event {
+                    role: "user".to_string(),
+                    content: format!("turn {i}"),
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let repr_session =
+            crate::session_from_events("a", "/t/.gemini/tmp/c/chats/a.json", mk_events(4))
+                .expect("repr session");
+        let mut member =
+            crate::session_from_events("b", "/t/.gemini/tmp/c/checkpoints/b.json", mk_events(40))
+                .expect("member session");
+        member.diagnostics.loop_cost.total_loop_cost = 1.25;
+        let mut sessions = vec![repr_session, member];
+        let folded = merge_cross_file_conversations(&mut sessions);
+        assert_eq!(folded, 1, "one member folded");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].diagnostics.loop_cost.total_loop_cost, 1.25,
+            "the fuller checkpoint snapshot's analysis must survive the fold"
+        );
+        assert_eq!(sessions[0].metrics.events_total, 40);
     }
 }

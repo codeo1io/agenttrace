@@ -6335,8 +6335,15 @@ fn parse_opencode_storage_session(
     }
     let storage_root = opencode_storage_root_from_session_file(path)
         .with_context(|| format!("opencode: unsupported storage path {path}"))?;
-    let mut messages = read_opencode_records(&storage_root.join("message").join(session_id));
+    let (mut messages, message_capped) =
+        read_opencode_records_capped(&storage_root.join("message").join(session_id));
+    let mut capped_records = message_capped;
     if messages.is_empty() {
+        if capped_records > 0 {
+            // Review fix F4: every message record was found and capped —
+            // the session still exists, as its own disclosure carrier.
+            return Ok(vec![opencode_capped_disclosure(capped_records)]);
+        }
         bail!("opencode: no messages found for session {}", session_id);
     }
     sort_opencode_records(&mut messages);
@@ -6358,8 +6365,13 @@ fn parse_opencode_storage_session(
         // consumed no billing class, so the rescue still fires and the
         // step's input/output survives.
         let message_fold = add_opencode_tokens(&mut usage, msg.doc.get("tokens"), true);
-        let (events, part_usage) =
-            parse_opencode_message(&storage_root, &msg.doc, &model, message_fold);
+        let (events, part_usage) = parse_opencode_message(
+            &storage_root,
+            &msg.doc,
+            &model,
+            message_fold,
+            &mut capped_records,
+        );
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
@@ -6368,6 +6380,11 @@ fn parse_opencode_storage_session(
     }
 
     let mut events = Vec::new();
+    // rm-1418: disclose capped-away records on the session — never a
+    // silent drop (the copilot cwd-truncation event precedent).
+    if capped_records > 0 {
+        events.push(opencode_capped_disclosure(capped_records));
+    }
     if model != "unknown" || usage_has_values(&usage) {
         events.push(Event {
             role: "meta".to_string(),
@@ -6396,25 +6413,90 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn read_opencode_records(dir: &Path) -> Vec<OpenCodeRecord> {
+/// rm-1418 (run 942ed30a cycle 3): per-record byte cap for opencode
+/// storage JSON reads. Record dirs are untrusted disk contents — a
+/// corrupt or adversarial multi-gigabyte "record" must never be read
+/// whole into memory. 8 MiB is far above any real message/part record
+/// (~KBs) and far below the pathological case; oversized records are
+/// SKIPPED (a partial JSON record cannot be parsed soundly) and the
+/// skip is DISCLOSED via the `opencode_record_capped` counter on the
+/// session, never a silent drop.
+pub(crate) const OPENCODE_RECORD_BYTE_CAP: u64 = 8 * 1024 * 1024;
+
+/// rm-1418: read the JSON records of one opencode storage dir, skipping
+/// non-JSON entries, unreadable entries, and entries over
+/// [`OPENCODE_RECORD_BYTE_CAP`] bytes. The metadata-length gate runs
+/// BEFORE any read, so an oversized record costs one stat, not a full
+/// read — and the READ itself is bounded too (review fix F3: a record
+/// that grows between stat and read still cannot be ingested whole).
+/// Returns the records plus how many records were capped away
+/// (the caller mints the disclosure).
+fn read_opencode_records_capped(dir: &Path) -> (Vec<OpenCodeRecord>, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut records = Vec::new();
+    let mut capped = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let over_cap = std::fs::metadata(&path)
+            .map(|meta| meta.len() > OPENCODE_RECORD_BYTE_CAP)
+            .unwrap_or(false);
+        if over_cap {
+            capped += 1;
+            continue;
+        }
+        // Review fix F3: the stat gate above is the fast path; this
+        // bounded read is the enforcement — cap + 1 bytes taken, and a
+        // longer result is over-cap whatever the stat said.
+        let Some(raw) = read_capped_string(&path, OPENCODE_RECORD_BYTE_CAP) else {
             continue;
         };
+        if raw.len() as u64 > OPENCODE_RECORD_BYTE_CAP {
+            capped += 1;
+            continue;
+        }
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
         records.push(OpenCodeRecord { path, doc });
     }
-    records
+    (records, capped)
+}
+
+/// rm-1418 review fix F3 (independent review 09b3e188): bound the READ,
+/// not just the stat — take `cap + 1` bytes so a record that grew
+/// between the metadata gate and here still never enters memory whole;
+/// the caller treats a result longer than `cap` as capped. A record
+/// whose bytes split a UTF-8 sequence exactly at the boundary reads as
+/// invalid UTF-8 and is skipped as unreadable — at 8 MiB that is the
+/// pathological tail of the pathological case.
+fn read_capped_string(path: &Path, cap: u64) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(file, cap + 1), &mut raw).ok()?;
+    Some(raw)
+}
+
+/// rm-1418 review fix F4 (independent review 09b3e188): a session whose
+/// every message record was capped away still EXISTS — its records were
+/// found and skipped, not absent. When nothing survives, this
+/// disclosure event is the session's whole event stream (a zero-message
+/// session carrying the `opencode_record_capped` counter) instead of a
+/// swallowed "no messages found" bail that surfaced downstream as
+/// "unsupported session format".
+fn opencode_capped_disclosure(capped_records: usize) -> Event {
+    Event {
+        role: "session_meta".to_string(),
+        source_tool: "opencode".to_string(),
+        disclosure_counters: [("opencode_record_capped".to_string(), capped_records as i64)]
+            .into_iter()
+            .collect(),
+        ..Event::default()
+    }
 }
 
 fn sort_opencode_records(records: &mut [OpenCodeRecord]) {
@@ -6431,11 +6513,16 @@ fn parse_opencode_message(
     msg: &Map<String, Value>,
     model: &str,
     message_fold: OpencodeTokensFold,
+    capped_records: &mut usize,
 ) -> (Vec<Event>, BTreeMap<String, i64>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
     let msg_id = string(msg.get("id")).unwrap_or("");
-    let mut parts = read_opencode_records(&storage_root.join("part").join(msg_id));
+    // rm-1418: the part dir read is capped with the message dir read;
+    // both flow into the session's `opencode_record_capped` disclosure.
+    let (mut parts, part_capped) =
+        read_opencode_records_capped(&storage_root.join("part").join(msg_id));
+    *capped_records += part_capped;
     sort_opencode_records(&mut parts);
 
     let mut events = Vec::new();
@@ -11304,4 +11391,70 @@ fn oh_my_pi_usage_cache_write_1h_is_own_class() {
     let usage = oh_my_pi_usage(Some(&snake)).expect("snake alias yields usage");
     assert_eq!(usage.get("cache_write_1h_tokens"), Some(&7));
     assert!(!usage.contains_key("cache_creation_input_tokens"));
+}
+
+/// rm-1418 review-fix pins (independent review 09b3e188, attempt
+/// 97ef8844) for the bounded-read enforcement.
+#[cfg(test)]
+mod opencode_cap_tests {
+    use super::*;
+
+    /// Review fix F3: the byte cap must be enforced by the READ (take
+    /// cap+1), not only by the metadata fast path — a record that grows
+    /// between stat and read can still never be ingested whole.
+    /// Boundary pins: exactly-cap reads whole; cap+5 yields exactly
+    /// cap+1 bytes (the caller's over-cap signal, whatever the stat
+    /// said).
+    #[test]
+    fn read_capped_string_bounds_the_read_not_just_the_stat() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-cap-bound-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let cap = 64u64;
+
+        let at_cap = dir.join("at-cap.txt");
+        std::fs::write(&at_cap, "A".repeat(cap as usize)).expect("at-cap file");
+        assert_eq!(
+            read_capped_string(&at_cap, cap)
+                .expect("at-cap record reads whole")
+                .len(),
+            cap as usize
+        );
+
+        let over_cap = dir.join("over-cap.txt");
+        std::fs::write(&over_cap, "B".repeat(cap as usize + 5)).expect("over-cap file");
+        let raw = read_capped_string(&over_cap, cap).expect("over-cap read is bounded, not failed");
+        assert_eq!(
+            raw.len(),
+            cap as usize + 1,
+            "the bound is take(cap + 1): the extra byte is the caller's over-cap signal"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review fix F3: unreadable entries (a directory opens but cannot
+    /// be read as a file) surface as None, never as a panic or an
+    /// unbounded read.
+    #[test]
+    fn read_capped_string_skips_unreadable_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenttrace-cap-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        assert!(read_capped_string(&dir, 64).is_none());
+        assert!(read_capped_string(&dir.join("absent.json"), 64).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

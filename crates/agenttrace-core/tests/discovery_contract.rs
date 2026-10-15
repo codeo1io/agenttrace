@@ -2418,28 +2418,42 @@ fn rust_discovers_gemini_cli_tmp_chats_and_checkpoints() {
         );
 
         let sessions = load_sessions_from_dir(None);
-        assert!(
-            sessions.len() >= 2,
-            "both gemini tmp sessions must load: {}",
-            sessions.len()
-        );
-        let thoughts = sessions
+        // rm-1417: chats/ and checkpoints/ under one tmp root mirror the SAME
+        // conversation — the loader now folds the family into ONE session
+        // (cumulative max, chats-lane representative) instead of two.
+        let merged = sessions
             .iter()
             .find(|session| session.path == chat_path.to_string_lossy())
-            .expect("chat session loaded");
-        assert_eq!(thoughts.metrics.source_tool, "gemini_cli");
-        assert_eq!(thoughts.metrics.tokens_input, 80);
-        assert_eq!(thoughts.metrics.tokens_output, 60);
+            .expect("merged conversation session loaded");
+        assert_eq!(merged.metrics.source_tool, "gemini_cli");
         assert_eq!(
-            thoughts.metrics.tokens_reasoning, 40,
+            sessions
+                .iter()
+                .filter(|session| session.metrics.source_tool == "gemini_cli")
+                .count(),
+            1,
+            "one mirrored conversation must render as one session"
+        );
+        assert_eq!(
+            merged.metrics.tokens_input, 80,
+            "cumulative max across the mirror family"
+        );
+        assert_eq!(
+            merged.metrics.tokens_output, 60,
+            "cumulative max across the mirror family"
+        );
+        assert_eq!(
+            merged.metrics.tokens_reasoning, 40,
             "thoughtsTokenCount must reach the reasoning breakdown (CU-20)"
         );
-        let plain = sessions
-            .iter()
-            .find(|session| session.path == checkpoint_path.to_string_lossy())
-            .expect("checkpoint session loaded");
-        assert_eq!(plain.metrics.source_tool, "gemini_cli");
-        assert_eq!(plain.metrics.tokens_reasoning, 0);
+        assert_eq!(
+            merged
+                .metrics
+                .disclosure_counters
+                .get("cross_file_sessions_merged"),
+            Some(&1),
+            "the merge must be disclosed, never silent"
+        );
     });
 
     let _ = fs::remove_dir_all(root);
