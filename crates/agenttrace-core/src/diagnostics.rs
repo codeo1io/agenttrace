@@ -160,6 +160,9 @@ pub struct CostAlert {
     pub current: f64,
     pub baseline: f64,
     pub ratio: f64,
+    /// rm-1438: human-readable identity of the baseline cohort, e.g.
+    /// `'gpt-5.1-mini' sessions` or `sessions without model attribution`.
+    pub basis: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -478,6 +481,35 @@ pub fn fix_suggestions(session: &Session) -> Vec<FixSuggestion> {
 }
 
 pub fn predict_cost_anomaly(history: &[Session], current: &Session) -> CostAlert {
+    // rm-1438: the baseline comes from SAME-MODEL sessions only. A pooled
+    // cross-model baseline manufactured false criticals (an ordinary
+    // expensive-model session over a cheap-model history PoC'd at 30.0x) and
+    // masked real waste (a cheap-model session at 2.5x its own norm scored
+    // 0.08x and never fired). Sessions without model attribution still pool
+    // among themselves; a thin (<2 sessions) basis is disclosed in the message.
+    // Review fix (run f923a62a, review b8ca9c7b F2): attribution is
+    // sentinel-bearing, not just empty — lib.rs seeds "default", events
+    // carry "unknown", and governance.rs classes default|unknown|multiple
+    // as ONE unattributed set. The cohort key folds every sentinel (and
+    // the empty label) into a single "sessions without model attribution"
+    // pool, so the sentinels neither leak into user-facing text as
+    // pseudo-model names ('default' sessions) nor fragment the fallback
+    // into three cohorts. Residual window, disclosed here: a "multiple"
+    // session prices exactly per-block (rm-521) but its model mix varies,
+    // so a pooled sentinel baseline can still carry cross-mix variance.
+    fn cohort_of(model: &str) -> Option<&str> {
+        let model = model.trim();
+        if model.is_empty() || matches!(model, "default" | "unknown" | "multiple") {
+            None
+        } else {
+            Some(model)
+        }
+    }
+    let current_cohort = cohort_of(current.metrics.model_used.as_str());
+    let basis = match current_cohort {
+        None => "sessions without model attribution".to_string(),
+        Some(model) => format!("'{model}' sessions"),
+    };
     let costs = history
         .iter()
         // Only sessions with a real (non-zero) cost estimate belong in
@@ -488,17 +520,32 @@ pub fn predict_cost_anomaly(history: &[Session], current: &Session) -> CostAlert
             session.path != current.path
                 && session.metrics.assistant_turns > 0
                 && session.metrics.cost_estimated > 0.0
+                && cohort_of(session.metrics.model_used.as_str()) == current_cohort
         })
         .map(|session| session.metrics.cost_estimated / session.metrics.assistant_turns as f64)
         .collect::<Vec<_>>();
-    if costs.is_empty() || current.metrics.assistant_turns == 0 {
+    if current.metrics.assistant_turns == 0 {
         return CostAlert {
             level: "info".to_string(),
             message: "No comparable cost history.".to_string(),
+            basis,
+            ..CostAlert::default()
+        };
+    }
+    if costs.is_empty() {
+        return CostAlert {
+            level: "info".to_string(),
+            message: format!("No same-model cost history for {basis}; cost anomaly check skipped."),
+            basis,
             ..CostAlert::default()
         };
     }
     let baseline = costs.iter().sum::<f64>() / costs.len() as f64;
+    let thin_note = if costs.len() < 2 {
+        format!(" (thin history: {} same-model session)", costs.len())
+    } else {
+        String::new()
+    };
     let value = current.metrics.cost_estimated / current.metrics.assistant_turns as f64;
     let ratio = if baseline > 0.0 {
         value / baseline
@@ -513,13 +560,13 @@ pub fn predict_cost_anomaly(history: &[Session], current: &Session) -> CostAlert
         (
             true,
             "critical",
-            format!("Cost/turn is {ratio:.1}x the session baseline."),
+            format!("Cost/turn is {ratio:.1}x the {basis} baseline{thin_note}."),
         )
     } else if ratio > 2.0 {
         (
             true,
             "warning",
-            format!("Cost/turn is {ratio:.1}x the session baseline."),
+            format!("Cost/turn is {ratio:.1}x the {basis} baseline{thin_note}."),
         )
     } else if loop_pct > 50.0 {
         (
@@ -537,7 +584,7 @@ pub fn predict_cost_anomaly(history: &[Session], current: &Session) -> CostAlert
         (
             false,
             "info",
-            format!("Cost/turn is {ratio:.1}x the session baseline."),
+            format!("Cost/turn is {ratio:.1}x the {basis} baseline{thin_note}."),
         )
     };
     CostAlert {
@@ -547,6 +594,7 @@ pub fn predict_cost_anomaly(history: &[Session], current: &Session) -> CostAlert
         current: value,
         baseline,
         ratio,
+        basis,
     }
 }
 
@@ -1411,6 +1459,148 @@ mod tests {
         let alert = predict_cost_anomaly(&history, &current);
         assert_eq!(alert.level, "warning");
         assert!(alert.message.contains("2.5x"));
+    }
+
+    #[test]
+    fn cost_anomaly_same_model_baseline_no_false_critical_for_ordinary_expensive_model() {
+        // rm-1438: an ordinary expensive-model session must not be compared
+        // against a cheap-model history. Pre-fix PoC (assess e0e6c4c9): pooled
+        // baseline 0.030/turn -> ratio 30.0 -> false level=critical.
+        let history: Vec<Session> = (0..6)
+            .map(|i| {
+                let mut s = session_with_cost(&format!("hist-{i}"), 10, 0.30);
+                s.metrics.model_used = "gpt-5.1-mini".to_string();
+                s
+            })
+            .collect();
+        let mut current = session_with_cost("current", 10, 9.0);
+        current.metrics.model_used = "claude-opus-4-6".to_string();
+        let alert = predict_cost_anomaly(&history, &current);
+        assert!(
+            !alert.triggered,
+            "ordinary opus spend must not alert against a cheap-model history: {}",
+            alert.message
+        );
+        assert_eq!(alert.level, "info");
+        assert!(
+            alert.message.to_lowercase().contains("same-model"),
+            "skip reason must name the same-model basis: {}",
+            alert.message
+        );
+    }
+
+    #[test]
+    fn cost_anomaly_same_model_outlier_triggers() {
+        // rm-1438 masked-waste complement: a session at 2.5x its OWN model's
+        // norm must trigger. Pre-fix PoC vs an expensive-dominated pooled
+        // baseline this scored 0.08x and never fired.
+        let history: Vec<Session> = (0..6)
+            .map(|i| {
+                let mut s = session_with_cost(&format!("hist-{i}"), 10, 0.30);
+                s.metrics.model_used = "gpt-5.1-mini".to_string();
+                s
+            })
+            .collect();
+        let mut current = session_with_cost("current", 10, 0.75);
+        current.metrics.model_used = "gpt-5.1-mini".to_string();
+        let alert = predict_cost_anomaly(&history, &current);
+        assert!(alert.triggered);
+        assert_eq!(alert.level, "warning");
+        assert_eq!(alert.ratio, 2.5);
+        assert!(
+            alert.message.contains("gpt-5.1-mini"),
+            "message must name the model basis: {}",
+            alert.message
+        );
+    }
+
+    #[test]
+    fn cost_anomaly_thin_history_is_disclosed_in_message() {
+        // rm-1438: a single comparable same-model session is a thin basis;
+        // the alert may still fire but the message must disclose the size.
+        let mut peer = session_with_cost("only-peer", 10, 9.0);
+        peer.metrics.model_used = "claude-opus-4-6".to_string();
+        let mut current = session_with_cost("current", 10, 28.0);
+        current.metrics.model_used = "claude-opus-4-6".to_string();
+        let alert = predict_cost_anomaly(&[peer], &current);
+        assert!(alert.triggered);
+        assert_eq!(alert.level, "critical");
+        assert!((alert.ratio - 2.8 / 0.9).abs() < 1e-9);
+        assert!(
+            alert.message.to_lowercase().contains("thin"),
+            "thin basis must be disclosed: {}",
+            alert.message
+        );
+    }
+
+    #[test]
+    fn cost_anomaly_sentinel_labels_pool_as_one_unattributed_cohort() {
+        // rm-1438 review fix (b8ca9c7b F2): attribution sentinels are not
+        // model names — lib.rs seeds "default", events carry "unknown",
+        // governance classes default|unknown|multiple as ONE unattributed
+        // set. A sentinel-labeled current session must pool every sentinel
+        // (and the empty label) as its baseline — never leak 'default'
+        // sessions into the message, never split three pseudo-model
+        // cohorts, and never baseline a sentinel against an attributed
+        // model's history.
+        let sentinel = |name: &str, label: &str| {
+            let mut s = session_with_cost(name, 10, 0.30);
+            s.metrics.model_used = label.to_string();
+            s
+        };
+        let history = vec![
+            sentinel("d", "default"),
+            sentinel("u", "unknown"),
+            sentinel("e", ""),
+        ];
+        // An attributed session at a wildly different rate must NOT enter
+        // the unattributed baseline (if it did, the pooled mean would be
+        // 0.2475/turn and the ratio would fall to ~0.12, not 1.0).
+        let mut gpt = session_with_cost("gpt", 10, 9.0);
+        gpt.metrics.model_used = "gpt-5.5".to_string();
+        let history = [history, vec![gpt]].concat();
+        let mut current = session_with_cost("current", 10, 0.30);
+        current.metrics.model_used = "multiple".to_string();
+        let alert = predict_cost_anomaly(&history, &current);
+        assert!(
+            (alert.ratio - 1.0).abs() < 1e-9,
+            "sentinel cohort must pool exactly the sentinel history: ratio {}",
+            alert.ratio
+        );
+        assert_eq!(alert.basis, "sessions without model attribution");
+        assert!(!alert.triggered);
+        assert!(
+            !alert.message.contains("'default'")
+                && !alert.message.contains("'unknown'")
+                && !alert.message.contains("'multiple'"),
+            "sentinel labels must not leak into the message: {}",
+            alert.message
+        );
+    }
+
+    #[test]
+    fn cost_anomaly_unattributed_skip_names_friendly_basis() {
+        // rm-1438 review fix (b8ca9c7b F2): a sentinel-labeled session with
+        // no sentinel history must skip on the FRIENDLY unattributed basis
+        // (pre-fix this rendered "No same-model cost history for 'default'
+        // sessions; ..." — an internal sentinel leaked into user text).
+        let mut gpt = session_with_cost("gpt", 10, 0.30);
+        gpt.metrics.model_used = "gpt-5.5".to_string();
+        let mut current = session_with_cost("current", 10, 0.30);
+        current.metrics.model_used = "default".to_string();
+        let alert = predict_cost_anomaly(&[gpt], &current);
+        assert_eq!(alert.level, "info");
+        assert!(!alert.triggered);
+        assert!(
+            alert.message.contains("sessions without model attribution"),
+            "skip must name the friendly unattributed basis: {}",
+            alert.message
+        );
+        assert!(
+            !alert.message.contains("'default'"),
+            "sentinel label must not leak into the skip message: {}",
+            alert.message
+        );
     }
 
     #[test]

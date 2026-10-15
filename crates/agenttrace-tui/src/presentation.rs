@@ -2864,12 +2864,31 @@ pub(super) fn cost_alert_message(value: &str, language: Language) -> String {
     if language == Language::En {
         return value.to_string();
     }
+    // rm-1438 reshaped every cost/turn message around a named basis —
+    // "x the 'model' sessions baseline." / the unattributed basis / a
+    // thin-history tail / the same-model skip — so the zh table
+    // translates the new shapes. The old "x the session baseline."
+    // literal no longer exists on any production path (review b8ca9c7b
+    // F1: the stale pair left zh alerts half-translated, e.g.
+    // 每轮成本是基线的 2.5x the 'gpt-5.5' sessions baseline.). Pinned by
+    // zh_cost_alert_covers_same_model_message_shapes.
     value
         .replace("Cost/turn is ", "每轮成本是基线的 ")
-        .replace("x the session baseline.", " 倍。")
+        .replace("x the ", " 倍（")
+        .replace("sessions without model attribution", "未标注模型的会话")
+        .replace("' sessions", "' 会话")
+        .replace(" baseline", "基线）")
+        .replace(" (thin history: ", "（同模型历史仅 ")
+        .replace(" same-model session)", " 个会话）")
+        .replace("）.", "）。")
         .replace("Loop waste is ", "循环浪费占会话成本的 ")
         .replace("% of session cost.", "% 。")
         .replace("No comparable cost history.", "没有可比较的成本历史。")
+        .replace(
+            "No same-model cost history for ",
+            "没有可比较的同模型成本历史（",
+        )
+        .replace("; cost anomaly check skipped.", "）；已跳过成本异常检查。")
 }
 
 pub(super) fn signal_lines(session: &Session, language: Language) -> Vec<String> {
@@ -4028,5 +4047,56 @@ mod loop_basis_disclosure_tests {
             !en_priced.contains("basis=synthetic"),
             "priced must stay unmarked: {en_priced}"
         );
+    }
+
+    #[test]
+    fn zh_cost_alert_covers_same_model_message_shapes() {
+        // rm-1438 review fix (b8ca9c7b F1): the same-model baseline
+        // reshaped every cost/turn message and the zh replace table still
+        // targeted the dead "x the session baseline." literal — a zh TUI
+        // cost alert rendered mixed-language output. Every live shape is
+        // pinned here so the seam cannot drift again.
+        let zh = |message: &str| cost_alert_message(message, Language::Zh);
+        assert_eq!(
+            zh("Cost/turn is 2.5x the 'gpt-5.5' sessions baseline."),
+            "每轮成本是基线的 2.5 倍（'gpt-5.5' 会话基线）。"
+        );
+        assert_eq!(
+            zh("Cost/turn is 30.0x the sessions without model attribution baseline."),
+            "每轮成本是基线的 30.0 倍（未标注模型的会话基线）。"
+        );
+        assert_eq!(
+            zh("Cost/turn is 3.1x the 'claude-opus-4-6' sessions baseline (thin history: 1 same-model session)."),
+            "每轮成本是基线的 3.1 倍（'claude-opus-4-6' 会话基线）（同模型历史仅 1 个会话）。"
+        );
+        assert_eq!(
+            zh("No same-model cost history for 'gpt-5.5' sessions; cost anomaly check skipped."),
+            "没有可比较的同模型成本历史（'gpt-5.5' 会话）；已跳过成本异常检查。"
+        );
+        assert_eq!(
+            zh("No same-model cost history for sessions without model attribution; cost anomaly check skipped."),
+            "没有可比较的同模型成本历史（未标注模型的会话）；已跳过成本异常检查。"
+        );
+        // Pre-existing shapes stay covered.
+        assert_eq!(
+            zh("Loop waste is 42% of session cost."),
+            "循环浪费占会话成本的 42% 。"
+        );
+        assert_eq!(zh("No comparable cost history."), "没有可比较的成本历史。");
+        // No half-translated output can survive: every message shape
+        // above must contain no residual ASCII 'baseline' fragment.
+        for message in [
+            "Cost/turn is 2.5x the 'gpt-5.5' sessions baseline.",
+            "Cost/turn is 30.0x the sessions without model attribution baseline.",
+            "Cost/turn is 3.1x the 'claude-opus-4-6' sessions baseline (thin history: 1 same-model session).",
+            "No same-model cost history for 'gpt-5.5' sessions; cost anomaly check skipped.",
+            "No same-model cost history for sessions without model attribution; cost anomaly check skipped.",
+        ] {
+            let rendered = zh(message);
+            assert!(
+                !rendered.contains("baseline") && !rendered.contains("sessions"),
+                "zh rendering must not leave English fragments: {rendered}"
+            );
+        }
     }
 }

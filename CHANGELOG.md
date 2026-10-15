@@ -337,6 +337,35 @@
 
 ### Fixed
 
+- cost-anomaly baselines are same-model, disclosed when thin (rm-1514, run
+  f923a62a cycle 3; row renumbered at integration from the campaign-local
+  rm-1438 — the landed c1cafed5 wall row owns that numeral per the 800cf090
+  precedent; dated in-tree comments keep rm-1438): `predict_cost_anomaly`
+  pooled every history session into
+  one cost/turn baseline, so an ordinary expensive-model session over a
+  cheap-model history PoC'd at 30.0x -> a false `critical`, while real waste on
+  a cheap model hid under an expensive-dominated baseline (2.5x-own-norm
+  scored 0.08x and never fired). The baseline now comes from same-model
+  sessions only (sessions without model attribution still pool among
+  themselves), the message names its basis (`'model' sessions` / no-model
+  fallback) and discloses a thin history, and `CostAlert` gains a `basis`
+  field so machine lanes can see the comparison class. No same-model history
+  means an honest info skip naming the reason — never a pooled guess.
+  Review fixes (b8ca9c7b F1/F2): attribution sentinels — `default`/
+  `unknown`/`multiple`, the one unattributed set governance classes
+  together, plus the empty label — now pool as that single
+  "sessions without model attribution" cohort instead of leaking
+  `'default' sessions` into user-facing text or fragmenting the fallback
+  into three pseudo-model baselines (a `multiple` session still prices
+  per-block exactly, but its model mix varies — that residual cross-mix
+  variance in a pooled sentinel baseline is disclosed at the cohort),
+  pinned by `cost_anomaly_sentinel_labels_pool_as_one_unattributed_cohort`
+  and `cost_anomaly_unattributed_skip_names_friendly_basis`; and the
+  zh-CN TUI cost-alert table covers every new message shape (model basis,
+  unattributed basis, thin-history tail, same-model skip), pinned by
+  `zh_cost_alert_covers_same_model_message_shapes` — the stale
+  `"x the session baseline."` pair had left zh alerts half-translated
+  (`每轮成本是基线的 2.5x the 'gpt-5.5' sessions baseline.`).
 - doubled `Error: Error loading …` on a non-session positional argument
   (rm-1434, run a3f96656 cycle 3): the positional-path guard's bail
   literal opened with its own `Error ` while the top-level printer also
