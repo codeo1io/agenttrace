@@ -4,6 +4,33 @@
 
 ### Added
 
+- Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
+  a3f96656 cycle 3): Cline journals record per-response usage — as a say
+  entry whose text is a JSON object (`cost`/`tokensIn`/`tokensOut`/
+  `cacheReads`/`cacheWrites`) on the Roo task-dir store, and as a sibling
+  `metrics` object on the Cline CLI `.messages.json` envelope
+  (`inputTokens`/`outputTokens`/`cacheReadTokens`/`cacheWriteTokens`/
+  `cost`) — but the parser extracted text events only, so every
+  metrics-bearing Cline session reported 0 tokens / $0.00 into every
+  rollup, cache, statusline, and governance surface. Carriers now fold
+  through a synthetic `session_meta` usage event appended after the text
+  stream (pi `recorded_cost_usd` precedent), so text events are
+  additive-untouched and reported usage flips token provenance to
+  `reported_by_agent` (suppressing text estimation, which is only ever a
+  fallback). `tokensIn` is the API input_tokens and includes the cache
+  legs: input is recorded net with the cache legs separate (rm-600 delta
+  basis), matching the tokscale reference implementation. Values arrive
+  as untrusted JSON (numbers or strings, negative in the wild — tokscale
+  #1369) and are clamped at intake and disclosed
+  (`cline_metrics_negative_clamped`), never propagated;
+  present-but-unparseable fields count into
+  `cline_metrics_unparsed_fields` instead of being invented, and a bare
+  `cost` without any token field is not a carrier (an invoice pasted as
+  text must not mint usage). Counters `cline_metrics_carriers_parsed` and
+  `cline_reported_cost_carriers` ride the disclosed-facts channel on
+  doctor/overview; metrics-free stores render byte-identically to before
+  (pinned).
+
 - OpenClaw sessions are auto-discovered (rm-1373 arm, run f084f50e cycle 3): the README
   family list has claimed OpenClaw since it landed, but discovery registered no OpenClaw
   root — the wrapper parser lane existed with nothing feeding it. `known_session_dirs()`
@@ -309,6 +336,14 @@
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
 ### Fixed
+
+- doubled `Error: Error loading …` on a non-session positional argument
+  (rm-1434, run a3f96656 cycle 3): the positional-path guard's bail
+  literal opened with its own `Error ` while the top-level printer also
+  prefixes `Error: `, so `--overview <dir>` rendered the message twice
+  prefixed. The literal now carries only the message; exit code and the
+  remaining text are unchanged (pinned), and a guard test keeps any
+  future bail!/context/anyhow! literal from re-doubling the prefix.
 
 - The docs-commands gate now reports the real failure when the agenttrace binary is
   unusable (rm-369 arm, run f084f50e cycle 3): `scripts/ci/check-docs-commands.sh` answered

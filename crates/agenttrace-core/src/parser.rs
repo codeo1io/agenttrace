@@ -7153,6 +7153,200 @@ fn cline_unix_timestamp(value: i64) -> String {
     }
 }
 
+// rm-1430: Cline usage metrics carriers. Roo/Cline journals record
+// per-response usage either as a standalone say entry whose text is a
+// JSON object ("cost"/"tokensIn"/"tokensOut"/"cacheReads"/
+// "cacheWrites"/"apiProtocol") or, on the Cline CLI `.messages.json`
+// envelope, as a sibling `metrics` object per message
+// ("inputTokens"/"outputTokens"/"cacheReadTokens"/
+// "cacheWriteTokens"/"cost"). Values arrive as untrusted JSON — numbers
+// or strings — and have been observed negative in the wild (tokscale
+// #1369): every field is clamped at intake and the clamp disclosed,
+// never propagated. `tokensIn` is the API input_tokens, which INCLUDES
+// the cache legs; agenttrace's delta basis (rm-600) records net input
+// and the cache legs separately, so input is reduced by them
+// (saturating), matching the tokscale reference implementation.
+#[derive(Default)]
+struct ClineUsageState {
+    usage: BTreeMap<String, i64>,
+    carriers: i64,
+    negative_clamped: i64,
+    unparsed_fields: i64,
+    cost_carriers: i64,
+    reported_cost: f64,
+    last_ts: String,
+}
+
+/// One absorbed metrics carrier; fields present-but-unparseable count
+/// into `unparsed_fields` instead of being invented.
+struct ClineCarrier {
+    input: Option<i64>,
+    output: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+    cost: Option<f64>,
+    unparsed_fields: i64,
+}
+
+fn cline_metric_i64(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok()))
+            .or_else(|| number.as_f64().filter(|v| v.is_finite()).map(|v| v as i64)),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn cline_metric_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64().filter(|v| v.is_finite()),
+        Value::String(text) => text.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    }
+}
+
+/// Never invent (rm-1430 acceptance 4): a token count is the evidence
+/// of usage. A bare "cost" (an invoice pasted as text, say) is not a
+/// carrier; at least one token field is required.
+fn cline_carrier_from_object(object: &Value) -> Option<ClineCarrier> {
+    const TOKEN_KEYS: [&str; 8] = [
+        "tokensIn",
+        "tokensOut",
+        "cacheReads",
+        "cacheWrites",
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+    ];
+    let fields = object.as_object()?;
+    if !TOKEN_KEYS.iter().any(|key| fields.contains_key(*key)) {
+        return None;
+    }
+    let token = |key: &str| -> Option<i64> { cline_metric_i64(fields.get(key)) };
+    let input = token("tokensIn").or_else(|| token("inputTokens"));
+    let output = token("tokensOut").or_else(|| token("outputTokens"));
+    let cache_read = token("cacheReads").or_else(|| token("cacheReadTokens"));
+    let cache_write = token("cacheWrites").or_else(|| token("cacheWriteTokens"));
+    let mut unparsed_fields = 0;
+    for key in TOKEN_KEYS {
+        if fields.contains_key(key) && cline_metric_i64(fields.get(key)).is_none() {
+            unparsed_fields += 1;
+        }
+    }
+    let cost = cline_metric_f64(fields.get("cost"));
+    if fields.contains_key("cost") && cost.is_none() {
+        unparsed_fields += 1;
+    }
+    Some(ClineCarrier {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        cost,
+        unparsed_fields,
+    })
+}
+
+/// A say entry whose text is itself a JSON metrics object (the Roo
+/// task-dir carrier).
+fn cline_text_metrics_carrier(text: &str) -> Option<ClineCarrier> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    cline_carrier_from_object(&value)
+}
+
+fn cline_clamped(state: &mut ClineUsageState, value: i64) -> i64 {
+    if value < 0 {
+        state.negative_clamped += 1;
+        0
+    } else {
+        value
+    }
+}
+
+fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: &str) {
+    state.carriers += 1;
+    state.last_ts = ts.to_string();
+    state.unparsed_fields += carrier.unparsed_fields;
+    let input = cline_clamped(state, carrier.input.unwrap_or(0));
+    let output = cline_clamped(state, carrier.output.unwrap_or(0));
+    let cache_read = cline_clamped(state, carrier.cache_read.unwrap_or(0));
+    let cache_write = cline_clamped(state, carrier.cache_write.unwrap_or(0));
+    let net_input = input.saturating_sub(cache_read).saturating_sub(cache_write);
+    let mut add = |key: &str, value: i64| {
+        if let Some(total) = state.usage.get_mut(key) {
+            *total = total.saturating_add(value);
+        } else {
+            state.usage.insert(key.to_string(), value);
+        }
+    };
+    add("input_tokens", net_input);
+    add("output_tokens", output);
+    add("cache_read_input_tokens", cache_read);
+    add("cache_creation_input_tokens", cache_write);
+    match carrier.cost {
+        Some(cost) if cost >= 0.0 => {
+            state.cost_carriers += 1;
+            state.reported_cost += cost;
+        }
+        Some(_) => state.unparsed_fields += 1,
+        None => {}
+    }
+}
+
+/// Fold absorbed carriers through a session_meta usage event — the
+/// native-lane pattern analyze() folds (pi `recorded_cost_usd`
+/// precedent) — appended after the text stream so text events are
+/// additive-untouched.
+fn cline_usage_event(state: &ClineUsageState, model: &str) -> Option<Event> {
+    if state.carriers == 0 {
+        return None;
+    }
+    let mut disclosure_counters = BTreeMap::new();
+    disclosure_counters.insert("cline_metrics_carriers_parsed".to_string(), state.carriers);
+    if state.negative_clamped > 0 {
+        disclosure_counters.insert(
+            "cline_metrics_negative_clamped".to_string(),
+            state.negative_clamped,
+        );
+    }
+    if state.unparsed_fields > 0 {
+        disclosure_counters.insert(
+            "cline_metrics_unparsed_fields".to_string(),
+            state.unparsed_fields,
+        );
+    }
+    let mut wire_metadata = BTreeMap::new();
+    if state.cost_carriers > 0 {
+        disclosure_counters.insert(
+            "cline_reported_cost_carriers".to_string(),
+            state.cost_carriers,
+        );
+        wire_metadata.insert(
+            "cline_reported_cost_usd_sum".to_string(),
+            format!("{:.6}", state.reported_cost),
+        );
+    }
+    Some(Event {
+        role: "session_meta".to_string(),
+        content: format!("Cline metrics carriers: {}", state.carriers),
+        timestamp: state.last_ts.clone(),
+        model_used: model.to_string(),
+        source_tool: "cline".to_string(),
+        usage: state.usage.clone(),
+        disclosure_counters,
+        wire_metadata,
+        recorded_cost_usd: (state.cost_carriers > 0).then_some(state.reported_cost),
+        ..Event::default()
+    })
+}
+
 fn timestamp_millis(ms: i64) -> String {
     // rm-1501: euclidean div/rem keep pre-epoch (negative) instants exact —
     // truncating `/`/`%` fed a negative remainder into a wrapping `as u32`
@@ -8183,6 +8377,7 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         _ => &[],
     };
     let mut events = Vec::new();
+    let mut usage_state = ClineUsageState::default();
     for message in messages {
         let Some(message) = message.as_object() else {
             continue;
@@ -8191,13 +8386,25 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
             .or_else(|| string(message.get("content")))
             .or_else(|| string(message.get("message")))
             .unwrap_or("");
-        if text.is_empty() {
-            continue;
-        }
         let ts = cline_timestamp(
             first_value(message, &["ts", "timestamp", "createdAt", "created_at"])
                 .unwrap_or(&Value::Null),
         );
+        // rm-1430: absorb usage carriers — a say entry whose text is a
+        // JSON metrics object, and/or a sibling `metrics` object (Cline
+        // CLI envelope). Text events are unaffected: metrics presence
+        // never alters the text stream.
+        if let Some(carrier) = message.get("metrics").and_then(cline_carrier_from_object) {
+            cline_absorb_carrier(&mut usage_state, carrier, &ts);
+        }
+        if !text.is_empty() {
+            if let Some(carrier) = cline_text_metrics_carrier(text) {
+                cline_absorb_carrier(&mut usage_state, carrier, &ts);
+            }
+        }
+        if text.is_empty() {
+            continue;
+        }
         let kind = string(message.get("type")).unwrap_or("");
         let ask = string(message.get("ask")).unwrap_or("");
         let say = string(message.get("say")).unwrap_or("");
@@ -8216,6 +8423,9 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
             source_tool: "cline".to_string(),
             ..Event::default()
         });
+    }
+    if let Some(event) = cline_usage_event(&usage_state, model) {
+        events.push(event);
     }
     events
 }
@@ -10368,6 +10578,216 @@ mod tests {
         session_id.insert("type".into(), Value::String("user".into()));
         session_id.insert("session_id".into(), Value::String("s-1".into()));
         assert!(is_qwen_code_event(&session_id));
+    }
+
+    #[test]
+    fn cline_metrics_text_carriers_fold_usage_into_session_totals() {
+        // rm-1430 red-first: Cline/Roo journals carry per-response usage
+        // as a say entry whose text is a JSON metrics object (tokscale
+        // #1369 documents the same carrier class); the lane parsed text
+        // events only, so every metrics-bearing Cline session reported
+        // 0 tokens / $0.00 into every rollup. The carrier folds through
+        // a session_meta usage event (pi `recorded_cost_usd` precedent),
+        // keeping the text-event stream byte-identical.
+        let dir = std::env::temp_dir().join("agenttrace-rm1430-carriers");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ui_messages.json"),
+            concat!(
+                "[",
+                r#"{"ts":1700000000,"type":"say","say":"user_feedback","text":"do the thing"}"#,
+                ",",
+                r#"{"ts":1700000001,"type":"say","say":"text","text":"{\"cost\":0.0123,\"tokensIn\":1200,\"tokensOut\":150,\"cacheReads\":700,\"cacheWrites\":300,\"apiProtocol\":\"anthropic\"}"}"#,
+                ",",
+                r#"{"ts":1700000002,"type":"say","say":"text","text":"done"}"#,
+                "]"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("api_conversation_history.json"),
+            r#"[{"role":"user","content":"do the thing"},{"role":"assistant","content":"done"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("task_metadata.json"),
+            r#"{"task":"Do the thing","workDir":"/tmp","created":1700000000000,"status":"completed"}"#,
+        )
+        .unwrap();
+
+        let session = parse_file(&dir).expect("cline task dir parses");
+        // End state: the carrier folds into the session totals, the tokens
+        // are reported (not estimated) — the lane-truth flip — and the
+        // recorded cost rides the pi `recorded_cost_usd` channel.
+        assert_eq!(session.metrics.tokens_input, 200);
+        assert_eq!(session.metrics.tokens_output, 150);
+        assert_eq!(session.metrics.tokens_cache_r, 700);
+        assert_eq!(session.metrics.tokens_cache_w, 300);
+        assert_eq!(session.metrics.provenance.tokens, "reported_by_agent");
+        assert_eq!(session.metrics.cost_estimated, 0.0123);
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cline_metrics_text_stream_is_unchanged_and_meta_is_additive() {
+        // rm-1430 clause 5: metrics presence must not alter text events.
+        // The metrics say entry keeps its text event; the usage event is
+        // additive (session_meta), appended after the text stream.
+        let doc = serde_json::json!([
+            {"ts":1700000000,"type":"say","say":"user_feedback","text":"do the thing"},
+            {"ts":1700000001,"type":"say","say":"text","text":"{\"cost\":0.0123,\"tokensIn\":1200,\"tokensOut\":150,\"cacheReads\":700,\"cacheWrites\":300,\"apiProtocol\":\"anthropic\"}"},
+            {"ts":1700000002,"type":"say","say":"text","text":"done"}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let text_events: Vec<&Event> = events.iter().filter(|e| e.role != "session_meta").collect();
+        assert_eq!(
+            text_events.len(),
+            3,
+            "all three say entries keep their text events"
+        );
+        assert!(
+            text_events
+                .iter()
+                .any(|e| e.content.contains("\"tokensIn\":1200")),
+            "the metrics entry still renders as its text event"
+        );
+        let meta_positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.role == "session_meta")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            meta_positions,
+            vec![events.len() - 1],
+            "exactly one meta event, appended last"
+        );
+    }
+
+    #[test]
+    fn cline_cli_envelope_metrics_objects_fold_usage() {
+        // rm-1430: the Cline CLI `.messages.json` envelope carries usage
+        // as a sibling `metrics` object per message; values arrive as
+        // untrusted JSON (numbers or strings) and are extracted
+        // defensively — string-typed numerics are pinned here.
+        let doc = serde_json::json!({
+            "sessionId": "cli-1", "agent": "cli",
+            "messages": [
+                {"id":"m1","role":"user","ts":1700000100,"content":[{"type":"text","text":"hi"}]},
+                {"id":"m2","role":"assistant","ts":1700000101,
+                 "content":[{"type":"text","text":"hello"}],
+                 "modelInfo":{"id":"claude-sonnet-4-20260514","provider":"anthropic"},
+                 "metrics":{"inputTokens":1500,"outputTokens":"900","cacheReadTokens":600,"cacheWriteTokens":200,"cost":"0.045"}}
+            ]
+        });
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("cli envelope metrics fold");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&700));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&900));
+        assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&600));
+        assert_eq!(meta.usage.get("cache_creation_input_tokens"), Some(&200));
+        assert_eq!(meta.recorded_cost_usd, Some(0.045));
+        assert_eq!(meta.model_used, "unknown");
+    }
+
+    #[test]
+    fn cline_negative_metrics_are_clamped_and_disclosed() {
+        // tokscale #1369 documents negative Cline metrics in the wild;
+        // the lane clamps at intake and discloses — never propagates.
+        let doc = serde_json::json!({
+            "sessionId": "neg-1", "agent": "cli",
+            "messages": [
+                {"id":"m1","role":"assistant","ts":1700000200,
+                 "content":[{"type":"text","text":"x"}],
+                 "metrics":{"inputTokens":500,"outputTokens":-40,"cacheReadTokens":0,"cacheWriteTokens":0,"cost":-0.01}}
+            ]
+        });
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("negative carrier still folds (clamped)");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&500));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&0));
+        assert_eq!(
+            meta.recorded_cost_usd, None,
+            "negative cost must not be recorded"
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_negative_clamped"),
+            Some(&1)
+        );
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_unparsed_fields"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn cline_cost_only_text_is_not_a_metrics_carrier() {
+        // Never-invent: a JSON text message carrying only a "cost" (an
+        // invoice pasted into chat, say) has no token evidence and must
+        // not fold usage. Carriers require at least one token field.
+        let doc = serde_json::json!([
+            {"ts":1,"type":"say","say":"text","text":"{\"cost\": 1.5}"}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        assert!(
+            events.iter().all(|event| event.role != "session_meta"),
+            "cost-only JSON text must not fold usage"
+        );
+    }
+
+    #[test]
+    fn cline_store_without_metrics_is_unchanged() {
+        // rm-1430 zero-delta pin: a metrics-free store renders exactly
+        // as before the carrier work — no session_meta event, no cline
+        // counters, zero usage.
+        let dir = std::env::temp_dir().join("agenttrace-rm1430-zero-delta");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ui_messages.json"),
+            r#"[{"ts":1700000000,"type":"say","say":"user_feedback","text":"do the thing"},{"ts":1700000001,"type":"say","say":"text","text":"done"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("api_conversation_history.json"),
+            r#"[{"role":"user","content":"do the thing"},{"role":"assistant","content":"done"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("task_metadata.json"),
+            r#"{"task":"T","workDir":"/tmp","created":1700000000000,"status":"completed"}"#,
+        )
+        .unwrap();
+
+        let session = parse_file(&dir).expect("metrics-free cline dir parses");
+        assert!(
+            session
+                .metrics
+                .disclosure_counters
+                .keys()
+                .all(|key| !key.starts_with("cline_")),
+            "no cline counters without carriers"
+        );
+        // Pre-change behavior pinned: a metrics-free store keeps its
+        // text-estimated token counts (3 here) and their estimated cost —
+        // the estimation path is untouched.
+        assert_eq!(session.metrics.tokens_input, 3);
+        assert_eq!(session.metrics.cost_estimated, 0.0001);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
