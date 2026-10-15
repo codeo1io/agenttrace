@@ -16,6 +16,7 @@
 //! stdin still prints a line, diagnostics go to stderr only, the tee is
 //! best-effort, and the process exits 0.
 
+use crate::session_cache::resolve_user_cache_dir;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -207,55 +208,15 @@ fn user_cache_dir() -> PathBuf {
     )
 }
 
-/// Pure resolution core for [`user_cache_dir`]: the same rules without
-/// touching process environment state, so the empty-env fallbacks are
-/// unit-testable without mutating (unsafe) globals (the
-/// `resolve_user_config_path` pattern from rm-683).
-///
-/// Review 95d74221 F2 (2026-10-07): a set-but-empty `HOME` is now
-/// treated as unset on BOTH arms — the same XDG-spec v0.8 rule the
-/// user-config guard applies. Without the guard, `HOME=` joined the
-/// RELATIVE `Library/Caches` / `.cache`, so the capture journal
-/// resolved against the CWD and a `.cache/agenttrace/statusline.jsonl`
-/// planted in the working directory was read into the budget view
-/// (live PoC: `$999.00 ... OVER by $989.00` from a planted journal).
-///
-/// Cycle-3 review F1 (2026-10-13, run 64e89da50d71, attempt ae97110b):
-/// the RELATIVE arm now matches the rm-248 rider — `HOME=rel-home`
-/// planted ./rel-home/.cache/agenttrace/statusline.jsonl (0600) in the
-/// CWD and `--statusline-report` read the planted journal back (live
-/// PoC: ae97110b-scratch/poc/). A set-but-empty OR RELATIVE `HOME` is
-/// unset-equivalent on BOTH arms, the same rule the rider pinned at
-/// the session_cache / doctor / pricing copies.
-fn resolve_user_cache_dir(
-    home: Option<&std::ffi::OsStr>,
-    xdg_cache_home: Option<&std::ffi::OsStr>,
-) -> PathBuf {
-    let usable_home = home
-        .filter(|value| !value.is_empty())
-        .filter(|value| std::path::Path::new(value).is_absolute());
-    if cfg!(target_os = "macos") {
-        if let Some(home) = usable_home {
-            return PathBuf::from(home).join("Library").join("Caches");
-        }
-    }
-    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
-    // $XDG_CACHE_HOME values; a relative one is treated as unset and
-    // falls through to the HOME-based default instead of scattering a
-    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
-    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
-    // scratch cwd).
-    if let Some(cache) = xdg_cache_home
-        .filter(|value| !value.is_empty())
-        .filter(|value| std::path::Path::new(value).is_absolute())
-    {
-        return PathBuf::from(cache);
-    }
-    if let Some(home) = usable_home {
-        return PathBuf::from(home).join(".cache");
-    }
-    std::env::temp_dir()
-}
+// rm-1389: this module's private resolver core moved to
+// session_cache::resolve_user_cache_dir (the one shared definition —
+// four hand-synced copies drifted twice before the consolidation).
+// History: review 95d74221 F2 (empty HOME) and cycle-3 review F1
+// (attempt ae97110b, relative HOME) — a set-but-empty OR RELATIVE
+// HOME is unset-equivalent on both arms; the un-guarded join read a
+// CWD-planted .cache/agenttrace/statusline.jsonl back into the
+// budget view (live PoCs: `$999.00 ... OVER by $989.00`;
+// ae97110b-scratch/poc/).
 
 /// The statusline host entry point. Contract: never fails, never blocks
 /// (no session-cache locking, no discovery), prints exactly one line to
@@ -1311,6 +1272,7 @@ pub fn render_statusline_report(
                     series.first_day_baseline_unknown_sessions,
                 "first_day_baseline_unknown_usd":
                     series.first_day_baseline_unknown_usd,
+            "invalid_cost_samples": series.invalid_cost_samples,
             });
         }
         return Ok(format!("{}\n", serde_json::to_string_pretty(&value)?));
@@ -1467,6 +1429,13 @@ fn render_statusline_report_text(
                 series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
             ));
         }
+        if series.invalid_cost_samples > 0 {
+            out.push_str(&format!(
+                "Budget samples: {} invalid cost sample(s) excluded from the 7d total \
+             (negative or non-finite journal cost)\n",
+                series.invalid_cost_samples
+            ));
+        }
     }
     // rm-037: context pressure per session — the payload's
     // pre-calculated utilization plus the last-API token counts
@@ -1570,8 +1539,19 @@ fn render_statusline_report_text(
 /// The `cost.total_cost_usd` sample a capture carries, if any. The
 /// payload gates this field at v2.1.251+, so older captures simply
 /// contribute nothing rather than failing the aggregation.
-fn capture_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
+/// Journal cost with no validity judgement — Some only when the field
+/// is present as a number.
+fn raw_journal_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
     capture.payload.get("cost")?.get("total_cost_usd")?.as_f64()
+}
+
+fn capture_cost_usd(capture: &CapturedStatusline) -> Option<f64> {
+    // rm-1388: journal cost samples share the parser's recorded-cost
+    // validity contract (finite && >= 0.0 —
+    // parser::recorded_cost_sample_is_valid). An invalid sample is
+    // treated as absent so it can never book spend.
+    raw_journal_cost_usd(capture)
+        .filter(|total| crate::parser::recorded_cost_sample_is_valid(*total))
 }
 
 fn utc_day(epoch: i64) -> String {
@@ -1629,6 +1609,10 @@ pub struct StatuslineBudgetSeries {
     /// Sum of those sessions' first observed cumulative values — the
     /// excluded pre-journal bias, rounded to cents (rm-771 arm 1).
     pub first_day_baseline_unknown_usd: f64,
+    /// rm-1388: journal cost samples that were present but failed the
+    /// shared validity predicate (negative / non-finite) — excluded
+    /// from `daily`/`total`, disclosed per render lane.
+    pub invalid_cost_samples: usize,
 }
 
 pub fn statusline_budget_series(
@@ -1645,8 +1629,16 @@ pub fn statusline_budget_series(
     // retained journal — the session began mid-window, or the 10 MiB
     // retention cap (rm-385) dropped its true first days (rm-771).
     let mut per_session: BTreeMap<&str, BTreeMap<String, (f64, f64)>> = BTreeMap::new();
+    // rm-1388: journal cost samples that are present but fail the
+    // shared validity predicate are excluded and disclosed, never
+    // booked.
+    let mut invalid_cost_samples = 0;
     for capture in captures {
-        if let Some(cost) = capture_cost_usd(capture) {
+        let journal_cost = capture_cost_usd(capture);
+        if raw_journal_cost_usd(capture).is_some() && journal_cost.is_none() {
+            invalid_cost_samples += 1;
+        }
+        if let Some(cost) = journal_cost {
             let day = utc_day(capture.captured_at);
             if day.is_empty() {
                 continue;
@@ -1731,6 +1723,9 @@ pub fn statusline_budget_series(
             // bias — F3 scopes the counters to the (empty) window.
             first_day_baseline_unknown_sessions: 0,
             first_day_baseline_unknown_usd: 0.0,
+            // rm-1388: an empty window books no samples, so none can
+            // be invalid.
+            invalid_cost_samples: 0,
         };
     }
     let window_start = today - Duration::days(days as i64 - 1);
@@ -1790,6 +1785,7 @@ pub fn statusline_budget_series(
         excluded_older_days,
         first_day_baseline_unknown_sessions: baseline_unknown_sessions,
         first_day_baseline_unknown_usd: (baseline_unknown_usd * 100.0).round() / 100.0,
+        invalid_cost_samples,
     }
 }
 
@@ -1834,6 +1830,7 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "first_day_baseline_unknown_sessions":
                 series.first_day_baseline_unknown_sessions,
             "first_day_baseline_unknown_usd": series.first_day_baseline_unknown_usd,
+            "invalid_cost_samples": series.invalid_cost_samples,
         });
         if let Some(budget) = weekly_budget {
             value["weekly_budget_usd"] = serde_json::json!(budget);
@@ -1876,6 +1873,13 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "  first-day baseline unknown for {} session(s) — \
              ${:.2} of pre-journal spend excluded from the 7d total\n",
             series.first_day_baseline_unknown_sessions, series.first_day_baseline_unknown_usd
+        ));
+    }
+    if series.invalid_cost_samples > 0 {
+        out.push_str(&format!(
+            "  {} invalid cost sample(s) excluded from the 7d total \
+             (negative or non-finite journal cost)\n",
+            series.invalid_cost_samples
         ));
     }
     match weekly_budget {
@@ -1967,6 +1971,70 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .expect("noon exists");
         chrono::Utc.from_utc_datetime(&noon).timestamp() + secs_into_day
+    }
+
+    #[test]
+    fn budget_series_excludes_hostile_negative_cost_samples() {
+        // rm-1388 red-first: a journal-authored negative
+        // total_cost_usd must not book negative spend or flip a budget
+        // verdict (live PoC at assess ecf1d292: {+5,+8} plus {-50,-50}
+        // on a $10 weekly budget printed "7d total $-47.00" /
+        // "$57.00 remaining (100%)" — the first-seen baseline gate only
+        // fires on positives, so the negative first delta books as
+        // spend). All samples sit on one in-window day (noon-anchored,
+        // never future-dated).
+        let captures = vec![
+            budget_capture("sess-real", epoch_on_day_offset(1, 0), 5.0),
+            budget_capture("sess-real", epoch_on_day_offset(1, 3600), 8.0),
+            budget_capture("sess-neg", epoch_on_day_offset(1, 600), -50.0),
+            budget_capture("sess-neg", epoch_on_day_offset(1, 4200), -50.0),
+            budget_capture("sess-alt", epoch_on_day_offset(1, 5400), 10.0),
+            budget_capture("sess-alt", epoch_on_day_offset(1, 6000), -10.0),
+        ];
+        let series = statusline_budget_series(&captures, 7, Utc::now());
+        assert!(
+            series.total.is_finite(),
+            "total must stay finite: {}",
+            series.total
+        );
+        assert_eq!(
+            series.total, 3.0,
+            "only valid samples book: sess-real span 8-5=3; sess-neg has no \
+             valid sample and sess-alt's -10 is excluded"
+        );
+        assert!(
+            series.daily.iter().all(|(_, v)| *v >= 0.0),
+            "no day may book negative spend: {:?}",
+            series.daily
+        );
+        assert_eq!(
+            series.invalid_cost_samples, 3,
+            "the two -50 samples and the -10 sample must be disclosed as \
+             excluded invalid samples"
+        );
+    }
+
+    // rm-1388: the validated accessor is the single gate every journal
+    // cost sample passes before booking (NaN and infinities cannot
+    // round-trip serde_json, so negatives are the reachable hostile
+    // arm; the predicate itself is unit-tested in parser.rs).
+    #[test]
+    fn capture_cost_usd_rejects_negative_journal_cost() {
+        let valid = budget_capture("s", 1_700_000_000, 3.5);
+        assert_eq!(capture_cost_usd(&valid), Some(3.5));
+        let zero = budget_capture("s", 1_700_000_000, 0.0);
+        assert_eq!(capture_cost_usd(&zero), Some(0.0));
+        for hostile in [-0.01, -50.0, -1e308] {
+            let capture = budget_capture("s", 1_700_000_000, hostile);
+            assert_eq!(
+                capture_cost_usd(&capture),
+                None,
+                "negative journal cost must be treated as absent"
+            );
+            assert_eq!(raw_journal_cost_usd(&capture), Some(hostile));
+        }
+        let absent = budget_capture("s", 1_700_000_000, f64::NAN);
+        assert_eq!(raw_journal_cost_usd(&absent), None);
     }
 
     #[test]

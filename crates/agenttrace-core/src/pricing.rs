@@ -1,4 +1,5 @@
 use crate::round4;
+use crate::session_cache::resolve_user_cache_dir;
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2031,50 +2032,14 @@ fn user_cache_dir() -> PathBuf {
     )
 }
 
-/// Pure resolution core for [`user_cache_dir`]: the same rules
-/// without touching process environment state, so the
-/// empty/relative-env fallbacks are unit-testable without mutating
-/// (unsafe) globals (the `resolve_user_config_path` pattern from
-/// rm-683, shared with statusline).
-///
-/// rm-248 rider (2026-10-12, run 64e89da50d71 cycle 3): a
-/// set-but-empty OR RELATIVE `HOME` is treated as unset on BOTH arms,
-/// extending the empty-env rule statusline's copy already applies
-/// (review 95d74221 F2). Without the guard, `HOME=` joined the
-/// RELATIVE `.cache`, so the pricing cache (`pricing.json` under the
-/// same agenttrace root) would plant ./.cache/agenttrace in the
-/// working directory (live PoC on the sibling session-cache copy:
-/// /tmp/at-probe-8275/homeempty/), and a relative `HOME=rel-home`
-/// planted ./rel-home/.cache the same way.
-fn resolve_user_cache_dir(
-    home: Option<&std::ffi::OsStr>,
-    xdg_cache_home: Option<&std::ffi::OsStr>,
-) -> PathBuf {
-    let usable_home = home
-        .filter(|value| !value.is_empty())
-        .filter(|value| std::path::Path::new(value).is_absolute());
-    if cfg!(target_os = "macos") {
-        if let Some(home) = usable_home {
-            return PathBuf::from(home).join("Library").join("Caches");
-        }
-    }
-    // rm-248: the XDG Base Directory spec only defines ABSOLUTE
-    // $XDG_CACHE_HOME values; a relative one is treated as unset and
-    // falls through to the HOME-based default instead of scattering a
-    // per-cwd cache (observed live: `XDG_CACHE_HOME=rel-cache
-    // agenttrace --overview` wrote ./rel-cache/agenttrace from a
-    // scratch cwd).
-    if let Some(cache) = xdg_cache_home
-        .filter(|value| !value.is_empty())
-        .filter(|value| std::path::Path::new(value).is_absolute())
-    {
-        return PathBuf::from(cache);
-    }
-    if let Some(home) = usable_home {
-        return PathBuf::from(home).join(".cache");
-    }
-    std::env::temp_dir()
-}
+// rm-1389: this module's private resolver core moved to
+// session_cache::resolve_user_cache_dir (the one shared definition —
+// four hand-synced copies drifted twice before the consolidation).
+// History: rm-248 rider (run 64e89da50d71) — a set-but-empty OR
+// RELATIVE HOME is unset on both arms; the un-guarded join planted
+// the pricing cache (`pricing.json` under the same agenttrace root)
+// in the working directory (live PoC on the sibling session-cache
+// copy: /tmp/at-probe-8275/homeempty/).
 
 #[cfg(test)]
 mod tests {

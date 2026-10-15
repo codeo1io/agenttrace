@@ -3240,7 +3240,14 @@ fn user_cache_dir() -> PathBuf {
 /// ./.cache/agenttrace/sessions.json (mode 0600) in the working
 /// directory (live PoC: /tmp/at-probe-8275/homeempty/), and a
 /// relative `HOME=rel-home` planted ./rel-home/.cache the same way.
-fn resolve_user_cache_dir(
+/// rm-1389: the ONE user-cache base resolver shared by session_cache,
+/// doctor, pricing, and statusline (previously four hand-synced
+/// private copies that drifted twice — empty HOME, then relative
+/// HOME — before this consolidation). Pure over (HOME, XDG_CACHE_HOME)
+/// so every call path stays test-injectable; the both-unusable
+/// fallback is std::env::temp_dir(), mirroring the journal ROOT
+/// policy this module already owns.
+pub(crate) fn resolve_user_cache_dir(
     home: Option<&std::ffi::OsStr>,
     xdg_cache_home: Option<&std::ffi::OsStr>,
 ) -> PathBuf {
@@ -5196,6 +5203,47 @@ mod tests {
         // ladder end, never a relative root.
         let both_unusable = resolve_user_cache_dir(relative, Some(OsStr::new("rel-cache")));
         assert!(both_unusable.is_absolute(), "{both_unusable:?}");
+    }
+
+    #[test]
+    fn shared_user_cache_resolver_census_pins_one_definition() {
+        // rm-1389 census pin: this module now owns the ONE shared
+        // resolver that doctor, pricing, and statusline import. The
+        // four hand-synced private copies this consolidation removed
+        // had already drifted twice in three days (the empty-HOME fix
+        // landed on three copies in dade9cd while statusline's
+        // lagged; the relative-HOME fix then landed on statusline
+        // alone), so a re-born private copy is a regression of
+        // exactly that family. The needle is assembled at runtime so
+        // this test's own source cannot count itself.
+        let needle = ["fn ", "resolve_user_cache_dir"].concat();
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("crates");
+        let mut definitions = 0usize;
+        let mut stack = vec![crates_dir];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("census cannot read {}: {err}", dir.display()));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("census cannot read {}: {err}", path.display()));
+                definitions += source.matches(&needle).count();
+            }
+        }
+        assert_eq!(
+            definitions, 1,
+            "exactly one shared resolver definition may exist (this module); \
+             the census found {definitions} across crates/"
+        );
     }
 
     #[test]
