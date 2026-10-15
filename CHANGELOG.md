@@ -299,6 +299,22 @@
 
 ### Fixed
 
+- opencode transcript reads are stat-capped at 10 MiB per file (rm-1437, run
+  c1cafed5 cycle 5): `read_opencode_records` previously read every message and
+  part transcript whole into memory regardless of size, so peak heap scaled
+  with the corpus, not the query. Oversized files are now skipped before the
+  read and disclosed through `line_skips`
+  (`opencode_transcript_files_capped` / `opencode_transcript_bytes_capped`),
+  folding into `--doctor` next to the other skip classes; a session whose
+  transcripts are all over-cap now parses with its disclosure instead of
+  surfacing as `unsupported session format`.
+- npm launcher preserves signal exits (rm-1438, run c1cafed5 cycle 5):
+  `npm/bin/agenttrace.js` kept `process.exit(result.status ?? 1)`, which
+  collapsed any signal death (Ctrl-C, `kill`) into generic rc 1 at the wrapper
+  boundary — `result.signal` was discarded. The wrapper now re-raises the
+  child's signal to itself (numeric exit codes still pass through unchanged),
+  so shells and CI observe real termination semantics under `npm exec`.
+
 - Doctor text-report formula hardening — the doctor text report now neutralizes spreadsheet-formula introducers on every corpus-controlled sample line: zero-usage sample names, duplicate-sqlite-db paths, and baked project-decode sample lines (defense-in-depth; today's decode arms emit fixed prefixes). Paste-safety on the doctor lane now matches the rm-985 cell-lane guarantees, and the JSON surface stays byte-lossless by design (raw payload values, no marker). Verified red-first with the `formula-lane` fixture family (`=2+5_zero_usage.jsonl` derived from `=2+5_cmd.jsonl` at base 3e90993): `cargo test -p agenttrace-core --test formula_lane_contract` 8/8, including the JSON-raw contrast arm. (rm-897 residual, run `a64735b75a46` cycle 3, 2026-10-14)
 - CI install-runtime gate derives the expected pinned ref from `install.sh` — test D previously grepped the literal `ref=v0.9.0` while `install.sh` pinned `REF="v0.10.1"`, leaving the gate standing-red on every battery since the v0.10.1 bump. The expected ref is now parsed from install.sh's `REF` default at runtime, so test D/E stay live receipt↔pin drift guards (`bash scripts/ci/check-install-runtime.sh` → rc0, including the glibc floor arm under `AGENTTRACE_BIN`). (rm-012/rm-051 family, run `a64735b75a46` cycle 3, 2026-10-14)
 - Guarded the `--diagnostics` text lane against spreadsheet-formula payloads: `session.diagnostics` JSON dump string leaves now carry the `'` paste-marker like the report and doctor lanes, while the `-f json` machine lane stays byte-lossless by design (#rm-540).

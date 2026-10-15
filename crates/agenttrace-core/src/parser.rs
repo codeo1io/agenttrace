@@ -509,8 +509,20 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
         }
     }
     if let Some(value) = parsed_value {
-        if let Some(events) = parse_opencode_storage_value(path, &value) {
-            return session_from_events(name, path, events);
+        let mut opencode_admission = OpencodeAdmissionStats::default();
+        if let Some(events) = parse_opencode_storage_value(path, &value, &mut opencode_admission) {
+            let mut session = session_from_events(name, path, events)?;
+            if opencode_admission.capped_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_files_capped".to_string(),
+                    opencode_admission.capped_files,
+                );
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_bytes_capped".to_string(),
+                    opencode_admission.capped_bytes as usize,
+                );
+            }
+            return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
             return session_from_events(name, path, events);
@@ -6360,12 +6372,16 @@ struct OpenCodeRecord {
     doc: Map<String, Value>,
 }
 
-fn parse_opencode_storage_value(path: &str, value: &Value) -> Option<Vec<Event>> {
+fn parse_opencode_storage_value(
+    path: &str,
+    value: &Value,
+    admission: &mut OpencodeAdmissionStats,
+) -> Option<Vec<Event>> {
     let doc = value.as_object()?;
     if !is_opencode_storage_session_doc(path, doc) {
         return None;
     }
-    parse_opencode_storage_session(path, doc).ok()
+    parse_opencode_storage_session(path, doc, admission).ok()
 }
 
 fn is_opencode_storage_session_doc(path: &str, doc: &Map<String, Value>) -> bool {
@@ -6418,6 +6434,7 @@ fn rel_from_root(root: &Path, path: &Path) -> Option<String> {
 fn parse_opencode_storage_session(
     path: &str,
     session: &Map<String, Value>,
+    admission_out: &mut OpencodeAdmissionStats,
 ) -> anyhow::Result<Vec<Event>> {
     let session_id = string(session.get("id")).unwrap_or("");
     if session_id.is_empty() {
@@ -6425,8 +6442,15 @@ fn parse_opencode_storage_session(
     }
     let storage_root = opencode_storage_root_from_session_file(path)
         .with_context(|| format!("opencode: unsupported storage path {path}"))?;
-    let mut messages = read_opencode_records(&storage_root.join("message").join(session_id));
-    if messages.is_empty() {
+    let mut admission = OpencodeAdmissionStats::default();
+    let (mut messages, message_admission) =
+        read_opencode_records(&storage_root.join("message").join(session_id));
+    admission.accumulate(message_admission);
+    // rm-1437: an empty event set is expected when every transcript was
+    // stat-capped away — bail into the unsupported lane only when we have no
+    // such explanation, so a fully-capped session still parses and carries its
+    // disclosure instead of masquerading as a foreign format.
+    if messages.is_empty() && admission.capped_files == 0 {
         bail!("opencode: no messages found for session {}", session_id);
     }
     sort_opencode_records(&mut messages);
@@ -6448,12 +6472,19 @@ fn parse_opencode_storage_session(
         // consumed no billing class, so the rescue still fires and the
         // step's input/output survives.
         let message_fold = add_opencode_tokens(&mut usage, msg.doc.get("tokens"), true);
-        let (events, part_usage) =
-            parse_opencode_message(&storage_root, &msg.doc, &model, message_fold);
+        let (events, part_usage) = parse_opencode_message(
+            &storage_root,
+            &msg.doc,
+            &model,
+            message_fold,
+            &mut admission,
+        );
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
-    if body.is_empty() {
+    // rm-1437: same relaxation as the messages gate — a fully stat-capped
+    // corpus legitimately yields no parseable events; disclose, don't bail.
+    if body.is_empty() && admission.capped_files == 0 {
         bail!("opencode: no parseable events for session {}", session_id);
     }
 
@@ -6472,6 +6503,7 @@ fn parse_opencode_storage_session(
         });
     }
     events.extend(body);
+    admission_out.accumulate(admission);
     Ok(events)
 }
 
@@ -6486,14 +6518,49 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn read_opencode_records(dir: &Path) -> Vec<OpenCodeRecord> {
+/// rm-1437: admission disclosure for the opencode transcript lane. Whole-file
+/// reads are stat-capped; over-cap files are skipped and reported through
+/// [`Metrics::line_skips`] so `--doctor` surfaces them next to the other skip
+/// classes and data-health confidence degrades honestly (the rm-526 loss
+/// channel — a skipped transcript is lost data, not a value-preserving
+/// adjustment, so it does NOT ride `disclosure_counters`).
+#[derive(Debug, Default, Clone, Copy)]
+struct OpencodeAdmissionStats {
+    capped_files: usize,
+    capped_bytes: u64,
+}
+
+impl OpencodeAdmissionStats {
+    fn accumulate(&mut self, other: OpencodeAdmissionStats) {
+        self.capped_files += other.capped_files;
+        self.capped_bytes += other.capped_bytes;
+    }
+}
+
+/// rm-1437: per-file read cap for opencode message/part transcripts, mirroring
+/// the statusline journal lane's `capped_away_bytes` discipline (rm-821): the
+/// metadata length is checked BEFORE the read so an oversized transcript is
+/// never admitted into memory. Legitimate transcripts are KB-scale; 10 MiB
+/// matches the fleet's transcript-side read caps.
+const OPENCODE_TRANSCRIPT_READ_CAP_BYTES: u64 = 10 * 1024 * 1024;
+
+fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionStats) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), OpencodeAdmissionStats::default());
     };
     let mut records = Vec::new();
+    let mut admission = OpencodeAdmissionStats::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        // rm-1437: stat before read — over-cap transcripts are skipped and
+        // disclosed instead of being admitted into memory.
+        let file_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if file_len > OPENCODE_TRANSCRIPT_READ_CAP_BYTES {
+            admission.capped_files += 1;
+            admission.capped_bytes += file_len;
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -6504,7 +6571,7 @@ fn read_opencode_records(dir: &Path) -> Vec<OpenCodeRecord> {
         };
         records.push(OpenCodeRecord { path, doc });
     }
-    records
+    (records, admission)
 }
 
 fn sort_opencode_records(records: &mut [OpenCodeRecord]) {
@@ -6521,11 +6588,14 @@ fn parse_opencode_message(
     msg: &Map<String, Value>,
     model: &str,
     message_fold: OpencodeTokensFold,
+    admission: &mut OpencodeAdmissionStats,
 ) -> (Vec<Event>, BTreeMap<String, i64>) {
     let role = string(msg.get("role")).unwrap_or("");
     let ts = opencode_time_from_map(msg.get("time"), &["created", "start"]);
     let msg_id = string(msg.get("id")).unwrap_or("");
-    let mut parts = read_opencode_records(&storage_root.join("part").join(msg_id));
+    let (mut parts, part_admission) =
+        read_opencode_records(&storage_root.join("part").join(msg_id));
+    admission.accumulate(part_admission);
     sort_opencode_records(&mut parts);
 
     let mut events = Vec::new();
