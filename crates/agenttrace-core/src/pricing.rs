@@ -1553,7 +1553,12 @@ fn match_variants(raw: &str) -> Vec<String> {
     variants
 }
 
-fn normalize_model(raw: &str) -> String {
+/// rm-1900: consumed by diagnostics' anomaly cohort pooling, so the
+/// cost baseline keys on the same identity the rate lookup prices by.
+/// Every fold this function performs (case, `/`-path tails, provider
+/// markers, date/version suffixes) is a fold the anomaly cohort must
+/// mirror or mixed-spelling histories silently skip the check.
+pub(crate) fn normalize_model(raw: &str) -> String {
     if raw.is_empty() || raw == "unknown" {
         return "default".to_string();
     }
