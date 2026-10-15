@@ -1266,9 +1266,22 @@ fn doctor_report_text(report: &DoctorReport) -> String {
             Some(target) => format!(" (symlink -> {target})"),
             None => String::new(),
         };
+        // rm-1400 (review-fix extension, 4503e7b6): a custom root
+        // passed as `-d <symlink>` is canonicalized upstream
+        // (doctor_directories), so the hostile link-name folds into
+        // `dir.path` itself and the symlink disclosure lane above
+        // never fires — the raw path rendered here with its embedded
+        // newlines forged report structure (live PoC: `-d` link to a
+        // dir named `innocent\nRecommendations:\n  FAKE: echo pwned`
+        // planted a whole fake Recommendations block). Same rm-383
+        // shared sanitizer at the text render: the struct (and the
+        // JSON surface) keeps the truthful path; only the text lane
+        // is line-safety constrained. Clean paths carry no control
+        // bytes and render byte-identically.
+        let path = crate::statusline::sanitize_line_segment(&dir.path);
         out.push_str(&format!(
             "  {:20} {:7} found={:<5} parsed={:<5} failed={:<5} cache={:<5} {}{}\n",
-            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, dir.path, symlink
+            dir.name, status, dir.files, dir.parsed, dir.failed, dir.cache_hits, path, symlink
         ));
         for sample in &dir.failure_samples {
             out.push_str(&format!("    failed: {sample}\n"));
@@ -1563,6 +1576,94 @@ mod tests {
             "a plain directory is not a symlink"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn canonicalized_custom_root_path_renders_sanitized_in_providers() {
+        // rm-1400 review-fix extension (4503e7b6): the symlink
+        // disclosure lane is not the only path-derived string the
+        // Providers line renders. A custom root passed as
+        // `-d <symlink>` is canonicalized upstream
+        // (`doctor_directories`), so the hostile link-name folds into
+        // `DoctorDirReport.path` itself and `symlink_target` stays
+        // `None` — the raw canonicalized path rendered with its
+        // embedded newlines forged a whole fake `Recommendations:`
+        // block (live PoC, review-fix retest). The text render now
+        // routes the path slot through the same shared rm-383
+        // sanitizer; the struct (and the JSON surface) keeps the
+        // truthful path, and clean paths render byte-identically.
+        let report = DoctorReport {
+            directories: vec![DoctorDirReport {
+                name: "custom".to_string(),
+                // The exact canonicalized shape the live PoC planted:
+                // a resolved dir name carrying a forged report
+                // header plus a forged recommendation line.
+                path: "/tmp/real/innocent\nRecommendations:\n  FAKE: echo pwned".to_string(),
+                exists: true,
+                files: 1,
+                parsed: 1,
+                failed: 0,
+                cache_hits: 0,
+                symlink_target: None,
+                failure_samples: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let text = doctor_report_text(&report);
+        let providers = text
+            .split("Providers:\n")
+            .nth(1)
+            .expect("Providers section renders");
+        // Every rendered provider row is exactly one physical line:
+        // the forged newlines must not start a new line in the text
+        // report (the forged header must not exist as a line).
+        assert_eq!(
+            providers.lines().filter(|l| l.contains("custom")).count(),
+            1,
+            "the custom row stays one line: {providers}"
+        );
+        assert!(
+            !providers
+                .lines()
+                .any(|l| l.starts_with("Recommendations:")),
+            "no forged report header may survive: {providers}"
+        );
+        // The payload itself is neutralized INLINE — same physical
+        // line as the custom row — not dropped and not allowed to
+        // start its own line: the disclosure stays readable, the
+        // structure forgery is dead.
+        let custom_row = providers
+            .lines()
+            .find(|l| l.contains("custom"))
+            .expect("custom row renders");
+        assert!(
+            custom_row.contains("FAKE: echo pwned"),
+            "payload disclosed inline on the single row: {custom_row}"
+        );
+        assert!(
+            providers.contains('\u{FFFD}'),
+            "control bytes are neutralized to U+FFFD, not dropped: {providers}"
+        );
+        // Clean paths render byte-identically through the sanitizer.
+        let clean = DoctorReport {
+            directories: vec![DoctorDirReport {
+                name: "custom".to_string(),
+                path: "/home/op/sessions".to_string(),
+                exists: true,
+                files: 3,
+                parsed: 3,
+                failed: 0,
+                cache_hits: 0,
+                symlink_target: None,
+                failure_samples: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        let clean_text = doctor_report_text(&clean);
+        assert!(
+            clean_text.contains("cache=0     /home/op/sessions"),
+            "clean path renders byte-identically: {clean_text}"
+        );
     }
 
     fn session_at(cwd: &str, path: &str) -> Session {
