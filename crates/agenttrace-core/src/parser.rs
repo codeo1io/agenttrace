@@ -74,7 +74,10 @@ const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`]. Every failure keeps the named-format
 /// wording (never a generic UTF-8 error): a corrupt frame names the decode
 /// failure, an empty frame says so, and an over-cap frame names the cap.
-fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
+/// `pub(crate)`: the rm-402 replay scanner (`codex_replay.rs`) shares this
+/// exact decoder so fingerprinting and parsing always see the same bytes —
+/// one decode lane, one cap, one refusal wording.
+pub(crate) fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     let mut decoder = match ruzstd::decoding::StreamingDecoder::new(&raw[..]) {
         Ok(decoder) => decoder,

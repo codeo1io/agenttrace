@@ -3379,8 +3379,21 @@ pub(super) fn load_summary_line(app: &App) -> String {
             } else {
                 String::new()
             };
+            // rm-402 (review af521003 F5): replay-adjusted children
+            // disclose in the same Ready summary — the TUI's
+            // counterpart to the CLI's codex_multiagent_replayed_child_adjusted
+            // disclosure counter. 0-count-clean clause.
+            let replay = if state.replay_children_adjusted > 0 {
+                format!(
+                    ", {} {}",
+                    format_count(state.replay_children_adjusted as i64),
+                    app.t("replay-adjusted sessions", "回放校正会话")
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "{} {} {}, {} {}, {source}{unlinked}",
+                "{} {} {}, {} {}, {source}{unlinked}{replay}",
                 app.t("loaded", "已加载"),
                 format_count(state.parsed as i64),
                 app.t("sessions", "个会话"),

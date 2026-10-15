@@ -1629,6 +1629,11 @@ pub struct StatuslineBudgetSeries {
     /// Sum of those sessions' first observed cumulative values — the
     /// excluded pre-journal bias, rounded to cents (rm-771 arm 1).
     pub first_day_baseline_unknown_usd: f64,
+    /// rm-727: distinct sampled UTC days strictly LATER than today —
+    /// a future-dated capture bills into no calendar window; excluded
+    /// from `daily`/`total` and disclosed by the budget views so a
+    /// misdated journal stays visible, not silently dropped.
+    pub excluded_future_days: usize,
 }
 
 pub fn statusline_budget_series(
@@ -1723,10 +1728,27 @@ pub fn statusline_budget_series(
     // one-day window; no test pinned that edge either way).
     let today = now.date_naive();
     if days == 0 {
+        // rm-727 (review af521003 F9): the empty window still labels its
+        // exclusions by side — a future-only sampled journal must not be
+        // reported as `excluded_older_days` with `excluded_future_days`
+        // hardcoded 0. `daily` is keyed "YYYY-MM-DD", so lexicographic
+        // range IS date range; a sample on today itself is non-future
+        // and lands in the older bucket (the zero-day window excludes
+        // it too, and "older" is the closest side for a degenerate
+        // window).
+        let today_key = today.format("%Y-%m-%d").to_string();
+        let excluded_future_days = daily
+            .range((
+                std::ops::Bound::Excluded(today_key),
+                std::ops::Bound::Unbounded,
+            ))
+            .count();
+        let excluded_older_days = daily.len() - excluded_future_days;
         return StatuslineBudgetSeries {
             daily: Vec::new(),
             total: 0.0,
-            excluded_older_days: daily.len(),
+            excluded_older_days,
+            excluded_future_days,
             // rm-771: an empty window counts no baseline-unknown
             // bias — F3 scopes the counters to the (empty) window.
             first_day_baseline_unknown_sessions: 0,
@@ -1739,6 +1761,9 @@ pub fn statusline_budget_series(
         .filter_map(|(day, spend)| Some((day.parse::<chrono::NaiveDate>().ok()?, spend)))
         .collect();
     let excluded_older_days = by_day.range(..window_start).count();
+    let excluded_future_days = by_day
+        .range((std::ops::Bound::Excluded(today), std::ops::Bound::Unbounded))
+        .count();
     let any_in_window = by_day.range(window_start..=today).next().is_some();
     let window: Vec<(String, f64)> = if any_in_window {
         // Zero-fill the calendar days inside the window so gaps are
@@ -1788,6 +1813,7 @@ pub fn statusline_budget_series(
         daily: window,
         total,
         excluded_older_days,
+        excluded_future_days,
         first_day_baseline_unknown_sessions: baseline_unknown_sessions,
         first_day_baseline_unknown_usd: (baseline_unknown_usd * 100.0).round() / 100.0,
     }
@@ -1827,6 +1853,8 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "spend_7d_usd": series.total,
             // rm-917: stale sampled days the calendar window excluded.
             "excluded_older_days": series.excluded_older_days,
+            // rm-727: future-dated sampled days excluded from the window.
+            "excluded_future_days": series.excluded_future_days,
             // rm-771: sessions that predate the journal are excluded
             // from the 7d total; expose the bias so the number is
             // interpretable (0 / 0.0 when every session was observed
@@ -1865,6 +1893,17 @@ pub fn render_budget_view(format: &str, weekly_budget: Option<f64>) -> anyhow::R
             "  ({} older day{} outside the window not counted)\n",
             series.excluded_older_days,
             if series.excluded_older_days == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if series.excluded_future_days > 0 {
+        out.push_str(&format!(
+            "  ({} future-dated day{} outside the window not counted)\n",
+            series.excluded_future_days,
+            if series.excluded_future_days == 1 {
                 ""
             } else {
                 "s"
@@ -2171,6 +2210,9 @@ mod tests {
         // calendar window (-10, -9, -8, -7) are excluded and
         // disclosed, not billed.
         assert_eq!(series.excluded_older_days, 4, "{series:?}");
+        // rm-727: the future-dated capture must be DISCLOSED as well as
+        // excluded — one distinct sampled day beyond today.
+        assert_eq!(series.excluded_future_days, 1, "{series:?}");
         // Review 9af53c3f F3 (rm-771, on the rm-917 calendar window):
         // the baseline-unknown counters scope to the window. A's
         // first retained day (day -10) and B's (day -9) both sit
@@ -2186,8 +2228,9 @@ mod tests {
         // and inside a window that RETAINS days -10/-9 both
         // baseline-unknown sessions are disclosed again. Day -8 is a
         // counter RESET (contributes 0), and tomorrow's $99 future
-        // capture is excluded by the today-bounded upper bound;
-        // rm-917 zero-fills the unsampled in-window days.
+        // capture is excluded by the today-bounded upper bound
+        // (disclosed as a future day under rm-727); rm-917 zero-fills
+        // the unsampled in-window days.
         let full = statusline_budget_series(&captures, 30, now);
         assert!((full.total - (1.50 + 7.0 * 0.25)).abs() < 1e-9, "{full:?}");
         assert_eq!(full.first_day_baseline_unknown_sessions, 2);
@@ -2355,6 +2398,118 @@ mod tests {
         let full = statusline_budget_series(&captures, 30, now);
         assert_eq!(full.first_day_baseline_unknown_sessions, 2, "{full:?}");
         assert!((full.first_day_baseline_unknown_usd - 43.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn far_future_samples_disclosed_and_cannot_evict_real_days() {
+        // rm-727 literal PoC pin (review af521003 F8): the row's attack
+        // shape was a far-future capture (12-25) evicting a real sampled
+        // day under the OLD first-N-observed window. The calendar window
+        // makes eviction structurally impossible — every one of the real
+        // in-window days must survive, the far-future days must be
+        // disclosed via `excluded_future_days`, and their spend must land
+        // in no window or row. Pinning the literal shape so the arm is
+        // satisfied non-vacuously.
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+        let base = now.timestamp();
+        let day = |n: i64| base + n * 86_400;
+        let mut captures = Vec::new();
+        // Seven real sampled in-window days, 0.10 each. Re-anchored
+        // onto the landed rm-771 baseline witness at integration: the
+        // first retained day seeds a 0.00 sample before its 0.10 max,
+        // so the session is proven to start from zero inside the
+        // window and its full first-day rise stays booked (the run's
+        // original fixture opened day -6 straight at a nonzero
+        // cumulative, which rm-771 — landed on main after this run's
+        // base — now books as an excluded pre-journal carry; every
+        // assertion below is unchanged).
+        captures.push(budget_capture("real", day(-6) - 60, 0.00));
+        for n in -6..=0 {
+            captures.push(budget_capture("real", day(n), 0.10 * (n + 7) as f64));
+        }
+        // The literal far-future shape: 12-25 and 11-01 (two distinct
+        // far-future sampled days) with large spend.
+        let dec = Utc
+            .with_ymd_and_hms(2026, 12, 25, 0, 0, 0)
+            .unwrap()
+            .timestamp();
+        let nov = Utc
+            .with_ymd_and_hms(2026, 11, 1, 0, 0, 0)
+            .unwrap()
+            .timestamp();
+        captures.push(budget_capture("ff1", dec, 500.00));
+        captures.push(budget_capture("ff2", nov, 250.00));
+        let series = statusline_budget_series(&captures, 7, now);
+        assert_eq!(
+            series.daily.len(),
+            7,
+            "calendar rows only: {:?}",
+            series.daily
+        );
+        let real_days: Vec<String> = series.daily.iter().map(|(d, _)| d.clone()).collect();
+        for n in -6..=0 {
+            let want = Utc
+                .timestamp_opt(day(n), 0)
+                .unwrap()
+                .date_naive()
+                .format("%Y-%m-%d")
+                .to_string();
+            assert!(
+                real_days.contains(&want),
+                "far-future sample evicted real day {want}: {:?}",
+                series.daily
+            );
+        }
+        assert_eq!(series.excluded_future_days, 2, "{series:?}");
+        assert_eq!(series.excluded_older_days, 0, "{series:?}");
+        assert!((series.total - 7.0 * 0.10).abs() < 1e-9, "{series:?}");
+        let today_key = now.date_naive().format("%Y-%m-%d").to_string();
+        assert!(
+            series
+                .daily
+                .iter()
+                .all(|(d, _)| d.as_str() <= today_key.as_str()),
+            "far-future spend billed into a row: {:?}",
+            series.daily
+        );
+        // The full-journal window excludes the far-future days too
+        // (upper bound is `today`, not `max sampled day`).
+        let full = statusline_budget_series(&captures, 365, now);
+        assert_eq!(full.excluded_future_days, 2, "{full:?}");
+        assert!((full.total - series.total).abs() < 1e-9, "{full:?}");
+    }
+
+    #[test]
+    fn empty_window_labels_future_only_samples_by_side() {
+        // rm-727 (review af521003 F9): the degenerate zero-day window
+        // used to dump every sampled day into `excluded_older_days`
+        // with `excluded_future_days` hardcoded 0 — a future-only
+        // journal reported itself as excluded-as-older. The empty
+        // window still labels exclusions by side.
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+        let base = now.timestamp();
+        let day = |n: i64| base + n * 86_400;
+        // Future-only journal: two distinct future sampled days.
+        let future_only = vec![
+            budget_capture("f1", day(1), 1.0),
+            budget_capture("f2", day(2), 2.0),
+        ];
+        let series = statusline_budget_series(&future_only, 0, now);
+        assert!(series.daily.is_empty());
+        assert_eq!(series.excluded_future_days, 2, "{series:?}");
+        assert_eq!(series.excluded_older_days, 0, "{series:?}");
+        assert_eq!(series.total, 0.0, "{series:?}");
+        // Mixed sides: one sampled day strictly before today and one
+        // strictly after — each labeled on its own side.
+        let mixed = vec![
+            budget_capture("past", day(-3), 1.0),
+            budget_capture("future", day(3), 2.0),
+        ];
+        let series = statusline_budget_series(&mixed, 0, now);
+        assert_eq!(series.excluded_older_days, 1, "{series:?}");
+        assert_eq!(series.excluded_future_days, 1, "{series:?}");
     }
 
     #[test]
@@ -3027,6 +3182,16 @@ mod tests {
         assert_eq!(stats.captures_with_prompt_id, 1);
         assert_eq!(stats.captures_pre_first_input, 1);
         assert_eq!(stats.captures_unknown_payload, 2);
+        // rm-558: report-side readers must never mutate the journal —
+        // only the statusline host append path may write it, so an
+        // invocation requesting a report (or diagnostics) can never
+        // grow the file it is summarizing.
+        let after = fs::read_to_string(&path).expect("journal readable after stats");
+        assert_eq!(
+            after,
+            lines.join("\n") + "\n",
+            "statusline_journal_stats must be read-only"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

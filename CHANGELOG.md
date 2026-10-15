@@ -4,8 +4,60 @@
 
 ### Added
 
-<<<<<<< HEAD
-- OpenCode v2 per-file delivery evidence — the `summary_diffs` column is consumed, disclosed, and divergence-checked (rm-1509, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): opencode's staged v2 session schema adds a `summary_diffs` json column beside the landed `summary_additions`/`summary_deletions`/`summary_files` integers, carrying the per-file `FileDiff.LegacyInfo[]` list (`{file?, additions, deletions, status?}` — patch bodies deliberately not mirrored; delivery evidence reports counts and paths). The sqlite lane reads it behind the same column-presence probe as the rm-991 integers (fixed read indices unchanged — the new column pads to index 16 and null-pads for 1.x stores, which parse byte-identically), and `Metrics` gains `summary_diffs`, `summary_diffs_dropped`, and `summary_diffs_divergence`: a payload that is present but fails to decode is counted per session, never a hard error and never silently re-derived, and when the per-file sums disagree with the integer columns on the same row the divergence is disclosed on its own evidence line (`per-file diff sums diverge from the row's summary columns: +40 vs +500 additions, -4 vs -50 deletions`) instead of silently reconciled into either side — the same recorded-vs-derived failure class ccusage closed with #1883's float tolerance. A writer-reported non-empty list also surfaces as `writer-reported per-file diff summary: N files (+A/-D)` in `--delivery-evidence`; an explicitly empty list never flags divergence (absence is not disagreement), sums saturate so hostile i64::MAX payloads cannot overflow the disclosure arithmetic, and the session cache rung advances 64 -> 65 (shape-only: warm entries replay no per-file evidence) with the sqlite snapshot rung 12 -> 13. Pinned red-first by `crates/agenttrace-core/tests/opencode_summary_diffs.rs` against a synthetic v2-shape fixture (matched/divergent/malformed/empty rows + builder/worker agent split) with the rm-991 fixture kept as the 1.x byte-stability oracle; v2 is not on npm yet, so the contract ships readiness-before-corpus, the same posture as rm-991 and the gemini 0.63 chats lane.
+- codex MultiAgent V2 replayed prefixes are counted once per family (rm-402,
+  run aa36ecb0 cycle 3; review af521003 fixes): a multi-agent child rollout
+  opens by replaying the parent's transcript as its own context, so a corpus
+  that summed per-rollout usage billed the replay twice (acceptance PoC:
+  parent final 1,400 + child-from-zero 1,700 = 3,100 reported vs 1,700 true,
+  +82%). Corpus assembly now fingerprints each rollout's opening
+  `response_item` payloads; members of a family sharing a byte-identical
+  opening (2+ items and at least 384 bytes of shared transcript — short
+  identical openings are prompt retries or templated first turns, not
+  replays) inherit the earliest starter's final cumulative token snapshot
+  as a saturating baseline, keeping only their own delta — the prefix stays
+  counted once, attributed to the parent. The earliest starter is resolved
+  from the rollout file's own first timestamp (re-derived from disk, so the
+  session cache's dropped `metrics.timestamps` cannot invert the roles on a
+  warm run), with the canonical path as a deterministic tie-break. A child
+  whose final snapshot falls below the parent's on any field (concurrent
+  spawn) is left intact and disclosed via
+  `codex_multiagent_replay_skipped_below_baseline` instead of being
+  saturated to zero under a replay label. Children priced from
+  upstream-recorded costs are skipped (token recompute would be dishonest)
+  and disclosed via `codex_multiagent_replay_skipped_upstream_priced`;
+  adjusted children carry `codex_multiagent_replayed_child_adjusted` and
+  `codex_multiagent_replayed_tokens_dropped` through the existing
+  disclosure-counter channel, and their rebased cost uses the same per-Mtok
+  catalog formula the analyze pass applies (each class /1e6 at its own
+  rate). The TUI reconciles at both load sites and discloses adjusted
+  children in its Ready summary. Corpora without a family — including every
+  single-file codex corpus — are untouched. (Integration, conflict case
+  4404ce94, independent review of the combined tree: the run's base
+  predated the landed zstd rollout lane (rm-992), whose transparent decode
+  made zstd rollouts first-class parseable sessions while this scanner
+  still read rollout files as raw text — every line failed UTF-8, so replay
+  families in the format Codex ≥0.152 actually writes silently never
+  reconciled; rm-402's counted-once/attribution/disclosure acceptance held
+  only for the legacy container. The scanner now shares the parser's single
+  bounded decode lane (same 64 MiB cap, same named refusal — a scan-side
+  decode failure yields no evidence, never a second loud error for a file
+  the parser already refused), pinned by a zstd fixture family that must
+  reconcile identically to its uncompressed twin; family identity is
+  content-based, so a zstd parent and an uncompressed child of the same
+  rollout still tie.)
+
+- statusline budget series excludes future-dated journal samples and
+  discloses them (rm-727, run aa36ecb0 cycle 3): a future-dated journal
+  capture (clock skew, hostile edit) must never bill into a statusline
+  budget window. The budget window is now the calendar range ending at
+  today — future-only sampled days fall outside it, are counted in a new
+  `excluded_future_days` disclosure (JSON + rendered line), and the
+  degenerate zero-day window labels its exclusions by side instead of
+  reporting a future-only journal as excluded-as-older. Far-future samples
+  cannot evict real sampled days from the window (pinned by test against
+  the row's literal 12-25 PoC shape).
+
+- OpenCode v2 per-file delivery evidence — the `summary_diffs` column is consumed, disclosed, and divergence-checked (rm-1509, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): opencode's staged v2 session schema adds a `summary_diffs` json column beside the landed `summary_additions`/`summary_deletions`/`summary_files` integers, carrying the per-file `FileDiff.LegacyInfo[]` list (`{file?, additions, deletions, status?}` — patch bodies deliberately not mirrored; delivery evidence reports counts and paths). The sqlite lane reads it behind the same column-presence probe as the rm-991 integers (fixed read indices unchanged — the new column pads to index 16 and null-pads for 1.x stores, which parse byte-identically), and `Metrics` gains `summary_diffs`, `summary_diffs_dropped`, and `summary_diffs_divergence`: a payload that is present but fails to decode — or sits in a non-TEXT storage class — is counted per session, never a hard error and never silently re-derived, and when the per-file sums disagree with the integer columns on the same row the divergence is disclosed on its own evidence line (`per-file diff sums diverge from the row's summary columns: +40 vs +500 additions, -4 vs -50 deletions`) instead of silently reconciled into either side — the same recorded-vs-derived failure class ccusage closed with #1883's float tolerance. A writer-reported non-empty list also surfaces as `writer-reported per-file diff summary: N files (+A/-D)` in `--delivery-evidence`; an explicitly empty list never flags divergence (absence is not disagreement), sums saturate so hostile i64::MAX payloads cannot overflow the disclosure arithmetic (review fix: the delivery-evidence per-file sums initially used a plain `.sum()` that panicked debug builds on exactly that hostile payload and wrapped negative in release — they now share the divergence check's saturating fold, pinned end-to-end by a hostile fixture, and a present-but-BLOB payload is counted as dropped rather than read as absent), and the session cache rung advances 64 -> 65 (shape-only: warm entries replay no per-file evidence) with the sqlite snapshot rung 12 -> 13. Pinned red-first by `crates/agenttrace-core/tests/opencode_summary_diffs.rs` against a synthetic v2-shape fixture (matched/divergent/malformed/empty rows + builder/worker agent split) with the rm-991 fixture kept as the 1.x byte-stability oracle; v2 is not on npm yet, so the contract ships readiness-before-corpus, the same posture as rm-991 and the gemini 0.63 chats lane.
 - Cline/Roo usage metrics carriers are consumed, not zeroed (rm-1430, run
   a3f96656 cycle 3): Cline journals record per-response usage — as a say
   entry whose text is a JSON object (`cost`/`tokensIn`/`tokensOut`/
@@ -103,9 +155,6 @@
   fixture pair under `tests/fixtures/codex-zstd/` pins decode-parity with the
   uncompressed twin and the over-cap refusal.
 
-=======
-- OpenCode v2 per-file delivery evidence — the `summary_diffs` column is consumed, disclosed, and divergence-checked (rm-1509, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): opencode's staged v2 session schema adds a `summary_diffs` json column beside the landed `summary_additions`/`summary_deletions`/`summary_files` integers, carrying the per-file `FileDiff.LegacyInfo[]` list (`{file?, additions, deletions, status?}` — patch bodies deliberately not mirrored; delivery evidence reports counts and paths). The sqlite lane reads it behind the same column-presence probe as the rm-991 integers (fixed read indices unchanged — the new column pads to index 16 and null-pads for 1.x stores, which parse byte-identically), and `Metrics` gains `summary_diffs`, `summary_diffs_dropped`, and `summary_diffs_divergence`: a payload that is present but fails to decode — or sits in a non-TEXT storage class — is counted per session, never a hard error and never silently re-derived, and when the per-file sums disagree with the integer columns on the same row the divergence is disclosed on its own evidence line (`per-file diff sums diverge from the row's summary columns: +40 vs +500 additions, -4 vs -50 deletions`) instead of silently reconciled into either side — the same recorded-vs-derived failure class ccusage closed with #1883's float tolerance. A writer-reported non-empty list also surfaces as `writer-reported per-file diff summary: N files (+A/-D)` in `--delivery-evidence`; an explicitly empty list never flags divergence (absence is not disagreement), sums saturate so hostile i64::MAX payloads cannot overflow the disclosure arithmetic (review fix: the delivery-evidence per-file sums initially used a plain `.sum()` that panicked debug builds on exactly that hostile payload and wrapped negative in release — they now share the divergence check's saturating fold, pinned end-to-end by a hostile fixture, and a present-but-BLOB payload is counted as dropped rather than read as absent), and the session cache rung advances 64 -> 65 (shape-only: warm entries replay no per-file evidence) with the sqlite snapshot rung 12 -> 13. Pinned red-first by `crates/agenttrace-core/tests/opencode_summary_diffs.rs` against a synthetic v2-shape fixture (matched/divergent/malformed/empty rows + builder/worker agent split) with the rm-991 fixture kept as the 1.x byte-stability oracle; v2 is not on npm yet, so the contract ships readiness-before-corpus, the same posture as rm-991 and the gemini 0.63 chats lane.
->>>>>>> caa46ee (fix: harden rm-1509 delivery evidence against hostile summary_diffs payloads)
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
@@ -341,6 +390,18 @@
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
 ### Fixed
+
+- `--fetch` before the `statusline`/`mcp` keywords now fails loudly instead of
+  being silently swallowed (rm-558, run aa36ecb0 cycle 3): the offline
+  keyword lanes dispatch the host command before the rm-505 trailing-flag
+  guard ever runs, so `agenttrace --fetch statusline` looked like an honored
+  flag while the fully-offline host command ignored it — the exact
+  keyword-shadowing class rm-573 closed for report flags. The keyword lanes
+  now pre-flight positional-report-only flags and exit with a named usage
+  error naming the flag and the lane; the `upstream` keyword legitimately
+  consumes `--fetch` (network is its purpose) and stays quiet. Report- and
+  diagnostics-side journal readers are pinned read-only so an invocation
+  requesting a report can never grow the journal it is summarizing.
 
 - rustls 0.23.45 -> 0.23.46, closing all four open cargo-deny advisories (rm-018, run b01c2b6a cycle 2, batch "advisory closure + OpenCode v2 delivery-evidence readiness"): RUSTSEC-2026-0346 through RUSTSEC-2026-0349 all pin rustls 0.23.45 with `patched >= 0.23.46` (advisory DB dated 2026-10-14). rustls reaches this workspace only transitively through ureq's TLS stack (the sole network call is the pricing snapshot fetch), so the fix is a `Cargo.lock`-only bump — `cargo update -p rustls` moves exactly the `rustls` entry (0.23.46 release-confirmed on crates.io; 0.24 exists only as a dev release) and rewires the `errno`/`rustix` `windows-sys` dependency edges to the already-present 0.61.2 entry — dependency-edge re-selection, not a checksum-line rewrite, and `getrandom` has no `windows-sys` edge in this lock — with no manifest edits. `cargo deny check advisories` is clean of the rustls findings after the bump.
 - The upstream `outside_a_git_repository_fails` test no longer fails when TMPDIR lives inside a git repository (run b01c2b6a cycle 2, same batch): delegate runtimes set TMPDIR to scratch paths under trees that carry a `.git` ancestor (e.g. `.../.hermes/tmp/delegate`), and the test asserted its scratch dir was outside any repository — so the suite reported the environment, not the code (13/13 under `/tmp`, 12/13 under a hermes TMPDIR). The test now probes the conventional temp roots (`TMPDIR`, `/var/tmp`, `/tmp`) and picks the first with no `.git` at or above it, panicking with a named diagnosis only when every candidate is inside a repository; the assertion under test is unchanged.
