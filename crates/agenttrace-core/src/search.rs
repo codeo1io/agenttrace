@@ -4,19 +4,147 @@ use crate::{
     total_tokens, SearchResult, Session, VERSION,
 };
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::Read;
+
+/// rm-1415: per-file byte cap for the bounded transcript re-read arm of
+/// `--search`. Files larger than this are skipped and disclosed (counted in
+/// the scan summary) rather than read — a hostile corpus of giant journals
+/// cannot make one search unbounded.
+pub const TRANSCRIPT_SCAN_FILE_BYTE_CAP: u64 = 8 * 1024 * 1024;
+/// rm-1415: total read budget across a whole `--search` invocation. The
+/// canonical (newest-first) session order is scanned until the budget is
+/// exhausted; every file past the line is skipped and disclosed.
+pub const TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+/// rm-1415: transcript evidence items a single session may contribute; the
+/// row-level `matches` cap (8) is applied after metadata + transcript merge.
+const TRANSCRIPT_MATCHES_PER_SESSION: usize = 4;
+
+/// Corpus-level disclosure for the rm-1415 transcript re-read lane: every
+/// candidate session file is accounted for exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptScanSummary {
+    pub files_considered: usize,
+    pub scanned_files: usize,
+    pub scanned_bytes: u64,
+    pub skipped_missing: usize,
+    pub skipped_unreadable: usize,
+    pub skipped_oversized: usize,
+    pub skipped_non_file: usize,
+    pub skipped_budget: usize,
+    pub file_byte_cap: u64,
+    pub total_byte_budget: u64,
+}
+
+impl TranscriptScanSummary {
+    fn new(file_byte_cap: u64, total_byte_budget: u64) -> Self {
+        Self {
+            files_considered: 0,
+            scanned_files: 0,
+            scanned_bytes: 0,
+            skipped_missing: 0,
+            skipped_unreadable: 0,
+            skipped_oversized: 0,
+            skipped_non_file: 0,
+            skipped_budget: 0,
+            file_byte_cap,
+            total_byte_budget,
+        }
+    }
+
+    /// Human sentence for the text report tail; "none considered" renders
+    /// nothing (the blank-query guard returns before any file is touched).
+    fn describe(&self) -> Option<String> {
+        if self.files_considered == 0 {
+            return None;
+        }
+        let mut parts = vec![format!(
+            "{} file(s) scanned ({} bytes)",
+            self.scanned_files, self.scanned_bytes
+        )];
+        for (label, count) in [
+            ("missing", self.skipped_missing),
+            ("unreadable", self.skipped_unreadable),
+            ("over byte cap", self.skipped_oversized),
+            ("non-file", self.skipped_non_file),
+            ("read budget exhausted", self.skipped_budget),
+        ] {
+            if count > 0 {
+                parts.push(format!("{count} skipped: {label}"));
+            }
+        }
+        Some(format!(
+            "Transcript scan: {}; caps: {} bytes/file, {} bytes total.",
+            parts.join(", "),
+            self.file_byte_cap,
+            self.total_byte_budget
+        ))
+    }
+}
+
+/// rm-1415: `--search` outcome with the transcript-scan disclosure attached.
+#[derive(Debug, Clone)]
+pub struct SearchReport {
+    pub results: Vec<SearchResult>,
+    pub scan: TranscriptScanSummary,
+}
 
 pub fn search_sessions(sessions: &[Session], query: &str, limit: usize) -> Vec<SearchResult> {
+    search_sessions_detailed(
+        sessions,
+        query,
+        limit,
+        TRANSCRIPT_SCAN_FILE_BYTE_CAP,
+        TRANSCRIPT_SCAN_TOTAL_BYTE_BUDGET,
+    )
+    .results
+}
+
+/// rm-1415: full-text search across discovered session transcripts —
+/// metadata evidence first (unchanged field list and ordering), then a
+/// bounded re-read of each session file under explicit byte caps. Every
+/// candidate file is accounted for in the returned scan summary; a body-only
+/// query hit is the contract this restores (README.md / `--help` wording
+/// predates the metadata-only implementation gap).
+pub fn search_sessions_detailed(
+    sessions: &[Session],
+    query: &str,
+    limit: usize,
+    file_byte_cap: u64,
+    total_byte_budget: u64,
+) -> SearchReport {
     let query = query.trim().to_ascii_lowercase();
+    let mut scan = TranscriptScanSummary::new(file_byte_cap, total_byte_budget);
     if query.is_empty() {
-        return Vec::new();
+        // rm-988: a blank query matches NOTHING (never everything) — and
+        // never touches the filesystem.
+        return SearchReport {
+            results: Vec::new(),
+            scan,
+        };
     }
     let mut results = Vec::new();
+    let mut budget_left = total_byte_budget;
 
     for session in canonical_sessions(sessions) {
-        let matches = search_session_evidence(&session, &query);
+        let mut matches = search_session_evidence(&session, &query);
+        let (transcript_matches, transcript_scan) = transcript_evidence(
+            &session.path,
+            &query,
+            file_byte_cap,
+            &mut budget_left,
+            &mut scan,
+        );
+        let mut seen: BTreeSet<String> = matches.iter().cloned().collect();
+        for item in transcript_matches {
+            if seen.insert(item.clone()) {
+                matches.push(item);
+            }
+        }
         if matches.is_empty() {
             continue;
         }
+        matches.truncate(8);
         results.push(SearchResult {
             name: session.name.clone(),
             path: session.path.clone(),
@@ -27,13 +155,14 @@ pub fn search_sessions(sessions: &[Session], query: &str, limit: usize) -> Vec<S
             cost: round4(session.metrics.cost_estimated),
             tokens: total_tokens(&session),
             matches,
+            transcript_scan,
         });
         if results.len() >= limit {
             break;
         }
     }
 
-    results
+    SearchReport { results, scan }
 }
 
 pub fn report_search_json(results: &[SearchResult]) -> String {
@@ -56,6 +185,17 @@ pub fn report_search_json(results: &[SearchResult]) -> String {
 }
 
 fn write_search_results_json(out: &mut String, results: &[SearchResult]) {
+    write_search_results_json_inner(out, results, false)
+}
+
+/// `include_transcript_scan` gates the rm-1415 per-row disclosure so the
+/// stable [`report_search_json`] lane stays byte-identical to the pre-1415
+/// schema while the detailed lane carries the new key.
+fn write_search_results_json_inner(
+    out: &mut String,
+    results: &[SearchResult],
+    include_transcript_scan: bool,
+) {
     out.push_str("[\n");
     for (index, result) in results.iter().enumerate() {
         out.push_str("    {\n");
@@ -78,6 +218,16 @@ fn write_search_results_json(out: &mut String, results: &[SearchResult]) {
         out.push_str("      \"matches\": ");
         write_string_array_json(out, &result.matches, 3);
         out.push('\n');
+        if include_transcript_scan {
+            // `matches` was the final key pre-1415; the detailed lane appends
+            // one key after it, so the array needs its comma back.
+            out.pop();
+            out.push_str(",\n");
+            out.push_str(&format!(
+                "      \"transcript_scan\": {}\n",
+                json_string(&result.transcript_scan)
+            ));
+        }
         out.push_str("    }");
         if index + 1 < results.len() {
             out.push(',');
@@ -105,6 +255,68 @@ fn write_string_array_json(out: &mut String, values: &[String], base_indent: usi
     }
     out.push_str(&close_indent);
     out.push(']');
+}
+
+/// rm-1415: detailed JSON lane — per-row `transcript_scan` disclosure plus
+/// the corpus-level scan summary object (additive to the stable schema of
+/// [`report_search_json`], which is kept byte-stable for library consumers).
+pub fn report_search_json_detailed(report: &SearchReport) -> String {
+    let results = &report.results;
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!("  \"count\": {},\n", results.len()));
+    out.push_str("  \"results\": ");
+    if results.is_empty() {
+        out.push_str("[],\n");
+    } else {
+        write_search_results_json_inner(&mut out, results, true);
+        out.push_str(",\n");
+    }
+    out.push_str("  \"transcript_scan\": ");
+    write_transcript_summary_json(&mut out, &report.scan);
+    out.push_str(",\n");
+    out.push_str(&format!(
+        "  \"version\": {}\n",
+        serde_json::to_string(VERSION).expect("version serializes")
+    ));
+    out.push('}');
+    out
+}
+
+fn write_transcript_summary_json(out: &mut String, scan: &TranscriptScanSummary) {
+    out.push_str("{\n");
+    let fields = [
+        ("files_considered", scan.files_considered.to_string()),
+        ("scanned_files", scan.scanned_files.to_string()),
+        ("scanned_bytes", scan.scanned_bytes.to_string()),
+        ("skipped_missing", scan.skipped_missing.to_string()),
+        ("skipped_unreadable", scan.skipped_unreadable.to_string()),
+        ("skipped_oversized", scan.skipped_oversized.to_string()),
+        ("skipped_non_file", scan.skipped_non_file.to_string()),
+        ("skipped_budget", scan.skipped_budget.to_string()),
+        ("file_byte_cap", scan.file_byte_cap.to_string()),
+        ("total_byte_budget", scan.total_byte_budget.to_string()),
+    ];
+    for (index, (key, value)) in fields.iter().enumerate() {
+        out.push_str(&format!("    \"{key}\": {value}"));
+        if index + 1 < fields.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("  }");
+}
+
+/// rm-1415: detailed text lane — the stable text report plus a per-row
+/// `transcript:` disclosure line and the scan summary tail.
+pub fn report_search_text_detailed(report: &SearchReport, query: &str) -> String {
+    let mut out = report_search_text(&report.results, query);
+    if let Some(summary) = report.scan.describe() {
+        out.push('\n');
+        out.push_str(&summary);
+        out.push('\n');
+    }
+    out
 }
 
 pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
@@ -237,6 +449,107 @@ fn add_match(
     }
 }
 
+/// rm-1415: bounded transcript re-read for one session file. Returns the
+/// evidence snippets ("transcript: …" items, at most
+/// [`TRANSCRIPT_MATCHES_PER_SESSION`]) plus the per-row disclosure string;
+/// every outcome — including skips — is counted in `scan` so the corpus-level
+/// summary can disclose what the lane did NOT read. Unreadable, missing,
+/// oversized, non-file (`demo://`) and budget-exhausted files are disclosed,
+/// never fatal: the metadata lanes above keep working verbatim.
+#[allow(clippy::too_many_arguments)]
+fn transcript_evidence(
+    path: &str,
+    query: &str,
+    file_byte_cap: u64,
+    budget_left: &mut u64,
+    scan: &mut TranscriptScanSummary,
+) -> (Vec<String>, String) {
+    scan.files_considered += 1;
+    if path.is_empty() || path.contains("://") {
+        scan.skipped_non_file += 1;
+        return (Vec::new(), "skipped: non-file path".to_string());
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            scan.skipped_missing += 1;
+            return (Vec::new(), "skipped: file missing".to_string());
+        }
+    };
+    if !metadata.is_file() {
+        scan.skipped_non_file += 1;
+        return (Vec::new(), "skipped: non-file path".to_string());
+    }
+    let len = metadata.len();
+    if len > file_byte_cap {
+        scan.skipped_oversized += 1;
+        return (
+            Vec::new(),
+            format!("skipped: over byte cap ({len} > {file_byte_cap})"),
+        );
+    }
+    if len > *budget_left {
+        scan.skipped_budget += 1;
+        return (Vec::new(), "skipped: read budget exhausted".to_string());
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => {
+            scan.skipped_unreadable += 1;
+            return (Vec::new(), "skipped: unreadable".to_string());
+        }
+    };
+    let mut bytes = Vec::with_capacity(len as usize);
+    if file.take(file_byte_cap).read_to_end(&mut bytes).is_err() {
+        scan.skipped_unreadable += 1;
+        return (Vec::new(), "skipped: unreadable".to_string());
+    }
+    let read = bytes.len() as u64;
+    *budget_left -= read;
+    scan.scanned_files += 1;
+    scan.scanned_bytes += read;
+
+    // Lossy decode: a torn multibyte tail must not abort the scan.
+    let content = String::from_utf8_lossy(&bytes);
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if out.len() >= TRANSCRIPT_MATCHES_PER_SESSION {
+            break;
+        }
+        if let Some(snippet) = snippet_around(line, query, 96) {
+            out.push(format!("transcript: {snippet}"));
+        }
+    }
+    (out, format!("scanned ({read} bytes)"))
+}
+
+/// A `…window…` snippet centered on the first case-insensitive hit of
+/// `query` inside `line` (indices align: `to_ascii_lowercase` preserves byte
+/// length). `None` when the line does not contain the query. Window edges
+/// are walked to char boundaries so a multibyte hit cannot panic slicing.
+fn snippet_around(line: &str, query: &str, width: usize) -> Option<String> {
+    let haystack = line.to_ascii_lowercase();
+    let idx = haystack.find(query)?;
+    let qlen = query.len();
+    let mut start = idx.saturating_sub(width / 2);
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (idx + qlen + width / 2).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push('…');
+    }
+    snippet.push_str(&line[start..end]);
+    if end < line.len() {
+        snippet.push('…');
+    }
+    Some(snippet)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +603,7 @@ mod tests {
             cost: 0.0,
             tokens: 42,
             matches: vec!["tool argument: error".to_string()],
+            transcript_scan: "scanned (0 bytes)".to_string(),
         };
 
         let report = report_search_json(&[result]);
@@ -315,6 +629,7 @@ mod tests {
             cost: 0.0,
             tokens: 42,
             matches: vec!["tool argument: x\u{001b}]52;c;aGVsbG8=\u{0007}".to_string()],
+            transcript_scan: "scanned (0 bytes)".to_string(),
         };
         let text = report_search_text(&[result], "probe");
         assert!(
