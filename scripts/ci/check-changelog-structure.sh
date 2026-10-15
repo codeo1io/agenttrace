@@ -66,4 +66,30 @@ total="${counts##* }"
 [ "$visible" -eq "$total" ] ||
 	fail "a first-per-kind parse of Unreleased hides entries: $visible visible of $total — duplicate section headings"
 
-echo "check-changelog-structure: no duplicate section kinds; first-per-kind Unreleased parse sees all $total entries"
+# Pass 3 (rm-1875): byte-identical duplicate bullets. A keep-a-changelog
+# merge once duplicated a whole run of Unreleased `### Added` bullets
+# (the spotted twin pair was the rm-503 stdin entry at :168/:252; the
+# real extent was 39 byte-identical bullets, lines 197-298 replaying
+# 125-194, landing with the 2026-10-16 integration merge). A bullet
+# printed twice inside the same `##` release section is always a
+# defect: it either double-reports one change or hides that a second,
+# different change was overwritten by the copy. Fails the moment any
+# `##` section carries two byte-identical `^- ` bullets, wherever the
+# copy re-appears (same subsection or not).
+if ! dups="$(awk '
+	/^## / { section = $0; sub(/^## +/, "", section); next }
+	/^- / {
+		key = section "\t" $0
+		if (seen[key]) {
+			printf("  section [%s] repeats a byte-identical bullet: first at line %d, again at line %d\n", section, seen[key], NR)
+			bad = 1
+		} else {
+			seen[key] = NR
+		}
+	}
+	END { exit bad ? 1 : 0 }
+' "$changelog")"; then
+	fail "byte-identical duplicate bullets in CHANGELOG.md:"$'\n'"$dups"
+fi
+
+echo "check-changelog-structure: no duplicate section kinds; no byte-identical bullets; first-per-kind Unreleased parse sees all $total entries"

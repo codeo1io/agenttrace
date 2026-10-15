@@ -57,6 +57,32 @@ fn run_cli(cwd: &Path, args: &[&str]) -> Output {
     command.output().expect("run agenttrace CLI")
 }
 
+/// Hermetic twin of [`run_cli`] for probes whose verdict depends on
+/// git's *upward* repository discovery (rm-241). The fixtures live
+/// under `std::env::temp_dir()`, and on hosts where TMPDIR itself is
+/// inside an unrelated git repository (every conductor host keeps it
+/// inside the .hermes repository) the CLI's `git rev-parse
+/// --show-toplevel` walked straight past the fixture into that
+/// repository — `outside_a_git_repository_fails` then failed with the
+/// noremote diagnosis, and under cargo's fail-fast default silently
+/// dropped every later suite. Pinning `GIT_CEILING_DIRECTORIES` at
+/// the temp root (the fixture root's parent, canonicalized so
+/// symlinked TMPDIRs still match) stops discovery from ever leaving
+/// the temp tree, under any TMPDIR. A probe whose repository sits at
+/// the fixture root itself keeps working: discovery succeeds at the
+/// starting directory before any ceiling applies.
+fn run_cli_with_git_ceiling(cwd: &Path, args: &[&str]) -> Output {
+    let temp_root = std::env::temp_dir();
+    let ceiling = temp_root.canonicalize().unwrap_or(temp_root);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+    command.args(args).current_dir(cwd);
+    for (key, value) in GIT_ENV {
+        command.env(key, value);
+    }
+    command.env("GIT_CEILING_DIRECTORIES", &ceiling);
+    command.output().expect("run agenttrace CLI")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
@@ -233,7 +259,11 @@ fn missing_upstream_remote_fails_with_setup_hint() {
     std::fs::create_dir_all(&root).expect("create fixture dir");
     git(&root, &["init", "-q", "-b", "master"]);
 
-    let output = run_cli(&root, &["upstream"]);
+    // Ceiling for defense (rm-241): this probe's repository is the
+    // fixture root itself, so discovery succeeds at the starting
+    // directory regardless — but the pin keeps the probe hermetic if
+    // the fixture layout ever grows subdirectory probes.
+    let output = run_cli_with_git_ceiling(&root, &["upstream"]);
     assert!(
         !output.status.success(),
         "must fail without an upstream remote"
@@ -253,7 +283,12 @@ fn outside_a_git_repository_fails() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create plain dir");
 
-    let output = run_cli(&root, &["upstream"]);
+    // rm-241: pin the discovery ceiling at the temp root so the
+    // probe stays hermetic when TMPDIR lives inside an unrelated git
+    // repository — without the ceiling the CLI walks up out of the
+    // temp tree and this asserts the wrong error class (proven red
+    // on conductor hosts before the fix).
+    let output = run_cli_with_git_ceiling(&root, &["upstream"]);
     assert!(
         !output.status.success(),
         "must fail outside a git repository"
