@@ -460,7 +460,7 @@ fails when the README table drifts from the binary's actual flag count
 | `--budget` |  | Show the weekly budget window-burn view: per-day spend from the statusline journal against the resolved weekly budget; the window is the trailing 7 CALENDAR days ending today — stale journals disclose instead of verdicting (rm-385, rm-917) |
 | `--version` |  | Print the version banner and exit 0; wins over action validation |
 | `--demo` |  | Use the built-in demo corpus instead of discovered agent homes (stable epoch-anchored sessions) |
-| `--doctor` |  | Run environment self-checks (config paths, cache consistency, agent homes) and exit non-zero on failure |
+| `--doctor` |  | Run environment self-checks (config paths, cache consistency, agent homes, and a read-only census of the Codex `state*.sqlite` family — per-thread token totals, per-goal budget pressure, schema drift — skipped for `--dir` corpora and `--demo`) and exit non-zero on failure |
 | `--search <SEARCH>` |  | Full-text search across discovered session transcripts for this query (blank or whitespace-only queries are rejected with a usage error — an empty query matches nothing and is far more likely an unquoted accident than a search) |
 | `--search-limit <SEARCH_LIMIT>` | `20` | Cap the number of `--search` hits reported (default 20) |
 | `--fail-under-health <FAIL_UNDER_HEALTH>` | `0` | CI gate: exit non-zero when corpus health drops below this score (0 disables the gate) |

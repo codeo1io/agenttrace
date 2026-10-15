@@ -1,3 +1,4 @@
+mod codex_state;
 mod demo;
 mod diagnostics;
 mod discovery;
@@ -36,6 +37,10 @@ pub use filters::{
     NumericFilterOp,
 };
 
+pub use codex_state::{
+    codex_state_census, codex_state_census_at, codex_state_render, CodexStateCensus,
+    CodexStateDbReport,
+};
 pub use discovery::{
     collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
     load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,

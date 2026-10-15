@@ -107,6 +107,12 @@ pub struct DoctorReport {
     /// database reads cleanly.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sqlite_read_failures: Vec<crate::sqlite_sessions::SqliteUnreadableDb>,
+    /// rm-1504: read-only census of the Codex state-store family
+    /// (`~/.codex/state*.sqlite` and siblings). Empty — and invisible
+    /// to the text report — when the family is absent, the corpus is
+    /// a custom `--dir`, or `--doctor --demo` is running.
+    #[serde(skip_serializing_if = "crate::codex_state::CodexStateCensus::is_empty")]
+    pub codex_state: crate::codex_state::CodexStateCensus,
     pub recommendations: Vec<String>,
 }
 
@@ -179,6 +185,7 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    codex_state: crate::codex_state::CodexStateCensus,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -206,6 +213,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            codex_state: crate::codex_state::CodexStateCensus::default(),
         };
     }
     let cache = load_session_cache_report();
@@ -236,6 +244,15 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
     } else {
         (Vec::new(), SqliteIngestReport::default())
     };
+    // rm-1504: the state-store family is a real-home fact, not a
+    // corpus fact — `--dir` runs skip the census so their output
+    // stays byte-identical to the pre-census behavior (the demo arm
+    // returned above with an empty census for the same reason).
+    let codex_state = if dir.is_some() {
+        crate::codex_state::CodexStateCensus::default()
+    } else {
+        crate::codex_state::codex_state_census()
+    };
     DoctorDiscovery {
         cache,
         cache_size_bytes,
@@ -243,6 +260,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        codex_state,
     }
 }
 
@@ -254,6 +272,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        codex_state,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -332,6 +351,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
             snapshot_age_phrase(crate::pricing::bundled_snapshot_age_days().unwrap_or(-1))
         ) + &doctor_deprecation_suffix(),
         sqlite_read_failures: sqlite_ingest.unreadable,
+        codex_state,
         recommendations: Vec::new(),
     };
     report.recommendations = doctor_recommendations(&report, dir, demo);
@@ -1169,6 +1189,10 @@ fn doctor_report_text(report: &DoctorReport) -> String {
             failure.reason
         ));
     }
+    // rm-1504: read-only codex state-store family census — additive
+    // disclosure, rendered only when the family exists (an absent
+    // family leaves this report byte-identical).
+    out.push_str(&crate::codex_state::codex_state_render(&report.codex_state));
     out.push_str(&format!(
         "Project attribution: {} resolved, {} ambiguous, {} unresolved encoded project dirs\n",
         report.project_decode.resolved,

@@ -4,6 +4,22 @@
 
 ### Added
 
+- `--doctor` now censuses the Codex state-store family read-only (rm-1504): every
+  `*.sqlite` directly under `$CODEX_HOME` (default `~/.codex`) — `state_N`
+  (threads), `goals_N` (thread goals), `thread_history_N`, `memories_N`,
+  `queue_N`, `logs_N`, plus anything unrecognized — is opened `READ_ONLY`, table-
+  censused against the observed schema with drift disclosed both ways (missing
+  core tables stop that class's projection; extra tables are newer upstream
+  migration state), and projected into additive doctor facts: per-thread
+  `tokens_used` totals with source counts and sanitized, hard-truncated sample
+  titles, and per-goal budget-vs-used with an over-budget count. Unreadable
+  databases are named with their error (`found` + `unreadable`), an absent
+  family renders nothing (`--dir` corpora and `--demo` are byte-identical to
+  before), and no database is ever written — main-file bytes stay untouched
+  (md5-pinned) and a writer's non-empty `-wal` is never checkpointed;
+  rollback-mode members get no sidecars, while reading a WAL-mode member
+  coordinates through SQLite's WAL-index and may leave an `-shm`/empty
+  `-wal` read-coordination file beside it.
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
