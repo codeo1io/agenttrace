@@ -523,10 +523,20 @@ JSON it carries the same verdicts the text banner does, as data (schema
 `agenttrace.waste.v1`): `waste_score` (0–100), `waste_level`,
 `total_wasted_cost`, `loop_waste_percent`, `loop_cost_basis`,
 `session_cost`, `cache`
-(`rating`, `hit_rate_percent`, `cache_read_tokens`,
-`total_input_tokens`, `wasted_cost`, `suggestion`), `tool_bloat`
+(`rating`, `hit_rate_percent`, `hit_rate_exclusive_percent`,
+`cache_read_tokens`, `total_input_tokens`, `wasted_cost`, `suggestion`),
+`tool_bloat`
 (`tools_per_turn`, `bloat_score`, `bloat_level`, `top_bloat[]`),
 `stuck_patterns[]`, `summary`, and `top_actions[]`.
+
+The cache block's two hit rates carry different bases (rm-339):
+`hit_rate_percent` is the cache-INCLUSIVE share of the billed context
+served from cache — reads / (reads + fresh input), bounded at 100% by
+construction — and it is the graded rate behind `rating`.
+`hit_rate_exclusive_percent` is the raw cache-EXCLUSIVE ratio
+reads / fresh input, disclosed for diagnosis: the parser's
+`tokens_input` is a fresh-only (delta) basis, so this ratio exceeds
+100% on every healthy cache-heavy session and is not an anomaly.
 
 Per-tool `allocated_cost` figures share the text report's caveat: they
 are a share of the session-level estimate, not measured per-tool spend.

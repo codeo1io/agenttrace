@@ -9,7 +9,15 @@ use crate::{
 pub struct CacheEfficiency {
     cache_read_tokens: i64,
     total_input_tokens: i64,
+    /// The GRADED hit rate on the cache-INCLUSIVE basis:
+    /// reads / (reads + fresh input), bounded at 100% by construction
+    /// (rm-339 basis re-work, run f2fccaa9 cycle 3).
     hit_rate: f64,
+    /// The raw cache-EXCLUSIVE ratio reads / fresh input, kept
+    /// visible for diagnosis — it exceeds 100% on every healthy
+    /// cache-heavy session because `tokens_input` is the parser's
+    /// delta (fresh-only) basis (parser.rs subtract_cached_input).
+    hit_rate_exclusive: f64,
     wasted_cost: f64,
     rating: &'static str,
     suggestion: &'static str,
@@ -100,11 +108,10 @@ pub fn compute_waste_report(session: &Session) -> WasteReport {
         "none" => 20.0,
         "poor" => 15.0,
         "good" => 5.0,
-        // rm-339 (run e88f2da2 cycle 3): an above-100% hit rate is a
-        // metering anomaly, not measured efficiency — it neither
-        // grades as waste (the reads may be real) nor as excellence;
-        // the rating discloses it instead.
-        "anomalous" => 0.0,
+        // "excellent" (and anything else) contributes no cache waste
+        // — the rm-339 "anomalous" rung is retired (run f2fccaa9 cycle
+        // 3: it fired only on the mis-read cache-exclusive basis), so
+        // the ladder above can no longer mint it.
         _ => 0.0,
     };
     score += bloat.bloat_score as f64 * 0.25;
@@ -252,6 +259,11 @@ pub fn waste_report_json(report: &WasteReport) -> String {
         "cache": {
             "rating": report.cache.rating,
             "hit_rate_percent": (report.cache.hit_rate * 10.0).round() / 10.0,
+            // rm-339 (run f2fccaa9 cycle 3): the raw cache-exclusive
+            // ratio, disclosed verbatim — `tokens_input` is the
+            // parser's fresh-only basis, so this exceeds 100% on every
+            // healthy cache-heavy session and is not an anomaly.
+            "hit_rate_exclusive_percent": (report.cache.hit_rate_exclusive * 10.0).round() / 10.0,
             "cache_read_tokens": report.cache.cache_read_tokens,
             "total_input_tokens": report.cache.total_input_tokens,
             "wasted_cost": round4(report.cache.wasted_cost),
@@ -292,8 +304,29 @@ pub fn waste_report_json(report: &WasteReport) -> String {
 }
 
 fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
-    let hit_rate = if metrics.tokens_input > 0 {
-        metrics.tokens_cache_r as f64 / metrics.tokens_input as f64 * 100.0
+    // rm-339 basis re-work (run f2fccaa9 cycle 3, prioritize
+    // ca5a4697, assess 53af6c9e F11): `tokens_input` is the parser's
+    // cache-EXCLUSIVE basis — fresh tokens only, cached reads already
+    // subtracted (parser.rs subtract_cached_input) — so reads/fresh
+    // routinely exceeds 100% on the fleet's most cache-efficient
+    // sessions (the old arm graded those "anomalous", a false
+    // positive). Grading now runs on the cache-INCLUSIVE basis — the
+    // share of the billed context served from cache,
+    // reads / (reads + fresh input), bounded at 100% by construction —
+    // while the raw exclusive ratio stays disclosed verbatim below
+    // and in the json (`hit_rate_exclusive_percent`).
+    let cache_read = metrics.tokens_cache_r.max(0);
+    let fresh_input = metrics.tokens_input.max(0);
+    let inclusive_total = cache_read + fresh_input;
+    let hit_rate = if inclusive_total > 0 {
+        cache_read as f64 / inclusive_total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let hit_rate_exclusive = if fresh_input > 0 {
+        cache_read as f64 / fresh_input as f64 * 100.0
+    } else if cache_read > 0 {
+        f64::INFINITY
     } else {
         0.0
     };
@@ -305,17 +338,7 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
     // ran on (a flex session's wasted input costs the flex input rate).
     let price = pricing::lookup_price_tiered(&metrics.model_used, metrics.service_tier.as_deref());
     let wasted_cost = round4(wasted_tokens as f64 / 1e6 * price.input);
-    let (rating, suggestion) = if hit_rate > 100.0 {
-        // rm-339 (run e88f2da2 cycle 3): cache reads exceeding total
-        // input (hostile corpora reached 50000%) is a metering
-        // anomaly, not efficiency. Rate it "anomalous" so text and
-        // json disclose it instead of grading it "excellent"; the
-        // raw hit_rate stays visible for diagnosis.
-        (
-            "anomalous",
-            "cache hit rate above 100% - reads exceed total input; token metering anomaly, verify usage reporting",
-        )
-    } else if hit_rate >= 80.0 {
+    let (rating, suggestion) = if hit_rate >= 80.0 {
         (
             "excellent",
             "cache utilization excellent - keep current prompt structure",
@@ -340,6 +363,7 @@ fn analyze_cache_efficiency(metrics: &Metrics) -> CacheEfficiency {
         cache_read_tokens: metrics.tokens_cache_r,
         total_input_tokens: metrics.tokens_input,
         hit_rate,
+        hit_rate_exclusive,
         wasted_cost,
         rating,
         suggestion,
@@ -443,7 +467,7 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
     out.push('\n');
     out.push_str(t(language, "  -- Cache --\n", "  -- 缓存 --\n"));
     out.push_str(&format!(
-        "  {} ({} {:.0}%, {} {} / {} {})\n",
+        "  {} ({} {:.0}%, {} {} / {} {} fresh)\n",
         cache_rating_label(report.cache.rating, language),
         t(language, "hit", "命中"),
         report.cache.hit_rate,
@@ -452,6 +476,28 @@ fn waste_report_text(report: &WasteReport, language: ReportLanguage) -> String {
         format_tokens(report.cache.total_input_tokens),
         t(language, "input", "输入")
     ));
+    // rm-339 basis re-work (run f2fccaa9 cycle 3): disclose when reads
+    // exceed the fresh-input basis — the normal cache-heavy shape on
+    // the parser's delta basis, graded here on the inclusive basis.
+    if report.cache.hit_rate_exclusive > 100.0 {
+        let ratio = if report.cache.hit_rate_exclusive.is_finite() {
+            format!("{:.0}%", report.cache.hit_rate_exclusive)
+        } else {
+            "n/a".to_string()
+        };
+        out.push_str(&format!(
+            "  {} {} {} - {} {}\n",
+            t(language, "reads exceed fresh input", "读取超过新鲜输入"),
+            ratio,
+            t(language, "of fresh input", "新鲜输入"),
+            t(language, "cache-exclusive metering", "缓存独占计量"),
+            t(
+                language,
+                "graded on the cache-inclusive basis",
+                "按缓存包含基准评级"
+            )
+        ));
+    }
     if report.cache.wasted_cost > 0.0 {
         out.push_str(&format!(
             "  {}: {}\n",
@@ -588,7 +634,6 @@ fn waste_summary(report: &WasteReport, language: ReportLanguage) -> String {
 fn cache_suggestion(rating: &str, language: ReportLanguage) -> &'static str {
     if language == ReportLanguage::En {
         return match rating {
-            "anomalous" => "cache hit rate above 100% - reads exceed total input; token metering anomaly, verify usage reporting",
             "excellent" => "cache utilization excellent - keep current prompt structure",
             "good" => "moderate cache hit - place static system instructions at prompt prefix",
             "poor" => "low cache hit rate - enable prompt caching with static prefix content",
@@ -596,7 +641,6 @@ fn cache_suggestion(rating: &str, language: ReportLanguage) -> &'static str {
         };
     }
     match rating {
-        "anomalous" => "缓存命中率超过100% - 读取超过总输入，token计量异常，请核查用量上报",
         "excellent" => "缓存利用率优秀，保持当前提示词结构",
         "good" => "缓存命中率中等，将静态系统指令放在提示词前缀",
         "poor" => "缓存命中率较低，使用静态前缀启用提示词缓存",
@@ -664,7 +708,6 @@ fn action_text(action: &str, language: ReportLanguage) -> String {
 
 fn cache_rating_label(rating: &str, language: ReportLanguage) -> &'static str {
     match rating {
-        "anomalous" => t(language, "anomalous", "异常"),
         "excellent" => t(language, "excellent", "优秀"),
         "good" => t(language, "good", "良好"),
         "poor" => t(language, "poor", "较差"),
@@ -714,12 +757,18 @@ mod tests {
 
     #[test]
     fn cache_hit_rate_above_100_is_disclosed_not_excellent() {
-        // rm-339 corroborated arm (run e88f2da2 cycle 3) red-first:
-        // hostile corpora can report cache reads far above total
-        // input (cachehostile.jsonl: 5.0K read / 10 input = 50000%).
-        // Grading that "excellent" endorses a token-metering
-        // anomaly as efficiency; the rating must disclose it instead
-        // while keeping the raw value visible.
+        // rm-339 basis re-work (run f2fccaa9 cycle 3, prioritize
+        // ca5a4697, assess 53af6c9e F11): `tokens_input` is the
+        // parser's cache-EXCLUSIVE (delta) basis — fresh tokens only
+        // (parser.rs subtract_cached_input) — so "reads exceed input"
+        // is the NORMAL shape of a cache-heavy session (5.0K read /
+        // 10 fresh input), not a token-metering anomaly. The earlier
+        // arm graded every such session "anomalous" — a false
+        // positive on the fleet's most cache-efficient sessions.
+        // Grading now runs on the cache-INCLUSIVE basis (reads /
+        // (reads + fresh input), bounded at 100% by construction)
+        // while the exclusive ratio stays visible and disclosed
+        // verbatim.
         let session = Session {
             name: "anom".to_string(),
             path: "/tmp/anom.jsonl".to_string(),
@@ -736,21 +785,80 @@ mod tests {
             diagnostics: crate::Diagnostics::default(),
         };
         let report = compute_waste_report(&session);
-        assert_eq!(
+        assert_ne!(
             report.cache.rating, "anomalous",
-            "an above-100% hit rate is a disclosure, not a grade"
+            "an exclusive-basis ratio above 100% is the normal cache-heavy shape, not an anomaly"
         );
-        assert!(report.cache.hit_rate > 100.0, "raw value stays visible");
+        assert_eq!(
+            report.cache.rating, "excellent",
+            "the inclusive basis grades 5000/(5000+10) = 99.8% cache-served as excellent"
+        );
         assert!(
-            report.cache.suggestion.contains("100%"),
-            "the suggestion names the anomaly: {}",
-            report.cache.suggestion
+            report.cache.hit_rate <= 100.0,
+            "the graded rate is bounded by construction: {}",
+            report.cache.hit_rate
         );
         let json = waste_report_json(&report);
-        assert!(
-            json.contains("anomalous"),
-            "the json rating carries the disclosure too: {json}"
+        let parsed: serde_json::Value =
+            serde_json::from_str(json.trim()).expect("waste json parses");
+        assert_eq!(
+            parsed["cache"]["hit_rate_percent"], 99.8,
+            "json hit_rate_percent carries the inclusive rate"
         );
+        assert_eq!(
+            parsed["cache"]["hit_rate_exclusive_percent"], 50000.0,
+            "the unclamped exclusive ratio stays visible and disclosed (no data loss)"
+        );
+        let text = render_waste_report(&session);
+        assert!(
+            text.contains("reads exceed fresh input"),
+            "the text lane names the exclusive-over-100% shape: {text}"
+        );
+    }
+
+    #[test]
+    fn cache_heavy_session_grades_on_the_cache_inclusive_basis() {
+        // rm-339 partial arm: the honest denominator. On the delta
+        // basis the graded fraction is reads / (reads + fresh input)
+        // — the share of the billed context served from cache. A
+        // mid-cache session (1000 fresh + 1000 read) is "good" (50%),
+        // not "excellent" (100%) as the exclusive ratio claimed.
+        let graded = |input: i64, read: i64, writes: i64| {
+            let session = Session {
+                name: "graded".to_string(),
+                path: "/tmp/graded.jsonl".to_string(),
+                cwd: String::new(),
+                branch: String::new(),
+                metrics: Metrics {
+                    tokens_input: input,
+                    tokens_cache_r: read,
+                    tokens_cache_w: writes,
+                    ..Metrics::default()
+                },
+                anomalies: Vec::new(),
+                health: 100,
+                tool_warnings: Vec::new(),
+                diagnostics: crate::Diagnostics::default(),
+            };
+            compute_waste_report(&session).cache
+        };
+
+        let heavy = graded(1_000, 9_000, 0);
+        assert_eq!(heavy.rating, "excellent", "9000/(9000+1000) = 90%");
+        assert!((heavy.hit_rate - 90.0).abs() < 1e-9);
+        assert_eq!(heavy.hit_rate_exclusive, 900.0);
+
+        let mid = graded(1_000, 1_000, 0);
+        assert_eq!(mid.rating, "good", "1000/(1000+1000) = 50%");
+        assert!((mid.hit_rate - 50.0).abs() < 1e-9);
+
+        // "poor" still requires evidence the session actually attempted
+        // cache writes (the pre-existing ladder, unchanged).
+        let light = graded(500, 100, 1);
+        assert_eq!(light.rating, "poor", "100/(100+500) = 16.7%");
+
+        let none = graded(10, 0, 0);
+        assert_eq!(none.rating, "none", "no cache reads, no rate");
     }
 
     #[test]

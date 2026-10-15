@@ -2491,6 +2491,17 @@ fn render_test_match_json() -> anyhow::Result<String> {
         "anthropic/claude-sonnet-4-6",
         "vertex_ai/claude-opus-4-5@20251101",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        // rm-1053 (run f2fccaa9 cycle 3): the regional-twin probe
+        // family, mirrored from render_test_match — the two lanes
+        // keep one probe list (the ultrafast rider hit exactly this
+        // drift: the text lane gained the row and this one was left
+        // behind, merged at conflict case bc360d0d).
+        "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "bedrock/us-gov-east-1/anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "azure/us-gov/gpt-5.1",
         "openai/gpt-4.1",
         "gpt-5.6",
         "gpt-4.1-mini-2025-04-14",

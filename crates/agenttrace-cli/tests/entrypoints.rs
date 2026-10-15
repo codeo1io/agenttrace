@@ -2938,6 +2938,75 @@ fn doctor_json_artifact_carries_config_disclosure() {
 }
 
 #[test]
+fn cli_quota_view_clamps_a_future_skewed_corpus() {
+    // rm-1402 (run f2fccaa9 cycle 3, assess 53af6c9e F3 PoC,
+    // end-to-end): one hostile future-dated journal line used to
+    // anchor the corpus cutoff in the future, pushing every real
+    // event outside the trailing 5h/7d windows — the PoC corpus
+    // billed $0.0045 against an honest $1.52. The cutoff must clamp
+    // at the newest plausible instant, the guard firing must ride
+    // the json, and the real events must still bill.
+    let sandbox = std::env::temp_dir().join("at-quota-future-clamp-cli");
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).expect("sandbox dir");
+    let journal = sandbox.join("future-skew.jsonl");
+    let body = concat!(
+        "{\"role\":\"assistant\",\"content\":\"real work\",\"timestamp\":\"2026-10-12T10:00:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}\n",
+        "{\"role\":\"assistant\",\"content\":\"more work\",\"timestamp\":\"2026-10-12T10:30:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}\n",
+        "{\"role\":\"assistant\",\"content\":\"hostile future line\",\"timestamp\":\"2099-06-01T00:00:00Z\",\"ModelUsed\":\"gpt-5\",\"SourceTool\":\"generic\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}\n",
+    );
+    std::fs::write(&journal, body).expect("fixture write");
+
+    let json = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args([
+            "--quota",
+            "-f",
+            "json",
+            journal.to_str().expect("fixture path is UTF-8"),
+        ])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(json.status.success(), "quota json lane failed: {:?}", json);
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&json.stdout).trim_end())
+            .expect("quota json lane is one pure JSON document");
+    let cutoff = report["corpus"]["cutoff_utc"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        cutoff.starts_with("2026-10-12"),
+        "the cutoff clamps at the newest plausible instant, got {cutoff:?}"
+    );
+    assert_eq!(
+        report["corpus"]["future_discarded_sessions"], 1,
+        "the clock-skew guard firing is disclosed"
+    );
+    let weekly = report["weekly"]["spend_usd"].as_f64().unwrap_or(0.0);
+    assert!(
+        weekly > 0.0,
+        "the real events must still bill through the clamped window, got {weekly}"
+    );
+
+    let text = Command::new(env!("CARGO_BIN_EXE_agenttrace"))
+        .args(["--quota", journal.to_str().expect("fixture path is UTF-8")])
+        .output()
+        .expect("run agenttrace CLI");
+    assert!(text.status.success(), "quota text lane failed: {:?}", text);
+    let text_stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        !text_stdout.contains("2099"),
+        "no future anchor leaks into the text lane"
+    );
+    assert!(
+        text_stdout.contains("2026-10-12"),
+        "the text lane renders the clamped cutoff: {text_stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
 fn cli_quota_view_reports_plan_windows_and_guards_its_lane() {
     // rm-201 (run 12a73275 cycle 4): --quota emits the stable
     // agenttrace.quota/1 schema with TTL-correct rolling windows and
