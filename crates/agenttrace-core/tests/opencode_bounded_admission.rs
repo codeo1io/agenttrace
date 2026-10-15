@@ -201,3 +201,102 @@ fn over_cap_part_transcript_is_disclosed_and_lanes_accumulate() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// rm-732 (parser-side admission): the transcript lane must validate
+/// file KIND before ANY read. A planted FIFO under `message/<sid>/`
+/// stat-reports len 0 — it passes the rm-1437 size cap and then wedges
+/// the whole scan on the blocking open (assess PoC: `timeout 25
+/// agenttrace -d … --overview` rc=124, no message, every later
+/// invocation frozen until the fifo is removed). It must instead be
+/// skipped, disclosed through the line-skips loss channel, and the
+/// surviving regular transcripts must parse exactly as if the fifo
+/// never existed. If admission ever regresses to opening the fifo,
+/// this test hangs (and CI's job timeout fails it) — it cannot
+/// silently pass.
+#[test]
+#[cfg(unix)]
+fn planted_fifo_is_skipped_disclosed_and_never_blocks() {
+    let root = std::env::temp_dir().join(format!("at_rm732_fifo_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_storage(&root, false, false);
+    let fifo = root.join("opencode/storage/message/sess_1/planted.json");
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo available on unix");
+    assert!(mkfifo.success(), "the fixture plants a non-regular entry");
+
+    // Under the killed defect this open blocked forever with no timeout
+    // of its own; today the entry is refused at the dirent and the
+    // parse completes.
+    let session = parse_file(&session_file)
+        .expect("a planted fifo must never wedge or fail the session parse");
+
+    assert_eq!(
+        session
+            .metrics
+            .line_skips
+            .get("opencode_transcript_non_files_skipped"),
+        Some(&1),
+        "the skipped non-regular entry must be disclosed: {:?}",
+        session.metrics.line_skips
+    );
+    assert!(
+        session.metrics.events_total > 0,
+        "the surviving regular transcripts still parse"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// rm-732: a symlinked `*.json` entry is refused as non-regular AT THE
+/// DIRENT — never followed, never opened. `std::fs::metadata` FOLLOWS
+/// links, so the pre-fix size cap trusted the TARGET's stat: a symlink
+/// planted at an endless source (`/dev/zero`, the assess hazard) stats
+/// as len 0 and the unbounded read never ends. Refusing every
+/// non-regular dirent kills that class structurally. The target here
+/// is an innocent regular file so the pin is the KIND gate itself, and
+/// the session must come out exactly as if the link never existed.
+#[test]
+#[cfg(unix)]
+fn symlinked_transcript_entry_is_refused_as_non_file() {
+    let root = std::env::temp_dir().join(format!("at_rm732_symlink_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_storage(&root, false, false);
+    let target = root.join("innocent-target.json");
+    fs::write(
+        &target,
+        r#"{"id": "m3", "sessionID": "sess_1", "role": "user", "time": {"created": 1764750003000}}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        &target,
+        root.join("opencode/storage/message/sess_1/m3.json"),
+    )
+    .unwrap();
+
+    let linked = parse_file(&session_file).expect("symlink entry refused, session still parses");
+
+    assert_eq!(
+        linked
+            .metrics
+            .line_skips
+            .get("opencode_transcript_non_files_skipped"),
+        Some(&1),
+        "the refused symlink must be disclosed: {:?}",
+        linked.metrics.line_skips
+    );
+    // Equivalence with the link never existing at all: same fingerprint,
+    // and none of the linked record's content leaked in.
+    let baseline_root =
+        std::env::temp_dir().join(format!("at_rm732_symlink_base_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&baseline_root);
+    let baseline_file = write_storage(&baseline_root, false, false);
+    let baseline = parse_file(&baseline_file).unwrap();
+    assert_eq!(
+        fingerprint(&linked),
+        fingerprint(&baseline),
+        "a refused non-file entry must leave the session exactly as if it never existed"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&baseline_root);
+}
