@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 64 and the SQLite snapshot is schema 12; the
+The session cache is schema 65 and the SQLite snapshot is schema 12; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -418,6 +418,11 @@ tree's landed 62 and 63 rungs — so this integration, conflict case
 8fbcfcfd5e4d440b8e2890456aaacede, re-bases it onto the advanced
 ceiling as 63 → 64, one invalidation either way)
 — so cached sessions regenerate under the corrected totals;
+and to 65 when cached rows gained the Claude org-dimension identity
+fields (org/org_email from `$.session.identity`, run 4f2af62e cycle 1
+"Claude org-dimension truth" — serde defaults keep older snapshots
+decodable as org-absent while the rung bump regenerates them anyway,
+so a warm row can never hide the org dimension a re-parse would find);
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8
 when snapshots began carrying their opencode fork-exclusion count so v7

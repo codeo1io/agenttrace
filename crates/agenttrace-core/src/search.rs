@@ -266,6 +266,8 @@ mod tests {
                 .insert(format!("internal/billing/file-{idx}.go"), 1);
         }
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "billing".to_string(),
             path: "/tmp/billing.jsonl".to_string(),
             cwd: String::new(),
@@ -343,6 +345,8 @@ mod tests {
     #[test]
     fn blank_and_whitespace_queries_match_nothing() {
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "01-healthy-ship".to_string(),
             path: "demo://01-healthy-ship.jsonl".to_string(),
             cwd: String::new(),

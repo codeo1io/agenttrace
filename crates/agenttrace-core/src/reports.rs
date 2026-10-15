@@ -523,6 +523,11 @@ pub fn report_overview_json_with_health(
     // by_provider; missing / detached-HEAD / no-branch lanes roll up
     // under the explicit "unknown" bucket (compute_overview_iter).
     let branches = group_items(&overview.by_branch, false);
+    // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+    // zero-noise org facet — items exist only for sessions carrying
+    // $.session.identity.orgIdentifier; the key is omitted from the
+    // JSON payload entirely when empty (no "unknown" bucket).
+    let orgs = group_items(&overview.by_org, false);
     let task_types = task_type_items(&overview.by_task_type, overview.total_cost);
     let top_cost_drivers = top_cost_driver_rows(&ordered, 3)
         .into_iter()
@@ -589,6 +594,17 @@ pub fn report_overview_json_with_health(
     if let Value::Object(obj) = &mut payload {
         let summary = obj.remove("summary").unwrap_or(Value::Null);
         obj.insert("summary".to_string(), strip_nulls(summary));
+    }
+    // rm-1405 reap: by_org rides the payload only when org data
+    // exists — same zero-noise contract as the facet itself (a
+    // pre-org consumer never sees the key).
+    if !orgs.is_empty() {
+        if let Value::Object(obj) = &mut payload {
+            obj.insert(
+                "by_org".to_string(),
+                serde_json::to_value(&orgs).unwrap_or(Value::Null),
+            );
+        }
     }
     serde_json::to_string_pretty(&payload).expect("overview report serializes")
 }
@@ -1622,6 +1638,14 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     out.push_str("  ── By Branch ──\n");
     push_text_group_family(&mut out, &overview.by_branch, 40, |name| name.clone());
 
+    // rm-1405 reap (run 4f2af62e5b7e): By Org renders only when org
+    // data exists (zero-noise facet — no "unknown" bucket).
+    let org_groups = group_items(&overview.by_org, false);
+    if !org_groups.is_empty() {
+        out.push_str("  ── By Org ──\n");
+        push_text_group_family(&mut out, &overview.by_org, 40, |name| name.clone());
+    }
+
     out.push_str("  ── By Task Type ──\n");
     for (task_type, group) in sorted_task_type_groups(&overview.by_task_type) {
         out.push_str(&format!(
@@ -1819,6 +1843,32 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
             "*… +{} more not shown*\n",
             overview.by_branch.len() - GROUP_TAKE
         ));
+    }
+
+    // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+    // the org section renders only when org data exists — no
+    // "unknown" bucket, so org-less corpora keep a byte-identical
+    // markdown shape.
+    if !overview.by_org.is_empty() {
+        out.push_str("\n## By org\n\n");
+        out.push_str("| Org | Sessions | Cost |\n|---|---:|---:|\n");
+        for (org, group) in sorted_group_overview(&overview.by_org)
+            .into_iter()
+            .take(GROUP_TAKE)
+        {
+            out.push_str(&format!(
+                "| {} | {} | {} |\n",
+                markdown_cell(org),
+                format_count(group.sessions),
+                format_cost(group.cost)
+            ));
+        }
+        if overview.by_org.len() > GROUP_TAKE {
+            out.push_str(&format!(
+                "*… +{} more not shown*\n",
+                overview.by_org.len() - GROUP_TAKE
+            ));
+        }
     }
 
     out.push_str("\n## By task type\n\n");
@@ -3929,6 +3979,8 @@ mod tests {
         // panicked and release builds printed `total_tokens = -2` — the
         // original F1 symptom.
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "adversarial".to_string(),
             path: "/tmp/adversarial.jsonl".to_string(),
             cwd: String::new(),
@@ -3966,6 +4018,8 @@ mod tests {
             .tool_usage
             .insert("evil\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(), 3);
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "osc\u{001b}]52;c;aGVsbG8=\u{0007}".to_string(),
             path: "/tmp/osc.jsonl".to_string(),
             cwd: String::new(),
@@ -3992,6 +4046,8 @@ mod tests {
     #[test]
     fn compare_json_formats_zero_cost_like_go() {
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "session".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
@@ -4021,6 +4077,8 @@ mod tests {
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 assistant_turns: 2,
                 tool_calls_total: 4,
@@ -4041,6 +4099,8 @@ mod tests {
     #[test]
     fn text_and_compare_reports_support_chinese() {
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "会话".to_string(),
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),

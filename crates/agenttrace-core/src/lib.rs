@@ -160,6 +160,31 @@ pub struct Event {
         deserialize_with = "deserialize_string"
     )]
     pub branch: String,
+    /// rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+    /// org identity captured from the claude-code lane's
+    /// `$.session.identity` envelope block (`orgIdentifier` /
+    /// `loginEmail`, claude-code 2.1.29x+) onto the session's meta
+    /// event beside `branch`. Empty when the journal carries no
+    /// identity; the `by_org` rollup leaves such sessions out
+    /// entirely (no "unknown" bucket — zero-noise facet) instead of
+    /// inventing an org.
+    #[serde(
+        default,
+        rename = "org",
+        alias = "Org",
+        deserialize_with = "deserialize_string"
+    )]
+    pub org: String,
+    /// Login email riding the same identity block. Provenance only —
+    /// bucketing uses `org` — and empty when the journal carries no
+    /// identity.
+    #[serde(
+        default,
+        rename = "org_email",
+        alias = "OrgEmail",
+        deserialize_with = "deserialize_string"
+    )]
+    pub org_email: String,
     #[serde(
         default,
         rename = "tool_calls",
@@ -763,6 +788,18 @@ pub struct Session {
     /// values under "unknown" instead of inventing a value.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub branch: String,
+    /// rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+    /// org identifier (`$.session.identity.orgIdentifier`) when the
+    /// claude-code journal carries it; empty otherwise. The `by_org`
+    /// rollup only buckets sessions with a non-empty org — no
+    /// "unknown" bucket — so corpora without org data render
+    /// identically to before (zero-noise facet).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub org: String,
+    /// Login email riding the same identity block; provenance only
+    /// (bucketing uses `org`), serialized only when present.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub org_email: String,
     pub metrics: Metrics,
     pub anomalies: Vec<Anomaly>,
     pub health: i32,
@@ -795,6 +832,15 @@ pub struct Overview {
     /// branch concept yet (codex/qwen/copilot — gap disclosed in the
     /// governance guide). Sessions and cost only, like by_provider.
     pub by_branch: BTreeMap<String, GroupOverview>,
+    /// rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+    /// org-attributed rollup from the claude-code
+    /// `$.session.identity.orgIdentifier` dimension. Zero-noise by
+    /// contract: only sessions that carry a non-empty org are
+    /// bucketed — there is no "unknown" bucket, so corpora without
+    /// org data leave the map empty and render identically to before
+    /// (no facet key in report JSON, no section on text surfaces).
+    /// Sessions and cost only, like by_branch.
+    pub by_org: BTreeMap<String, GroupOverview>,
     /// rm-245: heuristic task-type attribution. Correlation over parsed
     /// aggregates, not ground truth; see `infer_task_type`.
     pub by_task_type: BTreeMap<String, TaskTypeOverview>,
@@ -1206,6 +1252,10 @@ pub fn session_from_events(
     let mut model = "default".to_string();
     let mut cwd = String::new();
     let mut branch = String::new();
+    // rm-1405 reap (run 4f2af62e5b7e): org identity locals, captured
+    // from the claude-code lane's meta-event carrier below.
+    let mut org = String::new();
+    let mut org_email = String::new();
     // rm-861: the session model label is only writable by rows that
     // speak for the session's model — assistant turns,
     // session/meta identity rows, and usage-bearing rows (a row that
@@ -1237,6 +1287,15 @@ pub fn session_from_events(
         // cwd (claude-code writes both envelope fields on every line).
         if branch.is_empty() && !event.branch.is_empty() {
             branch = event.branch.clone();
+        }
+        // rm-1405 reap (run 4f2af62e5b7e): org identity rides the same
+        // meta event — first non-empty capture wins; the parser only
+        // sets the fields on one carrier per session.
+        if org.is_empty() && !event.org.is_empty() {
+            org = event.org.clone();
+        }
+        if org_email.is_empty() && !event.org_email.is_empty() {
+            org_email = event.org_email.clone();
         }
         if model != "default" && !cwd.is_empty() {
             break;
@@ -1311,6 +1370,8 @@ pub fn session_from_events(
         path: path.to_string(),
         cwd,
         branch,
+        org,
+        org_email,
         metrics,
         anomalies,
         health,
@@ -2714,6 +2775,23 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         branch_entry.sessions += 1;
         branch_entry.cost += session.metrics.cost_estimated;
 
+        // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension
+        // truth"): org attribution from the claude-code
+        // `$.session.identity.orgIdentifier` dimension. Zero-noise:
+        // sessions without a carried org are left OUT of the facet
+        // entirely — no "unknown" bucket, deliberately unlike
+        // by_branch, because a missing identity is the normal state
+        // of pre-2.1.29x journals and single-account hosts, not a
+        // disclosure-worthy gap; the disclosure counter
+        // `claude_org_identity:*` (journal basis vs config-dir
+        // fallback) carries that signal instead. Sessions and cost
+        // only, like by_branch.
+        if !session.org.is_empty() {
+            let org_entry = overview.by_org.entry(session.org.clone()).or_default();
+            org_entry.sessions += 1;
+            org_entry.cost += session.metrics.cost_estimated;
+        }
+
         for anomaly in &session.anomalies {
             overview.anomalies_top.push(AnomalyTop {
                 session: session.name.clone(),
@@ -3592,6 +3670,8 @@ mod tests {
             path: format!("/{name}.jsonl"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 session_start: session_start.to_string(),
                 ..Default::default()
@@ -4507,6 +4587,8 @@ mod tests {
 
     fn test_session() -> Session {
         Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "test".to_string(),
             path: "test".to_string(),
             cwd: String::new(),
@@ -4726,6 +4808,8 @@ mod quota_tests {
             path: format!("/{name}.jsonl"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 timestamps,
                 cost_estimated: cost,
@@ -4744,6 +4828,8 @@ mod quota_tests {
         // The warm-cache shape: `timestamps` is serde-skipped, only the
         // session_start/session_end strings round-trip.
         Session {
+            org: String::new(),
+            org_email: String::new(),
             name: name.to_string(),
             path: format!("/{name}.jsonl"),
             cwd: String::new(),

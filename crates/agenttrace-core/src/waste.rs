@@ -701,6 +701,8 @@ mod tests {
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -720,6 +722,8 @@ mod tests {
         // condition; the metrics seed must not stack a second entry for
         // the same evidence on top of it.
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "s".to_string(),
             path: "/tmp/s".to_string(),
             cwd: String::new(),
@@ -752,6 +756,8 @@ mod tests {
         // "bash" on a $10 session.)
         use std::collections::BTreeMap;
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "s".to_string(),
             path: "/tmp/s".to_string(),
             cwd: String::new(),
@@ -804,6 +810,8 @@ mod loop_cost_basis_disclosure_tests {
 
     fn session_with_loop(basis: LoopCostBasis) -> Session {
         Session {
+            org: String::new(),
+            org_email: String::new(),
             name: String::from("loop-basis-probe"),
             path: String::from("/tmp/loop-basis-probe.jsonl"),
             cwd: String::new(),

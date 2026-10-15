@@ -5,7 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+// Bumped 64 -> 65 (integration of run 4f2af62e5b7e4541be0a73d732be56d9
+// cycle 1, "Claude org-dimension truth", rm-1405 LEAD reap +
+// attribution separation): cached rows gain the org/org_email
+// identity fields ($.session.identity from claude-code 2.1.29x+
+// journals). Serde defaults keep older snapshots decodable as
+// org-absent; the rung bump regenerates them anyway so a warm row
+// can never hide the org dimension a re-parse would find.
 // Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case
@@ -1138,6 +1145,16 @@ struct GoSession {
     /// them anyway.
     #[serde(default, rename = "Branch")]
     branch: String,
+    /// rm-1405 reap (run 4f2af62e5b7e): org identity dimension from
+    /// $.session.identity.orgIdentifier / loginEmail. Empty for
+    /// corpora whose journals carry no identity block; the by_org
+    /// facet leaves those sessions out entirely. Serialized only
+    /// when present so org-absent snapshots stay byte-equivalent to
+    /// the pre-facet shape.
+    #[serde(default, rename = "Org", skip_serializing_if = "String::is_empty")]
+    org: String,
+    #[serde(default, rename = "OrgEmail", skip_serializing_if = "String::is_empty")]
+    org_email: String,
     #[serde(default, rename = "Metrics")]
     metrics: GoMetrics,
     #[serde(default, rename = "Anomalies")]
@@ -2998,6 +3015,8 @@ impl GoSession {
             path: session.path.clone(),
             cwd: session.cwd.clone(),
             branch: session.branch.clone(),
+            org: session.org.clone(),
+            org_email: session.org_email.clone(),
             metrics: GoMetrics::from_metrics(&session.metrics),
             anomalies: session
                 .anomalies
@@ -3024,6 +3043,8 @@ impl GoSession {
             },
             cwd: self.cwd,
             branch: self.branch,
+            org: self.org,
+            org_email: self.org_email,
             metrics: self.metrics.into_metrics(),
             anomalies: self
                 .anomalies
@@ -3415,6 +3436,8 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -3472,6 +3495,8 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -3500,6 +3525,8 @@ mod tests {
             &database,
             &snapshot,
             &[Session {
+                org: String::new(),
+                org_email: String::new(),
                 name: "cached".to_string(),
                 path: database.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -3538,6 +3565,8 @@ mod tests {
         fs::write(&database_a, b"a").expect("write database a");
         fs::write(&database_b, b"b").expect("write database b");
         let session_for = |name: &str, path: &Path| Session {
+            org: String::new(),
+            org_email: String::new(),
             name: name.to_string(),
             path: path.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -3599,6 +3628,8 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "cached".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -3980,6 +4011,8 @@ mod tests {
         fs::create_dir_all(&listed).expect("create listed dir");
 
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "cached".to_string(),
             path: live.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -4047,6 +4080,8 @@ mod tests {
             handle.set_modified(stamp).expect("set deterministic mtime");
             drop(handle);
             let session = Session {
+                org: String::new(),
+                org_email: String::new(),
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -4206,6 +4241,8 @@ mod tests {
             drop(handle);
             stamps.push(file.clone());
             let session = Session {
+                org: String::new(),
+                org_email: String::new(),
                 name: format!("session-{i}"),
                 path: file,
                 cwd: String::new(),
@@ -4298,6 +4335,8 @@ mod tests {
             handle.set_modified(stamp).expect("set deterministic mtime");
             drop(handle);
             let session = Session {
+                org: String::new(),
+                org_email: String::new(),
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -4382,6 +4421,8 @@ mod tests {
             handle.set_modified(stamp).expect("set deterministic mtime");
             drop(handle);
             let session = Session {
+                org: String::new(),
+                org_email: String::new(),
                 name: format!("session-{i}"),
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
@@ -4435,6 +4476,8 @@ mod tests {
         for (i, path) in paths.iter().enumerate() {
             let file = PathBuf::from(path);
             let session = Session {
+                org: String::new(),
+                org_email: String::new(),
                 name: format!("session-{i}"),
                 path: path.clone(),
                 cwd: String::new(),
@@ -5285,6 +5328,8 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp dir");
         fs::write(&database, b"db").expect("write database");
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "private session".to_string(),
             path: database.to_string_lossy().to_string(),
             cwd: "/work/secret".to_string(),
@@ -5675,6 +5720,8 @@ mod tests {
         // Populate a store at the CURRENT schema and CURRENT catalog.
         let mut cache = load_session_cache();
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "price".to_string(),
             path: journal.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -5800,6 +5847,8 @@ mod tests {
         // live listing for a real directory.
         let mut cache = load_session_cache();
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "flip".to_string(),
             path: journal.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -5937,6 +5986,8 @@ mod tests {
         // The entry round trip must keep working through the encoded
         // key: store, persist, reload, serve.
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "raw name".to_string(),
             path: journal.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -6144,6 +6195,8 @@ mod tests {
         fs::write(&seed_file, b"{}").expect("write seed");
         let mut cache = load_session_cache();
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "seed".to_string(),
             path: seed_file.to_string_lossy().to_string(),
             cwd: String::new(),
@@ -6179,6 +6232,8 @@ mod tests {
                 let mut cache = load_session_cache();
                 barrier.wait();
                 let session = Session {
+                    org: String::new(),
+                    org_email: String::new(),
                     name: format!("writer-{i}"),
                     path: file.to_string_lossy().to_string(),
                     cwd: String::new(),

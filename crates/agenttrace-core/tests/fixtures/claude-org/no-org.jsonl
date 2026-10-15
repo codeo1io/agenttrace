@@ -1,0 +1,2 @@
+{"type":"user","uuid":"u-legacy-1","timestamp":"2026-10-14T10:00:00.000Z","cwd":"/work/projects/shared","gitBranch":"main","sessionId":"sess-legacy-1","message":{"role":"user","content":"pre-identity journal session"}}
+{"type":"assistant","uuid":"u-legacy-2","parentUuid":"u-legacy-1","timestamp":"2026-10-14T10:00:05.000Z","cwd":"/work/projects/shared","gitBranch":"main","sessionId":"sess-legacy-1","message":{"role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":60,"output_tokens":30}}}

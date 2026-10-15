@@ -4,6 +4,22 @@
 
 ### Added
 
+- Claude org-dimension truth (rm-1405 reap, run 4f2af62e5b7e cycle 1):
+  claude-code 2.1.29x+ journals carry an identity envelope
+  (`$.session.identity.orgIdentifier` / `loginEmail`) that the parsers
+  previously ignored, so a multi-org host's overview silently merged
+  two orgs' spend into one attribution. Both identity fields are now
+  captured on the session's meta carrier (first non-empty wins, the
+  cwd/gitBranch discipline) and surface as a `by_org` rollup on the
+  overview report — JSON, markdown, and text — plus a
+  `claude_org_identity:transcript` disclosure counter so a host can
+  audit which sessions carry the dimension. Zero-noise by contract:
+  sessions without an identity block are left out of the facet
+  entirely (no "unknown" bucket) and org-less corpora render
+  byte-identically to before — no `by_org` key in the JSON, no section
+  on text surfaces. The session cache rung moves 64 → 65 (org fields
+  on cached rows, serde-defaulted so older snapshots decode as
+  org-absent and regenerate).
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
