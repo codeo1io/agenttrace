@@ -35,6 +35,30 @@
 //! disclosure; the family total then overcounts (conservative) rather
 //! than destroying data.
 //!
+//! rm-1541: opening equality alone is NOT family membership. Two
+//! INDEPENDENT projects that instantiate the same templated opening (the
+//! company-preamble shape: four shared items, ~2kB serialized, past every
+//! volume guard) used to merge, rebasing the later project's usage away
+//! under a FALSE replayed-prefix disclosure (acceptance PoC: the alpha and
+//! beta project pair reported a 1,500 total against an honest 2,500).
+//! Family formation now also requires the corroboration the wire carries
+//! and the scan used to ignore: both rollouts must name the SAME project
+//! in `session_meta.payload.cwd`. A rollout without a cwd cannot
+//! corroborate anything and never joins a family (silent, conservative —
+//! the pre-rm-402 behavior for that file); different projects split the
+//! same way. The signal is re-derived from the rollout file at every
+//! pass, so warm-cache and cold corpora agree.
+//!
+//! rm-1542: reconciliation re-reads every codex rollout from disk at
+//! every invocation (four call sites), so a rollout the pass CANNOT read
+//! — deleted or chmod-000'd after the session cache captured the
+//! session — is a verification gap, not a quiet no-op: it used to flip
+//! the family total silently between warm and cold runs (cache_hits=2
+//! with an unreadable child reported the naive total with ZERO
+//! disclosures). Such a rollout keeps its full (conservative, possibly
+//! double-counted) usage and carries a loud
+//! `codex_multiagent_reconcile_skipped_unreadable` disclosure instead.
+//!
 //! Guarantees:
 //! * A corpus with no family (e.g. any single-file codex corpus) is
 //!   untouched — byte-identical output before/after.
@@ -78,6 +102,11 @@ pub struct CodexReplayAdjustment {
     /// exceeds theirs on some field (concurrent-spawn shape) — a saturating
     /// rebase would erase real usage (review af521003 F3).
     pub children_below_baseline: usize,
+    /// rm-1542: codex rollouts the pass could not re-read from disk
+    /// (missing or unreadable — the cache-armed determinism hazard).
+    /// Each also carries a per-session
+    /// `codex_multiagent_reconcile_skipped_unreadable` disclosure.
+    pub rollouts_unreadable: usize,
     /// Replayed tokens removed from children, per class.
     pub tokens_input_dropped: i64,
     pub tokens_cache_read_dropped: i64,
@@ -135,6 +164,16 @@ struct OpeningFingerprint {
 /// Everything the reconciliation pass needs from one rollout file.
 struct RolloutScan {
     fingerprint: Option<OpeningFingerprint>,
+    /// rm-1541: the project linkage from `session_meta.payload.cwd` —
+    /// the corroboration signal. `None` when the file carries no
+    /// session_meta (or none with a cwd): the rollout cannot
+    /// corroborate a family and never joins one.
+    cwd: Option<String>,
+    /// rm-1542: the file could not be read/decoded at scan time (it is
+    /// missing, unreadable, or no longer valid UTF-8/zstd). The session
+    /// may still be in the corpus via the cache — the caller discloses
+    /// the verification gap loudly instead of silently opting out.
+    unreadable: bool,
     /// Final cumulative `total_token_usage` snapshot (the file's last one).
     total: TotalSnapshot,
     /// First RFC3339 `timestamp` seen on any line of the file — the
@@ -159,17 +198,25 @@ struct RolloutScan {
 /// uses, so a session the parser accepted as first-class can never be
 /// invisible to family detection — the acceptance (replay counted once,
 /// attributed to the parent, disclosed) holds on the wire format Codex
-/// actually writes. A decode failure here yields no evidence, not an error:
+/// actually writes. A decode failure here marks the scan unreadable
+/// (rm-1542) instead of yielding an error:
 /// the parser has already failed loudly for that file at parse time, and
 /// reconciliation must never turn one parse-level refusal into a second one.
 fn scan_rollout(path: &Path) -> RolloutScan {
     let mut scan = RolloutScan {
         fingerprint: None,
+        cwd: None,
+        unreadable: false,
         total: TotalSnapshot::default(),
         first_timestamp: None,
         response_items: 0,
     };
     let Ok(mut raw) = std::fs::read(path) else {
+        // rm-1542: unreadable at reconcile time (missing / chmod-000) —
+        // report the gap so the caller can disclose it; a session that
+        // only survives via the cache must not silently opt out of the
+        // family (the warm/cold totals flip).
+        scan.unreadable = true;
         return scan;
     };
     // The zstd magic `28 B5 2F FD` — same probe as `parse_session_bytes`
@@ -178,10 +225,18 @@ fn scan_rollout(path: &Path) -> RolloutScan {
         let label = path.display().to_string();
         match crate::parser::decode_zstd_rollout_bounded(raw, &label) {
             Ok(decoded) => raw = decoded,
-            Err(_) => return scan,
+            Err(_) => {
+                // rm-1542: the frame no longer decodes — same verification
+                // gap as an unreadable file (the cache may still hold the
+                // session from when it did).
+                scan.unreadable = true;
+                return scan;
+            }
         }
     }
     let Ok(text) = String::from_utf8(raw) else {
+        // rm-1542: no longer valid UTF-8 — ditto.
+        scan.unreadable = true;
         return scan;
     };
     let mut hasher = DefaultHasher::new();
@@ -214,6 +269,18 @@ fn scan_rollout(path: &Path) -> RolloutScan {
                         .map(|serialized| serialized.len())
                         .unwrap_or(0);
                     items += 1;
+                }
+            }
+            // rm-1541: the project linkage every rollout carries on its
+            // first line — the corroboration signal family formation
+            // requires beyond opening equality. First session_meta wins
+            // (a rollout carries one).
+            "session_meta" => {
+                if scan.cwd.is_none() {
+                    scan.cwd = payload
+                        .get("cwd")
+                        .and_then(|cwd| cwd.as_str())
+                        .map(str::to_string);
                 }
             }
             "event_msg" => {
@@ -272,9 +339,27 @@ fn rebase_cost(metrics: &Metrics, uncached_input: i64, rebased: &TotalSnapshot) 
 ///
 /// Runs after all sessions are assembled and before any view is prepared.
 /// Mutates only children of detected families; everything else — including
-/// every single-file corpus — is left byte-identical.
+/// every single-file corpus — is left byte-identical. rm-1541: a family is
+/// a shared opening AND a shared `session_meta.payload.cwd` project —
+/// opening equality across different projects is the templated-preamble
+/// shape, not a replay. rm-1542: a codex rollout that cannot be re-read
+/// from disk keeps its full usage and discloses the verification gap
+/// (`codex_multiagent_reconcile_skipped_unreadable`) instead of silently
+/// flipping the family total on warm runs.
 pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexReplayAdjustment {
     let mut stats = CodexReplayAdjustment::default();
+
+    // rm-1542: the loud arm for a rollout the pass cannot verify — the
+    // session keeps its full (possibly double-counted) usage and the
+    // corpus learns the reconciliation was skipped for it.
+    fn note_reconcile_skip(session: &mut Session) {
+        session
+            .metrics
+            .disclosure_counters
+            .entry("codex_multiagent_reconcile_skipped_unreadable".to_string())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+    }
 
     // Pass 1: scan codex sessions for family evidence.
     struct Evidence {
@@ -285,16 +370,37 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
         fingerprint_items: usize,
         response_items: usize,
     }
-    let mut families: HashMap<OpeningFingerprint, Vec<Evidence>> = HashMap::new();
-    for (idx, session) in sessions.iter().enumerate() {
+    // rm-1541: the family key is the opening fingerprint PLUS the
+    // corroborating cwd — identical openings in different projects are
+    // two families of one (i.e. no family), never one cross-project
+    // family that rebases a stranger's usage away.
+    let mut families: HashMap<(OpeningFingerprint, String), Vec<Evidence>> = HashMap::new();
+    for (idx, session) in sessions.iter_mut().enumerate() {
         if session.metrics.source_tool != "codex_cli" {
             continue;
         }
+        // rm-1542: the rollout file is gone — the session can only be
+        // here through the cache, and its usage cannot be verified.
+        // Keep it whole and say so loudly (the silent arm used to flip
+        // the family total between warm and cold runs).
         let Ok(path) = Path::new(&session.path).canonicalize() else {
+            note_reconcile_skip(session);
+            stats.rollouts_unreadable += 1;
             continue;
         };
         let scan = scan_rollout(&path);
+        if scan.unreadable {
+            note_reconcile_skip(session);
+            stats.rollouts_unreadable += 1;
+            continue;
+        }
         let Some(fingerprint) = scan.fingerprint else {
+            continue;
+        };
+        // rm-1541: no cwd, no corroboration — the rollout never joins a
+        // family (silent and conservative, exactly like the F4
+        // non-membership arm: its usage stays fully counted).
+        let Some(cwd) = scan.cwd else {
             continue;
         };
         // Review af521003 F1: prefer the rollout FILE's own first
@@ -306,14 +412,17 @@ pub fn reconcile_codex_multiagent_replays(sessions: &mut [Session]) -> CodexRepl
             .first_timestamp
             .or_else(|| session.metrics.timestamps.first().copied())
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-        families.entry(fingerprint).or_default().push(Evidence {
-            session_idx: idx,
-            started_at,
-            path,
-            total: scan.total,
-            fingerprint_items: fingerprint.items,
-            response_items: scan.response_items,
-        });
+        families
+            .entry((fingerprint, cwd))
+            .or_default()
+            .push(Evidence {
+                session_idx: idx,
+                started_at,
+                path,
+                total: scan.total,
+                fingerprint_items: fingerprint.items,
+                response_items: scan.response_items,
+            });
     }
 
     // Pass 2: per family, earliest start is the parent; rebase the rest.
