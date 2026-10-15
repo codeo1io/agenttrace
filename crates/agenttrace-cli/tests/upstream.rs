@@ -57,6 +57,25 @@ fn run_cli(cwd: &Path, args: &[&str]) -> Output {
     command.output().expect("run agenttrace CLI")
 }
 
+/// rm-241 (cycle 3): run the CLI with git discovery ceilinged at
+/// `ceiling`. Git never chdirs up INTO a ceiling directory (the CWD
+/// itself stays searchable — exactly the property the "outside a git
+/// repository" lane asserts), so a fixture under the ceiling cannot
+/// inherit the host's repository ancestry. The CLI probes the repo via
+/// a `git rev-parse` subprocess, which honors the variable natively.
+fn run_cli_ceilinged(cwd: &Path, args: &[&str], ceiling: &Path) -> Output {
+    let ceiling = ceiling
+        .canonicalize()
+        .unwrap_or_else(|_| ceiling.to_path_buf());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
+    command.args(args).current_dir(cwd);
+    for (key, value) in GIT_ENV {
+        command.env(key, value);
+    }
+    command.env("GIT_CEILING_DIRECTORIES", &ceiling);
+    command.output().expect("run agenttrace CLI")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
@@ -248,12 +267,44 @@ fn missing_upstream_remote_fails_with_setup_hint() {
 
 #[test]
 fn outside_a_git_repository_fails() {
-    let root =
-        std::env::temp_dir().join(format!("agenttrace-upstream-nogit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    // rm-241: this lane's verdict used to depend on where TMPDIR lived.
+    // On conductor delegate hosts TMPDIR sits inside a git worktree, git
+    // discovery walked up from the plain fixture dir into that ancestor's
+    // .git, and the CLI reported a repository where the fixture has none
+    // (red reproduced 2026-10-14 under both a probe TMPDIR inside this
+    // repo and the ambient /home/agent/.hermes/tmp/delegate). The fixture
+    // now plants its own hostile .git-bearing ancestor and ceilings
+    // discovery there, so the lane asserts the product verdict on any
+    // host instead of the host's TMPDIR ancestry.
+    let hostile = std::env::temp_dir().join(format!(
+        "agenttrace-upstream-nogit-hostile-{}",
+        std::process::id()
+    ));
+    let root = hostile.join("nogit");
+    let _ = std::fs::remove_dir_all(&hostile);
     std::fs::create_dir_all(&root).expect("create plain dir");
+    git(&hostile, &["init", "-q", "-b", "master"]);
 
-    let output = run_cli(&root, &["upstream"]);
+    // The trap must stay live: without the ceiling, discovery walks
+    // straight into the hostile ancestor. If this ever stops failing,
+    // the fixture has gone vacuous and must be repaired, not trusted.
+    let mut trap = Command::new("git");
+    trap.args([
+        "-C",
+        root.to_str().expect("fixture path is UTF-8"),
+        "rev-parse",
+        "--show-toplevel",
+    ]);
+    for (key, value) in GIT_ENV {
+        trap.env(key, value);
+    }
+    let trap = trap.output().expect("probe hostile ancestor discovery");
+    assert!(
+        trap.status.success(),
+        "hostile ancestor must be discoverable without the ceiling"
+    );
+
+    let output = run_cli_ceilinged(&root, &["upstream"], &hostile);
     assert!(
         !output.status.success(),
         "must fail outside a git repository"
@@ -263,7 +314,7 @@ fn outside_a_git_repository_fails() {
         "expected repository hint, got {:?}",
         stderr(&output)
     );
-    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&hostile);
 }
 
 #[test]

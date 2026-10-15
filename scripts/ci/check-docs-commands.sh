@@ -15,7 +15,23 @@ repo_root="$(git rev-parse --show-toplevel)" \
 bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
 out_dir="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-ci}"
 
-[[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
+# rm-241 (cycle 3): split "not built yet" from "built but not
+# executable". The old single "not executable" message sent operators
+# chasing permissions when the binary simply was not there — under
+# shared CARGO_TARGET_DIR layouts (repro: sibling assess N1, dual-
+# direction TMPDIR run 2026-10-13) the default path can point at a
+# target dir this checkout never built into. Both arms name the
+# sanctioned escapes: AGENTTRACE_BIN overrides, cargo build --release
+# produces.
+if [[ ! -e "$bin" ]]; then
+  if [[ -n "${AGENTTRACE_BIN:-}" ]]; then
+    fail "AGENTTRACE_BIN does not exist: $bin"
+  else
+    fail "agenttrace binary not found: $bin — build it with 'cargo build --release -p agenttrace' or point AGENTTRACE_BIN at an existing build"
+  fi
+elif [[ ! -x "$bin" ]]; then
+  fail "agenttrace binary is not executable: $bin (chmod +x it, or point AGENTTRACE_BIN at an executable build)"
+fi
 mkdir -p "$out_dir/docs"
 
 "$bin" --version >"$out_dir/docs/version.txt"

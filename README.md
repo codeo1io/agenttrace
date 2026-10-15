@@ -518,6 +518,8 @@ directory; missing directories are simply skipped.
 | GitHub Copilot CLI | `~/.copilot/session-state` |
 | GitHub Copilot CLI (OTEL) | `~/.copilot/otel` |
 | Kimi CLI | `~/.kimi/sessions` |
+| OpenClaw | `~/.openclaw/sessions` |
+| OpenClaw (legacy Clawdbot) | `~/.clawdbot/sessions` |
 | OpenCode | `~/.local/share/opencode/storage` |
 | OpenCode (macOS) | `~/Library/Application Support/opencode/storage` |
 | Cline (VS Code) | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` |
@@ -525,7 +527,9 @@ directory; missing directories are simply skipped.
 Relocations honored at scan time: `CODEX_HOME` (Codex sessions and
 archived sessions), `CLAUDE_CONFIG_DIR` (Claude Code transcripts and
 projects), `XDG_CONFIG_HOME` (Antigravity config and Cline),
-`XDG_DATA_HOME` / `OPENCODE_DATA_DIR` (OpenCode). Pi-family homes are
+`XDG_DATA_HOME` / `OPENCODE_DATA_DIR` (OpenCode), `OPENCLAW_STATE_DIR`
+(OpenClaw sessions; the legacy `~/.clawdbot` root is not relocatable).
+Pi-family homes are
 enumerated structurally (every `~/.pi`, `~/.omp`, `~/.senpi`, `~/.omo`,
 `~/.config/pi` root child carrying a `sessions/` directory registers —
 including fork-relocated agent dirs), so they have no fixed rows here.

@@ -198,6 +198,8 @@ discovery 声明的根目录上，新注册的根目录无法绕过文档落地�
 | GitHub Copilot CLI | `~/.copilot/session-state` |
 | GitHub Copilot CLI（OTEL） | `~/.copilot/otel` |
 | Kimi CLI | `~/.kimi/sessions` |
+| OpenClaw | `~/.openclaw/sessions` |
+| OpenClaw（旧名 Clawdbot） | `~/.clawdbot/sessions` |
 | OpenCode | `~/.local/share/opencode/storage` |
 | OpenCode（macOS） | `~/Library/Application Support/opencode/storage` |
 | Cline（VS Code） | `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks` |
@@ -205,7 +207,8 @@ discovery 声明的根目录上，新注册的根目录无法绕过文档落地�
 扫描时识别的迁移变量：`CODEX_HOME`（Codex 会话与归档会话）、
 `CLAUDE_CONFIG_DIR`（Claude Code 转写与 projects）、`XDG_CONFIG_HOME`
 （Antigravity 配置与 Cline）、`XDG_DATA_HOME` / `OPENCODE_DATA_DIR`
-（OpenCode）。Pi 家族主目录按结构枚举（`~/.pi`、`~/.omp`、`~/.senpi`、
+（OpenCode）、`OPENCLAW_STATE_DIR`（OpenClaw 会话；旧版 `~/.clawdbot`
+根目录不可迁移）。Pi 家族主目录按结构枚举（`~/.pi`、`~/.omp`、`~/.senpi`、
 `~/.omo`、`~/.config/pi` 下任何携带 `sessions/` 目录的子目录都会注册，
 包括 fork 迁移过的 agent 目录），因此这里没有固定行。表外的任何
 位置只能通过显式的 `-d/--dir` 逃生口扫描。

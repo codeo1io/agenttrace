@@ -10,7 +10,8 @@
 //!
 //! Determinism: `known_session_dirs()` reads `HOME` plus the
 //! relocation env vars (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
-//! `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `OPENCODE_DATA_DIR`) and scans
+//! `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `OPENCODE_DATA_DIR`,
+//! `OPENCLAW_STATE_DIR`) and scans
 //! pi-family roots structurally. This binary runs under a scratch
 //! `HOME` with every relocation var cleared, so the enumeration is
 //! exactly the statically declared list — no host state can leak in.
@@ -50,6 +51,7 @@ fn scratch_enumeration() -> Vec<(String, String)> {
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "OPENCODE_DATA_DIR",
+        "OPENCLAW_STATE_DIR",
     ] {
         std::env::remove_var(var);
     }

@@ -1147,7 +1147,13 @@ mod tests {
         let root = unique_decode_root("shadow");
         let fixture = root.join(format!("agenttrace-project-{}", std::process::id()));
         let repo = fixture.join("src").join("my-repo");
-        fs::create_dir_all(&repo).expect("create repo");
+        // rm-241 (cycle 3): the fixture owns its git boundary. Without
+        // it, resolved_from_path's ancestor walk escaped the unique root
+        // on conductor delegate hosts — TMPDIR lives under ~/.hermes,
+        // which is itself a git repository, so the "git root" latched
+        // the ancestor and the root assertion failed only there (red
+        // reproduced 2026-10-14 under the ambient delegate TMPDIR).
+        fs::create_dir_all(repo.join(".git")).expect("create fixture repo");
         fs::create_dir_all(root.join("agenttrace")).expect("plant shadow ancestor");
         let encoded = repo.to_string_lossy().replace('/', "-");
         let transcript = root.join("projects").join(&encoded).join("session.jsonl");
@@ -1261,7 +1267,10 @@ mod tests {
         let root = unique_decode_root("misattr");
         let base = root.join("misattr");
         let true_repo = base.join("my-repo");
-        fs::create_dir_all(&true_repo).expect("create true repo");
+        // rm-241 (cycle 3): own git boundary — same delegate-host latch as
+        // the shadow lane above; the asserted root must never depend on
+        // TMPDIR ancestry.
+        fs::create_dir_all(true_repo.join(".git")).expect("create true repo");
         let decoy = base.join("my").join("repo");
         fs::create_dir_all(&decoy).expect("plant decoy");
         let encoded = true_repo.to_string_lossy().replace('/', "-");
@@ -1304,6 +1313,32 @@ mod tests {
             project_decode_status(&session),
             ProjectDecodeStatus::Resolved { .. }
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_stays_hermetic_under_a_git_bearing_ancestor() {
+        // rm-241 (cycle 3): pins the hermeticity pattern the two decode
+        // lanes above now rely on. A hostile .git-bearing ancestor is
+        // planted deliberately above the fixture repo; because the
+        // fixture owns its own .git boundary, the ancestor walk must
+        // never reach it, and the attribution stays on the fixture repo
+        // on any host — including conductor delegate hosts where TMPDIR
+        // sits under ~/.hermes, itself a git repository.
+        let root = unique_decode_root("gitancestor");
+        let hostile = root.join("state-dir");
+        let repo = hostile.join("work").join("my-repo");
+        fs::create_dir_all(repo.join(".git")).expect("create fixture repo");
+        fs::create_dir_all(hostile.join(".git")).expect("plant hostile git ancestor");
+        let session = session_at(&repo.to_string_lossy(), "/gone.jsonl");
+
+        let resolved = resolve_project(&session);
+        assert_eq!(resolved.display_name, "my-repo");
+        assert_eq!(
+            resolved.root,
+            lexical_normalize(&repo).to_string_lossy().to_string()
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

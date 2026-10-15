@@ -2024,6 +2024,100 @@ fn rust_parses_openclaw_anthropic_wrapper() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// rm-1373 (cycle 3): seeds `<state>/sessions/<provider>/<uuid>/` with a
+/// copy of the checked-in wrapper fixture and returns the session dir —
+/// the layout pinned by upstream src/config/paths.ts + codeburn PR #1728
+/// (anthropic_message_wrapper docs, provider/uuid directory nesting).
+fn seed_openclaw_session(state: &std::path::Path, provider: &str) -> std::path::PathBuf {
+    let session_dir = state
+        .join("sessions")
+        .join(provider)
+        .join("9af1c0de-5e17-4b2a-8d64-3f1a2b3c4d5e");
+    fs::create_dir_all(&session_dir).expect("create openclaw session dir");
+    fs::copy(
+        generated_fixture("openclaw-wrapper.json"),
+        session_dir.join("session.json"),
+    )
+    .expect("seed openclaw wrapper session");
+    session_dir
+}
+
+#[test]
+fn openclaw_default_state_dir_sessions_are_discovered() {
+    // rm-1373: README.md:32 has listed OpenClaw in the supported family
+    // since the family list landed, but at c0da781 discovery registered
+    // no OpenClaw root — the claim shipped without the lane (parser and
+    // fixture already existed; only the root was missing). Synthetic
+    // state-dir fixture per the row's acceptance; real-corpus validation
+    // is deferred and disclosed, not silently claimed.
+    let root = temp_root("agenttrace-openclaw-default");
+    let home = root.join("home");
+    seed_openclaw_session(&home.join(".openclaw"), "anthropic");
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "openclaw default state dir must be discovered"
+        );
+        assert_eq!(sessions[0].metrics.source_tool, "openclaw");
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn openclaw_state_dir_relocation_is_honored() {
+    // rm-1373: OPENCLAW_STATE_DIR relocates the whole sessions root
+    // (upstream src/config/paths.ts resolveStateDir). The fake home
+    // deliberately has NO ~/.openclaw, so the single discovered session
+    // proves the override fed discovery, not the default path. A
+    // non-anthropic provider directory exercises the generic walker
+    // admission over the provider/uuid nesting.
+    let root = temp_root("agenttrace-openclaw-relocated");
+    let home = root.join("home");
+    let state = root.join("elsewhere").join("agent-state");
+    seed_openclaw_session(&state, "openai");
+
+    with_home(&home, || {
+        with_openclaw_state(&state, || {
+            let sessions = load_sessions_from_dir(None);
+            assert_eq!(
+                sessions.len(),
+                1,
+                "relocated OPENCLAW_STATE_DIR sessions must be discovered"
+            );
+            assert_eq!(sessions[0].metrics.source_tool, "openclaw");
+        });
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn openclaw_legacy_clawdbot_state_dir_is_discovered() {
+    // rm-1373: ~/.clawdbot is the pre-rename state dir (upstream
+    // resolveLegacyStateDirs) and carries the same sessions layout; it
+    // registers without any env override and coexists with the
+    // ~/.openclaw root when both exist.
+    let root = temp_root("agenttrace-openclaw-legacy");
+    let home = root.join("home");
+    seed_openclaw_session(&home.join(".clawdbot"), "anthropic");
+    seed_openclaw_session(&home.join(".openclaw"), "anthropic");
+
+    with_home(&home, || {
+        let sessions = load_sessions_from_dir(None);
+        assert_eq!(
+            sessions.len(),
+            2,
+            "legacy clawdbot and current openclaw roots must both register"
+        );
+        assert!(sessions
+            .iter()
+            .all(|session| session.metrics.source_tool == "openclaw"));
+    });
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn rust_parses_hermes_json_session() {
     let root = temp_root("agenttrace-rust-hermes-json");
@@ -2705,6 +2799,21 @@ fn temp_root(prefix: &str) -> std::path::PathBuf {
 
 fn with_home(home: &std::path::Path, f: impl FnOnce()) {
     with_home_and_cache(home, &home.join("cache"), f);
+}
+
+/// rm-1373: points `OPENCLAW_STATE_DIR` at a relocated state dir for the
+/// duration of `f`. MUST run inside a `with_home` closure — the env lock
+/// is already held there, so the surgery is race-free against sibling
+/// tests in this binary. Restores the previous value even when `f`
+/// panics, mirroring `with_home_and_cache`'s catch-and-resume shape.
+fn with_openclaw_state(state: &std::path::Path, f: impl FnOnce()) {
+    let previous = std::env::var_os("OPENCLAW_STATE_DIR");
+    std::env::set_var("OPENCLAW_STATE_DIR", state);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    restore_env("OPENCLAW_STATE_DIR", previous);
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 fn with_session_cache(cache: &std::path::Path, f: impl FnOnce()) {

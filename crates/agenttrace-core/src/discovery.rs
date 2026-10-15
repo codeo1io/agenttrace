@@ -197,6 +197,24 @@ pub fn known_session_dirs() -> Vec<KnownSessionDir> {
             name: "Kimi CLI".to_string(),
             path: home.join(".kimi").join("sessions"),
         },
+        // rm-1373 (cycle 3): OpenClaw is the one family README.md:32
+        // lists that discovery did not ship — the parser lane existed
+        // (parse_openclaw_value routes anthropic_message_wrapper docs),
+        // only the roots were missing. Upstream keeps sessions under
+        // `<state>/sessions/<provider>/<uuid>/` (src/config/paths.ts +
+        // codeburn PR #1728), `OPENCLAW_STATE_DIR` relocates the default
+        // `~/.openclaw`, and `~/.clawdbot` is the pre-rename legacy
+        // state dir (no env override upstream). Filenames inside the
+        // uuid dirs are not pinned upstream, so the generic walker
+        // admission applies (default depth covers provider/uuid/file).
+        KnownSessionDir {
+            name: "OpenClaw".to_string(),
+            path: env_home("OPENCLAW_STATE_DIR", home.join(".openclaw")).join("sessions"),
+        },
+        KnownSessionDir {
+            name: "OpenClaw legacy".to_string(),
+            path: home.join(".clawdbot").join("sessions"),
+        },
     ];
     dirs.extend(open_code_known_session_dirs(&home));
     dirs.extend(cline_known_session_dirs(&home));

@@ -4,6 +4,18 @@
 
 ### Added
 
+- OpenClaw sessions are auto-discovered (rm-1373 arm, run f084f50e cycle 3): the README
+  family list has claimed OpenClaw since it landed, but discovery registered no OpenClaw
+  root — the wrapper parser lane existed with nothing feeding it. `known_session_dirs()`
+  now resolves `OPENCLAW_STATE_DIR` (empty-string override falls back like every other
+  root) to `~/.openclaw`, keeps the pre-rename legacy `~/.clawdbot`, and walks
+  `sessions/<provider>/<uuid>/session.json` anthropic-message-wrapper transcripts through
+  the existing `parse_anthropic_message_wrapper` lane, so `--doctor`/`--overview` pick the
+  sessions up with no manual path. Pinned by `discovery_contract` (107 tests, incl. the
+  override/legacy/default-root trio) and a new `docs_discovery_roots_contract` that pins
+  the README table's discovery truth; the wild-corpus survey arm stays open (synthetic
+  fixture per the documented wrapper shape).
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
@@ -224,6 +236,15 @@
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
 ### Fixed
+
+- The docs-commands gate now reports the real failure when the agenttrace binary is
+  unusable (rm-369 arm, run f084f50e cycle 3): `scripts/ci/check-docs-commands.sh` answered
+  a missing default-path binary with "binary not executable", sending operators chasing
+  permissions when nothing was there (routine under shared CARGO_TARGET_DIR layouts, where
+  the default path can point at a target dir this checkout never built into). The gate now
+  splits missing / not-executable / present into three honest arms — each failure message
+  names the sanctioned `AGENTTRACE_BIN` override or the `cargo build --release -p agenttrace`
+  step — and exits rc1 without running the docs sweep on an unusable binary.
 
 - statusline context-window truths now parse `context_window()` exactly once per capture: the peak-utilization fold and the per-session latest-window list share a single pre-parsed vector instead of each cloning + serde-parsing the payload (rm-921 residual, run 4401a380 cycle 2; pinned by `context_window_parsed_once_per_capture`).
 - `tests/otel_export` fixture directories are now unique per call (atomic per-process suffix instead of the constant `line!()`), closing the intra-process window where one suite's truncating fixture rewrite could be observed mid-write by another suite's parse (rm-1065, run 4401a380 cycle 2; pinned by `fixture_dirs_are_unique_per_call`).
