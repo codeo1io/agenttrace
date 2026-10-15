@@ -2,8 +2,11 @@
 //!
 //! Emits an OTLP/HTTP-JSON `ExportTraceServiceRequest` document with one
 //! INTERNAL span per session carrying `gen_ai.*` attributes per the GenAI
-//! semantic conventions (open-telemetry/semantic-conventions docs/gen-ai,
-//! attribute names verified on [`SEMCONV_SNAPSHOT_DATE`]). The render is a
+//! semantic conventions (open-telemetry/semantic-conventions-genai,
+//! `model/gen-ai/registry.yaml`, attribute names verified on
+//! [`SEMCONV_SNAPSHOT_DATE`] at commit [`SEMCONV_SNAPSHOT_COMMIT`] —
+//! see docs/otel-attributes.md for the full emitted-key table and each
+//! key's standing, including the one fork-retained name). The render is a
 //! file/stdout write only — there is no network transport in this module,
 //! honoring PRIVACY.md's offline-first posture.
 //!
@@ -31,11 +34,30 @@ use crate::Session;
 use serde::Serialize;
 use std::path::Path;
 
-/// Date the GenAI semantic-convention attribute names used below were
-/// verified against the `docs/gen-ai` tree. Golden tests pin this constant
-/// so a future semconv drift forces a conscious refresh of the attribute
-/// names rather than silent staleness.
-pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-05";
+/// rm-546: currency is pinned to the exact upstream COMMIT the
+/// emitted attribute names were verified against, because the
+/// semconv-genai repository publishes no releases or tags (verified
+/// live 2026-10-14) — a date alone cannot identify a tree. Golden
+/// tests pin this constant (and [`SEMCONV_SNAPSHOT_DATE`]) so a future
+/// semconv drift forces a conscious refresh of the attribute names
+/// and the pin together, rather than silent staleness.
+pub const SEMCONV_SNAPSHOT_COMMIT: &str = "07794021";
+
+/// rm-546: committer date of [`SEMCONV_SNAPSHOT_COMMIT`] —
+/// open-telemetry/semantic-conventions-genai@07794021 ("Fix templates
+/// for next weaver release", committed 2026-10-14T11:58:15Z). Names
+/// verified present in `model/gen-ai/registry.yaml` at that commit:
+/// `gen_ai.request.model`, `gen_ai.usage.input_tokens`,
+/// `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`,
+/// `gen_ai.usage.cache_write.input_tokens`,
+/// `gen_ai.usage.reasoning.output_tokens`. NOT present at this pin:
+/// `gen_ai.system` — the registry's provider discriminator there is
+/// `gen_ai.provider.name` (enum: openai, gcp.gen_ai, …). We still emit
+/// `gen_ai.system` as a fork-retained name (pre-rename lineage, what
+/// consumers key on today); migrating to `gen_ai.provider.name` is a
+/// named decision reserved for the next pin refresh. A refresh moves
+/// the commit and this date together, deliberately.
+pub const SEMCONV_SNAPSHOT_DATE: &str = "2026-10-14";
 
 /// Recorded input-token basis of the emitted `gen_ai.usage.*` counters —
 /// see the module docs for the rationale. Emitted on every span so
@@ -306,7 +328,7 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
         // attribute below.
         attr_int("gen_ai.usage.input_tokens", metrics.tokens_input),
         attr_int("gen_ai.usage.output_tokens", metrics.tokens_output),
-        // GenAI semconv snapshot 2026-10-05: cache_read/cache_write are
+        // GenAI semconv snapshot @07794021: cache_read/cache_write are
         // input-subset counters and reasoning is an output-subset
         // counter. The cache buckets always emit (honest zeros);
         // reasoning emits only when the session recorded any — a zero
@@ -343,6 +365,13 @@ fn session_span(session: &Session, ordinal: u64) -> Span {
         attr_str(
             "agenttrace.export.semconv_snapshot_date",
             SEMCONV_SNAPSHOT_DATE,
+        ),
+        // rm-546: the exact pin travels with the export so a consumer
+        // can identify the semconv tree the vocabulary was verified
+        // against (the repo has no releases to cite).
+        attr_str(
+            "agenttrace.export.semconv_snapshot_commit",
+            SEMCONV_SNAPSHOT_COMMIT,
         ),
         attr_str("agenttrace.export.input_token_basis", INPUT_TOKEN_BASIS),
     ];
@@ -466,7 +495,11 @@ mod tests {
 
     #[test]
     fn semconv_snapshot_date_is_pinned() {
-        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-05");
+        assert_eq!(SEMCONV_SNAPSHOT_DATE, "2026-10-14");
+        // rm-546: the pin names the commit — the semconv-genai repo has
+        // no releases/tags to cite, so a bare date cannot identify the
+        // verified tree. Refresh moves both constants together.
+        assert_eq!(SEMCONV_SNAPSHOT_COMMIT, "07794021");
     }
 
     #[test]

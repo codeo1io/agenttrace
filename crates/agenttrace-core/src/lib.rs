@@ -57,7 +57,9 @@ pub use insights::{
     session_matches_time_range, DataHealth, ProjectDecodeStatus, ProjectIdentity, ReportScope,
     SessionComparison, SourceScope, TimeRange,
 };
-pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
+pub use otel::{
+    gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_COMMIT, SEMCONV_SNAPSHOT_DATE,
+};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
     list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,

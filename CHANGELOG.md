@@ -4,6 +4,40 @@
 
 ### Added
 
+- OTel export vocabulary is pinned to a semconv commit with a golden
+  attribute-set contract, and the upstream copilot OTel deltas are
+  reconciled (rm-546 + rm-983, run 45d3f3ed cycle 3): the GenAI
+  semantic-convention attribute names the export emits were last
+  verified against a bare date, but the semconv-genai repository
+  publishes no releases or tags — a date cannot identify a tree. The
+  pin is now the exact commit (`SEMCONV_SNAPSHOT_COMMIT` =
+  open-telemetry/semantic-conventions-genai@07794021, 2026-10-14;
+  registry `model/gen-ai/registry.yaml`) and travels with every export
+  as a new `agenttrace.export.semconv_snapshot_commit` attribute
+  beside the existing snapshot date, so a consumer can identify the
+  vocabulary tree; golden tests force any drift to move both constants
+  together. The session span's attribute VOCABULARY is now a pinned
+  contract: a new test asserts the exact sorted key set per span shape
+  (reasoning recorded vs not, resource attributes, the snapshot attrs,
+  and the cost-omitted arm) so adding, renaming, or retiring ANY
+  attribute — including the legacy `agenttrace.session.cache_*` names
+  during their one-deprecation-cycle retirement — fails the suite
+  until docs/otel-attributes.md (new: every emitted key, its source,
+  its semconv standing, the recorded delta-basis divergence from the
+  registry's cache-inclusive SHOULD, and the non-goal histogram /
+  modality / duration arms) is updated alongside. Upstream ccusage
+  #1858 (the wall's "#312" citation mislabels a data-loader PR) is
+  reconciled with named decisions: the inputTokens cache-subtraction
+  and reasoning-subset semantics are fork-supersedes (delta basis
+  since inception, additionally disclosed per-span via
+  `agenttrace.export.input_token_basis`; reasoning pinned since
+  rm-863), while the count-OTel-calls-missing-from-shutdowns ingest
+  arm is declined this cycle (parser lane occupied) and the
+  cache-write pricing arm is out of scope (copilot bills off
+  totalNanoAiu credits, rm-485, zero regression pinned). The copilot
+  chat-span usage-summation truth (per-model checkpoint folds SUM
+  across a rotation: 1,050,000 in / 105,000 out) now rides the export
+  attributes under a pinned fixture test.
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously

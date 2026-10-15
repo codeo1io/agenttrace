@@ -6,7 +6,9 @@
 //! names drift, these tests are the tripwire — update the constant and
 //! the attribute spellings together, deliberately.
 
-use agenttrace_core::{parse_file, report_otel_export, SEMCONV_SNAPSHOT_DATE};
+use agenttrace_core::{
+    parse_file, report_otel_export, SEMCONV_SNAPSHOT_COMMIT, SEMCONV_SNAPSHOT_DATE,
+};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -425,4 +427,192 @@ fn prompt_id_joins_statusline_captures_to_otel_export() {
     // never an error.
     let bare: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert!(correlated_prompt_ids(&captures, &bare).is_empty());
+}
+
+#[test]
+fn emitted_attribute_vocabulary_is_pinned_rm546() {
+    // rm-546: the session span's attribute VOCABULARY is a consumer
+    // contract. This pins the exact sorted key set per span shape, so
+    // adding, renaming, or dropping ANY emitted attribute — including
+    // the legacy agenttrace.session.cache_* names during their
+    // deprecation cycle — fails here and forces a deliberate update of
+    // docs/otel-attributes.md and CHANGELOG.md alongside the code.
+    let a = write_session("claude-a.jsonl", CLAUDE_BODY);
+    let b = write_session("codex-b.jsonl", CODEX_BODY);
+    let c = write_session("workbuddy-c.jsonl", WORKBUDDY_BODY);
+    let sessions: Vec<_> = [a, b, c].iter().map(|p| parse_file(p).unwrap()).collect();
+    let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&sessions)).unwrap();
+
+    fn keyset(span: &serde_json::Value) -> Vec<&str> {
+        span["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kv| kv["key"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+    let spans = &doc["resourceSpans"][0]["scopeSpans"][0]["spans"];
+    let claude_span = &spans[0];
+    let codex_span = &spans[1];
+    let workbuddy_span = &spans[2];
+
+    // The common core: every session span carries exactly these keys.
+    let core = [
+        "agenttrace.export.input_token_basis",
+        "agenttrace.export.semconv_snapshot_commit",
+        "agenttrace.export.semconv_snapshot_date",
+        "agenttrace.session.cache_read_tokens",
+        "agenttrace.session.cache_write_tokens",
+        "agenttrace.session.cost_usd",
+        "agenttrace.session.file",
+        "agenttrace.session.pricing_source",
+        "agenttrace.session.source_tool",
+        "agenttrace.session.tool_calls",
+        "gen_ai.request.model",
+        "gen_ai.system",
+        "gen_ai.usage.cache_read.input_tokens",
+        "gen_ai.usage.cache_write.input_tokens",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+    ];
+    let mut codex_keys = core.to_vec();
+    codex_keys.sort();
+    assert_eq!(keyset(codex_span), codex_keys, "codex (reasoning=0) shape");
+    assert_eq!(keyset(workbuddy_span), codex_keys, "workbuddy shape");
+
+    // The claude fixture additionally records reasoning tokens — the
+    // one conditional attribute at this revision.
+    let mut claude_keys = codex_keys.clone();
+    claude_keys.push("gen_ai.usage.reasoning.output_tokens");
+    claude_keys.sort();
+    assert_eq!(
+        keyset(claude_span),
+        claude_keys,
+        "claude (reasoning>0) shape"
+    );
+
+    // Deprecation-cycle policy pinned: while a session records cache
+    // activity, BOTH the semconv name and the legacy
+    // agenttrace.session.* name emit — the legacy pair retires only
+    // after one full deprecation cycle, announced in CHANGELOG.
+    assert!(
+        attr(claude_span, "agenttrace.session.cache_read_tokens")["intValue"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        attr(claude_span, "gen_ai.usage.cache_read.input_tokens")["intValue"]
+            .as_i64()
+            .unwrap(),
+        attr(claude_span, "agenttrace.session.cache_read_tokens")["intValue"]
+            .as_i64()
+            .unwrap(),
+        "legacy and semconv cache counters stay value-identical during the cycle"
+    );
+
+    // Resource vocabulary: exactly the service identity pair.
+    let resource_keys: Vec<String> = doc["resourceSpans"][0]["resource"]["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|kv| kv["key"].as_str().unwrap().to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(resource_keys, vec!["service.name", "service.version"]);
+
+    // The pin travels with the export — date AND commit (the
+    // semconv-genai repo has no releases, so the commit is the only
+    // citable tree).
+    assert_eq!(
+        attr(claude_span, "agenttrace.export.semconv_snapshot_date")["stringValue"],
+        SEMCONV_SNAPSHOT_DATE
+    );
+    assert_eq!(
+        attr(claude_span, "agenttrace.export.semconv_snapshot_commit")["stringValue"],
+        SEMCONV_SNAPSHOT_COMMIT
+    );
+    assert_eq!(SEMCONV_SNAPSHOT_COMMIT, "07794021");
+
+    // Span naming: the tool travels as gen_ai.system (not span name —
+    // per-assistant-turn spans are a disclosed rm-493 follow-up). The
+    // name is the session identity from the fixture body.
+    assert_eq!(claude_span["name"].as_str().unwrap(), "session hello");
+}
+
+#[test]
+fn copilot_chat_span_usage_summation_exports_rm983() {
+    // rm-983 reconciliation memo (upstream deltas, named decisions):
+    // The wall's citation "#312" resolves live to a data-loader PR in
+    // BOTH ccusage repos (ryoppippi/ccusage#312 == ccusage/ccusage#312,
+    // "Using UTC year/month/day in data-loader", merged 2025-07-19) —
+    // mislabeled. The real OTel copilot vocabulary/summation deltas are
+    // ccusage/ccusage#1858 ("count OTel calls missing from shutdowns,
+    // dedupe re-exports, fix cache-write pricing", merged 2026-10-10).
+    //   (a) inputTokens-cache-subtraction: fork-supersedes. Upstream
+    //       normalizes OTel `gen_ai.usage.input_tokens` to the uncached
+    //       remainder (max(input - cacheRead - cacheWrite, 0)); the
+    //       fork has ALWAYS emitted that delta basis and additionally
+    //       discloses it per-span via
+    //       `agenttrace.export.input_token_basis`.
+    //       NOTE the deliberate divergence from the semconv registry,
+    //       which says the cache buckets SHOULD be *included* in
+    //       input_tokens: agenttrace's pricing lane bills uncached
+    //       input, cache reads, and cache writes at different rates, so
+    //       the delta basis is the cost-relevant one and is disclosed.
+    //   (b) reasoningTokens-subset-of-output: fork-supersedes — pinned
+    //       since rm-863 (CU-20: never add reasoning on top of output).
+    //   (c) count-OTel-calls-missing-from-shutdowns: DECLINED this
+    //       cycle — an ingest-truth change in the copilot parser lane
+    //       (occupied seam); follow-up candidate, not silently skipped.
+    //   (d) cache-write pricing fix: out of batch (pricing seam); the
+    //       fork prices copilot sessions off totalNanoAiu credits
+    //       (rm-485) — zero regression pinned by the reconciliation
+    //       suite, and finite-cost emission is asserted below.
+    //
+    // Chat-span usage summation on the wire: model-rotation.jsonl
+    // carries two usage checkpoints across a model rotation; the fold
+    // SUMS per-model usage (pinned by copilot_checkpoint_reconciliation
+    // "rotation must sum both models" = 1_050_000 input). This test
+    // pins that the SAME folded totals ride the export attributes.
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/copilot-checkpoints/model-rotation.jsonl");
+    let session = parse_file(&fixture).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&report_otel_export(&[session])).unwrap();
+    let span = &doc["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+
+    assert_eq!(attr(span, "gen_ai.system")["stringValue"], "copilot");
+    assert_eq!(
+        attr(span, "gen_ai.usage.input_tokens")["intValue"],
+        1_050_000,
+        "checkpoints summed across the rotation"
+    );
+    assert_eq!(
+        attr(span, "gen_ai.usage.output_tokens")["intValue"],
+        105_000
+    );
+    // Honest zeros: the copilot checkpoints record no cache buckets.
+    assert_eq!(
+        attr(span, "gen_ai.usage.cache_read.input_tokens")["intValue"],
+        0
+    );
+    assert_eq!(
+        attr(span, "gen_ai.usage.cache_write.input_tokens")["intValue"],
+        0
+    );
+    assert!(
+        opt_attr(span, "gen_ai.usage.reasoning.output_tokens").is_none(),
+        "copilot checkpoints record no reasoning — attr omitted, not zero"
+    );
+    // rm-485 zero-regression on the export side: the credit-based cost
+    // is finite (max(refined estimate, credit_usd)) and rides the wire.
+    assert!(
+        attr(span, "agenttrace.session.cost_usd")["doubleValue"]
+            .as_f64()
+            .is_some(),
+        "copilot credit cost must export finite, not omitted"
+    );
 }
