@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 64 and the SQLite snapshot is schema 12; the
+The session cache is schema 65 and the SQLite snapshot is schema 12; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -416,7 +416,15 @@ number is never repriced, the zero side is disclosed, not resolved;
 minted 60 → 61 at the run's base 82e23b9, below the frontier — this
 tree's landed 62 and 63 rungs — so this integration, conflict case
 8fbcfcfd5e4d440b8e2890456aaacede, re-bases it onto the advanced
-ceiling as 63 → 64, one invalidation either way)
+ceiling as 63 → 64, one invalidation either way), and to 65 when
+Claude sessions began carrying org/account identity through the cache
+(rm-1397, run 9be62073 cycle 2, first cut: the claude lanes fold the
+journal's identity surfaces — `$.session.identity`, gateway
+attribution blocks, inline identity objects, Claude Code 2.1.299+ —
+onto Session.org/email beside the rm-585 branch, and the GoSession
+mirror persists both, so a warm v64 entry replays empty identity and
+the by_org dimension renders nothing for every cached claude session
+— one invalidation, every warm entry regenerates once)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

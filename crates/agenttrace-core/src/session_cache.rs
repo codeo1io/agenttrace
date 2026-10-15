@@ -5,7 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+// Bumped 64 -> 65 (repository-maintenance run
+// 9be62073e00942f497293b32cad13c60 cycle 2, rm-1397 Claude
+// org/account-aware attribution first cut): Session gained `org` and
+// `email` identity fields, so warm v64 entries would keep serving
+// empty identity and the by_org rollup would bucket every cached
+// claude session under "unknown" until the next write. Same rm-230
+// convention as every bump below — cache regeneration, never a
+// semantics change to reported totals.
 // Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case
@@ -1138,6 +1146,14 @@ struct GoSession {
     /// them anyway.
     #[serde(default, rename = "Branch")]
     branch: String,
+    /// rm-1397: org slug of the account the session ran under
+    /// (claude-code identity surfaces, CC 2.1.299). Serde-default keeps
+    /// older caches decodable; schema bump regenerates.
+    #[serde(default, rename = "Org")]
+    org: String,
+    /// rm-1397: account email of the same identity surface.
+    #[serde(default, rename = "Email")]
+    email: String,
     #[serde(default, rename = "Metrics")]
     metrics: GoMetrics,
     #[serde(default, rename = "Anomalies")]
@@ -2998,6 +3014,8 @@ impl GoSession {
             path: session.path.clone(),
             cwd: session.cwd.clone(),
             branch: session.branch.clone(),
+            org: session.org.clone(),
+            email: session.email.clone(),
             metrics: GoMetrics::from_metrics(&session.metrics),
             anomalies: session
                 .anomalies
@@ -3024,6 +3042,8 @@ impl GoSession {
             },
             cwd: self.cwd,
             branch: self.branch,
+            org: self.org,
+            email: self.email,
             metrics: self.metrics.into_metrics(),
             anomalies: self
                 .anomalies
@@ -3399,6 +3419,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn go_session_round_trips_org_and_email_identity() {
+        // rm-1397: Session gained org/email identity fields, so the
+        // cache must carry them both ways — a warm entry that dropped
+        // identity would replay empty org/email and the by_org
+        // dimension would render nothing for every cached claude
+        // session after a reload.
+        let session = Session {
+            name: "identity".to_string(),
+            path: "/tmp/identity.jsonl".to_string(),
+            cwd: "/work/app".to_string(),
+            branch: "main".to_string(),
+            org: "acme-corp".to_string(),
+            email: "dev@acme-corp.example".to_string(),
+            metrics: Metrics::default(),
+            anomalies: Vec::new(),
+            health: 100,
+            tool_warnings: Vec::new(),
+            diagnostics: Diagnostics::default(),
+        };
+        let cached = GoSession::from_session(&session);
+        assert_eq!(cached.org, "acme-corp");
+        assert_eq!(cached.email, "dev@acme-corp.example");
+        let restored = cached.into_session("fallback");
+        assert_eq!(restored.org, "acme-corp", "org must survive the round trip");
+        assert_eq!(
+            restored.email, "dev@acme-corp.example",
+            "email must survive the round trip"
+        );
+        // serde-default keeps a pre-rm-1397 cache entry (no Org/Email
+        // keys) decodable with empty identity.
+        let legacy = serde_json::json!({
+            "Name": "legacy",
+            "Path": "/tmp/legacy.jsonl",
+            "CWD": "",
+            "Branch": "main",
+            "Metrics": {},
+        });
+        let decoded: GoSession =
+            serde_json::from_value(legacy).expect("legacy entry decodes (serde defaults)");
+        assert!(decoded.org.is_empty() && decoded.email.is_empty());
+    }
+
+    #[test]
     fn concurrent_persist_never_races_on_a_shared_temp_file() {
         // Pass-6 P6-3: cache persist used a fixed `<name>.json.tmp`
         // sibling, so two concurrent writers raced on the same temp file
@@ -3419,6 +3482,8 @@ mod tests {
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -3476,6 +3541,8 @@ mod tests {
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -3504,6 +3571,8 @@ mod tests {
                 path: database.to_string_lossy().to_string(),
                 cwd: String::new(),
                 branch: String::new(),
+                org: String::new(),
+                email: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -3542,6 +3611,8 @@ mod tests {
             path: path.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -3603,6 +3674,8 @@ mod tests {
             path: database.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 stored_totals_delta: 720,
                 // rm-790/rm-791: the source row key and the raw parent row
@@ -3984,6 +4057,8 @@ mod tests {
             path: live.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -4051,6 +4126,8 @@ mod tests {
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
                 branch: String::new(),
+                org: String::new(),
+                email: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -4215,6 +4292,8 @@ mod tests {
                 tool_warnings: Vec::new(),
                 diagnostics: Diagnostics::default(),
                 branch: String::new(),
+                org: String::new(),
+                email: String::new(),
             };
             store_session(Path::new(&stamps[i as usize]), &session, &mut cache)
                 .expect("store entry");
@@ -4302,6 +4381,8 @@ mod tests {
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
                 branch: String::new(),
+                org: String::new(),
+                email: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -4386,6 +4467,8 @@ mod tests {
                 path: file.to_string_lossy().to_string(),
                 cwd: String::new(),
                 branch: String::new(),
+                org: String::new(),
+                email: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -4439,6 +4522,8 @@ mod tests {
                 path: path.clone(),
                 cwd: String::new(),
                 branch: String::new(),
+                org: String::new(),
+                email: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -5289,6 +5374,8 @@ mod tests {
             path: database.to_string_lossy().to_string(),
             cwd: "/work/secret".to_string(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -5679,6 +5766,8 @@ mod tests {
             path: journal.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -5804,6 +5893,8 @@ mod tests {
             path: journal.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -5941,6 +6032,8 @@ mod tests {
             path: journal.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             // A non-empty source tool keeps the empty-source-tool
             // eviction gate (below) from treating this entry as
             // pre-gate legacy junk once it reloads into raw_entries.
@@ -6148,6 +6241,8 @@ mod tests {
             path: seed_file.to_string_lossy().to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 source_tool: "agenttrace-test".to_string(),
                 ..Metrics::default()
@@ -6183,6 +6278,8 @@ mod tests {
                     path: file.to_string_lossy().to_string(),
                     cwd: String::new(),
                     branch: String::new(),
+                    org: String::new(),
+                    email: String::new(),
                     metrics: Metrics {
                         source_tool: "agenttrace-test".to_string(),
                         ..Metrics::default()

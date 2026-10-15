@@ -1349,6 +1349,8 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         path: agg.path,
         cwd: agg.cwd,
         branch: String::new(),
+        org: String::new(),
+        email: String::new(),
         metrics,
         anomalies,
         health,

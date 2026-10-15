@@ -825,6 +825,34 @@ fn doctor_directories(
         &mut scan.scanned_sessions,
         &mut scan.disclosure_fold.disclosures,
     );
+    // rm-1397 (Claude org/account-aware attribution, first cut):
+    // informational-tier census of the distinct accounts in the
+    // scanned corpus — the account key follows the by_org rollup rule
+    // (org slug, email fallback). The key fires only when TWO OR MORE
+    // accounts are mixed: a single-account corpus reads identically to
+    // an identity-less one (0/1-count-clean), while a corpus mixing
+    // two corporate accounts — the ambiguity this row exists for —
+    // gets a disclosed count instead of silently co-mingled spend.
+    let distinct_accounts = scan
+        .scanned_sessions
+        .iter()
+        .map(|session| {
+            if !session.org.is_empty() {
+                session.org.clone()
+            } else if !session.email.is_empty() {
+                session.email.clone()
+            } else {
+                String::new()
+            }
+        })
+        .filter(|key| !key.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct_accounts.len() > 1 {
+        scan.disclosure_fold.disclosures.insert(
+            "claude_identity_accounts".to_string(),
+            distinct_accounts.len(),
+        );
+    }
     dirs
 }
 
@@ -1496,6 +1524,8 @@ mod tests {
             path: path.to_string(),
             cwd: cwd.to_string(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: crate::Metrics::default(),
             anomalies: Vec::new(),
             health: 100,

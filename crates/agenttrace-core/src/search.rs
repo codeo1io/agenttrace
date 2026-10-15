@@ -270,6 +270,8 @@ mod tests {
             path: "/tmp/billing.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics,
             anomalies: Vec::new(),
             health: 100,
@@ -347,6 +349,8 @@ mod tests {
             path: "demo://01-healthy-ship.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 source_tool: "pi".to_string(),
                 ..Metrics::default()

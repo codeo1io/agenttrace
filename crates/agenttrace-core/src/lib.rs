@@ -160,6 +160,31 @@ pub struct Event {
         deserialize_with = "deserialize_string"
     )]
     pub branch: String,
+    /// rm-1397 (Claude org/account-aware attribution, first cut): the
+    /// organization slug of the account the session ran under, captured
+    /// from the claude-code lane's identity surfaces (`$.session.identity`
+    /// and the gateway attribution block, CC 2.1.299). Other lanes leave
+    /// it empty and the optional `by_org` rollup then contributes no
+    /// row for them (zero-noise dimension). Like `branch`, the raw
+    /// value rides the event verbatim and only the rollup normalizes.
+    #[serde(
+        default,
+        rename = "org",
+        alias = "Org",
+        deserialize_with = "deserialize_string"
+    )]
+    pub org: String,
+    /// rm-1397: the account email of the same identity surface. Empty
+    /// when the journal carries no identity; the `by_org` rollup prefers
+    /// the org slug and falls back to the email so a gateway account
+    /// without a published slug still gets its own bucket.
+    #[serde(
+        default,
+        rename = "email",
+        alias = "Email",
+        deserialize_with = "deserialize_string"
+    )]
+    pub email: String,
     #[serde(
         default,
         rename = "tool_calls",
@@ -763,6 +788,20 @@ pub struct Session {
     /// values under "unknown" instead of inventing a value.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub branch: String,
+    /// rm-1397 (Claude org/account-aware attribution, first cut): the
+    /// organization slug of the account the session ran under, from the
+    /// claude-code lane's identity surfaces (`$.session.identity` and
+    /// the gateway attribution block, CC 2.1.299). Empty when the
+    /// journal carries no identity; the optional `by_org` rollup then
+    /// contributes no row for it (zero-noise dimension — identity-free
+    /// corpora render byte-identically).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub org: String,
+    /// rm-1397: the account email of the same identity surface. The
+    /// `by_org` rollup prefers the org slug and falls back to the email
+    /// so an account without a published slug still gets its own bucket.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub email: String,
     pub metrics: Metrics,
     pub anomalies: Vec<Anomaly>,
     pub health: i32,
@@ -795,6 +834,11 @@ pub struct Overview {
     /// branch concept yet (codex/qwen/copilot — gap disclosed in the
     /// governance guide). Sessions and cost only, like by_provider.
     pub by_branch: BTreeMap<String, GroupOverview>,
+    /// rm-1397: spend by organization/account. Key is the org slug,
+    /// falling back to the account email. ZERO-NOISE: identity-less
+    /// journals contribute no row, so the map (and its render on every
+    /// surface) is empty unless the corpus carries identity.
+    pub by_org: BTreeMap<String, GroupOverview>,
     /// rm-245: heuristic task-type attribution. Correlation over parsed
     /// aggregates, not ground truth; see `infer_task_type`.
     pub by_task_type: BTreeMap<String, TaskTypeOverview>,
@@ -1206,6 +1250,11 @@ pub fn session_from_events(
     let mut model = "default".to_string();
     let mut cwd = String::new();
     let mut branch = String::new();
+    // rm-1397: org/email identity ride the same session_meta/meta event
+    // as cwd/branch (the claude-code lane stamps the journal's identity
+    // surfaces there), so the same first-non-empty capture applies.
+    let mut org = String::new();
+    let mut email = String::new();
     // rm-861: the session model label is only writable by rows that
     // speak for the session's model — assistant turns,
     // session/meta identity rows, and usage-bearing rows (a row that
@@ -1237,6 +1286,14 @@ pub fn session_from_events(
         // cwd (claude-code writes both envelope fields on every line).
         if branch.is_empty() && !event.branch.is_empty() {
             branch = event.branch.clone();
+        }
+        // rm-1397: identity rides the same event (see the capture note
+        // above).
+        if org.is_empty() && !event.org.is_empty() {
+            org = event.org.clone();
+        }
+        if email.is_empty() && !event.email.is_empty() {
+            email = event.email.clone();
         }
         if model != "default" && !cwd.is_empty() {
             break;
@@ -1311,6 +1368,8 @@ pub fn session_from_events(
         path: path.to_string(),
         cwd,
         branch,
+        org,
+        email,
         metrics,
         anomalies,
         health,
@@ -2714,6 +2773,29 @@ pub fn compute_overview_iter<'a>(sessions: impl Iterator<Item = &'a Session>) ->
         branch_entry.sessions += 1;
         branch_entry.cost += session.metrics.cost_estimated;
 
+        // rm-1397 (Claude org/account-aware attribution, first cut): the
+        // account dimension, ZERO-NOISE by the acceptance clauses.
+        // Bucket key prefers the org slug and falls back to the
+        // account email (a gateway account without a published slug
+        // still gets its own bucket); a session with NEITHER
+        // contributes no row — the dimension stays empty unless the
+        // corpus actually carries identity, and every render lane then
+        // omits it so identity-free corpora keep byte-identical output
+        // (unlike by_branch there is no "unknown" bucket: the absence
+        // of an account is not an account). Same GroupOverview shape as
+        // by_branch — no token totals, so no clamp contract needed
+        // here.
+        if !session.org.is_empty() || !session.email.is_empty() {
+            let org_bucket = if !session.org.is_empty() {
+                session.org.clone()
+            } else {
+                session.email.clone()
+            };
+            let org_entry = overview.by_org.entry(org_bucket).or_default();
+            org_entry.sessions += 1;
+            org_entry.cost += session.metrics.cost_estimated;
+        }
+
         for anomaly in &session.anomalies {
             overview.anomalies_top.push(AnomalyTop {
                 session: session.name.clone(),
@@ -3592,6 +3674,8 @@ mod tests {
             path: format!("/{name}.jsonl"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 session_start: session_start.to_string(),
                 ..Default::default()
@@ -4511,6 +4595,8 @@ mod tests {
             path: "test".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
@@ -4726,6 +4812,8 @@ mod quota_tests {
             path: format!("/{name}.jsonl"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 timestamps,
                 cost_estimated: cost,
@@ -4748,6 +4836,8 @@ mod quota_tests {
             path: format!("/{name}.jsonl"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 timestamps: Vec::new(),
                 cost_estimated: cost,

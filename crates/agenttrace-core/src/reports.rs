@@ -523,6 +523,11 @@ pub fn report_overview_json_with_health(
     // by_provider; missing / detached-HEAD / no-branch lanes roll up
     // under the explicit "unknown" bucket (compute_overview_iter).
     let branches = group_items(&overview.by_branch, false);
+    // rm-1397 (Claude org/account-aware attribution, first cut): org
+    // slug key with email fallback; ZERO-NOISE — empty when the corpus
+    // carries no identity, and then omitted from the payload below so
+    // identity-free corpora stay byte-identical.
+    let orgs = group_items(&overview.by_org, false);
     let task_types = task_type_items(&overview.by_task_type, overview.total_cost);
     let top_cost_drivers = top_cost_driver_rows(&ordered, 3)
         .into_iter()
@@ -579,6 +584,7 @@ pub fn report_overview_json_with_health(
         "by_project": projects,
         "by_provider": providers,
         "by_branch": branches,
+        "by_org": orgs,
         "by_task_type": task_types,
         "top_cost_drivers": top_cost_drivers,
         "recent_sessions": recent_sessions,
@@ -589,6 +595,12 @@ pub fn report_overview_json_with_health(
     if let Value::Object(obj) = &mut payload {
         let summary = obj.remove("summary").unwrap_or(Value::Null);
         obj.insert("summary".to_string(), strip_nulls(summary));
+        if orgs.is_empty() {
+            // rm-1397: the by-org dimension is optional — omit the key
+            // entirely when empty so identity-free corpora render
+            // byte-identically to the pre-dimension payload.
+            obj.remove("by_org");
+        }
     }
     serde_json::to_string_pretty(&payload).expect("overview report serializes")
 }
@@ -1622,6 +1634,18 @@ pub fn report_overview_text(overview: &Overview, sessions: &[Session]) -> String
     out.push_str("  ── By Branch ──\n");
     push_text_group_family(&mut out, &overview.by_branch, 40, |name| name.clone());
 
+    // rm-1397 (Claude org/account-aware attribution, first cut): the
+    // account dimension beside the branch lane. Bucket key is the org
+    // slug with email fallback (compute_overview_iter); width 40 for
+    // the same identify-the-label reason as by_branch — an org slug or
+    // an account email cut at 25 stops being identifiable. ZERO-NOISE:
+    // the section renders only when the corpus carries identity, so
+    // identity-free output stays byte-identical.
+    if !overview.by_org.is_empty() {
+        out.push_str("  ── By Org ──\n");
+        push_text_group_family(&mut out, &overview.by_org, 40, |name| name.clone());
+    }
+
     out.push_str("  ── By Task Type ──\n");
     for (task_type, group) in sorted_task_type_groups(&overview.by_task_type) {
         out.push_str(&format!(
@@ -1821,6 +1845,32 @@ pub fn report_overview_markdown(overview: &Overview, sessions: &[Session]) -> St
         ));
     }
 
+    // rm-1397: org/account dimension, one bucket per identity-bearing
+    // session. ZERO-NOISE: identity-less journals contribute no row and
+    // the section is omitted entirely when the corpus carries no
+    // identity, keeping identity-free output byte-identical.
+    if !overview.by_org.is_empty() {
+        out.push_str("\n## By org\n\n");
+        out.push_str("| Org | Sessions | Cost |\n|---|---:|---:|\n");
+        for (org, group) in sorted_group_overview(&overview.by_org)
+            .into_iter()
+            .take(GROUP_TAKE)
+        {
+            out.push_str(&format!(
+                "| {} | {} | {} |\n",
+                markdown_cell(org),
+                format_count(group.sessions),
+                format_cost(group.cost)
+            ));
+        }
+        if overview.by_org.len() > GROUP_TAKE {
+            out.push_str(&format!(
+                "*… +{} more not shown*\n",
+                overview.by_org.len() - GROUP_TAKE
+            ));
+        }
+    }
+
     out.push_str("\n## By task type\n\n");
     out.push_str(
         "| Task type | Sessions | Tokens in | Tokens out | Cost |\n|---|---:|---:|---:|---:|\n",
@@ -1893,6 +1943,7 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
     let models = sorted_group_overview(&overview.by_model);
     let providers = sorted_group_overview(&overview.by_provider);
     let branches = sorted_group_overview(&overview.by_branch);
+    let orgs = sorted_group_overview(&overview.by_org);
 
     let mut out = String::new();
     let mut w = |line: String| {
@@ -2081,6 +2132,23 @@ pub fn report_overview_html(overview: &Overview, sessions: &[Session]) -> String
         ));
     }
     w(group_section_close(overview.by_branch.len()));
+
+    // rm-1397 (Claude org/account-aware attribution, first cut): the
+    // account dimension beside by_branch. ZERO-NOISE: the section is
+    // omitted when the corpus carries no identity, keeping identity-
+    // free output byte-identical.
+    if !orgs.is_empty() {
+        w("<section><h2>By org</h2><table><thead><tr><th>Org</th><th class=\"num\">Sessions</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
+        for (org, group) in orgs.iter().take(GROUP_TAKE) {
+            w(format!(
+                "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                html_escape(org),
+                format_count(group.sessions),
+                format_cost(group.cost)
+            ));
+        }
+        w(group_section_close(overview.by_org.len()));
+    }
 
     w("<section><h2>By task type</h2><table><thead><tr><th>Task type</th><th class=\"num\">Sessions</th><th class=\"num\">Tokens in</th><th class=\"num\">Tokens out</th><th class=\"num\">Cost</th></tr></thead><tbody>".to_string());
     for (task_type, group) in sorted_task_type_groups(&overview.by_task_type) {
@@ -3933,6 +4001,8 @@ mod tests {
             path: "/tmp/adversarial.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 tokens_input: i64::MAX,
                 tokens_output: i64::MAX,
@@ -3970,6 +4040,8 @@ mod tests {
             path: "/tmp/osc.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics,
             anomalies: vec![crate::Anomaly {
                 kind: "tool_failures".to_string(),
@@ -3996,6 +4068,8 @@ mod tests {
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 assistant_turns: 2,
                 tool_calls_total: 4,
@@ -4021,6 +4095,8 @@ mod tests {
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 assistant_turns: 2,
                 tool_calls_total: 4,
@@ -4045,6 +4121,8 @@ mod tests {
             path: "/tmp/session.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            email: String::new(),
             metrics: Metrics {
                 assistant_turns: 2,
                 tool_calls_total: 4,
