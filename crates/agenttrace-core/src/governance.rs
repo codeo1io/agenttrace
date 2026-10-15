@@ -494,7 +494,11 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         if matches!(model.as_str(), "default" | "unknown" | "multiple") {
             row.unknown += 1;
             coverage.unpriced_or_unknown_sessions += 1;
-        } else if pricing::has_specific_price(&model) {
+        } else if pricing::has_specific_price(&model) && !pricing::is_locally_defined(&model) {
+            // rm-1426: only a row that NAMES this model counts as specific —
+            // a locally-defined slug that name-collides with a collapsed
+            // carrier row prices at a foreign carrier's rate and is
+            // disclosed via `locally_defined_model_pricing:{slug}`.
             row.specific += 1;
             coverage.priced_sessions += 1;
         } else {
@@ -756,7 +760,10 @@ pub fn session_cost_audit(session: &Session) -> SessionCostAudit {
             "unpriced_or_unknown",
             "model name is missing or generic; cost is not a catalog match",
         )
-    } else if pricing::has_specific_price(&model) {
+    } else if pricing::has_specific_price(&model) && !pricing::is_locally_defined(&model) {
+        // rm-1426: same rule as the census above — a locally-defined slug
+        // is not an exact match, it merely shares a collapsed name with a
+        // carrier row; the disclosure counter carries the full story.
         (
             "catalog_estimate",
             "exact normalized model match in pricing catalog",

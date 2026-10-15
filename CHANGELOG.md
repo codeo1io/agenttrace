@@ -9,16 +9,23 @@
   record slugs no pricing row backs — bare `glm-5.2` is absent from the bundled
   snapshot, live LiteLLM and the builtin table while ~90 prefixed `zai/glm-5.2`
   carrier rows exist — so every lookup priced such usage at the builtin default
-  ($3.00/$15.00 per Mtok) with zero indication. `pricing::is_default_fallback`
-  classifies the slug (variant-ladder-accurate, unlike the exact-key
-  `has_specific_price`); `analyze` now mints
+  ($3.00/$15.00 per Mtok) with zero indication. `pricing::is_locally_defined`
+  classifies the slug against the RAW published snapshot keys (pre-collapse:
+  a bare name that only matches a carrier-prefixed row after `convert_litellm`
+  collapses it is still locally-defined — arm b — which the collapsed-catalog
+  `has_specific_price` cannot see); `analyze` now mints
   `locally_defined_model_pricing:{slug}` occurrence counters and a
   `locally_defined_priced_cents` total (both arms: per-block and the
   single-model catalog formula; upstream-recorded cost excluded, staying in the
   rm-1052 lane) into the metrics disclosure channel — insights
   `data_health.disclosures` and doctor's per-session fold render them with no
-  further plumbing. An `AGENTTRACE_PRICING_FILE` row for the slug is the
-  operator escape hatch and flips the disclosure off.
+  further plumbing, and the guard families agree again:
+  `data_health.fallback_pricing` and the governance cost-audit coverage /
+  `session_cost_audit` classification count locally-defined slugs as fallback,
+  never `specific`/`catalog_estimate`. Per-slug counters ride the rm-594
+  distinct-key cap family (`kimi_usage_alias` precedent). An
+  `AGENTTRACE_PRICING_FILE` row for the slug is the operator escape hatch and
+  flips the disclosure off.
 
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and

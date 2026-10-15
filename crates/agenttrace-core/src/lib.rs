@@ -1016,6 +1016,11 @@ fn counts_toward_disclosure_cap(key: &str) -> bool {
         || key.starts_with("usage_alias_unmapped:")
         || key.starts_with("usage_unconsumed_location:")
         || key.starts_with("kimi_usage_alias:")
+        // rm-1426: per-slug fan-out, the `kimi_usage_alias` shape — a fleet
+        // of distinct locally-defined catalog slugs must not mint unbounded
+        // distinct keys. The fixed `locally_defined_priced_cents` key stays
+        // out, exactly like rm-1052's single-key counters.
+        || key.starts_with("locally_defined_model_pricing:")
 }
 
 /// Mint one disclosure key (with its occurrence count) into a

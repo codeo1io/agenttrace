@@ -903,7 +903,15 @@ fn data_health_from_parts(
         .count();
     let fallback_pricing = sessions
         .iter()
-        .filter(|s| !pricing::has_specific_price(&s.metrics.model_used))
+        .filter(|s| {
+            // rm-1426: a locally-defined slug (codex `model_catalog_json` /
+            // private-proxy class) has no row that names IT — arm (b) slugs
+            // name-collide with collapsed carrier rows and would pass
+            // `has_specific_price` while the disclosure channel flags their
+            // dollars as fabricated — so they count as fallback here too.
+            pricing::is_locally_defined(&s.metrics.model_used)
+                || !pricing::has_specific_price(&s.metrics.model_used)
+        })
         .count();
     let stored_totals_sessions = sessions
         .iter()
