@@ -1,8 +1,8 @@
 use agenttrace_core::{
-    add_baseline_comparison, average_health, build_doctor_report, compute_overview,
-    compute_waste_report, context_trends, cost_audit, data_health, data_health_scoped,
-    delivery_evidence_with_git, demo_sessions, evaluate_overview_gate, filter_sessions,
-    fix_suggestions, guard_formula_json_leaves, inspect_first, list_pricing,
+    add_baseline_comparison, average_health, build_doctor_report, cache_rate_census,
+    compute_overview, compute_waste_report, context_trends, cost_audit, data_health,
+    data_health_scoped, delivery_evidence_with_git, demo_sessions, evaluate_overview_gate,
+    filter_sessions, fix_suggestions, guard_formula_json_leaves, inspect_first, list_pricing,
     load_sessions_with_options, lookup_price, matches_numeric_filter, mcp_governance, parse_file,
     parse_numeric_filter, parse_stdin_bytes, predict_cost_anomaly, pricing_cache_path,
     pricing_source, recommendations, render_doctor_report, render_model_pricing_list,
@@ -2467,12 +2467,19 @@ fn render_test_match_json() -> anyhow::Result<String> {
             // render_test_match's probe list and tier disclosure —
             // the flex lane updated both surfaces, and the merged
             // text-only ultrafast line had left this one behind.
+            // rm-1508 (run 5c144613 cycle 4): standard cache slots are
+            // number-or-null now — null = no published cache rate
+            // (billed at the disclosed fallback), 0.0 = published $0;
+            // the *_billed fields carry the exact rate a cache-token
+            // turn bills at including that fallback.
             serde_json::json!({
                 "model": model,
                 "input_per_million": price.input,
                 "output_per_million": price.output,
                 "cache_write_per_million": price.cw,
                 "cache_read_per_million": price.cr,
+                "cache_write_billed_per_million": price.cache_write_billed().0,
+                "cache_read_billed_per_million": price.cache_read_billed().0,
                 "flex_input_per_million": price.input_flex,
                 "flex_output_per_million": price.output_flex,
                 "flex_cache_write_per_million": price.cw_flex,
@@ -2486,6 +2493,11 @@ fn render_test_match_json() -> anyhow::Result<String> {
         .collect();
     let doc = serde_json::json!({
         "source": pricing_source(),
+        // rm-1508: catalog-wide cache-rate census — absent vs
+        // published-$0 vs published-nonzero per cache class; the
+        // population the ingest distinction is answerable against
+        // without a code change.
+        "cache_rate_census": cache_rate_census(),
         "models": rows,
     });
     Ok(serde_json::to_string_pretty(&doc)?)

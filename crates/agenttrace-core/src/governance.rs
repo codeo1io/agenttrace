@@ -49,6 +49,13 @@ pub struct CostAudit {
 pub struct PricingCoverage {
     pub priced_sessions: usize,
     pub fallback_priced_sessions: usize,
+    /// rm-1508: sessions whose cache tokens billed at the absent-rate
+    /// fallback (catalog row publishes no cache rate; cr at the input
+    /// rate, cw at 1.25× input) — counted from the
+    /// `cache_rate_fallback` disclosure counter. Zero (absent once
+    /// serialized) means no session in scope hit the fallback.
+    #[serde(skip_serializing_if = "usize_is_zero")]
+    pub cache_rate_fallback_sessions: usize,
     pub unpriced_or_unknown_sessions: usize,
     pub exact_pricing_pct: f64,
     pub confidence: String,
@@ -218,21 +225,28 @@ fn current_cost_estimate(
     // flex session at the standard row and flagged a false drift
     // (current 48 vs stored 36 on a flex+standard corpus).
     let rate = pricing::lookup_price_tiered(model, service_tier);
+    // rm-1508: the recompute bills the same absent-rate fallback the
+    // stored estimate did (cr = input rate, cw = 1.25× input), so the
+    // drift check never flags a false mismatch on fallback-priced
+    // sessions; the rates render with the fallback disclosed in the
+    // source arm so the census carries the decision.
+    let (cw_billed, cw_absent) = rate.cache_write_billed();
+    let (cr_billed, cr_absent) = rate.cache_read_billed();
     let rates = PriceBreakdown {
         input: rate.input,
         output: rate.output,
-        cache_write: rate.cw,
-        cache_read: rate.cr,
+        cache_write: cw_billed,
+        cache_read: cr_billed,
         total: 0.0,
     };
     let mut components = PriceBreakdown {
         input: round4(tokens.input.saturating_sub(recorded.input) as f64 / 1e6 * rate.input),
         output: round4(tokens.output.saturating_sub(recorded.output) as f64 / 1e6 * rate.output),
         cache_write: round4(
-            tokens.cache_write.saturating_sub(recorded.cache_write) as f64 / 1e6 * rate.cw,
+            tokens.cache_write.saturating_sub(recorded.cache_write) as f64 / 1e6 * cw_billed,
         ),
         cache_read: round4(
-            tokens.cache_read.saturating_sub(recorded.cache_read) as f64 / 1e6 * rate.cr,
+            tokens.cache_read.saturating_sub(recorded.cache_read) as f64 / 1e6 * cr_billed,
         ),
         total: 0.0,
     };
@@ -256,6 +270,14 @@ fn current_cost_estimate(
             pricing::pricing_source_for(model)
         ),
         None => pricing::pricing_source_for(model),
+    };
+    // rm-1508: carry the absent-rate fallback in the same disclosure
+    // string — only when the row actually prices cache tokens at the
+    // fallback, so published-rate rows render unchanged.
+    let source = if cw_absent || cr_absent {
+        format!("{source}; cache rates not published — fallback (cr=input, cw=1.25×input)")
+    } else {
+        source
     };
     Some((source, rates, components))
 }
@@ -523,6 +545,16 @@ pub fn cost_audit(sessions: &[Session]) -> CostAudit {
         } else {
             row.fallback += 1;
             coverage.fallback_priced_sessions += 1;
+        }
+        // rm-1508: count fallback-cache-priced sessions — the census
+        // arm that makes the fallback population visible in the
+        // report overview (pattern: fallback_pricing).
+        if session
+            .metrics
+            .disclosure_counters
+            .contains_key("cache_rate_fallback")
+        {
+            coverage.cache_rate_fallback_sessions += 1;
         }
     }
     let negative_components = sessions
@@ -1877,6 +1909,45 @@ mod tests {
             audit.pricing_note
         );
         assert!((audit.recorded_cost_usd.expect("recorded marker") - 0.07).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audit_counts_cache_rate_fallback_disclosures_as_coverage() {
+        // rm-1508 (run 5c144613 cycle 4): a session whose pricing fired
+        // the absent-rate fallback carries the disclosure counter, and
+        // the coverage census must surface it — once per session, not
+        // per application, and only for that key. The census renders
+        // as the `; cache-rate fallback: N` report arm, and only when
+        // nonzero, so fallback-free audits stay byte-identical.
+        let mut fired_twice = session("fallback-a");
+        fired_twice.metrics.model_used = "claude-sonnet-4-20250514".to_string();
+        fired_twice
+            .metrics
+            .disclosure_counters
+            .insert("cache_rate_fallback".to_string(), 2);
+        let mut fired_once_other_key_too = session("fallback-b");
+        fired_once_other_key_too.metrics.model_used = "claude-sonnet-4-20250514".to_string();
+        fired_once_other_key_too
+            .metrics
+            .disclosure_counters
+            .insert("cache_rate_fallback".to_string(), 1);
+        fired_once_other_key_too
+            .metrics
+            .disclosure_counters
+            .insert("unrelated_disclosure".to_string(), 7);
+        let mut clean = session("clean");
+        clean.metrics.model_used = "claude-sonnet-4-20250514".to_string();
+        let audit = cost_audit(&[fired_twice, fired_once_other_key_too, clean]);
+        assert_eq!(
+            audit.pricing_coverage.cache_rate_fallback_sessions, 2,
+            "one per session that fired the fallback, not per application"
+        );
+        let audit_json = serde_json::to_value(&audit).expect("cost audit json");
+        assert_eq!(
+            audit_json["pricing_coverage"]["cache_rate_fallback_sessions"],
+            serde_json::json!(2),
+            "the census rides the serialized audit the governance/report surfaces use"
+        );
     }
 
     #[test]

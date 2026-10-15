@@ -25,8 +25,10 @@ fn ultrafast_turns_bill_at_the_published_ultrafast_rates() {
     assert_eq!(per_million(&standard), (10.0, 50.0));
     let ultrafast = lookup_price_tiered("gpt-6-astra", Some("ultrafast"));
     assert_eq!(per_million(&ultrafast), (60.0, 300.0));
-    assert!((ultrafast.cw - 75.0).abs() < 1e-9);
-    assert!((ultrafast.cr - 6.0).abs() < 1e-9);
+    // rm-1508: standard cache slots are Option — the ultrafast set
+    // publishes both rates, unwrap() keeps the pin strict.
+    assert!((ultrafast.cw.unwrap() - 75.0).abs() < 1e-9);
+    assert!((ultrafast.cr.unwrap() - 6.0).abs() < 1e-9);
     // The sibling tiers keep their own rows: flex is NOT ultrafast.
     let flex = lookup_price_tiered("gpt-6-astra", Some("flex"));
     assert_eq!(per_million(&flex), (5.0, 25.0));

@@ -60,8 +60,9 @@ pub use insights::{
 pub use otel::{gen_ai_system_for_path, report_otel_export, SEMCONV_SNAPSHOT_DATE};
 pub use parser::{parse_file, parse_raw_session, parse_stdin_bytes};
 pub use pricing::{
-    list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path, pricing_source,
-    pricing_source_for, render_model_pricing_list, render_test_match, update_pricing, Price,
+    cache_rate_census, list_pricing, lookup_price, lookup_price_tiered, pricing_cache_path,
+    pricing_source, pricing_source_for, render_model_pricing_list, render_test_match,
+    update_pricing, CacheRateCensus, Price,
 };
 pub use reports::{
     add_baseline_comparison, guard_formula_json_leaves, report_compare, report_compare_json,
@@ -643,6 +644,11 @@ pub struct Metrics {
     /// run 1f12309a — a result-record usage echo kept visibly
     /// uncounted because counting it would double-bill the request
     /// its message/function_call record already summed).
+    /// rm-1508 (run 5c144613 cycle 4): `cache_rate_fallback` — pricing
+    /// billed cache tokens at the absent-rate fallback (the catalog
+    /// row publishes no cache rate; cr bills at the input rate, cw at
+    /// 1.25× input). Counted per application (session-rate arm or
+    /// per-block arm); suppressed counterfactuals do not fire it.
     /// Empty for journals without disclosures.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub disclosure_counters: BTreeMap<String, usize>,
@@ -1840,22 +1846,35 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
     // the catalog formula so they are priced exactly once, at the
     // recorded value, instead of being estimated at the session
     // model's rate on top of the recorded cost.
+    // rm-1508: cache rates resolve with the absent-rate fallback
+    // (cr = input rate, cw = input × 1.25) when the catalog row
+    // publishes none — never a silent $0. Term order is unchanged so
+    // published-rate sessions price byte-identically.
+    let (catalog_cw, _) = catalog_price.cache_write_billed();
+    let (catalog_cr, _) = catalog_price.cache_read_billed();
+    let catalog_cache_w = metrics
+        .tokens_cache_w
+        .saturating_sub(upstream_priced_cache_w);
+    let catalog_cache_r = metrics
+        .tokens_cache_r
+        .saturating_sub(upstream_priced_cache_r);
     let catalog_cost = round4(
         metrics.tokens_input.saturating_sub(upstream_priced_input) as f64 / 1e6
             * catalog_price.input
             + metrics.tokens_output.saturating_sub(upstream_priced_output) as f64 / 1e6
                 * catalog_price.output
-            + metrics
-                .tokens_cache_w
-                .saturating_sub(upstream_priced_cache_w) as f64
-                / 1e6
-                * catalog_price.cw
-            + metrics
-                .tokens_cache_r
-                .saturating_sub(upstream_priced_cache_r) as f64
-                / 1e6
-                * catalog_price.cr,
+            + catalog_cache_w as f64 / 1e6 * catalog_cw
+            + catalog_cache_r as f64 / 1e6 * catalog_cr,
     );
+    // rm-1508: the fallback is a disclosure, not a guess — count it on
+    // the session's non-loss disclosure channel so the governance
+    // census and the data-health fold surface it.
+    if pricing::cache_fallback_fired(&catalog_price, catalog_cache_w, catalog_cache_r) {
+        *metrics
+            .disclosure_counters
+            .entry("cache_rate_fallback".to_string())
+            .or_insert(0) += 1;
+    }
     // rm-520: persist which token classes the journal priced upstream
     // so audits can reproduce the stored estimate on the same basis
     // (the classes above are already excluded from the catalog
@@ -1926,6 +1945,12 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
             // rm-610: mirror the tier the turn actually ran on.
             pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
         };
+        // rm-1508: the counterfactual prices at the same fallback
+        // rates real billing would use, but does NOT fire the
+        // disclosure counter — the counter tracks billed estimates,
+        // not suppressed counterfactuals.
+        let (suppressed_cw, _) = suppressed_price.cache_write_billed();
+        let (suppressed_cr, _) = suppressed_price.cache_read_billed();
         let suppressed_estimate =
             event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64 / 1e6
                 * suppressed_price.input
@@ -1944,7 +1969,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .unwrap_or(0)
                     .max(0) as f64
                     / 1e6
-                    * suppressed_price.cw
+                    * suppressed_cw
                 + event
                     .usage
                     .get("cache_read_input_tokens")
@@ -1952,7 +1977,7 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .unwrap_or(0)
                     .max(0) as f64
                     / 1e6
-                    * suppressed_price.cr;
+                    * suppressed_cr;
         if suppressed_estimate - recorded > 0.005 {
             *metrics
                 .disclosure_counters
@@ -2032,6 +2057,30 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                 // flex-disclosing turns use the row's flex slots.
                 pricing::lookup_price_tiered(&event.model_used, event.service_tier.as_deref())
             };
+            // rm-1508: per-block cache rates resolve with the same
+            // absent-rate fallback as the session-rate arm, and the
+            // fallback here DOES fire the disclosure counter — this is
+            // a billed estimate.
+            let (block_cw, _) = block_price.cache_write_billed();
+            let (block_cr, _) = block_price.cache_read_billed();
+            let block_cache_w = event
+                .usage
+                .get("cache_creation_input_tokens")
+                .copied()
+                .unwrap_or(0)
+                .max(0);
+            let block_cache_r = event
+                .usage
+                .get("cache_read_input_tokens")
+                .copied()
+                .unwrap_or(0)
+                .max(0);
+            if pricing::cache_fallback_fired(&block_price, block_cache_w, block_cache_r) {
+                *metrics
+                    .disclosure_counters
+                    .entry("cache_rate_fallback".to_string())
+                    .or_insert(0) += 1;
+            }
             let block_cost = event.usage.get("input_tokens").copied().unwrap_or(0).max(0) as f64
                 / 1e6
                 * block_price.input
@@ -2043,22 +2092,8 @@ pub fn analyze(events: &[Event], model: &str) -> Metrics {
                     .max(0) as f64
                     / 1e6
                     * block_price.output
-                + event
-                    .usage
-                    .get("cache_creation_input_tokens")
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as f64
-                    / 1e6
-                    * block_price.cw
-                + event
-                    .usage
-                    .get("cache_read_input_tokens")
-                    .copied()
-                    .unwrap_or(0)
-                    .max(0) as f64
-                    / 1e6
-                    * block_price.cr;
+                + block_cache_w as f64 / 1e6 * block_cw
+                + block_cache_r as f64 / 1e6 * block_cr;
             per_block_cost += block_cost;
             entry.cost_usd = round4(entry.cost_usd + block_cost);
         }

@@ -65,10 +65,12 @@ fn parsed(name: &str, body: &str) -> Session {
 
 fn catalog_total() -> f64 {
     let price = lookup_price("claude-sonnet-4-20250514");
+    // rm-1508: standard cache slots are Option; sonnet publishes both
+    // rates, so unwrap() keeps the oracle strict.
     (500.0 / 1e6 * price.input)
         + (1000.0 / 1e6 * price.output)
-        + (5000.0 / 1e6 * price.cw)
-        + (25000.0 / 1e6 * price.cr)
+        + (5000.0 / 1e6 * price.cw.unwrap())
+        + (25000.0 / 1e6 * price.cr.unwrap())
 }
 
 const DRIFT_NOTE: &str = "current rates recalculate";
