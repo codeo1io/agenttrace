@@ -45,6 +45,13 @@ require_json() {
 [[ -x "$bin" ]] || fail "agenttrace binary is not executable: $bin"
 [[ -d "$source_dir" ]] || fail "real sessions directory does not exist: $source_dir"
 
+# rm-525: the snapshot stages REAL operator transcripts; stage it
+# private (umask 077 — observed live as -rw-rw-r-- copies landing next
+# to the binary's own 0600 cache files) and every later artifact of
+# this gate stays private too. The umask sits ABOVE the output/snapshot
+# mkdirs (review 6cbb259b F6) so the staged DIRECTORIES are owner-only
+# as well, not just the files inside them.
+umask 077
 rm -rf "$out_dir"
 mkdir -p "$out_dir"
 
@@ -57,6 +64,12 @@ while IFS= read -r file; do
   [[ "$copied" -ge "$file_limit" ]] && break
 done < <(find "$source_dir" -type f 2>/dev/null | sort)
 [[ "$copied" -gt 0 ]] || fail "could not copy real session files from: $source_dir"
+
+# rm-525 acceptance arm: prove the staging is private — no group/other
+# access bits on any staged file OR directory (directories included
+# per review 6cbb259b F6).
+[[ -z "$(find "$snapshot_dir" -perm /077 -print -quit)" ]] ||
+  fail "real-session snapshot must not be group/other accessible (rm-525)"
 
 run_capture doctor-default --doctor -f json
 run_capture doctor-snapshot --doctor -d "$snapshot_dir" -f json

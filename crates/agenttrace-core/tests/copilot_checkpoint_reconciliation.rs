@@ -209,6 +209,7 @@ fn agent_host_turn_markers_are_named_not_dropped() {
 // (rm-230 convention). This pins the masking PoC as a regression: on a
 // tree where the const is still 32 the hand-written v32 entry below IS
 // served and both assertions fail.
+#[cfg(unix)]
 #[test]
 fn stale_schema_32_cache_cannot_mask_the_agent_lane_rollup() {
     use std::os::unix::fs::MetadataExt;
@@ -307,6 +308,7 @@ fn stale_schema_32_cache_cannot_mask_the_agent_lane_rollup() {
 // (rm-230 convention). This pins the masking PoC as a regression: on a
 // tree where the const is still 35 the hand-written v35 entry below IS
 // served and the assertions fail.
+#[cfg(unix)]
 #[test]
 fn stale_schema_35_cache_cannot_mask_the_hostile_value_folds() {
     use std::os::unix::fs::MetadataExt;

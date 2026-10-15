@@ -121,6 +121,7 @@ fn mixed_session_counts_only_the_zero_blocks() {
 // This is the review's PoC pinned as a regression: on a tree where the
 // const is still 22 the hand-written v22 entry below IS served and the
 // first assertion fails.
+#[cfg(unix)]
 #[test]
 fn stale_schema_22_cache_cannot_mask_the_disclosure() {
     use std::os::unix::fs::MetadataExt;

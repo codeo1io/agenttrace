@@ -1873,6 +1873,7 @@ fn waste_report_format_matrix_pins_every_machine_surface() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_alias_paths_report_one_session() {
     // rm-597 (run 250cfd64, cycle 4; minted campaign-locally as rm-511,
