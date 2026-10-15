@@ -1,0 +1,35 @@
+{
+ "_snapshot": {
+  "date": "2026-10-01",
+  "models": 3,
+  "source": "fixture"
+ },
+ "prov/alpha": {
+  "cache_creation_input_token_cost": 3.75e-06,
+  "cache_read_input_token_cost": 3e-07,
+  "input_cost_per_token": 3e-06,
+  "litellm_provider": "prov",
+  "max_input_tokens": 200000,
+  "mode": "chat",
+  "output_cost_per_token": 1.5e-05
+ },
+ "prov/beta": {
+  "cache_creation_input_token_cost": 0,
+  "cache_read_input_token_cost": 4e-07,
+  "deprecation_date": "2027-01-01",
+  "input_cost_per_token": 1e-06,
+  "input_cost_per_token_flex": 5e-07,
+  "litellm_provider": "prov",
+  "max_input_tokens": 100000,
+  "mode": "chat",
+  "output_cost_per_token": 5e-06
+ },
+ "prov/gamma": {
+  "cache_creation_input_token_cost": 0,
+  "cache_read_input_token_cost": 0,
+  "input_cost_per_token": 2e-06,
+  "litellm_provider": "prov",
+  "mode": "chat",
+  "output_cost_per_token": 1e-05
+ }
+}

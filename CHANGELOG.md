@@ -4,6 +4,31 @@
 
 ### Added
 
+- every pricing snapshot refresh now records a change-class ledger (rm-1440,
+  run b9963213 cycle 3): `scripts/pricing/update-snapshot.sh` appends one JSON
+  line per successful refresh to `scripts/pricing/snapshot-change-ledger.jsonl`
+  classifying the diff against the committed bundle — growth, correction,
+  window, removal (honored manual drop), field_removal, and oscillation —
+  because research proved the upstream catalog takes correction-only drifts
+  (identical key counts, different rates; the same cell moved twice within
+  two hours) that md5 and key-count freshness gates cannot see. A retained
+  model losing a cost/context field upstream is RESTORED from the prior
+  bundle (absent cache rates used to be silently zeroed by the trim step);
+  a cell moving back to a value it already held in a recent refresh is
+  QUARANTINED with the prior value retained and the attempt disclosed. The
+  histogram prints on every refresh and replays via `--histogram`; the
+  pricing-drift PR body embeds it. New flags under the rm-901 guard:
+  `--check` reports upstream-vs-vendored drift writing nothing,
+  `--selftest` runs the offline fixture arms
+  (`scripts/pricing/fixtures/change-class/`), `--histogram` replays the last
+  ledger line. The v0.0.4 release tag gains a no-changelog-section marker
+  (rm-1443), closing the last red row of the plugin-version gate.
+- pricing snapshot refreshed to 2026-10-14 (rm-588 union refresh, first
+  landing recorded through the rm-1440 change-class ledger): +38 new priced
+  models, 267 rate corrections, 67 window-only changes, 2 field removals
+  restored from the prior bundle, 466 retired keys retained by the never-drop
+  union; `PRICING_SNAPSHOT_DATE` bumped to match.
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
@@ -1113,3 +1138,52 @@ section); this section records the upstream release being adopted wholesale:
 <!-- no-changelog-section: v0.7.6: release only published the npm launcher under the zack78 scope (e20a224); packaging plumbing, no user-facing behavior to section -->
 <!-- no-changelog-section: v0.7.7: release only fixed release-channel script permissions (cd33203); CI plumbing, no user-facing behavior to section -->
 <!-- no-changelog-section: v0.8.0: upstream merge "Improve pricing provenance and TUI session exploration (#280)" (b964a74) shipped without a dedicated section; its user-visible changes are covered by the v0.8.1 and v0.9.0 sections that follow it -->
+<!-- no-changelog-section: v0.0.4: initial tag predating the per-tag CHANGELOG discipline (rm-303); no user-facing section to reconstruct (rm-1443) -->
+<!-- no-changelog-section: v0.3.0: bilingual i18n release (e93f695) predates the per-tag CHANGELOG discipline (rm-303); shipped with full release notes on the tag, no section worth reconstructing -->
+<!-- no-changelog-section: v0.3.1: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Merge pull request #1 from luoyuctl/codex/tui-product-polish" (a2cb63e); section not reconstructed -->
+<!-- no-changelog-section: v0.3.2: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Add built-in demo sessions" (bda2bab); section not reconstructed -->
+<!-- no-changelog-section: v0.3.3: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Prepare v0.3.3 release" (6bf79bd); section not reconstructed -->
+<!-- no-changelog-section: v0.3.4: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Add setup doctor command" (5f5c389); section not reconstructed -->
+<!-- no-changelog-section: v0.3.5: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.5" (24a8a1d); section not reconstructed -->
+<!-- no-changelog-section: v0.3.6: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.6" (78f2254); section not reconstructed -->
+<!-- no-changelog-section: v0.3.7: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Add Cursor export parser" (134aac5); section not reconstructed -->
+<!-- no-changelog-section: v0.3.8: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.8" (f34deac); section not reconstructed -->
+<!-- no-changelog-section: v0.3.9: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.9" (9d38cd0); section not reconstructed -->
+<!-- no-changelog-section: v0.3.10: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.10" (aa270a2); section not reconstructed -->
+<!-- no-changelog-section: v0.3.11: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.11" (698aa65); section not reconstructed -->
+<!-- no-changelog-section: v0.3.12: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.12" (4904655); section not reconstructed -->
+<!-- no-changelog-section: v0.3.13: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.13" (4eabcad); section not reconstructed -->
+<!-- no-changelog-section: v0.3.14: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.14" (c972ac2); section not reconstructed -->
+<!-- no-changelog-section: v0.3.15: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.15" (66d95e6); section not reconstructed -->
+<!-- no-changelog-section: v0.3.16: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.16" (82e1354); section not reconstructed -->
+<!-- no-changelog-section: v0.3.17: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.17" (44f650d); section not reconstructed -->
+<!-- no-changelog-section: v0.3.18: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.18" (8e3aa97); section not reconstructed -->
+<!-- no-changelog-section: v0.3.19: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.19" (2a70fac); section not reconstructed -->
+<!-- no-changelog-section: v0.3.20: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.20" (eea6892); section not reconstructed -->
+<!-- no-changelog-section: v0.3.21: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.21" (6bee969); section not reconstructed -->
+<!-- no-changelog-section: v0.3.22: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.22" (d1750a8); section not reconstructed -->
+<!-- no-changelog-section: v0.3.23: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.23" (4ad4023); section not reconstructed -->
+<!-- no-changelog-section: v0.3.24: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.24" (43ddd22); section not reconstructed -->
+<!-- no-changelog-section: v0.3.25: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.25" (6f8bae8); section not reconstructed -->
+<!-- no-changelog-section: v0.3.26: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.26" (ffd4f7c); section not reconstructed -->
+<!-- no-changelog-section: v0.3.27: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.27" (b322e33); section not reconstructed -->
+<!-- no-changelog-section: v0.3.28: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.28" (6278094); section not reconstructed -->
+<!-- no-changelog-section: v0.3.29: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Release 0.3.29" (bd90a9a); section not reconstructed -->
+<!-- no-changelog-section: v0.3.30: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Add health trend to overview" (883747b); section not reconstructed -->
+<!-- no-changelog-section: v0.3.31: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Prepare 0.3.31 release" (636a3bf); section not reconstructed -->
+<!-- no-changelog-section: v0.3.32: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Prepare 0.3.32 release" (c90a397); section not reconstructed -->
+<!-- no-changelog-section: v0.3.33: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Prepare 0.3.33 release" (1c5aa2a); section not reconstructed -->
+<!-- no-changelog-section: v0.3.34: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Prepare 0.3.34 release" (6e9a634); section not reconstructed -->
+<!-- no-changelog-section: v0.3.35: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.35" (4faab91); section not reconstructed -->
+<!-- no-changelog-section: v0.3.36: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.36" (dead5c8); section not reconstructed -->
+<!-- no-changelog-section: v0.3.37: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.37" (d6f7afb); section not reconstructed -->
+<!-- no-changelog-section: v0.3.38: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Sync 0.3.38 metadata" (c870a7d); section not reconstructed -->
+<!-- no-changelog-section: v0.3.39: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Show compact triage columns" (4e5e083); section not reconstructed -->
+<!-- no-changelog-section: v0.3.40: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Improve keymap readability" (d5fb998); section not reconstructed -->
+<!-- no-changelog-section: v0.3.41: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Improve standard-width TUI readability" (f7dfef0); section not reconstructed -->
+<!-- no-changelog-section: v0.3.42: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Pin npm installer release tag (#6)" (2fe2a03); section not reconstructed -->
+<!-- no-changelog-section: v0.3.44: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Prepare 0.3.44 release (#15)" (4ef4811); section not reconstructed -->
+<!-- no-changelog-section: v0.3.45: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.45 (#78)" (505ea2e); section not reconstructed -->
+<!-- no-changelog-section: v0.3.46: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.46 (#81)" (15a5694); section not reconstructed -->
+<!-- no-changelog-section: v0.3.47: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.47" (7f3729f); section not reconstructed -->
+<!-- no-changelog-section: v0.3.48: legacy tag predating the per-tag CHANGELOG discipline (rm-303); shipped as "Bump version to 0.3.48" (a71b7b8); section not reconstructed -->

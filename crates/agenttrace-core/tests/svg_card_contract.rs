@@ -175,10 +175,19 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
             .unwrap_or("<no date labels>")
     );
     // The demo corpus's fixed timestamps are far from today; if the card
-    // were anchored to `Utc::now()` today's date would leak in.
+    // were anchored to `Utc::now()` today's date would leak in. The pricing
+    // footer legitimately carries the bundled snapshot's date, which CAN be
+    // today's UTC date on a same-day refresh — a corpus-independent fact,
+    // not a wall-clock leak — so the scan covers corpus-derived content only
+    // (everything except that footer line).
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let corpus_scoped: String = card
+        .lines()
+        .filter(|line| !line.contains("pricing LiteLLM snapshot"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !card.contains(&today),
+        !corpus_scoped.contains(&today),
         "wall-clock date leaked into a corpus-anchored card"
     );
 }

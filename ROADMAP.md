@@ -1993,6 +1993,8 @@ test' rc0, 38 suites 697/0, fmt/clippy/release/docs-gate rc0.
 - id: `rm-901` | track: reliability | priority: 41.0 | status: candidate
 - acceptance: --help/-h/usage print usage and exit rc0 with ZERO side effects (no fetch, no write); a --check mode reports upstream-vs-vendored drift (today 3,743 vs 3,099) without writing anything; the default no-arg refresh lane is unchanged; a smoke check (or docs-gate hook) pins the no-side-effect guarantee
 - evidence: campaign-recorded in agenttrace ROADMAP.md
+- EXECUTED (cycle 3 run b9963213, 2026-10-15): --check reports drift via drift-check.sh --live with bundle+ledger md5 pinned identical in/out (zero writes); --histogram replays the rm-1440 ledger; --selftest pins the no-side-effect guarantee; stray-argv refusal rc2 pre-existed (premise correction disclosed); review fix F4/F7 tightened the argv contract further — exactly-one-argument refusal rc2 before any fetch, unreadable LITELLM_SNAPSHOT_SRC infra rc2 (see the rm-1440 acceptance clause). status flip to done pends the commit gate (rm-012).
+- VALIDATED: targeted f288562075 + full_tests b871becec (check-mode zero-writes pinned both ends).
 
 ### Run-acceptance (trust disposition) ledger — watch item, promotion-gated
 - id: `rm-090` | track: reliability | priority: 40.0 | status: candidate
@@ -2445,5 +2447,129 @@ Batch **'usage truthfulness & honest ordering'** (prioritize f4db79c1; implement
 - Integration seam (2026-10-13, conflict cases 8fbcfcfd5e4d440b8e2890456aaacede (textual, round 1) + 2779148a1b474625a9d951154ffbd171 (independent semantic review, this round); integration of run 90514a3833d04721a6a3ca40ea695423 cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache accounting' — rm-1052 LEAD recorded-zero disclosure + rm-499 cacheWrite1h own canonical class, conductor-landing 9a881b9 @ candidate base 82e23b9 into advanced integration HEAD 794b6e5 past the sibling landings of 975ac79d/4309a268/12a73275/b5affead/df258362/4aaa4c9f + the 2138cec render): ROUND 1 (8fbcfcfd) re-based the batch's session-cache schema 60→61 mint onto the landed 62→63 ceiling as 63→64 (landed-rung-keeps-numeral convention, c7c07e48/58fbbd6c/7762d54b; rung 61 stays permanently free — resolving the c4 compound banner's schema-61 collision question against the rm-1022 sibling) with every pinned surface swept same-unit (const + dated ladder rung, usage_occurrence_contract oracle, governance-guide sentence, sweep doc). THIS ROUND re-applies the never-landed commit-gate ROADMAP chain per the a085b2c3/95610bc8/c24610a5 precedent — the run's commit phase was provider-reaped (429-gated), so terminal landing 9a881b9 carried only the code unit: p1 roadmap c4 (6d394bb5) + p2 compound c4 (0696b983), the review-fix-corrected chained postimages authoritative per the 931f52f8 handoff — at the render seams of the advanced wall: both c4 banners at the stack top (newest-landed-first), the five dated riders on their anchor rows with ONE BY-TITLE RE-ANCHOR (RC6's serde_json 1.0.152/.153/.154 burst lands on the rm-1023 pin-watch row — minted by run 4309a268 only AFTER p1 was authored against the stale 82e23b9 render whose literal anchor was the rm-248 block tail; by-title, never-id), the wall-foot mint band rm-1052..rm-1054 with ORIGINAL numerals (zero def-row claims on this wall; the compound VALIDATED riders verbatim) and the compound's flips landed with the code: rm-1052 minted-implemented, rm-499 candidate→implemented (done-flips stay reserved to the shipping gate, rm-012 convention). SEMANTIC ADJUDICATIONS by this review: (1) the c4 banner's rm-1053/rm-988 title-twin fold question resolves NEGATIVE on this lineage — pricing.rs is untouched between 82e23b9 and 794b6e5 at provider_for_in/pricing_source_for_catalog/normalize_model/matching_catalog_key (no sibling landed the raw-id single-normalize seam here; this wall's rm-988 is the blank-search row, title-disjoint), so rm-1053 stays candidate as minted; (2) the merged-tree mechanics re-verified at the seam: the disclosure loop sits above the multi/single-model arm split in lib.rs (catalog_price + pricing::lookup_price_tiered, divergence >$0.005, recorded stays the number per the rm-419 discipline), pi_cache_write_1h_blocks increments at all three oh_my_pi_usage call sites in parser.rs, and the session-cache ladder carries the 63→64 rung with its dated comment; (3) the two standing full-gate reds (check-plugin-version FULL-CLONE-ONLY class, check-install-runtime test D) are banner-carried and intersect nothing this merge touched. Post-landing census: 386 def rows, zero duplicate ids, def-max rm-1369, managed footer still the file's last line. VERIFICATION (targeted only; the full suite is the supervisor's): zero conflict markers tree-wide; cargo check --workspace rc0; cargo fmt --check rc0.
 
 - Integration seam (2026-10-13, conflict case 3304528b10e844ba87a8c14c1db03886, independent semantic review round — the textual round was bc91bdf5bb324f24bde2017afeee2804 above; integration of run 8e5a088724f1481c873b8b0c359ba6d8 cycle 3 "formula-guard completion" — rm-985 LEAD every-human-lane neutralization + rm-897 evidence refresh + the two vendored hostile fixtures, landing cfe2aa1 @ base 82e23b9 into advanced integration HEAD past the sibling landings): REVIEW VERDICT — the combined tree is sound; round 1's adjudications re-verified against the code, not just the banners. AUDIT SCOPE: canonical three-way re-merge per shared file — governance.rs/lib.rs/reports.rs staged == clean merge byte-identical; main.rs and search.rs differ from canonical ONLY inside the regions canonical flagged, and each difference keeps BOTH intents (rm-985 String-leaf csv_export guard composed with rm-1014 null-omission semantics in render_plain_value; both the rm-988 blank-search pin and the rm-985 search pin); def-row id census 386 unique with the managed footer last. CROSS-LANE GUARD COVERAGE verified against every master-side text surface landed past the base: the rm-201 `--quota` view renders through its own formatter with no guarded cell (byte-stable, its 4 lib pins green on the merged tree), the rm-992 statusline lane is untouched by the batch, mcp.rs speaks JSON-RPC wire (deliberately outside the human-lane guard, byte-lossless by design), and the landed rm-625 output-safety matrix's control-byte assertions are orthogonal to the introducer guard — both suites green together. FINDINGS FIXED THIS ROUND: (1) NTFS portability — the vendored name-fixture kept the PoC's raw filename `=2+5|cmd.jsonl`, whose `|` is un-creatable on NTFS: the windows-latest Test lane (`cargo test -p agenttrace-core`) would fail at checkout; renamed `=2+5_cmd.jsonl` (index + HOSTILE_FIXTURE const + provenance comment; the poison is the message body, so nothing else moves). (2) CHANGELOG rider — the batch landed with no Unreleased bullet although every landed maintenance batch carries one (the a93aa56a precedent): the rm-985/rm-897 Fixed bullet added with the integration-seam record. VERIFICATION (targeted only; the full suite is the supervisor's): zero conflict markers tree-wide; cargo check --workspace --all-targets --locked rc0; core --lib 385/0; CLI bin 110/0; formula_lane_contract 5/0 post-rename; output_safety_matrix + csv_export green; changelog-structure gate rc0. No schema-affecting arm — the cache rung stays 64 (the 8fbcfcfd mint above).
+
+## Cycle 3 compound band — run b9963213061e47ec9185474ce4901b04 (2026-10-15)
+
+Banner (repository-maintenance 15dcd35d cycle 3, worktree dade9cd, base 3e90993): batch
+'snapshot refresh truth: change-class ledger + gate closure' shipped — full battery green
+modulo 3 disclosed standing reds (install-runtime test D rm-051; actionlint SC2001
+ci.yml:192; cargo-deny rustls 0.23.45 advisories — still 0.23.45 on origin/master at
+compound finish), zero new failures. WALL DIVERGENCE DISCLOSED (adoption-verified by
+attempt 5a93dcfc 2026-10-15): origin/master advanced to e130845c during the cycle (21
+commits past dade9cd; sibling wall deltas landed — 9e84599 mints rm-1500..rm-1502,
+3655355 mints rm-1401/rm-1402 — live wall 397 def rows, def-max rm-1502, managed
+footer last); this band's numerals are absent there and reconcile BY TITLE
+landed-first at the commit gate (fog convention; never renumber pre-landing). The
+roadmap phase's spool-side band (bad1a64e scratch + /tmp mirror) was REAPED before
+compound — the mint rows below are the in-tree rebuild of record from the work-order
+record (the rm-1401 rebuilt-at-compound precedent). The rm-588 clause-3 refresh delta
+(+38 growth / 267 correction / 67 window / 2 field_removal / 466 retained,
+2026-10-14) has no rm-588 row in either tree (rm-176 exists in both) and is durably
+recorded in scripts/pricing/snapshot-change-ledger.jsonl line 1 (tracked artifact) +
+CHANGELOG. Done-flips pend the commit gate (rm-012). AMENDED at review-fix
+99b6b7b2 per independent review 4ccd30ab (VERDICT NEEDS_CHANGES, 8 findings F1-F8):
+F4/F5/F6/F7/F8 were CODE fixes — landed by review-fix attempt cf669bbe, which died of
+a provider failure ~23 min in; its durable tree work (update-snapshot.sh mtime
+07:53:55Z, ledger 07:58:37Z, both inside its 07:39:04-08:02:48Z event-log window) was
+ADOPTED by 99b6b7b2 after first-hand re-verification, F1/F2/F3 are the PROSE
+corrections completed by 99b6b7b2 (oscillation-is-selftest-pinned, acceptance/evidence
+clauses on every mint row, arm/guard counts corrected). See the REVIEW-FIX AMENDMENT
+in the cycle record doc.
+
+### Snapshot refresh change-class ledger — rm-1440
+- id: `rm-1440` | track: reliability | priority: 66.0 | status: implemented (flip pends commit rm-012)
+- EXECUTED: scripts/pricing/update-snapshot.sh rewritten (+559/-162 numstat at
+  implement; +677/-166 after review fix) — append-per-refresh
+  ledger scripts/pricing/snapshot-change-ledger.jsonl classifying growth / correction /
+  window / removal / field_removal (restored from prior bundle, never silently zeroed —
+  trim() 'or 0' cache_read zeroing eliminated, proven RED first) / oscillation
+  (quarantined: prior value retained, attempt disclosed; A→B→A′ regression proven RED
+  first). Offline --selftest + fixtures scripts/pricing/fixtures/change-class/ — 7 arms
+  at implement (arm1 correction, arm2 oscillation, arm3 field-removal incl. provider,
+  arm4 never-drop union, arm4b malformed-drop refusal, arm5 honored removal, arm6
+  ledger schema — the implement-time "8-arm" phrasing was a miscount, review F3);
+  arm7 event-cap ordering added at review fix = 8 arms + 6 guard checks.
+- VALIDATED: selftest ALL ARMS PASS — 8 arms + 6 guards at review-fix close (7 arms + 4
+  guards at implement); ledger line 1 (real refresh 3130→3168 models) exercises every
+  class except removal and oscillation (oscillation:0 live, selftest-pinned arm2 —
+  review F1); core --lib 388/0 incl. pricing suite over refreshed bundle; full
+  battery 24 lane groups green (targeted d55c6589-redo f288562075 + full b871becec).
+- acceptance: every successful refresh appends one per-event change-class ledger line
+  with counts COMPLETE under the 400-event cap (safety-critical removal /
+  field_removal / oscillation assembled FIRST, any truncation disclosed via
+  truncated_events — review F6); no RESTORE_FIELD can be silently zeroed or absorbed
+  (trim() stamps no absent rate; litellm_provider rides only when non-empty, so an
+  upstream loss fires field_removal + restore from the prior bundle — review F5);
+  oscillation quarantine retains the prior value while disclosing the attempt;
+  report-only modes (--check / --histogram / --selftest) write nothing — bundle+ledger
+  md5 pinned identical in/out; argv contract = exactly zero or one argument (stray or
+  second argument REFUSED rc 2 before any fetch — review F4; unreadable
+  LITELLM_SNAPSHOT_SRC = infra rc 2 under both --check and refresh, never colliding
+  with drift's rc 1 — review F7); the tracked ledger baseline carries only real
+  refreshes (re-run/selftest debris pruned with the prune disclosed — review F8).
+- evidence: bash scripts/pricing/update-snapshot.sh --selftest → rc0 'ALL ARMS PASS'
+  (8 arms + 6 guards); LITELLM_SNAPSHOT_SRC=scripts/pricing/fixtures/change-class/
+  base.json … --check → rc1 actionable drift, zero writes (bundle ffa3b7e7 / ledger
+  19a31117 pinned in/out); --check extra-stray-arg → rc2 REFUSED no-fetch; 
+  LITELLM_SNAPSHOT_SRC=<missing-file> … --check → rc2 infra; --typo-flag → rc2;
+  snapshot-change-ledger.jsonl line 1 counts correction=267 field_removal=2 growth=38
+  oscillation=0 removal=0 retained=466 window=67 (date 2026-10-14, src_md5 9ffd6b2e);
+  cargo test -p agenttrace-core --lib 388/0 (incl. pricing suite over the refreshed
+  bundle, implement af17e490 + targeted f288562075); full_tests b871becec lane-4 13
+  suites 684/0.
+
+### Legacy plugin-version gate closure — rm-1443
+- id: `rm-1443` | track: dev-ex | priority: 45.0 | status: implemented (flip pends commit rm-012)
+- EXECUTED: 49 no-changelog-section markers (v0.0.4 + v0.3.0..v0.3.48) — the rm-303 arm
+  walks EVERY merged semver tag; markers cite each tag's own commit subject.
+- VALIDATED: check-plugin-version.sh rc1→rc0 with causality flip (delete→rc1→restore
+  →rc0); green under git fetch --tags verbatim at full_tests b871becec.
+- acceptance: check-plugin-version.sh exits rc0 at the batch tree AND rc1 the moment
+  any merged-semver-tag section or marker is deleted (causality proven BOTH
+  directions); every merged v* tag is walked (the one-tag premise retired — 49 tags
+  deep), each marker citing its tag's own commit subject; version chain monotone
+  (plugin.json == CHANGELOG == latest merged tag).
+- evidence: bash scripts/ci/check-plugin-version.sh → rc0 'plugin.json v0.10.1 matches
+  CHANGELOG v0.10.1 and advances past merged tag v0.10.1' (pre-batch rc1: 'merged tag
+  v0.0.4 has no CHANGELOG section', prioritize 2aa1611); delete-marker → rc1, restore
+  → rc0 (targeted f288562075); 49 markers == 49 merged legacy tags, SHAs spot-checked
+  (v0.3.30 883747b, v0.3.0 e93f695, v0.3.48 a71b7b8, v0.3.42 2fe2a03; v0.3.43 never
+  existed); re-run rc0 at review fix 99b6b7b2.
+
+### Claude multi-org attribution — rm-1441
+- id: `rm-1441` | track: parsing | priority: 55.0 | status: ceded-in-flight
+- Ceded to sibling 4f2af62e implementing the title (claude_org_identity_contract.rs +
+  fixtures/claude-org/ observed dirty 2026-10-14 14:0xZ); research riders: codeburn
+  #1758/#1759 org PRs advancing; CC 2.1.299 $.session.identity() org/email surface.
+- acceptance: none executably owed by this run — one subject, one landing; the sibling
+  4f2af62e landing owns the title and reconciles here BY TITLE (never numeral) at the
+  commit gate; this band records the cession + riders only.
+- evidence: sibling worktree porcelain observation 2026-10-14 14:0xZ (prioritize
+  2aa1611 fleet census — 4f2af62e dirty on claude_org_identity_contract.rs +
+  fixtures/claude-org/); research ebfb76ed riders: codeburn #1758/#1759 org PRs,
+  CC 2.1.299 $.session.identity() org/email surface.
+
+### Codex per-turn usage attribution — rm-1442
+- id: `rm-1442` | track: parsing | priority: 50.0 | status: deferred-next-cycle
+- Deferred: parser.rs/reports.rs contended by in-flight siblings at selection time;
+  demand evidence live (codex #53855 15.9M-token single turn; #53848 wrong-account
+  threads). NEXT CYCLE SEED: bounded per-turn usage attribution with #53855 as fixture
+  shape, post-contention.
+- acceptance: owed by the next cycle, not this one — bounded per-turn usage attribution
+  (#53855's 15.9M-token single turn as fixture shape) implemented post-contention on
+  parser.rs/reports.rs, per-turn totals disclosed without regressing session totals.
+- evidence: demand live at selection: codex #53855 (15.9M-token single turn), #53848
+  (wrong-account threads); deferral rationale = surface contention census at
+  prioritize 2aa1611 (parser.rs dirty in 2 sibling worktrees, reports.rs contended).
+
+### rider — svg-golden regen quad (pre-full_tests drift, adopted)
+- id: rm-1513 | track: reliability | priority: S | status: implemented (flip pends commit rm-012)
+- Fleet-delegate drift landed between targeted and full validation: 3 svg goldens +
+  svg_card_contract.rs regenerated for the 2026-10-14 bundle refresh (contract asserts
+  the 2026-10-08→2026-10-14 pricing-snapshot migration). Validated inside core 388/0 at
+  full_tests b871becec. Numeral rm-1513: unclaimed on the live wall (verified at
+  origin/master e130845c) but fog-contended fleet-wide — title-unique binding governs,
+  never renumber pre-landing; annotation row by design (adopted drift carries no
+  roadmap score).
 
 <!-- managed by hermes-roadmap render; do not edit by hand -->
