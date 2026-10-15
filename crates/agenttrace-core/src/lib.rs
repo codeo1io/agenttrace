@@ -85,8 +85,9 @@ pub use session_cache::{
     MIN_CONFIGURED_SESSION_CACHE_ENTRIES, SESSION_CACHE_SCHEMA_VERSION,
 };
 pub use sqlite_sessions::{
-    load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported, skip_sqlite_backed_file_dir,
-    SqliteDroppedRows, SqliteDuplicateDb, SqliteIngestReport, SqliteUnreadableDb,
+    load_sqlite_backed_sessions, load_sqlite_backed_sessions_reported,
+    load_sqlite_backed_sessions_reported_bounded, skip_sqlite_backed_file_dir, SqliteDroppedRows,
+    SqliteDuplicateDb, SqliteIngestReport, SqlitePartialDb, SqliteScanBudget, SqliteUnreadableDb,
 };
 pub use statusline::{
     correlated_prompt_ids, is_bidi_format_control, load_statusline_insights, render_budget_view,

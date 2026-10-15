@@ -4,6 +4,49 @@
 
 ### Added
 
+- `--doctor` completes honestly on real homes (rm-367 stages (b)(c)(d), run
+  ff5c1cd8 cycle 4): the doctor walk now runs under a per-root wall-clock
+  budget (default 60s, `AGENTTRACE_DOCTOR_ROOT_BUDGET_MS`) with a per-root
+  parsed-byte cap (default 512 MiB, `AGENTTRACE_DOCTOR_ROOT_MAX_BYTES`) and a
+  bounded SQLite lane (`AGENTTRACE_DOCTOR_DB_BUDGET_MS` per database,
+  `AGENTTRACE_DOCTOR_SQLITE_TOTAL_BUDGET_MS` total — a watcher thread
+  interrupts runaway aggregates), so a decade-scale HOME can no longer stall
+  the scan silently (the cycle-4 assess red: `--doctor -f json` hit rc 124 at
+  BOTH timeout 240 and 900 with zero stdout; after: rc 0 in 61s on the same
+  home). Truncation is disclosed, never hidden: files the budget or size cap
+  skipped count as `skipped_budget`/`skipped_size` (never as failures), a
+  truncated SQLite pass is listed in `sqlite_partial_dbs` and never persists a
+  snapshot, and the report gains a `scan_partial` block ('scanned N of M
+  roots…', roots truncated, per-bucket counts) — omitted entirely when the
+  scan is complete, so clean and `--demo` outputs serialize byte-identically
+  (pinned). Progress lines on stderr before each root's first parse and
+  before each database ingest make a hung run diagnosable. Cache hits stay
+  exempt from the budget (checked first), so warm reruns keep their numbers
+  under a spent budget (pinned). Contract suite:
+  `crates/agenttrace-core/tests/doctor_scan_budget_contract.rs` (6 tests).
+  Rider: `LoadReport` grew with the truncation disclosure, pushing the TUI
+  load message over clippy's large-variant threshold — the one-shot completion
+  payload is boxed (`agenttrace-tui`), hot path untouched.
+
+- the output-contract gate no longer walks the operator's real HOME
+  (rm-1425, run ff5c1cd8 cycle 4): `scripts/ci/check-output-contract.sh`'s
+  doctor probe ran `--doctor -f json` against the inherited HOME — on a
+  developer host that is the operator's live corpus (a gate run mutated the
+  real `~/.cache/agenttrace/sessions.json` and captured a 25,160-session
+  report into a CI artifact). The probe is now scoped to a deterministic
+  throwaway home (fixed path under `TMPDIR`, HOME/XDG/cache overridden in a
+  subshell) — the gate still asserts exactly what it always did (non-empty,
+  valid-JSON doctor output, rc 0) and the captured `doctor.json` is now
+  byte-deterministic run-to-run (DoctorReport.cache_path embeds the cache
+  location, so a random scratch path would leak into the artifact). Scoping
+  template for the remaining gates: prefer a repo fixture via `-d`
+  (check-docs-commands.sh, rm-444); when the gate's subject is only "does
+  the command emit valid output", scope HOME/XDG/cache to a deterministic
+  scratch (this change); a genuine real-corpus smoke keeps the real HOME but
+  must pin `AGENTTRACE_SESSION_CACHE_DIR` to its own out-dir
+  (check-rust-real-cli-smoke.sh) — those two were already compliant;
+  check-output-contract.sh was the only unscoped walker.
+
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously
