@@ -7270,6 +7270,18 @@ fn cline_clamped(state: &mut ClineUsageState, value: i64) -> i64 {
     }
 }
 
+/// rm-1885: the upstream say vocabulary that carries usage. cline/cline
+/// getApiMetrics.ts counts usage from api_req_started (post-merge),
+/// deleted_api_reqs and subagent_usage rows; the persisted metrics live in
+/// the api_req_finished row (combineApiRequests.ts merges started/finished
+/// only at webview render time), so finished rows are folded too.
+fn cline_say_carries_usage(say: &str) -> bool {
+    matches!(
+        say,
+        "api_req_started" | "api_req_finished" | "deleted_api_reqs" | "subagent_usage"
+    )
+}
+
 fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: &str) {
     state.carriers += 1;
     state.last_ts = ts.to_string();
@@ -7278,7 +7290,15 @@ fn cline_absorb_carrier(state: &mut ClineUsageState, carrier: ClineCarrier, ts: 
     let output = cline_clamped(state, carrier.output.unwrap_or(0));
     let cache_read = cline_clamped(state, carrier.cache_read.unwrap_or(0));
     let cache_write = cline_clamped(state, carrier.cache_write.unwrap_or(0));
-    let net_input = input.saturating_sub(cache_read).saturating_sub(cache_write);
+    // rm-1884: identity input basis. Upstream Cline `tokensIn` is
+    // cache-EXCLUSIVE — the persisted journal meters uncached input only,
+    // and the cache legs are disjoint subset counters (cline/cline
+    // apps/vscode/src/sdk/legacy-task-handling.ts:160 reconstructs total
+    // input as tokensIn+cacheReads+cacheWrites; Anthropic bills cache
+    // reads/writes separately from input_tokens). The rm-600 net fold
+    // subtracted cache legs from an already-exclusive basis, driving
+    // input_tokens to ~0 on every cache-hit request; record as-is.
+    let net_input = input;
     let mut add = |key: &str, value: i64| {
         if let Some(total) = state.usage.get_mut(key) {
             *total = total.saturating_add(value);
@@ -8394,10 +8414,24 @@ fn parse_cline_ui_messages(value: &Value, model: &str) -> Vec<Event> {
         // JSON metrics object, and/or a sibling `metrics` object (Cline
         // CLI envelope). Text events are unaffected: metrics presence
         // never alters the text stream.
-        if let Some(carrier) = message.get("metrics").and_then(cline_carrier_from_object) {
+        //
+        // rm-1885: per-message single-shape precedence — a sibling
+        // `metrics` object (the CLI envelope carrier) wins; the text-JSON
+        // carrier (the Roo task-dir shape) folds only when the entry has
+        // no sibling carrier and sits in a say-type that carries usage
+        // upstream (getApiMetrics.ts: api_req_started, deleted_api_reqs,
+        // subagent_usage — plus api_req_finished, whose row is where the
+        // persisted metrics live, because combineApiRequests merges
+        // started/finished only at render time). Both shapes on one
+        // message are ONE measurement, not two; token-shaped JSON in any
+        // other say-type is content (an echo, an export), not usage
+        // evidence.
+        let sibling_carrier = message.get("metrics").and_then(cline_carrier_from_object);
+        if let Some(carrier) = sibling_carrier {
             cline_absorb_carrier(&mut usage_state, carrier, &ts);
-        }
-        if !text.is_empty() {
+        } else if !text.is_empty()
+            && cline_say_carries_usage(string(message.get("say")).unwrap_or(""))
+        {
             if let Some(carrier) = cline_text_metrics_carrier(text) {
                 cline_absorb_carrier(&mut usage_state, carrier, &ts);
             }
@@ -10597,7 +10631,7 @@ mod tests {
                 "[",
                 r#"{"ts":1700000000,"type":"say","say":"user_feedback","text":"do the thing"}"#,
                 ",",
-                r#"{"ts":1700000001,"type":"say","say":"text","text":"{\"cost\":0.0123,\"tokensIn\":1200,\"tokensOut\":150,\"cacheReads\":700,\"cacheWrites\":300,\"apiProtocol\":\"anthropic\"}"}"#,
+                r#"{"ts":1700000001,"type":"say","say":"api_req_started","text":"{\"cost\":0.0123,\"tokensIn\":1200,\"tokensOut\":150,\"cacheReads\":700,\"cacheWrites\":300,\"apiProtocol\":\"anthropic\"}"}"#,
                 ",",
                 r#"{"ts":1700000002,"type":"say","say":"text","text":"done"}"#,
                 "]"
@@ -10619,7 +10653,9 @@ mod tests {
         // End state: the carrier folds into the session totals, the tokens
         // are reported (not estimated) — the lane-truth flip — and the
         // recorded cost rides the pi `recorded_cost_usd` channel.
-        assert_eq!(session.metrics.tokens_input, 200);
+        // rm-1884: identity basis — tokensIn recorded as-is (1200), never
+        // netted against the cache legs (disjoint counters upstream).
+        assert_eq!(session.metrics.tokens_input, 1200);
         assert_eq!(session.metrics.tokens_output, 150);
         assert_eq!(session.metrics.tokens_cache_r, 700);
         assert_eq!(session.metrics.tokens_cache_w, 300);
@@ -10642,7 +10678,7 @@ mod tests {
         // additive (session_meta), appended after the text stream.
         let doc = serde_json::json!([
             {"ts":1700000000,"type":"say","say":"user_feedback","text":"do the thing"},
-            {"ts":1700000001,"type":"say","say":"text","text":"{\"cost\":0.0123,\"tokensIn\":1200,\"tokensOut\":150,\"cacheReads\":700,\"cacheWrites\":300,\"apiProtocol\":\"anthropic\"}"},
+            {"ts":1700000001,"type":"say","say":"api_req_started","text":"{\"cost\":0.0123,\"tokensIn\":1200,\"tokensOut\":150,\"cacheReads\":700,\"cacheWrites\":300,\"apiProtocol\":\"anthropic\"}"},
             {"ts":1700000002,"type":"say","say":"text","text":"done"}
         ]);
         let events = parse_cline_ui_messages(&doc, "unknown");
@@ -10692,12 +10728,142 @@ mod tests {
             .iter()
             .find(|event| event.role == "session_meta")
             .expect("cli envelope metrics fold");
-        assert_eq!(meta.usage.get("input_tokens"), Some(&700));
+        // rm-1884: identity basis — the envelope inputTokens alias records
+        // as-is (1500); cache legs are separate counters, never subtracted.
+        assert_eq!(meta.usage.get("input_tokens"), Some(&1500));
         assert_eq!(meta.usage.get("output_tokens"), Some(&900));
         assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&600));
         assert_eq!(meta.usage.get("cache_creation_input_tokens"), Some(&200));
         assert_eq!(meta.recorded_cost_usd, Some(0.045));
         assert_eq!(meta.model_used, "unknown");
+    }
+
+    #[test]
+    fn cline_input_basis_is_identity_not_netted() {
+        // rm-1884 red-first: upstream tokensIn is cache-EXCLUSIVE (cline
+        // legacy-task-handling.ts:160 reconstructs total input as
+        // tokensIn+cacheReads+cacheWrites; Anthropic bills cache legs
+        // separately from input_tokens), so input is recorded as-is and an
+        // all-positive cache-heavy carrier must NOT mint the negative_to_zero
+        // census (assess-F2 PoC).
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"api_req_started",
+             "text":"{\"tokensIn\":500,\"tokensOut\":50,\"cacheReads\":700,\"cacheWrites\":100,\"cost\":0.01}"}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("cache-heavy carrier still folds");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&500));
+        assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&700));
+        assert_eq!(meta.usage.get("cache_creation_input_tokens"), Some(&100));
+        assert!(
+            !meta
+                .disclosure_counters
+                .contains_key("magnitude_clamped:negative_to_zero"),
+            "all-positive carrier must not mint negative_to_zero"
+        );
+    }
+
+    #[test]
+    fn cline_dual_shape_message_absorbs_once() {
+        // rm-1885 red-first: ONE message carrying both the text-JSON carrier
+        // and a sibling metrics object is ONE measurement — sibling wins,
+        // never both (assess-F1 PoC: tokens 2x, cost 2x from one message).
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"api_req_started",
+             "text":"{\"tokensIn\":500,\"tokensOut\":50,\"cacheReads\":700,\"cacheWrites\":100,\"cost\":0.01}",
+             "metrics":{"tokensIn":500,"tokensOut":50,"cacheReads":700,"cacheWrites":100,"cost":0.01}}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("dual-shape message folds (once)");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&500));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&50));
+        assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&700));
+        assert_eq!(meta.usage.get("cache_creation_input_tokens"), Some(&100));
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&1),
+            "dual-shape message must absorb exactly once"
+        );
+    }
+
+    #[test]
+    fn cline_text_carrier_outside_usage_say_types_is_not_a_carrier() {
+        // rm-1885: the text-JSON carrier scan is gated on the upstream usage
+        // say vocabulary (getApiMetrics.ts: api_req_started, deleted_api_reqs,
+        // subagent_usage; api_req_finished rows carry the persisted metrics).
+        // Token-shaped JSON in any other say-type is content, not usage.
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"text",
+             "text":"{\"tokensIn\":500,\"tokensOut\":50,\"cost\":0.01}"}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        assert!(
+            events.iter().all(|event| event.role != "session_meta"),
+            "token-shaped JSON text in a non-usage say-type must not fold usage"
+        );
+    }
+
+    #[test]
+    fn cline_finished_rows_fold_and_token_free_started_rows_are_structurally_not_carriers() {
+        // rm-1885 (c): on-disk metrics live in the api_req_finished row
+        // (combineApiRequests.ts merges started/finished only at webview
+        // render time), so finished rows ARE absorbed; and a started row
+        // whose text carries no token field is a non-carrier STRUCTURALLY
+        // — the vocabulary gates the row, the never-invent token-evidence
+        // rule gates the shape. Neither arm may rely on the other.
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"api_req_started",
+             "text":"{\"cost\":0.01,\"apiProtocol\":\"anthropic\"}"},
+            {"ts":1700000002,"type":"say","say":"api_req_finished",
+             "text":"{\"tokensIn\":400,\"tokensOut\":40,\"cacheReads\":600,\"cacheWrites\":80,\"cost\":0.01}"}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("api_req_finished row folds usage");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&400));
+        assert_eq!(meta.usage.get("cache_read_input_tokens"), Some(&600));
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&1),
+            "cost-only started row must not fold; the finished row folds once"
+        );
+    }
+
+    #[test]
+    fn cline_deleted_and_subagent_carriers_keep_distinct_census() {
+        // rm-1885 (d): deleted_api_reqs and subagent_usage rows are
+        // distinct measurements upstream (getApiMetrics.ts counts them
+        // separately); each folds its own carrier — the census counts
+        // two, with no cross-message dedup and no merging into one.
+        let doc = serde_json::json!([
+            {"ts":1700000001,"type":"say","say":"deleted_api_reqs",
+             "text":"{\"tokensIn\":100,\"tokensOut\":10,\"cost\":0.001}"},
+            {"ts":1700000002,"type":"say","say":"subagent_usage",
+             "text":"{\"tokensIn\":50,\"tokensOut\":5,\"cost\":0.002}"}
+        ]);
+        let events = parse_cline_ui_messages(&doc, "unknown");
+        let meta = events
+            .iter()
+            .find(|event| event.role == "session_meta")
+            .expect("both vocabulary rows fold");
+        assert_eq!(meta.usage.get("input_tokens"), Some(&150));
+        assert_eq!(meta.usage.get("output_tokens"), Some(&15));
+        assert_eq!(
+            meta.disclosure_counters
+                .get("cline_metrics_carriers_parsed"),
+            Some(&2),
+            "distinct rows keep distinct census — no cross-message dedup"
+        );
     }
 
     #[test]

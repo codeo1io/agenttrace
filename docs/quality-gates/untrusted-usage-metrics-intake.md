@@ -16,13 +16,13 @@ Every intake of externally-recorded usage MUST:
 - **Clamp at intake, and disclose the clamp.** Negative values are recorded as 0 with a counter (e.g. `cline_metrics_negative_clamped`) disclosed in the report's data-health disclosures — never silently propagated, never a hard failure.
 - **Count what you cannot parse.** Present-but-unparseable fields increment a disclosed `unparsed_fields` counter; they are not defaulted, not dropped.
 - **Refuse cost-only "carriers".** An object with a cost and no token fields is **not** a usage carrier; treating it as one invents token truth from a price. Require ≥1 token field before the object qualifies.
-- **Preserve the delta basis.** If the provider's `input` figure includes cache legs (Cline `tokensIn` does), record net input with the cache legs separate (rm-600 basis), saturating — and pin the arithmetic in tests.
+- **Adjudicate the input basis per provider — and pin the arithmetic.** The provider's `input` figure is either cache-EXCLUSIVE or cache-INCLUSIVE, and the intake must match which: Cline `tokensIn` meters uncached input only (upstream reconstructs the total additively as `tokensIn+cacheReads+cacheWrites`; Anthropic bills the cache legs separately from `input_tokens`) — record it by IDENTITY with the cache legs as separate disjoint counters (rm-1884; netting an exclusive basis mints false zeros on every cache-hit request); a genuinely cache-INCLUSIVE figure (the Gemini `promptTokenCount` class) keeps the rm-600 net-of-cache basis, saturating. Pin the arithmetic in tests on both sides of the line.
 - **Flip provenance, suppress estimation.** When a real carrier is absorbed, token provenance becomes `reported_by_agent` and text-stream estimation is suppressed — but the event stream stays additive-untouched otherwise.
 - **Pin the metrics-free case byte-identically.** A store without carriers must render exactly as before the feature landed (including preserved text-estimated fallbacks), or the change is a regression, not an addition.
 
 ## Test shape (red-first)
 
-Write the failing tests against a banked payload fixture **before** the parser exists (fixture-first — no host corpus needed, per the tokscale-reference payload). Cover: string-typed numerics, negative metrics (clamp + disclosure), cost-only rejection, net-of-cache arithmetic, and the metrics-free zero-delta pin.
+Write the failing tests against a banked payload fixture **before** the parser exists (fixture-first — no host corpus needed, per the tokscale-reference payload). Cover: string-typed numerics, negative metrics (clamp + disclosure), cost-only rejection, input-basis arithmetic (identity vs net-of-cache, per the adjudication above — the rm-1884 lesson: the wrong side of that line is the false-zero class), and the metrics-free zero-delta pin.
 
 ## Why this is a doc and not just a row
 
