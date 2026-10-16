@@ -970,21 +970,56 @@ fn run() -> anyhow::Result<()> {
             write_stdout(&out)?;
             return Ok(());
         }
+        let mut inspect_header = None;
         let session = if let Some(rank) = args.inspect {
             if rank == 0 {
                 bail!("--inspect rank starts at 1");
             }
-            let item = inspect_first(&sessions)
-                .get(rank - 1)
-                .cloned()
-                .context("inspect rank exceeds available priority sessions")?;
-            &sessions[item.index]
+            // rm-1522: `--inspect N` addresses the SAME ordinal the
+            // `--sessions` listing renders — 1-based, post-filter, in
+            // the active --sort/--order view (README and --help have
+            // always promised exactly that). The old lane fed N to the
+            // hidden inspect_first() triage list instead, so `--inspect 1`
+            // silently rendered a priority pick that was not --sessions
+            // row 1, ranks past the ≤5-entry triage list failed with
+            // "exceeds available priority sessions" while many more
+            // rows were listable, and the report body carried no
+            // session identity — a mis-addressed inspection was
+            // undetectable from its own output. The identity header
+            // (name + journal + triage reason) keeps the rendered
+            // report self-identifying.
+            let total = sessions.len();
+            if rank > total {
+                bail!(
+                    "--inspect rank {} exceeds the --sessions listing: {} session(s) match the current filters (valid ranks are 1..={} in --sessions order)",
+                    rank,
+                    total,
+                    total
+                );
+            }
+            let index = rank - 1;
+            inspect_header = Some(inspect_identity_header(
+                &sessions[index],
+                rank,
+                total,
+                &sessions,
+            ));
+            &sessions[index]
         } else if args.latest {
             latest_session(&sessions).expect("sessions checked non-empty")
         } else {
             sessions.first().expect("sessions checked non-empty")
         };
-        let out = render_diagnostics(session, &sessions, &args.format, language)?;
+        let mut out = render_diagnostics(session, &sessions, &args.format, language)?;
+        if let Some(header) = inspect_header {
+            // Text lanes get the identity header prepended to the same
+            // document; the JSON lane is lossless by contract and its
+            // session object already carries name+path (the header
+            // would corrupt the JSON document).
+            if args.format != "json" {
+                out = format!("{}\n{}", header, out);
+            }
+        }
         let out = dispatch_sanitize(&args.format, out);
         write_output(&args.output, &(out.clone() + "\n"))?;
         write_stdout(&out)?;
@@ -1778,6 +1813,37 @@ fn flag_takes_value(arg: &OsString) -> bool {
             | "--history-dir"
             | "--pricing-file"
             | "--weekly-budget"
+    )
+}
+
+/// rm-1522: identity header for the `--inspect` human-readable lanes.
+/// The diagnostics report body itself carries no session identity
+/// (no name, no path), so under the old hidden priority-list ordering
+/// the CLI could hand the user a different session than the one they
+/// addressed with nothing in the rendered bytes to expose the switch.
+/// The header names the session and its journal, the `--sessions`
+/// ordinal that selected it, and — when the session is one of
+/// `inspect_first`'s triage candidates — the reason field that list
+/// computes (the diagnostics.rs field the old lane never rendered).
+/// "none" is honest: the session carries no triage signal. Both the
+/// name and the journal path are transcript-derived strings and pass
+/// through the shared line sanitizer + formula guard before printing.
+fn inspect_identity_header(
+    session: &agenttrace_core::Session,
+    rank: usize,
+    total: usize,
+    sessions: &[agenttrace_core::Session],
+) -> String {
+    let name = csv_export::guard_formula(&sanitize_line_segment(&session.name));
+    let journal = sanitize_line_segment(&session.path);
+    let reason = inspect_first(sessions)
+        .iter()
+        .find(|item| item.index + 1 == rank)
+        .map(|item| item.reason)
+        .unwrap_or("none");
+    format!(
+        "Inspected session: {}\nJournal: {}\n--sessions row {} of {} (triage: {})",
+        name, journal, rank, total, reason
     )
 }
 

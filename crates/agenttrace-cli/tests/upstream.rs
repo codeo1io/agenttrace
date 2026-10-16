@@ -57,22 +57,29 @@ fn run_cli(cwd: &Path, args: &[&str]) -> Output {
     command.output().expect("run agenttrace CLI")
 }
 
-/// rm-241 (cycle 3): run the CLI with git discovery ceilinged at
-/// `ceiling`. Git never chdirs up INTO a ceiling directory (the CWD
-/// itself stays searchable — exactly the property the "outside a git
-/// repository" lane asserts), so a fixture under the ceiling cannot
-/// inherit the host's repository ancestry. The CLI probes the repo via
-/// a `git rev-parse` subprocess, which honors the variable natively.
-fn run_cli_ceilinged(cwd: &Path, args: &[&str], ceiling: &Path) -> Output {
-    let ceiling = ceiling
-        .canonicalize()
-        .unwrap_or_else(|_| ceiling.to_path_buf());
+/// rm-1524 (2026-10-16): discovery-fenced variant of [`run_cli`] for
+/// tests whose precondition is "this directory is NOT inside a git
+/// repository". On this fleet the delegate TMPDIR itself lives inside
+/// a git worktree (/home/agent/.hermes carries .git), so git's upward
+/// discovery escapes the fixture namespace and finds a HOST ancestor:
+/// the "not inside a git repository" verdicts flip to "no 'upstream'
+/// remote configured" (live-failing test run at d2a02af, run 7288595f
+/// phase evidence). GIT_CEILING_DIRECTORIES names a directory git must
+/// never chdir UP INTO, so fencing cwd's ancestor pins discovery
+/// inside the fixture namespace on every host. Semantics pinned live:
+/// the ceiling must be a STRICT ANCESTOR of cwd — a ceiling equal to
+/// cwd does not fence (the ceiling itself is still searched from,
+/// and ascending past it is allowed).
+fn run_cli_discovery_fenced(cwd: &Path, ceiling: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agenttrace"));
     command.args(args).current_dir(cwd);
     for (key, value) in GIT_ENV {
         command.env(key, value);
     }
-    command.env("GIT_CEILING_DIRECTORIES", &ceiling);
+    command.env(
+        "GIT_CEILING_DIRECTORIES",
+        ceiling.to_str().expect("ceiling path is UTF-8"),
+    );
     command.output().expect("run agenttrace CLI")
 }
 
@@ -267,44 +274,22 @@ fn missing_upstream_remote_fails_with_setup_hint() {
 
 #[test]
 fn outside_a_git_repository_fails() {
-    // rm-241: this lane's verdict used to depend on where TMPDIR lived.
-    // On conductor delegate hosts TMPDIR sits inside a git worktree, git
-    // discovery walked up from the plain fixture dir into that ancestor's
-    // .git, and the CLI reported a repository where the fixture has none
-    // (red reproduced 2026-10-14 under both a probe TMPDIR inside this
-    // repo and the ambient /home/agent/.hermes/tmp/delegate). The fixture
-    // now plants its own hostile .git-bearing ancestor and ceilings
-    // discovery there, so the lane asserts the product verdict on any
-    // host instead of the host's TMPDIR ancestry.
-    let hostile = std::env::temp_dir().join(format!(
-        "agenttrace-upstream-nogit-hostile-{}",
-        std::process::id()
-    ));
-    let root = hostile.join("nogit");
-    let _ = std::fs::remove_dir_all(&hostile);
+    // rm-1524: fenced discovery — the plain dir is created directly
+    // under the host temp dir, and on a host whose temp dir lives
+    // inside a git worktree the unfenced run resolves the HOST repo
+    // (flip live-reproduced at d2a02af on this fleet). The ceiling
+    // fences cwd's parent (a strict ancestor — see the helper doc),
+    // so this precondition holds on every host class.
+    let root =
+        std::env::temp_dir().join(format!("agenttrace-upstream-nogit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create plain dir");
-    git(&hostile, &["init", "-q", "-b", "master"]);
 
-    // The trap must stay live: without the ceiling, discovery walks
-    // straight into the hostile ancestor. If this ever stops failing,
-    // the fixture has gone vacuous and must be repaired, not trusted.
-    let mut trap = Command::new("git");
-    trap.args([
-        "-C",
-        root.to_str().expect("fixture path is UTF-8"),
-        "rev-parse",
-        "--show-toplevel",
-    ]);
-    for (key, value) in GIT_ENV {
-        trap.env(key, value);
-    }
-    let trap = trap.output().expect("probe hostile ancestor discovery");
-    assert!(
-        trap.status.success(),
-        "hostile ancestor must be discoverable without the ceiling"
+    let output = run_cli_discovery_fenced(
+        &root,
+        root.parent().expect("temp root has a parent"),
+        &["upstream"],
     );
-
-    let output = run_cli_ceilinged(&root, &["upstream"], &hostile);
     assert!(
         !output.status.success(),
         "must fail outside a git repository"
@@ -314,7 +299,72 @@ fn outside_a_git_repository_fails() {
         "expected repository hint, got {:?}",
         stderr(&output)
     );
-    let _ = std::fs::remove_dir_all(&hostile);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn host_ancestor_repository_cannot_satisfy_discovery() {
+    // rm-1524 red-first arm: a plain directory nested INSIDE a git
+    // repository is "inside a repository" as far as git's upward
+    // discovery is concerned — exactly the host class this fleet
+    // lives in, reproduced deterministically on ANY host by planting
+    // the ancestor repo ourselves instead of borrowing the host's.
+    // Both directions are pinned:
+    //   unfenced — the ancestor IS discovered, so the CLI proceeds
+    //              past the repo check to the next prerequisite and
+    //              reports the missing 'upstream' remote (this is the
+    //              live flip the unfenced `outside_a_git_repository_fails`
+    //              suffered under a repo-enclosed TMPDIR);
+    //   fenced   — discovery cannot escape into the ancestor, so the
+    //              CLI reports "not inside a git repository".
+    // Census note (rm-1524 acceptance): this file's other repo-presence
+    // assertion is the negative spawn-diagnosis check below, whose cwd
+    // is a real repository (its own .git is the nearest — host
+    // ancestors are irrelevant there). The workspace's remaining
+    // temp_dir()-rooted hermeticity flakiness (agenttrace-core insights
+    // decode / plausible_ancestors walkers) asserts fixture-repo
+    // RESOLUTION in-process, not repository absence — that class is
+    // the rm-381/rm-382 family, ceded to its own rows.
+    let ancestor = std::env::temp_dir().join(format!(
+        "agenttrace-upstream-ancestor-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&ancestor);
+    std::fs::create_dir_all(&ancestor).expect("create ancestor root");
+    let _ = git(&ancestor, &["init"]);
+    write(&ancestor, "README.md", "ancestor repo");
+    let _ = git(&ancestor, &["add", "README.md"]);
+    let _ = git(&ancestor, &["commit", "-m", "ancestor"]);
+    let plain = ancestor.join("plain");
+    std::fs::create_dir_all(&plain).expect("create plain dir inside ancestor");
+
+    let unfenced = run_cli(&plain, &["upstream"]);
+    assert!(
+        !unfenced.status.success(),
+        "ancestor repo without an upstream remote must still fail"
+    );
+    let unfenced_err = stderr(&unfenced);
+    assert!(
+        unfenced_err.contains("no 'upstream' remote configured"),
+        "unfenced run must discover the ancestor repo (got {:?})",
+        unfenced_err
+    );
+    assert!(
+        !unfenced_err.contains("not inside a git repository"),
+        "unfenced run must not claim the ancestor repo is absent"
+    );
+
+    let fenced = run_cli_discovery_fenced(&plain, &ancestor, &["upstream"]);
+    assert!(
+        !fenced.status.success(),
+        "fenced run must fail without a repository"
+    );
+    assert!(
+        stderr(&fenced).contains("not inside a git repository"),
+        "fenced run must not discover the ancestor repo, got {:?}",
+        stderr(&fenced)
+    );
+    let _ = std::fs::remove_dir_all(&ancestor);
 }
 
 #[test]

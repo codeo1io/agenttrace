@@ -7,12 +7,17 @@
 //! directional Cf set (RLO/PDF/LRI/PDI), the invisible-spoofing Cf set
 //! (BOM/ZWNBSP, word joiner, Mongolian vowel separator, and — since
 //! the review-6f85e2c9 F1 fix — the plane-14 tag block U+E0000..U+E007F,
-//! DEFENDED, previously unlabeled), the deliberately-EXCLUDED adjacent
-//! Cf (soft hyphen, ZWSP/ZWNJ/ZWJ; the plane-14 Variation Selectors
+//! DEFENDED, previously unlabeled), the adjacent Cf that this contract
+//! keeps verbatim (soft hyphen, ZWSP; the plane-14 Variation Selectors
 //! Supplement U+E0080+ is likewise excluded-and-bounds-pinned but not
-//! carried in the corpus), and the preserved-verbatim neighbors
-//! (NBSP, LS/PS). This contract pins ONE invariant across EVERY output
-//! boundary composition:
+//! carried in the corpus), the zero-width JOINER pair ZWNJ/ZWJ
+//! (SUPERSEDED 2026-10-16 by run 7288595f's rm-933 widening arm —
+//! `is_joiner_format_control`: the render/document lanes substitute
+//! the pair as a live-verified cell-gluing spoofing vector, while the
+//! union, the JSON escape lane, and the TUI display filter stay
+//! unwidened), and the preserved-verbatim neighbors (NBSP, LS/PS).
+//! This contract pins ONE invariant across EVERY output boundary
+//! composition:
 //!
 //! * render/document lanes substitute U+FFFD and keep layout controls;
 //! * the serialized-JSON lane escapes `\uXXXX` and is lossless;
@@ -30,9 +35,10 @@ const KITCHEN_SINK: &str = concat!(
     "c\u{1b}P+q\u{1b}\\",                     // DCS
     "d\u{202e}RLO\u{202c}PDF\u{2066}LRI\u{2069}PDI", // directional Cf
     "e\u{feff}zwnbsp\u{2060}wj\u{180e}mvs",   // invisible spoofing Cf
-    "f\u{00ad}soft\u{200b}zwsp\u{200c}zwnj\u{200d}zwj", // excluded-but-adjacent Cf
-    "g\u{e0000}tag\u{e0001}",                 // plane-14 tag characters
-    "h\u{a0}nbsp i\u{2028}sep j\u{2029}par",  // preserved neighbors
+    "f\u{00ad}soft\u{200b}zwsp\u{200c}zwnj\u{200d}zwj", // adjacent Cf: zwsp kept verbatim, joiner pair superseded
+    // (substituted on render lanes by the 7288595f widening arm)
+    "g\u{e0000}tag\u{e0001}",                // plane-14 tag characters
+    "h\u{a0}nbsp i\u{2028}sep j\u{2029}par", // preserved neighbors
 );
 
 #[test]
@@ -85,26 +91,36 @@ fn no_lane_emits_raw_spoofing_characters() {
 #[test]
 fn excluded_cf_and_neighbors_survive_verbatim_in_data_lanes() {
     let doc = sanitize_output_document(KITCHEN_SINK);
-    for keep in [
-        "\u{00ad}soft",
-        "\u{200b}zwsp",
-        "\u{200c}zwnj",
-        "\u{200d}zwj",
-        "\u{a0}nbsp",
-        "sep",
-        "par",
-    ] {
+    // Still-verbatim adjacent Cf and neighbors: soft hyphen, ZWSP,
+    // NBSP and the separators stay byte-exact (functional typography
+    // the spoofing predicates must not eat).
+    for keep in ["\u{00ad}soft", "\u{200b}zwsp", "\u{a0}nbsp", "sep", "par"] {
         assert!(
             doc.contains(keep),
             "document lane must keep {keep:?} verbatim"
         );
     }
+    // SUPERSESSION (2026-10-16, run 7288595f rm-933 widening arm):
+    // this contract originally pinned \u{200c}zwnj and \u{200d}zwj
+    // verbatim in the document lane; the widening arm's live od-verified
+    // evidence (raw E2 80 8D / E2 80 8C in rendered --sessions cells at
+    // d2a02af) superseded that pin — the joiner pair now substitutes in
+    // both shared sanitizers while staying raw in the machine lanes.
+    for c in ['\u{200c}', '\u{200d}'] {
+        assert!(
+            !doc.contains(c),
+            "document lane must substitute the joiner pair: {c:?} survived"
+        );
+        assert!(doc.contains('\u{fffd}'));
+    }
     // The invisible set is disclosed, not silently dropped: substitution
     // markers sit where the payload was.
     assert!(doc.contains('\u{fffd}'));
-    // Render lane keeps neither layout controls nor the spoofing set.
+    // Render lane keeps neither layout controls nor the spoofing set
+    // nor (since the widening arm) the joiner pair.
     let seg = sanitize_line_segment(KITCHEN_SINK);
     assert!(seg.contains("\u{00ad}soft") && seg.contains("\u{200b}zwsp"));
+    assert!(!seg.contains('\u{200c}') && !seg.contains('\u{200d}'));
     assert!(!seg.contains('\n') && !seg.contains('\t') && !seg.contains('\r'));
 }
 
@@ -152,8 +168,10 @@ fn invisible_set_bounds_are_pinned() {
             c as u32
         );
     }
-    // The excluded-but-adjacent family must stay excluded so the data
-    // lanes above can assert verbatim survival.
+    // The excluded-but-adjacent family must stay excluded from the
+    // UNION (the joiner pair rides its own separate predicate —
+    // `is_joiner_format_control` — after the 7288595f widening arm),
+    // so the JSON data lane above can assert verbatim survival.
     for c in ['\u{00ad}', '\u{200b}', '\u{200c}', '\u{200d}'] {
         assert!(!is_spoofing_format_control(c), "{c:?} wrongly flagged");
     }
