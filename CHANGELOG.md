@@ -4,6 +4,28 @@
 
 ### Added
 
+- Claude org-dimension truth (rm-1405 reap, run 4f2af62e5b7e cycle 1):
+  claude-code 2.1.29x+ journals carry an identity envelope
+  (`$.session.identity.orgIdentifier` / `loginEmail`) that the parsers
+  previously ignored, so a multi-org host's overview silently merged
+  two orgs' spend into one attribution. Both identity fields are now
+  captured on the session's meta carrier (first non-empty wins, the
+  cwd/gitBranch discipline) and surface as a `by_org` rollup on the
+  overview report — JSON, markdown, and text — plus a
+  `claude_org_identity:transcript` disclosure counter so a host can
+  audit which sessions carry the dimension. Zero-noise by contract:
+  sessions without an identity block are left out of the facet
+  entirely (no "unknown" bucket) and org-less corpora render
+  byte-identically to before — no `by_org` key in the JSON, no section
+  on text surfaces. The session-cache rung minted 64 → 65 on the
+  batch's base dade9cd and lands at 68 — this tree had since taken 65
+  (run b01c2b6a's opencode summary_diffs rung) and 67 (run 6d2a1d8d's
+  newest-lanes fix, which left 66 free for run abb3b091's in-flight
+  mint), so the landed rungs keep their numerals and this integration
+  (conflict case 306ad63f60a14196a928fedc08f5785f) re-bases the rung
+  onto the advanced ceiling as 67 → 68, one invalidation either way;
+  org fields ride the cached rows serde-defaulted, so older snapshots
+  decode as org-absent and regenerate.
 - terminal-spoofing sanitization covers the invisible zero-width Cf family, and the
   machine lanes stay lossless (rm-933 slice 3, run ff7615be cycle 3; review fix 6f85e2c9): the shared
   predicate split into directional (`is_bidi_format_control`, unchanged set) and
@@ -231,7 +253,6 @@
   had shipped at research time (2026-10-15); 0.163.0 went stable later
   that same day with the write flag still off, verified at tag
   rust-v0.163.0).
-
 - pi cancelled runs are consumed, not skipped (rm-990, run b5affead cycle 2): pi 1.1.0
   (upstream #10607) marks cancellation on the wire — `agent_settled.aborted` and
   the terminal message's `stopReason:"aborted"` — and the parser previously

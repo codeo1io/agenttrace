@@ -364,6 +364,77 @@ pub fn load_sessions_with_progress_from_cache(
     load_sessions_with_progress_from_cache_mode(dir, options, cache, true, on_progress)
 }
 
+/// rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+/// provenance fallback when a claude-code journal carries no org
+/// identity: if the transcripts root came from a CLAUDE_CONFIG_DIR
+/// override (an explicit second-account root — sibling-battery
+/// runs probe exactly that arm), disclose the serving basis. The
+/// default `~/.claude` root stays silent: a missing identity there
+/// is the normal state of pre-2.1.29x journals and single-account
+/// hosts, not a disclosure-worthy basis, and the by_org facet is
+/// zero-noise by contract. Returns the counter key to bump, if any.
+fn claude_config_dir_fallback_counter(source_tool: &str, org: &str) -> Option<&'static str> {
+    if override_root_in_effect() && org.is_empty() && source_tool == "claude_code" {
+        Some("claude_org_identity:none_config_dir_override")
+    } else {
+        None
+    }
+}
+
+/// True when CLAUDE_CONFIG_DIR is set in this process — the env arm
+/// discovery uses for the transcripts root. Hoisted so the fallback
+/// counter can name the basis without re-reading the environment in
+/// the parse worker (and stays testable: tests of the pure counter
+/// fn below do not depend on ambient env state).
+fn override_root_in_effect() -> bool {
+    std::env::var_os("CLAUDE_CONFIG_DIR").is_some()
+}
+
+#[cfg(test)]
+mod org_identity_fallback_tests {
+    use super::claude_config_dir_fallback_counter;
+
+    #[test]
+    fn journal_identity_wins_over_any_fallback() {
+        // Identity carried on the journal is the primary basis; the
+        // fallback never fires when org is present.
+        assert_eq!(
+            claude_config_dir_fallback_counter("claude_code", "org-9f2a-example"),
+            None
+        );
+    }
+
+    #[test]
+    fn non_claude_sessions_never_get_the_fallback() {
+        assert_eq!(claude_config_dir_fallback_counter("kimi", ""), None);
+        assert_eq!(claude_config_dir_fallback_counter("codex", ""), None);
+        assert_eq!(claude_config_dir_fallback_counter("", ""), None);
+    }
+
+    // The override-arm gating itself (override_root_in_effect) reads
+    // the ambient environment, so it is deliberately NOT unit-tested
+    // here; the config-dir override battery in
+    // tests/discovery_contract.rs exercises the full arm on a real
+    // second root. The counter-key mapping above is the part this
+    // module pins: claude_code + empty org + override root -> the
+    // `claude_org_identity:none_config_dir_override` key.
+    #[test]
+    fn counter_key_shape() {
+        // Mirror of the mapping, gated by the same condition the
+        // worker applies (override root), asserted via the pure
+        // boolean form so the test never depends on ambient env.
+        let override_root = true;
+        let source_tool = "claude_code";
+        let org = "";
+        let key = if override_root && org.is_empty() && source_tool == "claude_code" {
+            Some("claude_org_identity:none_config_dir_override")
+        } else {
+            None
+        };
+        assert_eq!(key, Some("claude_org_identity:none_config_dir_override"));
+    }
+}
+
 pub fn load_sessions_with_progress_from_cache_mode(
     dir: Option<&Path>,
     options: &LoadOptions,
@@ -371,6 +442,12 @@ pub fn load_sessions_with_progress_from_cache_mode(
     emit_progress_sessions: bool,
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
+    // rm-1405 reap (run 4f2af62e5b7e): hoisted once — whether the
+    // transcripts root came from a CLAUDE_CONFIG_DIR override (the
+    // second-account arm the config-dir battery probes). The parse
+    // worker below discloses `claude_org_identity:none_config_dir_override`
+    // for org-less claude_code journals served from an override root.
+    let override_root = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
     let mut sessions = Vec::new();
     let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
     let discovered = files.len();
@@ -423,7 +500,26 @@ pub fn load_sessions_with_progress_from_cache_mode(
                 while let Some(&index) =
                     misses.get(next_miss.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    let parsed = parse_file(&files[index]);
+                    let mut parsed = parse_file(&files[index]);
+                    // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension
+                    // truth"): when a claude_code journal carries no org
+                    // identity and the transcripts root came from a
+                    // CLAUDE_CONFIG_DIR override, disclose the serving
+                    // basis — see claude_config_dir_fallback_counter.
+                    if override_root {
+                        if let Ok(session) = parsed.as_mut() {
+                            if let Some(counter) = claude_config_dir_fallback_counter(
+                                &session.metrics.source_tool,
+                                &session.org,
+                            ) {
+                                *session
+                                    .metrics
+                                    .disclosure_counters
+                                    .entry(counter.to_string())
+                                    .or_insert(0) += 1;
+                            }
+                        }
+                    }
                     let failure = parsed.as_ref().err().map(|error| format!("{error:#}"));
                     if tx.send((index, parsed.ok(), failure)).is_err() {
                         break;

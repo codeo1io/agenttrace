@@ -3735,6 +3735,8 @@ mod tests {
             path: "/tmp/parent.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 cost_estimated: 0.0105,
                 ..Metrics::default()
@@ -3776,6 +3778,8 @@ mod tests {
                 path: format!("/tmp/s{i}.jsonl"),
                 cwd: String::new(),
                 branch: String::new(),
+                org: String::new(),
+                org_email: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -3809,6 +3813,8 @@ mod tests {
                 path: format!("/tmp/s{i}.jsonl"),
                 cwd: String::new(),
                 branch: String::new(),
+                org: String::new(),
+                org_email: String::new(),
                 metrics: Metrics::default(),
                 anomalies: Vec::new(),
                 health: 100,
@@ -3844,6 +3850,8 @@ mod tests {
             path: "/tmp/parent.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 cost_estimated: 0.0105,
                 ..Metrics::default()
@@ -3897,6 +3905,8 @@ mod tests {
             path: "/tmp/osc.jsonl".to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 source_tool: "pi\u{0007}".to_string(),
                 model_used: "m\u{001b}[2J".to_string(),
@@ -5079,6 +5089,8 @@ mod tests {
             path: path.to_string(),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 session_start: session_start.to_string(),
                 ..Metrics::default()

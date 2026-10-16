@@ -5187,6 +5187,25 @@ fn token_usage_delta(cur: &TokenUsage, prev: Option<&TokenUsage>) -> TokenUsage 
     .collect()
 }
 
+/// rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+/// org identity from the claude-code 2.1.29x+ envelope block
+/// `$.session.identity` — `orgIdentifier` first, `loginEmail` beside
+/// it. Accepts the identity object hoisted to the top level as a
+/// shape fallback for journals that flatten it. Returns `None` when
+/// the line carries no non-empty `orgIdentifier` — identity is
+/// session-stable, so the first capture wins and later lines only
+/// fill the gap (mirrors the cwd/gitBranch capture discipline).
+fn claude_org_identity(obj: &JsonObject) -> Option<(String, String)> {
+    let identity = obj
+        .get("session")
+        .and_then(Value::as_object)
+        .and_then(|session| session.get("identity"))
+        .or_else(|| obj.get("identity"))?;
+    let org = string(identity.get("orgIdentifier")).filter(|value| !value.is_empty())?;
+    let email = string(identity.get("loginEmail")).unwrap_or("");
+    Some((org.to_string(), email.to_string()))
+}
+
 fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     let mut events = Vec::new();
     let mut model = "unknown".to_string();
@@ -5225,6 +5244,11 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // (every re-emission repeats it in full).
     let mut iterations_mined: BTreeSet<String> = BTreeSet::new();
     let mut cwd = String::new();
+    // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+    // org identity capture — `$.session.identity` rides any line
+    // (first non-empty wins; see the carrier note at the lane tail).
+    let mut org = String::new();
+    let mut org_email = String::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
         if cwd.is_empty() {
@@ -5254,6 +5278,17 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     disclosure_counters: cwd_truncation_disclosure("claude_code", cwd_truncated),
                     ..Event::default()
                 });
+            }
+        }
+        // rm-1405 reap (run 4f2af62e5b7e): capture the org identity
+        // envelope block from whichever line first carries it — cwd
+        // and gitBranch ride the envelope too, but identity may only
+        // appear on later lines, so this capture is independent of
+        // the cwd gate above.
+        if org.is_empty() {
+            if let Some((captured_org, captured_email)) = claude_org_identity(obj) {
+                org = captured_org;
+                org_email = captured_email;
             }
         }
         match typ {
@@ -5464,6 +5499,48 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
             _ => {}
         }
     }
+
+    // rm-1405 reap (run 4f2af62e5b7e, "Claude org-dimension truth"):
+    // org identity rides the session's meta event beside cwd/branch —
+    // ONE carrier, one `claude_org_identity:transcript` counter,
+    // regardless of how many lines repeat the identity block. The
+    // counter names the basis (journal-supplied identity) so a
+    // multi-org host can audit which sessions carry the dimension
+    // and which fell back to config-dir provenance (discovery-side
+    // counter `claude_org_identity:none_config_dir_override`); it
+    // flows to Metrics via the same meta-event aggregation as the
+    // refold counters below. Sessions whose journals carry no
+    // identity get NO carrier — the by_org facet leaves them out
+    // entirely rather than bucketing an invented "unknown".
+    if !org.is_empty() {
+        let carrier = events.iter_mut().find(|event| event.role == "session_meta");
+        match carrier {
+            Some(meta) => {
+                meta.org = org;
+                meta.org_email = org_email;
+                *meta
+                    .disclosure_counters
+                    .entry("claude_org_identity:transcript".to_string())
+                    .or_insert(0) += 1;
+            }
+            None => {
+                let mut counters = BTreeMap::new();
+                counters.insert("claude_org_identity:transcript".to_string(), 1);
+                events.insert(
+                    0,
+                    Event {
+                        role: "session_meta".to_string(),
+                        org,
+                        org_email,
+                        source_tool: "claude_code".to_string(),
+                        disclosure_counters: counters,
+                        ..Event::default()
+                    },
+                );
+            }
+        }
+    }
+
     // One-carrier note (review 543ac419 F4): this Claude lane mints no
     // earlier meta carrier in this parser — the insert below is the
     // lane's ONLY meta event, and it carries every refold counter on

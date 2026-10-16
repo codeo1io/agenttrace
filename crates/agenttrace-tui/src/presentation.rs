@@ -4033,6 +4033,8 @@ mod loop_basis_disclosure_tests {
             path: String::from("/tmp/loop-basis.jsonl"),
             cwd: String::new(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 cost_estimated: 1.0,
                 ..Metrics::default()

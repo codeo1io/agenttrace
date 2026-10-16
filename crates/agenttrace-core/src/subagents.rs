@@ -266,6 +266,8 @@ mod tests {
 
     fn session(path: &str, cost: f64, input: i64) -> Session {
         Session {
+            org: String::new(),
+            org_email: String::new(),
             name: path.to_string(),
             path: path.to_string(),
             cwd: String::new(),

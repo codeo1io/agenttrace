@@ -276,6 +276,11 @@ impl DerivedSession {
             path: format!("history:{}", self.id),
             cwd: self.project,
             branch: String::new(),
+            // rm-1405 reap (run 4f2af62e5b7e): the history lane has no
+            // identity dimension; org stays empty and the by_org facet
+            // leaves the session out (zero-noise contract).
+            org: String::new(),
+            org_email: String::new(),
             metrics: Metrics {
                 source_tool: self.source,
                 model_used: self.model,
@@ -316,6 +321,8 @@ mod tests {
     #[test]
     fn preserved_history_contains_only_derived_fields() {
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
@@ -436,6 +443,8 @@ mod tests {
         let prior = std::env::var_os("AGENTTRACE_HISTORY_DIR");
         std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
@@ -482,6 +491,8 @@ mod tests {
         // preserve_derived_history's records.insert overwrote the earlier
         // row (assess PoC /tmp/at-assess-cd02/poc-history-collision).
         let session = |key: &str| Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "session".to_string(),
             path: "/home/u/.local/share/opencode/opencode.db".to_string(),
             cwd: String::new(),
@@ -523,6 +534,8 @@ mod tests {
         // `path|start` preimage, so every existing history file dedupes
         // against ids computed by this build without migration.
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "session".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: String::new(),
@@ -549,6 +562,8 @@ mod tests {
     #[test]
     fn session_id_is_deterministic_hex_and_path_sensitive() {
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "secret task".to_string(),
             path: "/tmp/private/session.jsonl".to_string(),
             cwd: "/work/project".to_string(),
@@ -595,6 +610,8 @@ mod tests {
         std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
 
         let sqlite_session = |row: &str, input: i64| Session {
+            org: String::new(),
+            org_email: String::new(),
             name: format!("proj-{row}"),
             path: "/home/u/.local/share/opencode/opencode.db".to_string(),
             cwd: "/work/poc".to_string(),
@@ -686,6 +703,8 @@ mod tests {
         std::env::set_var("AGENTTRACE_HISTORY_DIR", &root);
 
         let session = Session {
+            org: String::new(),
+            org_email: String::new(),
             name: "legacy row".to_string(),
             path: "/tmp/private/legacy.jsonl".to_string(),
             cwd: "/work/project".to_string(),

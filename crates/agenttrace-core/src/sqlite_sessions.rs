@@ -1447,6 +1447,11 @@ fn session_from_sqlite_agg(agg: SqliteSessionAgg) -> Session {
         path: agg.path,
         cwd: agg.cwd,
         branch: String::new(),
+        // rm-1405 reap (run 4f2af62e5b7e): the sqlite aggregate lane
+        // has no identity dimension; org stays empty and the by_org
+        // facet leaves the session out (zero-noise contract).
+        org: String::new(),
+        org_email: String::new(),
         metrics,
         anomalies,
         health,

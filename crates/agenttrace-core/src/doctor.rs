@@ -1417,6 +1417,8 @@ mod tests {
             path: path.to_string(),
             cwd: cwd.to_string(),
             branch: String::new(),
+            org: String::new(),
+            org_email: String::new(),
             metrics: crate::Metrics::default(),
             anomalies: Vec::new(),
             health: 100,
