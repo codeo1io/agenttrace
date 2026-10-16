@@ -1,9 +1,11 @@
 use agenttrace_core::{
-    compute_overview, parse_file, recommendations, render_waste_report, report_compare,
-    report_overview_html, report_overview_markdown, report_overview_text, report_search_text,
-    report_text, search_sessions, Session, ToolLatency,
+    compute_overview, parse_file, recommendations, render_doctor_report, render_waste_report,
+    report_compare, report_overview_html, report_overview_markdown, report_overview_text,
+    report_search_text, report_text, search_sessions, Session, ToolLatency,
 };
+use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Vendored byte-for-byte from the assess fdaf8b39 live PoC corpus
 /// (delegate/fdaf8b39…-scratch/poc/corpus/=2+5|cmd.jsonl — the vendored
@@ -30,6 +32,32 @@ const HOSTILE_TOOL_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/formula-lane/hostile-tool.jsonl"
 );
+/// rm-1395 poison leaf: the rm-985 name fixture (`=2+5_cmd.jsonl`)
+/// carries NON-zero usage (input 120 / output 40), so it can never mint
+/// the doctor's rm-408 zero-usage sample — the exact lane the assess
+/// 77d65419 live PoC proved unguarded (`--doctor -d` over a zero-usage
+/// corpus emitted `    =HYPERLINK("http://evil.example","click-me")
+/// please review: 1 all-zero usage block(s) counted as measured`,
+/// out/doctor-text.txt:21). Same corpus shape, but the assistant block
+/// reports present-and-all-zero recognized classes, which is what trips
+/// `zero_usage_events` and the `collect_zero_usage` sample mint.
+const HOSTILE_ZERO_USAGE_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/formula-lane/hostile-zero-usage.jsonl"
+);
+/// Benign control for the doctor pin: identical zero-usage shape, plain
+/// prose first-user-message — it must render byte-identical (no
+/// paste-marker), proving the guard costs nothing on benign names.
+const BENIGN_ZERO_USAGE_SESSION: &str = concat!(
+    "{\"parentUuid\": null, \"isSidechain\": false, \"promptId\": \"p1\", \"type\": \"user\", ",
+    "\"message\": {\"role\": \"user\", \"content\": \"benign code review request\"}, ",
+    "\"uuid\": \"u1\", \"timestamp\": \"2026-10-12T10:00:00Z\", \"sessionId\": \"s2\", \"version\": \"1.0.0\"}\n",
+    "{\"parentUuid\": \"u1\", \"isSidechain\": false, \"type\": \"assistant\", ",
+    "\"message\": {\"role\": \"assistant\", \"model\": \"claude-sonnet-4\", ",
+    "\"content\": [{\"type\": \"text\", \"text\": \"ok\"}], ",
+    "\"usage\": {\"input_tokens\": 0, \"output_tokens\": 0}}, ",
+    "\"uuid\": \"a1\", \"timestamp\": \"2026-10-12T10:00:02Z\", \"sessionId\": \"s2\", \"version\": \"1.0.0\"}\n",
+);
 const TOOL_PAYLOAD_HEAD: &str = "+cmd|";
 const PAYLOAD_HEAD: &str = "=HYPERLINK(";
 const PAYLOAD_FULL: &str = "=HYPERLINK(\"http://evil.example\",\"click-me\") please review";
@@ -41,6 +69,52 @@ fn hostile_sessions() -> Vec<Session> {
     // session name, not a hand-built stand-in.
     assert_eq!(session.name, PAYLOAD_FULL);
     vec![session]
+}
+
+/// Serializes HOME/XDG/AGENTTRACE_SESSION_CACHE_DIR pinning within this
+/// test binary (doctor_honesty_contract.rs pattern — the doctor
+/// PERSISTS fresh parses through the session cache, so the rm-1395 pin
+/// must keep its fixtures out of the operator's real cache; the
+/// catch-unwind keeps a failing assertion from poisoning the lock).
+fn lock_env() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn restore_env(key: &str, previous: Option<std::ffi::OsString>) {
+    match previous {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+}
+
+fn with_home(home: &Path, f: impl FnOnce()) {
+    let result = {
+        let _guard = lock_env();
+        let previous_home = std::env::var_os("HOME");
+        let previous_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
+        let previous_xdg_data = std::env::var_os("XDG_DATA_HOME");
+        let previous_cache = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR");
+        std::env::set_var("HOME", home);
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", home.join("cache"));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        restore_env("HOME", previous_home);
+        restore_env("XDG_CONFIG_HOME", previous_xdg_config);
+        restore_env("XDG_CACHE_HOME", previous_xdg_cache);
+        restore_env("XDG_DATA_HOME", previous_xdg_data);
+        restore_env("AGENTTRACE_SESSION_CACHE_DIR", previous_cache);
+        result
+    };
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 /// Every occurrence of the payload head in a human-readable lane must be
@@ -444,4 +518,110 @@ fn doctor_duplicate_db_lane_gets_formula_guard_and_json_stays_raw() {
         json.contains("=HYPERLINK(") && !json.contains("'=HYPERLINK("),
         "JSON surface must stay raw (payload present, marker absent):\n{json}"
     );
+}
+
+/// rm-1395 (run 966bd5f9 cycle 4, assess 77d65419 PoC replay): the
+/// doctor's default text lane rendered its transcript-derived sample
+/// families — the rm-408 zero-usage session names (`collect_zero_usage`
+/// mints them from `session.name`, which derives from the transcript's
+/// FIRST user message) and the rm-381 project-decode samples — as
+/// `    {sample}` lines. Four leading spaces were the only prefix, and
+/// a spreadsheet paste treats the first non-whitespace character as
+/// the cell start, so a `=HYPERLINK(…)` first user message re-armed as
+/// a live formula cell (live PoC: `--doctor -d` over the zero-usage
+/// corpus emitted `    =HYPERLINK("http://evil.example","click-me")
+/// please review: 1 all-zero usage block(s) counted as measured`).
+/// rm-897's executed sweep re-swept 23 lanes whitespace-tolerant but
+/// never enumerated the doctor leaf (its own rider warns coverage is
+/// reachability-dependent — that corpus rendered no doctor leaf). Both
+/// families now route through the same `guard_formula_cell` the CSV
+/// (rm-540) / markdown (rm-897) / TSV lanes use, at ONE render
+/// choke-point; the JSON lane stays byte-lossless by construction (the
+/// guard is text-render-only). This pin drives the REAL doctor walk
+/// (discovery + cache persist + render) over a corpus holding the
+/// hostile zero-usage fixture beside a benign control.
+#[test]
+fn doctor_sample_lane_neutralizes_the_hostile_formula_corpus() {
+    let home = std::env::temp_dir().join(format!("at-rm1395-home-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    fs::create_dir_all(&home).expect("create temp home");
+    with_home(&home, || {
+        let corpus = std::env::temp_dir().join(format!("at-rm1395-corpus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&corpus);
+        fs::create_dir_all(&corpus).expect("create corpus dir");
+        fs::copy(HOSTILE_ZERO_USAGE_FIXTURE, corpus.join("hostile.jsonl"))
+            .expect("plant hostile zero-usage fixture");
+        fs::write(corpus.join("benign.jsonl"), BENIGN_ZERO_USAGE_SESSION)
+            .expect("plant benign control fixture");
+
+        let text = render_doctor_report(Some(&corpus), false, "text").expect("render doctor text");
+
+        // The poison must have actually minted a zero-usage sample, or
+        // every assertion below is vacuous — the guarded line, whole.
+        let guarded_line = concat!(
+            "'=HYPERLINK(\"http://evil.example\",\"click-me\") please review: ",
+            "1 all-zero usage block(s) counted as measured"
+        );
+        assert!(
+            text.contains(&format!("    {guarded_line}\n")),
+            "the hostile zero-usage sample must render guarded: {text}"
+        );
+        // Family uniformity: every payload occurrence carries the
+        // paste-marker at its cell start, and no pasted line LEADS
+        // with the live formula.
+        assert_every_occurrence_preceded(&text, "doctor text", "'");
+        assert_no_line_leads_with_payload(&text, "doctor text");
+        // Acceptance arm: zero SAMPLE lines — the four-space-indented
+        // cell surface both families render into — whose first
+        // non-whitespace char is an introducer carry an unmarked
+        // payload: any introducer-led sample must open with the `'`
+        // marker instead (fullwidth introducers included, matching
+        // guard_formula_cell). Prose bullets elsewhere in the report
+        // (`- Ready: …`) are not paste cells and stay out of scope —
+        // the rm-897 false-positive trade was made for cells, not for
+        // the report's own vocabulary.
+        for line in text.lines() {
+            if !line.starts_with("    ") {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if let Some(first) = trimmed.chars().next() {
+                if matches!(
+                    first,
+                    '=' | '+' | '@' | '-' | '\u{FF1D}' | '\u{FF0B}' | '\u{FF20}' | '\u{FF0D}'
+                ) {
+                    assert!(
+                        trimmed.starts_with('\''),
+                        "doctor text: introducer-led sample line lacks the paste-marker: {trimmed:?}"
+                    );
+                }
+            }
+        }
+
+        // Benign control: the harmless name renders byte-identical —
+        // the guard buys no paste-marker on non-introducer names.
+        assert!(
+            text.contains(concat!(
+                "    benign code review request: ",
+                "1 all-zero usage block(s) counted as measured\n"
+            )),
+            "benign zero-usage sample must render unmarked: {text}"
+        );
+        assert!(
+            !text.contains("'benign"),
+            "benign sample must not carry a paste-marker: {text}"
+        );
+
+        // The JSON lane stays byte-lossless by design: the guard is a
+        // text-render arm, so the machine lane carries the raw name.
+        let json = render_doctor_report(Some(&corpus), false, "json").expect("render doctor json");
+        assert!(
+            json.contains("=HYPERLINK("),
+            "json lane must stay lossless and carry the raw sample: {json}"
+        );
+        assert!(
+            !json.contains("'=HYPERLINK("),
+            "json lane must not carry the text lane's paste-marker: {json}"
+        );
+    });
 }

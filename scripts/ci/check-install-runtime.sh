@@ -27,7 +27,9 @@ fail() {
 sh -n install.sh || fail "install.sh must remain valid POSIX sh"
 
 # The expected pinned ref is DERIVED from install.sh's default (rm-012/rm-051
-# family, run a64735b75a46 2026-10-14): deriving keeps test D/E a live
+# family, run a64735b75a46 2026-10-14 — the identical derive-from-install.sh
+# fix shape was executed in parallel by sibling run 966bd5f9 cycle 4 and
+# folds here by title, one derivation): deriving keeps test D/E a live
 # receipt<->pin drift guard instead of a second literal that rots on every
 # release bump (the gate was red on v0.9.0 while install.sh pinned v0.10.1).
 expected_ref="$(sed -n 's/^REF="${AGENTTRACE_SOURCE_REF:-\([^"]*\)}"$/\1/p' install.sh | head -n1)"
@@ -118,10 +120,9 @@ grep -q "no Rust toolchain" "$out" ||
 	fail "test C: failure must name the missing Rust toolchain"
 
 # — test D: incompatible download + toolchain → cargo source-build fallback —
-# The ref is whatever install.sh pins as its default (derived above, rm-051)
-# or whatever
-# AGENTTRACE_SOURCE_REF names, so the fallback never has to resolve
-# api.github.com in an offline run.
+# The ref is the installer's pinned default ($expected_ref, derived above
+# from install.sh — rm-051) or whatever AGENTTRACE_SOURCE_REF names, so
+# the fallback never has to resolve api.github.com in an offline run.
 shims="$tmp/shims"
 mkdir -p "$shims"
 cat >"$shims/git" <<FAKE_GIT
