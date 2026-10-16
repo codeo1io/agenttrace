@@ -1,0 +1,1 @@
+{"timestamp":"2026-10-13T09:10:00Z","type":"assistant","message":{"id":"msg_eu_01","model":"eu.anthropic.claude-sonnet-4-5-20250929-v1:0","usage":{"input_tokens":1000000,"output_tokens":1000000}}}
