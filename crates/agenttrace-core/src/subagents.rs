@@ -225,9 +225,21 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
             sessions[child].metrics.cost_estimated,
             total_tokens(&sessions[child]),
         );
-        sessions[parent].metrics.subagent_count += 1;
-        sessions[parent].metrics.subagent_cost += cost;
-        sessions[parent].metrics.subagent_tokens += tokens;
+        // rm-487: these are sums of untrusted child totals, so the
+        // clamp-plus-saturate contract (lib.rs `analyze`) governs here
+        // too: counts and tokens saturate (a hostile corpus must never
+        // panic a debug build or wrap a release total), and poisoned
+        // (non-finite) child costs are skipped per the rm-1500 rule the
+        // insights rollups already follow.
+        sessions[parent].metrics.subagent_count =
+            sessions[parent].metrics.subagent_count.saturating_add(1);
+        if cost.is_finite() {
+            sessions[parent].metrics.subagent_cost += cost;
+        }
+        sessions[parent].metrics.subagent_tokens = sessions[parent]
+            .metrics
+            .subagent_tokens
+            .saturating_add(tokens);
         sessions[child].metrics.parent_session = sessions[parent].path.clone();
     }
     for (child, parent_key) in key_links {
@@ -251,10 +263,14 @@ pub fn attribute_subagents(sessions: &mut [Session]) -> usize {
             total_tokens(&sessions[child]),
         );
         sessions[child].metrics.parent_session = parent_key;
+        // rm-487: same clamp-plus-saturate contract as the path-linked
+        // lane above — saturate counts and tokens, skip poisoned costs.
         let metrics = &mut sessions[parent].metrics;
-        metrics.subagent_count += 1;
-        metrics.subagent_cost += cost;
-        metrics.subagent_tokens += tokens;
+        metrics.subagent_count = metrics.subagent_count.saturating_add(1);
+        if cost.is_finite() {
+            metrics.subagent_cost += cost;
+        }
+        metrics.subagent_tokens = metrics.subagent_tokens.saturating_add(tokens);
     }
     unlinked
 }
@@ -331,6 +347,43 @@ mod tests {
         let mut orphans = sessions[1..].to_vec();
         assert_eq!(attribute_subagents(&mut orphans), 3);
         assert!(orphans[0].metrics.parent_session.is_empty());
+    }
+
+    #[test]
+    fn hostile_child_totals_saturate_instead_of_panicking() {
+        // rm-487 pin: 2 x (i64::MAX/2 + 1) input tokens overflow a plain
+        // `+=` (debug panic, release wrap); the debug profile IS the
+        // ordinary test lane, so this test panics before the fix.
+        let hostile = i64::MAX / 2 + 1;
+        let mut sessions = vec![
+            session("/p/proj/abc.jsonl", 1.0, 100),
+            session("/p/proj/abc/subagents/agent-a1.jsonl", 0.5, hostile),
+            session("/p/proj/abc/subagents/agent-a2.jsonl", 0.5, hostile),
+        ];
+        assert_eq!(attribute_subagents(&mut sessions), 0);
+        let parent = &sessions[0].metrics;
+        assert_eq!(parent.subagent_count, 2);
+        assert_eq!(parent.subagent_tokens, i64::MAX, "must saturate, not wrap");
+        assert!((parent.subagent_cost - 1.0).abs() < 1e-9);
+        // Re-running on already-attributed sessions stays saturated.
+        assert_eq!(attribute_subagents(&mut sessions), 0);
+        assert_eq!(sessions[0].metrics.subagent_tokens, i64::MAX);
+    }
+
+    #[test]
+    fn poisoned_child_cost_is_skipped_not_propagated() {
+        // rm-1500 discipline reaches the rollup: a non-finite child cost
+        // must not poison the parent's subagent_cost forever.
+        let mut sessions = vec![
+            session("/p/proj/abc.jsonl", 1.0, 100),
+            session("/p/proj/abc/subagents/agent-bad.jsonl", f64::INFINITY, 40),
+            session("/p/proj/abc/subagents/agent-ok.jsonl", 0.25, 10),
+        ];
+        assert_eq!(attribute_subagents(&mut sessions), 0);
+        let parent = &sessions[0].metrics;
+        assert_eq!(parent.subagent_count, 2);
+        assert!(parent.subagent_cost.is_finite());
+        assert!((parent.subagent_cost - 0.25).abs() < 1e-9);
     }
 
     fn sqlite_row_session(

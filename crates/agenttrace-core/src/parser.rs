@@ -70,6 +70,14 @@ fn parse_session_bytes(raw: Vec<u8>, label: &str, name: &str) -> anyhow::Result<
 /// can always decompress manually and re-run.
 const ZSTD_ROLLOUT_DECODE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// rm-1025: the over-cap refusal numeral is DERIVED from
+/// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`], never hand-written — a cap change
+/// must not leave the user-facing message stating a stale size (same
+/// discipline as `MCP_INPUT_MAX_BYTES` in the CLI transport lane).
+fn zstd_decode_cap_label() -> String {
+    format!("{} MiB", ZSTD_ROLLOUT_DECODE_MAX_BYTES / (1024 * 1024))
+}
+
 /// Decode one zstd-compressed Codex rollout, bounded by
 /// [`ZSTD_ROLLOUT_DECODE_MAX_BYTES`]. Every failure keeps the named-format
 /// wording (never a generic UTF-8 error): a corrupt frame names the decode
@@ -102,7 +110,7 @@ fn decode_zstd_rollout_bounded(raw: Vec<u8>, label: &str) -> anyhow::Result<Vec<
             bail!(
                 "session file {} is zstd-compressed (Codex rollout format) and would decompress past the {} cap; refusing the unbounded decode — decompress it manually instead (e.g. `zstd -d rollout.jsonl.zst -o rollout.jsonl`, then re-run or pipe)",
                 label,
-                "64 MiB"
+                zstd_decode_cap_label()
             );
         }
         decoded.extend_from_slice(&chunk[..n]);
@@ -11438,4 +11446,24 @@ fn oh_my_pi_usage_cache_write_1h_is_own_class() {
     let usage = oh_my_pi_usage(Some(&snake)).expect("snake alias yields usage");
     assert_eq!(usage.get("cache_write_1h_tokens"), Some(&7));
     assert!(!usage.contains_key("cache_creation_input_tokens"));
+}
+
+#[cfg(test)]
+mod zstd_cap_label_tests {
+    use super::*;
+
+    #[test]
+    fn over_cap_refusal_numeral_tracks_the_constant() {
+        // rm-1025: the refusal size is derived from
+        // ZSTD_ROLLOUT_DECODE_MAX_BYTES so a cap change can never ship a
+        // stale hand-written numeral; the plain-string assertion pins the
+        // current user-facing text exactly.
+        assert_eq!(zstd_decode_cap_label(), "64 MiB");
+        let derived = ZSTD_ROLLOUT_DECODE_MAX_BYTES / (1024 * 1024);
+        assert!(zstd_decode_cap_label().contains(&derived.to_string()));
+        // The label is a whole number of MiB at every value the constant
+        // can take (the derivation must not silently produce "0 MiB" or
+        // a fraction if the cap is ever retuned).
+        assert_eq!(ZSTD_ROLLOUT_DECODE_MAX_BYTES % (1024 * 1024), 0);
+    }
 }
