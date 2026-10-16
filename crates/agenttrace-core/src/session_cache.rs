@@ -5,7 +5,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 64;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+// Bumped 64 -> 65 (run 7fd83ab2fd7f4ea090b5d540983a0abb cycle 2
+// 'evidence-lane paste-safety + claude-lane format-compat', review
+// 3ea62c4d F1 -> fix 282d5474, rm-1522): the claude lane began
+// disclosing unmatched wire kinds — claude_unmatched_type:{kind}
+// counters riding the lane's one-carrier meta event (+1
+// events_total for journals with genuine disclosures) — for the
+// v2.1.300 request-reproduction records and the previously-silent
+// known kinds. A parse-shape change: a warm v64 entry replays the
+// pre-change parse, so the never-silent disclosure the unit exists
+// to guarantee never materializes for an upgraded fleet (proven
+// live by the review on a v64-warmed store: --doctor zero hits over
+// warm, the counter present cold). Bumped per the rm-230 convention
+// so cached claude journals regenerate and disclose. Minted in-tree
+// by the review fix at the run's base e130845c on the landed
+// ceiling 64, one invalidation either way; the SQLite snapshot
+// stays 12 (no snapshot semantics moved). Entries regenerate once
+// on next scan.
 // Bumped 63 -> 64 (integration of run 90514a3833d04721a6a3ca40ea695423
 // cycle 4 'pi cost truth: recorded-zero disclosure + 1h-tier cache
 // accounting', rm-1052 LEAD + rm-499, conflict case

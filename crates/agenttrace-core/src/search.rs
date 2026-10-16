@@ -127,6 +127,24 @@ fn guarded_segment(value: &str) -> String {
     crate::reports::guard_formula_cell(&crate::statusline::sanitize_line_segment(value))
 }
 
+/// rm-540 residual (run 7fd83ab2 cycle 2, assess cbf457f4 F1): evidence
+/// items are `label: value` pairs joined in `add_match`, and
+/// `guard_formula_cell` only neutralizes an introducer at the FIRST
+/// non-whitespace character — so guarding the JOINED item at the render
+/// loop could never fire behind the label, and every evidence row
+/// (`name:`, `tool:`, `tool argument:`, …) rendered its payload raw.
+/// Split the fixed label off and guard the VALUE: text-to-columns and
+/// `": "`-aware paste targets make the value a cell of its own. The
+/// value passes through the same rm-985 stack, and JSON output remains
+/// lossless (the guard is a text-render concern; the stored match item
+/// keeps its raw value).
+fn guarded_evidence_item(item: &str) -> String {
+    match item.split_once(": ") {
+        Some((label, value)) => format!("{}: {}", label, guarded_segment(value)),
+        None => guarded_segment(item),
+    }
+}
+
 pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
     let mut out = format!("Search results: {:?} ({})\n", query, results.len());
     if results.is_empty() {
@@ -157,7 +175,7 @@ pub fn report_search_text(results: &[SearchResult], query: &str) -> String {
             out.push_str(&format!("  path: {}\n", guarded_segment(&result.path)));
         }
         for item in &result.matches {
-            out.push_str(&format!("  - {}\n", guarded_segment(item)));
+            out.push_str(&format!("  - {}\n", guarded_evidence_item(item)));
         }
     }
     out

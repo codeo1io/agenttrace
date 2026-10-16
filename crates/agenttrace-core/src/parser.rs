@@ -5016,6 +5016,16 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // (every re-emission repeats it in full).
     let mut iterations_mined: BTreeSet<String> = BTreeSet::new();
     let mut cwd = String::new();
+    // rm-1522 (run 7fd83ab2 cycle 2): wire kinds this lane does not arm —
+    // disclosed by type (`claude_unmatched_type:{kind}`), never silently
+    // skipped. Claude Code v2.1.300 started writing per-request
+    // `request_reproduction` records (system prompt + tools +
+    // parameters, upstream CHANGELOG §2.1.300), and the previously-known
+    // unarmed kinds (`summary`, `system`, …) had the same silent fall-
+    // through; the qwen/codex lanes already disclose this way. Counted
+    // only — the record content (repeated per request, potentially
+    // large) is never retained, keeping parsing bounded.
+    let mut unmatched_kinds: BTreeMap<String, i64> = BTreeMap::new();
     for obj in objs.iter() {
         let typ = string(obj.get("type")).unwrap_or("");
         if cwd.is_empty() {
@@ -5252,7 +5262,17 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
                     }
                 }
             }
-            _ => {}
+            // rm-1522: disclose, never silently skip (see the
+            // `unmatched_kinds` declaration for the v2.1.300 context).
+            other => {
+                let shape = if other.trim().is_empty() {
+                    "missing_type"
+                } else {
+                    other
+                };
+                let key = disclosure_key("claude_unmatched_type", shape);
+                *unmatched_kinds.entry(key).or_insert(0) += 1;
+            }
         }
     }
     // One-carrier note (review 543ac419 F4): this Claude lane mints no
@@ -5266,16 +5286,31 @@ fn parse_claude_code_jsonl(objs: &[JsonObject]) -> Option<Vec<Event>> {
     // for 58 alongside the rm-300 U1 arm (the run minted the rung as
     // 42 -> 52 at its base 15a8da8; this integration re-based it onto
     // the advanced ceiling as 57 -> 58 per the
-    // landed-rung-keeps-numeral convention).
-    if !tool_result_refolds.is_empty() {
-        events.insert(
-            0,
-            Event {
-                role: "meta".to_string(),
-                disclosure_counters: std::mem::take(&mut tool_result_refolds),
-                ..Event::default()
-            },
-        );
+    // landed-rung-keeps-numeral convention). The rm-1522 unmatched-kind
+    // counters ride the SAME single carrier (one event regardless of
+    // how many unmatched records the journal holds). The carrier is
+    // gated on the lane having MINED content (discovery_contract pins
+    // this): without the gate, a claude-detected but contentless journal
+    // (legacy generic-rust `type` events without roles) would flip
+    // `non_empty(events)` and STEAL the file from the generic lane —
+    // the lane must decline contentless journals so the generic lane's
+    // own disclosures own them.
+    if !events.is_empty() {
+        if !unmatched_kinds.is_empty() {
+            for (key, count) in unmatched_kinds {
+                *tool_result_refolds.entry(key).or_insert(0) += count;
+            }
+        }
+        if !tool_result_refolds.is_empty() {
+            events.insert(
+                0,
+                Event {
+                    role: "meta".to_string(),
+                    disclosure_counters: std::mem::take(&mut tool_result_refolds),
+                    ..Event::default()
+                },
+            );
+        }
     }
     if saw_claude {
         non_empty(events)

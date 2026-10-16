@@ -1,7 +1,7 @@
 use agenttrace_core::{
     compute_overview, parse_file, recommendations, render_waste_report, report_compare,
-    report_overview_html, report_overview_markdown, report_overview_text, report_search_text,
-    report_text, search_sessions, Session, ToolLatency,
+    report_overview_html, report_overview_markdown, report_overview_text, report_search_json,
+    report_search_text, report_text, search_sessions, Session, ToolLatency,
 };
 use std::path::Path;
 
@@ -41,6 +41,20 @@ fn hostile_sessions() -> Vec<Session> {
     // session name, not a hand-built stand-in.
     assert_eq!(session.name, PAYLOAD_FULL);
     vec![session]
+}
+
+/// Both live assess PoC surfaces in one corpus: the vendored name fixture
+/// (transcript-derived `=HYPERLINK…` session name) plus the hostile-tool
+/// fixture whose `assistant.tool_use.name` is `+cmd|' /C calc'!A0` (the
+/// name-fixture has no tool calls — see the HOSTILE_TOOL_FIXTURE note
+/// above — so both sessions are needed for the value-guard pins).
+fn search_lane_sessions() -> Vec<Session> {
+    let mut sessions = hostile_sessions();
+    let tool_session = parse_file(Path::new(HOSTILE_TOOL_FIXTURE))
+        .unwrap_or_else(|error| panic!("hostile-tool fixture must parse: {error}"));
+    assert_eq!(tool_session.name, PAYLOAD_FULL);
+    sessions.push(tool_session);
+    sessions
 }
 
 /// Every occurrence of the payload head in a human-readable lane must be
@@ -123,6 +137,9 @@ fn every_human_lane_neutralizes_the_hostile_formula_corpus() {
     );
     // Evidence items embed the payload mid-line (`field: snippet`); the
     // paste boundary is the line, and no line may lead with the formula.
+    // (rm-540 residual supersedes the weaker "mid-line is text" reading
+    // this companion used to carry alone — see the value-guard test below,
+    // which upgrades this lane to the strict marker-preceded form.)
     assert_no_line_leads_with_payload(&search_text, "search text");
 
     let compare = report_compare(&sessions, "claude-sonnet-4");
@@ -131,6 +148,50 @@ fn every_human_lane_neutralizes_the_hostile_formula_corpus() {
         "compare text lane must carry the paste-marker: {compare}"
     );
     assert_every_occurrence_preceded(&compare, "compare text", "'");
+}
+
+/// rm-540 residual (assess cbf457f4 F1, run 7fd83ab2 cycle 2): the search
+/// evidence rows join `label: value` BEFORE the render-time
+/// `guarded_segment(item)` — and `guard_formula_cell` only neutralizes an
+/// introducer at the FIRST non-whitespace character, so the whole-item
+/// guard could never fire behind the label; every evidence row rendered
+/// its payload raw. The VALUE must carry the `'` paste-marker itself:
+/// text-to-columns and ": "-aware paste targets make the value a cell of
+/// its own. Pinned on both live assess PoCs (`--search cmd` -> the
+/// `- tool: '+cmd|…` row; `--search please` -> the `- name: '=HYPERLINK…`
+/// row), with the lane upgraded to the strict marker-preceded form and
+/// the JSON lane pinned lossless (the guard is a TEXT-render concern).
+#[test]
+fn search_evidence_rows_carry_the_value_paste_marker() {
+    let sessions = search_lane_sessions();
+
+    // Live assess PoC 1: the hostile tool name behind the `tool:` label.
+    let tool_hits = search_sessions(&sessions, "cmd", 10);
+    assert!(!tool_hits.is_empty(), "hostile tool name must match `cmd`");
+    let tool_text = report_search_text(&tool_hits, "cmd");
+    assert!(
+        tool_text.contains("- tool: '+cmd|"),
+        "tool evidence row must guard the VALUE, not the whole line: {tool_text}"
+    );
+    assert_every_occurrence_preceded(&tool_text, "search text", "'");
+
+    // Live assess PoC 2: the hostile session name behind the `name:` label.
+    let name_hits = search_sessions(&sessions, "please", 10);
+    assert!(!name_hits.is_empty(), "hostile name must match `please`");
+    let name_text = report_search_text(&name_hits, "please");
+    assert!(
+        name_text.contains("- name: '=HYPERLINK("),
+        "name evidence row must guard the VALUE, not the whole line: {name_text}"
+    );
+    assert_every_occurrence_preceded(&name_text, "search text", "'");
+
+    // The JSON lane is lossless by design: the raw payload rides the
+    // machine-readable item untouched (rm-985 doc contract).
+    let json = report_search_json(&tool_hits);
+    assert!(
+        json.contains("tool: +cmd|"),
+        "JSON search output must stay lossless (raw payload, no marker): {json}"
+    );
 }
 
 /// The guard must not damage benign numeric-looking transcript fields:
