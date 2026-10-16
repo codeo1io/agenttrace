@@ -370,11 +370,17 @@ For public demo, report, or release-surface checks, run the reusable gates from 
 
 ```bash
 scripts/ci/check-rust-release-local.sh
-AGENTTRACE_BIN=/tmp/agenttrace scripts/ci/check-output-contract.sh
-AGENTTRACE_BIN=/tmp/agenttrace scripts/ci/check-deterministic-output.sh
-AGENTTRACE_BIN=/tmp/agenttrace scripts/ci/check-report-semantics.sh
+scripts/ci/check-output-contract.sh
+scripts/ci/check-deterministic-output.sh
+scripts/ci/check-report-semantics.sh
 scripts/ci/check-release-surfaces.sh
 ```
+
+The three report gates derive the repository's own `target/release/agenttrace`
+(rm-377) — the `cargo build --release -p agenttrace` step above is what they
+validate. Do not pin `AGENTTRACE_BIN=/tmp/agenttrace`: the shared /tmp path is
+exactly the stale-binary false-green vector those gates were hardened against;
+override only for a deliberate A/B against a pinned build.
 
 ## Release Consistency Checklist
 
