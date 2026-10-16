@@ -331,6 +331,193 @@ fn zstd_rollout_family_reconciles_like_the_uncompressed_twin() {
     assert_eq!(mixed_counts, vec![1_400, 300]);
 }
 
+/// rm-402 direct-parent rebase (cycle 3): the nested chain A→B→C. B's
+/// opening billing (its first cumulative snapshot, 1000) IS A's final
+/// state, and C's (1500) is B's — so the direct parent of C is B, never
+/// the family-earliest A. The pre-fix code rebased every member onto
+/// members[0]: C kept 1000 instead of its true 500 (family total 2500,
+/// +25% over the honest 2000).
+#[test]
+fn chain_rebases_onto_the_direct_parent_not_the_family_earliest() {
+    let mut sessions = vec![
+        load_dir("codex-multiagent-v2-chain", "a.jsonl"),
+        load_dir("codex-multiagent-v2-chain", "b.jsonl"),
+        load_dir("codex-multiagent-v2-chain", "c.jsonl"),
+    ];
+    // PoC arithmetic: naive sum double-counts both replayed prefixes.
+    let naive: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+    assert_eq!(naive, 4_500);
+
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1);
+    assert_eq!(stats.children_adjusted, 2);
+    let counts: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert_eq!(
+        counts,
+        vec![1_000, 500, 500],
+        "chain must resolve to A=1000, B=500 (onto A), C=500 (onto B)"
+    );
+    // Family true total = 2,000 — the +25% chain misreport is gone.
+    let family: i64 = counts.iter().sum();
+    assert_eq!(family, 2_000);
+
+    // The sharpest direct-parent pin: C's dropped tokens are B's ENTIRE
+    // final (1,500) — under family-earliest keying C dropped only A's
+    // 1,000. (B and C both end at 500, so pick by path.)
+    let c = sessions
+        .iter()
+        .find(|s| s.path.ends_with("c.jsonl"))
+        .expect("rebased C");
+    assert_eq!(
+        c.metrics
+            .disclosure_counters
+            .get("codex_multiagent_replayed_tokens_dropped"),
+        Some(&1_500),
+        "C's baseline must be its direct parent B, not the family earliest A"
+    );
+    assert_eq!(
+        c.metrics
+            .disclosure_counters
+            .get("codex_multiagent_replayed_child_adjusted"),
+        Some(&1)
+    );
+    let b = sessions
+        .iter()
+        .find(|s| s.path.ends_with("b.jsonl"))
+        .expect("rebased B");
+    assert_eq!(b.metrics.tokens_input, 500);
+    assert_eq!(
+        b.metrics
+            .disclosure_counters
+            .get("codex_multiagent_replayed_tokens_dropped"),
+        Some(&1_000),
+        "B's baseline is its direct parent A"
+    );
+    assert_eq!(stats.tokens_input_dropped, 2_500);
+}
+
+/// rm-402 sibling/template shape: three independent rollouts that merely
+/// share a template opening (the standing 0779d26b F1 corpus shape). No
+/// member's opening contains another member's final state — there is no
+/// parent-child edge at all — so every member stands alone and the
+/// family reports the full 4,500. The pre-fix family-earliest rebase
+/// destroyed two siblings to zero (1,500 reported, −67%).
+#[test]
+fn sibling_template_family_members_stand_alone() {
+    let mut sessions = vec![
+        load_dir("codex-multiagent-v2-siblings", "s1.jsonl"),
+        load_dir("codex-multiagent-v2-siblings", "s2.jsonl"),
+        load_dir("codex-multiagent-v2-siblings", "s3.jsonl"),
+    ];
+    let naive: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+    assert_eq!(naive, 4_500);
+
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1);
+    // No sibling has a valid baseline: nothing may be rebased.
+    assert_eq!(stats.children_adjusted, 0);
+    assert_eq!(stats.tokens_input_dropped, 0);
+    let family: i64 = sessions.iter().map(|s| s.metrics.tokens_input).sum();
+    assert_eq!(family, 4_500, "each sibling's full usage is real and kept");
+    for session in &sessions {
+        assert_eq!(
+            child_adjusted_counters(session),
+            None,
+            "no sibling may be attributed as a replay child"
+        );
+    }
+    // The two later siblings carry the below-baseline disclosure (their
+    // opening billing sits below the earliest member's final) — kept
+    // intact and disclosed, never saturated to zero.
+    assert_eq!(stats.children_below_baseline, 2);
+}
+
+/// The single-snapshot control for the non-UTF8 corpus: identical content
+/// under UTF-8 names reconciles exactly — the child's opening billing
+/// (1,600) contains the parent's final (1,200), so the child keeps only
+/// its own 400. This output must hold byte-identically before and after
+/// the rm-402/rm-1916 batch.
+#[test]
+fn single_snapshot_child_inherits_parent_final_as_baseline() {
+    let mut sessions = vec![
+        load_dir("codex-multiagent-v2-single-snapshot", "parent.jsonl"),
+        load_dir("codex-multiagent-v2-single-snapshot", "child.jsonl"),
+    ];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.families, 1);
+    assert_eq!(stats.children_adjusted, 1);
+    assert_eq!(stats.tokens_input_dropped, 1_200);
+    let counts: Vec<i64> = sessions.iter().map(|s| s.metrics.tokens_input).collect();
+    assert_eq!(counts, vec![1_200, 400]);
+    let family: i64 = counts.iter().sum();
+    assert_eq!(family, 1_600);
+    assert_eq!(child_adjusted_counters(&sessions[1]), Some(1));
+    assert_eq!(
+        sessions[1]
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_replayed_tokens_dropped"),
+        Some(&1_200)
+    );
+}
+
+/// rm-1916: a member whose stored path cannot be resolved back to a file
+/// — the non-UTF8-name shape, which reaches reconciliation through the
+/// parser's lossy path seam (`to_string_lossy`) — used to leave its
+/// replay family SILENTLY, so the prefix it replays double-counted with
+/// no disclosure (assess PoC: 2,800/$0.0084 reported, no disclosures key
+/// at all). The member must now carry a distinct disclosure, keep its
+/// full usage (conservative), and never be mislabeled as a replay child.
+#[cfg(unix)]
+#[test]
+fn non_utf8_named_member_is_disclosed_not_silently_dropped() {
+    use std::os::unix::ffi::OsStrExt;
+    let ctl = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-multiagent-v2-single-snapshot");
+    let parent_bytes = std::fs::read(ctl.join("parent.jsonl")).expect("control parent");
+    let child_bytes = std::fs::read(ctl.join("child.jsonl")).expect("control child");
+
+    let dir = std::env::temp_dir().join(format!("agenttrace-rm1916-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    let bad_name = std::ffi::OsStr::from_bytes(b"parent_bad\xffname.jsonl");
+    let parent_path = dir.join(bad_name);
+    let child_path = dir.join("child_utf8.jsonl");
+    std::fs::write(&parent_path, &parent_bytes).expect("write parent");
+    std::fs::write(&child_path, &child_bytes).expect("write child");
+
+    let parent = agenttrace_core::parse_file(&parent_path).expect("non-UTF8 name parses");
+    let child = agenttrace_core::parse_file(&child_path).expect("child parses");
+    // The seam: the stored path is lossy and no longer resolves.
+    assert!(
+        std::path::Path::new(&parent.path).canonicalize().is_err(),
+        "fixture must exercise the lossy-path seam"
+    );
+
+    let mut sessions = vec![parent, child];
+    let stats = reconcile_codex_multiagent_replays(&mut sessions);
+    assert_eq!(stats.members_unreadable, 1);
+    assert_eq!(
+        sessions[0]
+            .metrics
+            .disclosure_counters
+            .get("codex_multiagent_replay_member_unreadable"),
+        Some(&1),
+        "the dropped member is disclosed, never silent"
+    );
+    // No family can form: the child stands alone, usage intact, with no
+    // replay attribution and no unreadable counter of its own.
+    assert_eq!(stats.families, 0);
+    assert_eq!(sessions[0].metrics.tokens_input, 1_200);
+    assert_eq!(sessions[1].metrics.tokens_input, 1_600);
+    assert_eq!(child_adjusted_counters(&sessions[1]), None);
+    assert!(!sessions[1]
+        .metrics
+        .disclosure_counters
+        .contains_key("codex_multiagent_replay_member_unreadable"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Review af521003 F4: two unrelated sessions that merely share a short
 /// 2-item opening (293 bytes — the prompt-retry / templated-first-turns
 /// shape) must NOT merge into a family; both keep their full usage with
