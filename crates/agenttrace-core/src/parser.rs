@@ -522,6 +522,12 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                     opencode_admission.capped_bytes as usize,
                 );
             }
+            if opencode_admission.non_regular_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_non_regular".to_string(),
+                    opencode_admission.non_regular_files,
+                );
+            }
             return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
@@ -6528,12 +6534,17 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
 struct OpencodeAdmissionStats {
     capped_files: usize,
     capped_bytes: u64,
+    /// Transcripts skipped for file class (FIFO/socket/device) — the
+    /// open never happens, so nothing was read to count in bytes
+    /// (rm-1867).
+    non_regular_files: usize,
 }
 
 impl OpencodeAdmissionStats {
     fn accumulate(&mut self, other: OpencodeAdmissionStats) {
         self.capped_files += other.capped_files;
         self.capped_bytes += other.capped_bytes;
+        self.non_regular_files += other.non_regular_files;
     }
 }
 
@@ -6557,7 +6568,25 @@ fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionS
         }
         // rm-1437: stat before read — over-cap transcripts are skipped and
         // disclosed instead of being admitted into memory.
-        let file_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        // rm-1867: only regular files are admitted. `metadata` never
+        // blocks — the open does — so the file-class check rides the
+        // same stat the read cap already uses: a FIFO/socket/device
+        // named `*.json` is skipped and disclosed instead of hanging
+        // the reader forever on the open (live PoC: a FIFO session
+        // transcript, `timeout 8 agenttrace session` rc124 with zero
+        // output). A stat failure keeps the landed semantics: the read
+        // below fails and the file is dropped silently (per-failure
+        // disclosure is rm-1866's arm, ceded there).
+        let metadata = std::fs::metadata(&path);
+        if metadata
+            .as_ref()
+            .map(|meta| !meta.file_type().is_file())
+            .unwrap_or(false)
+        {
+            admission.non_regular_files += 1;
+            continue;
+        }
+        let file_len = metadata.map(|meta| meta.len()).unwrap_or(0);
         if file_len > OPENCODE_TRANSCRIPT_READ_CAP_BYTES {
             admission.capped_files += 1;
             admission.capped_bytes += file_len;

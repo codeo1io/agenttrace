@@ -299,6 +299,45 @@
 
 ### Fixed
 
+- opencode transcript admission rejects non-regular files (rm-1867, run
+  e40916d7 cycle 2, batch "admission truth completion"): a `*.json` transcript
+  path that is a FIFO/socket/device used to reach the reader's open — a
+  FIFO session transcript hung `agenttrace session` forever (live PoC:
+  `timeout 8 agenttrace <root> session` rc124, zero output), and a socket
+  path read as empty and silently vanished. The file-class check rides the
+  same `metadata` stat the read cap already uses, before the open: non-regular
+  transcripts are skipped and disclosed as `opencode_transcript_non_regular`
+  in `line_skips`, so `--doctor` and `--overview -f json` degrade confidence
+  exactly like a capped read.
+
+- admission caps render as their own doctor row, byte counters with units
+  (rm-1868, run e40916d7 cycle 2, batch "admission truth completion"):
+  the rm-1437 admission counters rendered inside "Dropped lines (parse loss)",
+  so `opencode_transcript_bytes_capped=10486375` (bytes) sat beside
+  `unparseable_line=1` (lines) and read as ten million dropped lines —
+  ~6 orders of magnitude off — and an over-cap corpus with zero parse loss
+  still showed a dropped-lines row. Admission counters
+  (`*_bytes_capped` / `*_files_capped` / `*_non_regular`) now render under
+  "Admission caps (skipped before read)" with the byte total unit-aware
+  (`10.5 MiB`); genuine parse loss keeps the old row (the
+  `disclosure_keys_capped` pin is unchanged), and the `--overview -f json`
+  `data_health` contract is unchanged (now pinned on both lanes: the
+  unit-aware text render and the raw-integer `data_health.line_skips` JSON
+  number).
+
+- the npm test lane can no longer pass green with zero tests (rm-1869, run
+  e40916d7 cycle 2, batch "admission truth completion"):
+  `node --test test/**/*.test.js` expands the glob only on Node ≥ 21 — on the
+  engines floor the pattern stayed literal, zero test files ran, and the
+  suite exited green (observed live in this cycle's assess). `npm test` now
+  enumerates every test file explicitly (portable to the declared floor), and
+  `npm/test/test-discovery.test.js` pins the contract: every listed file must
+  exist, the enumeration must exactly match the `*.test.js` files on disk,
+  and no glob metacharacter can leak back in. The README's Node.js floor
+  claim is synced to the same floor (`Node.js 20+`), and the floor itself is
+  probe-verified: the suite runs green with a nonzero test count on
+  Node 20 itself.
+
 - opencode transcript reads are stat-capped at 10 MiB per file (rm-1437, run
   c1cafed5 cycle 5): `read_opencode_records` previously read every message and
   part transcript whole into memory regardless of size, so peak heap scaled

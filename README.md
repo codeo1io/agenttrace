@@ -94,7 +94,7 @@ Package managers:
 # macOS and Linux
 brew install luoyuctl/tap/agenttrace
 
-# macOS, Linux, and Windows (requires Node.js 18+)
+# macOS, Linux, and Windows (requires Node.js 20+)
 npm install -g @zack78/agenttrace
 
 # From source

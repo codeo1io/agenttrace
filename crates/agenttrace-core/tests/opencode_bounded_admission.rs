@@ -13,7 +13,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agenttrace_core::{parse_file, Session};
+use agenttrace_core::{
+    build_doctor_report, data_health, parse_file, render_doctor_report, Session,
+};
 
 /// 10 MiB read cap (rm-1437); one byte over is already over-cap.
 const CAP_BYTES: usize = 10 * 1024 * 1024;
@@ -199,5 +201,192 @@ fn over_cap_part_transcript_is_disclosed_and_lanes_accumulate() {
             > 2 * CAP_BYTES,
         "both over-cap files' bytes must be disclosed: {skips:?}"
     );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg(unix)]
+fn non_regular_transcripts_are_skipped_and_disclosed() {
+    let clean = std::env::temp_dir().join(format!("at_rm1867_sock_clean_{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("at_rm1867_sock_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&clean);
+    let _ = fs::remove_dir_all(&root);
+    let clean_file = write_storage(&clean, false, false);
+    let session_file = write_storage(&root, false, false);
+
+    // A unix-socket file is non-regular; open(2) fails (ENXIO) rather
+    // than blocking, so the unguarded behavior drops it silently. The
+    // admission guard must skip the whole class and disclose it
+    // (rm-1867: the live hazard is a FIFO transcript, which hangs the
+    // reader's open forever - pinned by the fifo test below). Survival
+    // is pinned the house way: the session is exactly the clean
+    // corpus's, plus the disclosure counter.
+    let sock_path = root.join("opencode/storage/message/sess_1/m3.sock.json");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&sock_path).expect("bind socket transcript");
+
+    let clean_session = parse_file(&clean_file).unwrap();
+    let session =
+        parse_file(&session_file).expect("parse must not fail on a non-regular transcript");
+    assert_eq!(fingerprint(&session), fingerprint(&clean_session));
+    assert_eq!(
+        session
+            .metrics
+            .line_skips
+            .get("opencode_transcript_non_regular"),
+        Some(&1),
+    );
+    drop(listener);
+    let _ = fs::remove_dir_all(&clean);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg(unix)]
+fn fifo_transcript_cannot_hang_the_reader() {
+    let clean = std::env::temp_dir().join(format!("at_rm1867_fifo_clean_{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("at_rm1867_fifo_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&clean);
+    let _ = fs::remove_dir_all(&root);
+    let clean_file = write_storage(&clean, false, false);
+    let session_file = write_storage(&root, false, false);
+
+    let fifo_path = root.join("opencode/storage/message/sess_1/m3.fifo.json");
+    // Hold a writer end opening in the background so even a regressed
+    // guard cannot block forever in the reader's open: the read then
+    // sees EOF, the JSON lane drops the file silently, and the missing
+    // disclosure assertion below fails red instead of hanging the
+    // suite.
+    let writer_path = fifo_path.clone();
+    let writer = std::thread::spawn(move || {
+        let _held = std::fs::OpenOptions::new().write(true).open(&writer_path);
+    });
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status();
+
+    match mkfifo {
+        Ok(status) if status.success() => {
+            let clean_session = parse_file(&clean_file).unwrap();
+            let session =
+                parse_file(&session_file).expect("parse must complete over a FIFO transcript");
+            assert_eq!(fingerprint(&session), fingerprint(&clean_session));
+            assert_eq!(
+                session
+                    .metrics
+                    .line_skips
+                    .get("opencode_transcript_non_regular"),
+                Some(&1),
+            );
+        }
+        _ => {
+            // mkfifo unavailable (non-Linux host): the socket test pins
+            // the same file class; skip loudly rather than silently.
+            eprintln!("mkfifo unavailable; FIFO arm skipped (class pinned by the socket test)");
+        }
+    }
+    drop(writer);
+    let _ = fs::remove_dir_all(&clean);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn admission_caps_render_in_their_own_doctor_row() {
+    let root = std::env::temp_dir().join(format!("at_rm1868_doctor_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    write_storage(&root, true, false);
+
+    let report = build_doctor_report(Some(&root), false);
+    // The byte total is the padded message file's size on disk (cap +
+    // padding + the JSON wrapper), so pin it as a window around the cap
+    // rather than an exact size.
+    let capped_bytes = *report
+        .dropped_lines
+        .get("opencode_transcript_bytes_capped")
+        .expect("bytes counter present");
+    assert!(
+        capped_bytes > CAP_BYTES && capped_bytes < CAP_BYTES + 4096,
+        "capped byte total should sit just over the cap: {capped_bytes}"
+    );
+    assert_eq!(
+        report.dropped_lines.get("opencode_transcript_files_capped"),
+        Some(&1),
+    );
+
+    let text = render_doctor_report(Some(&root), false, "text").expect("doctor text render");
+    // rm-1868: a capped 10 MiB corpus has no parse loss at all - the
+    // old render showed these counters inside "Dropped lines (parse
+    // loss)" with the byte total as a bare integer, reading as ten
+    // million dropped lines.
+    assert!(
+        !text.contains("Dropped lines (parse loss)"),
+        "over-cap-only corpus must not render a parse-loss row: {text}"
+    );
+    let admission_row = text
+        .lines()
+        .find(|line| line.starts_with("Admission caps"))
+        .expect("admission caps row");
+    assert!(admission_row.contains("opencode_transcript_files_capped=1"));
+    assert!(
+        admission_row.contains("opencode_transcript_bytes_capped=10.0 MiB"),
+        "byte counter must render unit-aware: {admission_row}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn admission_counters_carry_raw_integers_into_the_json_lane() {
+    // rm-1868 arm (4), json half (review-fix F3): the doctor text lane
+    // renders the byte total unit-aware, but `--overview -f json`
+    // serializes `data_health.line_skips` straight from this map — the
+    // raw lossless integer must survive the wire as a JSON number, and
+    // the doctor's raw fold must carry the same integer (one counter,
+    // two lanes, zero drift between them).
+    let root = std::env::temp_dir().join(format!("at_rm1868_json_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let session_file = write_storage(&root, true, false);
+
+    let session = parse_file(&session_file).unwrap();
+    let health = data_health(std::slice::from_ref(&session), 1, 0);
+
+    let raw = *health
+        .line_skips
+        .get("opencode_transcript_bytes_capped")
+        .expect("data_health.line_skips must carry the bytes counter");
+    assert!(
+        raw > CAP_BYTES && raw < CAP_BYTES + 4096,
+        "json lane must carry the raw lossless integer, not a formatted unit: {raw}"
+    );
+    assert_eq!(
+        health.line_skips.get("opencode_transcript_files_capped"),
+        Some(&1),
+        "data_health.line_skips must carry the files counter: {:?}",
+        health.line_skips
+    );
+    assert_eq!(
+        health.confidence, "low",
+        "admission caps degrade confidence through the shared line_skips map"
+    );
+
+    // Wire truth: serialize exactly what the `-f json` lane emits and
+    // require a JSON number — a future unit-formatting or stringifying
+    // change to the json lane fails here.
+    let wire = serde_json::to_value(&health).expect("DataHealth serializes");
+    let bytes_on_wire = &wire["line_skips"]["opencode_transcript_bytes_capped"];
+    assert!(
+        bytes_on_wire.is_u64(),
+        "json data_health.line_skips bytes counter must be a raw JSON number: {bytes_on_wire}"
+    );
+    assert_eq!(bytes_on_wire.as_u64(), Some(raw as u64));
+
+    // Cross-lane parity: the doctor's raw dropped-lines fold equals the
+    // json lane's integer for the same corpus.
+    let report = build_doctor_report(Some(&root), false);
+    assert_eq!(
+        report.dropped_lines.get("opencode_transcript_bytes_capped"),
+        Some(&raw),
+        "doctor and json lanes must agree on the raw counter"
+    );
+
     let _ = fs::remove_dir_all(&root);
 }

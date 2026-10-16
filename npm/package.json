@@ -33,10 +33,10 @@
   ],
   "scripts": {
     "postinstall": "node scripts/install.js",
-    "test": "node --test test/**/*.test.js"
+    "test": "node --test test/install-runtime.test.js test/launcher-exit.test.js test/package.test.js test/test-discovery.test.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "os": [
     "darwin",

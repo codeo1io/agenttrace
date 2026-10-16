@@ -152,6 +152,33 @@ struct CacheEntryHeader {
     size: i64,
 }
 
+/// rm-1868: counters that name transcripts skipped at admission —
+/// before any line was read — rather than lines lost while parsing a
+/// read file. The byte total is byte-denominated and the file counts
+/// name whole files, so they must not render beside line counts.
+fn admission_cap_counter(counter: &str) -> bool {
+    counter.ends_with("_bytes_capped")
+        || counter.ends_with("_files_capped")
+        || counter.ends_with("_non_regular")
+}
+
+/// Byte-denominated admission counters render unit-aware so a byte
+/// total is never read as a line count (rm-1868).
+fn format_admission_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0usize;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
 pub fn render_doctor_report(
     dir: Option<&Path>,
     demo: bool,
@@ -1221,22 +1248,64 @@ pub fn doctor_report_text(report: &DoctorReport) -> String {
         // informational tier uses applies here too (first
         // DISCLOSURE_RENDER_ENTRY_CAP entries plus an explicit count
         // of what is held back).
-        let mut dropped_parts: Vec<String> = report
+        //
+        // rm-1868: admission-cap counters are not parse loss — the byte
+        // counter is byte-denominated (a capped 10 MiB transcript
+        // rendered `opencode_transcript_bytes_capped=10486375` beside
+        // `unparseable_line=1`, reading as ten million dropped lines,
+        // ~6 orders of magnitude off) and the file/non-regular counts
+        // name transcripts skipped before any line was read. Split the
+        // tier by key class: line-denominated loss keeps this row,
+        // admission caps render under their own row with byte units
+        // spelled out. The `--overview -f json` `data_health` contract
+        // is unchanged.
+        let parse_loss: Vec<(&String, &usize)> = report
             .dropped_lines
+            .iter()
+            .filter(|(key, _)| !admission_cap_counter(key))
+            .collect();
+        let admission_caps: Vec<(&String, &usize)> = report
+            .dropped_lines
+            .iter()
+            .filter(|(key, _)| admission_cap_counter(key))
+            .collect();
+        let mut dropped_parts: Vec<String> = parse_loss
             .iter()
             .take(crate::parser::DISCLOSURE_RENDER_ENTRY_CAP)
             .map(|(key, count)| format!("{}={count}", crate::parser::capped_disclosure_value(key)))
             .collect();
-        if report.dropped_lines.len() > crate::parser::DISCLOSURE_RENDER_ENTRY_CAP {
+        if parse_loss.len() > crate::parser::DISCLOSURE_RENDER_ENTRY_CAP {
             dropped_parts.push(format!(
                 "+{} more distinct keys",
-                report.dropped_lines.len() - crate::parser::DISCLOSURE_RENDER_ENTRY_CAP
+                parse_loss.len() - crate::parser::DISCLOSURE_RENDER_ENTRY_CAP
             ));
         }
-        out.push_str(&format!(
-            "Dropped lines (parse loss): {}\n",
-            dropped_parts.join(", ")
-        ));
+        if !dropped_parts.is_empty() {
+            out.push_str(&format!(
+                "Dropped lines (parse loss): {}\n",
+                dropped_parts.join(", ")
+            ));
+        }
+        if !admission_caps.is_empty() {
+            let admission_parts: Vec<String> = admission_caps
+                .iter()
+                .map(|(key, count)| {
+                    if key.ends_with("_bytes_capped") {
+                        format!(
+                            "{}={}",
+                            crate::parser::capped_disclosure_value(key),
+                            format_admission_bytes(**count)
+                        )
+                    } else {
+                        format!("{}={count}", crate::parser::capped_disclosure_value(key))
+                    }
+                })
+                .collect();
+            out.push_str(&format!(
+                "Admission caps (skipped before read): {}\n",
+                admission_parts.join(", ")
+            ));
+        }
     }
     if !report.disclosures.is_empty() {
         // rm-595: disclosure keys route through the control-byte
