@@ -26,6 +26,14 @@ fail() {
 
 sh -n install.sh || fail "install.sh must remain valid POSIX sh"
 
+# rm-051 (cycle-5 fix): the pinned default ref is install.sh's single
+# source of truth (line 13: REF="${AGENTTRACE_SOURCE_REF:-…}"). Tests D
+# and E DERIVE the expectation from it, so a release bump can never
+# leave the gate greping a stale literal (the v0.9.0-vs-v0.10.1 miss
+# this gate shipped with).
+pinned_ref="$(sed -n 's/^REF="${AGENTTRACE_SOURCE_REF:-\([^}"]*\)}"$/\1/p' install.sh | head -1)"
+[ -n "$pinned_ref" ] || fail "cannot derive the pinned default ref from install.sh (expected REF=\"${AGENTTRACE_SOURCE_REF:-vX.Y.Z}\" on its REF line)"
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -149,8 +157,8 @@ grep -q "pinned ref" "$out" ||
 	fail "test D: fallback must announce the pinned ref it builds (rm-051)"
 grep -q "Built from source successfully" "$out" ||
 	fail "test D: fallback success must be announced"
-grep -q '^ref=v0.9.0$' "$tmp/d-receipt" ||
-	fail "test D: install receipt must record the default pinned ref (rm-051)"
+grep -q "^ref=$pinned_ref$" "$tmp/d-receipt" ||
+	fail "test D: install receipt must record the default pinned ref (rm-051) — expected ref=$pinned_ref (derived from install.sh)"
 
 # — test E: the fallback clones a PINNED ref, never a moving default
 #   branch (rm-051) — this fake git refuses an unpinned clone and
@@ -194,9 +202,9 @@ if ! env PATH="$shims_e:$PATH" AGENTTRACE_INSTALL_DIR="$tmp/e" \
 	cat "$out" >&2
 	fail "test E: pinned source build must succeed"
 fi
-grep -q '^clone --branch v0.9.0$' "$tmp/git-e.args" ||
-	fail "test E: the fallback clone must pass --branch v0.9.0 (the pinned default ref)"
-grep -q "pinned ref v0.9.0" "$out" ||
+grep -q "^clone --branch $pinned_ref$" "$tmp/git-e.args" ||
+	fail "test E: the fallback clone must pass --branch $pinned_ref (the pinned default ref derived from install.sh)"
+grep -q "pinned ref $pinned_ref" "$out" ||
 	fail "test E: fallback must echo the pinned ref to the user"
 grep -q '^source=source-build$' "$tmp/e-receipt" ||
 	fail "test E: install receipt must record the source-build lane"

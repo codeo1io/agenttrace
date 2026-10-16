@@ -1087,6 +1087,12 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.ends_with(".lock") {
         return false;
     }
+    // rm-1435: agenttrace's own at-rest artifacts (cache ledgers, snapshot
+    // journals, the statusline journal) are never sessions. Single-sourced
+    // next to the writers — see session_cache::is_agenttrace_artifact_file_name.
+    if crate::session_cache::is_agenttrace_artifact_file_name(name) {
+        return false;
+    }
     name.ends_with(".jsonl") || name.ends_with(".json")
 }
 
@@ -1307,5 +1313,50 @@ fn report_load_progress(
             cache_hits,
             session: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod session_file_name_tests {
+    use super::is_session_file_name;
+
+    #[test]
+    fn agenttrace_at_rest_artifacts_are_not_session_files() {
+        // rm-1435 red-first: `--overview -d $HOME` failed wholesale on
+        // `.cache/agenttrace/opencode-sqlite.json` being collected as a
+        // session (rc=1 "unsupported session format", PoC 2026-10-14).
+        // Every at-rest artifact the writers emit must stay rejected —
+        // the enumeration lives beside the writers
+        // (session_cache::is_agenttrace_artifact_file_name).
+        for name in [
+            "sessions.json",
+            "pricing.json",
+            "pricing.meta.json",
+            "opencode-sqlite.json",
+            "hermes-sqlite.json",
+            "snapshot.json",
+            "statusline.jsonl",
+            "opencode-sqlite-v7-20250801.json",
+            "hermes-sqlite-v3-20260702.json",
+        ] {
+            assert!(
+                !is_session_file_name(name),
+                "{name} is agenttrace's own artifact, not a session"
+            );
+        }
+    }
+
+    #[test]
+    fn real_session_files_still_pass_the_walk_filter() {
+        for name in [
+            "session-abc123.jsonl",
+            "2026-10-14T10-00-00.json",
+            ".aider.chat.history.md",
+        ] {
+            assert!(
+                is_session_file_name(name),
+                "{name} is a legitimate session filename"
+            );
+        }
     }
 }

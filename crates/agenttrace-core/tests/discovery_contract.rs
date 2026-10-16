@@ -4336,3 +4336,47 @@ fn antigravity_sibling_roots_are_discovered_and_disclosed() {
     });
     let _ = fs::remove_dir_all(&home);
 }
+
+#[test]
+fn scan_roots_skip_agenttrace_at_rest_artifacts() {
+    // rm-1435: a `-d` walk over an agent home must not ingest the
+    // agenttrace cache root's own files as session candidates. PoC
+    // 2026-10-14: `--overview -d $HOME` collected
+    // `.cache/agenttrace/opencode-sqlite.json` and failed wholesale
+    // ("unsupported session format"), hiding every real session.
+    let root = std::env::temp_dir().join(format!("at-rm1435-walk-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let cache = root.join(".cache").join("agenttrace");
+    fs::create_dir_all(&cache).expect("mkdir cache");
+    for name in [
+        "sessions.json",
+        "pricing.json",
+        "pricing.meta.json",
+        "opencode-sqlite.json",
+        "hermes-sqlite.json",
+        "snapshot.json",
+        "statusline.jsonl",
+        "opencode-sqlite-v7-20250801.json",
+    ] {
+        fs::write(cache.join(name), "{}").expect("plant artifact");
+    }
+    let project = root.join("projects").join("demo");
+    fs::create_dir_all(&project).expect("mkdir project");
+    fs::write(
+        project.join("session-real.jsonl"),
+        "{\"type\":\"user\",\"timestamp\":\"2026-10-14T10:00:00.000Z\"}\n",
+    )
+    .expect("plant session");
+
+    let collected = collect_session_files(&root);
+    let _ = fs::remove_dir_all(&root);
+    let names: Vec<String> = collected
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["session-real.jsonl".to_string()],
+        "the walk must collect only the real session, not agenttrace artifacts: {names:?}"
+    );
+}

@@ -872,6 +872,37 @@ const ORPHAN_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(
 /// snapshot without limit.
 pub const MAX_SESSION_CACHE_ENTRIES: usize = 20_000;
 
+/// rm-1435: is `name` a file agenttrace ITSELF writes at rest?
+/// Single source for discovery's walk filter — `-d` walks over an
+/// agent home used to ingest our own cache ledgers as "sessions"
+/// and then fail wholesale on the first one (`--overview -d $HOME` →
+/// rc=1 "unsupported session format: …/.cache/agenttrace/opencode-sqlite.json",
+/// PoC 2026-10-14). Every writer's filename lives here, next to the
+/// code that writes it, so a new artifact cannot ship unlisted:
+/// - `sessions.json` — the session ledger (this module)
+/// - `pricing.json` / `pricing.meta.json` — the pricing cache
+///   (pricing.rs fetch lane)
+/// - `opencode-sqlite.json` / `hermes-sqlite.json` — sqlite snapshot
+///   ledgers (this module + sqlite_sessions.rs); `snapshot.json` is
+///   listed defensively — no production writer emits that name today
+///   (its only occurrence in the tree is a test fixture), kept listed
+///   so a future writer of that name cannot ship unlisted
+/// - legacy versioned sqlite snapshots `opencode-sqlite-v*…` /
+///   `hermes-sqlite-v*…` (retired format, still read from old caches)
+/// - `statusline.jsonl` — the statusline journal
+pub fn is_agenttrace_artifact_file_name(name: &str) -> bool {
+    match name {
+        "sessions.json"
+        | "pricing.json"
+        | "pricing.meta.json"
+        | "opencode-sqlite.json"
+        | "hermes-sqlite.json"
+        | "snapshot.json"
+        | "statusline.jsonl" => true,
+        _ => name.starts_with("opencode-sqlite-v") || name.starts_with("hermes-sqlite-v"),
+    }
+}
+
 /// Hard bound on the serialized `sessions.json` size, enforced over
 /// EVERY byte the writer emits — entry values, per-path keys, JSON
 /// punctuation, the top-level fields, and the `dirs` map (rm-298: the
