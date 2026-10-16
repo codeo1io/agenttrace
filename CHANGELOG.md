@@ -314,6 +314,38 @@
   boundary — `result.signal` was discarded. The wrapper now re-raises the
   child's signal to itself (numeric exit codes still pass through unchanged),
   so shells and CI observe real termination semantics under `npm exec`.
+- opencode identifiers can no longer steer reads outside the storage root
+  (rm-1870, run c0a4e32f cycle 4): session and message documents carry
+  attacker-influenceable `id` fields that flowed straight into filesystem
+  joins (`join("message").join(id)`, `join("part").join(id)`), so an absolute
+  id replaced the join base and a dot-dot id traversed out of the lane —
+  reading foreign transcripts into the parse (titles, events, `--search`).
+  Identifiers now pass admission first: a single safe path component whose
+  value matches the file it was discovered under (the
+  `storage/message/<sessionID>/<messageID>.json` layout rule) for the lanes
+  whose stems feed joins; part documents are admitted on component safety
+  alone because they are named by type (`part_text.json`). Rejected records
+  are skipped and disclosed (`opencode_session_id_rejected`,
+  `opencode_message_id_rejected`, `opencode_part_id_rejected`) through the
+  existing `--doctor` parse-loss fold, and a clean sibling parses on.
+- opencode transcript scans are budgeted across the whole session, not per
+  file (rm-1871, run c0a4e32f cycle 4): the rm-1437 stat gate bounded one
+  file, so N under-cap files still admitted N × 10 MiB (measured RSS grew
+  linearly with corpus size) and the stat-before-read gate raced live
+  writers. The scan now enforces a read-side session budget — 64 MiB of
+  transcript bytes and 8192 records — with reads taken through a bounded
+  reader (a truncated file is never parsed), so aggregate corpus size can no
+  longer drive memory, and a mid-scan writer flip cannot smuggle an oversized
+  file past the gate. Over-budget remainder is disclosed as
+  `opencode_transcript_budget_files_capped` / `_bytes_capped` in `--doctor`.
+- npm launcher clamps non-re raisable signals on Windows (rm-1873, run
+  c0a4e32f cycle 4): Node emulates only SIGINT/SIGTERM/SIGKILL on win32,
+  so the rm-1438 re-raise map's SIGHUP-class entries would throw from
+  `process.kill` on a platform package.json declares supported. Non-emulated
+  signals now fall back to the `128 + signalNumber` exit contract (the same
+  fallback used when a handler overrides the signal), pinned by an
+  all-platform mapping-table test (`reRaiseableOn`) alongside the existing
+  exit-contract tests.
 
 - Doctor text-report formula hardening — the doctor text report now neutralizes spreadsheet-formula introducers on every corpus-controlled sample line: zero-usage sample names, duplicate-sqlite-db paths, and baked project-decode sample lines (defense-in-depth; today's decode arms emit fixed prefixes). Paste-safety on the doctor lane now matches the rm-985 cell-lane guarantees, and the JSON surface stays byte-lossless by design (raw payload values, no marker). Verified red-first with the `formula-lane` fixture family (`=2+5_zero_usage.jsonl` derived from `=2+5_cmd.jsonl` at base 3e90993): `cargo test -p agenttrace-core --test formula_lane_contract` 8/8, including the JSON-raw contrast arm. (rm-897 residual, run `a64735b75a46` cycle 3, 2026-10-14)
 - CI install-runtime gate derives the expected pinned ref from `install.sh` — test D previously grepped the literal `ref=v0.9.0` while `install.sh` pinned `REF="v0.10.1"`, leaving the gate standing-red on every battery since the v0.10.1 bump. The expected ref is now parsed from install.sh's `REF` default at runtime, so test D/E stay live receipt↔pin drift guards (`bash scripts/ci/check-install-runtime.sh` → rc0, including the glibc floor arm under `AGENTTRACE_BIN`). (rm-012/rm-051 family, run `a64735b75a46` cycle 3, 2026-10-14)

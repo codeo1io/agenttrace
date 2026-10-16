@@ -98,3 +98,38 @@ test("SIGTERM death is re-raised, not converted to exit 1", () => {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+// rm-1873: Node documents (process.kill) that win32 emulates only
+// SIGINT/SIGTERM/SIGKILL — every other signal in the launcher's table
+// must clamp to the 128+signalNumber exit fallback instead of reaching
+// process.kill, which would THROW on a platform package.json declares
+// supported. Mapping-table tests run on ALL platforms (no spawn, no
+// platform guards) — they pin the clamp decision itself.
+const launcherModule = require(launcher);
+const SIGNAL_TABLE = Object.keys(launcherModule.SIGNAL_NUMBERS);
+const WIN32_EMULATED = new Set(["SIGINT", "SIGTERM", "SIGKILL"]);
+
+test("win32 clamps every non-emulated signal to the numeric fallback", () => {
+	assert.ok(SIGNAL_TABLE.length >= 15, `signal table must be covered, got ${SIGNAL_TABLE.length}`);
+	for (const signal of SIGNAL_TABLE) {
+		assert.equal(
+			launcherModule.reRaiseableOn("win32", signal),
+			WIN32_EMULATED.has(signal),
+			`win32 re-raise decision for ${signal} must follow the Node emulation contract`,
+		);
+	}
+	// Unknown signals (not in the table) clamp too — never reach process.kill.
+	assert.equal(launcherModule.reRaiseableOn("win32", "SIGWRAP"), false);
+});
+
+test("posix platforms re-raise every signal in the table", () => {
+	for (const platform of ["linux", "darwin", "freebsd"]) {
+		for (const signal of SIGNAL_TABLE) {
+			assert.equal(
+				launcherModule.reRaiseableOn(platform, signal),
+				true,
+				`${platform} must re-raise ${signal}`,
+			);
+		}
+	}
+});
