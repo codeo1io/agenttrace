@@ -1040,6 +1040,23 @@ struct CacheEntry {
     mod_time: i64,
     size: i64,
     session: GoSession,
+    /// rm-299 (assess F1, 'warm-path truth'): composite fingerprint of
+    /// the opencode storage sibling fan-out (`storage/message/<id>/` +
+    /// `storage/part/<msg>/`) — the files the parse actually derives
+    /// its events and usage from, which the session-doc fingerprint
+    /// above cannot see. `None` for every non-opencode entry (the
+    /// field is skipped at rest, so those entries serialize exactly as
+    /// they did before rm-299), for scopes the enumeration cannot
+    /// verify (message ids that do not match their file names — see
+    /// `opencode_sibling_scope_verifiable`), and for pre-rm-299
+    /// entries: absent compares not-equal to the fresh enumeration, so
+    /// a store upgraded mid-life self-heals through exactly one
+    /// re-parse per entry. No schema bump: the rm-230 rung convention
+    /// reserves bumps for what fingerprints CANNOT see, and this field
+    /// IS a fingerprint — it self-invalidates instead of needing a
+    /// rung to retire stale entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opencode_siblings: Option<OpencodeSiblingFingerprints>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1052,6 +1069,29 @@ struct CacheEntryHeader {
 struct FileFingerprint {
     mod_time: i64,
     size: i64,
+}
+
+/// rm-299 (assess F1, 'warm-path truth'): the opencode storage sibling
+/// fan-out as a stat-only map — see `CacheEntry::opencode_siblings`.
+/// `pub(crate)` so `--doctor`'s reusable-entry census (review fix,
+/// finding 2) can apply the same composite freshness the warm serve
+/// path does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct OpencodeSiblingFingerprints {
+    /// Relative sibling paths (`"message/<sid>/<file>.json"`,
+    /// `"part/<msg id>/<file>.json"`) → fingerprint. Map equality
+    /// subsumes the enumerated directory set: a gained, lost, or
+    /// rewritten sibling always moves a fingerprint or the file set,
+    /// and a directory that was empty both times reads equal because
+    /// the parse read nothing from it either time.
+    files: BTreeMap<String, FileFingerprint>,
+    /// `false` when the walk stopped at
+    /// [`MAX_OPENCODE_SIBLING_FINGERPRINT_FILES`] (or hit an unreadable
+    /// sibling): a partial map that must never compare equal. Only
+    /// bounded maps are ever banked, so an over-cap or degraded fan-out
+    /// re-parses every scan instead of risking a stale serve.
+    #[serde(default)]
+    bounded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2362,6 +2402,11 @@ pub(crate) fn cached_file_mod_time_if_fresh(
     metadata: &fs::Metadata,
     cache: &mut SessionCache,
 ) -> Option<i64> {
+    // rm-299: this gate stays on the session-doc fingerprint on
+    // purpose — it only orders the most-recent-first listing; the
+    // authoritative truth gate (including the opencode sibling
+    // composite) is `cached_session`, which the load loop runs for
+    // every file right after this ordering pass.
     let key = cache_key(path);
     let header = cached_entry_header(&key, cache)?;
     if header.size == metadata.len() as i64 && header.mod_time == file_mod_time_nanos(metadata) {
@@ -2941,6 +2986,223 @@ pub fn save_session_cache(cache: &mut SessionCache) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// rm-299: sibling files fingerprinted per opencode storage session
+/// before the walk gives up and marks the scope unbounded. opencode
+/// writes one `*.json` file per part (text, reasoning, tool and
+/// step-finish are separate files), so a long agentic session can
+/// legitimately exceed this cap — that is a degradation, not a
+/// failure: an over-cap, unreadable, or non-UTF8-named sibling set
+/// degrades to always-re-parse, never to stale totals, and
+/// `--doctor`'s reusable-entry census counts such entries as NOT
+/// reusable (the disclosure counter), while the capped walk keeps a
+/// hostile fan-out from ballooning the warm path. Review finding 3:
+/// no claim is made here about where genuine corpora sit relative to
+/// this bound — only that exceeding it stays on the safe side.
+const MAX_OPENCODE_SIBLING_FINGERPRINT_FILES: usize = 8192;
+
+/// Stat one `*.json`-populated sibling directory into `files` (keyed
+/// `"<prefix>/<file>.json"`), returning the file names seen. An
+/// absent or unreadable directory returns no names — exactly what the
+/// parser's `read_dir` derives from it: nothing.
+fn fingerprint_opencode_dir_json(
+    dir: &Path,
+    prefix: &str,
+    files: &mut BTreeMap<String, FileFingerprint>,
+    bounded: &mut bool,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Mirror the parser's admission (`read_opencode_records`):
+        // directories are never records, only `*.json` files are.
+        if path.is_dir() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            // rm-299 review fix (finding 1): the parser admits
+            // non-UTF8-named `*.json` siblings (`read_opencode_records`
+            // checks is_dir/extension/content and never stringifies
+            // the name), so a file this map cannot key may still be
+            // counted by the parse. Degrade to unbounded — the scope
+            // re-parses every scan — instead of skip-and-trust, which
+            // served stale totals for exactly such siblings (review
+            // PoC poc-nonutf8-sibling.txt).
+            *bounded = false;
+            break;
+        };
+        names.push(name.to_string());
+        if files.len() >= MAX_OPENCODE_SIBLING_FINGERPRINT_FILES {
+            *bounded = false;
+            break;
+        }
+        let Ok(metadata) = fs::metadata(&path) else {
+            // An unreadable sibling now would be an unreadable record
+            // for the parse too — degrade to unbounded (re-parse)
+            // instead of fingerprinting half the truth.
+            *bounded = false;
+            break;
+        };
+        files.insert(
+            format!("{prefix}/{name}"),
+            FileFingerprint {
+                mod_time: file_mod_time_nanos(&metadata),
+                size: metadata.len() as i64,
+            },
+        );
+    }
+    names.sort();
+    names
+}
+
+/// rm-299 (assess F1, 'warm-path truth'): enumerate and fingerprint
+/// the opencode storage sibling fan-out a parse of `session_path`
+/// derives its events and usage from — every `*.json` in
+/// `storage/message/<id>/` and, per message file, every `*.json` in
+/// `storage/part/<message file stem>/` (parser.rs
+/// `parse_opencode_storage_session` keys parts by the message doc's
+/// `id`, which equals the file stem on every genuine store;
+/// `opencode_sibling_scope_verifiable` enforces that invariant at
+/// store time, which is what makes the path-only keying sound).
+/// Stat-only — no sibling is ever read here — and `None` for paths
+/// that are not opencode storage session files (a path-shape string
+/// check, so every other lane pays nothing).
+pub(crate) fn opencode_sibling_fingerprints(
+    session_path: &Path,
+) -> Option<OpencodeSiblingFingerprints> {
+    let root =
+        crate::parser::opencode_storage_root_from_session_file(&session_path.to_string_lossy())?;
+    let session_id = session_path.file_stem()?.to_string_lossy().into_owned();
+    let mut files = BTreeMap::new();
+    let mut bounded = true;
+
+    // The message directory first: its file set anchors the part
+    // enumeration, and its fingerprints are compared as part of the
+    // map (a message gained/lost/rewritten always moves the map).
+    let message_prefix = format!("message/{session_id}");
+    let message_names = fingerprint_opencode_dir_json(
+        &root.join("message").join(&session_id),
+        &message_prefix,
+        &mut files,
+        &mut bounded,
+    );
+    if bounded {
+        for name in &message_names {
+            if !bounded {
+                break;
+            }
+            let Some(stem) = Path::new(name).file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            fingerprint_opencode_dir_json(
+                &root.join("part").join(stem),
+                &format!("part/{stem}"),
+                &mut files,
+                &mut bounded,
+            );
+        }
+    }
+    Some(OpencodeSiblingFingerprints { files, bounded })
+}
+
+/// rm-299 store-time safety valve. The enumeration above keys part
+/// directories by message FILE names; the parse keys them by the
+/// message DOC's `id` field. On a genuine opencode store the two are
+/// the same string (files are named by their ids), so the invariant
+/// holds and the path-only fingerprint covers exactly what the parse
+/// reads. On a renamed, forked, or hostile corpus they can differ —
+/// then the fingerprinted fan-out would not be the parsed one, so the
+/// scope is *unverifiable* and must never be banked: the session
+/// re-parses every scan (a cache miss, never a stale serve). Reads
+/// only at store time, when every sibling is already in the OS page
+/// cache from the parse that just ran. `true` for paths that are not
+/// opencode storage session files (the caller only invokes this after
+/// `opencode_sibling_fingerprints` returned `Some`).
+fn opencode_sibling_scope_verifiable(session_path: &Path) -> bool {
+    let Some(root) =
+        crate::parser::opencode_storage_root_from_session_file(&session_path.to_string_lossy())
+    else {
+        return true;
+    };
+    let stem = session_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id_matches_stem = |doc: &Value, stem: &str| -> bool {
+        match doc.get("id").and_then(Value::as_str) {
+            Some(id) => !id.is_empty() && id == stem,
+            // A doc without an id contributes no record to the parse —
+            // nothing keyed by it can be missed. The session doc is
+            // checked separately below.
+            None => true,
+        }
+    };
+
+    // The session doc's id names the message directory the parse
+    // reads from, so it must equal the path stem the enumeration used.
+    let Ok(raw) = fs::read_to_string(session_path) else {
+        return false;
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    if !id_matches_stem(&doc, &stem) {
+        return false;
+    }
+    let Some(session_id) = doc.get("id").and_then(Value::as_str) else {
+        return true;
+    };
+
+    let Ok(entries) = fs::read_dir(root.join("message").join(session_id)) else {
+        return true; // no messages: the parse bails; nothing to verify
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            // rm-299 review fix (finding 1): a non-UTF8-named message
+            // doc is still parsed and counted (the parser never
+            // stringifies names), but this verifier cannot key or
+            // compare it — the scope is unverifiable, never assumed
+            // fine.
+            return false;
+        };
+        let Some(stem) = Path::new(name).file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        // Unreadable or unparseable docs never become records (the
+        // parser skips them), and one becoming readable later moves
+        // its size/mtime — the sibling map catches that first.
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(message) = serde_json::from_str::<Value>(&raw) {
+                if !id_matches_stem(&message, stem) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// rm-299 review fix (finding 2): the sibling composite a RAW cache
+/// entry carries (absent → `None`, matching
+/// `skip_serializing_if`), decoded for `--doctor`'s reusable-entry
+/// census — a garbage/unreadable value decodes to `None` and then
+/// never equals a fresh `Some`, so it counts as NOT reusable (the
+/// conservative direction).
+pub(crate) fn banked_opencode_siblings(entry: &Value) -> Option<OpencodeSiblingFingerprints> {
+    entry
+        .get("opencode_siblings")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
 pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> {
     let key = cache_key(path);
     let header = cached_entry_header(&key, cache)?;
@@ -2961,6 +3223,19 @@ pub fn cached_session(path: &Path, cache: &mut SessionCache) -> Option<Session> 
         return None;
     }
     let entry = cached_entry(&key, cache)?;
+    // rm-299: the session-doc fingerprint above cannot see the opencode
+    // storage sibling fan-out the parse derives its usage from, so a
+    // post-session sibling write used to keep the entry "fresh" while
+    // serving stale totals. The composite gate: the freshly enumerated
+    // sibling map must equal the banked one. `None == None` for every
+    // non-opencode lane (no enumeration cost — the path shape rejects
+    // them before any I/O), pre-rm-299 entries self-heal (absent vs
+    // `Some`), and unverifiable scopes are banked `None` so they miss
+    // forever by construction.
+    if opencode_sibling_fingerprints(path) != entry.opencode_siblings {
+        delete_cached_session_key(&key, cache);
+        return None;
+    }
     // The fallback path is display-only (Session.path is a String),
     // but it must name the real file: decode a losslessly-encoded key
     // (rm-041) instead of exposing the encoded form.
@@ -2975,12 +3250,19 @@ pub fn store_session(
 ) -> anyhow::Result<()> {
     let metadata = fs::metadata(path)?;
     let key = cache_key(path);
+    // rm-299: bank the sibling composite only when it is bounded and
+    // the scope verified (message ids == file stems); otherwise store
+    // `None`, which never compares equal to the fresh enumeration and
+    // so forces a re-parse on every scan — correctness over caching.
+    let opencode_siblings = opencode_sibling_fingerprints(path)
+        .filter(|stats| stats.bounded && opencode_sibling_scope_verifiable(path));
     cache.entries.insert(
         key.clone(),
         CacheEntry {
             mod_time: file_mod_time_nanos(&metadata),
             size: metadata.len() as i64,
             session: GoSession::from_session(session),
+            opencode_siblings,
         },
     );
     cache.raw_entries.remove(&key);
@@ -4637,6 +4919,7 @@ mod tests {
                         mod_time: 900_000 + i * 1_000,
                         size: 1,
                         session,
+                        opencode_siblings: None,
                     },
                 );
             }

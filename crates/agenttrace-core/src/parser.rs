@@ -6507,7 +6507,11 @@ fn parse_opencode_storage_session(
     Ok(events)
 }
 
-fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
+/// Resolve the storage root for an opencode storage session doc
+/// from its path (shared by the parse lane and rm-299's sibling
+/// fingerprint enumeration in session_cache.rs, so both always agree
+/// on what "the storage root of this session" means).
+pub(crate) fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
     if !is_opencode_storage_session_file(path) {
         return None;
     }

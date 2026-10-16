@@ -1,0 +1,50 @@
+# Compound record — 2026-10-16 cycle 1 run e9ccf0f6 (repository-maintenance 98fd0e5a cycle 1, pre-review)
+
+- campaign/repository: `repository-maintenance:98fd0e5ae67a46f8aed2d21c5963e0ea` cycle 1 — `/work/projects/agenttrace`, dispatch base c4aa3a01ed2a42ac3dc72b661b76ad9bc4a70bea, worktree `/home/agent/.hermes/conductor-worktrees/agenttrace-80c75f65b7/run-e9ccf0f6e6e7-e9ccf0f6`
+- selected batch: **warm-path truth** (single member, LEAD `rm-299` / assess F1) — the opencode storage warm-cache fingerprint now covers the `storage/message/<id>/` + `storage/part/<msg>/` sibling fan-out, so post-session sibling writes stop serving stale costs silently (PoC: cold $0.0060, sibling append with session doc untouched → warm served stale $0.0060 vs truth $0.0240)
+- review status: **reviewed 2026-10-16** — independent review (560addba) returned NEEDS_CHANGES on one PoC-proven medium finding; the review-fix turn (7e497469) landed the cure plus the four lows — see "Review outcome" below. Everything else below stands as recorded cycle evidence.
+
+## Review outcome (2026-10-16, post-review fix 7e4974694b9b4563bc0bbe94b6148898)
+
+- **F1 (medium, PoC poc-nonutf8-sibling.txt) — FIXED**: a sibling with a non-UTF8 FILE NAME was admitted by the parser (`read_opencode_records` never stringifies names) but skipped by both the enumerator (`fingerprint_opencode_dir_json` `continue`) and the scope verifier, so its fan-out was never walked and warm served stale totals across scans (cold 360/$0.0024; mutate the non-UTF8 sibling's part 150→3000 → warm still 360; an ASCII sibling mutation re-parses fine). Cure = degrade, never skip: the enumerator sets `bounded = false` and breaks (the scope never banks), the verifier returns `false` (unverifiable) — such corpora re-parse every scan, in the safe direction. Pinned red-first by `non_utf8_named_sibling_degrades_to_reparse_not_stale_serve` (cfg unix): pre-fix it warm-served (RED at the miss assert), post-fix the fresh truth 3100/620 is served every scan (the contract suite is now 6 tests).
+- **F2 (low) — FIXED**: `--doctor`'s reusable-entry census (`valid_cached_session_count`, doctor.rs) checked size/mtime only, so sibling-stale and never-bankable opencode entries counted as reusable (and F1-adjacent over-cap/unverifiable scopes had no disclosure counter). Cure: `SessionCacheReport` now carries each entry's banked `opencode_siblings` composite (decoded via `session_cache::banked_opencode_siblings`), and the census requires fresh-enumeration equality (`None == None` keeps non-opencode lanes exactly as before; a mismatched or unbankable composite counts as NOT reusable — the conservative direction, and the disclosure counter F3 wanted). Pinned by `doctor::tests::valid_cached_session_count_applies_sibling_composite` (fresh=1, banked-None=0, stale=0, non-opencode=1).
+- **F3 (low) — FIXED (comment)**: the `MAX_OPENCODE_SIBLING_FINGERPRINT_FILES = 8192` doc comment claimed "Genuine sessions sit orders of magnitude below this" — unevidenced (opencode writes one `*.json` per part, so long agentic sessions can legitimately exceed it). Reworded to claim only the safe direction: over-cap/unreadable/non-UTF8-named sets degrade to always-re-parse, with `--doctor`'s reusable census as the disclosure counter. Cap value unchanged (8192).
+- **F4 (low) — FIXED (this document)**: the "warm gates … extended" line above overstated the changed surface; corrected to the actual gate set (`cached_session` only; `cached_file_mod_time_if_fresh` comment-only; `is_fresh` untouched).
+- **F5 (low, NOT this turn — seal-band obligation)**: the roadmap band rider (rm-299 evidence-refresh line) says "any fingerprint-shape change takes a schema rung" while the landing takes none (justified and test-pinned: the composite self-invalidates via None≠Some per the rm-230 convention, and the EXECUTED bullet discloses the decision). Per the reviewer, the durable-record cure belongs to the SEAL band: reconcile that rider sentence when the seal composes its band. Recorded as provisional future work on the fix envelope.
+- Fix-turn validation (targeted, per dispatch required_scope): contract suite 6/0 (incl. the new arm), full `--lib` 412/0, doctor/discovery/opencode-focused lanes — 12 targets 562/0; fmt rc0; clippy `-D warnings` rc0. No schema rung: `SESSION_CACHE_SCHEMA_VERSION` stays 64.
+
+## Findings & pre-review status
+
+- `rm-299` IMPLEMENTED pre-review: `crates/agenttrace-core/src/session_cache.rs` (+245: per-session sibling enumeration, composite `CacheEntry` fingerprints, warm gate `cached_session` extended with the composite check — `cached_file_mod_time_if_fresh` gained a comment-only rationale since it never unwraps the session, and `is_fresh` is untouched; admission/store path writes the composite) + `crates/agenttrace-core/src/parser.rs` (+6/-1) + NEW `crates/agenttrace-core/tests/opencode_storage_fingerprint_contract.rs` (red-first: 4 failing pre-change — sibling-append 100-vs-250, part-mutation 250-vs-3150, prefix-entry strip, unverifiable-warm — → 5 green post-change)
+- rung decision executed as planned: NO `SESSION_CACHE_SCHEMA_VERSION` bump (still 64) — the composite-fingerprint shape self-invalidates prefix entries (None≠Some one re-parse, then stable), consistent with the in-file rm-230 convention ("bumps are for what fingerprints CANNOT see"); the contract suite pins both the strip behavior and the fresh-invalidation path
+- follow-house-rule when landing: the mutation-correctness acceptance arm of rm-299 is now satisfied for the opencode lane; a formal status transition remains the seal band's job (rm-299 stays `candidate` until then)
+
+## Roadmap reconciliation
+
+- cycle band: roadmap phase fbd3a9a5 delivered SPOOL-SIDE (12 dated riders, 0 mints, 0 flips; wall 2,694 lines md5 caaefc74 → postimage 2,708 md5 b2ac292d; git apply --check rc0 at base + fresh-dir round-trip byte-identical); riders: rm-299/rm-499/rm-540/rm-933/rm-546/rm-690/rm-992/rm-1020/rm-1021/rm-164/rm-758/rm-423
+- compound band (this phase): EXECUTED bullet appended under rm-299's cycle rider in the band postimage — spool-side `delegate/e7fb5384…-scratch/compound.patch`, applies on top of the fbd3a9a5 postimage (base md5 b2ac292d verified); gate landing order: ROADMAP.patch (fbd3a9a5) → compound.patch (this) → the 3-file code delta + this record
+- fog ceiling at cycle: rm-1880 (d7a3b530 band, run fdf53444 @5b94464); no cessions claimed this cycle; title-twin discipline held (assess F2/F4 corroborate fog rm-1534/rm-1535 — fold at integration, no duplicate rows)
+- no roadmap flips performed (flips are the seal's exclusive job)
+
+## Next cycle assessment context (hand-off)
+
+1. **LEAD candidate: pricing-catalog truth** — rm-1020 refresh (live LiteLLM 4,162 vs bundled 3,131 @2026-10-08; +1,498/-467; above_1h 198 live/0 bundled; search_context 339/0; gemini-4-argon priced live everywhere, 0 bundled keys) + rm-499 1h-arm lift (gate premise falsified on live LiteLLM 2 consecutive census days; bundle is the sole blocker). Raw fetches banked: `delegate/ed3bea43…-scratch/{litellm-live,modelsdev-live}.json` (md5 8cea126e/f2009013). Check the fog first — sibling campaign fdf53444's riders named the refresh "the shared blocker"; reconcile by title, cede if claimed.
+2. F2 (far-future timestamps, year-9999 PoC) + F4 (CJK width) — fog twins rm-1534/rm-1535; implement only after confirming the owning campaign hasn't landed them (reconcile by title).
+3. rm-992 zst admission gating (foo.zst admits by extension; magic-sniff never gates) — well-evidenced (poc3), no dependency, backlog member.
+4. Watch triggers to re-probe next assessment: claude-code `next:2.1.301` (no changelog yet — probe for the 5m/1h OTel split in JSONL), ccusage v20.0.34 antigravity map adoption (rm-690 needs the pinned table + catalog refresh), opencode daily dev tag (v2 lane), pi 1.2.0 contract tripwire re-pin (rm-423), gemini-cli 0.65 stable (rm-758 lane decision needs the delta-patched chunk-shape contract probe).
+5. Prior-attempt forensics pattern (3 provider-reaped attempts this cycle — implement 6a090e83 @25s, targeted a2bf52af @85s, full_tests 20ae61b1; each: typed envelope absent + `session_reaped:provider` in events/*.jsonl + scratch absent → nothing durable → clean redo) — already documented in docs/solutions/workflow-issues/provider-reaped-delegate-attempts; this cycle adds 3 confirming instances (envelope-absence is the durable test, not the events log alone).
+
+## Fleet learnings (cross-run infrastructure — not repo defects)
+
+- shared `CARGO_TARGET_DIR` trap struck AGAIN, new facet: a PRIVATE dir under `/home/agent/.cache` (`at-fulltests-adefe1e7`) was reaper-swept MID-RUN (rc=101 after 24 green suites, "could not execute process … (never executed) / No such file or directory"); `/var/tmp` retry passed clean (68 suites 1164/0/0). Standing rule (memory #18697) confirmed with a second instance: **private target dirs must live under `/var/tmp`**, `/home/agent/.cache` only for short jobs; suites also need `TMPDIR=/tmp` (memory #18664).
+- full-suite delta vs assess baseline: 67→68 suites, 1159→1164 passed (the new contract suite +5), 0 failed — no collateral movement anywhere else in the workspace.
+
+## Memory
+
+- no separate memory write needed — the two fleet constraints above are already pinned (#18664/#18695/#18697); the reaped-attempt redo pattern is documented in-repo (docs/solutions/workflow-issues/provider-reaped-delegate-attempts) and needs no new entry.
+
+## Validation evidence consumed (recorded this cycle, NOT re-run here)
+
+- targeted_tests 2c0d9eea: fmt rc0 + clippy -D rc0 + 10 focused suites green on the exact delta; engine digest re-derived `validation:v1:56f2c1d80b5df3c7a82a61416f91666ea8d7caff45213f1c358a2f6a66abea97` == dispatch (no executable drift)
+- full_tests adefe1e7: `cargo test --workspace --locked` rc0 = 68 suites, 1164 passed / 0 failed / 0 ignored at the same digest; schema pins intact (`SESSION_CACHE_SCHEMA_VERSION=64` unchanged; schema-64 oracle green)
+- implement 8f19f012: red-first 4-fail → green 5-pass transcript; `git diff --stat` parser.rs +6/-1, session_cache.rs +245, untracked contract test

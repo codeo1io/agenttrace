@@ -142,6 +142,11 @@ pub struct DoctorDirReport {
 struct SessionCacheReport {
     path: PathBuf,
     entries: BTreeMap<String, CacheEntryHeader>,
+    /// rm-299 review fix (finding 2): banked opencode sibling
+    /// composites per entry key (absent → `None`), so the
+    /// reusable-entry census applies the same composite freshness
+    /// the warm serve path does instead of trusting size/mtime alone.
+    opencode_siblings: BTreeMap<String, Option<crate::session_cache::OpencodeSiblingFingerprints>>,
     dirs: usize,
     invalidation_note: Option<String>,
 }
@@ -199,6 +204,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             cache: SessionCacheReport {
                 path: session_cache_path(),
                 entries: BTreeMap::new(),
+                opencode_siblings: BTreeMap::new(),
                 dirs: 0,
                 invalidation_note: None,
             },
@@ -1302,9 +1308,18 @@ fn load_session_cache_report() -> SessionCacheReport {
         };
     };
     let mut entries = BTreeMap::new();
+    let mut opencode_siblings = BTreeMap::new();
     if let Some(raw_entries) = doc.get("entries").and_then(Value::as_object) {
         for (path, entry) in raw_entries {
             if let Some(header) = decode_cache_entry_header(entry) {
+                // rm-299 review fix (finding 2): carry the banked
+                // sibling composite alongside the header so the
+                // reusable census can compare it to the fresh
+                // enumeration.
+                opencode_siblings.insert(
+                    path.clone(),
+                    crate::session_cache::banked_opencode_siblings(entry),
+                );
                 entries.insert(path.clone(), header);
             }
         }
@@ -1338,6 +1353,7 @@ fn load_session_cache_report() -> SessionCacheReport {
     SessionCacheReport {
         path,
         entries,
+        opencode_siblings,
         dirs,
         invalidation_note,
     }
@@ -1428,9 +1444,24 @@ fn valid_cached_session_count(paths: &[PathBuf], cache: &SessionCacheReport) -> 
         if entry.size != metadata.len() as i64 {
             continue;
         }
-        if file_mod_time_nanos(&metadata) == Some(entry.mod_time) {
-            valid += 1;
+        if file_mod_time_nanos(&metadata) != Some(entry.mod_time) {
+            continue;
         }
+        // rm-299 review fix (finding 2): size/mtime equality is only
+        // the session-doc half of opencode storage freshness — the
+        // banked sibling composite must match the fresh enumeration
+        // too, else doctor counted sibling-stale (or never-bankable)
+        // entries as reusable. `None == None` keeps every non-opencode
+        // lane exactly as before; a mismatched or unbankable composite
+        // counts as NOT reusable — the conservative direction, and the
+        // disclosure counter for over-cap/unverifiable/non-UTF8-named
+        // scopes (which never bank and so always count as not
+        // reusable here).
+        let banked = cache.opencode_siblings.get(&key).cloned().flatten();
+        if crate::session_cache::opencode_sibling_fingerprints(path) != banked {
+            continue;
+        }
+        valid += 1;
     }
     valid
 }
@@ -1500,6 +1531,126 @@ mod tests {
         );
         let both_unusable = resolve_user_cache_dir(relative, Some(OsStr::new("rel-cache")));
         assert!(both_unusable.is_absolute(), "{both_unusable:?}");
+    }
+
+    /// rm-299 review fix (finding 2): doctor's reusable-entry census
+    /// must apply the opencode sibling composite, not just the
+    /// session-doc size/mtime — a sibling-stale or never-bankable
+    /// (unverifiable/over-cap/non-UTF8-named) opencode entry counts
+    /// as NOT reusable, while non-opencode lanes (None == None) keep
+    /// their size/mtime semantics exactly.
+    #[test]
+    fn valid_cached_session_count_applies_sibling_composite() {
+        let root = std::env::temp_dir().join(format!("at-doctor-rm299-fix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let storage = root.join("opencode/storage");
+        std::fs::create_dir_all(storage.join("message/sess_1")).unwrap();
+        std::fs::create_dir_all(storage.join("part/m1")).unwrap();
+        let session_file = storage.join("session/sess_1/sess_1.json");
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session_file,
+            r#"{"id": "sess_1", "title": "t", "model": {"id": "claude-sonnet-4-5"}, "time": {"created": 1764750000000, "updated": 1764750004000}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("message/sess_1/m1.json"),
+            r#"{"id": "m1", "sessionID": "sess_1", "role": "user", "time": {"created": 1764750001000}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("part/m1/p_fin.json"),
+            r#"{"id": "p_fin", "type": "step-finish", "time": {"created": 1764750001600}, "tokens": {"input": 100, "output": 20}}"#,
+        )
+        .unwrap();
+
+        let metadata = std::fs::metadata(&session_file).unwrap();
+        let header = CacheEntryHeader {
+            mod_time: file_mod_time_nanos(&metadata).expect("mtime"),
+            size: metadata.len() as i64,
+        };
+        let key = session_file.to_string_lossy().to_string();
+
+        let report_with = |banked: Option<crate::session_cache::OpencodeSiblingFingerprints>| {
+            SessionCacheReport {
+                path: PathBuf::new(),
+                entries: [(key.clone(), header.clone())].into_iter().collect(),
+                opencode_siblings: [(key.clone(), banked)].into_iter().collect(),
+                dirs: 0,
+                invalidation_note: None,
+            }
+        };
+
+        // A fresh, matching composite: reusable.
+        let fresh = crate::session_cache::opencode_sibling_fingerprints(&session_file)
+            .expect("an opencode storage path enumerates its siblings");
+        assert_eq!(
+            valid_cached_session_count(
+                std::slice::from_ref(&session_file),
+                &report_with(Some(fresh.clone()))
+            ),
+            1,
+            "a matching sibling composite counts as reusable"
+        );
+
+        // Banked None (never-bankable scope) never equals a fresh
+        // Some: NOT reusable.
+        assert_eq!(
+            valid_cached_session_count(std::slice::from_ref(&session_file), &report_with(None)),
+            0,
+            "an unbankable opencode scope is NOT reusable"
+        );
+
+        // A sibling-stale banked composite (size/mtime of the session
+        // doc still equal — the pre-fix false positive): NOT reusable.
+        // Wrapped as a raw cache ENTRY (the helper reads the
+        // `opencode_siblings` field, absent → `None`).
+        let stale_value: Value = serde_json::json!({
+            "mod_time": 123,
+            "size": 45,
+            "opencode_siblings": {
+                "files": {"message/sess_1/m1.json": {"mod_time": 1, "size": 2}},
+                "bounded": true
+            }
+        });
+        let stale = crate::session_cache::banked_opencode_siblings(&stale_value)
+            .expect("a fabricated composite decodes");
+        assert_ne!(fresh, stale, "the fixture must differ from the fresh map");
+        assert_eq!(
+            valid_cached_session_count(
+                std::slice::from_ref(&session_file),
+                &report_with(Some(stale))
+            ),
+            0,
+            "a sibling-stale banked composite is NOT reusable even with size/mtime equal"
+        );
+
+        // Non-opencode lane: None == None keeps size/mtime semantics.
+        let journal = root.join("plain.jsonl");
+        std::fs::write(&journal, "{}\n").unwrap();
+        let journal_metadata = std::fs::metadata(&journal).unwrap();
+        let journal_key = journal.to_string_lossy().to_string();
+        let cache = SessionCacheReport {
+            path: PathBuf::new(),
+            entries: [(
+                journal_key.clone(),
+                CacheEntryHeader {
+                    mod_time: file_mod_time_nanos(&journal_metadata).expect("mtime"),
+                    size: journal_metadata.len() as i64,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            opencode_siblings: [(journal_key, None)].into_iter().collect(),
+            dirs: 0,
+            invalidation_note: None,
+        };
+        assert_eq!(
+            valid_cached_session_count(&[journal], &cache),
+            1,
+            "non-opencode entries keep the None == None arm"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn session_at(cwd: &str, path: &str) -> Session {
