@@ -167,6 +167,32 @@ output-contract gate's doctor probe still runs in a scoped throwaway home
 the cache path in its JSON, so a `$HOME`-derived probe can never be
 byte-stable.
 
+## Rule 9 — battery TMPDIR must live outside every `.git` ancestor (2026-10-15)
+
+Run 5c144613 cycle-4 assess: `outside_a_git_repository_fails`
+(upstream.rs:249–263) red 4/4 under the fleet delegate TMPDIR because that
+TMPDIR (`/home/agent/.hermes/tmp/delegate`) sits inside a git repository —
+so a temp-rooted scratch repo resolves to the WRONG toplevel (`.hermes`).
+Both debug and release binaries printed the correct error in a plain
+directory under a full 8-var git env, so the binary was right and the
+ENVIRONMENT was the flake. Rule: run batteries under a neutral TMPDIR that
+is not inside any `.git` ancestor; the durable test-side fix (fixture-owned
+temp root or `GIT_CEILING_DIRECTORIES`) rides rm-241's hermeticity batch.
+Same family as Rule 8's shared-target-dir interference: assume nothing
+about harness-provided temp/state paths.
+
+## Rule 10 — standing-red triage: prove it pristine before blaming the batch (2026-10-15)
+
+Run 5c144613 cycle-4 full_tests found three red lanes (actionlint SC2001 at
+ci.yml:192, check-install-runtime test D rm-051, cargo-deny 4× RUSTSEC
+rustls) — and cleared the batch by reproducing each lane BYTE-IDENTICAL at
+the pristine base commit in a detached worktree. Rule: when a lane reds
+under a batch, first re-run that lane at the merge-base in a clean checkout
+and diff the failure output; only lanes whose failures DIFFER from the
+pristine run count against the batch. This turns "the suite is red" into a
+two-line triage and stops cycles from chasing inherited debt as if it were
+regression.
+
 ## Rule 11 — a dead attempt's scratch logs describe a past tree, not this one (2026-10-16)
 
 Run ff5c1cd8 cycle-4 targeted-tests forensics: reaped attempt 406ede47's

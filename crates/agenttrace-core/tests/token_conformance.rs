@@ -76,11 +76,15 @@ fn snapshot_derived_cost(model: &str, tokens: &Value) -> f64 {
         m => m,
     });
     let term = |key: &str| tokens[key].as_f64().unwrap_or(0.0) / 1_000_000.0;
+    // rm-1508: standard cache slots are Option — the conformance
+    // oracle prices only models whose bundle rows publish rates
+    // (explicit 0 included), so unwrap() fails loudly rather than
+    // silently repricing an absent-rate row at $0.
     round4(
         term("input") * price.input
             + term("output") * price.output
-            + term("cache_w") * price.cw
-            + term("cache_r") * price.cr,
+            + term("cache_w") * price.cw.unwrap()
+            + term("cache_r") * price.cr.unwrap(),
     )
 }
 

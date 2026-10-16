@@ -714,7 +714,18 @@ pub fn report_overview_markdown_with_context(
     let audit = cost_audit(sessions);
     let mut out = report_overview_markdown(overview, sessions);
     out.push_str("\n## Scope and confidence\n\n| Field | Value |\n|---|---|\n");
-    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {} |\n", markdown_cell(&scope.range), markdown_cell(&scope.earliest_session_at), markdown_cell(&scope.latest_session_at), markdown_cell(&parse_coverage_phrase(data_health, "; ")), markdown_cell(&data_health.confidence), markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions));
+    // rm-1508: the census arm renders only when a session in scope
+    // actually billed cache tokens at the absent-rate fallback — zero
+    // keeps every existing report byte-identical.
+    let cache_rate_arm = if audit.pricing_coverage.cache_rate_fallback_sessions > 0 {
+        format!(
+            "; cache-rate fallback: {}",
+            audit.pricing_coverage.cache_rate_fallback_sessions
+        )
+    } else {
+        String::new()
+    };
+    out.push_str(&format!("| Range | {} |\n| Session window | {} → {} |\n| Parse coverage | {} |\n| Confidence | {} |\n| Pricing | {} |\n| Pricing coverage | exact: {}; fallback: {}; unknown: {}{} |\n", markdown_cell(&scope.range), markdown_cell(&scope.earliest_session_at), markdown_cell(&scope.latest_session_at), markdown_cell(&parse_coverage_phrase(data_health, "; ")), markdown_cell(&data_health.confidence), markdown_cell(&audit.pricing_source), audit.pricing_coverage.priced_sessions, audit.pricing_coverage.fallback_priced_sessions, audit.pricing_coverage.unpriced_or_unknown_sessions, cache_rate_arm));
     if !data_health.line_skips.is_empty() {
         out.push_str(&format!(
             "| Dropped lines | {} |\n",

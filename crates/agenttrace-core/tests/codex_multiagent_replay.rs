@@ -180,11 +180,16 @@ fn rebased_child_cost_uses_the_canonical_per_mtok_formula() {
         &child.metrics.model_used,
         child.metrics.service_tier.as_deref(),
     );
+    // rm-1508 seam at the 2026-10-17 integration (case 7f566ee8): cw/cr
+    // are Option in the absence-preserving catalog — an unpublished rate
+    // bills at the disclosed fallback ladder, mirroring rebase_cost.
+    let (cw, _) = price.cache_write_billed();
+    let (cr, _) = price.cache_read_billed();
     let expected = agenttrace_core::round4(
         child.metrics.tokens_input as f64 / 1e6 * price.input
             + child.metrics.tokens_output as f64 / 1e6 * price.output
-            + child.metrics.tokens_cache_w as f64 / 1e6 * price.cw
-            + child.metrics.tokens_cache_r as f64 / 1e6 * price.cr,
+            + child.metrics.tokens_cache_w as f64 / 1e6 * cw
+            + child.metrics.tokens_cache_r as f64 / 1e6 * cr,
     );
     assert_eq!(child.metrics.cost_estimated, expected);
     // The x1e6 regression shape: the child's cost must be a per-Mtok

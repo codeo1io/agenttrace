@@ -260,11 +260,19 @@ fn scan_rollout(path: &Path) -> RolloutScan {
 /// carries no separate term, exactly like the canonical formula).
 fn rebase_cost(metrics: &Metrics, uncached_input: i64, rebased: &TotalSnapshot) -> f64 {
     let price = lookup_price_tiered(&metrics.model_used, metrics.service_tier.as_deref());
+    // rm-1508 seam at the 2026-10-17 integration (case 7f566ee8): this
+    // master-side replay formula was written when cw/cr were plain f64;
+    // the landed absence-preserving catalog made them Option, so an
+    // unpublished rate here must bill at the disclosed fallback ladder
+    // (cr = input rate, cw = input x the vendor-convention multiple)
+    // exactly like the canonical `catalog_cost` — never a silent $0.
+    let (cw, _) = price.cache_write_billed();
+    let (cr, _) = price.cache_read_billed();
     round4(
         uncached_input as f64 / 1e6 * price.input
             + rebased.output as f64 / 1e6 * price.output
-            + rebased.cache_creation as f64 / 1e6 * price.cw
-            + rebased.cached as f64 / 1e6 * price.cr,
+            + rebased.cache_creation as f64 / 1e6 * cw
+            + rebased.cached as f64 / 1e6 * cr,
     )
 }
 

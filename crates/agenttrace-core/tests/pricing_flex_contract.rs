@@ -21,10 +21,12 @@ fn flex_turns_bill_at_the_published_flex_rates() {
     assert_eq!(per_million(&standard), (4.0, 20.0));
     let flex = lookup_price_tiered("gpt-5.6", Some("flex"));
     assert_eq!(per_million(&flex), (2.0, 10.0));
-    assert_eq!(flex.cw, 2.5);
-    assert_eq!(flex.cw, 2.5);
+    // rm-1508: standard cache slots are Option — the flex row
+    // publishes both rates, so unwrap() keeps the pin strict.
+    assert_eq!(flex.cw, Some(2.5));
+    assert_eq!(flex.cw, Some(2.5));
     assert!(
-        (flex.cr - 0.2).abs() < 1e-9,
+        (flex.cr.unwrap() - 0.2).abs() < 1e-9,
         "4e-6 scaled is 0.2 within f64"
     );
     // Tiers other than "flex" — including the None a tier-less turn

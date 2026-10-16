@@ -140,11 +140,29 @@ def trim(data):
         entry = {
             "input_cost_per_token": inp,
             "output_cost_per_token": outp,
-            "cache_creation_input_token_cost": value.get("cache_creation_input_token_cost") or 0,
-            "cache_read_input_token_cost": value.get("cache_read_input_token_cost") or 0,
             "mode": "chat",
             "litellm_provider": value.get("litellm_provider") or "",
         }
+        # rm-1508 (run 5c144613 cycle 4): preserve cache-rate ABSENCE.
+        # The `or 0` zero-fill destroyed absent-vs-published-$0 before
+        # the Rust ingest could ever see it (51.5%/84.3% of the
+        # 2026-10-08 bundle carried a silent $0 cache-read/write rate
+        # for rows that publish none). The key rides along only when
+        # the source carries a number — an explicit 0 stays a published
+        # $0 — mirroring the flex/ultrafast omit-when-absent contract
+        # below. NOTE for the next refresh (the rm-176 reconcile lane):
+        # keys that survive only through the never-drop union carry
+        # their pre-fix zero-filled values forward and age out as
+        # upstream drops them; live-side rows get the distinction, and
+        # tests/pricing_snapshot_hygiene.rs pins the counts so any
+        # movement is conscious.
+        for cache_field in (
+            "cache_creation_input_token_cost",
+            "cache_read_input_token_cost",
+        ):
+            rate = value.get(cache_field)
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool):
+                entry[cache_field] = rate
         max_input = value.get("max_input_tokens")
         if isinstance(max_input, int) and max_input > 0:
             entry["max_input_tokens"] = max_input

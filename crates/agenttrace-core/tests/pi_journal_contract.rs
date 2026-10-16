@@ -170,8 +170,8 @@ fn pi_v3_journal_message_usage_and_model_contract() {
     let catalog_only = agenttrace_core::round4(
         500.0 / 1e6 * sonnet.input
             + 1000.0 / 1e6 * sonnet.output
-            + 25000.0 / 1e6 * sonnet.cr
-            + 5000.0 / 1e6 * sonnet.cw,
+            + 25000.0 / 1e6 * sonnet.cr.unwrap()
+            + 5000.0 / 1e6 * sonnet.cw.unwrap(),
     );
     assert!(
         (session.metrics.cost_estimated - 0.0075).abs() < 1e-9,

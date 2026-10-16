@@ -1042,8 +1042,8 @@ fn compaction_usage_composes_with_catalog() {
     let expected = round4(
         price.input / 1e6 * 500.0
             + price.output / 1e6 * 1000.0
-            + price.cr / 1e6 * 25000.0
-            + price.cw / 1e6 * 5000.0
+            + price.cr.unwrap() / 1e6 * 25000.0
+            + price.cw.unwrap() / 1e6 * 5000.0
             + 0.0123,
     );
     assert!(
