@@ -297,6 +297,34 @@
 
 - Added `scripts/ci/check-plugin-version.sh` tying `.codex-plugin/plugin.json` to the latest CHANGELOG version so release drift is caught locally.
 
+- First-party pricing for dated Anthropic ids via an embedded models.dev extract (rm-1532, run
+  92ea794984ae40f4ad8c73836efe21a6 cycle 4, batch "silent lies in attribution lanes"):
+  the bundled LiteLLM snapshot carries no first-party rows for
+  `claude-sonnet-4-20250514`, `claude-3-7-sonnet-20250219`, or
+  `claude-opus-4-1-20250805`, while qualified reseller rows end in exactly those
+  ids, so first-party Claude Code sessions priced and attributed through
+  openrouter/vercel_ai_gateway (and a reseller fall-through could misprice —
+  jiekou lists sonnet-4 at 10% off). Live LiteLLM has zero rows in any form for
+  these ids, so a snapshot refresh cannot heal it. The pricing ladder now
+  consults an embedded models.dev extract (`models_dev_snapshot.json`, provenance
+  noted in-file) when the LiteLLM catalog lacks an exact first-party row: dated
+  ids price at vendor list, `By Provider` reports `anthropic`, and
+  `pricing_source` discloses "models.dev snapshot 2026-10-16 (embedded
+  first-party extract; LiteLLM lacks a first-party row)". Plain-id provider
+  winners stay byte-stable (base_model_pricing goldens green) and
+  `AGENTTRACE_PRICING_FILE` overrides still win over the extract.
+
+- Far-future session timestamps are bounded and disclosed (rm-1534, run
+  92ea794984ae40f4ad8c73836efe21a6 cycle 4): `session_admitted_since`
+  previously lower-bounded only, so a corrupt clock (year-99999 fixture) scored
+  HEALTH 100 with zero anomalies and was silently admitted into every forward
+  `--range`. Admission now upper-bounds at now+48h across the insights,
+  discovery, and sqlite lanes, excluded sessions surface as a
+  `future_timestamp_sessions` disclosure counter, a new `future_timestamp`
+  anomaly class dings health and shows in `--sessions`, and `--doctor` reports a
+  census row with a recommendation. In-grace clock-skew tolerance is pinned by
+  test and healthy corpora render zero-count clean.
+
 ### Fixed
 
 - opencode transcript reads are stat-capped at 10 MiB per file (rm-1437, run
