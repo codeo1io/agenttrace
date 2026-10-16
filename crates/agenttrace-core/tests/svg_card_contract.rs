@@ -13,8 +13,8 @@
 ///   `Utc::now()`, so the card cannot drift between renders;
 /// - an empty corpus renders a valid card instead of panicking.
 use agenttrace_core::{
-    compute_overview, demo_sessions, report_overview_svg, report_overview_svg_with_context,
-    SvgCardTheme,
+    bundled_snapshot_date, compute_overview, demo_sessions, report_overview_svg,
+    report_overview_svg_with_context, SvgCardTheme,
 };
 
 const GOLDEN_DIR: &str = "tests/fixtures/svg-card";
@@ -175,10 +175,25 @@ fn sparkline_is_anchored_to_the_corpus_clock_not_wall_clock() {
             .unwrap_or("<no date labels>")
     );
     // The demo corpus's fixed timestamps are far from today; if the card
-    // were anchored to `Utc::now()` today's date would leak in.
+    // were anchored to `Utc::now()` today's date would leak in. The ONE
+    // date the card legitimately carries that is not corpus-derived is
+    // the pricing-snapshot disclosure in the footer (rm-1514, run
+    // 96287e10 cycle 1): a same-day snapshot refresh — the weekly
+    // automation's normal mode (SNAPSHOT_DATE defaults to today UTC) and
+    // a supported manual path — stamps today into that disclosure, so
+    // scrub the disclosure before the leak check. The scrub targets the
+    // whole "LiteLLM snapshot <date> (bundled)" phrase (the only
+    // date-bearing shape the offline footer produces — pricing.rs
+    // `catalog_source`; override suffixes append after the paren), NOT
+    // the bare date: on a same-day refresh the snapshot date IS today,
+    // and scrubbing the bare date would mask a genuine leak of today
+    // anywhere else. A wall-clock leak into the sparkline, the window,
+    // or any other position stays fully caught.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let disclosure = format!("LiteLLM snapshot {} (bundled)", bundled_snapshot_date());
+    let scrubbed = card.replace(&disclosure, "\u{2039}pricing-snapshot-disclosure\u{203a}");
     assert!(
-        !card.contains(&today),
+        !scrubbed.contains(&today),
         "wall-clock date leaked into a corpus-anchored card"
     );
 }

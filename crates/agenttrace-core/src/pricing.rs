@@ -176,12 +176,16 @@ pub fn lookup_price(model: &str) -> Price {
 /// "priority", ...) bills at the standard rates. A model without
 /// tier rates bills tiered turns at the standard rates: that is the
 /// published behavior (codeburn #1642, held for the third tier
-/// family), not a guess.
+/// family), not a guess. Tier matching is case-insensitive (rm-164
+/// rider, run 96287e10 cycle 1): journals carry the tier string
+/// verbatim from user configuration, and 'Flex'/'ULTRAAFAST' must
+/// price on their rows, not silently reprice at the standard rates.
 pub fn lookup_price_tiered(model: &str, service_tier: Option<&str>) -> Price {
     let catalog = pricing_catalog();
     let model = resolve_alias(model, &catalog.aliases);
     let mut price = lookup_price_in(&model, &catalog.entries);
-    let (input_tier, output_tier, cw_tier, cr_tier) = match service_tier {
+    let service_tier = service_tier.map(str::to_ascii_lowercase);
+    let (input_tier, output_tier, cw_tier, cr_tier) = match service_tier.as_deref() {
         Some("flex") => (
             price.input_flex,
             price.output_flex,
