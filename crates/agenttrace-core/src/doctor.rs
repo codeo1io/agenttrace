@@ -180,6 +180,7 @@ struct DoctorDiscovery {
     sessions: Vec<Session>,
     sqlite_ingest: SqliteIngestReport,
     opencode_fork_excluded: usize,
+    compressed_sibling_skipped: usize,
 }
 
 /// rm-596: the single demo gate for the doctor report's discovery lanes.
@@ -207,17 +208,15 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
             sessions: crate::demo_sessions().expect("bundled demo corpus"),
             sqlite_ingest: SqliteIngestReport::default(),
             opencode_fork_excluded: 0,
+            compressed_sibling_skipped: 0,
         };
     }
     let cache = load_session_cache_report();
     let cache_size_bytes = std::fs::metadata(&cache.path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    let (files, opencode_fork_excluded) = if dir.is_none() {
-        find_reportable_session_files(None)
-    } else {
-        (find_session_files(dir), 0)
-    };
+    let (files, opencode_fork_excluded, compressed_sibling_skipped) =
+        find_reportable_session_files(dir);
     // rm-753 (minted campaign-locally as rm-596; rebind recorded in
     // the ROADMAP): the SQLite-backed load returns its per-file failure
     // report alongside the sessions so doctor counters stop printing
@@ -244,6 +243,7 @@ fn doctor_discovery(dir: Option<&Path>, demo: bool) -> DoctorDiscovery {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        compressed_sibling_skipped,
     }
 }
 
@@ -255,6 +255,7 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         sessions,
         sqlite_ingest,
         opencode_fork_excluded,
+        compressed_sibling_skipped,
     } = doctor_discovery(dir, demo);
     let cached_valid = valid_cached_session_count(&files, &cache);
     // rm-298 capacity arm: disclose the bound actually in force (and
@@ -298,6 +299,18 @@ pub fn build_doctor_report(dir: Option<&Path>, demo: bool) -> DoctorReport {
         disclosures.insert(
             "opencode_fork_excluded_sessions".to_string(),
             opencode_fork_excluded_total,
+        );
+    }
+    if compressed_sibling_skipped > 0 {
+        // rm-992: same rule as the fork exclusion above — the doctor
+        // applies the loader's compressed-sibling precedence, so the
+        // twins it dropped must surface through the same disclosure
+        // channel (identical key to the loader/overview lanes) or the
+        // doctor's `sessions` looks arbitrarily smaller than a raw
+        // file count for no visible reason.
+        disclosures.insert(
+            "compressed_sibling_skipped_sessions".to_string(),
+            compressed_sibling_skipped,
         );
     }
     let mut report = DoctorReport {
@@ -623,10 +636,7 @@ fn doctor_statusline_report(demo: bool) -> DoctorStatuslineReport {
     }
 }
 
-fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
-    if dir.is_some() {
-        return (find_session_files(dir), 0);
-    }
+fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize, usize) {
     // rm-548 (independent-review fix): the doctor's auto-discovery
     // inventory aggregates through the SAME loader primitive the CLI
     // uses (`find_session_files_cached`), not a private walk — an
@@ -637,16 +647,30 @@ fn find_reportable_session_files(dir: Option<&Path>) -> (Vec<PathBuf>, usize) {
     // rides the session-cache memo (fingerprint-keyed fork-probe
     // results; a rewritten doc always re-probes) instead of
     // re-reading every storage session info doc, and the exclusion
-    // rides the disclosure channel instead of dying silently. An
-    // explicit `--dir` keeps every file (the exclusion is
-    // aggregation-only, same rule as the loader).
+    // rides the disclosure channel instead of dying silently.
+    // rm-992: the loader's compressed-sibling precedence runs here
+    // too — on BOTH arms. Upstream codex rules a directory holding
+    // `rollout.jsonl` and `rollout.jsonl.zst` ONE rollout (the plain
+    // file hides the compressed twin), and the loader drops the twin
+    // as a named skip on its `-d` arm as well, so an explicit `--dir`
+    // keeping both twins would double-count what every other lane
+    // already deduplicated (the rm-904 doctor/loader agreement
+    // class).
+    if let Some(dir) = dir {
+        let mut files = find_session_files(Some(dir));
+        let compressed_sibling_skipped =
+            crate::discovery::apply_compressed_sibling_precedence(&mut files);
+        return (files, 0, compressed_sibling_skipped);
+    }
     let mut cache = crate::session_cache::load_session_cache();
-    let (files, opencode_fork_excluded) =
+    let (mut files, opencode_fork_excluded) =
         crate::discovery::find_session_files_cached(None, &mut cache, true);
+    let compressed_sibling_skipped =
+        crate::discovery::apply_compressed_sibling_precedence(&mut files);
     // A cache write failure must never fail the doctor (the cache is
     // an optimization; the inventory answer is already correct).
     let _ = crate::session_cache::save_session_cache(&mut cache);
-    (files, opencode_fork_excluded)
+    (files, opencode_fork_excluded, compressed_sibling_skipped)
 }
 
 // rm-753 × rm-596 composition: the landed demo gate and the sqlite

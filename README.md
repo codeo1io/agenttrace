@@ -562,6 +562,16 @@ including fork-relocated agent dirs), so they have no fixed rows here.
 Anything outside these roots is reachable only through the explicit
 `-d/--dir` escape.
 
+Codex rollouts compressed in place are first-class: codex ≥0.152 writes
+sessions as zstd frames, newer builds beside a compressed `rollout.jsonl.zst`
+twin while the plain `rollout.jsonl` still exists. Discovery admits both
+`.jsonl.zst` / `.json.zst` names (and decodes them by magic, so a compressed
+file under any admitted name works), and applies codex's own precedence — a
+plain file hides its compressed twin, so the pair is ONE session, never two.
+The hidden twin is disclosed (`compressed_sibling_skipped_sessions`, plus an
+advisory line in `--overview` and `--doctor`) instead of counting as a parse
+failure.
+
 ## What you get
 
 | Need | agenttrace gives you |

@@ -54,6 +54,19 @@ fn run_cli(cwd: &Path, args: &[&str]) -> Output {
     for (key, value) in GIT_ENV {
         command.env(key, value);
     }
+    // rm-241 (scan-hermeticity pair): bound git repository discovery at
+    // the shared temp root the fixtures live under. Git natively honors
+    // GIT_CEILING_DIRECTORIES ("directories git should not chdir up
+    // into"), so on a host whose TMPDIR sits inside a git repository —
+    // conductor sandboxes default TMPDIR into the orchestrator's own
+    // checkout — `outside_a_git_repository_fails` no longer resolves
+    // the ENCLOSING repo through the temp tree and silently flips its
+    // verdict. Benign hosts behave exactly as before: the ceiling only
+    // stops a walk that would otherwise leave the temp tree.
+    command.env(
+        "GIT_CEILING_DIRECTORIES",
+        std::env::temp_dir().to_string_lossy().to_string(),
+    );
     command.output().expect("run agenttrace CLI")
 }
 

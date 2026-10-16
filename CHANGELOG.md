@@ -4,6 +4,25 @@
 
 ### Added
 
+- Compressed codex rollouts are discovered, deduplicated, and disclosed
+  (rm-992 + rm-241, run 6b28edba cycle 1, batch "scan-visibility truth"):
+  codex writes sessions as zstd frames (`rollout.jsonl.zst`, `.json.zst`) and
+  newer builds keep the plain `rollout.jsonl` twin beside the compressed one,
+  but discovery admitted only the plain endings — compressed-only sessions
+  were invisible, and a twin pair could count as two rollouts. Discovery now
+  admits the compressed spellings (bare `.zst` and non-session names still
+  rejected), applies codex's own precedence (`RolloutFile::from_path`: an
+  existing plain file hides its compressed sibling — ONE rollout, not two)
+  across the loader, `--overview`, `--doctor -d`, and the session-cache
+  directory listing, and discloses the hidden twin as
+  `compressed_sibling_skipped_sessions` plus an `--overview` advisory line
+  instead of a parse failure. Scan hermeticity pairs with it: git-repo
+  ancestor walks honor `GIT_CEILING_DIRECTORIES` (git's native boundary), so
+  project attribution and the `outside a git repository` refusal no longer
+  latch an enclosing repository through TMPDIR on hosts whose temp tree
+  lives inside a git checkout (conductor sandboxes), and the affected tests
+  run ceiling-bounded with a checked-in hostile-shadow fixture.
+
 - stdin sessions read through a named cap (rm-503, run 80e8beb6 cycle 1, batch
   "bounded inputs, honest docs"): the `-` lane drained stdin without bound —
   `cat /dev/zero | agenttrace --overview -` grew the process until the

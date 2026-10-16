@@ -37,10 +37,11 @@ pub use filters::{
 };
 
 pub use discovery::{
-    collect_session_files, discover_session_dirs, find_session_files, known_session_dirs,
-    load_sessions_from_dir, load_sessions_with_options, load_sessions_with_progress,
-    load_sessions_with_progress_from_cache, load_sessions_with_progress_from_cache_mode,
-    KnownSessionDir, LoadOptions, LoadProgress, LoadReport,
+    collect_session_files, discover_session_dirs, find_session_files, is_session_file_name,
+    known_session_dirs, load_sessions_from_dir, load_sessions_with_options,
+    load_sessions_with_progress, load_sessions_with_progress_from_cache,
+    load_sessions_with_progress_from_cache_mode, KnownSessionDir, LoadOptions, LoadProgress,
+    LoadReport,
 };
 pub use doctor::{
     build_doctor_report, doctor_report_text, render_doctor_report, DoctorDirReport, DoctorReport,

@@ -680,7 +680,7 @@ fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, 
     // (This run's compound banner pre-recorded the re-anchor: "re-anchor
     // mcp.rs (origin carries rm-548 threading at :293-306 over this
     // base)").
-    let health = data_health_scoped(
+    let mut health = data_health_scoped(
         &report.sessions,
         report.discovered,
         report.skipped,
@@ -688,6 +688,16 @@ fn usage_overview(root: Option<&Path>, range: TimeRange) -> Result<Value, (i64, 
         report.opencode_fork_excluded,
         report.sqlite.unreadable.clone(),
     );
+    // rm-992: identical insert to the CLI overview arm — same key the
+    // doctor lane uses — so MCP, CLI, and doctor agree that a
+    // compressed twin hidden by a plain sibling is a disclosed skip,
+    // not a lost session.
+    if report.compressed_sibling_skipped > 0 {
+        health
+            .disclosures
+            .entry("compressed_sibling_skipped_sessions".to_string())
+            .or_insert(report.compressed_sibling_skipped);
+    }
     let text = report_overview_json_with_context(
         &overview,
         &report.sessions,

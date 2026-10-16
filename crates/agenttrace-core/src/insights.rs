@@ -695,6 +695,22 @@ const GIT_ROOT_MAX_DEPTH: usize = 64;
 
 fn find_git_root(path: &Path) -> Option<PathBuf> {
     let mut current = if path.is_dir() { path } else { path.parent()? };
+    // rm-241 (scan-hermeticity pair): honor GIT_CEILING_DIRECTORIES
+    // exactly like git's own repository discovery — git "should not
+    // chdir up into" any listed directory, so a ceiling terminates the
+    // walk BEFORE the ceiling directory itself is examined. Operators
+    // already use this variable to bound `git rev-parse` on hosts
+    // with unreachable ancestors; mirroring it here keeps our decoder
+    // and the git subprocesses it parallels in agreement, and lets
+    // test fixtures own their discovery boundary (on hosts whose
+    // TMPDIR sits inside a git repository — conductor sandboxes do —
+    // the unbounded walk latched the ENCLOSING repo's name over the
+    // fixture's project and made the decode goldens host-state
+    // dependent). Comparison is component-wise (Path's PartialEq), so
+    // trailing separators in the variable are harmless.
+    let ceilings: Vec<PathBuf> = std::env::var_os("GIT_CEILING_DIRECTORIES")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
     let mut depth = 0;
     loop {
         let marker = current.join(".git");
@@ -708,7 +724,13 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
         if depth >= GIT_ROOT_MAX_DEPTH {
             return None;
         }
-        current = current.parent()?;
+        let parent = current.parent()?;
+        if ceilings.iter().any(|ceiling| ceiling == parent) {
+            // Discovery may examine everything strictly below a
+            // ceiling, but never crosses INTO it — git parity.
+            return None;
+        }
+        current = parent;
     }
 }
 
@@ -1067,6 +1089,101 @@ mod tests {
         ))
     }
 
+    /// rm-241: run `f` with GIT_CEILING_DIRECTORIES pinned to `ceiling`
+    /// so the git-root ancestor walk (and any git subprocess) cannot
+    /// cross above the fixture tree this test exclusively owns. On
+    /// hostile hosts — conductor sandboxes default TMPDIR INSIDE the
+    /// orchestrator's git repository — the unbounded walk latched the
+    /// enclosing repo's name (".hermes") over the fixture's project.
+    /// The lock serializes env mutation between env-isolated tests and
+    /// the guard is dropped before a caught panic resumes (the
+    /// poisoned-lock cascade rule discovery_contract's `lock_env`
+    /// established).
+    fn with_git_ceiling(ceiling: &std::path::Path, f: impl FnOnce()) {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let result = {
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("GIT_CEILING_DIRECTORIES");
+            std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            match previous {
+                Some(value) => std::env::set_var("GIT_CEILING_DIRECTORIES", value),
+                None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
+            }
+            result
+        };
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// rm-241: plant the CHECKED-IN hostile shadow tree
+    /// (tests/fixtures/hostile-shadow/agenttrace) beside a fixture
+    /// root — realistic sibling content (session + project journals)
+    /// instead of an empty `create_dir_all` stub, so the regression
+    /// fixture proves a greedy decoder still cannot consume it while
+    /// the ceiling bounds the ancestor walk.
+    fn plant_hostile_shadow(root: &std::path::Path) {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("hostile-shadow")
+            .join("agenttrace");
+        let target = root.join("agenttrace");
+        fs::create_dir_all(target.join("projects")).expect("create shadow projects dir");
+        fs::copy(source.join("session.jsonl"), target.join("session.jsonl"))
+            .expect("copy shadow session journal");
+        fs::copy(
+            source.join("projects").join("shadow-project.jsonl"),
+            target.join("projects").join("shadow-project.jsonl"),
+        )
+        .expect("copy shadow project journal");
+    }
+
+    #[test]
+    fn git_root_honors_git_ceiling_directories() {
+        // rm-241: the decoder's ancestor .git walk must respect
+        // GIT_CEILING_DIRECTORIES with git's exact semantics — git
+        // never chdir's up INTO a listed directory, so discovery may
+        // examine everything strictly below a ceiling but stops before
+        // the ceiling directory itself. Without the bound, any fixture
+        // (or user session) whose ancestors cross into an enclosing
+        // repository latches THAT repo's name — ".hermes" on conductor
+        // sandboxes whose TMPDIR lives inside the orchestrator
+        // checkout (the three live reds of this class).
+        let root = unique_decode_root("ceiling");
+        let nested = root.join("nested").join("deep");
+        fs::create_dir_all(&nested).expect("create nested fixture");
+        // Hostile enclosing repo ABOVE the ceiling boundary but inside
+        // the tree this test exclusively owns.
+        fs::create_dir_all(root.join(".git")).expect("plant enclosing repo");
+
+        // No ceiling: the walk finds the enclosing repo.
+        assert_eq!(find_git_root(&nested), Some(root.clone()));
+
+        // Ceiling at root/nested: the walk from below never crosses
+        // INTO it, even though the enclosing .git still exists.
+        with_git_ceiling(&root.join("nested"), || {
+            assert_eq!(
+                find_git_root(&nested),
+                None,
+                "walk must stop at the ceiling instead of latching the enclosing repo"
+            );
+            // A .git strictly BELOW the ceiling is still found — the
+            // bound is on crossing, not on descending.
+            let inside = root.join("nested").join("inside-repo");
+            fs::create_dir_all(inside.join(".git")).expect("create inside repo");
+            assert_eq!(find_git_root(&inside), Some(inside.clone()));
+        });
+
+        // Ceiling removed: the enclosing repo is found again — the
+        // bound is purely environmental, no state was hidden.
+        assert_eq!(find_git_root(&nested), Some(root.clone()));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn projects_group_worktrees_and_decode_agent_dirs() {
         // rm-382: hermetic fixture — unique root, no `agenttrace` component
@@ -1146,33 +1263,44 @@ mod tests {
         // component of the fixture path `…/<tmp>/agenttrace-project-<pid>/
         // src/my-repo` and the walk never recovered — the suite failed only
         // on hosts with that shadow (release-local gate rc101 cascade). The
-        // shadow is planted INSIDE the unique root, so the fixture never
-        // mutates shared host state while reproducing the exact trap.
+        // shadow is planted INSIDE the unique root (rm-241: from the
+        // CHECKED-IN hostile fixture, realistic content, not an empty
+        // stub), so the fixture never mutates shared host state while
+        // reproducing the exact trap.
+        //
+        // rm-241: the same host class also breaks this test through the
+        // ANCESTOR walk — with TMPDIR inside a git repository the decode
+        // verified `my-repo` but `resolved_from_path` latched the
+        // enclosing ".hermes" repo root over it. The ceiling bounds the
+        // walk at the fixture root the test owns, so both hostilities
+        // (hostile sibling + enclosing repo) are pinned by one fixture.
         let root = unique_decode_root("shadow");
         let fixture = root.join(format!("agenttrace-project-{}", std::process::id()));
         let repo = fixture.join("src").join("my-repo");
         fs::create_dir_all(&repo).expect("create repo");
-        fs::create_dir_all(root.join("agenttrace")).expect("plant shadow ancestor");
+        plant_hostile_shadow(&root);
         let encoded = repo.to_string_lossy().replace('/', "-");
         let transcript = root.join("projects").join(&encoded).join("session.jsonl");
         fs::create_dir_all(&transcript).unwrap();
-        let decoded = resolve_project(&session_at(
-            "",
-            &transcript.join("s.jsonl").to_string_lossy(),
-        ));
-        assert_eq!(decoded.display_name, "my-repo");
-        assert_eq!(
-            decoded.root,
-            lexical_normalize(&repo).to_string_lossy().to_string()
-        );
-        // The shadow never even becomes a disclosed candidate.
-        assert!(matches!(
-            project_decode_status(&session_at(
+        with_git_ceiling(&root, || {
+            let decoded = resolve_project(&session_at(
                 "",
-                &transcript.join("s.jsonl").to_string_lossy()
-            )),
-            ProjectDecodeStatus::Resolved { .. }
-        ));
+                &transcript.join("s.jsonl").to_string_lossy(),
+            ));
+            assert_eq!(decoded.display_name, "my-repo");
+            assert_eq!(
+                decoded.root,
+                lexical_normalize(&repo).to_string_lossy().to_string()
+            );
+            // The shadow never even becomes a disclosed candidate.
+            assert!(matches!(
+                project_decode_status(&session_at(
+                    "",
+                    &transcript.join("s.jsonl").to_string_lossy()
+                )),
+                ProjectDecodeStatus::Resolved { .. }
+            ));
+        });
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1262,12 +1390,20 @@ mod tests {
         // my-repo` rc1) and flipped back after it was removed. Attribution
         // must be byte-identical in both host states, and the ambiguity must
         // be disclosed, not decided silently.
+        //
+        // rm-241: the same attribution flips HOST-STATE-DEPENDENTLY when
+        // TMPDIR lives inside a git repository — the ancestor walk latched
+        // the enclosing ".hermes" repo over the verified `my-repo`. The
+        // ceiling bounds the walk at the fixture root, and the checked-in
+        // hostile shadow (rm-382 class) rides along, pinning both
+        // hostilities in one goldens fixture.
         let root = unique_decode_root("misattr");
         let base = root.join("misattr");
         let true_repo = base.join("my-repo");
         fs::create_dir_all(&true_repo).expect("create true repo");
         let decoy = base.join("my").join("repo");
         fs::create_dir_all(&decoy).expect("plant decoy");
+        plant_hostile_shadow(&root);
         let encoded = true_repo.to_string_lossy().replace('/', "-");
         let transcript = root
             .join("projects")
@@ -1277,37 +1413,39 @@ mod tests {
             .to_string();
         let session = session_at("", &transcript);
 
-        // Decoy present: attributed to the true project, not the decoy.
-        let with_decoy = resolve_project(&session);
-        assert_eq!(with_decoy.display_name, "my-repo");
-        assert_eq!(
-            with_decoy.root,
-            lexical_normalize(&true_repo).to_string_lossy().to_string()
-        );
-        // The alternative the old decoder would have descended into is
-        // disclosed as shadowed.
-        match project_decode_status(&session) {
-            ProjectDecodeStatus::Ambiguous { path, shadowed } => {
-                assert!(path.ends_with("misattr/my-repo"), "true path: {path}");
-                assert!(
-                    shadowed.iter().any(|alt| alt.ends_with("misattr/my/repo")),
-                    "decoy decode disclosed: {shadowed:?}"
-                );
+        with_git_ceiling(&root, || {
+            // Decoy present: attributed to the true project, not the decoy.
+            let with_decoy = resolve_project(&session);
+            assert_eq!(with_decoy.display_name, "my-repo");
+            assert_eq!(
+                with_decoy.root,
+                lexical_normalize(&true_repo).to_string_lossy().to_string()
+            );
+            // The alternative the old decoder would have descended into is
+            // disclosed as shadowed.
+            match project_decode_status(&session) {
+                ProjectDecodeStatus::Ambiguous { path, shadowed } => {
+                    assert!(path.ends_with("misattr/my-repo"), "true path: {path}");
+                    assert!(
+                        shadowed.iter().any(|alt| alt.ends_with("misattr/my/repo")),
+                        "decoy decode disclosed: {shadowed:?}"
+                    );
+                }
+                other => panic!("expected ambiguity disclosure, got {other:?}"),
             }
-            other => panic!("expected ambiguity disclosure, got {other:?}"),
-        }
 
-        // Decoy removed: a fresh walk (bypassing the resolve memo) yields the
-        // byte-identical attribution — host state cannot flip it.
-        fs::remove_dir_all(&decoy).unwrap();
-        let parts = encoded_plain_components(&transcript).expect("encoded components");
-        let walk = decode_encoded_components(&parts, false).expect("decode without decoy");
-        assert_eq!(walk.path, true_repo.to_string_lossy().to_string());
-        assert!(walk.shadowed.is_empty());
-        assert!(matches!(
-            project_decode_status(&session),
-            ProjectDecodeStatus::Resolved { .. }
-        ));
+            // Decoy removed: a fresh walk (bypassing the resolve memo) yields the
+            // byte-identical attribution — host state cannot flip it.
+            fs::remove_dir_all(&decoy).unwrap();
+            let parts = encoded_plain_components(&transcript).expect("encoded components");
+            let walk = decode_encoded_components(&parts, false).expect("decode without decoy");
+            assert_eq!(walk.path, true_repo.to_string_lossy().to_string());
+            assert!(walk.shadowed.is_empty());
+            assert!(matches!(
+                project_decode_status(&session),
+                ProjectDecodeStatus::Resolved { .. }
+            ));
+        });
         let _ = fs::remove_dir_all(root);
     }
 

@@ -975,7 +975,7 @@ fn run() -> anyhow::Result<()> {
         // parse failures stay separate from sessions excluded by the
         // range/filters, so "Parse coverage N/M" is true for every
         // range (pass-8 F8-2).
-        let health = match load_report.as_ref() {
+        let mut health = match load_report.as_ref() {
             Some(report) => data_health_scoped(
                 &sessions,
                 report.discovered,
@@ -986,6 +986,19 @@ fn run() -> anyhow::Result<()> {
             ),
             None => data_health(&sessions, sessions.len(), 0),
         };
+        // rm-992: the loader dropped compressed twins that a plain
+        // sibling hides (codex parity — one rollout, not two sessions);
+        // surface that count through the same disclosure channel the
+        // doctor lane uses, under the identical key, so `--overview`
+        // and `--doctor` agree on the skip.
+        if let Some(report) = load_report.as_ref() {
+            if report.compressed_sibling_skipped > 0 {
+                health
+                    .disclosures
+                    .entry("compressed_sibling_skipped_sessions".to_string())
+                    .or_insert(report.compressed_sibling_skipped);
+            }
+        }
         if args.limit < sessions.len() {
             eprintln!(
                 "Note: --limit caps list views only; this overview's aggregates cover all {} sessions.",
@@ -2101,7 +2114,12 @@ fn load_sessions_report(args: &Args) -> anyhow::Result<(Vec<Session>, Option<Loa
     // admitted) — loud BEFORE any bytes are staged. rm-912: the walk
     // lane also contributes its attempted-but-unparseable journals —
     // overwriting one would destroy the user's only copy.
-    ensure_output_is_not_an_input(args, &sessions, &report.parse_failure_paths)?;
+    ensure_output_is_not_an_input(
+        args,
+        &sessions,
+        &report.parse_failure_paths,
+        &report.compressed_sibling_skipped_paths,
+    )?;
     Ok((sessions, Some(report)))
 }
 
@@ -2144,15 +2162,32 @@ fn disclose_sqlite_ingest(ingest: &agenttrace_core::SqliteIngestReport) {
 /// (None when every discovered file parsed). Kept as a pure function so
 /// the exact wording ships with a pinned test.
 fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
-    if report.parse_failures == 0 {
-        return None;
-    }
-    report.first_parse_failure.as_deref().map(|first| {
+    // rm-992 (precedence arm, run 6b28edba): compressed siblings hidden
+    // by plain twins are a disclosed exclusion, not a parse failure —
+    // they carry their own clause so the two counts never blur.
+    let compressed = (report.compressed_sibling_skipped > 0).then(|| {
         format!(
-            "{} of {} discovered session files failed to parse; first: {first}",
-            report.parse_failures, report.discovered
+            "{} compressed session file(s) (.jsonl.zst) skipped: hidden by an existing plain sibling (codex parity)",
+            report.compressed_sibling_skipped
         )
-    })
+    });
+    let failures = match (report.parse_failures, report.first_parse_failure.as_deref()) {
+        (0, _) => None,
+        (count, Some(first)) => Some(format!(
+            "{count} of {} discovered session files failed to parse; first: {first}",
+            report.discovered
+        )),
+        // counted failures without a retained message stay silent —
+        // there is nothing honest to print for them, but a compressed
+        // skip (if any) still surfaces below.
+        (_, None) => None,
+    };
+    match (failures, compressed) {
+        (None, None) => None,
+        (Some(failures), None) => Some(failures),
+        (None, Some(compressed)) => Some(compressed),
+        (Some(failures), Some(compressed)) => Some(format!("{failures}; {compressed}")),
+    }
 }
 
 /// rm-534: `--output` must never be an input journal. write_output
@@ -2172,10 +2207,17 @@ fn parse_failure_advisory(report: &LoadReport) -> Option<String> {
 /// silently overwrote the unfixable input (only a `.orig` twin left
 /// behind). Attempted-but-failed paths join the refusal set and the
 /// error names the transcript.
+///
+/// rm-992 + review F1 (run 6b28edba review fix): EVERY compressed
+/// twin the loader DROPPED joins the refusal set too — the shipped
+/// guard kept only the first/newest one, so in a multi-pair directory
+/// `-o dir/older.jsonl.zst` exited 0 and atomically replaced that
+/// compressed transcript with the rendered report.
 fn ensure_output_is_not_an_input(
     args: &Args,
     sessions: &[Session],
     attempted_parse_failures: &[PathBuf],
+    dropped_compressed_siblings: &[PathBuf],
 ) -> anyhow::Result<()> {
     let Some(output) = args.output.as_deref() else {
         return Ok(());
@@ -2197,6 +2239,26 @@ fn ensure_output_is_not_an_input(
             if source == resolved {
                 bail!(
                     "--output {} is an input session journal that failed to parse ({}); refusing to overwrite a transcript — convert or move the journal, or choose a different --output destination",
+                    output.display(),
+                    candidate.display()
+                );
+            }
+        }
+    }
+    // rm-992 + review F1: every compressed twin the loader DROPPED
+    // (its plain sibling carries the session) is still a discovered
+    // input journal — none of them are in the sets above, so without
+    // this arm `--overview -d dir -o dir/rollout.jsonl.zst` would
+    // atomically replace the compressed source with the rendered
+    // report (the rm-912 class: an admitted file invisible to the
+    // guard). Checking the WHOLE dropped set, not just the first
+    // entry, is the review-F1 fix: a multi-pair directory's older
+    // .jsonl.zst used to be writable here (transcript destroyed, rc 0).
+    for candidate in dropped_compressed_siblings {
+        if let Ok(source) = fs::canonicalize(candidate) {
+            if source == resolved {
+                bail!(
+                    "--output {} is a discovered compressed session file ({}); refusing to overwrite a transcript — choose a different --output destination",
                     output.display(),
                     candidate.display()
                 );
@@ -2249,8 +2311,10 @@ fn prepare_explicit_sessions(
     // rm-912: the explicit lane has no attempted-parse-failure set — an
     // explicit positional file that fails to parse bails at `parse_file`
     // (non-zero, before any write), so nothing attempted-and-failed
-    // can reach this guard.
-    ensure_output_is_not_an_input(args, &sessions, &[])?;
+    // can reach this guard. rm-992: same for dropped compressed twins
+    // — the explicit lane never discovers directories, so there is no
+    // sibling-precedence drop to cover here either.
+    ensure_output_is_not_an_input(args, &sessions, &[], &[])?;
     if args.preserve_history {
         agenttrace_core::preserve_derived_history(&sessions)?;
     }
@@ -4177,6 +4241,124 @@ mod tests {
         .expect("honored family parses");
         assert_eq!(Some("mcp"), args.path.as_deref());
         refuse_inapplicable_mcp_flags(&args);
+    }
+
+    #[test]
+    fn output_guard_refuses_dropped_compressed_twin() {
+        // rm-992: when a plain sibling hides a compressed twin, the
+        // loader DROPS the twin before parsing — it lands in neither
+        // the session set nor the parse-failure set, so without the
+        // dedicated arm `--overview -d dir -o dir/rollout.jsonl.zst`
+        // would atomically replace the compressed source with the
+        // rendered report (the rm-912 class: an admitted input file
+        // invisible to the membership guard).
+        let dir = std::fs::canonicalize(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../agenttrace-core/tests/fixtures/codex-zstd/twins"),
+        )
+        .expect("twins fixture exists");
+        let twin = dir.join("rollout.jsonl.zst");
+        let twin_str = twin.to_string_lossy().to_string();
+
+        let refuse = Args::try_parse_from([
+            "agenttrace",
+            "-d",
+            dir.to_string_lossy().as_ref(),
+            "--overview",
+            "-o",
+            twin_str.as_str(),
+        ])
+        .expect("refusal arm parses");
+        let error = ensure_output_is_not_an_input(&refuse, &[], &[], std::slice::from_ref(&twin))
+            .expect_err("writing over the dropped twin must refuse");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("refusing to overwrite a transcript"),
+            "refusal must name the guard: {message}"
+        );
+        assert!(
+            message.contains("compressed session file"),
+            "refusal must name the compressed twin: {message}"
+        );
+
+        // Control: a destination beside (not onto) the twin passes.
+        let beside = dir.join("report.md");
+        let allow = Args::try_parse_from([
+            "agenttrace",
+            "-d",
+            dir.to_string_lossy().as_ref(),
+            "--overview",
+            "-o",
+            beside.to_string_lossy().as_ref(),
+        ])
+        .expect("control arm parses");
+        ensure_output_is_not_an_input(&allow, &[], &[], std::slice::from_ref(&twin))
+            .expect("a sibling destination must pass the guard");
+    }
+
+    #[test]
+    fn output_guard_refuses_every_dropped_compressed_twin() {
+        // Review F1 (run 6b28edba review fix, rm-992 hardening): a
+        // directory can hold SEVERAL plain/compressed pairs, and the
+        // loader drops EVERY hidden twin. The shipped guard kept only
+        // the report's FIRST dropped path (the newest twin), so with
+        // pairs a (older) + b the report was [b.jsonl.zst, a.jsonl.zst]
+        // and `-o a.jsonl.zst` exited 0, atomically replacing the
+        // older compressed transcript with the rendered report
+        // (reviewer PoC: md5 f39dd442 -> acc7484a, file now report
+        // text). This pins the multi-pair refusal for BOTH twins.
+        let dir =
+            std::env::temp_dir().join(format!("agenttrace-f1-two-pairs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        for stem in ["a", "b"] {
+            std::fs::write(dir.join(format!("{stem}.jsonl")), b"plain twin\n").expect("plain twin");
+            std::fs::write(dir.join(format!("{stem}.jsonl.zst")), b"compressed twin\n")
+                .expect("zst twin");
+        }
+        let b_twin = dir.join("b.jsonl.zst");
+        let a_twin = dir.join("a.jsonl.zst");
+        // Discovery order (newest first): a is the NON-first entry the
+        // shipped guard missed.
+        let dropped = vec![b_twin.clone(), a_twin.clone()];
+
+        for target in [&a_twin, &b_twin] {
+            let refuse = Args::try_parse_from([
+                "agenttrace",
+                "-d",
+                dir.to_string_lossy().as_ref(),
+                "--overview",
+                "-o",
+                target.to_string_lossy().as_ref(),
+            ])
+            .expect("refusal arm parses");
+            let error = ensure_output_is_not_an_input(&refuse, &[], &[], &dropped)
+                .expect_err("writing over ANY dropped twin must refuse");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("refusing to overwrite a transcript"),
+                "refusal must name the guard: {message}"
+            );
+            assert!(
+                message.contains("compressed session file"),
+                "refusal must name the compressed twin: {message}"
+            );
+        }
+
+        // Control: a destination beside (not onto) the pairs passes.
+        let beside = dir.join("report.md");
+        let allow = Args::try_parse_from([
+            "agenttrace",
+            "-d",
+            dir.to_string_lossy().as_ref(),
+            "--overview",
+            "-o",
+            beside.to_string_lossy().as_ref(),
+        ])
+        .expect("control arm parses");
+        ensure_output_is_not_an_input(&allow, &[], &[], &dropped)
+            .expect("a sibling destination must pass the guard");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3056,6 +3056,158 @@ fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
 }
 
 #[test]
+fn codex_zst_pair_loads_plain_twin_once_and_discloses_skip() {
+    // rm-992 (naming/precedence arm): upstream codex >=0.162 writes
+    // `rollout.jsonl.zst` BESIDE its plain `rollout.jsonl` twin, and
+    // codex `RolloutFile::from_path` rules the pair ONE rollout (the
+    // plain file hides the compressed sibling — see
+    // codex-rs/rollout/src/compression.rs:209-223). Discovery must
+    // admit both names, then apply the same precedence: exactly one
+    // session from the pair, sourced from the PLAIN twin, with the
+    // dropped twin disclosed as a NAMED skip — never a parse failure
+    // and never a second session that double-counts the rollout.
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-zstd/twins");
+    let report = load_sessions_with_progress(Some(&dir), &LoadOptions::default(), |_| {});
+    assert_eq!(
+        report.sessions.len(),
+        1,
+        "a plain/compressed twin pair is ONE rollout, got {}",
+        report.sessions.len()
+    );
+    assert_eq!(
+        report.compressed_sibling_skipped, 1,
+        "the hidden twin must surface as a named skip"
+    );
+    assert_eq!(report.parse_failures, 0, "the skip is not a parse failure");
+    let source = report.sessions[0].path.as_str();
+    assert!(
+        source.ends_with("twins/rollout.jsonl"),
+        "session must come from the PLAIN twin, got {source}"
+    );
+}
+
+#[test]
+fn codex_zst_two_pairs_report_every_dropped_twin_for_the_output_guard() {
+    // Review F1 (run 6b28edba review fix): the twins test above pins
+    // the single-pair shape; this pins the multi-pair shape the
+    // `--output` guard depends on — TWO plain/compressed pairs must
+    // surface BOTH dropped twins in `compressed_sibling_skipped_paths`
+    // (the shipped report kept only the newest, so in a two-pair
+    // directory `-o dir/older.jsonl.zst` was writable and destroyed
+    // that compressed transcript). Cache-isolated: every load persists
+    // to the env-resolved session cache, and a bare call would race
+    // sibling tests on the process-global env.
+    let root = temp_root("codex-zst-two-pairs");
+    fs::create_dir_all(&root).expect("scratch dir");
+    let twins =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-zstd/twins");
+    for stem in ["a", "b"] {
+        fs::copy(
+            twins.join("rollout.jsonl"),
+            root.join(format!("{stem}.jsonl")),
+        )
+        .expect("plain twin copy");
+        fs::copy(
+            twins.join("rollout.jsonl.zst"),
+            root.join(format!("{stem}.jsonl.zst")),
+        )
+        .expect("compressed twin copy");
+    }
+    with_session_cache(&root.join("cache"), || {
+        let report = load_sessions_with_progress(Some(&root), &LoadOptions::default(), |_| {});
+        assert_eq!(
+            report.sessions.len(),
+            2,
+            "two plain/compressed pairs are TWO rollouts, got {}",
+            report.sessions.len()
+        );
+        assert_eq!(
+            report.compressed_sibling_skipped, 2,
+            "both hidden twins must surface as named skips"
+        );
+        assert_eq!(report.parse_failures, 0);
+        assert_eq!(
+            report.compressed_sibling_skipped_paths.len(),
+            2,
+            "the report must carry EVERY dropped twin for the -o guard, not just the newest"
+        );
+        let reported: Vec<String> = report
+            .compressed_sibling_skipped_paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        for expected in ["a.jsonl.zst", "b.jsonl.zst"] {
+            assert!(
+                reported.iter().any(|name| name == expected),
+                "dropped set must contain {expected}, got {reported:?}"
+            );
+        }
+    });
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn codex_zst_compressed_only_dir_loads_plain_twin_equivalent() {
+    // rm-992 naming arm: a compressed-only directory (upstream rotates
+    // to .jsonl.zst after a size threshold, so both layouts occur in
+    // the wild) must decode through the zstd sniffer to the session
+    // the plain twin would have produced — the compressed fixture here
+    // is the zstd frame of the SAME rollout the twins fixture ships as
+    // plain — with no skip to disclose.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-zstd/compressed-only");
+    let report = load_sessions_with_progress(Some(&dir), &LoadOptions::default(), |_| {});
+    assert_eq!(
+        report.sessions.len(),
+        1,
+        "compressed-only rollout must decode to one session"
+    );
+    assert_eq!(report.compressed_sibling_skipped, 0);
+    assert_eq!(report.parse_failures, 0);
+    let source = report.sessions[0].path.as_str();
+    assert!(
+        source.ends_with("compressed-only/rollout.jsonl.zst"),
+        "compressed-only must load through the zst twin, got {source}"
+    );
+}
+
+#[test]
+fn session_file_naming_admits_only_upstream_rollout_zst_spellings() {
+    // rm-992 naming arm, pinned at the admission boundary
+    // (is_session_file_name): a session file name admits the upstream
+    // spellings (.jsonl, .json, and their zst twins .jsonl.zst /
+    // .json.zst) and nothing else — a bare `.zst` (unknown payload), a
+    // compressed NON-session name, case variants, and chained
+    // compressions are all rejected before any parse attempt.
+    let admits = |name: &str| agenttrace_core::is_session_file_name(name);
+    assert!(admits("rollout.jsonl"));
+    assert!(admits("rollout.json"));
+    assert!(admits("rollout.jsonl.zst"));
+    assert!(admits("rollout.json.zst"));
+    assert!(
+        !admits("archive.zst"),
+        "bare zst is not a known session name"
+    );
+    assert!(
+        !admits("notes.txt.zst"),
+        "compression does not make a name a session"
+    );
+    assert!(
+        !admits("rollout.jsonl.ZST"),
+        "upstream spelling is case-sensitive"
+    );
+    assert!(
+        !admits("rollout.jsonlzst"),
+        "the dot is part of the spelling"
+    );
+    assert!(
+        !admits("rollout.jsonl.zst.zst"),
+        "one compression frame, no chains"
+    );
+}
+
+#[test]
 fn symlinked_child_directories_are_discovered_and_cycles_terminate() {
     // Codex #42135 (cycle 7; pass-11 A11-5 re-verified): the walk tested
     // `entry.file_type().is_dir()`, which is false for symlinks, so a

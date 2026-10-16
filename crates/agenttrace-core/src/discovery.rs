@@ -60,12 +60,27 @@ pub struct LoadReport {
     /// rollout hint), so an all-corrupt directory can say what actually
     /// happened instead of "no sessions match the filters".
     pub first_parse_failure: Option<String>,
+    /// rm-992 (naming/precedence arm, run 6b28edba): compressed session
+    /// files (.jsonl.zst / .json.zst — the names codex's rollout
+    /// compression writes) skipped because an existing plain sibling
+    /// (X.jsonl / X.json) already carries the session. Counted separately
+    /// from `skipped` so the disclosure channel can explain the exclusion
+    /// instead of folding it into parse failures.
+    pub compressed_sibling_skipped: usize,
     /// rm-912 (assess F2): every discovered file the loader ATTEMPTED
     /// but failed to parse, in discovery order — the CLI's -o
     /// membership check must cover these too, or
     /// `--overview -d dir -o dir/bad.jsonl` silently overwrites the
     /// unparseable input (a `.orig` twin is not a recovery path).
     pub parse_failure_paths: Vec<PathBuf>,
+    /// rm-992 + review F1 (run 6b28edba review fix): EVERY dropped
+    /// compressed twin's path, in discovery order — same pattern as
+    /// `parse_failure_paths`. The full set (not just the first/newest
+    /// twin) is what lets the `--output` membership guard refuse
+    /// writes onto ANY hidden twin: a single representative path left
+    /// `--overview -d dir -o dir/older.jsonl.zst` free to atomically
+    /// destroy that compressed transcript.
+    pub compressed_sibling_skipped_paths: Vec<PathBuf>,
     /// rm-799: subagent transcripts whose parent session is NOT part
     /// of the loaded corpus (orphaned children — moved transcripts,
     /// partial copies). They still render as standalone rows, but the
@@ -354,7 +369,27 @@ pub fn load_sessions_with_progress_from_cache_mode(
     mut on_progress: impl FnMut(LoadProgress),
 ) -> LoadReport {
     let mut sessions = Vec::new();
-    let (files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    let (mut files, json_fork_excluded) = find_session_files_cached(dir, cache, true);
+    // rm-992 (naming/precedence arm, run 6b28edba): codex parity — an
+    // existing plain sibling (X.jsonl / X.json) hides its compressed twin
+    // X.jsonl.zst, so the compressed file is skipped BEFORE parsing and the
+    // skip is disclosed via LoadReport (never silent, never double-counted).
+    // Mirrors codex compression.rs RolloutFile::from_path: compressed
+    // siblings hidden by an existing plain .jsonl are not admitted.
+    // `compressed_sibling_skipped_paths` names EVERY dropped twin so
+    // the --output membership guard can refuse writes onto each one
+    // (review F1: naming only the first/newest left the older twins
+    // writable, so -o destroyed their compressed transcripts).
+    let compressed_sibling_skipped_paths: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| is_compressed_session_file(p))
+        .filter(|p| match compressed_plain_sibling(p) {
+            Some(sibling) => files.contains(&sibling),
+            None => false,
+        })
+        .cloned()
+        .collect();
+    let compressed_sibling_skipped = apply_compressed_sibling_precedence(&mut files);
     let discovered = files.len();
     let mut cache_hits = 0;
     let mut skipped = 0;
@@ -538,6 +573,8 @@ pub fn load_sessions_with_progress_from_cache_mode(
         parse_failures,
         first_parse_failure,
         parse_failure_paths,
+        compressed_sibling_skipped,
+        compressed_sibling_skipped_paths,
         unlinked_subagents,
     }
 }
@@ -1087,7 +1124,71 @@ pub fn is_session_file_name(name: &str) -> bool {
     if name.ends_with(".lock") {
         return false;
     }
+    // rm-992 (naming arm, run 6b28edba): codex rollout compression writes
+    // <id>.jsonl.zst (compression.rs COMPRESSED_SUFFIX ".zst") — admit the
+    // compressed names so scans see files codex stable ships today. Content
+    // is routed by the existing magic sniff, so a non-zstd file with a
+    // compressed name degrades to a disclosed parse skip, not a scan miss.
+    if name.ends_with(".jsonl.zst") || name.ends_with(".json.zst") {
+        return true;
+    }
     name.ends_with(".jsonl") || name.ends_with(".json")
+}
+
+/// True for the compressed session-file names codex writes
+/// (`X.jsonl.zst`, `X.json.zst`).
+fn is_compressed_session_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".jsonl.zst") || n.ends_with(".json.zst"))
+        .unwrap_or(false)
+}
+
+/// The plain sibling a compressed session file would duplicate:
+/// `X.jsonl.zst` -> `X.jsonl` (codex names keep the plain stem).
+fn compressed_plain_sibling(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".zst")?;
+    if stem.ends_with(".jsonl") || stem.ends_with(".json") {
+        Some(path.with_file_name(stem))
+    } else {
+        None
+    }
+}
+
+/// rm-992 (precedence arm, run 6b28edba): drop compressed session files
+/// whose plain sibling is also in the candidate list (codex parity — the
+/// plain file wins) and return how many were dropped. Pure filter over the
+/// final candidate list, so it covers both the fresh walk and the
+/// cache-fed walk in one place.
+/// rm-992: drop compressed-rollout twins that an existing plain
+/// sibling hides (codex `RolloutFile::from_path` parity: a directory
+/// holding `rollout.jsonl` + `rollout.jsonl.zst` is ONE rollout, the
+/// plain file wins) and return how many candidates were dropped so
+/// every admission lane can disclose the skip instead of counting it
+/// as a parse failure. `pub(crate)` because the doctor inventory
+/// applies the identical rule through `find_reportable_session_files`
+/// (rm-904 agreement).
+pub(crate) fn apply_compressed_sibling_precedence(paths: &mut Vec<PathBuf>) -> usize {
+    // rm-992: upstream precedence is "plain file hides its compressed
+    // twin" — a compressed candidate is dropped ONLY when its plain
+    // sibling is itself part of the discovered set (codex
+    // `RolloutFile::from_path`: compressed siblings "hidden by an
+    // existing plain .jsonl file"). A compressed file with NO plain
+    // twin is the rollout's only carrier and MUST stay (rotation
+    // layouts ship exactly that shape). Owned set so the borrow of
+    // `paths` ends before `retain` needs it mutable (E0502).
+    let plain: std::collections::HashSet<PathBuf> = paths
+        .iter()
+        .filter(|p| !is_compressed_session_file(p))
+        .cloned()
+        .collect();
+    let before = paths.len();
+    paths.retain(|p| match compressed_plain_sibling(p) {
+        Some(sibling) => !plain.contains(&sibling),
+        None => true,
+    });
+    before - paths.len()
 }
 
 fn max_session_dir_depth(dir: &Path) -> usize {
