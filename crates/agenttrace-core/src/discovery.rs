@@ -85,12 +85,24 @@ pub struct LoadProgress {
 }
 
 pub fn known_session_dirs() -> Vec<KnownSessionDir> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    // rm-1921: HOME must be absolute for the same reason as every primary
+    // below — a relative base would graft the whole discovery surface onto
+    // whatever directory the CLI happened to run in.
+    let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+    else {
         return Vec::new();
     };
     let env_home = |name: &str, fallback: PathBuf| {
+        // rm-1921: empty or relative values are inert (treated as unset) —
+        // guard-join absolute values only, mirroring the cache_dir.rs
+        // rm-248 filter, so discovery results are CWD-independent.
         std::env::var_os(name)
-            .filter(|value| !value.is_empty())
+            .filter(|value| {
+                let path = std::path::Path::new(value);
+                !value.is_empty() && path.is_absolute()
+            })
             .map(PathBuf::from)
             .unwrap_or(fallback)
     };

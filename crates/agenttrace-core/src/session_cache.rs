@@ -1376,7 +1376,10 @@ struct GoAnomaly {
 
 pub fn session_cache_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
+        // rm-1921: a relative value stays inert — it would resolve against
+        // the CWD and plant the cache beside whatever directory the CLI ran
+        // in. Guard-join absolute values only (cache_dir.rs rm-248 family).
+        if dir.is_absolute() {
             return dir.join("sessions.json");
         }
     }

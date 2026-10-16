@@ -13,7 +13,24 @@ cd "$repo_root"
 out_parent="${AGENTTRACE_CI_OUT:-/tmp/agenttrace-rust-release-local}"
 mkdir -p "$out_parent"
 out_dir="$(mktemp -d "$out_parent/release-local.XXXXXX")"
-bin="${AGENTTRACE_BIN:-$repo_root/target/release/agenttrace}"
+# rm-1925: this gate compiles and runs tests, so it must not silently
+# inherit an ambient CARGO_TARGET_DIR. A target dir shared across
+# concurrent checkouts produced false reds and a false green in the fleet
+# (sibling worktrees clobbering each other's artifacts). Modes:
+#   AGENTTRACE_GATE_TARGET_MODE=private -> lane-private mktemp target dir
+#   AGENTTRACE_GATE_TARGET_MODE=inherit -> accept the ambient value as-is
+#   unset (auto)                        -> ambient unset keeps the repo default
+#     ($repo_root/target, per-checkout private); a SET ambient value is
+#     refused unless it equals the repo default.
+if [[ "${AGENTTRACE_GATE_TARGET_MODE:-}" == "private" ]]; then
+  export CARGO_TARGET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agenttrace-gate-target.XXXXXXXX")"
+elif [[ "${AGENTTRACE_GATE_TARGET_MODE:-}" != "inherit" \
+  && -n "${CARGO_TARGET_DIR:-}" \
+  && "${CARGO_TARGET_DIR}" != "$repo_root/target" ]]; then
+  echo "gate-check-rust-release-local: refusing inherited CARGO_TARGET_DIR='$CARGO_TARGET_DIR': shared target dirs across concurrent checkouts yield false results (rm-1925). Set AGENTTRACE_GATE_TARGET_MODE=private for a lane-private dir, AGENTTRACE_GATE_TARGET_MODE=inherit to accept it, or unset CARGO_TARGET_DIR for the repo default." >&2
+  exit 1
+fi
+bin="${AGENTTRACE_BIN:-${CARGO_TARGET_DIR:-$repo_root/target}/release/agenttrace}"
 
 fail() {
   echo "check-rust-release-local: $*" >&2

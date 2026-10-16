@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bin="${AGENTTRACE_BIN:-target/release/agenttrace}"
+# rm-1925: honor CARGO_TARGET_DIR layouts for the built binary (rm-391
+# follow-up); AGENTTRACE_BIN still wins.
+bin="${AGENTTRACE_BIN:-${CARGO_TARGET_DIR:-.}/target/release/agenttrace}"
 source_dir="${AGENTTRACE_TUI_REAL_DIR:-$HOME/.pi/agent/sessions}"
 file_limit="${AGENTTRACE_TUI_REAL_FILE_LIMIT:-2}"
 timeout_seconds="${AGENTTRACE_TUI_TIMEOUT:-30}"

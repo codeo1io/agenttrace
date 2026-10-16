@@ -595,7 +595,10 @@ pub fn pricing_cache_path() -> PathBuf {
     // same path (pricing_meta_cache_path), so both move together. An
     // empty value stays inert, matching the session cache's ladder.
     if let Some(dir) = std::env::var_os("AGENTTRACE_SESSION_CACHE_DIR").map(PathBuf::from) {
-        if !dir.as_os_str().is_empty() {
+        // rm-1921: a relative value stays inert — it would resolve against
+        // the CWD and plant pricing.json beside whatever directory the CLI
+        // ran in (cache_dir.rs rm-248 family).
+        if dir.is_absolute() {
             return dir.join("pricing.json");
         }
     }
@@ -2287,6 +2290,12 @@ mod tests {
             pricing_cache_path(),
             default_root.join("pricing.json"),
             "empty env must fall through to the default root, matching session_cache_path"
+        );
+        std::env::set_var("AGENTTRACE_SESSION_CACHE_DIR", "rel-cache");
+        assert_eq!(
+            pricing_cache_path(),
+            default_root.join("pricing.json"),
+            "rm-1921: a relative override must stay inert — it would plant pricing.json in the CWD"
         );
 
         std::env::remove_var("AGENTTRACE_SESSION_CACHE_DIR");
