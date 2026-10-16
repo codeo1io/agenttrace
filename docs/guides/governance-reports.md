@@ -104,7 +104,7 @@ is simply labeled `cache(stale)` in the pricing source field, and the only
 refresh path is the explicit `--update-pricing` action. If a refresh fails,
 the stale cache remains usable and is reported as stale.
 
-The session cache is schema 65 and the SQLite snapshot is schema 13; the
+The session cache is schema 67 and the SQLite snapshot is schema 13; the
 versions move whenever the persisted session model changes (the session
 cache to 21 when tool call/result pairing and retry-loop keying were
 corrected, then to 22 when per-format usage accounting was corrected —
@@ -416,7 +416,27 @@ number is never repriced, the zero side is disclosed, not resolved;
 minted 60 → 61 at the run's base 82e23b9, below the frontier — this
 tree's landed 62 and 63 rungs — so this integration, conflict case
 8fbcfcfd5e4d440b8e2890456aaacede, re-bases it onto the advanced
-ceiling as 63 → 64, one invalidation either way)
+ceiling as 63 → 64, one invalidation either way),
+and to 65 when the opencode v2 `session.summary_diffs` per-file list,
+its malformed-payload drop counter, and the per-file-vs-`summary_*`
+divergence disclosure joined the persisted metrics — a shape-only rung:
+a warm v64 entry replays `summary_diffs: None` with no divergence and
+no drop count while a fresh parse of the same v2 database surfaces all
+three (run b01c2b6abe28 cycle 2, rm-1509, minted 64 → 65 straight at
+the ceiling on base 8bc0587; the SQLite snapshot moved to 13 in the
+same unit),
+and to 67 when opencode sessions began attributing by_project through
+their `directory`/project-doc cwd instead of "unknown", transcript
+read/parse losses began disclosing into `Metrics::line_skips`, and
+antigravity numeric model ids began attributing to their model (mapped
+when a mapping is proven) — a warm v64/v65 entry keeps serving the
+"unknown" attribution with the losses silent (run 6d2a1d8d cycle 6,
+rm-1864 + rm-1865 + rm-1866, review fix F2; minted 64 → 67 above the
+fleet's in-flight frontier — eleven sibling worktrees holding
+uncommitted 65s and run abb3b091 holding 66 — so this integration,
+conflict case 65fe5ac36e864d78a582277965933011, lands it as minted
+above this tree's landed 65 with 66 left free, one invalidation either
+way)
 — so cached sessions regenerate under the corrected totals;
 the SQLite snapshot to 7
 when Hermes tool outcomes began deriving from message result rows, to 8

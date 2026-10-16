@@ -8,7 +8,38 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 65;
+pub const SESSION_CACHE_SCHEMA_VERSION: i64 = 67;
+// Bumped 64 -> 67 (independent-review fix, run 6d2a1d8db1ca48ef83522a8d5e6e733c
+// cycle 6 batch 'newest lanes lie silently' — rm-1864 antigravity numeric
+// model ids + rm-1865 opencode directory/projectID attribution + rm-1866
+// read-failure disclosure; review finding F2, candidate 9116291 @ base
+// c4aa3a0): the batch changes the served report for UNCHANGED files — an
+// opencode session now attributes by_project through its `directory`/
+// project-doc cwd instead of "unknown", --search renders the true cwd,
+// transcript read/parse losses surface in Metrics::line_skips, and
+// antigravity numeric model ids attribute to their (mapped when proven)
+// model — so a warm v64/v65 cache keeps serving the pre-fix attribution
+// on matching (mtime,size) fingerprints and never re-parses (rm-230
+// convention: parser-semantics changes that alter the served report bump
+// the schema so cached sessions regenerate under corrected accounting).
+// SEAM: the run minted 67 ABOVE the fleet's observed in-flight frontier
+// rather than at its tree's own 64 -> 65 — census 2026-10-16: the
+// canonical wall sat at 60 (rungs 61..64 rode un-integrated run
+// branches), eleven sibling worktrees held uncommitted consts at 65
+// (incl. 477a0c5c/0779d26b/80d52c94/2ae9f619) and run abb3b091 held
+// 66, and the shared ~/.cache/agenttrace invalidation log showed live
+// 64<->65 schema ping-pong (observed_schema_version 65 records) —
+// minting 65 or 66 would alias a held rung's semantics on the shared
+// cache. This integration (conflict case 65fe5ac36e864d78a582277965933011,
+// merging candidate 9116291 into a HEAD that had landed run b01c2b6abe28's
+// 65 rung, below) lands the mint AS MINTED above that landed 65 — the
+// landed rung keeps its numeral (c7c07e48/58fbbd6c convention) and a mint
+// already above the ceiling lands unchanged with the gap left free for the
+// sibling that holds it (the 0dee05b4 precedent: rung 62 landed above the
+// landed 60 with 61 left free), one invalidation either way; 66 stays
+// free for run abb3b091's uncommitted mint. The run minted no SQLite
+// snapshot rung, so the landed 13 (run b01c2b6a, below) remains the
+// snapshot ceiling. Entries regenerate once on next scan.
 // Bumped 64 -> 65 (run b01c2b6abe28 cycle 2 'advisory closure +
 // OpenCode v2 delivery-evidence readiness', rm-1509 LEAD, worktree
 // run-b01c2b6abe28-b01c2b6a @ base 8bc0587): a SHAPE-ONLY rung —

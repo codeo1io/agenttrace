@@ -525,6 +525,28 @@ pub fn parse_raw_session(name: &str, path: &str, raw: &str) -> anyhow::Result<Se
                     opencode_admission.capped_bytes as usize,
                 );
             }
+            // rm-1866: read/parse losses ride the same line_skips loss
+            // channel (rm-1437 precedent — lost data, NOT a
+            // value-preserving disclosure_counter), so --doctor surfaces
+            // them next to the caps.
+            if opencode_admission.unreadable_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_files_unreadable".to_string(),
+                    opencode_admission.unreadable_files,
+                );
+            }
+            if opencode_admission.unparseable_files > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_files_unparseable".to_string(),
+                    opencode_admission.unparseable_files,
+                );
+            }
+            if opencode_admission.unreadable_dirs > 0 {
+                session.metrics.line_skips.insert(
+                    "opencode_transcript_dirs_unreadable".to_string(),
+                    opencode_admission.unreadable_dirs,
+                );
+            }
             return Ok(session);
         }
         if let Some(events) = parse_cursor_export(&value) {
@@ -1125,11 +1147,77 @@ fn antigravity_usage_block(obj: &Map<String, Value>) -> Option<BTreeMap<String, 
         .find_map(|key| obj.get(*key).and_then(usage_from_value))
 }
 
-fn antigravity_model_id(obj: &Map<String, Value>) -> Option<String> {
-    ANTIGRAVITY_MODEL_KEYS
-        .iter()
-        .find_map(|key| string(obj.get(*key)).map(str::to_string))
-        .filter(|model| !model.is_empty())
+/// rm-1864: a decoded antigravity model id. `display` is the attribution
+/// string (a proven mapping for known numeric ids, else the raw spelling);
+/// `numeric` marks ids that arrived as JSON numbers so the fold can
+/// disclose every numeric sighting.
+struct AntigravityModelId {
+    display: String,
+    numeric: bool,
+}
+
+/// rm-1864: numeric model ids observed in the wild and their proven
+/// model names. 1417 → gemini-4-argon is ccusage v20.0.34's first-party
+/// mapping (PR #1894, 2026-10-15); further ids arrive weekly (ccusage
+/// #1897 reports 1277/1050 unmapped). The map fixes IDENTITY only —
+/// pricing still rides the catalog's normal lookup, so a mapped id whose
+/// model is absent from the catalog degrades through the disclosed
+/// unknown-model path rather than this table inventing a price.
+const ANTIGRAVITY_NUMERIC_MODEL_MAP: &[(i64, &str)] = &[(1417, "gemini-4-argon")];
+
+/// rm-1864 review F5 (2026-10-16): JSON `1417.0` and `1417` are the same
+/// number, but the float spelling stringifies as `"1417.0"` — the
+/// proven-map lookup (an i64 parse) missed, so a mapped model silently
+/// attributed to the raw spelling instead of its model. Integral floats
+/// canonicalize to the integer spelling; genuinely fractional ids keep
+/// their raw spelling (disclosed and unmapped — the table never invents
+/// an id).
+fn canonical_antigravity_number_id(number: &serde_json::Number) -> String {
+    if let Some(int) = number.as_i64() {
+        return int.to_string();
+    }
+    if let Some(float) = number.as_f64() {
+        // 2^53: the f64 integer-exactness bound, so the cast is lossless.
+        if float.is_finite() && float.fract() == 0.0 && float.abs() <= 9_007_199_254_740_992.0 {
+            return (float as i64).to_string();
+        }
+    }
+    number.to_string()
+}
+
+fn antigravity_model_id(obj: &Map<String, Value>) -> Option<AntigravityModelId> {
+    ANTIGRAVITY_MODEL_KEYS.iter().find_map(|key| {
+        // rm-1864: antigravity ALSO emits numeric model ids (JSON numbers —
+        // 1417/1277/1050 per ccusage #1894/#1897). The old string-only
+        // decode folded them to None, banking usage with `models_seen ==
+        // 0`: model identity silently lost, by_model → unknown, per-model
+        // pricing misses, and `multi_model_last_wins` never fired on
+        // numeric-only corpora. Numbers now stringify (and map when a
+        // first-party mapping is proven) with every numeric sighting
+        // disclosed via `antigravity_model:numeric_id`.
+        let (raw, numeric) = match obj.get(*key)? {
+            Value::String(text) => (text.clone(), false),
+            Value::Number(number) => (canonical_antigravity_number_id(number), true),
+            _ => return None,
+        };
+        if raw.is_empty() {
+            return None;
+        }
+        let display = if numeric {
+            raw.parse::<i64>()
+                .ok()
+                .and_then(|int| {
+                    ANTIGRAVITY_NUMERIC_MODEL_MAP
+                        .iter()
+                        .find(|(id, _)| *id == int)
+                        .map(|(_, mapped)| (*mapped).to_string())
+                })
+                .unwrap_or(raw)
+        } else {
+            raw
+        };
+        Some(AntigravityModelId { display, numeric })
+    })
 }
 
 /// rm-720 fold state: sums per-generation usage blocks and emits ONE
@@ -1140,6 +1228,7 @@ struct AntigravityUsageFold {
     usage: BTreeMap<String, i64>,
     model: String,
     models_seen: usize,
+    numeric_model_ids: usize,
     generations: usize,
     latest_timestamp: String,
 }
@@ -1150,12 +1239,18 @@ impl AntigravityUsageFold {
             usage: BTreeMap::new(),
             model: String::new(),
             models_seen: 0,
+            numeric_model_ids: 0,
             generations: 0,
             latest_timestamp: String::new(),
         }
     }
 
-    fn fold(&mut self, usage: &BTreeMap<String, i64>, model: Option<String>, timestamp: &str) {
+    fn fold(
+        &mut self,
+        usage: &BTreeMap<String, i64>,
+        model: Option<AntigravityModelId>,
+        timestamp: &str,
+    ) {
         self.generations += 1;
         for (key, value) in usage {
             // rm-831: the rm-046 clamp-plus-saturate contract
@@ -1172,7 +1267,10 @@ impl AntigravityUsageFold {
         }
         if let Some(model) = model {
             self.models_seen += 1;
-            self.model = model;
+            if model.numeric {
+                self.numeric_model_ids += 1;
+            }
+            self.model = model.display;
         }
         self.latest_timestamp = later_rfc3339(&self.latest_timestamp, timestamp);
     }
@@ -1195,6 +1293,15 @@ impl AntigravityUsageFold {
             counters.insert(
                 "antigravity_model:multi_model_last_wins".to_string(),
                 self.models_seen as i64,
+            );
+        }
+        // rm-1864: every numeric-id sighting is disclosed — mapped or not
+        // — so a numeric-only corpus can never masquerade as a
+        // well-attributed one.
+        if self.numeric_model_ids > 0 {
+            counters.insert(
+                "antigravity_model:numeric_id".to_string(),
+                self.numeric_model_ids as i64,
             );
         }
         Some(Event {
@@ -6449,11 +6556,12 @@ fn parse_opencode_storage_session(
     let (mut messages, message_admission) =
         read_opencode_records(&storage_root.join("message").join(session_id));
     admission.accumulate(message_admission);
-    // rm-1437: an empty event set is expected when every transcript was
-    // stat-capped away — bail into the unsupported lane only when we have no
-    // such explanation, so a fully-capped session still parses and carries its
-    // disclosure instead of masquerading as a foreign format.
-    if messages.is_empty() && admission.capped_files == 0 {
+    // rm-1437/rm-1866: an empty event set is explained when every
+    // transcript was stat-capped OR lost to a read/parse failure — bail
+    // into the unsupported lane only when we have no such explanation, so
+    // a fully-capped or fully-unreadable session still parses and carries
+    // its disclosure instead of masquerading as a foreign format.
+    if messages.is_empty() && !admission.explains_empty() {
         bail!("opencode: no messages found for session {}", session_id);
     }
     sort_opencode_records(&mut messages);
@@ -6485,18 +6593,34 @@ fn parse_opencode_storage_session(
         add_usage(&mut usage, &part_usage);
         body.extend(events);
     }
-    // rm-1437: same relaxation as the messages gate — a fully stat-capped
-    // corpus legitimately yields no parseable events; disclose, don't bail.
-    if body.is_empty() && admission.capped_files == 0 {
+    // rm-1437/rm-1866: same relaxation as the messages gate — a corpus
+    // fully stat-capped or lost to read/parse failures legitimately yields
+    // no parseable events; disclose, don't bail.
+    if body.is_empty() && !admission.explains_empty() {
         bail!("opencode: no parseable events for session {}", session_id);
     }
 
+    // rm-1865: session docs carry `directory` (the working dir the
+    // conversation ran in) and/or `projectID`; neither was decoded, so
+    // every opencode session rolled up as by_project "unknown" — even
+    // docs with an explicit directory (the in-tree project_alpha
+    // fixture). The doc's directory wins; otherwise the referenced
+    // project doc (`storage/project/<id>.json`, v1 store layout) is
+    // consulted. Either way it rides the meta event's cwd (capped like
+    // every other lane's cwd) so session_from_events attributes the
+    // session to its project — resolve_project prefers cwd — with the
+    // unknown fallback still disclosed when neither is present.
+    let directory_raw = opencode_session_directory(&storage_root, session);
+    let (directory, cwd_truncated) = cap_session_cwd(&directory_raw);
+
     let mut events = Vec::new();
-    if model != "unknown" || usage_has_values(&usage) {
+    if model != "unknown" || usage_has_values(&usage) || !directory.is_empty() {
         events.push(Event {
             role: "meta".to_string(),
             model_used: model,
             source_tool: "opencode".to_string(),
+            cwd: directory.clone(),
+            disclosure_counters: cwd_truncation_disclosure("opencode", cwd_truncated),
             usage: if usage_has_values(&usage) {
                 usage
             } else {
@@ -6508,6 +6632,55 @@ fn parse_opencode_storage_session(
     events.extend(body);
     admission_out.accumulate(admission);
     Ok(events)
+}
+
+/// rm-1865: decode the session's working directory for project
+/// attribution — the doc's `directory` first, then the project doc
+/// referenced by `projectID` (`storage/project/<id>.json`, v1 store
+/// layout). A failed project-doc lookup degrades to the disclosed
+/// unknown-project fallback rather than a hard error.
+fn opencode_session_directory(storage_root: &Path, session: &Map<String, Value>) -> String {
+    if let Some(dir) = string(session.get("directory")) {
+        if !dir.is_empty() {
+            return dir.to_string();
+        }
+    }
+    let project_id = string(session.get("projectID")).unwrap_or("");
+    if project_id.is_empty() {
+        return String::new();
+    }
+    // Review F1 (2026-10-16): projectID is hostile-writable session-doc
+    // input joined into a filesystem path, and `Path::join` is not a
+    // confinement — an ABSOLUTE id replaces the base path entirely and
+    // a `../`-spelled one walks out of `storage/project`, so a planted
+    // session doc could import any `*.json` on the machine as its
+    // project attribution (live-proven both variants: out-of-store docs
+    // flipped by_project). Real opencode project ids are single path
+    // segments; anything else degrades to the disclosed unknown-project
+    // fallback instead of reading outside the store.
+    if project_id.contains('/') || project_id.contains('\\') || project_id.starts_with("..") {
+        return String::new();
+    }
+    let project_doc = storage_root
+        .join("project")
+        .join(format!("{project_id}.json"));
+    // Review F1 (rm-1437 discipline): stat before read — an oversized
+    // project doc is skipped rather than admitted into memory, degrading
+    // to the unknown-project fallback like every other failed lookup.
+    if std::fs::metadata(&project_doc)
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+        > OPENCODE_TRANSCRIPT_READ_CAP_BYTES
+    {
+        return String::new();
+    }
+    let Ok(raw) = std::fs::read_to_string(&project_doc) else {
+        return String::new();
+    };
+    let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&raw) else {
+        return String::new();
+    };
+    string(doc.get("directory")).unwrap_or("").to_string()
 }
 
 fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
@@ -6531,12 +6704,34 @@ fn opencode_storage_root_from_session_file(path: &str) -> Option<PathBuf> {
 struct OpencodeAdmissionStats {
     capped_files: usize,
     capped_bytes: u64,
+    /// rm-1866: transcript-side read/parse losses that used to vanish
+    /// silently — `read_to_string` and JSON-parse failures returned empty
+    /// with zero disclosure, and an unreadable message dir even masqueraded
+    /// as "unsupported session format". They ride the same line_skips
+    /// loss channel as the caps (a skipped transcript is lost data).
+    unreadable_files: usize,
+    unparseable_files: usize,
+    unreadable_dirs: usize,
 }
 
 impl OpencodeAdmissionStats {
     fn accumulate(&mut self, other: OpencodeAdmissionStats) {
         self.capped_files += other.capped_files;
         self.capped_bytes += other.capped_bytes;
+        self.unreadable_files += other.unreadable_files;
+        self.unparseable_files += other.unparseable_files;
+        self.unreadable_dirs += other.unreadable_dirs;
+    }
+
+    /// rm-1866 (extending the rm-1437 relaxation): transcript-side losses
+    /// are an explanation for an empty event set — caps AND read/parse
+    /// losses. Bailing into the unsupported lane is only honest when we
+    /// have no such explanation.
+    fn explains_empty(&self) -> bool {
+        self.capped_files > 0
+            || self.unreadable_files > 0
+            || self.unparseable_files > 0
+            || self.unreadable_dirs > 0
     }
 }
 
@@ -6548,12 +6743,33 @@ impl OpencodeAdmissionStats {
 const OPENCODE_TRANSCRIPT_READ_CAP_BYTES: u64 = 10 * 1024 * 1024;
 
 fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionStats) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (Vec::new(), OpencodeAdmissionStats::default());
+    let mut admission = OpencodeAdmissionStats::default();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // rm-1866: a missing dir is the store's own "no such container"
+        // (a message without parts, a project with no sessions) — not a
+        // loss. Every OTHER read_dir failure IS a loss and must be
+        // disclosed instead of being indistinguishable from an empty
+        // conversation.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), admission);
+        }
+        Err(_) => {
+            admission.unreadable_dirs += 1;
+            return (Vec::new(), admission);
+        }
     };
     let mut records = Vec::new();
-    let mut admission = OpencodeAdmissionStats::default();
-    for entry in entries.flatten() {
+    for entry in entries {
+        // Review F4 (2026-10-16): read_dir errors also fire MID-iteration
+        // (EACCES/EIO during enumeration) — `flatten()` dropped those
+        // silently, a residual silent channel of exactly rm-1866's class.
+        // Each mid-iteration failure counts into the dir-level loss
+        // channel; enumeration continues with what the OS still yields.
+        let Ok(entry) = entry else {
+            admission.unreadable_dirs += 1;
+            continue;
+        };
         let path = entry.path();
         if path.is_dir() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
@@ -6567,9 +6783,14 @@ fn read_opencode_records(dir: &Path) -> (Vec<OpenCodeRecord>, OpencodeAdmissionS
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else {
+            // rm-1866: a readable-failed transcript is lost data — count
+            // and disclose it, never swallow it.
+            admission.unreadable_files += 1;
             continue;
         };
         let Ok(Value::Object(doc)) = serde_json::from_str::<Value>(&raw) else {
+            // rm-1866: same nothing-silent contract for unparseable JSON.
+            admission.unparseable_files += 1;
             continue;
         };
         records.push(OpenCodeRecord { path, doc });
@@ -9792,6 +10013,230 @@ mod tests {
                 .get("antigravity_usage_basis:planner_response_summed"),
             Some(&2),
             "the fold names its basis"
+        );
+    }
+
+    #[test]
+    fn antigravity_numeric_model_ids_stringify_map_and_disclose() {
+        // rm-1864 red-first: with the string-only decode, a corpus whose
+        // modelConfigId values are JSON numbers folded every model id to
+        // None — usage was banked with models_seen == 0, by_model showed
+        // "unknown", per-model pricing missed, and NEITHER model
+        // disclosure key could fire. Numbers must now stringify (mapped
+        // when a first-party mapping is proven), attribute, and disclose.
+        let raw = serde_json::json!({
+            "trajectoryId": "22222222-3333-4444-5555-666666666666",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T10:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Numeric generation.",
+                        "usageStats": {
+                            "inputTokens": 31,
+                            "outputTokens": 17,
+                            "cacheReadInputTokens": 11
+                        },
+                        "modelConfigId": 1417
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T10:00:09Z" },
+                    "plannerResponse": {
+                        "response": "Unmapped numeric generation.",
+                        "usageStats": { "inputTokens": 10, "outputTokens": 5 },
+                        "modelConfigId": 1277
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-model-ids", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "1277",
+            "last numeric id wins and an unmapped numeric attributes to its stringified id"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&2),
+            "every numeric sighting — mapped or not — must be disclosed"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:multi_model_last_wins"),
+            Some(&2),
+            "numeric-only corpora must count as multi-model when they are"
+        );
+        assert_eq!(session.metrics.tokens_input, 41);
+        assert_eq!(session.metrics.tokens_cache_r, 11);
+
+        // The proven 1417 → gemini-4-argon mapping (ccusage #1894) fixes
+        // identity on a numeric-only corpus without touching pricing.
+        let raw = serde_json::json!({
+            "trajectoryId": "22222222-3333-4444-5555-777777777777",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T11:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Mapped numeric generation.",
+                        "usageStats": { "inputTokens": 7, "outputTokens": 3 },
+                        "modelConfigId": 1417
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("numeric-id-map", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-4-argon",
+            "a proven numeric mapping attributes the mapped model name"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "a mapped numeric id is still disclosed as numeric"
+        );
+        assert!(
+            !session
+                .metrics
+                .disclosure_counters
+                .contains_key("antigravity_model:multi_model_last_wins"),
+            "one numeric id across the corpus is not multi-model"
+        );
+
+        // Review F5: float-SPELLED numeric ids (1417.0) are the same id
+        // as 1417 — pre-fix the raw "1417.0" spelling missed the proven
+        // map and attributed to the spelling instead of the model.
+        // Integral floats canonicalize to the integer spelling;
+        // fractional ids keep their raw spelling, disclosed and unmapped.
+        let raw = serde_json::json!({
+            "trajectoryId": "22222222-3333-4444-5555-999999999999",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T13:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Float-spelled mapped generation.",
+                        "usageStats": { "inputTokens": 4, "outputTokens": 2 },
+                        "modelConfigId": 1417.0
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("float-id-map", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-4-argon",
+            "a float-spelled integral id must hit the same proven mapping as its integer spelling"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "the float spelling is still a numeric sighting and discloses as one"
+        );
+
+        let raw = serde_json::json!({
+            "trajectoryId": "22222222-3333-4444-5555-aaaaaaaaaaaa",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T14:00:05Z" },
+                    "plannerResponse": {
+                        "response": "Fractional id generation.",
+                        "usageStats": { "inputTokens": 6, "outputTokens": 1 },
+                        "modelConfigId": 1277.5
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session =
+            parse_raw_session("float-id-raw", "conversation.trajectory.json", &raw).unwrap();
+        assert_eq!(
+            session.metrics.model_used, "1277.5",
+            "a fractional id keeps its raw spelling — disclosed and unmapped, never invented"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+        );
+
+        // Mixed corpora: string + numeric ids keep both attributions and
+        // disclose both keys (numeric_id counts only the numeric sightings).
+        let raw = serde_json::json!({
+            "trajectoryId": "22222222-3333-4444-5555-888888888888",
+            "steps": [
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T12:00:05Z" },
+                    "plannerResponse": {
+                        "response": "String generation.",
+                        "usageStats": { "inputTokens": 5, "outputTokens": 2 },
+                        "modelConfigId": "gemini-pro-default"
+                    }
+                },
+                {
+                    "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                    "status": "COMPLETED",
+                    "metadata": { "createdAt": "2026-10-15T12:00:09Z" },
+                    "plannerResponse": {
+                        "response": "Numeric generation.",
+                        "usageStats": { "inputTokens": 6, "outputTokens": 3 },
+                        "modelConfigId": 1417
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let session = parse_raw_session(
+            "mixed-string-numeric-ids",
+            "conversation.trajectory.json",
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(
+            session.metrics.model_used, "gemini-4-argon",
+            "last-wins across kinds still holds"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:numeric_id"),
+            Some(&1),
+            "only the numeric sighting counts as numeric"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .disclosure_counters
+                .get("antigravity_model:multi_model_last_wins"),
+            Some(&2)
         );
     }
 
