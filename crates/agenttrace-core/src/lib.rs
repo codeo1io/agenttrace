@@ -1,3 +1,4 @@
+mod cache_dir;
 mod codex_replay;
 mod demo;
 mod diagnostics;

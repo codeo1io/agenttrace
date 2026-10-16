@@ -3164,6 +3164,7 @@ fn zstd_rollouts_fail_with_a_named_error_not_generic_utf8() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_child_directories_are_discovered_and_cycles_terminate() {
     // Codex #42135 (cycle 7; pass-11 A11-5 re-verified): the walk tested
@@ -3225,6 +3226,7 @@ fn symlinked_child_directories_are_discovered_and_cycles_terminate() {
 // `symlinked_child_directories_are_discovered_and_cycles_terminate`
 // at exactly two files, so this admission must not over-collapse.
 
+#[cfg(unix)]
 #[test]
 fn symlinked_session_file_aliases_are_collected_once() {
     let root = temp_root("agenttrace-rm597-symlink-file");
@@ -3247,6 +3249,7 @@ fn symlinked_session_file_aliases_are_collected_once() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_session_file_aliases_across_directories_are_collected_once() {
     // The alias and its target live in different walked directories, so
@@ -3299,6 +3302,7 @@ fn hardlinked_session_file_aliases_are_collected_once() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn symlink_only_session_file_still_counts() {
     // The acceptance contract cuts both ways: when the alias is the only
@@ -3327,6 +3331,7 @@ fn symlink_only_session_file_still_counts() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_session_file_aliases_dedup_on_the_cached_walk() {
     // The cached walk stores raw per-directory listings and replays
@@ -3355,6 +3360,7 @@ fn symlinked_session_file_aliases_dedup_on_the_cached_walk() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_session_file_aliases_dedup_on_the_uncached_walk() {
     // `collect_session_files` is the doctor path: it bypasses the
@@ -3372,6 +3378,7 @@ fn symlinked_session_file_aliases_dedup_on_the_uncached_walk() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinked_child_directories_are_resolved_through_the_cached_walk() {
     // The cached walk replays stored directory listings; it must follow
@@ -3411,6 +3418,7 @@ fn symlinked_child_directories_are_resolved_through_the_cached_walk() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn doctor_names_symlinked_session_roots_instead_of_silent_following() {
     // Doctor disclosure (cycle 7): a session root that is itself a
